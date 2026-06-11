@@ -119,6 +119,15 @@ pub struct Engine {
     /// are rebuilt on startup from the primary redo replay + device scan.
     redo_log: std::sync::OnceLock<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>,
     blob_store: Option<Arc<dyn BlobStore>>,
+    /// In-flight external-blob pins (F-IJ-002).
+    ///
+    /// The create dispatch pins a txid here BEFORE its blob digest check and
+    /// releases the pin after the index registration; the periodic blob-GC
+    /// sweep re-verifies "not pinned AND still unreferenced" under the pin
+    /// stripe lock immediately before unlinking a candidate. Closes the
+    /// TOCTOU where an aged blob (older than the F-G9-004 grace window) was
+    /// deleted between a create's digest check and its registration.
+    blob_pins: crate::storage::blobstore::BlobPinSet,
     /// Per-shard record counts for migration verification.
     ///
     /// Startup leaves these counters uninitialized so `Engine::new` does not
@@ -185,6 +194,7 @@ impl Engine {
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_log: std::sync::OnceLock::new(),
             blob_store: None,
+            blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
             shard_counts_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
@@ -600,6 +610,16 @@ impl Engine {
     /// Get a reference to the blobstore, if configured.
     pub fn blob_store(&self) -> Option<&dyn BlobStore> {
         self.blob_store.as_deref()
+    }
+
+    /// In-flight external-blob pin set (F-IJ-002).
+    ///
+    /// Create dispatch: pin the txid BEFORE the blob digest check and hold
+    /// the guard until after index registration (drop on every failure
+    /// path). Blob-GC: route every candidate unlink through
+    /// [`crate::storage::blobstore::BlobPinSet::delete_orphan_guarded`].
+    pub fn blob_pins(&self) -> &crate::storage::blobstore::BlobPinSet {
+        &self.blob_pins
     }
 
     /// Get the record count for a shard.

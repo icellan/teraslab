@@ -3623,19 +3623,28 @@ fn handle_create_batch(
     // Phase 1: Validate ownership, check blobs, and build the record bytes
     // that will be captured in CreateV2 after batch allocation assigns
     // record offsets.
-    struct PendingCreate<'a> {
+    struct PendingCreate<'a, 'p> {
         idx: usize,
         create_req: CreateRequest<'a>,
         utxo_count: u32,
         reservation_size: u64,
         record_bytes: Vec<u8>,
+        /// F-IJ-002: keeps the external blob pinned against the periodic
+        /// blob-GC sweep from the digest check until index registration.
+        /// Released on drop — every failure path (item `continue`, batch
+        /// early return) un-pins automatically.
+        blob_pin: Option<crate::storage::blobstore::BlobPinGuard<'p>>,
     }
 
-    struct ValidCreate<'a> {
+    struct ValidCreate<'a, 'p> {
         idx: usize,
         create_req: CreateRequest<'a>,
         record_offset: u64,
         reservation_size: u64,
+        /// See [`PendingCreate::blob_pin`]; held until after
+        /// `create_at_offset` registers the index entry. Never read —
+        /// exists purely for its `Drop` (un-pin).
+        _blob_pin: Option<crate::storage::blobstore::BlobPinGuard<'p>>,
     }
     let mut pending_items: Vec<PendingCreate> = Vec::new();
     let mut valid_items: Vec<ValidCreate> = Vec::new();
@@ -3649,7 +3658,7 @@ fn handle_create_batch(
         // Check whether this item uses an externally-uploaded blob and bind
         // the record metadata to the durable blobstore digest.
         let is_ext = item.flags & FLAG_EXTERNAL_BLOB != 0;
-        let external_ref = if is_ext {
+        let (external_ref, blob_pin) = if is_ext {
             let Some(bs) = blob_store else {
                 errors.push(BatchItemError {
                     item_index: i as u32,
@@ -3658,16 +3667,27 @@ fn handle_create_batch(
                 });
                 continue;
             };
+            // F-IJ-002: pin the txid BEFORE the digest check and hold the
+            // pin until index registration. The blob may be older than the
+            // F-G9-004 grace window (clients legitimately stream the blob
+            // long before sending the create), so without the pin a
+            // concurrent periodic GC sweep could unlink it between this
+            // digest check and `create_at_offset`'s registration —
+            // acknowledging an EXTERNAL record whose cold data is gone.
+            let pin = engine.blob_pins().pin(&item.txid);
             match bs.digest(&item.txid) {
-                Ok(Some(digest)) => Some(ExternalRef {
-                    store_type: 1,
-                    content_hash: digest.sha256,
-                    total_size: digest.length,
-                    input_count: 0,
-                    output_count: 0,
-                    inputs_offset: 0,
-                    outputs_offset: 0,
-                }),
+                Ok(Some(digest)) => (
+                    Some(ExternalRef {
+                        store_type: 1,
+                        content_hash: digest.sha256,
+                        total_size: digest.length,
+                        input_count: 0,
+                        output_count: 0,
+                        inputs_offset: 0,
+                        outputs_offset: 0,
+                    }),
+                    Some(pin),
+                ),
                 Ok(None) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
@@ -3686,7 +3706,7 @@ fn handle_create_batch(
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         let (inputs, outputs, inpoints) = if is_ext {
@@ -3751,6 +3771,7 @@ fn handle_create_batch(
             utxo_count,
             reservation_size,
             record_bytes,
+            blob_pin,
         });
     }
 
@@ -3806,6 +3827,7 @@ fn handle_create_batch(
             create_req: pending.create_req,
             record_offset: region.offset,
             reservation_size: region.size,
+            _blob_pin: pending.blob_pin,
         });
     }
 

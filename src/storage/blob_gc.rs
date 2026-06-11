@@ -37,6 +37,15 @@
 //! both cases signal a blob the foreground pipeline does not (and never will)
 //! reference. The same call also sweeps stale `.tmp` upload artefacts from
 //! the file backend (see [`crate::storage::blobstore::FileBlobStore::STALE_TMP_AGE_SECS`]).
+//!
+//! The periodic sweep additionally synchronizes with in-flight creates via
+//! two mechanisms: the F-G9-004 mtime grace filter (skips blobs uploaded
+//! moments ago) and the F-IJ-002 pin handshake
+//! ([`crate::storage::blobstore::BlobPinSet`]) which protects blobs OLDER
+//! than the grace that an in-flight create is about to reference — the
+//! create pins the txid before its digest check, and the sweep re-verifies
+//! "unpinned AND still unreferenced" under the pin stripe lock immediately
+//! before each unlink.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,7 +55,7 @@ use std::time::Duration;
 use crate::index::{PrimaryBackend, TxKey};
 use crate::ops::engine::Engine;
 use crate::record::TxFlags;
-use crate::storage::blobstore::{BlobError, BlobStore};
+use crate::storage::blobstore::{BlobError, BlobPinSet, BlobStore, PinSweepOutcome};
 
 /// Minimum age a blob must reach before the periodic [`reconcile_orphan_blobs`]
 /// sweep will consider it for deletion (F-G9-004).
@@ -56,6 +65,12 @@ use crate::storage::blobstore::{BlobError, BlobStore};
 /// would mis-classify it as an orphan. The 60-second grace gives the
 /// in-flight create enough time to land its index registration even under
 /// substantial replication lag.
+///
+/// The grace only protects blobs whose mtime is FRESH. A blob uploaded long
+/// before its create lands (clients may legitimately stream the blob, then
+/// send `OP_CREATE_BATCH` minutes later) is past the grace; those are
+/// protected by the [`crate::storage::blobstore::BlobPinSet`] handshake
+/// instead (F-IJ-002) — see [`reconcile_orphan_blobs`].
 ///
 /// Recovery's reconciliation is race-free (no clients connected) and uses
 /// the un-aged [`BlobStore::list`] path; this constant only applies to the
@@ -83,6 +98,11 @@ pub struct BlobGcStats {
     /// Blobs that the store refused to delete (logged at warn; retried next
     /// sweep). Counted but not counted as `kept` either.
     pub delete_failed: u64,
+    /// Blobs skipped because an in-flight create holds a pin on the txid
+    /// (F-IJ-002). Re-examined on the next sweep: by then the create has
+    /// either registered the index entry (blob becomes `kept`) or failed and
+    /// released the pin (blob becomes an orphan and is deleted).
+    pub skipped_pinned: u64,
 }
 
 impl BlobGcStats {
@@ -119,19 +139,14 @@ pub enum LookupOutcome {
 /// in [`BlobGcStats::delete_failed`] so a single stuck blob cannot stop the
 /// entire sweep from making progress.
 ///
-/// **Concurrency contract.** Caller must guarantee that the primary index is
-/// in a consistent post-recovery state — i.e., recovery's redo replay has
-/// completed and any in-flight create that wrote a blob before the index
-/// registration must have either finalised the registration (so we observe the
-/// `EXTERNAL` flag and keep the blob) or aborted (so we sweep it). The dispatch
-/// path orders blob `put` BEFORE the index `register`, so a sweep that races a
-/// half-completed create can mis-classify a freshly written blob as an orphan.
-///
-/// F-G9-004 mitigates the race by making the periodic sweep call
-/// [`BlobStore::list_for_gc`] with a grace-period filter ([`PERIODIC_GC_MIN_BLOB_AGE`]),
-/// so blobs younger than the grace are skipped this round and re-examined on
-/// the next sweep. Recovery uses the un-aged `list()` because no client is
-/// connected and the race cannot occur.
+/// **Concurrency contract.** This entry point performs NO synchronization
+/// against in-flight creates: it is for recovery-time use only, after the
+/// redo replay has completed and before any client is connected, so a
+/// half-completed create cannot exist. The dispatch path orders blob `put`
+/// BEFORE the index `register`, so a sweep that raced a live create would
+/// mis-classify its blob as an orphan. Runtime sweeps must use
+/// [`reconcile_orphan_blobs`] (grace filter F-G9-004 + pin handshake
+/// F-IJ-002) or [`reconcile_orphan_blobs_with_pins`] instead.
 pub fn reconcile_orphan_blobs_with<F>(
     blob_store: &dyn BlobStore,
     mut lookup: F,
@@ -139,15 +154,41 @@ pub fn reconcile_orphan_blobs_with<F>(
 where
     F: FnMut(&TxKey) -> LookupOutcome,
 {
-    reconcile_orphan_blobs_with_filter(blob_store, None, &mut lookup)
+    reconcile_orphan_blobs_with_filter(blob_store, None, None, &mut lookup)
 }
 
-/// Internal helper shared by recovery (no min-age filter) and the periodic
-/// sweep (with min-age filter). See [`reconcile_orphan_blobs_with`] and
+/// Pin-aware sweep against an arbitrary index lookup (F-IJ-002).
+///
+/// Like [`reconcile_orphan_blobs_with`], but every candidate unlink is routed
+/// through [`BlobPinSet::delete_orphan_guarded`]: under the pin stripe lock
+/// the sweep re-invokes `lookup` and only deletes when the candidate is still
+/// unpinned AND still unreferenced. A blob whose index registration landed
+/// between candidate classification and the unlink is therefore kept, and a
+/// blob pinned by an in-flight create is skipped
+/// ([`BlobGcStats::skipped_pinned`]).
+///
+/// `min_blob_age` applies the F-G9-004 grace filter when `Some`; pass `None`
+/// to examine every blob (tests, stores without per-blob mtime).
+pub fn reconcile_orphan_blobs_with_pins<F>(
+    blob_store: &dyn BlobStore,
+    min_blob_age: Option<Duration>,
+    pins: &BlobPinSet,
+    mut lookup: F,
+) -> Result<BlobGcStats, BlobError>
+where
+    F: FnMut(&TxKey) -> LookupOutcome,
+{
+    reconcile_orphan_blobs_with_filter(blob_store, min_blob_age, Some(pins), &mut lookup)
+}
+
+/// Internal helper shared by recovery (no min-age filter, no pins) and the
+/// periodic sweep (min-age filter + pin handshake). See
+/// [`reconcile_orphan_blobs_with`], [`reconcile_orphan_blobs_with_pins`] and
 /// [`reconcile_orphan_blobs`] for the public entry points.
 fn reconcile_orphan_blobs_with_filter<F>(
     blob_store: &dyn BlobStore,
     min_blob_age: Option<Duration>,
+    pins: Option<&BlobPinSet>,
     lookup: &mut F,
 ) -> Result<BlobGcStats, BlobError>
 where
@@ -164,51 +205,77 @@ where
 
     for txid in keys {
         let key = TxKey { txid };
-        match lookup(&key) {
+        // Classification. An index entry present without EXTERNAL means the
+        // blob is debris from a prior failed create whose registration ended
+        // up referring to the inline / separate-tier path instead.
+        let classified_found = match lookup(&key) {
             LookupOutcome::Found { tx_flags } => {
                 let flags = TxFlags::from_bits_truncate(tx_flags);
                 if flags.contains(TxFlags::EXTERNAL) {
                     stats.kept += 1;
                     continue;
                 }
-                // Index entry present but does NOT own a blob. The blob is
-                // orphan from a prior failed create whose registration ended
-                // up referring to the inline / separate-tier path instead.
-                match blob_store.delete(&txid) {
-                    Ok(()) => {
-                        stats.deleted_not_external += 1;
-                        tracing::info!(
-                            txid = %hex_txid(&txid),
-                            "blob_gc: deleted orphan blob (index entry not flagged EXTERNAL)",
-                        );
-                    }
-                    Err(e) => {
-                        stats.delete_failed += 1;
-                        tracing::warn!(
-                            txid = %hex_txid(&txid),
-                            err = %e,
-                            "blob_gc: failed to delete orphan blob (not EXTERNAL); will retry next sweep",
-                        );
-                    }
-                }
+                true
             }
-            LookupOutcome::NoEntry => match blob_store.delete(&txid) {
-                Ok(()) => {
+            LookupOutcome::NoEntry => false,
+        };
+        let reason = if classified_found {
+            "index entry not flagged EXTERNAL"
+        } else {
+            "no primary-index entry"
+        };
+
+        // Deletion. With a pin set (periodic sweep), re-verify "unpinned AND
+        // still unreferenced" under the pin stripe lock immediately before
+        // the unlink so a create racing between the classification above and
+        // this point (F-IJ-002 TOCTOU) cannot lose its blob. Without a pin
+        // set (recovery — single-threaded by contract) delete directly.
+        let outcome = match pins {
+            Some(p) => p.delete_orphan_guarded(
+                &txid,
+                || {
+                    !matches!(
+                        lookup(&key),
+                        LookupOutcome::Found { tx_flags }
+                            if TxFlags::from_bits_truncate(tx_flags).contains(TxFlags::EXTERNAL)
+                    )
+                },
+                || blob_store.delete(&txid),
+            ),
+            None => blob_store.delete(&txid).map(|()| PinSweepOutcome::Deleted),
+        };
+        match outcome {
+            Ok(PinSweepOutcome::Deleted) => {
+                if classified_found {
+                    stats.deleted_not_external += 1;
+                } else {
                     stats.deleted_no_index += 1;
-                    tracing::info!(
-                        txid = %hex_txid(&txid),
-                        "blob_gc: deleted orphan blob (no primary-index entry)",
-                    );
                 }
-                Err(e) => {
-                    stats.delete_failed += 1;
-                    tracing::warn!(
-                        txid = %hex_txid(&txid),
-                        err = %e,
-                        "blob_gc: failed to delete orphan blob (no index); will retry next sweep",
-                    );
-                }
-            },
+                tracing::info!(
+                    txid = %hex_txid(&txid),
+                    "blob_gc: deleted orphan blob ({reason})",
+                );
+            }
+            Ok(PinSweepOutcome::SkippedPinned) => {
+                stats.skipped_pinned += 1;
+                tracing::info!(
+                    txid = %hex_txid(&txid),
+                    "blob_gc: skipped blob pinned by in-flight create; will re-examine next sweep",
+                );
+            }
+            Ok(PinSweepOutcome::SkippedReferenced) => {
+                // The index registration landed between classification and
+                // the unlink — the blob is live.
+                stats.kept += 1;
+            }
+            Err(e) => {
+                stats.delete_failed += 1;
+                tracing::warn!(
+                    txid = %hex_txid(&txid),
+                    err = %e,
+                    "blob_gc: failed to delete orphan blob ({reason}); will retry next sweep",
+                );
+            }
         }
     }
 
@@ -236,10 +303,17 @@ pub fn reconcile_orphan_blobs_against_index(
 /// Live sweep against the runtime [`Engine`] used by the periodic background
 /// task. The engine acquires its own index read lock per lookup.
 ///
-/// Applies the [`PERIODIC_GC_MIN_BLOB_AGE`] grace-period filter so blobs that
-/// were just uploaded by an in-flight create — and whose index registration
-/// has not yet landed — are skipped this round and re-examined on the next
-/// sweep (F-G9-004).
+/// Two protections against racing an in-flight create (whose dispatch orders
+/// blob `put` BEFORE the index `register`):
+///
+/// * F-G9-004: the [`PERIODIC_GC_MIN_BLOB_AGE`] grace-period filter excludes
+///   blobs whose mtime is fresh — covers creates whose blob was uploaded
+///   moments ago.
+/// * F-IJ-002: blobs OLDER than the grace (a client may stream the blob and
+///   send the create minutes later) are protected by the engine's
+///   [`Engine::blob_pins`] handshake — the create pins the txid before its
+///   digest check, and this sweep re-verifies "unpinned AND still
+///   unreferenced" under the pin stripe lock immediately before each unlink.
 pub fn reconcile_orphan_blobs(
     blob_store: &dyn BlobStore,
     engine: &Engine,
@@ -250,7 +324,12 @@ pub fn reconcile_orphan_blobs(
         },
         None => LookupOutcome::NoEntry,
     };
-    reconcile_orphan_blobs_with_filter(blob_store, Some(PERIODIC_GC_MIN_BLOB_AGE), &mut lookup)
+    reconcile_orphan_blobs_with_filter(
+        blob_store,
+        Some(PERIODIC_GC_MIN_BLOB_AGE),
+        Some(engine.blob_pins()),
+        &mut lookup,
+    )
 }
 
 /// Format a 32-byte txid as a lowercase hex string for log lines.
