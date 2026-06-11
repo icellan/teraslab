@@ -1437,3 +1437,512 @@ fn write_majority_early_return_with_slow_replica_first() {
     let _ = h1.join();
     let _ = h2.join();
 }
+
+// ---------------------------------------------------------------------------
+// R-D1/D-2/D-3: dense per-replica sequence space (audit sequence-space family)
+// ---------------------------------------------------------------------------
+
+use teraslab::replication::durable::run_catchup_for_replica;
+use teraslab::replication::receiver::ReplicationReceiver;
+use teraslab::server::dispatch::{
+    drop_replica_connection, reset_replica_stream, send_replica_ops_to,
+};
+
+/// Spawn a tracked `ReplicationReceiver` on a fresh port. Returns the
+/// receiver and its socket address. Unlike `start_test_server` (untracked
+/// dispatch fallback), this path enforces the dense-sequence contract.
+fn start_tracked_receiver(engine: Arc<Engine>) -> (ReplicationReceiver, std::net::SocketAddr) {
+    let receiver = ReplicationReceiver::new(engine);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    receiver.start(&addr.to_string()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    (receiver, addr)
+}
+
+fn spend_op_for(txid: [u8; 32], marker: u8) -> ReplicaOp {
+    let mut sd = [0u8; 36];
+    sd[0] = marker;
+    ReplicaOp::Spend {
+        tx_key: key_from_txid(txid),
+        offset: 0,
+        spending_data: sd,
+        current_block_height: 1000,
+        block_height_retention: 288,
+        master_generation: 0,
+    }
+}
+
+/// D-1 (wire level): a batch ahead of the receiver's next-expected
+/// sequence is NAKed with `ReplicaAck::Gap` over TCP — never ACKed —
+/// and once the sender re-delivers in order, every op is applied.
+/// Pre-fix the receiver applied the early batch and ACK-dropped the
+/// late one (acked but never applied).
+#[test]
+fn tcp_out_of_order_batch_naks_gap_then_heals_in_order() {
+    let replica_engine = make_engine();
+    for i in 1..=20u32 {
+        create_record_on_engine(&replica_engine, test_txid(2000 + i), 1);
+    }
+    let (receiver, addr) = start_tracked_receiver(replica_engine.clone());
+
+    let late_ops: Vec<ReplicaOp> = (1..=10u32)
+        .map(|i| spend_op_for(test_txid(2000 + i), i as u8))
+        .collect();
+    let early_ops: Vec<ReplicaOp> = (11..=20u32)
+        .map(|i| spend_op_for(test_txid(2000 + i), i as u8))
+        .collect();
+
+    let mk_batch = |first_sequence: u64, ops: &[ReplicaOp]| ReplicaBatch {
+        first_sequence,
+        ops: ops.to_vec(),
+        trace_ctx: None,
+        source_node_id: Some(21),
+        cluster_key: 0,
+    };
+
+    let mut transport =
+        TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
+
+    // Out-of-order: sequences 11..20 arrive first → Gap NAK on the wire.
+    transport.send_batch(&mk_batch(11, &early_ops)).unwrap();
+    let ack = transport.recv_ack(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        ack,
+        ReplicaAck::Gap {
+            expected_sequence: 1,
+            received_first_sequence: 11,
+        },
+        "ahead-of-expected batch must be NAKed, not silently ACK-dropped",
+    );
+    // Nothing applied by the NAKed batch.
+    let slot = replica_engine
+        .read_slot(&key_from_txid(test_txid(2011)), 0)
+        .unwrap();
+    assert_eq!(slot.status, UTXO_UNSPENT);
+
+    // In-order re-delivery: 1..10 then 11..20 both apply.
+    transport.send_batch(&mk_batch(1, &late_ops)).unwrap();
+    assert_eq!(
+        transport.recv_ack(Duration::from_secs(5)).unwrap(),
+        ReplicaAck::Ok {
+            through_sequence: 10
+        },
+    );
+    transport.send_batch(&mk_batch(11, &early_ops)).unwrap();
+    assert_eq!(
+        transport.recv_ack(Duration::from_secs(5)).unwrap(),
+        ReplicaAck::Ok {
+            through_sequence: 20
+        },
+    );
+
+    for i in 1..=20u32 {
+        let slot = replica_engine
+            .read_slot(&key_from_txid(test_txid(2000 + i)), 0)
+            .unwrap();
+        assert_eq!(slot.status, UTXO_SPENT, "op {i} must be applied");
+        assert_eq!(slot.spending_data[0], i as u8);
+    }
+    assert_eq!(receiver.applied_tracker().get("node:21"), 20);
+    receiver.stop();
+}
+
+/// Duplicate re-send over the wire: ACKed with the existing watermark,
+/// applied exactly once (engine generation unchanged on the re-send).
+#[test]
+fn tcp_duplicate_resend_acked_applied_once() {
+    let replica_engine = make_engine();
+    create_record_on_engine(&replica_engine, test_txid(2100), 1);
+    let (receiver, addr) = start_tracked_receiver(replica_engine.clone());
+
+    let ops = vec![spend_op_for(test_txid(2100), 7)];
+    let batch = ReplicaBatch {
+        first_sequence: 1,
+        ops,
+        trace_ctx: None,
+        source_node_id: Some(22),
+        cluster_key: 0,
+    };
+
+    let mut transport =
+        TcpReplicaTransport::connect(&addr.to_string(), Duration::from_secs(5)).unwrap();
+    transport.send_batch(&batch).unwrap();
+    assert_eq!(
+        transport.recv_ack(Duration::from_secs(5)).unwrap(),
+        ReplicaAck::Ok {
+            through_sequence: 1
+        },
+    );
+    let gen_after_first = replica_engine
+        .read_metadata(&key_from_txid(test_txid(2100)))
+        .unwrap()
+        .generation;
+
+    // Identical re-send: ACKed (idempotent), engine untouched.
+    transport.send_batch(&batch).unwrap();
+    assert_eq!(
+        transport.recv_ack(Duration::from_secs(5)).unwrap(),
+        ReplicaAck::Ok {
+            through_sequence: 1
+        },
+    );
+    let gen_after_resend = replica_engine
+        .read_metadata(&key_from_txid(test_txid(2100)))
+        .unwrap()
+        .generation;
+    assert_eq!(
+        gen_after_first, gen_after_resend,
+        "duplicate re-send must not touch the engine",
+    );
+    assert_eq!(receiver.applied_tracker().get("node:22"), 1);
+    receiver.stop();
+}
+
+/// D-3: the master assigns each replica its own dense sequence stream
+/// (probe-adopted, contiguous per address) even when the per-address op
+/// subsets differ, and a failing replica does not corrupt the healthy
+/// replica's stream tracking.
+#[test]
+fn tcp_multi_replica_dense_streams_and_slow_replica_isolation() {
+    let engine_a = make_engine();
+    let engine_b = make_engine();
+    for i in 1..=10u32 {
+        create_record_on_engine(&engine_a, test_txid(2200 + i), 1);
+        create_record_on_engine(&engine_b, test_txid(2200 + i), 1);
+    }
+    let (receiver_a, addr_a) = start_tracked_receiver(engine_a.clone());
+    let (receiver_b, addr_b) = start_tracked_receiver(engine_b.clone());
+    let node_id = 23u64;
+    let timeout = Duration::from_secs(5);
+
+    let ops_n = |from: u32, to: u32| -> Vec<ReplicaOp> {
+        (from..=to)
+            .map(|i| spend_op_for(test_txid(2200 + i), i as u8))
+            .collect()
+    };
+
+    // Different (filtered) subsets per replica, interleaved sends:
+    // A gets ops 1..2 and 3..5 (5 ops), B gets ops 6..6 and 7..10 (5 ops
+    // in differently shaped batches).
+    send_replica_ops_to(addr_a, &ops_n(1, 2), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr_b, &ops_n(6, 6), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr_a, &ops_n(3, 5), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr_b, &ops_n(7, 10), timeout, None, 0, node_id, 0).unwrap();
+
+    // Each stream is dense: watermark == number of ops that replica
+    // received, with no holes from the other replica's traffic.
+    let stream = format!("node:{node_id}");
+    assert_eq!(receiver_a.applied_tracker().get(&stream), 5);
+    assert_eq!(receiver_b.applied_tracker().get(&stream), 5);
+
+    // Kill replica B; sends to it fail, while A keeps advancing densely.
+    receiver_b.stop();
+    drop_replica_connection(addr_b);
+    std::thread::sleep(Duration::from_millis(50));
+    let err = send_replica_ops_to(
+        addr_b,
+        &ops_n(1, 2),
+        Duration::from_millis(500),
+        None,
+        0,
+        node_id,
+        0,
+    );
+    assert!(err.is_err(), "send to a dead replica must fail, not fake-ACK");
+
+    send_replica_ops_to(addr_a, &ops_n(6, 8), timeout, None, 0, node_id, 0).unwrap();
+    assert_eq!(
+        receiver_a.applied_tracker().get(&stream),
+        8,
+        "healthy replica's dense stream must be unaffected by the dead one",
+    );
+    for i in 1..=8u32 {
+        assert_eq!(
+            engine_a
+                .read_slot(&key_from_txid(test_txid(2200 + i)), 0)
+                .unwrap()
+                .status,
+            UTXO_SPENT,
+        );
+    }
+    receiver_a.stop();
+}
+
+/// Gap heal end-to-end: a failed batch burns its assigned positions;
+/// the next successful send is NAKed with `Gap`, relabeled at the
+/// replica's next-expected sequence, and re-sent — all inside
+/// `send_replica_ops_to`. Verified via the receiver-side gap metric
+/// and final state.
+#[test]
+fn tcp_burned_positions_heal_via_gap_nak_relabel() {
+    // Install process-global replication metrics so the gap counter is
+    // observable (idempotent across tests in this binary).
+    static METRICS: std::sync::OnceLock<&'static teraslab::metrics::ReplicationMetrics> =
+        std::sync::OnceLock::new();
+    let metrics = *METRICS.get_or_init(|| {
+        Box::leak(Box::new(teraslab::metrics::ReplicationMetrics::new()))
+    });
+    teraslab::metrics::init_replication_metrics(metrics);
+    let metrics = teraslab::metrics::replication_metrics().unwrap();
+
+    let replica_engine = make_engine();
+    for i in 1..=6u32 {
+        create_record_on_engine(&replica_engine, test_txid(2300 + i), 1);
+    }
+    let (receiver, addr) = start_tracked_receiver(replica_engine.clone());
+    // Receiver enforces epoch 5; cluster_key 3 batches are rejected.
+    receiver
+        .cluster_key_handle()
+        .store(5, std::sync::atomic::Ordering::Release);
+    let node_id = 24u64;
+    let timeout = Duration::from_secs(5);
+
+    let ops_n = |from: u32, to: u32| -> Vec<ReplicaOp> {
+        (from..=to)
+            .map(|i| spend_op_for(test_txid(2300 + i), i as u8))
+            .collect()
+    };
+
+    // 1. Healthy send (epoch 5): probe syncs cursor, seqs 1..2 apply.
+    send_replica_ops_to(addr, &ops_n(1, 2), timeout, None, 5, node_id, 0).unwrap();
+    assert_eq!(receiver.applied_tracker().get("node:24"), 2);
+
+    // 2. Stale-epoch send: receiver rejects, master burns positions 3..4.
+    let err = send_replica_ops_to(addr, &ops_n(3, 4), timeout, None, 3, node_id, 0);
+    assert!(err.is_err(), "stale-epoch batch must fail");
+    assert_eq!(
+        receiver.applied_tracker().get("node:24"),
+        2,
+        "rejected batch must not advance the replica watermark",
+    );
+
+    // 3. Next healthy send: labeled with burned positions → receiver
+    //    NAKs Gap → master relabels at 3 and re-sends → applied.
+    let gaps_before = metrics.replica_rejected_sequence_gap.get();
+    send_replica_ops_to(addr, &ops_n(5, 6), timeout, None, 5, node_id, 0).unwrap();
+    let gaps_after = metrics.replica_rejected_sequence_gap.get();
+    assert!(
+        gaps_after > gaps_before,
+        "the heal path must traverse a Gap NAK (got {gaps_before} → {gaps_after})",
+    );
+    assert_eq!(
+        receiver.applied_tracker().get("node:24"),
+        4,
+        "relabeled batch must land at the replica's next-expected positions",
+    );
+    for i in [1u32, 2, 5, 6] {
+        assert_eq!(
+            replica_engine
+                .read_slot(&key_from_txid(test_txid(2300 + i)), 0)
+                .unwrap()
+                .status,
+            UTXO_SPENT,
+        );
+    }
+    // Ops 3..4 were never delivered (their batch failed) — exactly the
+    // compensated-batch shape; their content is NOT silently resurrected.
+    for i in [3u32, 4] {
+        assert_eq!(
+            replica_engine
+                .read_slot(&key_from_txid(test_txid(2300 + i)), 0)
+                .unwrap()
+                .status,
+            UTXO_UNSPENT,
+        );
+    }
+    receiver.stop();
+}
+
+/// D-2: catch-up streams >1 chunk through the shared dense-stream
+/// sender with NO op skipped at chunk boundaries; the replica's spent
+/// state matches the master's byte-for-byte afterwards. Pre-fix the
+/// runner labeled chunk N+1 with the last ACKED sequence (not acked+1),
+/// silently dropping the first op of every chunk after the first.
+#[test]
+fn tcp_catchup_chunk_boundary_no_skip() {
+    let master_engine = make_engine();
+    let replica_engine = make_engine();
+    for i in 1..=12u32 {
+        create_record_on_engine(&master_engine, test_txid(2400 + i), 1);
+        create_record_on_engine(&replica_engine, test_txid(2400 + i), 1);
+    }
+    let (receiver, addr) = start_tracked_receiver(replica_engine.clone());
+    let node_id = 25u64;
+
+    // Spend all 12 on the master and collect the redo-derived ops.
+    let mut all_ops = Vec::new();
+    for i in 1..=12u32 {
+        let txid = test_txid(2400 + i);
+        let mut sd = [0u8; 36];
+        sd[0] = i as u8;
+        master_engine
+            .spend(&teraslab::ops::spend::SpendRequest {
+                tx_key: key_from_txid(txid),
+                offset: 0,
+                utxo_hash: test_utxo_hash(
+                    u32::from_le_bytes(txid[0..4].try_into().unwrap()),
+                    0,
+                ),
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        all_ops.push(spend_op_for(txid, i as u8));
+    }
+    let ops_for_cb = all_ops.clone();
+
+    // Replica is 12 redo ops behind: redo seqs 1..=12, batch_size 5 →
+    // chunks of 5,5,2 (two boundaries).
+    let result = run_catchup_for_replica(
+        &addr,
+        1,
+        13,
+        5,
+        10_000,
+        &move |_from| ops_for_cb.clone(),
+        Some(1),
+        &|chunk| {
+            send_replica_ops_to(
+                addr,
+                chunk,
+                Duration::from_secs(5),
+                None,
+                0,
+                node_id,
+                0,
+            )
+        },
+    );
+    assert_eq!(result.unwrap(), 12, "catch-up must cover redo seqs 1..=12");
+
+    // Replica state equals master state byte-for-byte for every record.
+    for i in 1..=12u32 {
+        let k = key_from_txid(test_txid(2400 + i));
+        let master_slot = master_engine.read_slot(&k, 0).unwrap();
+        let replica_slot = replica_engine.read_slot(&k, 0).unwrap();
+        assert_eq!(
+            replica_slot.status, master_slot.status,
+            "op {i}: catch-up must not skip ops at chunk boundaries",
+        );
+        assert_eq!(
+            replica_slot.spending_data, master_slot.spending_data,
+            "op {i}: replicated spending_data must match the master's",
+        );
+    }
+    assert_eq!(
+        receiver.applied_tracker().get("node:25"),
+        12,
+        "dense stream watermark covers all 12 catch-up ops",
+    );
+    receiver.stop();
+}
+
+/// Restart matrix:
+/// 1. Receiver restarts mid-stream with a persistent applied tracker —
+///    the master continues at its cursor and the first post-restart
+///    batch is an exact next-expected match (no gap, no double-apply).
+/// 2. Master "restarts" (stream state reset) — the probe re-adopts the
+///    receiver's persisted watermark, so new ops are never labeled at
+///    already-applied positions (which would be ACK-dropped).
+#[test]
+fn tcp_restart_resumes_watermark_no_double_apply_no_gap() {
+    let replica_engine = make_engine();
+    for i in 1..=8u32 {
+        create_record_on_engine(&replica_engine, test_txid(2500 + i), 1);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tracker_path = dir.path().join("applied.dat");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let node_id = 26u64;
+    let timeout = Duration::from_secs(5);
+    let stream = format!("node:{node_id}");
+
+    let ops_n = |from: u32, to: u32| -> Vec<ReplicaOp> {
+        (from..=to)
+            .map(|i| spend_op_for(test_txid(2500 + i), i as u8))
+            .collect()
+    };
+
+    // --- Receiver lifecycle 1: apply seqs 1..4.
+    let receiver1 =
+        ReplicationReceiver::with_ack_state(replica_engine.clone(), tracker_path.clone()).unwrap();
+    receiver1.start(&addr.to_string()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    send_replica_ops_to(addr, &ops_n(1, 2), timeout, None, 0, node_id, 0).unwrap();
+    send_replica_ops_to(addr, &ops_n(3, 4), timeout, None, 0, node_id, 0).unwrap();
+    assert_eq!(receiver1.applied_tracker().get(&stream), 4);
+
+    // --- Receiver restarts mid-stream.
+    receiver1.stop();
+    // Drop the master's pooled connection (its peer is gone) but KEEP
+    // the dense-stream cursor — the master process did not restart.
+    drop_replica_connection(addr);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let receiver2 = {
+        // The old accept loop frees the port within ~10ms of stop();
+        // retry bind briefly.
+        let mut last_err = String::new();
+        let mut started = None;
+        for _ in 0..50 {
+            let r = ReplicationReceiver::with_ack_state(
+                replica_engine.clone(),
+                tracker_path.clone(),
+            )
+            .unwrap();
+            match r.start(&addr.to_string()) {
+                Ok(()) => {
+                    started = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        started.unwrap_or_else(|| panic!("rebind failed: {last_err}"))
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        receiver2.applied_tracker().get(&stream),
+        4,
+        "restarted receiver must reload its persisted watermark",
+    );
+
+    // First post-restart batch: exact next-expected match — applied.
+    send_replica_ops_to(addr, &ops_n(5, 6), timeout, None, 0, node_id, 0).unwrap();
+    assert_eq!(receiver2.applied_tracker().get(&stream), 6);
+
+    // --- Master "restart": stream state wiped → probe re-adopts 6.
+    reset_replica_stream(addr);
+    send_replica_ops_to(addr, &ops_n(7, 8), timeout, None, 0, node_id, 0).unwrap();
+    assert_eq!(
+        receiver2.applied_tracker().get(&stream),
+        8,
+        "post-probe batch must land at 7..8, not at stale or overlapping labels",
+    );
+
+    // No gap, no double-apply: every op applied exactly once (spend ops
+    // re-applied with different spending_data would error / diverge; the
+    // markers prove first-application content survived).
+    for i in 1..=8u32 {
+        let slot = replica_engine
+            .read_slot(&key_from_txid(test_txid(2500 + i)), 0)
+            .unwrap();
+        assert_eq!(slot.status, UTXO_SPENT, "op {i} applied");
+        assert_eq!(slot.spending_data[0], i as u8, "op {i} applied exactly once");
+    }
+    receiver2.stop();
+}

@@ -583,6 +583,15 @@ impl ReplicationManager {
                                 sequence: failed_sequence,
                                 message,
                             },
+                            Ok(ReplicaAck::Gap {
+                                expected_sequence,
+                                received_first_sequence,
+                            }) => BatchOutcome::ReplicaErr {
+                                sequence: received_first_sequence,
+                                message: format!(
+                                    "sequence-gap NAK: replica expects {expected_sequence}"
+                                ),
+                            },
                             Err(e) => BatchOutcome::TransportErr(e),
                         },
                         Err(e) => BatchOutcome::TransportErr(e),

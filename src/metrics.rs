@@ -921,6 +921,15 @@ pub struct ReplicationMetrics {
     /// lives here so the G7 replication subsystem owns the metric
     /// schema and tests can reference it directly.
     pub replica_unauthenticated_accept_total: PaddedCounter,
+    /// R-D1/D-3: receiver-side counter — incremented every time an
+    /// inbound `OP_REPLICA_BATCH` is NAKed with `ReplicaAck::Gap`
+    /// because its `first_sequence` was ahead of the stream's
+    /// next-expected sequence. Occasional ticks are normal after a
+    /// failed/compensated batch burned sequence positions (the master
+    /// heals by relabeling and re-sending); sustained growth means a
+    /// master is repeatedly desynchronized from this replica's
+    /// applied watermark.
+    pub replica_rejected_sequence_gap: PaddedCounter,
 }
 
 /// Per-replica drill-down state exposed on `/admin/top`.
@@ -976,6 +985,7 @@ impl ReplicationMetrics {
             ack_tracker_flush_failures: PaddedCounter::new(),
             replica_worker_panics_total: PaddedCounter::new(),
             replica_unauthenticated_accept_total: PaddedCounter::new(),
+            replica_rejected_sequence_gap: PaddedCounter::new(),
         }
     }
 

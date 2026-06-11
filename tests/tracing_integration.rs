@@ -377,7 +377,7 @@ fn replication_receiver_inherits_wire_trace_context() {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             "tracing-integration-test",
             /* local_cluster_key */ 0,
         );

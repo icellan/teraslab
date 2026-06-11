@@ -913,7 +913,7 @@ fn main() {
             p.push(".repl-ack");
             std::path::PathBuf::from(p)
         };
-        teraslab::server::dispatch::init_ack_tracker(ack_path.clone());
+        teraslab::server::dispatch::init_ack_tracker(ack_path);
         let applied_path = {
             let mut p = config.resolved_cluster_state_path().into_os_string();
             p.push(".repl-applied");
@@ -985,8 +985,21 @@ fn main() {
             // sender + the node-address map for addr → NodeId
             // resolution; `RunningCluster` itself is not `Clone`.
             let resync_handle = running.resync_sender_handle();
+            // R-D2/D-3 + catch-up auth fix: chunks are sent through
+            // `dispatch::send_replica_ops_to`, which shares the per-address
+            // dense stream cursor (and pooled, HMAC-authenticated
+            // connection) with the steady-state fan-out. Capture the
+            // cluster secret and our node id before the thread detaches.
+            let catchup_auth_secret = running.cluster_secret().map(|s| s.to_vec());
+            let catchup_source_node_id = config.node_id;
             std::thread::spawn(move || {
-                let tracker = teraslab::replication::durable::AckTracker::new(ack_path);
+                // Use the process-wide ACK tracker installed by
+                // `init_ack_tracker` above — constructing a second
+                // instance on the same path would race its flushes.
+                let tracker = match teraslab::server::dispatch::ack_tracker_handle() {
+                    Some(t) => t,
+                    None => return,
+                };
                 let all_acked = tracker.all_acked();
                 if all_acked.is_empty() {
                     return; // No known replicas yet
@@ -1020,8 +1033,9 @@ fn main() {
                         .as_ref()
                         .and_then(|rl| rl.lock().earliest_sequence().ok().flatten());
 
-                    let local_cluster_key =
-                        cluster_key_handle.load(std::sync::atomic::Ordering::Acquire);
+                    let cluster_key_handle = cluster_key_handle.clone();
+                    let auth_secret = catchup_auth_secret.clone();
+                    let catchup_addr = *addr;
 
                     let result = teraslab::replication::durable::run_catchup_for_replica(
                         addr,
@@ -1056,7 +1070,22 @@ fn main() {
                                 .collect()
                         },
                         first_avail_seq,
-                        local_cluster_key,
+                        &move |chunk| {
+                            // Per-replica dense stream labels are assigned
+                            // inside `send_replica_ops_to` (shared cursor
+                            // with steady-state replication). The live
+                            // cluster epoch is re-read per chunk so a
+                            // topology commit mid-pass is honored.
+                            teraslab::server::dispatch::send_replica_ops_to(
+                                catchup_addr,
+                                chunk,
+                                std::time::Duration::from_secs(5),
+                                auth_secret.as_deref(),
+                                cluster_key_handle.load(std::sync::atomic::Ordering::Acquire),
+                                catchup_source_node_id,
+                                0, // redo coverage recorded once per pass below
+                            )
+                        },
                     );
 
                     match result {

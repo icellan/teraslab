@@ -4697,6 +4697,17 @@ fn stream_shard_baseline(
                     ));
                 }
                 Ok(ReplicaAck::Ok { .. }) => {} // success
+                Ok(ReplicaAck::Gap {
+                    expected_sequence,
+                    received_first_sequence,
+                }) => {
+                    // Migration batches bypass the receiver's sequence
+                    // tracking; a Gap NAK here means a protocol bug.
+                    return Err(format!(
+                        "migration batch: unexpected sequence-gap NAK \
+                         (expected {expected_sequence}, sent {received_first_sequence})"
+                    ));
+                }
                 Err(e) => {
                     return Err(format!("migration batch: failed to parse replica ack: {e}"));
                 }
@@ -5352,6 +5363,17 @@ fn send_delta_ops(
                 ));
             }
             Ok(ReplicaAck::Ok { .. }) => {}
+            Ok(ReplicaAck::Gap {
+                expected_sequence,
+                received_first_sequence,
+            }) => {
+                // Delta batches carry FLAG_MIGRATION_BATCH and bypass the
+                // receiver's sequence tracking; a Gap NAK is a protocol bug.
+                return Err(format!(
+                    "delta batch: unexpected sequence-gap NAK \
+                     (expected {expected_sequence}, sent {received_first_sequence})"
+                ));
+            }
             Err(e) => {
                 return Err(format!("failed to parse delta ack: {e}"));
             }
