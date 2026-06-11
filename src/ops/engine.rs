@@ -567,6 +567,78 @@ impl Engine {
         Ok(())
     }
 
+    /// Restore migrated lifecycle metadata, keeping the secondary indexes and
+    /// primary-index cached fields consistent with the on-device footer.
+    ///
+    /// The baseline migration path streams a record via [`Self::create`] with
+    /// `block_height = 0`, then must replay the master's real lifecycle state
+    /// (`generation`, `updated_at`, `unmined_since`, `delete_at_height`,
+    /// `preserve_until`). Patching the device footer alone (raw
+    /// `io::write_metadata`) left three derived structures stale on the live
+    /// migration target until its next restart:
+    ///
+    /// - the **unmined** secondary index (never inserted for unmined records),
+    /// - the **DAH** secondary index (never inserted for records with a pending
+    ///   delete-at-height),
+    /// - the **primary-index cached fields** (`unmined_since`,
+    ///   `dah_or_preserve`, `generation`, `HAS_PRESERVE_UNTIL`).
+    ///
+    /// This entry point writes the lifecycle fields to the device footer and
+    /// then routes the index updates through
+    /// [`Self::sync_primary_and_both_secondary_atomic`] — the same helper the
+    /// normal mutation path uses — so the DAH index, unmined index, and primary
+    /// cached fields all land for migrated records exactly as for locally
+    /// created ones. Mined records (`unmined_since == 0`,
+    /// `delete_at_height == 0`, `preserve_until == 0`) are handled correctly:
+    /// no secondary entries are created.
+    ///
+    /// The "old" heights for the secondary transitions are read from the
+    /// current on-device footer, so this is also correct when the create path
+    /// replaced a pre-existing record that already carried DAH/unmined state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::TxNotFound`] if the key is absent from the primary
+    /// index, or [`SpendError::StorageError`] if the device write, redo fsync,
+    /// or any index mutation fails. The caller MUST propagate the error so the
+    /// migration batch is NACKed rather than ACKed with a divergent target.
+    pub fn restore_migrated_lifecycle(
+        &self,
+        key: &TxKey,
+        generation: u32,
+        updated_at: u64,
+        unmined_since: u32,
+        delete_at_height: u32,
+        preserve_until: u32,
+    ) -> Result<(), SpendError> {
+        let _guard = self.locks.lock(key);
+        let entry = self.index.read().lookup(key).ok_or(SpendError::TxNotFound)?;
+        let mut meta = self.read_metadata_for_key(key, entry.record_offset)?;
+
+        // Old secondary heights come from the current footer so a create that
+        // replaced an existing record (with prior DAH/unmined state) transitions
+        // cleanly rather than leaking a stale index entry.
+        let old_unmined = { meta.unmined_since };
+        let old_dah = { meta.delete_at_height };
+
+        meta.generation = generation;
+        meta.updated_at = updated_at;
+        meta.unmined_since = unmined_since;
+        meta.delete_at_height = delete_at_height;
+        meta.preserve_until = preserve_until;
+
+        self.write_metadata_fast(entry.record_offset, &meta)?;
+
+        self.sync_primary_and_both_secondary_atomic(
+            key,
+            &meta,
+            old_dah,
+            delete_at_height,
+            old_unmined,
+            unmined_since,
+        )
+    }
+
     /// Refresh the cached wall-clock time from the system clock.
     ///
     /// Call this once per request batch in the dispatch layer so that all
