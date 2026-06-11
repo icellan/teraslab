@@ -612,7 +612,14 @@ impl Engine {
         preserve_until: u32,
     ) -> Result<(), SpendError> {
         let _guard = self.locks.lock(key);
-        let entry = self.index.read().lookup(key).ok_or(SpendError::TxNotFound)?;
+        let entry = self
+            .index
+            .read()
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
         let mut meta = self.read_metadata_for_key(key, entry.record_offset)?;
 
         // Old secondary heights come from the current footer so a create that
@@ -905,6 +912,12 @@ impl Engine {
 
         let resized = guard.resized_copy(target_capacity)?;
         let mut write_guard = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
+        // G-2: the resized copy renamed a fresh file over the backing path
+        // and now owns it. Mark the displaced index defunct before the swap
+        // so its `Drop` does not write the clean-shutdown sentinel for a
+        // path it no longer owns (which would disable torn-write detection
+        // for the rest of uptime).
+        write_guard.mark_defunct_for_resize();
         *write_guard = resized;
         Ok(())
     }
@@ -913,15 +926,24 @@ impl Engine {
     /// initialized, decrement the matching shard count atomically within the
     /// same index write-lock critical section.
     ///
-    /// Returns the removed entry (or `None` if the key was not present).
+    /// Returns the removed entry (or `None` if the key was not present), or
+    /// an [`IndexError`] if the (redb) backend's write transaction fails.
     /// After lazy initialization, the shard count is only decremented when an
     /// entry was actually removed. Before initialization, the first
     /// `shard_record_count` call will scan the primary index after any active
     /// writer drops this lock.
-    fn unregister_with_shard_count(&self, key: &TxKey) -> Option<TxIndexEntry> {
+    ///
+    /// G-4: propagates the backend error instead of collapsing it to `None`.
+    /// A collapsed `unregister` failure would leave the row in redb while the
+    /// caller proceeds to free the device region and remove secondary
+    /// entries — a torn delete.
+    fn unregister_with_shard_count(
+        &self,
+        key: &TxKey,
+    ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
         let mut guard = self.index.write();
-        let removed = guard.unregister(key);
+        let removed = guard.unregister_checked(key)?;
         if removed.is_some()
             && self
                 .shard_counts_initialized
@@ -930,7 +952,7 @@ impl Engine {
             self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
         drop(guard);
-        removed
+        Ok(removed)
     }
 
     // -----------------------------------------------------------------------
@@ -1137,9 +1159,40 @@ impl Engine {
             })
     }
 
-    /// Look up a transaction in the index.
+    /// Look up a transaction in the index, propagating backend read errors.
+    ///
+    /// Returns `Ok(Some(entry))` if present, `Ok(None)` if absent, and an
+    /// [`IndexError`] if the (redb) backend's read transaction fails.
+    /// Client-visible read paths MUST use this variant so a transient
+    /// backend error is reported as a storage error rather than being
+    /// collapsed into "transaction not found" (G-4).
+    pub fn lookup_checked(
+        &self,
+        key: &TxKey,
+    ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
+        self.index.read().lookup_checked(key)
+    }
+
+    /// Look up a transaction in the index (infallible convenience).
+    ///
+    /// G-4: this collapses a backend read error into `None` after logging
+    /// it. It exists for tests and internal diagnostics where "absent on
+    /// error" is acceptable. Client-visible read paths MUST instead call
+    /// [`Self::lookup_checked`] and surface the error — collapsing a redb
+    /// I/O failure to `None` here would tell a client a present
+    /// transaction does not exist.
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        self.index.read().lookup(key)
+        match self.index.read().lookup_checked(key) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::engine",
+                    err = %e,
+                    "Engine::lookup: index read failed; returning None (caller should use lookup_checked)",
+                );
+                None
+            }
+        }
     }
 
     /// Iterate over all registered transaction keys (for migration scanning).
@@ -1270,7 +1323,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
@@ -1517,7 +1573,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
@@ -1725,7 +1784,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
@@ -1880,7 +1942,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(tx_key)
+            .lookup_checked(tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
@@ -2235,7 +2300,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
 
@@ -2334,7 +2402,20 @@ impl Engine {
         // atomically inside `register_new_with_shard_count`; this early
         // return avoids allocating and writing for the common
         // already-exists case.
-        if self.index.read().lookup(&key).is_some() {
+        //
+        // G-4: use `lookup_checked` so a transient backend read error
+        // surfaces as a storage error rather than collapsing to "absent"
+        // — the latter would let this early-return pass and write a
+        // duplicate record over an existing txid.
+        if self
+            .index
+            .read()
+            .lookup_checked(&key)
+            .map_err(|e| CreateError::StorageError {
+                detail: format!("duplicate-check index lookup failed: {e}"),
+            })?
+            .is_some()
+        {
             return Err(CreateError::DuplicateTxId);
         }
         let external_ref = Self::external_ref_for_create(req)?;
@@ -2517,8 +2598,17 @@ impl Engine {
         // reservation.
         let _stripe_guard = self.locks.lock(&key);
 
-        // Check for duplicate txid
-        if self.index.read().lookup(&key).is_some() {
+        // Check for duplicate txid. G-4: `lookup_checked` so a backend
+        // read error does not collapse to "absent" and pass the guard.
+        if self
+            .index
+            .read()
+            .lookup_checked(&key)
+            .map_err(|e| CreateError::StorageError {
+                detail: format!("duplicate-check index lookup failed: {e}"),
+            })?
+            .is_some()
+        {
             return Err(CreateError::DuplicateTxId);
         }
         Self::external_ref_for_create(req)?;
@@ -2604,8 +2694,17 @@ impl Engine {
         // Duplicate check — another thread may have created it between
         // pre_allocate and now. (`register_new_with_shard_count` below
         // re-checks atomically; this early return skips the device write
-        // for the common case.)
-        if self.index.read().lookup(&key).is_some() {
+        // for the common case.) G-4: `lookup_checked` so a backend read
+        // error does not collapse to "absent" and pass the guard.
+        if self
+            .index
+            .read()
+            .lookup_checked(&key)
+            .map_err(|e| CreateError::StorageError {
+                detail: format!("duplicate-check index lookup failed: {e}"),
+            })?
+            .is_some()
+        {
             return Err(CreateError::DuplicateTxId);
         }
         let external_ref = Self::external_ref_for_create(req)?;
@@ -2933,7 +3032,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
 
         // Check if cold data is in the external blobstore.
@@ -3031,7 +3133,13 @@ impl Engine {
         child_txid: [u8; 32],
     ) -> Result<Vec<u32>, SpendError> {
         let _guard = self.locks.lock(parent_key);
-        let entry = match self.index.read().lookup(parent_key) {
+        // G-4: a backend read error must not collapse to "parent absent"
+        // (which would silently report no spent slots).
+        let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            }
+        })? {
             Some(entry) => entry,
             None => return Ok(Vec::new()),
         };
@@ -3059,7 +3167,13 @@ impl Engine {
         child_txid: [u8; 32],
     ) -> Result<bool, SpendError> {
         let _guard = self.locks.lock(parent_key);
-        let entry = match self.index.read().lookup(parent_key) {
+        // G-4: a backend read error must not collapse to "parent absent"
+        // (which would silently report the slot was not pruned).
+        let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            }
+        })? {
             Some(entry) => entry,
             None => return Ok(false),
         };
@@ -3143,7 +3257,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
@@ -3211,7 +3328,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
@@ -3258,7 +3378,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
@@ -3364,7 +3487,13 @@ impl Engine {
         loop {
             let (ro, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
-                let entry = match self.index.read().lookup(parent_key) {
+                // G-4: a backend read error must not collapse to "parent
+                // absent" (which would silently no-op the child append).
+                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("index lookup failed: {e}"),
+                    }
+                })? {
                     Some(e) => e,
                     None => return Ok(()),
                 };
@@ -3417,7 +3546,17 @@ impl Engine {
             let mut parent_gone = false;
             let committed = {
                 let _guard = self.locks.lock(parent_key);
-                match self.index.read().lookup(parent_key) {
+                // G-4: a backend read error must not collapse to "parent
+                // absent" (which would free the freshly-allocated block as
+                // if the parent vanished). Surface it as a storage error.
+                let looked_up =
+                    self.index
+                        .read()
+                        .lookup_checked(parent_key)
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("index lookup failed: {e}"),
+                        })?;
+                match looked_up {
                     None => {
                         parent_gone = true;
                         false
@@ -3584,7 +3723,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
         let meta = self.read_metadata_fast(ro)?;
@@ -3652,7 +3794,13 @@ impl Engine {
         loop {
             let (ro, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
-                let entry = match self.index.read().lookup(parent_key) {
+                // G-4: a backend read error must not collapse to "parent
+                // absent" (which would silently no-op the child append).
+                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("index lookup failed: {e}"),
+                    }
+                })? {
                     Some(e) => e,
                     None => return Ok(()),
                 };
@@ -3701,7 +3849,17 @@ impl Engine {
             let mut parent_gone = false;
             let committed = {
                 let _guard = self.locks.lock(parent_key);
-                match self.index.read().lookup(parent_key) {
+                // G-4: a backend read error must not collapse to "parent
+                // absent" (which would free the freshly-allocated block as
+                // if the parent vanished). Surface it as a storage error.
+                let looked_up =
+                    self.index
+                        .read()
+                        .lookup_checked(parent_key)
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("index lookup failed: {e}"),
+                        })?;
+                match looked_up {
                     None => {
                         parent_gone = true;
                         false
@@ -3855,7 +4013,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
         let meta = self.read_metadata_fast(ro)?;
@@ -3924,7 +4085,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
@@ -4123,7 +4287,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
@@ -4245,7 +4412,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let mut meta = self.read_metadata_fast(entry.record_offset)?;
         let old_dah = { meta.delete_at_height };
@@ -4278,7 +4448,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
@@ -4372,9 +4545,25 @@ impl Engine {
     /// freshly-read metadata. A missing / aliased record returns `false`.
     pub fn is_due_for_sweep(&self, key: &TxKey, current_block_height: u32) -> bool {
         let _guard = self.locks.lock(key);
-        let entry = match self.index.read().lookup(key) {
-            Some(e) => e,
-            None => return false,
+        // G-4 (justified want-absent-on-error): this is an advisory
+        // pre-filter for the DAH sweep. Returning `false` means "do not
+        // delete this candidate", which is always the safe direction — a
+        // present-but-unreadable record is preserved, never deleted, and
+        // the final delete re-validates under the stripe lock via
+        // `due_guard`. We therefore treat a backend read error the same as
+        // a missing record (and the same as the existing metadata-read
+        // error below), logging it so the operator still sees the fault.
+        let entry = match self.index.read().lookup_checked(key) {
+            Ok(Some(e)) => e,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::engine",
+                    err = %e,
+                    "is_due_for_sweep: index read failed; treating candidate as not-due (record preserved)",
+                );
+                return false;
+            }
         };
         match self.read_metadata_for_key(key, entry.record_offset) {
             Ok(meta) => Self::record_due_for_sweep(&meta, current_block_height),
@@ -4412,7 +4601,12 @@ impl Engine {
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
-        let entry = match self.index.read().lookup(&req.tx_key) {
+        // G-4: a backend read error must not collapse to "absent".
+        let entry = match self.index.read().lookup_checked(&req.tx_key).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            }
+        })? {
             Some(e) => e,
             None => return Err(SpendError::TxNotFound),
         };
@@ -4458,7 +4652,14 @@ impl Engine {
         // different transaction; a lock-free reader holding the offset
         // returned by the still-live primary-index entry would then read
         // that unrelated metadata back as if it belonged to `tx_key`.
-        self.unregister_with_shard_count(&req.tx_key);
+        //
+        // G-4: if the backend remove fails, propagate it and DO NOT free
+        // the region or touch secondaries — otherwise the row would remain
+        // in redb pointing at a region we just returned to the allocator.
+        self.unregister_with_shard_count(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index unregister failed: {e}"),
+            })?;
 
         // Step 4: Return the region to the allocator. From this point on
         // the offset can be handed out to a future `create`/`create_at_offset`.
@@ -4537,7 +4738,12 @@ impl Engine {
             return Ok(false);
         }
         let _guard = self.locks.lock(key);
-        let entry = match self.index.read().lookup(key) {
+        // G-4: a backend read error must not collapse to "absent".
+        let entry = match self.index.read().lookup_checked(key).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            }
+        })? {
             Some(e) => e,
             None => return Ok(false),
         };
@@ -4586,7 +4792,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(&req.tx_key)
+            .lookup_checked(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
@@ -4649,7 +4858,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         self.read_metadata_for_key(key, entry.record_offset)
     }
@@ -4663,8 +4875,35 @@ impl Engine {
     ///
     /// Use this for GET requests where the field mask only covers cached fields
     /// (see [`crate::protocol::codec::FieldMask::fully_cached`]).
+    ///
+    /// Propagates backend read errors (G-4): a transient redb failure
+    /// surfaces as an [`IndexError`] rather than collapsing to `None`,
+    /// which on a client GET path would falsely report the transaction as
+    /// absent.
+    pub fn lookup_cached_checked(
+        &self,
+        key: &TxKey,
+    ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
+        self.index.read().lookup_checked(key)
+    }
+
+    /// Infallible convenience variant of [`Self::lookup_cached_checked`].
+    ///
+    /// G-4: collapses a backend read error into `None` after logging it.
+    /// For tests / internal diagnostics only; client-visible read paths
+    /// MUST use [`Self::lookup_cached_checked`].
     pub fn lookup_cached(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        self.index.read().lookup(key)
+        match self.index.read().lookup_checked(key) {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::error!(
+                    target: "teraslab::engine",
+                    err = %e,
+                    "Engine::lookup_cached: index read failed; returning None (caller should use lookup_cached_checked)",
+                );
+                None
+            }
+        }
     }
 
     /// Read a single on-device UTXO slot.
@@ -4683,7 +4922,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         // Verify the offset still belongs to this key before reading the slot
         // (F-G2-001 second-line defense; subsumes F-G2-010 doc concern).
@@ -4708,7 +4950,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let meta = self.read_metadata_for_key(key, entry.record_offset)?;
         let slots = io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count)
@@ -4740,7 +4985,10 @@ impl Engine {
         let entry = self
             .index
             .read()
-            .lookup(key)
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
             .ok_or(SpendError::TxNotFound)?;
         let metadata = self.read_metadata_for_key(key, entry.record_offset)?;
         let count = metadata.block_entry_count as usize;
@@ -4781,6 +5029,16 @@ impl Engine {
     /// Primary index statistics for monitoring.
     pub fn index_stats(&self) -> crate::index::IndexStats {
         self.index.read().stats()
+    }
+
+    /// Test-only: arm a synthetic failure in the next primary-index read so
+    /// the next `lookup_checked` on the (redb) backend returns an
+    /// [`crate::index::IndexError`]. Used by the G-4 tests to confirm a
+    /// transient backend read error surfaces as a storage error instead of
+    /// collapsing to "transaction not found".
+    #[cfg(test)]
+    pub fn arm_fail_next_index_read(&self) {
+        self.index.read().arm_fail_next_read();
     }
 
     /// Access the underlying block device.
@@ -9832,6 +10090,102 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ))
+    }
+
+    /// Build a redb-backed engine. The redb backend is the only one whose
+    /// reads are fallible, so the G-4 fault-injection tests use it. The
+    /// `tempfile::TempDir` is returned so the caller keeps the redb files
+    /// alive for the duration of the test.
+    fn create_redb_engine() -> (Arc<Engine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let redb =
+            crate::index::redb_primary::RedbPrimary::open(&dir.path().join("primary.redb"), 0)
+                .unwrap();
+        let engine = Engine::new(
+            dev,
+            crate::index::backend::PrimaryBackend::OnDisk(redb),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        (Arc::new(engine), dir)
+    }
+
+    /// G-4: a transient backend (redb) read failure on the spend path must
+    /// surface as a storage error, NOT collapse into `TX_NOT_FOUND` for a
+    /// transaction that actually exists.
+    #[test]
+    fn g4_spend_surfaces_backend_read_error_not_tx_not_found() {
+        let (engine, _dir) = create_redb_engine();
+        let (_, req) = make_create_req(7, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        // Sanity: the record is present and spendable without the fault.
+        assert!(engine.lookup_checked(&key).unwrap().is_some());
+
+        // Arm a synthetic redb read failure, then spend.
+        engine.arm_fail_next_index_read();
+        let req = SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: [0u8; 32],
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 0xAB;
+                sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                sd
+            },
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        match engine.spend(&req) {
+            Err(SpendError::StorageError { .. }) => {}
+            Err(SpendError::TxNotFound) => panic!(
+                "G-4: backend read error collapsed to TX_NOT_FOUND for a present record"
+            ),
+            other => panic!("expected StorageError, got {other:?}"),
+        }
+    }
+
+    /// G-4: a transient backend (redb) read failure during the create
+    /// duplicate-check must surface as a storage error, NOT collapse into
+    /// "absent" and let a duplicate record be written over an existing txid.
+    #[test]
+    fn g4_create_dup_check_surfaces_backend_read_error_not_duplicate() {
+        let (engine, _dir) = create_redb_engine();
+        let (_, req) = make_create_req(8, 2);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        let first = engine.lookup_checked(&key).unwrap().unwrap();
+
+        // A second create of the same txid must normally be a DuplicateTxId.
+        // With a backend read fault armed on the duplicate-check lookup it
+        // must instead surface a storage error — never silently proceed.
+        engine.arm_fail_next_index_read();
+        match engine.create(&req) {
+            Err(CreateError::StorageError { .. }) => {}
+            Err(CreateError::DuplicateTxId) => panic!(
+                "G-4: backend read error during dup-check should surface as StorageError, \
+                 not be (coincidentally) caught as DuplicateTxId by a later layer"
+            ),
+            Ok(_) => panic!(
+                "G-4: backend read error collapsed to 'absent' and wrote a duplicate record"
+            ),
+            other => panic!("expected StorageError, got {other:?}"),
+        }
+
+        // The original record must be intact (record_offset unchanged).
+        let after = engine.lookup_checked(&key).unwrap().unwrap();
+        assert_eq!(
+            after.record_offset, first.record_offset,
+            "G-4: original record must not be overwritten by a faulted create"
+        );
     }
 
     #[test]

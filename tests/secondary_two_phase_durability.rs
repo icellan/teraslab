@@ -365,3 +365,116 @@ fn recover_dah_respects_has_preserve_until_flag() {
     assert_eq!(stats.entries_skipped, 1);
     assert!(dah_backend.is_empty());
 }
+
+/// G-5: a true post-crash restart. Unlike the tests above, this one does
+/// NOT reuse a live in-memory primary across the "crash". It rebuilds the
+/// primary purely from device bytes via the device-scan path
+/// (`PrimaryBackend::rebuild_file_backed`) — exactly what the startup
+/// pipeline does when the file-backed index was lost (no clean-shutdown
+/// sentinel / corrupt index). Recovery then reconciles both secondary redb
+/// indexes from that rebuilt primary, and we assert all three agree with
+/// the authoritative device metadata.
+#[test]
+fn restart_rebuilds_primary_from_device_then_reconciles_secondaries() {
+    use teraslab::device::BlockDevice;
+    use teraslab::record::UtxoSlot;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dev: Arc<dyn BlockDevice> =
+        Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+
+    // Pre-crash: allocate and persist two records on the device, each with
+    // a non-zero secondary-index height (one unmined, one DAH). We allocate
+    // through a real SlotAllocator so the device-scan rebuild after the
+    // crash knows the high-water mark to scan up to.
+    let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+
+    let key_unmined = make_key(40);
+    let key_dah = make_key(41);
+
+    let utxo_count: u32 = 5;
+    let record_size = TxMetadata::record_size_for(utxo_count);
+
+    let off_unmined = alloc.allocate(record_size).unwrap();
+    let off_dah = alloc.allocate(record_size).unwrap();
+
+    let slots: Vec<UtxoSlot> = (0..utxo_count)
+        .map(|_| UtxoSlot::new_unspent([0u8; 32]))
+        .collect();
+
+    let mut meta_unmined = TxMetadata::new(utxo_count);
+    meta_unmined.tx_id = key_unmined.txid;
+    meta_unmined.unmined_since = 700;
+    meta_unmined.delete_at_height = 0;
+    teraslab::io::write_full_record(&*data_dev, off_unmined, &meta_unmined, &slots).unwrap();
+
+    let mut meta_dah = TxMetadata::new(utxo_count);
+    meta_dah.tx_id = key_dah.txid;
+    meta_dah.unmined_since = 0;
+    meta_dah.delete_at_height = 1234;
+    teraslab::io::write_full_record(&*data_dev, off_dah, &meta_dah, &slots).unwrap();
+
+    // *** CRASH ***: the live primary object is gone; only the device bytes
+    // and the persisted allocator high-water mark survive. Reconstruct the
+    // primary from a device scan, just like startup's rebuild path.
+    let idx_path = dir.path().join("primary.idx");
+    let mut primary =
+        PrimaryBackend::rebuild_file_backed(&idx_path, &*data_dev, &alloc).unwrap();
+
+    // The rebuilt primary must contain both records found on the device.
+    assert!(
+        primary.lookup_checked(&key_unmined).unwrap().is_some(),
+        "device-scan rebuild must recover the unmined record"
+    );
+    assert!(
+        primary.lookup_checked(&key_dah).unwrap().is_some(),
+        "device-scan rebuild must recover the DAH record"
+    );
+
+    // Fresh (empty) secondary redb indexes — as on a real restart before
+    // reconciliation. They must end up reconstructed from the rebuilt
+    // primary, NOT carried over from any pre-crash in-memory state.
+    let dah_path = dir.path().join("dah.redb");
+    let unmined_path = dir.path().join("unmined.redb");
+    let mut dah_backend =
+        DahBackend::OnDisk(RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap());
+    let mut unmined_backend =
+        UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
+    assert!(dah_backend.is_empty());
+    assert!(unmined_backend.is_empty());
+
+    // Empty redo log (no pending intents): recovery's job here is purely to
+    // reconcile the secondaries from the freshly-rebuilt primary.
+    let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+    let redo_log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+
+    teraslab::recovery::recover_all(
+        &*data_dev,
+        &redo_log,
+        &mut primary,
+        &mut dah_backend,
+        &mut unmined_backend,
+    )
+    .unwrap();
+
+    // Both secondaries now agree with the authoritative device metadata.
+    // `range_query(cutoff)` returns every key at height <= cutoff.
+    //
+    // The unmined index holds exactly the unmined record (height 700) and
+    // never the DAH record (its unmined_since is 0, so it was not inserted).
+    let unmined_hits = unmined_backend.range_query(700);
+    assert_eq!(unmined_hits, vec![key_unmined]);
+    assert!(
+        unmined_backend.range_query(699).is_empty(),
+        "unmined key (height 700) must not appear below its height"
+    );
+
+    // The DAH index holds exactly the DAH record (height 1234) and never the
+    // unmined record (its delete_at_height is 0).
+    let dah_hits = dah_backend.range_query(1234);
+    assert_eq!(dah_hits, vec![key_dah]);
+    assert!(
+        dah_backend.range_query(1233).is_empty(),
+        "DAH key (height 1234) must not appear below its height"
+    );
+}

@@ -131,11 +131,14 @@ const BUCKET_EMPTY_SENTINEL: u8 = 0xFF;
 /// Maximum storable probe distance.  Any entry whose true Robin Hood
 /// displacement exceeds this is stored with probe_distance = 254.
 /// This disables Robin Hood early-termination for those (rare) entries.
-const MAX_STORED_PROBE: u16 = (BUCKET_EMPTY_SENTINEL - 1) as u16;
+const MAX_STORED_PROBE: usize = (BUCKET_EMPTY_SENTINEL - 1) as usize;
 
 /// Cap a probe distance for storage in a bucket's `probe_distance` field.
+///
+/// G-LOW: takes `usize` so probe counters above 65 536 (tables larger than
+/// 2^16 buckets) cap correctly instead of wrapping a `u16` first.
 #[inline(always)]
-fn cap_probe(dist: u16) -> u8 {
+fn cap_probe(dist: usize) -> u8 {
     dist.min(MAX_STORED_PROBE) as u8
 }
 
@@ -544,6 +547,16 @@ pub struct HashTable {
     /// the rename + parent directory fsync completes. Anonymous tables
     /// ignore the redo log (nothing to recover).
     redo_log: Option<Arc<Mutex<RedoLog>>>,
+    /// G-2: marks a file-backed table that has been displaced by a resize
+    /// and no longer owns its backing path. The replacement table (the
+    /// resized copy) now owns the file via the in-place rename, so the
+    /// displaced table's [`Drop`] must NOT write the clean-shutdown
+    /// sentinel — doing so mid-run would make the next crash look like a
+    /// clean shutdown and silently disable torn-write detection. Set to
+    /// `true` on the old table immediately before it is swapped out; only
+    /// the live, non-defunct table writes the sentinel on a genuine clean
+    /// shutdown.
+    defunct: bool,
 }
 
 impl std::fmt::Debug for HashTable {
@@ -624,6 +637,7 @@ impl HashTable {
             seed: fresh_seed(),
             backing: Backing::Anonymous,
             redo_log: None,
+            defunct: false,
         })
     }
 
@@ -765,6 +779,7 @@ impl HashTable {
                     path: path.to_path_buf(),
                 },
                 redo_log: None,
+                defunct: false,
             };
             table.rehash_to_seed()?;
             Ok(table)
@@ -789,6 +804,7 @@ impl HashTable {
                     path: path.to_path_buf(),
                 },
                 redo_log: None,
+                defunct: false,
             })
         }
     }
@@ -888,7 +904,7 @@ impl HashTable {
     pub fn get_entry(&self, key: &TxKey) -> Option<TxIndexEntry> {
         let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(key, self.seed, self.mask);
-        let mut dist: u16 = 0;
+        let mut dist: usize = 0;
 
         loop {
             let bucket = self.bucket(idx);
@@ -898,8 +914,8 @@ impl HashTable {
             if bucket.is_occupied() {
                 // Robin Hood early termination is only safe when the stored
                 // probe_distance is not capped (< MAX_STORED_PROBE).
-                if (bucket.probe_distance as u16) < MAX_STORED_PROBE
-                    && dist > bucket.probe_distance as u16
+                if (bucket.probe_distance as usize) < MAX_STORED_PROBE
+                    && dist > bucket.probe_distance as usize
                 {
                     return None;
                 }
@@ -909,7 +925,7 @@ impl HashTable {
             }
             idx = (idx + 1) & self.mask;
             dist += 1;
-            if dist as usize >= self.capacity {
+            if dist >= self.capacity {
                 return None;
             }
         }
@@ -921,15 +937,15 @@ impl HashTable {
         let fp = txid_fingerprint(&key.txid);
         {
             let mut idx = bucket_index(&key, self.seed, self.mask);
-            let mut dist: u16 = 0;
+            let mut dist: usize = 0;
             loop {
                 let bucket = self.bucket(idx);
                 if bucket.is_empty() {
                     break;
                 }
                 if bucket.is_occupied() {
-                    if (bucket.probe_distance as u16) < MAX_STORED_PROBE
-                        && dist > bucket.probe_distance as u16
+                    if (bucket.probe_distance as usize) < MAX_STORED_PROBE
+                        && dist > bucket.probe_distance as usize
                     {
                         break;
                     }
@@ -942,7 +958,7 @@ impl HashTable {
                 }
                 idx = (idx + 1) & self.mask;
                 dist += 1;
-                if dist as usize >= self.capacity {
+                if dist >= self.capacity {
                     break;
                 }
             }
@@ -950,7 +966,7 @@ impl HashTable {
 
         // New insert — Robin Hood insertion.
         let mut idx = bucket_index(&key, self.seed, self.mask);
-        let mut dist: u16 = 0;
+        let mut dist: usize = 0;
         let mut cur_key = key;
         let mut cur_entry = entry;
 
@@ -960,8 +976,8 @@ impl HashTable {
                 self.bucket_mut(idx)
                     .set_entry(&cur_key, &cur_entry, cap_probe(dist));
                 self.count += 1;
-                if dist as usize > self.max_probe {
-                    self.max_probe = dist as usize;
+                if dist > self.max_probe {
+                    self.max_probe = dist;
                 }
                 #[cfg(debug_assertions)]
                 self.debug_assert_count_consistent();
@@ -969,10 +985,10 @@ impl HashTable {
             }
 
             // Robin Hood: if our displacement is greater, swap.
-            if bucket.is_occupied() && dist > bucket.probe_distance as u16 {
+            if bucket.is_occupied() && dist > bucket.probe_distance as usize {
                 let displaced_key = TxKey { txid: bucket.txid };
                 let displaced_entry = bucket.entry();
-                let displaced_dist: u16 = bucket.probe_distance as u16;
+                let displaced_dist: usize = bucket.probe_distance as usize;
 
                 self.bucket_mut(idx)
                     .set_entry(&cur_key, &cur_entry, cap_probe(dist));
@@ -985,7 +1001,7 @@ impl HashTable {
             idx = (idx + 1) & self.mask;
             dist += 1;
 
-            if dist as usize >= self.capacity {
+            if dist >= self.capacity {
                 return Err(HashTableError::Full {
                     count: self.count,
                     capacity: self.capacity,
@@ -1051,7 +1067,7 @@ impl HashTable {
     pub fn remove(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
         let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(key, self.seed, self.mask);
-        let mut dist: u16 = 0;
+        let mut dist: usize = 0;
 
         // Find the entry.
         loop {
@@ -1060,8 +1076,8 @@ impl HashTable {
                 return None;
             }
             if bucket.is_occupied() {
-                if (bucket.probe_distance as u16) < MAX_STORED_PROBE
-                    && dist > bucket.probe_distance as u16
+                if (bucket.probe_distance as usize) < MAX_STORED_PROBE
+                    && dist > bucket.probe_distance as usize
                 {
                     return None;
                 }
@@ -1071,7 +1087,7 @@ impl HashTable {
             }
             idx = (idx + 1) & self.mask;
             dist += 1;
-            if dist as usize >= self.capacity {
+            if dist >= self.capacity {
                 return None;
             }
         }
@@ -1205,7 +1221,7 @@ impl HashTable {
     ) -> bool {
         let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(key, self.seed, self.mask);
-        let mut dist: u16 = 0;
+        let mut dist: usize = 0;
 
         loop {
             let bucket = self.bucket(idx);
@@ -1213,8 +1229,8 @@ impl HashTable {
                 return false;
             }
             if bucket.is_occupied() {
-                if (bucket.probe_distance as u16) < MAX_STORED_PROBE
-                    && dist > bucket.probe_distance as u16
+                if (bucket.probe_distance as usize) < MAX_STORED_PROBE
+                    && dist > bucket.probe_distance as usize
                 {
                     return false;
                 }
@@ -1231,7 +1247,7 @@ impl HashTable {
             }
             idx = (idx + 1) & self.mask;
             dist += 1;
-            if dist as usize >= self.capacity {
+            if dist >= self.capacity {
                 return false;
             }
         }
@@ -1313,8 +1329,24 @@ impl HashTable {
         }
 
         let new_table = self.build_resized(new_cap)?;
+        // G-2: the resized copy now owns the backing path (its tmp file
+        // was renamed over the original inside `build_resized`). Mark the
+        // table we are about to drop defunct so its `Drop` does not write
+        // the clean-shutdown sentinel for a path it no longer owns.
+        self.mark_defunct_for_resize();
         *self = new_table;
         Ok(())
+    }
+
+    /// G-2: mark this table as displaced by a resize so its [`Drop`] skips
+    /// the clean-shutdown sentinel write.
+    ///
+    /// Must be called on the *old* table immediately before it is replaced
+    /// by a resized copy (the copy renamed a fresh file over this table's
+    /// path and now owns it). A no-op for anonymous tables, which never
+    /// write a sentinel.
+    pub(crate) fn mark_defunct_for_resize(&mut self) {
+        self.defunct = true;
     }
 
     /// Build a resized copy of this table without mutating the current mapping.
@@ -1456,8 +1488,18 @@ impl Drop for HashTable {
                 // "crash mid-write". Best-effort — if creating the file
                 // fails (e.g. parent dir gone, EROFS) the next reopen
                 // will emit a warn, which is the correct outcome.
-                let sentinel = sentinel_path_for(path);
-                let _ = std::fs::File::create(&sentinel);
+                //
+                // G-2: skip the sentinel when this table is defunct — a
+                // table displaced by a resize no longer owns its path (the
+                // resized copy renamed a fresh file over it and now owns
+                // it). Writing the sentinel here would falsely mark a
+                // still-mutating index "cleanly shut down", so a later
+                // crash would be accepted as clean and torn buckets read
+                // as valid. Only the live table writes the sentinel.
+                if !self.defunct {
+                    let sentinel = sentinel_path_for(path);
+                    let _ = std::fs::File::create(&sentinel);
+                }
             } else {
                 unsafe { dealloc_mmap_buckets(self.ptr, self.mmap_len) };
             }
@@ -2233,6 +2275,73 @@ mod tests {
                 .get_entry(&make_key(i))
                 .expect("should survive resize + reopen");
             assert_eq!(e.record_offset, i * 100);
+        }
+    }
+
+    /// G-2: after an auto-resize, the displaced old table must NOT leave a
+    /// clean-shutdown sentinel on disk while the live table keeps mutating.
+    /// Before the fix, the old table's `Drop` wrote `<path>.shutdown_clean`
+    /// mid-run, so a later crash was accepted as clean.
+    #[test]
+    fn resize_does_not_write_sentinel_while_table_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g2.idx");
+        let sentinel = sentinel_path_for(&path);
+
+        let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+        for i in 0..10u64 {
+            t.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        // Fresh table: no sentinel yet.
+        assert!(
+            !sentinel.exists(),
+            "sentinel must not exist before any clean shutdown"
+        );
+
+        // Trigger the resize that displaces the old table.
+        t.resize(64).unwrap();
+
+        // The table is still live and mutating; the displaced old table's
+        // Drop must NOT have written the sentinel.
+        assert!(
+            !sentinel.exists(),
+            "G-2: resize wrote the clean-shutdown sentinel while the table is still live"
+        );
+
+        // The live table is still usable.
+        t.insert(make_key(99), make_entry(9900)).unwrap();
+        assert_eq!(t.get_entry(&make_key(99)).unwrap().record_offset, 9900);
+    }
+
+    /// G-2: a crash (no clean Drop) AFTER a resize must be detected as an
+    /// unclean shutdown on next open — i.e. the sentinel left mid-run by the
+    /// displaced old table must not mask the crash. Simulated with
+    /// `std::mem::forget`, which skips Drop just like a `kill -9`.
+    #[test]
+    fn crash_after_resize_detected_as_unclean_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g2crash.idx");
+
+        let mut t = HashTable::open_file_backed(&path, 16).unwrap();
+        for i in 0..10u64 {
+            t.insert(make_key(i), make_entry(i * 100)).unwrap();
+        }
+        t.resize(64).unwrap();
+        let new_cap = t.capacity();
+
+        // Simulate a crash: skip Drop on the live table so no sentinel is
+        // written by a clean close. The only way a sentinel could be present
+        // is the (buggy) displaced-table Drop during the resize above.
+        std::mem::forget(t);
+
+        let reopened = HashTable::open_file_backed(&path, new_cap);
+        match reopened {
+            Err(HashTableError::UncleanShutdown { .. }) => {}
+            Ok(_) => panic!(
+                "G-2: crash after resize was accepted as a clean shutdown \
+                 (displaced table wrote the sentinel mid-run)"
+            ),
+            Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
 

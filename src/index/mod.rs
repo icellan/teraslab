@@ -236,6 +236,17 @@ impl Index {
         })
     }
 
+    /// G-2: mark the underlying table as displaced by a non-blocking
+    /// resize so its [`Drop`] does not write the clean-shutdown sentinel.
+    ///
+    /// Callers that swap a freshly [`resized_copy`]'d index over this one
+    /// (e.g. the engine's reader-non-blocking resize) must call this on the
+    /// old index immediately before the swap; the resized copy now owns the
+    /// backing file. A no-op for anonymous-backed tables.
+    pub(crate) fn mark_defunct_for_resize(&mut self) {
+        self.table.mark_defunct_for_resize();
+    }
+
     fn resize_to_capacity(&mut self, target_capacity: usize) -> Result<()> {
         self.table.resize(target_capacity)?;
         Ok(())

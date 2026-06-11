@@ -91,11 +91,16 @@ impl PrimaryBackend {
     /// with `target = "teraslab::index"`, then collapsed to `None`. The
     /// in-memory and file-backed variants are infallible.
     ///
-    /// **Migration target**: call sites that need to distinguish
-    /// "key absent" from "redb read failed" should use
-    /// [`Self::lookup_checked`] and propagate the [`IndexError`]. The
-    /// `lookup` shim is retained so existing callers compile while the
-    /// migration is performed; engine code is the primary consumer.
+    /// G-4: the engine hot paths (spend, create-duplicate check, delete,
+    /// set_mined, freeze, conflict/child resolution, GET fast path) have
+    /// been migrated to [`Self::lookup_checked`] / [`Self::unregister_checked`]
+    /// and now propagate the [`IndexError`] as a storage error instead of
+    /// collapsing it to "absent". This infallible shim is retained only for
+    /// callers where treating a read failure as "absent" is acceptable —
+    /// recovery replay (a backend error there is surfaced by the
+    /// replay-failure path) and best-effort/diagnostic readers (blob-GC
+    /// orphan reconciliation, startup self-check). Client-visible read
+    /// paths MUST use [`Self::lookup_checked`].
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
         match self.lookup_checked(key) {
             Ok(found) => found,
@@ -121,6 +126,18 @@ impl PrimaryBackend {
             Self::InMemory(idx) => Ok(idx.lookup(key)),
             Self::OnDisk(redb) => redb.lookup(key),
             Self::FileBacked(idx) => Ok(idx.lookup(key)),
+        }
+    }
+
+    /// Test-only: arm a synthetic failure in the next redb read so the next
+    /// `lookup_checked` returns an [`IndexError`]. No-op for the in-memory
+    /// and file-backed variants (their reads are infallible). Used by the
+    /// G-4 engine tests to verify backend read errors surface as real
+    /// storage errors rather than collapsing to "absent".
+    #[cfg(test)]
+    pub fn arm_fail_next_read(&self) {
+        if let Self::OnDisk(redb) = self {
+            redb.arm_fail_next_read();
         }
     }
 
@@ -156,6 +173,18 @@ impl PrimaryBackend {
         }
     }
 
+    /// G-2: mark a displaced mmap-backed index defunct before the engine
+    /// swaps a freshly [`Self::resized_copy`]'d backend over it, so the old
+    /// table's `Drop` does not write the clean-shutdown sentinel for a path
+    /// the resized copy now owns. A no-op for the redb backend (no sentinel)
+    /// and for anonymous-backed in-memory tables.
+    pub(crate) fn mark_defunct_for_resize(&mut self) {
+        match self {
+            Self::InMemory(idx) | Self::FileBacked(idx) => idx.mark_defunct_for_resize(),
+            Self::OnDisk(_) => {}
+        }
+    }
+
     /// Build a resized copy of an mmap-backed index without mutating the
     /// currently visible table. The engine swaps the returned backend under an
     /// exclusive lock after the copy has been built under an upgradable read
@@ -179,12 +208,15 @@ impl PrimaryBackend {
     /// `tracing::error!` with `target = "teraslab::index"`, then collapsed
     /// to `None`. The in-memory and file-backed variants are infallible.
     ///
-    /// **Migration target**: call sites that need to distinguish "no entry
-    /// to remove" from "redb write failed" must use
-    /// [`Self::unregister_checked`] and propagate the [`IndexError`] —
-    /// otherwise a commit failure leaves the entry on disk while the caller
-    /// skips downstream cleanup (blob deletion, secondary-index removal,
-    /// shard-count adjustments). Engine code is the primary consumer.
+    /// G-4: the engine delete path now uses [`Self::unregister_checked`]
+    /// (via `Engine::unregister_with_shard_count`) and propagates the
+    /// [`IndexError`] — a commit failure aborts the delete before the
+    /// region is freed or secondaries are touched, so the entry can never
+    /// be left on disk while the caller skips downstream cleanup. This
+    /// infallible shim is retained only for recovery replay
+    /// (`recovery::replay_delete`), where a backend error is surfaced by
+    /// the replay-failure path. New mutation paths MUST use
+    /// [`Self::unregister_checked`].
     pub fn unregister(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
         match self.unregister_checked(key) {
             Ok(found) => found,

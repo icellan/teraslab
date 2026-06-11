@@ -714,12 +714,14 @@ mod tests {
 
     #[test]
     fn redb_primary_rebuild_failure_preserves_file() {
-        // Write garbage into the redb primary path so `restore_redb` fails;
-        // simulate rebuild failure by passing a device whose contents do
-        // not parse as TeraSlab records (the empty in-memory device returns
-        // Ok with zero entries, which is success — so to simulate failure
-        // we instead force a restore error and verify the on-disk file is
-        // preserved by the fail-closed path.
+        // G-7: write garbage into the redb primary path so `restore_redb`
+        // fails. `rebuild_redb` then re-opens the SAME corrupt path via
+        // `redb::Builder::create`, which cannot turn the garbage bytes into
+        // a valid redb database, so the rebuild also fails. The fail-closed
+        // contract (README.md:644) is that this surfaces a typed
+        // `RebuildError::RedbPrimary` with BOTH the restore and rebuild
+        // causes populated, and the corrupt file is preserved untouched for
+        // the operator to inspect — it is never silently deleted/recreated.
         let tmp = TempDir::new().unwrap();
         let redb_path = tmp.path().join("primary.redb");
         let dah_path = tmp.path().join("dah.redb");
@@ -735,17 +737,25 @@ mod tests {
         };
 
         let (dev, alloc) = fresh_dev_alloc();
-        // Empty device → rebuild returns Ok(empty). To test the fail-closed
-        // path we corrupt the device contents by writing partial records,
-        // but rebuild_redb tolerates corrupt magic by skipping. Instead,
-        // we verify the simpler invariant: a corrupted redb file is NOT
-        // deleted on the rebuild path. Since rebuild succeeds against an
-        // empty device, this case actually returns Ok with the rebuilt
-        // index — which is still acceptable, because the contract is
-        // "fail closed when rebuild errors", not "fail closed when restore
-        // errors and rebuild succeeds". Verify the file is preserved
-        // either way.
-        let _ = load_primary_index_redb(&cfg, &*dev, &alloc);
+        let result = load_primary_index_redb(&cfg, &*dev, &alloc);
+        match result {
+            Err(RebuildError::RedbPrimary {
+                ref path,
+                ref restore_err,
+                ref rebuild_err,
+            }) => {
+                assert_eq!(path, &redb_path.display().to_string());
+                assert!(
+                    !restore_err.is_empty(),
+                    "restore_err cause must be populated"
+                );
+                assert!(
+                    !rebuild_err.is_empty(),
+                    "rebuild_err cause must be populated"
+                );
+            }
+            other => panic!("expected fail-closed RebuildError::RedbPrimary, got {other:?}"),
+        }
         assert!(
             redb_path.exists(),
             "redb primary file must be preserved across load_primary_index_redb"

@@ -4596,13 +4596,28 @@ fn handle_create_batch(
         };
 
         let key = TxKey { txid: item.txid };
-        if engine.lookup(&key).is_some() {
-            errors.push(BatchItemError {
-                item_index: i as u32,
-                error_code: ERR_ALREADY_EXISTS,
-                error_data: vec![],
-            });
-            continue;
+        // G-4: surface a backend read error rather than collapsing it to
+        // "not present" and proceeding with the create. (The engine create
+        // re-checks atomically with a checked lookup, but the pre-filter
+        // must not report a wrong outcome either.)
+        match engine.lookup_checked(&key) {
+            Ok(Some(_)) => {
+                errors.push(BatchItemError {
+                    item_index: i as u32,
+                    error_code: ERR_ALREADY_EXISTS,
+                    error_data: vec![],
+                });
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                errors.push(BatchItemError {
+                    item_index: i as u32,
+                    error_code: ERR_STORAGE_IO,
+                    error_data: format!("index lookup failed: {e}").into_bytes(),
+                });
+                continue;
+            }
         }
 
         // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): build the full
@@ -6517,7 +6532,21 @@ fn handle_get_batch(
         // Fast path: if ALL requested fields are cached in the primary index,
         // serve directly without reading device metadata (zero I/O).
         if field_mask.fully_cached() {
-            if let Some(entry) = engine.lookup_cached(&key) {
+            // G-4: use the checked lookup so a transient backend read error
+            // is surfaced as ERR_STORAGE_IO rather than collapsing to
+            // ERR_TX_NOT_FOUND (which would tell the client a present
+            // transaction does not exist).
+            let cached = match engine.lookup_cached_checked(&key) {
+                Ok(found) => found,
+                Err(e) => {
+                    results.push(WireGetResult {
+                        status: ERR_STORAGE_IO as u8,
+                        data: format!("index lookup failed: {e}").into_bytes(),
+                    });
+                    continue;
+                }
+            };
+            if let Some(entry) = cached {
                 let mut data = Vec::new();
                 let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
                 // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
