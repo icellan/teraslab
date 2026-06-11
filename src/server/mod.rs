@@ -151,16 +151,33 @@ impl Drop for InflightBytesPermit {
 /// Per-connection state for streaming blob uploads.
 ///
 /// Each active upload session is keyed by txid. Sessions are cleaned up
-/// (aborted) when the connection closes.
+/// (aborted) when the connection closes, when their cumulative byte cap is
+/// exceeded, or when they go idle past [`Self::stream_idle_timeout`] (the
+/// idle-stream reaper — see [`Self::reap_idle_streams`]).
 pub(crate) struct ConnectionState {
     pub(crate) streams: HashMap<[u8; 32], ActiveStream>,
     pub(crate) max_stream_total_bytes: u64,
+    /// H-1/LM-1: cap on the number of concurrent in-progress streams. A new
+    /// stream open past this count is rejected with `ERR_RATE_LIMITED`
+    /// *before* a file descriptor / tmp file is allocated. `0` disables the
+    /// cap. See [`ServerConfig::max_active_streams_per_connection`].
+    pub(crate) max_active_streams: usize,
+    /// H-2: idle timeout after which a stream that has received no further
+    /// chunk is reaped (its fd, tmp file, hasher, and map entry freed),
+    /// independently of connection close. `None` disables the reaper. See
+    /// [`ServerConfig::stream_idle_timeout_secs`].
+    pub(crate) stream_idle_timeout: Option<Duration>,
 }
 
 /// An in-progress streaming blob upload for a single txid.
 pub(crate) struct ActiveStream {
     pub(crate) writer: Box<dyn BlobStreamWriter>,
     pub(crate) bytes_received: u64,
+    /// H-2: wall-clock instant of the most recent chunk for this stream,
+    /// refreshed on every accepted `OP_STREAM_CHUNK`. The idle reaper aborts
+    /// streams whose `last_activity` is older than
+    /// [`ConnectionState::stream_idle_timeout`].
+    pub(crate) last_activity: Instant,
 }
 
 impl ConnectionState {
@@ -168,12 +185,68 @@ impl ConnectionState {
         Self {
             streams: HashMap::new(),
             max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+            max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+            stream_idle_timeout: Some(Duration::from_secs(
+                ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+            )),
         }
     }
 
     pub(crate) fn with_max_stream_total_bytes(mut self, max_stream_total_bytes: u64) -> Self {
         self.max_stream_total_bytes = max_stream_total_bytes;
         self
+    }
+
+    /// H-1/LM-1: override the concurrent-stream cap. `0` disables it.
+    pub(crate) fn with_max_active_streams(mut self, max_active_streams: usize) -> Self {
+        self.max_active_streams = max_active_streams;
+        self
+    }
+
+    /// H-2: override the idle-stream timeout. `None` disables the reaper.
+    pub(crate) fn with_stream_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
+    /// H-1/LM-1: whether a *new* stream may be opened right now.
+    ///
+    /// Returns `true` when the concurrent-stream cap is disabled (`0`) or the
+    /// current open-stream count is strictly below the cap. Callers must
+    /// check this on the vacant-entry path of `OP_STREAM_CHUNK` *before*
+    /// calling `begin_stream`, so a rejected open never allocates a file
+    /// descriptor or tmp file.
+    pub(crate) fn can_open_new_stream(&self) -> bool {
+        self.max_active_streams == 0 || self.streams.len() < self.max_active_streams
+    }
+
+    /// H-2: reap in-progress streams idle longer than
+    /// [`Self::stream_idle_timeout`], measured against `now`.
+    ///
+    /// Each reaped stream's writer is `abort`ed (removing its tmp file) and
+    /// its map entry dropped. Returns the number of streams reaped. A no-op
+    /// when the timeout is `None` (reaper disabled) or no stream is stale.
+    ///
+    /// `now` is passed in (rather than read internally) so the reaper is
+    /// deterministically testable without sleeping; the connection loop
+    /// passes `Instant::now()`.
+    pub(crate) fn reap_idle_streams(&mut self, now: Instant) -> usize {
+        let Some(timeout) = self.stream_idle_timeout else {
+            return 0;
+        };
+        // Collect stale keys first to avoid mutating the map while iterating.
+        let stale: Vec<[u8; 32]> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| now.duration_since(s.last_activity) >= timeout)
+            .map(|(txid, _)| *txid)
+            .collect();
+        for txid in &stale {
+            if let Some(stream) = self.streams.remove(txid) {
+                let _ = stream.writer.abort();
+            }
+        }
+        stale.len()
     }
 }
 
@@ -510,6 +583,8 @@ impl Server {
                         let active_conns = self.active_connections.clone();
                         let max_batch = self.config.max_batch_size;
                         let max_stream_total_bytes = self.config.max_stream_total_bytes;
+                        let max_active_streams = self.config.max_active_streams_per_connection;
+                        let stream_idle_timeout_secs = self.config.stream_idle_timeout_secs;
                         let cluster = self.cluster.clone();
                         let redo_log = self.redo_log.clone();
                         let blob_store = self.blob_store.clone();
@@ -543,6 +618,8 @@ impl Server {
                                 ConnectionOptions {
                                     max_batch_size: max_batch,
                                     max_stream_total_bytes,
+                                    max_active_streams,
+                                    stream_idle_timeout_secs,
                                     cluster: cluster.as_deref(),
                                     redo_log: redo_log.as_deref(),
                                     blob_store: blob_store.as_deref(),
@@ -621,6 +698,12 @@ impl Server {
 struct ConnectionOptions<'a> {
     max_batch_size: u32,
     max_stream_total_bytes: u64,
+    /// H-1/LM-1: per-connection concurrent-stream cap (`0` disables). See
+    /// [`ServerConfig::max_active_streams_per_connection`].
+    max_active_streams: usize,
+    /// H-2: per-stream idle timeout in seconds (`0` disables the reaper). See
+    /// [`ServerConfig::stream_idle_timeout_secs`].
+    stream_idle_timeout_secs: u64,
     cluster: Option<&'a RunningCluster>,
     redo_log: Option<&'a Mutex<RedoLog>>,
     blob_store: Option<&'a dyn BlobStore>,
@@ -681,8 +764,18 @@ fn handle_connection_inner(
     // — no `to_vec()` copy on the request hot path.
     let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
     read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
-    let mut conn_state =
-        ConnectionState::new().with_max_stream_total_bytes(opts.max_stream_total_bytes);
+    // H-2: `0` disables the idle reaper; any positive value installs a
+    // per-stream idle deadline enforced on each request (see the
+    // `reap_idle_streams` call in the loop below).
+    let stream_idle_timeout = if opts.stream_idle_timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(opts.stream_idle_timeout_secs))
+    };
+    let mut conn_state = ConnectionState::new()
+        .with_max_stream_total_bytes(opts.max_stream_total_bytes)
+        .with_max_active_streams(opts.max_active_streams)
+        .with_stream_idle_timeout(stream_idle_timeout);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -947,6 +1040,22 @@ fn handle_connection_inner(
         let (request, _) = RequestFrame::decode_bytes(request_frame_bytes)
             .map_err(|e| format!("decode frame: {e}"))?;
 
+        // H-2: reap idle streams on every request before dispatch. The
+        // server is thread-per-connection and synchronous, so this is the
+        // natural tick — a client that keeps the connection cheaply alive
+        // with periodic pings (or any other op) drives a sweep here, freeing
+        // the fd / tmp file / hasher of any stream that has received no chunk
+        // within `stream_idle_timeout`. No background thread is required and
+        // the map is per-connection, so this holds no shared lock.
+        let reaped = conn_state.reap_idle_streams(Instant::now());
+        if reaped > 0 {
+            tracing::debug!(
+                reaped,
+                remaining = conn_state.streams.len(),
+                "reaped idle blob-stream sessions",
+            );
+        }
+
         // Dispatch to handler
         let response = dispatch::handle_request(
             &request,
@@ -1044,6 +1153,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,
@@ -1089,6 +1200,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,
@@ -1157,6 +1270,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,
@@ -1245,6 +1360,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,
@@ -1300,6 +1417,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,
@@ -1402,6 +1521,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,
@@ -1463,6 +1584,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,
@@ -1542,6 +1665,8 @@ mod tests {
                 ConnectionOptions {
                     max_batch_size: 1024,
                     max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
                     cluster: None,
                     redo_log: None,
                     blob_store: None,

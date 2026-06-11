@@ -493,6 +493,46 @@ pub struct ServerConfig {
     /// upload on a single connection before the stream is aborted.
     pub max_stream_total_bytes: u64,
 
+    /// Maximum number of in-progress streaming blob uploads that a single
+    /// connection may hold open simultaneously.
+    ///
+    /// Each in-progress stream (keyed by txid) holds an OS file descriptor,
+    /// a temp file, and a hasher in `ConnectionState.streams`. Without this
+    /// cap a single connection could open one `OP_STREAM_CHUNK` (offset 0,
+    /// one byte) for millions of distinct txids — never finishing any of
+    /// them — and exhaust the process file-descriptor table and blob tmp
+    /// directory. The per-stream byte cap ([`Self::max_stream_total_bytes`])
+    /// does not help: each abandoned stream needs only one chunk to stay
+    /// resident. Opening a new stream past this cap is rejected with
+    /// `ERR_RATE_LIMITED`; existing streams are unaffected.
+    ///
+    /// The default (64) comfortably exceeds the fan-out of any legitimate
+    /// client (Teranode uploads cold data one transaction at a time) while
+    /// bounding the fd/tmp footprint of a hostile connection. Setting it to
+    /// `0` disables the per-connection stream-count cap entirely (not
+    /// recommended outside trusted overlay networks).
+    pub max_active_streams_per_connection: usize,
+
+    /// Idle timeout, in seconds, after which an in-progress streaming blob
+    /// upload that has received no further chunk is reaped — its file
+    /// descriptor, temp file, hasher, and map entry freed — independently of
+    /// connection close.
+    ///
+    /// The frame-assembly deadline bounds a single frame's assembly, not the
+    /// gap *between* `OP_STREAM_CHUNK` frames. Without an idle-stream reaper a
+    /// client could open a stream, send one chunk, then keep the connection
+    /// cheaply alive (periodic `OP_PING`) and pin the stream's resources
+    /// forever. The reaper runs per connection on each request and aborts any
+    /// stream older than this timeout (removing the tmp file via the writer's
+    /// `abort`). A subsequent op on a reaped stream id is treated as an
+    /// unknown stream and returns a clean error.
+    ///
+    /// The default (60 s) is generous for a legitimate slow uploader (a 4 GiB
+    /// blob streamed at a few hundred KiB/s sends chunks far more often than
+    /// once a minute). Setting it to `0` disables the idle reaper entirely
+    /// (not recommended).
+    pub stream_idle_timeout_secs: u64,
+
     /// Maximum aggregate request-frame bytes allowed in flight across all
     /// TCP connection threads. A value of 0 disables the aggregate cap.
     pub max_inflight_request_bytes: usize,
@@ -749,6 +789,9 @@ impl Default for ServerConfig {
             max_connections: 1024,
             max_connections_per_ip: 64,
             max_stream_total_bytes: Self::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+            max_active_streams_per_connection:
+                Self::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+            stream_idle_timeout_secs: Self::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             max_inflight_request_bytes: 256 * 1024 * 1024,
             http_listen_addr: "127.0.0.1:9100".to_string(),
             enable_remote_bind: false,
@@ -802,6 +845,17 @@ impl ServerConfig {
     pub const ENV_MIGRATION_BATCH_SIZE: &'static str = "TERASLAB_MIGRATION_BATCH_SIZE";
     pub const ENV_MAX_STREAM_TOTAL_BYTES: &'static str = "TERASLAB_MAX_STREAM_TOTAL_BYTES";
     pub const DEFAULT_MAX_STREAM_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+    /// Default for [`Self::max_active_streams_per_connection`]. Mirrors the
+    /// style of [`Self::max_connections_per_ip`] (64): well above any
+    /// legitimate per-connection upload fan-out, low enough to bound the
+    /// fd/tmp footprint of a hostile connection.
+    pub const DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION: usize = 64;
+
+    /// Default for [`Self::stream_idle_timeout_secs`] (60 s). Long enough
+    /// that a legitimate slow uploader never trips it, short enough that an
+    /// abandoned half-open stream's resources are reclaimed promptly.
+    pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
 
     /// Environment variable that overrides [`Self::admin_token`]. When the
     /// env var is set to a non-empty value it replaces any TOML-configured
@@ -1600,6 +1654,23 @@ backend = ""
         assert!(
             err.contains("unknown replication_degraded_mode"),
             "error was: {err}"
+        );
+    }
+
+    /// H-1/LM-1 + H-2: the streaming-DoS caps default to the documented
+    /// values (64 concurrent streams per connection, 60 s idle timeout).
+    #[test]
+    fn stream_dos_caps_have_expected_defaults() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.max_active_streams_per_connection, 64);
+        assert_eq!(
+            cfg.max_active_streams_per_connection,
+            ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION
+        );
+        assert_eq!(cfg.stream_idle_timeout_secs, 60);
+        assert_eq!(
+            cfg.stream_idle_timeout_secs,
+            ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS
         );
     }
 
