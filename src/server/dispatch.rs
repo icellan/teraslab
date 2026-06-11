@@ -9400,8 +9400,14 @@ mod tests {
         let payload = encode_set_mined_batch(&set_mined_params, &[txid]);
         let resp = h.request_with_cluster(OP_SET_MINED_BATCH, payload, &cluster);
         // Per-item redirect comes back as a partial-error with one entry.
+        // LP-2 / spec §3.6: set_mined now encodes its response as
+        // partial-with-signals (success section + error section), so the
+        // redirect error is read from the error section of that envelope
+        // rather than the bare sparse-error form.
         assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
-        let errs = crate::protocol::codec::decode_sparse_errors(&resp.payload).unwrap();
+        let (_successes, errs) =
+            crate::protocol::codec::decode_partial_with_signals(&resp.payload)
+                .expect("set_mined redirect response must decode as partial-with-signals");
         assert_eq!(errs.len(), 1, "exactly one redirected item");
         assert_eq!(errs[0].error_code, ERR_REDIRECT);
 
