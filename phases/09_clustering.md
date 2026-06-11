@@ -1,6 +1,6 @@
 # Phase 9: Clustering
 
-**Status:** partial — `src/cluster/` (SWIM, sharding, migration, topology authority, coordinator, auth) in main; A-1 cluster_id wiring resolved 2026-05-18. Outstanding follow-ups: shard table fails to recompute for 2→3 scale-up (`_review/follow_ups.md` A-2b); `SWIM_PING_REQ_DROPPED_TOTAL` lives inside `cluster::swim` rather than the metrics registry (`_review/follow_ups.md` A-5).
+**Status:** shipped — `src/cluster/` (SWIM, sharding, migration, topology authority, coordinator, auth) in main; cluster_id wiring, 2→3 shard-table scale-up, and `swim_ping_req_dropped_total` metric registration all landed. Split-brain hardening (peak-derived activation quorum) and a partition/loss test fixture are in `tests/`.
 
 ## Goal
 

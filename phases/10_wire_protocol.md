@@ -1,6 +1,6 @@
 # Phase 10: Wire protocol
 
-**Status:** partial — `src/protocol/` (frame, codec, opcodes) and `src/server/` (TCP dispatch, HTTP observability) in main; F-G5/G6 fix campaigns closed inflight-bytes limiter, HMAC verification, etc. Outstanding production bug: `src/server/mod.rs:264-272` accept loop spins on a 10 ms sleep, burning CPU and slowing shutdown (`_review/follow_ups.md` A-2). Frame zero-copy / streaming HMAC / typed wire error codes are deferred perf items (`_review/follow_ups.md` C-6/C-7/C-8).
+**Status:** shipped — `src/protocol/` (frame, codec, opcodes) and `src/server/` (TCP dispatch, HTTP observability) in main; F-G5/G6 fix campaigns closed the inflight-bytes limiter and HMAC verification. The accept loop is event-driven (mio poller), frame decode is zero-copy, HMAC verification streams in bounded chunks, wire error codes are typed, and a whole-frame assembly deadline bounds slow-loris drip on both the server and replication read paths.
 
 ## Goal
 

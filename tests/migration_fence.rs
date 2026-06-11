@@ -1,6 +1,6 @@
 //! F-02 — migration write-fence + read-passthrough integration test.
 //!
-//! The audit (AUDIT.md F-02) flagged that the migration fence
+//! F-02: the migration fence
 //! (`MigrationManager::fence_shard` / `RunningCluster::is_shard_write_fenced`,
 //! enforced in `dispatch::check_shard_ownership`) had no end-to-end
 //! integration coverage asserting BOTH arms on the SAME fenced shard of

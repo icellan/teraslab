@@ -1,7 +1,7 @@
 //! G10 config-validation regression tests.
 //!
 //! Each test below is the runtime witness for one F-G10-* fix. Failures
-//! here regress a finding from `_review/02_findings_G10.md`.
+//! here regress a G10 deployment-hardening finding.
 
 use teraslab::config::{ConfigError, Secret, ServerConfig};
 

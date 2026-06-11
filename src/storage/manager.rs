@@ -215,7 +215,7 @@ impl StorageManager {
                 })
             }
             StorageTier::External => {
-                // R-048 (AUDIT.md IJK-01): the synchronous external-tier
+                // R-048: the synchronous external-tier
                 // write path used to discard the digest returned by
                 // `BlobStore::put`, leaving any caller no way to populate
                 // `ExternalRef.content_hash`. With the digest stranded at
@@ -1508,7 +1508,7 @@ mod tests {
         }
     }
 
-    // ---- R-048 (AUDIT.md IJK-01) regression tests ----
+    // ---- R-048 regression tests ----
     //
     // These tests pin the invariant that `StorageManager::write_cold_data`
     // for the External tier propagates the durable `BlobDigest` back to the
@@ -1632,7 +1632,7 @@ mod tests {
         // Audit-prescribed regression name. Pre-fix the recorded
         // `content_hash` was permanently zero, so the two failure modes were:
         //   * If a reader compared SHA-256 against zero, every read would
-        //     reject (which is what AUDIT.md IJK-01 reported).
+        //     reject (the external-tier overwrite hazard).
         //   * If a reader skipped the check on a zero hash, corruption would
         //     go undetected.
         // Either way, the integrity contract was broken. Post-fix the

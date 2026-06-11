@@ -123,8 +123,8 @@ fn primitive_footer_write_without_crc_surfaces_record_corruption() {
 // `__test_force_push_free_region` helper to seed 65 537 regions, so both paid the
 // same ~17 s of O(n²) `Vec::insert` + `debug_assert_sorted` cost in debug. The lib
 // test has the closer assertion shape and exercises the same overflow branch, so
-// the duplicate is removed here. See `_review/08_test_perf_audit.md` (smell #1)
-// and `_review/09_perf_fixes.md` for context.
+// the duplicate is removed here (test-perf cleanup: the lib test
+// exercises the same overflow branch with a closer assertion shape).
 
 /// F-G1-019 regression: `generation_target_ahead` must be symmetrically
 /// classified as not-ahead when the two generations are exactly

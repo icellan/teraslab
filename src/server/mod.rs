@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 /// F-G5-001 (CRITICAL): emit a single `tracing::warn!` the first time an
 /// inter-node opcode is received with no `cluster_secret` configured.
-/// The default (trusted-overlay) behaviour is fail-open per
-/// `_review/FIX_POLICY.md` §2; the warning surfaces the situation so
+/// The default (trusted-overlay) behaviour is fail-open by design;
+/// the warning surfaces the situation so
 /// an operator who forgot to wire a secret notices in production logs.
 ///
 /// One-shot — additional unsigned inter-node frames after the first are

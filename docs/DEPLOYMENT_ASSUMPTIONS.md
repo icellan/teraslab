@@ -165,14 +165,3 @@ only on natural exit (which never happened because the accept loop
 polled an unrelated atomic). `kill -9` of course still bypasses
 everything — that's expected behaviour and recovery on next startup
 handles it.
-
-## 6. Audit references
-
-The trusted-overlay model is documented end-to-end in the audit report:
-
-- `_review/02_findings_G10.md` — F-G10-007 / F-G10-010 / F-G10-011 (secret
-  hygiene), F-G10-008 (no outbound DNS probe at boot), F-X-001 (this
-  page).
-- `_review/02_findings_G5.md` — wire-protocol auth gate.
-- `_review/02_findings_G6.md` — admin / debug endpoint gating.
-- `_review/02_findings_G9.md` — F-G9-009 (encryption-at-rest absence).

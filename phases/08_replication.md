@@ -1,6 +1,6 @@
 # Phase 8: Replication
 
-**Status:** partial — `src/replication/` (manager, durable sequencing, batching, TCP transport, receiver) in main; R-034/R-035 (replica WAL durability + metadata-write error propagation) and F-G7-* fixes landed. Outstanding follow-ups: `replica_unauthenticated_accept_total` counter exists but is not incremented at any production site (`_review/follow_ups.md` A-3); `CatchupError` is still stringly-typed across the lib/bin boundary (`_review/follow_ups.md` B-4).
+**Status:** shipped — `src/replication/` (manager, durable sequencing, batching, TCP transport, receiver) in main; R-034/R-035 (replica WAL durability + metadata-write error propagation) and F-G7-* fixes landed. The `replica_unauthenticated_accept_total` counter is incremented at the auth gate, `CatchupError::RedoReclaimed` is a typed variant across the lib/bin boundary, and the receiver enforces a whole-frame assembly deadline.
 
 ## Goal
 

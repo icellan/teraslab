@@ -1552,7 +1552,7 @@ fn kill_node_detection_affected_shards() {
 }
 
 // ---------------------------------------------------------------------------
-// R-040 (AUDIT.md EF-03) — quorum: isolated 1-node remnant rejects writes.
+// R-040 — quorum: isolated 1-node remnant rejects writes.
 //
 // Contract: a node that was previously part of a multi-node cluster
 // (peak_cluster_size >= 2) must reject mutating ops with
@@ -1632,7 +1632,7 @@ fn wait_for_node_addrs_le(node: &TestNode, max_remaining: usize, timeout: Durati
 
 #[test]
 fn isolated_node_rejects_writes_with_no_quorum() {
-    // R-040 (AUDIT.md EF-03). Start a 3-node cluster with RF=2, wait for
+    // R-040. Start a 3-node cluster with RF=2, wait for
     // the topology commit, kill 2 of 3 peers, wait for SWIM to mark them
     // dead (NodeLeft removes them from node_addrs), then send
     // OP_CREATE_BATCH against the surviving node and assert it rejects

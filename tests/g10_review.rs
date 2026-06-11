@@ -3,7 +3,7 @@
 //! Catch-all integration tests that exercise the smaller G10 findings
 //! that don't warrant their own test file. Each test is the runtime
 //! witness for one F-G10-* fix; failure here regresses the cited
-//! finding in `_review/02_findings_G10.md`.
+//! G10 deployment-hardening finding.
 
 use teraslab::config::ServerConfig;
 

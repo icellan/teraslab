@@ -1,6 +1,6 @@
 //! F-G5-022 / A-4 — engine-side atomic apply for `spend()`.
 //!
-//! Hypothesis (from `_review/follow_ups.md` A-4 and the TODO at
+//! Hypothesis (F-G5-022 / A-4, and the TODO at
 //! `src/server/dispatch.rs:3242` referring to F-G5-022): a concurrent
 //! same-key spend could observe a stale before-image and write its
 //! own SPENT outcome on top of another thread's already-applied SPENT
@@ -38,7 +38,7 @@
 //! two readers to both observe UNSPENT) will surface as ≥2 `Ok`
 //! returns and a panic here.
 //!
-//! Per the roadmap (`_review/ROADMAP_TO_100.md` P1.3): if the race
+//! Per the original plan (P1.3): if the race
 //! is not reachable, this becomes documentation only and A-4 /
 //! F-G5-022 is resolved as NOT-APPLICABLE (existing stripe-lock
 //! already provides the atomic-apply invariant).

@@ -1,6 +1,6 @@
 # Phase 1: Storage layout and raw device I/O
 
-**Status:** shipped — `src/device.rs`, `src/record.rs`, `src/io.rs` in main; outstanding miri / portability items (`_review/follow_ups.md` C-1/C-3/C-4) are forward-looking refactor work, not unmet deliverables.
+**Status:** shipped — `src/device.rs`, `src/record.rs`, `src/io.rs` in main. Outstanding miri / portability items are forward-looking refactor work, not unmet deliverables.
 
 ## Goal
 

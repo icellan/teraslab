@@ -1,6 +1,6 @@
 # Phase 12: Integration testing and benchmarks
 
-**Status:** shipped — integration suites under `tests/`, Docker-based cluster harness under `teraslab-tests/`, criterion benches under `benches/`; `cargo test --all` reports 2092 / 0 / 0 on `c87339c` per `_review/ROADMAP_TO_100.md`.
+**Status:** shipped — integration suites under `tests/`, Docker-based cluster harness under `teraslab-tests/`, criterion benches under `benches/`; `cargo test --all` reports 2234 / 0 / 0.
 
 ## Goal
 

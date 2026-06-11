@@ -3696,7 +3696,7 @@ impl Engine {
     /// `_idempotent` (not the historical `set_locked`) precisely to
     /// trip compile-time review of any new call site — see
     /// May-2026 external review P1 "set_locked plain variant DAH-loss
-    /// foot-gun" and `_review/follow_ups.md`.
+    /// foot-gun".
     pub fn set_locked_idempotent(&self, req: &SetLockedRequest) -> Result<u32, SpendError> {
         Ok(self.set_locked_with_before_image(req)?.generation)
     }
@@ -3709,8 +3709,8 @@ impl Engine {
     /// either [`Self::set_locked_with_before_image`] (compensation-safe)
     /// or [`Self::set_locked_idempotent`] (the explicit idempotent
     /// shorthand). This alias exists only to ease the in-tree call-
-    /// site migration; remove it once `_review/follow_ups.md` records
-    /// zero remaining callers.
+    /// site migration; remove it once there are zero remaining
+    /// callers.
     #[deprecated(
         since = "0.4.0",
         note = "use `set_locked_idempotent` for replica-replay / benches, or \

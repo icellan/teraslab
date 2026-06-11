@@ -1,5 +1,5 @@
-//! Wire-level error-code conformance tests — audit gaps T-1..T-6
-//! (`audit/error-code-matrix.md`).
+//! Wire-level error-code conformance tests — error-code triggerability
+//! gaps T-1..T-6.
 //!
 //! Each test starts a real TCP server, sends framed requests as a client,
 //! and asserts the EXACT top-level status, sparse item index, error code,

@@ -76,7 +76,7 @@ mime_guess = "2"
 # instead of waiting for the next 10 ms `thread::sleep` tick. `mio` is a
 # small (~10k LOC), zero-dep epoll/kqueue wrapper already in the tokio
 # transitive graph, so promoting it to a direct dep does not enlarge the
-# build. See P1.2 in `_review/ROADMAP_TO_100.md`.
+# build.
 mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
 redb = "2"
@@ -119,7 +119,7 @@ io-uring = "0.7"
 # `nix::ioctl_read!` computes the correct encoded ioctl request number per
 # target (including 32-bit Linux variants where the hard-coded
 # `BLKGETSIZE64`/`DKIOCGETBLOCKCOUNT` integer constants in src/device.rs
-# would silently `ENOTTY`). See P3.3 / C-1 in `_review/follow_ups.md`.
+# would silently `ENOTTY`).
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["ioctl"] }
 

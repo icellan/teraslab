@@ -30,7 +30,6 @@ jobs:
         # Currently covers three hashtable benchmarks-as-tests in
         # src/index/hashtable.rs: ten_million_entries (~508s debug),
         # bench_lookup_1m and bench_insert_throughput (~6s each debug).
-        # See _review/08_test_perf_audit.md for context.
         run: cargo test --features slow-tests --lib
 
       - name: Criterion benchmarks

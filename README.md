@@ -27,28 +27,24 @@ The `io_uring` backend in `src/device_io/` is scaffolding only and is NOT wired 
 
 ## Status
 
-**Pre-production.** All 14 build phases (0–13) are implemented; phases 1–7, 12, 13 are fully shipped, while phases 0, 8–11 are partial — production code paths work but specific telemetry / lifecycle / scale-up follow-ups remain (see `_review/follow_ups.md`). Each `phases/NN_*.md` carries its own `Status:` header.
+**Pre-production.** All 14 build phases (0–13) are implemented; phases 1–7, 12, 13 are fully shipped, while phases 0, 8–11 are partial — production code paths work but specific telemetry / lifecycle / scale-up follow-ups remain. Each `phases/NN_*.md` carries its own `Status:` header.
 
 | Probe | Result |
 |-------|-------:|
-| `cargo test --all` | 2092 passed / 0 failed / 0 ignored (at `c87339c`, per `_review/ROADMAP_TO_100.md`) |
-| `cargo check --lib` | clean |
-| `cargo check --bins` | clean |
-| `cargo clippy --lib --no-deps` | 8 dead-code warnings in `src/device_io/*` (tracked: ROADMAP P3.1) |
+| `cargo test --all` | 2234 passed / 0 failed / 0 ignored |
+| `cargo test --features fault-injection` (gated binaries) | 9 passed / 0 failed |
+| `cd client/rust && cargo test` | 17 passed / 0 failed |
+| `cargo clippy --all-targets -- -D warnings` | clean (with and without `--features fault-injection`) |
 | `cargo fmt --all -- --check` | clean |
-
-**Known limitations** (production bugs from `_review/follow_ups.md` § A — refresh this list when items close):
-
-- A-2b — shard table can stay at 2-node assignment after a fresh 3-node bootstrap even though `committed_topology_members()` reports three; suspected `topology_commit_already_activated` dedup interaction.
-- A-3 — `replica_unauthenticated_accept_total` counter exists but is not incremented at the auth gate in `handle_connection_inner`.
-- A-4 — engine-side atomic apply (F-G5-022) is a concurrency hypothesis with no live repro yet.
 
 **Documented design choices** (deliberate scope decisions, not bugs):
 
 - **Single-interval freeze model.** `spendable_height` is a single `u32` per output (mirrors Aerospike). svnode's `enforceAtHeight` supports a multi-interval array. If Teranode's contract evolves to require multi-interval freezes (e.g. two disjoint locked windows on the same UTXO), a new op type (`OP_FREEZE_INTERVAL_BATCH` or similar) is required; the on-disk slot layout reserves enough spending-data bytes to extend without a format break, but the engine match arms and the wire protocol need additions.
-- A-5 — `SWIM_PING_REQ_DROPPED_TOTAL` lives inside `cluster::swim` instead of the registry exposed by `/metrics`.
 
-See `_review/ROADMAP_TO_100.md` for the sequenced finish plan and `REVIEW_REPORT.md` for the May 2026 review campaign that surfaced these.
+**Known residual coverage gaps** (tracked, low risk):
+
+- The Linux `BLKGETSIZE64` raw block-device size query is unit-tested for its arithmetic and exercised against a real macOS RAM-disk node (`tests/block_device_size.rs`), but not yet against a real Linux `/dev/nvme` device (needs a root loop-device CI job).
+- Wire-decoder fuzzing runs as a seeded in-tree smoke test on every CI run; the deep `cargo-fuzz` target (`fuzz/`) is run manually rather than on a scheduled nightly job.
 
 **License.** Open BSV License Version 6 — see [`LICENSE`](LICENSE). Not yet certified for production deployment.
 

@@ -47,7 +47,7 @@ pub enum ColdDataRef {
     /// `content_hash` on the record would remain zero and any subsequent
     /// integrity check on the blob payload would either trivially pass (if the
     /// reader compares against zero) or trivially fail (if the reader compares
-    /// against the real digest). See R-048 / AUDIT.md IJK-01 for the
+    /// against the real digest). See R-048 for the
     /// regression this prevents.
     External { digest: BlobDigest },
     /// No cold data.

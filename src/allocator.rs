@@ -1393,7 +1393,7 @@ impl SlotAllocator {
     /// `allocate`/`free` paths already trigger promotion at the same
     /// threshold, so this matches the realistic insertion shape.
     /// Without it, seeding 65 537 entries cost ~17 s in debug; with it,
-    /// the same loop is sub-second. See `_review/08_test_perf_audit.md`.
+    /// the same loop is sub-second.
     #[doc(hidden)]
     pub fn __test_force_push_free_region(&mut self, offset: u64, size: u64) {
         self.freelist.insert(offset, size);
