@@ -196,6 +196,35 @@ pub enum ConfigError {
     )]
     StrictAuthRequiresSecret,
 
+    /// E-2: the `cluster_secret` seen by the TCP server (from
+    /// [`ServerConfig`]) does not match the one the attached
+    /// [`crate::cluster::coordinator::RunningCluster`] uses for inter-node
+    /// HMAC.
+    ///
+    /// These are two independently-populated copies of the same shared
+    /// secret. Production TOML loading derives both from the same field, but
+    /// programmatic construction (notably tests) can set one and leave the
+    /// other `None`/different. When that happens the server signs client and
+    /// inter-node *responses* with one secret while topology / replication
+    /// proposals expect the other — every HMAC verification fails forever
+    /// with no surfaced error, manifesting as a silent cluster-formation
+    /// hang. A money store must fail closed at startup instead, so this is a
+    /// hard refuse whenever clustering is active (the cluster is attached and
+    /// the deployment is multi-node).
+    #[error(
+        "cluster_secret mismatch: the TCP server's secret (ServerConfig, {server_state}) \
+         differs from the attached cluster coordinator's secret (ClusterConfig, \
+         {cluster_state}); both must carry the identical shared secret or inter-node \
+         HMAC verification fails silently forever. Set cluster_secret once and derive \
+         both copies from it"
+    )]
+    ClusterSecretMismatch {
+        /// Human-readable state of the server-side secret (`"set"` / `"unset"`).
+        server_state: &'static str,
+        /// Human-readable state of the cluster-side secret (`"set"` / `"unset"`).
+        cluster_state: &'static str,
+    },
+
     /// One of the sizing knobs is zero, not a power of 2 where required, or
     /// otherwise out of range. See F-G10-005.
     #[error("invalid sizing config: {0}")]
@@ -1334,6 +1363,54 @@ impl ServerConfig {
     }
 }
 
+/// E-2: cross-check that the `cluster_secret` the TCP server signs with
+/// (from [`ServerConfig`]) is byte-identical to the one the attached
+/// [`crate::cluster::coordinator::RunningCluster`] uses for inter-node HMAC.
+///
+/// The two secrets are independently-populated copies. `ServerConfig::validate`
+/// cannot perform this check because it has no view of the running cluster —
+/// the coordinator is constructed separately and attached via
+/// `Server::with_cluster`. This guard runs at the boundary where both are
+/// finally known (server startup) and fails closed with a typed error so a
+/// split secret surfaces loudly at startup instead of as a silent
+/// cluster-formation hang.
+///
+/// The check only fires when clustering is actually active: a cluster is
+/// attached (`cluster_attached`) AND the deployment is multi-node
+/// (`multi_node`, i.e. `node_id > 0` OR `replication_factor > 1`). A true
+/// single-node deployment never exchanges authenticated inter-node frames, so
+/// a stray cluster handle with no secret is harmless there and must not block
+/// startup.
+///
+/// Empty secrets are normalized to "unset" (`None`-equivalent) so a degenerate
+/// `Some(b"")` on one side and `None` on the other are treated as a match, not
+/// a mismatch — both mean "no HMAC". Returns [`ConfigError::ClusterSecretMismatch`]
+/// when the effective secrets differ.
+pub(crate) fn check_cluster_secret_agreement(
+    server_secret: Option<&[u8]>,
+    cluster_secret: Option<&[u8]>,
+    cluster_attached: bool,
+    multi_node: bool,
+) -> std::result::Result<(), ConfigError> {
+    if !(cluster_attached && multi_node) {
+        return Ok(());
+    }
+    // Normalize empty -> None so "unset" and "explicitly empty" compare equal.
+    fn normalize(s: Option<&[u8]>) -> Option<&[u8]> {
+        s.filter(|bytes| !bytes.is_empty())
+    }
+    let server = normalize(server_secret);
+    let cluster = normalize(cluster_secret);
+    if server != cluster {
+        let describe = |s: Option<&[u8]>| if s.is_some() { "set" } else { "unset" };
+        return Err(ConfigError::ClusterSecretMismatch {
+            server_state: describe(server),
+            cluster_state: describe(cluster),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2040,6 +2117,124 @@ replication_factor = 1
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         cfg.validate_safe_defaults()
             .expect("true single-node mode needs no cluster_secret");
+    }
+
+    // E-2: cross-check between the server's secret (ServerConfig) and the
+    // attached cluster's secret (ClusterConfig). A split — set in one, absent
+    // or different in the other — must fail closed at startup instead of
+    // hanging cluster formation forever on silent HMAC failures.
+
+    #[test]
+    fn split_cluster_secret_server_only_is_rejected() {
+        // Server signs with a secret; cluster has none. Inter-node responses
+        // would be signed while proposals expect no signature -> silent hang.
+        let err = check_cluster_secret_agreement(
+            Some(b"0123456789abcdef"),
+            None,
+            /* cluster_attached */ true,
+            /* multi_node */ true,
+        )
+        .expect_err("server secret set but cluster secret unset must be rejected");
+        match err {
+            ConfigError::ClusterSecretMismatch {
+                server_state,
+                cluster_state,
+            } => {
+                assert_eq!(server_state, "set");
+                assert_eq!(cluster_state, "unset");
+            }
+            other => panic!("expected ClusterSecretMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_cluster_secret_cluster_only_is_rejected() {
+        let err = check_cluster_secret_agreement(
+            None,
+            Some(b"0123456789abcdef"),
+            true,
+            true,
+        )
+        .expect_err("cluster secret set but server secret unset must be rejected");
+        match err {
+            ConfigError::ClusterSecretMismatch {
+                server_state,
+                cluster_state,
+            } => {
+                assert_eq!(server_state, "unset");
+                assert_eq!(cluster_state, "set");
+            }
+            other => panic!("expected ClusterSecretMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn differing_cluster_secrets_are_rejected() {
+        let err = check_cluster_secret_agreement(
+            Some(b"secret-aaaaaaaaa"),
+            Some(b"secret-bbbbbbbbb"),
+            true,
+            true,
+        )
+        .expect_err("two different secrets must be rejected");
+        match err {
+            ConfigError::ClusterSecretMismatch {
+                server_state,
+                cluster_state,
+            } => {
+                assert_eq!(server_state, "set");
+                assert_eq!(cluster_state, "set");
+            }
+            other => panic!("expected ClusterSecretMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matching_cluster_secrets_are_accepted() {
+        check_cluster_secret_agreement(
+            Some(b"0123456789abcdef"),
+            Some(b"0123456789abcdef"),
+            true,
+            true,
+        )
+        .expect("identical secrets must agree");
+    }
+
+    #[test]
+    fn empty_and_unset_secrets_are_treated_as_equal() {
+        // Some(b"") on one side and None on the other both mean "no HMAC"
+        // and must not be flagged as a mismatch.
+        check_cluster_secret_agreement(Some(b""), None, true, true)
+            .expect("empty server secret and unset cluster secret both mean no HMAC");
+        check_cluster_secret_agreement(None, Some(b""), true, true)
+            .expect("unset server secret and empty cluster secret both mean no HMAC");
+    }
+
+    #[test]
+    fn single_node_skips_cluster_secret_cross_check() {
+        // Not multi-node: a stray cluster handle with a mismatched secret is
+        // harmless because no authenticated inter-node frames flow. Must not
+        // block startup.
+        check_cluster_secret_agreement(
+            Some(b"server-secret-aaa"),
+            None,
+            /* cluster_attached */ true,
+            /* multi_node */ false,
+        )
+        .expect("single-node deployment must not run the cross-check");
+    }
+
+    #[test]
+    fn no_cluster_attached_skips_cross_check() {
+        // No cluster coordinator attached: the server's secret is only used
+        // for client-facing signing; there is no second copy to disagree.
+        check_cluster_secret_agreement(
+            Some(b"server-secret-aaa"),
+            None,
+            /* cluster_attached */ false,
+            /* multi_node */ true,
+        )
+        .expect("with no cluster attached there is nothing to cross-check");
     }
 
     #[test]

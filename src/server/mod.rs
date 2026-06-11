@@ -303,8 +303,38 @@ impl Server {
         self
     }
 
+    /// E-2: verify the `cluster_secret` the server signs with (from
+    /// [`ServerConfig`]) agrees with the one the attached cluster coordinator
+    /// uses for inter-node HMAC.
+    ///
+    /// These are two independently-populated copies. If they diverge — easy to
+    /// do in programmatic construction by setting only one — the server signs
+    /// responses with one secret while topology / replication proposals expect
+    /// the other, so every HMAC verification fails forever with no surfaced
+    /// error (a silent cluster-formation hang). Failing closed here turns that
+    /// silent hang into a loud typed error at startup. Returns the stringified
+    /// [`ConfigError::ClusterSecretMismatch`] when the secrets disagree and
+    /// clustering is active.
+    fn validate_cluster_secret_agreement(&self) -> Result<(), String> {
+        let server_secret = self.config.cluster_secret.as_ref().map(|s| s.as_bytes());
+        let cluster_secret = self.cluster.as_ref().and_then(|c| c.cluster_secret());
+        let multi_node = self.config.is_clustered() || self.config.replication_factor > 1;
+        crate::config::check_cluster_secret_agreement(
+            server_secret,
+            cluster_secret,
+            self.cluster.is_some(),
+            multi_node,
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// Start listening for client connections. Blocks until shutdown.
     pub fn run(&self) -> Result<(), String> {
+        // E-2: fail closed before binding if the server's cluster_secret and
+        // the attached coordinator's secret disagree — otherwise inter-node
+        // HMAC silently fails forever and cluster formation hangs.
+        self.validate_cluster_secret_agreement()?;
+
         // P1.2: bind once with the std listener (it owns the SO_REUSEADDR /
         // bind-error reporting we already surface in tests), then convert
         // to a mio source. mio requires the FD to be non-blocking, which

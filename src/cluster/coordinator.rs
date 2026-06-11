@@ -6658,6 +6658,35 @@ impl RunningCluster {
                 &cluster_id,
                 &new_members,
             ),
+            // E-4 — THREAT-MODEL DECISION (trust authenticated peers by design):
+            //
+            // `voters` is set to the full surviving-member set even though NO
+            // votes were actually collected. This trivially satisfies
+            // `TopologyCommit::has_quorum_voter_proof` (voters ⊇ majority of
+            // members), so survivors accept the drain without a real round of
+            // ratification. This is INTENTIONAL and SAFE under the current
+            // threat model:
+            //
+            //   * The trust boundary is cluster *membership*: every peer that
+            //     receives this commit has already authenticated via the shared
+            //     `cluster_secret` HMAC (see `send_topology_frame` below). An
+            //     unauthenticated party cannot inject it.
+            //   * The fabricated voter list carries NO cryptographic proof of an
+            //     old-majority ratification, so it is deliberately NOT trusted to
+            //     lower the peak-derived quorum floor (E-01). The peak is never
+            //     lowered here — see the method-level doc. A drain therefore
+            //     cannot manufacture split-brain authority; the worst it can do
+            //     is shrink the live member set, which is exactly graceful drain.
+            //   * SWIM-membership-loss remnants never fabricate commits; only an
+            //     operator-initiated quiesce on an authenticated node does.
+            //
+            // WHAT WOULD HAVE TO CHANGE if the threat model ever included a
+            // *malicious authenticated* member shipping a shrinking commit: this
+            // fabricated voter list would have to be replaced by a real collected
+            // quorum of signed votes (or each voter entry carry its own signature
+            // that `has_quorum_voter_proof` verifies), so a single member could
+            // not unilaterally remove others. Until then, authenticated peers are
+            // trusted to drain themselves.
             voters: new_members.clone(),
         };
         // Apply locally first.
@@ -7944,6 +7973,74 @@ mod tests {
         );
         assert_eq!(cluster.inbound_pending_count(), 0);
         assert_eq!(cluster.fenced_shard_count(), 0);
+    }
+
+    /// E-4: pin the intended graceful-drain trust model. `quiesce()`
+    /// fabricates a `TopologyCommit` whose `voters` list trivially satisfies
+    /// `has_quorum_voter_proof` without collecting real votes — by design, it
+    /// trusts authenticated peers. This test locks in that the fabricated
+    /// commit is *accepted* by the topology authority (it shrinks the cluster
+    /// as designed) AND that the safety floor it must NOT touch — the
+    /// peak-derived quorum — stays put. A future refactor that accidentally
+    /// breaks graceful drain (e.g. the fabricated commit stops satisfying the
+    /// proof, so `handle_commit` silently drops it) fails here loudly; a
+    /// refactor that wrongly lets the drain lower the peak also fails here.
+    #[test]
+    fn quiesce_fabricated_commit_is_accepted_and_preserves_peak_floor() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 4);
+        let live_nodes = [
+            (NodeId(1), "127.0.0.1:12001".parse().unwrap()),
+            (NodeId(2), "127.0.0.1:12002".parse().unwrap()),
+            (NodeId(3), "127.0.0.1:12003".parse().unwrap()),
+        ];
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table.clone(),
+            &live_nodes,
+            &members,
+            &[],
+            &[],
+            &[],
+            members.len(),
+        );
+        let peak_before = cluster.topology_authority.peak_cluster_size();
+        assert_eq!(
+            peak_before, 3,
+            "precondition: peak reflects the 3-node cluster size",
+        );
+
+        cluster.quiesce();
+
+        // The fabricated-voter commit must have been ACCEPTED by
+        // `handle_commit` — if `has_quorum_voter_proof` rejected it,
+        // `handle_commit` returns `None` and committed members stay [1,2,3].
+        assert_eq!(
+            cluster.committed_topology_members(),
+            vec![NodeId(2), NodeId(3)],
+            "quiesce's fabricated commit must shrink the committed member set \
+             (proof of acceptance by has_quorum_voter_proof)",
+        );
+        assert_eq!(
+            cluster.committed_topology_term(),
+            table.version + 1,
+            "drain advances the committed term by exactly one",
+        );
+        // The recorded voter set is the fabricated full-survivor list — the
+        // structural signature of the trust-authenticated-peers design.
+        assert_eq!(
+            cluster.topology_authority.committed_voters(),
+            vec![NodeId(2), NodeId(3)],
+            "fabricated voters == surviving members (no real votes collected)",
+        );
+        // The peak-derived quorum floor (E-01) must be UNCHANGED — the drain
+        // is never trusted to lower split-brain safety.
+        assert_eq!(
+            cluster.topology_authority.peak_cluster_size(),
+            peak_before,
+            "quiesce must NEVER lower the peak; the fabricated commit carries \
+             no proof of old-majority ratification",
+        );
     }
 
     #[test]
