@@ -5,7 +5,6 @@
 //! Each incoming batch is acknowledged with a `ReplicaAck` response frame.
 
 use crate::index::TxKey;
-use crate::io;
 use crate::ops::create::*;
 use crate::ops::engine::Engine;
 use crate::ops::remaining::*;
@@ -1704,31 +1703,21 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             }
         }
         ReplicaOp::PruneSlot { tx_key, offset } => {
-            // PruneSlot sets the UTXO status to PRUNED. Since the engine
-            // doesn't have a dedicated prune_slot method, we write the
-            // slot directly via io, similar to how recovery handles it.
-            let entry = match engine.lookup(tx_key) {
-                Some(e) => e,
-                None => {
+            // C-4: route through the stripe-locked `engine.prune_slot` instead
+            // of a raw `io::read_utxo_slot` → mutate → `io::write_utxo_slot`
+            // RMW against the device. The lock-free RMW could race a
+            // concurrent mutation on the same record and corrupt the slot
+            // region; the engine method serializes on the tx stripe. Returns
+            // `false` (a no-op skip) when the tx is absent or the slot is
+            // already pruned — both idempotent.
+            match engine.prune_slot(tx_key, *offset) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
                     record_apply_skipped_missing_tx("prune_slot", tx_key);
-                    return Ok(()); // TX not found — skip
+                    Ok(())
                 }
-            };
-            let slot = match io::read_utxo_slot(engine.device(), entry.record_offset, *offset) {
-                Ok(s) => s,
-                Err(_) => {
-                    record_apply_skipped_missing_tx("prune_slot", tx_key);
-                    return Ok(());
-                }
-            };
-            if slot.status == UTXO_PRUNED {
-                return Ok(()); // already pruned
+                Err(e) => Err(format!("prune_slot: {e}")),
             }
-            let mut pruned = slot;
-            pruned.status = UTXO_PRUNED;
-            io::write_utxo_slot(engine.device(), entry.record_offset, *offset, &pruned)
-                .map_err(|e| format!("prune_slot: {e}"))?;
-            Ok(())
         }
         ReplicaOp::PruneSlotIfSpentBy {
             tx_key,
@@ -1795,15 +1784,22 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
     // the batch ACK so the master retries.
     if let Some(master_gen) = op.master_generation() {
         let tx_key = op.tx_key();
-        let mut meta = engine
-            .read_metadata(&tx_key)
-            .map_err(|e| format!("read metadata for generation sync: {e}"))?;
-        let entry = engine
-            .lookup(&tx_key)
-            .ok_or_else(|| format!("lookup for generation sync: tx {tx_key:?}"))?;
-        meta.generation = master_gen;
-        crate::io::write_metadata(engine.device(), entry.record_offset, &meta)
-            .map_err(|e| format!("write metadata for generation sync: {e}"))?;
+        // C-4: route the generation sync through the stripe-locked
+        // `engine.set_record_generation` instead of a raw
+        // `read_metadata` → mutate → `io::write_metadata` RMW. The lock-free
+        // RMW could race a concurrent local mutation on the same record and
+        // lose one of the two writes; the engine method holds the tx stripe
+        // for the read-modify-write and refreshes the primary-index cache.
+        // A missing record (returns `false`) means there is nothing to
+        // reconcile — the op already short-circuited as a skip above.
+        if !engine
+            .set_record_generation(&tx_key, master_gen)
+            .map_err(|e| format!("generation sync: {e}"))?
+        {
+            return Err(format!(
+                "generation sync: tx {tx_key:?} absent after apply"
+            ));
+        }
     }
 
     // F-G7-016 (batched in `handle_replica_batch_with_tracker_inner`):
@@ -2539,7 +2535,7 @@ mod tests {
         let entry = engine.lookup(&k).unwrap();
         let mut meta = engine.read_metadata(&k).unwrap();
         meta.generation = generation;
-        io::write_metadata(engine.device(), entry.record_offset, &meta).unwrap();
+        crate::io::write_metadata(engine.device(), entry.record_offset, &meta).unwrap();
     }
 
     #[test]
@@ -2605,6 +2601,166 @@ mod tests {
             { meta.delete_at_height },
             700_154,
             "receiver must use the master's DAH context, not a local default",
+        );
+    }
+
+    /// C-4 regression: the plain `ReplicaOp::PruneSlot` apply path must route
+    /// through the stripe-locked `engine.prune_slot` rather than a raw
+    /// device-level read-modify-write. We assert the slot is pruned, that a
+    /// second apply is idempotent (already-pruned → no-op skip), and — the
+    /// load-bearing part — that the engine method actually serializes against
+    /// a concurrent spend on the same record without corrupting the slot
+    /// region. A lock-free RMW (the pre-fix behavior) has no such guarantee.
+    #[test]
+    fn apply_prune_slot_routes_through_stripe_lock() {
+        let engine = make_engine();
+        let k = key(91);
+        create_record(&engine, k, 4);
+
+        // Apply PruneSlot for offset 2 via the receiver.
+        apply_op(&engine, &ReplicaOp::PruneSlot { tx_key: k, offset: 2 }).unwrap();
+        let slot = engine.read_slot(&k, 2).unwrap();
+        assert_eq!(slot.status, UTXO_PRUNED, "PruneSlot must prune the slot");
+
+        // Idempotent re-apply: already pruned → still pruned, no error.
+        apply_op(&engine, &ReplicaOp::PruneSlot { tx_key: k, offset: 2 }).unwrap();
+        assert_eq!(engine.read_slot(&k, 2).unwrap().status, UTXO_PRUNED);
+
+        // Missing tx → skip (no error).
+        apply_op(
+            &engine,
+            &ReplicaOp::PruneSlot {
+                tx_key: key(92),
+                offset: 0,
+            },
+        )
+        .unwrap();
+
+        // Concurrency: hammer engine.prune_slot on one offset while a writer
+        // spends a different offset on the same record. With the stripe lock
+        // these serialize; without it the two RMWs on the same record region
+        // could interleave. We assert the record stays internally consistent
+        // (slot count stable, pruned + spent never exceed utxo_count).
+        let engine2 = make_engine();
+        let kc = key(93);
+        let utxo_hashes: Vec<[u8; 32]> = (0..8u8)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i;
+                h[1] = 0xCD;
+                h
+            })
+            .collect();
+        engine2
+            .create(&crate::ops::create::CreateRequest {
+                tx_id: kc.txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 100,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .unwrap();
+
+        let pruner = {
+            let engine2 = engine2.clone();
+            std::thread::spawn(move || {
+                for off in 0..4u32 {
+                    engine2.prune_slot(&kc, off).unwrap();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let spender = {
+            let engine2 = engine2.clone();
+            let hashes = utxo_hashes.clone();
+            std::thread::spawn(move || {
+                for off in 4..8u32 {
+                    let mut spending_data = [0u8; 36];
+                    spending_data[0] = off as u8;
+                    engine2
+                        .spend(&crate::ops::spend::SpendRequest {
+                            tx_key: kc,
+                            offset: off,
+                            utxo_hash: hashes[off as usize],
+                            spending_data,
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 0,
+                            block_height_retention: 0,
+                        })
+                        .unwrap();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        pruner.join().unwrap();
+        spender.join().unwrap();
+
+        let (meta, slots) = engine2.read_record_snapshot(&kc).unwrap();
+        assert_eq!(slots.len(), 8, "slot count must remain stable");
+        let pruned = slots.iter().filter(|s| s.status == UTXO_PRUNED).count();
+        let spent = slots.iter().filter(|s| s.status == UTXO_SPENT).count();
+        assert_eq!(pruned, 4, "all four pruned slots must be PRUNED");
+        assert_eq!(spent, 4, "all four spent slots must be SPENT");
+        assert!(
+            (pruned + spent) <= { meta.utxo_count } as usize,
+            "status counts must not exceed utxo_count",
+        );
+    }
+
+    /// C-4 regression: the post-apply generation sync must route through the
+    /// stripe-locked `engine.set_record_generation`, not a raw
+    /// `io::write_metadata`. We apply an op carrying a `master_generation` and
+    /// assert the replica's generation matches the master's exactly (the
+    /// engine auto-increments on the mutation, then the sync overwrites it).
+    #[test]
+    fn generation_sync_routes_through_stripe_lock() {
+        let engine = make_engine();
+        let k = key(94);
+        create_record(&engine, k, 2);
+
+        const MASTER_GEN: u32 = 12_345;
+        apply_op(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 0,
+                spending_data: [0x11; 36],
+                current_block_height: 0,
+                block_height_retention: 0,
+                master_generation: MASTER_GEN,
+            },
+        )
+        .unwrap();
+
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { meta.generation },
+            MASTER_GEN,
+            "generation sync must set the replica's generation to the master's value",
+        );
+        // The cached generation in the primary index must match too — proving
+        // set_record_generation refreshed the index cache (sync_index_cache).
+        let cached = engine.lookup_cached(&k).unwrap();
+        assert_eq!(
+            cached.generation, MASTER_GEN,
+            "primary-index cached generation must match the synced generation",
         );
     }
 

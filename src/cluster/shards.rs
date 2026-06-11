@@ -306,9 +306,20 @@ impl ShardTable {
     ///
     /// Prefer `compute_with_epoch` in production; this exists for
     /// backward compatibility in tests and bootstrap paths.
+    ///
+    /// F-6: the version hash is computed over a **sorted** member list so it
+    /// depends only on the *set* of members, not the caller's argument order.
+    /// Pre-fix the hash folded each member weighted by its caller-order index
+    /// (`m * (i + 1)`), so `[1, 2]` and `[2, 1]` — the same membership —
+    /// produced different versions, which could spuriously look like a
+    /// topology change. Sorting makes the version order-independent. The
+    /// assignment itself (in `compute_with_epoch`) already sorts members
+    /// internally, so this only fixes the version label.
     pub fn compute(members: &[NodeId], replication_factor: u8) -> Self {
+        let mut sorted: Vec<NodeId> = members.to_vec();
+        sorted.sort_unstable_by_key(|n| n.0);
         let mut version_hash: u64 = 0;
-        for (i, m) in members.iter().enumerate() {
+        for (i, m) in sorted.iter().enumerate() {
             version_hash = version_hash.wrapping_add(m.0.wrapping_mul(i as u64 + 1));
         }
         Self::compute_with_epoch(members, replication_factor, version_hash)
@@ -603,6 +614,29 @@ mod tests {
         assert_eq!(t1.version, t2.version);
         for i in 0..NUM_SHARDS {
             assert_eq!(t1.assignments[i], t2.assignments[i]);
+        }
+    }
+
+    /// F-6 regression: `compute`'s version hash must depend only on the SET of
+    /// members, not the caller's argument order. Pre-fix the hash weighted each
+    /// member by its index (`m * (i + 1)`), so a permutation of the same set
+    /// produced a different version — making an unchanged membership look like
+    /// a topology change. The assignments were already order-independent
+    /// (compute_with_epoch sorts internally); this pins the version label too.
+    #[test]
+    fn compute_version_is_order_independent() {
+        let a = ShardTable::compute(&nodes(&[1, 2, 3]), 2);
+        let b = ShardTable::compute(&nodes(&[3, 1, 2]), 2);
+        let c = ShardTable::compute(&nodes(&[2, 3, 1]), 2);
+        assert_eq!(
+            a.version, b.version,
+            "permuted member list must yield the same version",
+        );
+        assert_eq!(a.version, c.version, "version must be permutation-invariant");
+        // And the assignments must match too (already true, but assert it).
+        for i in 0..NUM_SHARDS {
+            assert_eq!(a.assignments[i], b.assignments[i]);
+            assert_eq!(a.assignments[i], c.assignments[i]);
         }
     }
 

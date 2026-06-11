@@ -251,26 +251,63 @@ pub struct MigrationProgress {
 }
 ```
 
-Migration procedure (outbound — sending shard to new owner):
-1. Scan the index for all records belonging to this shard
-2. For each record:
-   a. Read the full record from device (metadata + all UTXO slots + cold data)
-   b. Send to the target node as a Create ReplicaOp
-   c. Mark the shard locally as "migrating to B"
-3. After all records sent:
-   a. Send a "migration complete" message
-   b. Remove the shard from local ownership
-   c. Delete migrated records (return space to allocator)
+Migration procedure (outbound — sending shard to new owner), as implemented in
+`src/cluster/coordinator.rs` (`run_migration_batch` + the fence/delta/manifest
+helpers):
 
-#### Write proxying during migration
+1. **Baseline stream**: scan the index for the shard's keys and stream each
+   record (metadata + all UTXO slots + cold data) to target node B as a Create
+   ReplicaOp over a single pooled TCP session. The read of each record is taken
+   under the per-tx stripe lock (C-3) so the snapshot is generation-consistent.
+   While baseline streaming runs, the shard is marked "migrating outbound" and
+   the **dual-write window** for it is open (see below).
+2. **Fence**: briefly fence the shard on node A so no new write commits during
+   the final catch-up. Fenced writes are *rejected with a retryable error*, not
+   redirected (see below).
+3. **Delta replay**: replay the redo-log entries written between the baseline
+   snapshot and the fence point (`send_delta_ops`) so B catches the in-flight
+   tail.
+4. **Manifest handshake**: A sends an `OP_MIGRATION_COMPLETE` frame carrying a
+   record manifest hash (txid XOR generation, order-independent). B verifies its
+   local manifest matches before accepting ownership; a mismatch aborts the
+   handoff rather than committing divergent state.
+5. **Commit + unfence**: on a verified manifest, commit the shard-table handoff,
+   lift the fence, close the dual-write window, and (for outbound) free the
+   migrated records' space.
+
+#### Write handling during migration
 
 During migration of shard S from node A (old master) to node B (new master):
 
-- **Reads arriving at node A**: served locally (node A still has the data).
-- **Writes arriving at node A**: node A returns a **Redirect** response pointing the client to node B. The client re-sends the write directly to B. There is no server-side proxying — the Redirect tells the client where to go, keeping the hot path free of extra hops.
-- **Why Redirect instead of proxy**: At millions of ops/sec, forwarding writes through an intermediary would add latency and create a bottleneck on the old master. A Redirect is a single small response; the client contacts B directly for the actual write.
+- **Reads arriving at node A**: served locally — node A still holds the data
+  throughout the outbound migration (`is_migrating_outbound` ⇒ handle locally).
+  There is **no read wait loop**; a read on a shard whose inbound data is not
+  yet present returns `ERR_MIGRATION_IN_PROGRESS` immediately so the client
+  retries.
+- **Writes arriving at node A (dual-write window)**: A applies the write locally
+  AND fans it out to B (the dual-write targets), so B stays consistent with
+  every write that lands mid-migration. The replication classifier enforces a
+  per-set ACK invariant — a write touching a migrating shard cannot succeed
+  unless at least one dual-write target ACKs — so B can never silently miss a
+  mid-migration write.
+- **Writes during the final fence window**: rejected with the retryable
+  `ERR_MIGRATION_IN_PROGRESS` (the client backs off and retries). This is a
+  short window covering only delta replay + the manifest handshake. A new master
+  B that has not yet received its inbound baseline likewise returns
+  `ERR_MIGRATION_IN_PROGRESS` for writes it does not yet own.
+- **Master address unknown**: if routing names a remote master whose address is
+  not yet known to this node, the dispatcher returns the retryable
+  `ERR_NO_QUORUM` ("master unknown, retry") rather than an empty-address
+  redirect (F-4).
 
-Once migration completes and node A removes shard S from its table, both reads and writes for shard S go exclusively to node B.
+Note: the earlier design sketched a plain client **Redirect** for every write
+during migration. The shipped protocol uses fence + dual-write + manifest
+verification instead, which keeps B consistent without a client round-trip per
+write and prevents a torn handoff. Plain `ERR_REDIRECT` is still used for the
+steady-state case where this node simply is not the master for a key.
+
+Once migration completes and node A removes shard S from its table, both reads
+and writes for shard S go exclusively to node B.
 
 ### 9.5 Client routing info — `src/cluster/routing.rs`
 

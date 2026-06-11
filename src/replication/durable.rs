@@ -812,19 +812,37 @@ pub fn run_catchup_for_replica(
 // Background lag monitor
 // ---------------------------------------------------------------------------
 
+/// Callback invoked by the lag monitor for a replica whose lag exceeds the
+/// catch-up threshold. Receives the replica address, its last-acked redo
+/// sequence, and the master's current redo sequence. Implementations should
+/// run one bounded catch-up pass for the replica (e.g. via
+/// [`run_catchup_for_replica`]) and persist the new ACK position; the lag
+/// monitor will re-invoke it on subsequent ticks until the replica converges.
+pub type OnLaggingReplica = std::sync::Arc<dyn Fn(SocketAddr, u64, u64) + Send + Sync>;
+
 /// Spawn a background thread that periodically checks replica lag.
 ///
 /// Every `interval` seconds, reads the per-replica `last_acked` from the
 /// tracker and compares against the current master sequence. Logs a
 /// warning when lag exceeds `warn_threshold` ops.
 ///
+/// D-7/D-8 runtime catch-up: when `on_lagging` is `Some` and a replica's lag
+/// exceeds `catchup_threshold` ops, the callback is invoked for that replica
+/// on this tick. The callback runs one bounded catch-up pass; because the
+/// monitor re-evaluates lag every interval, a replica that fell behind while
+/// the master stayed up converges over successive ticks without any spinning
+/// loop or master restart. Passing `None` preserves the warn-only behavior.
+///
 /// Returns a join handle. The thread runs until `shutdown` is set to true.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_lag_monitor(
     tracker: &'static AckTracker,
     current_seq_fn: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     interval_secs: u64,
     warn_threshold: u64,
+    catchup_threshold: u64,
+    on_lagging: Option<OnLaggingReplica>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let interval = std::time::Duration::from_secs(interval_secs);
@@ -845,6 +863,17 @@ pub fn spawn_lag_monitor(
                         master_seq,
                         "replication: replica lag exceeds threshold",
                     );
+                }
+                // D-7/D-8: drive runtime catch-up for replicas that have
+                // fallen behind the catch-up threshold. One bounded pass per
+                // tick; the monitor re-checks lag next interval, so the
+                // replica converges across ticks. Re-check `shutdown` so we
+                // do not start a fresh pass while tearing down.
+                if let Some(cb) = on_lagging.as_ref()
+                    && lag > catchup_threshold
+                    && !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    cb(*addr, *last_acked, master_seq);
                 }
             }
         }
@@ -990,6 +1019,8 @@ mod tests {
             // that the test does not hammer.
             1,
             u64::MAX, // suppress any warn lines — we test polling, not logs
+            u64::MAX, // no catch-up: this test pins only the polling contract
+            None,
         );
 
         // Wait up to 5 seconds for at least one poll, then trigger
@@ -1013,6 +1044,139 @@ mod tests {
         assert!(
             poll_count.load(std::sync::atomic::Ordering::Relaxed) >= 1,
             "lag monitor must call current_seq_fn at least once before shutdown",
+        );
+    }
+
+    /// D-7/D-8 regression: the lag monitor must drive runtime catch-up for a
+    /// replica that fell behind while the master stayed up. Pre-fix the
+    /// monitor was warn-only, so a lagging replica was never repaired until
+    /// the master restarted. This test seeds a replica far behind a static
+    /// master sequence and asserts that (1) the `on_lagging` callback is
+    /// invoked (proving the trigger fires), and (2) when the callback advances
+    /// the replica's ACK toward the master, the monitor converges and stops
+    /// invoking the callback. With the old (warn-only) signature this test
+    /// would not compile, and a monitor that ignored the callback would never
+    /// converge.
+    #[test]
+    fn lag_monitor_drives_catchup_to_convergence() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let tracker_box: Box<AckTracker> = Box::new(AckTracker::new(path));
+        let tracker_static: &'static AckTracker = Box::leak(tracker_box);
+        let replica = test_addr(6100);
+        // Replica starts 95 ops behind the master (master = 100).
+        tracker_static.record_ack(replica, 5);
+
+        const MASTER_SEQ: u64 = 100;
+        let current_seq_fn: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
+            std::sync::Arc::new(|| MASTER_SEQ);
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Count callback invocations. The callback simulates a successful
+        // catch-up pass: production `run_catchup_for_replica` streams up to
+        // `max_ops_per_pass` (10k) entries per pass — far more than this
+        // test's 95-op gap — so a single triggered pass closes the gap and
+        // records the master sequence back into the tracker. We clamp the
+        // step at `master` to model the bounded read.
+        let invocations = std::sync::Arc::new(AtomicU64::new(0));
+        let invocations_cb = invocations.clone();
+        let on_lagging: OnLaggingReplica =
+            std::sync::Arc::new(move |addr: SocketAddr, last_acked: u64, master: u64| {
+                invocations_cb.fetch_add(1, Ordering::Relaxed);
+                // A single bounded pass closes the gap up to the master.
+                let next = (last_acked + 10_000).min(master);
+                tracker_static.record_ack(addr, next);
+            });
+
+        let handle = spawn_lag_monitor(
+            tracker_static,
+            current_seq_fn,
+            shutdown.clone(),
+            1,         // 1s interval
+            u64::MAX,  // suppress warn lines
+            10,        // catch-up threshold: 10 ops
+            Some(on_lagging),
+        );
+
+        // Wait until the replica converges (last_acked reaches master) or the
+        // deadline. One pass closes the gap; allow generous slack for the
+        // first tick under CI noise.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if tracker_static.last_acked(&replica) >= MASTER_SEQ {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let converged_acked = tracker_static.last_acked(&replica);
+        let converged_invocations = invocations.load(Ordering::Relaxed);
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("lag monitor must exit cleanly");
+
+        assert_eq!(
+            converged_acked, MASTER_SEQ,
+            "lag monitor must drive the replica to full convergence via catch-up",
+        );
+        assert!(
+            converged_invocations >= 1,
+            "catch-up callback must have been invoked at least once",
+        );
+        // After convergence the lag (0) is below the threshold, so no further
+        // invocations occur — bound the total to a couple of ticks of slack,
+        // proving the loop drives catch-up but does not spin.
+        assert!(
+            converged_invocations <= 4,
+            "catch-up must converge in a bounded number of passes, not spin (got {converged_invocations})",
+        );
+    }
+
+    /// D-7/D-8 counter-case: the pre-fix behavior (warn-only monitor, i.e.
+    /// `on_lagging = None`) must NOT repair a lagging replica. This pins the
+    /// regression so a future change that accidentally drops the callback is
+    /// caught: with no callback the seeded replica stays exactly where it was
+    /// even after several monitor ticks against a far-ahead master.
+    #[test]
+    fn lag_monitor_without_callback_leaves_replica_behind() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        let tracker_box: Box<AckTracker> = Box::new(AckTracker::new(path));
+        let tracker_static: &'static AckTracker = Box::leak(tracker_box);
+        let replica = test_addr(6200);
+        tracker_static.record_ack(replica, 5);
+
+        let current_seq_fn: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
+            std::sync::Arc::new(|| 100);
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handle = spawn_lag_monitor(
+            tracker_static,
+            current_seq_fn,
+            shutdown.clone(),
+            1,
+            u64::MAX,
+            10,
+            None, // warn-only: the pre-fix behavior
+        );
+
+        // Let the monitor run a few ticks.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        let acked = tracker_static.last_acked(&replica);
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("lag monitor must exit cleanly");
+
+        assert_eq!(
+            acked, 5,
+            "warn-only monitor must leave the lagging replica unrepaired (got {acked})",
         );
     }
 

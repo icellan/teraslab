@@ -4111,484 +4111,6 @@ fn cleanup_orphaned_shard_if_settled(
     }
 }
 
-/// Migrate a single shard: baseline → fence → deltas → complete handshake.
-///
-/// Checks the shard table version before fencing and before the complete
-/// handshake. If the topology has changed (epoch advanced), the migration
-/// is aborted early — the new topology's coordinator will re-plan.
-///
-/// Returns `true` if the shard was migrated successfully, `false` if it failed.
-/// On failure the TCP stream may be broken and should be reconnected by the caller.
-///
-/// Kept as reference for the per-shard migration flow with redo-log delta
-/// replay. The production path is `run_migration_batch`, which pipelines
-/// baseline + late-key streaming + manifest handshake in one TCP session
-/// across many shards.
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-fn migrate_single_shard(
-    task: &MigrationTask,
-    keys_by_shard: &std::collections::HashMap<u16, Vec<&TxKey>>,
-    engine: &Engine,
-    migration: &Arc<Mutex<MigrationManager>>,
-    shard_table: &Arc<ShardTableLock<ShardTable>>,
-    redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
-    stream: &mut TcpStream,
-    addr: SocketAddr,
-    completed: &Arc<std::sync::atomic::AtomicU32>,
-    failed: &Arc<std::sync::atomic::AtomicU32>,
-    topology_epoch: u64,
-    batch_size: usize,
-    fenced_bm: &crate::cluster::migration::AtomicShardBitmap,
-    migrating_bm: &crate::cluster::migration::AtomicShardBitmap,
-    auth_secret: Option<&[u8]>,
-) -> bool {
-    let empty_vec = Vec::new();
-    let shard_keys = keys_by_shard.get(&task.shard).unwrap_or(&empty_vec);
-    let empty_manifest = compute_manifest_for_entries(&[]);
-
-    // Helper: mark task failed, rollback shard table, sync bitmaps.
-    let fail_shard = |migration: &Arc<Mutex<MigrationManager>>,
-                      shard_table: &Arc<ShardTableLock<ShardTable>>,
-                      failed: &Arc<std::sync::atomic::AtomicU32>,
-                      clear_target_inbound: bool| {
-        debug_shard_log(
-            task.shard,
-            format!(
-                "fail from={} to={} is_master={}",
-                task.from_node.0, task.to_node.0, task.is_master,
-            ),
-        );
-        if clear_target_inbound {
-            let _ = send_migration_complete(
-                addr,
-                task.shard,
-                task.from_node,
-                0,
-                0,
-                0,
-                None,
-                &empty_manifest,
-                &[],
-                false,
-                auth_secret,
-            );
-        }
-        let mut mgr = migration.lock();
-        mgr.mark_failed(task);
-        if !mgr.is_shard_fenced(task.shard) {
-            fenced_bm.clear(task.shard);
-        }
-        migrating_bm.clear(task.shard);
-        drop(mgr);
-        shard_table.write().rollback_shard(task.shard);
-        failed.fetch_add(1, Ordering::Relaxed);
-    };
-
-    // Retry loop: up to 3 attempts with exponential backoff for transient
-    // TCP failures. Handoff state resets are non-retryable (abort immediately).
-    const RETRY_DELAYS_MS: [u64; 3] = [0, 50, 200];
-    let mut last_err = String::new();
-
-    for (attempt, &delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
-        if attempt == 0 {
-            debug_shard_log(
-                task.shard,
-                format!(
-                    "start from={} to={} is_master={} snapshot_keys={}",
-                    task.from_node.0,
-                    task.to_node.0,
-                    task.is_master,
-                    shard_keys.len(),
-                ),
-            );
-        }
-        if attempt > 0 {
-            tracing::info!(
-                shard = task.shard,
-                attempt = attempt + 1,
-                delay_ms,
-                "cluster: shard retry attempt",
-            );
-            // Unfence before retry — the fence will be re-set in phase 2.
-            migration.lock().unfence_shard(task.shard);
-            fenced_bm.clear(task.shard);
-            std::thread::sleep(Duration::from_millis(delay_ms));
-        }
-
-        let snapshot_seq = redo_log
-            .as_ref()
-            .map(|rl| {
-                let guard = rl.lock();
-                guard.current_sequence()
-            })
-            .unwrap_or(0);
-        {
-            let mut mgr = migration.lock();
-            mgr.set_snapshot_sequence(task, snapshot_seq);
-        }
-
-        // Phase 1: baseline
-        let _baseline_manifest = match stream_shard_baseline(
-            task,
-            shard_keys,
-            engine,
-            stream,
-            batch_size,
-            topology_epoch,
-            auth_secret,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                last_err = format!("baseline: {e}");
-                if attempt < 2 {
-                    continue;
-                }
-                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
-                fail_shard(migration, shard_table, failed, true);
-                return false;
-            }
-        };
-
-        // Handoff state check: if the shard has already been committed or
-        // rolled back (ServingNew), abort — a newer topology has superseded
-        // this migration.  But if the shard is still in Copying/CommitReady,
-        // the migration is still valid even if the epoch was bumped by a
-        // re-activation, so continue.
-        {
-            let table = shard_table.read();
-            let handoff = table.shard_handoff_state(task.shard);
-            if handoff == ShardHandoff::ServingNew {
-                tracing::info!(
-                    shard = task.shard,
-                    "cluster: shard migration aborted — shard already committed/rolled back"
-                );
-                drop(table);
-                // Shard is already being served by the new master. Send
-                // OP_MIGRATION_COMPLETE to the RECEIVER so it clears the
-                // inbound entry and stops blocking writes. Use record_count=0
-                // to signal this is a no-data completion.
-                let _ = send_migration_complete(
-                    addr,
-                    task.shard,
-                    task.from_node,
-                    0,
-                    0,
-                    0,
-                    None,
-                    &empty_manifest,
-                    &[],
-                    false,
-                    auth_secret,
-                );
-                fail_shard(migration, shard_table, failed, false);
-                return false;
-            }
-        }
-
-        // Phase 2: Fence writes BEFORE capturing the redo sequence.
-        // This guarantees no write can slip through between the sequence
-        // capture and the fence. Any write that arrives between the
-        // baseline snapshot and the fence is captured in the delta stream.
-        let fence_seq;
-        {
-            let mut mgr = migration.lock();
-            mgr.fence_shard(task.shard);
-            fenced_bm.set(task.shard);
-            drop(mgr);
-        }
-        // Drain in-flight writes: acquire and release the redo lock to
-        // ensure any write that started before the fence has committed its
-        // redo entry.
-        {
-            fence_seq = redo_log
-                .as_ref()
-                .map(|rl| {
-                    let guard = rl.lock();
-                    guard.current_sequence()
-                })
-                .unwrap_or(0);
-            let mut mgr = migration.lock();
-            mgr.mark_fenced(task, fence_seq);
-        }
-
-        let snapshot_keys: std::collections::HashSet<TxKey> =
-            shard_keys.iter().copied().copied().collect();
-        // Fast check: if the shard record count matches the snapshot,
-        // no new keys appeared during the baseline and we can skip
-        // the expensive full index scan for late keys.
-        let fenced_count = engine.shard_record_count(task.shard);
-        let mut fenced_keys = if fenced_count as usize == snapshot_keys.len() {
-            shard_keys.iter().map(|k| **k).collect::<Vec<TxKey>>()
-        } else {
-            engine.keys_for_shard(task.shard)
-        };
-        let late_keys: Vec<TxKey> = fenced_keys
-            .iter()
-            .copied()
-            .filter(|k| !snapshot_keys.contains(k))
-            .collect();
-        debug_shard_log(
-            task.shard,
-            format!(
-                "fenced snapshot_keys={} fenced_keys={} late_keys={} snapshot_seq={} fence_seq={}",
-                snapshot_keys.len(),
-                fenced_keys.len(),
-                late_keys.len(),
-                snapshot_seq,
-                fence_seq,
-            ),
-        );
-        if !late_keys.is_empty() {
-            tracing::info!(
-                shard = task.shard,
-                late_keys = late_keys.len(),
-                "cluster: shard fenced re-scan found missing pre-snapshot keys",
-            );
-            let late_key_refs: Vec<&TxKey> = late_keys.iter().collect();
-            if let Err(e) = stream_shard_baseline(
-                task,
-                &late_key_refs,
-                engine,
-                stream,
-                batch_size,
-                topology_epoch,
-                auth_secret,
-            ) {
-                last_err = format!("late baseline: {e}");
-                if attempt < 2 {
-                    continue;
-                }
-                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
-                fail_shard(migration, shard_table, failed, true);
-                return false;
-            }
-        }
-
-        // Phase 3: Stream deltas (writes between baseline snapshot and fence).
-        // For quiesce migrations where snapshot_seq was not set (== 0),
-        // there's no delta window: the baseline already captured all keys
-        // that existed at activation time, and any writes between activation
-        // and fence are captured here if snapshot_seq > 0.
-        let mut delta_failed = false;
-        match collect_migration_delta_ops(redo_log, snapshot_seq, fence_seq, task.shard, engine) {
-            Ok(delta_ops) => {
-                debug_shard_log(
-                    task.shard,
-                    format!(
-                        "delta_ops={} snapshot_seq={} fence_seq={}",
-                        delta_ops.len(),
-                        snapshot_seq,
-                        fence_seq,
-                    ),
-                );
-                if !delta_ops.is_empty() {
-                    tracing::debug!(
-                        shard = task.shard,
-                        delta_ops = delta_ops.len(),
-                        snapshot_seq,
-                        fence_seq,
-                        "cluster: shard streaming delta ops",
-                    );
-                    if let Err(e) =
-                        send_delta_ops(stream, task.shard, &delta_ops, topology_epoch, auth_secret)
-                    {
-                        tracing::warn!(shard = task.shard, err = %e, "cluster: shard delta streaming failed");
-                        last_err = e;
-                        delta_failed = true;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    shard = task.shard,
-                    err = %e,
-                    "cluster: shard migration must restart due to unavailable redo delta",
-                );
-                last_err = e;
-                delta_failed = true;
-            }
-        }
-        if delta_failed {
-            if attempt < 2 {
-                continue;
-            }
-            tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
-            fail_shard(migration, shard_table, failed, true);
-            return false;
-        }
-
-        let mut known_fenced_keys: std::collections::HashSet<TxKey> =
-            fenced_keys.iter().copied().collect();
-        for pass in 0..3 {
-            // Fast check: if the shard count hasn't changed since the
-            // fence, no new keys appeared and we can skip the full scan.
-            let current_count = engine.shard_record_count(task.shard) as usize;
-            if current_count == known_fenced_keys.len() {
-                break;
-            }
-            let post_delta_keys = engine.keys_for_shard(task.shard);
-            let post_delta_late_keys: Vec<TxKey> = post_delta_keys
-                .iter()
-                .copied()
-                .filter(|k| !known_fenced_keys.contains(k))
-                .collect();
-            if post_delta_late_keys.is_empty() {
-                fenced_keys = post_delta_keys;
-                break;
-            }
-            tracing::info!(
-                shard = task.shard,
-                pass = pass + 1,
-                new_keys = post_delta_late_keys.len(),
-                "cluster: shard post-delta stabilization found newly appeared keys",
-            );
-            let late_key_refs: Vec<&TxKey> = post_delta_late_keys.iter().collect();
-            if let Err(e) = stream_shard_baseline(
-                task,
-                &late_key_refs,
-                engine,
-                stream,
-                batch_size,
-                topology_epoch,
-                auth_secret,
-            ) {
-                last_err = format!("post-delta baseline: {e}");
-                if attempt < 2 {
-                    continue;
-                }
-                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
-                fail_shard(migration, shard_table, failed, true);
-                return false;
-            }
-            known_fenced_keys.extend(post_delta_late_keys.iter().copied());
-            fenced_keys = post_delta_keys;
-            if pass == 2 {
-                tracing::warn!(
-                    shard = task.shard,
-                    "cluster: shard post-delta stabilization did not converge after 3 passes",
-                );
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // Handoff state check before final handshake: if the shard was
-        // committed or rolled back by a newer topology, abort.  Otherwise
-        // continue — the migration is still valid.
-        {
-            let table = shard_table.read();
-            let handoff = table.shard_handoff_state(task.shard);
-            if handoff == ShardHandoff::ServingNew {
-                tracing::info!(
-                    shard = task.shard,
-                    "cluster: shard migration aborted before complete — shard already committed/rolled back"
-                );
-                drop(table);
-                let _ = send_migration_complete(
-                    addr,
-                    task.shard,
-                    task.from_node,
-                    0,
-                    0,
-                    0,
-                    Some(stream),
-                    &empty_manifest,
-                    &[],
-                    false,
-                    auth_secret,
-                );
-                fail_shard(migration, shard_table, failed, false);
-                return false;
-            }
-        }
-
-        // Compute final manifest hash from engine state (post-fence, post-delta).
-        // This is the authoritative fingerprint of the shard's content.
-        // The target will compute the same hash from its local state to verify.
-        let manifest_entries = match collect_manifest_entries(engine, task.shard, &fenced_keys) {
-            Ok(entries) => entries,
-            Err(e) => {
-                last_err = e;
-                if attempt < 2 {
-                    continue;
-                }
-                tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
-                fail_shard(migration, shard_table, failed, true);
-                return false;
-            }
-        };
-        let manifest_hash = compute_manifest_for_entries(&manifest_entries);
-
-        debug_shard_log(
-            task.shard,
-            format!(
-                "handshake from={} to={} fence_seq={} records={} manifest_entries={} epoch={}",
-                task.from_node.0,
-                task.to_node.0,
-                fence_seq,
-                manifest_entries.len(),
-                manifest_entries.len(),
-                topology_epoch,
-            ),
-        );
-        if let Err(e) = send_migration_complete(
-            addr,
-            task.shard,
-            task.from_node,
-            manifest_entries.len() as u64,
-            fence_seq,
-            topology_epoch,
-            Some(stream),
-            &manifest_hash,
-            &manifest_entries,
-            false,
-            auth_secret,
-        ) {
-            last_err = format!("handshake: {e}");
-            if attempt < 2 {
-                continue;
-            }
-            tracing::warn!(shard = task.shard, err = %last_err, "cluster: shard migration failed (final attempt)");
-            fail_shard(migration, shard_table, failed, true);
-            return false;
-        }
-
-        // Success: mark complete and commit.
-        let mut mgr = migration.lock();
-        mgr.mark_complete(task);
-        if !mgr.is_shard_fenced(task.shard) {
-            fenced_bm.clear(task.shard);
-        }
-        migrating_bm.clear(task.shard);
-        drop(mgr);
-        // Two-phase activation: commit this shard so routing switches
-        // from the old master to the new master.
-        let should_commit_local_handoff = {
-            let table = shard_table.read();
-            let target_assignment = table.target_assignment(task.shard);
-            task.is_master
-                || target_assignment.master == task.from_node
-                || target_assignment.replicas.contains(&task.from_node)
-        };
-        debug_shard_log(
-            task.shard,
-            format!(
-                "complete from={} to={} commit_local={} fenced_keys={}",
-                task.from_node.0,
-                task.to_node.0,
-                should_commit_local_handoff,
-                fenced_keys.len(),
-            ),
-        );
-        if should_commit_local_handoff {
-            shard_table.write().commit_shard(task.shard);
-        }
-        completed.fetch_add(1, Ordering::Relaxed);
-        return true; // success — exit retry loop
-    }
-    false // All retries exhausted
-}
-
 /// Stream baseline records for one shard on an existing TCP connection.
 ///
 /// Returns the manifest hash accumulated over all streamed records
@@ -4612,8 +4134,14 @@ fn stream_shard_baseline(
     for chunk in shard_keys.chunks(batch_size) {
         let mut ops = Vec::with_capacity(chunk.len() * 2);
         for key in chunk {
-            let meta = match engine.read_metadata(key) {
-                Ok(meta) => meta,
+            // C-3: read metadata and all slots as one generation-consistent
+            // snapshot under the per-tx stripe lock. A lock-free
+            // read_metadata + per-slot read_slot could observe a torn record
+            // (half-old metadata, half-new slots) if a concurrent mutation
+            // landed mid-scan, drifting the manifest generation and shipping
+            // an inconsistent baseline to the joining replica.
+            let (meta, slots) = match engine.read_record_snapshot(key) {
+                Ok(snapshot) => snapshot,
                 Err(crate::ops::error::SpendError::TxNotFound) => {
                     tracing::debug!(
                         shard = task.shard,
@@ -4624,7 +4152,7 @@ fn stream_shard_baseline(
                 }
                 Err(e) => {
                     return Err(format!(
-                        "baseline read_metadata shard {} key {:?}: {e:?}",
+                        "baseline read_record_snapshot shard {} key {:?}: {e:?}",
                         task.shard, key
                     ));
                 }
@@ -4632,19 +4160,7 @@ fn stream_shard_baseline(
             // Accumulate (txid, generation) into the manifest hash.
             manifest.fold(&key.txid, meta.generation);
 
-            let utxo_count = meta.utxo_count;
-            let mut utxo_hashes = Vec::with_capacity(utxo_count as usize);
-            let mut slots = Vec::with_capacity(utxo_count as usize);
-            for v in 0..utxo_count {
-                let slot = engine.read_slot(key, v).map_err(|e| {
-                    format!(
-                        "baseline read_slot shard {} key {:?} offset {}: {e:?}",
-                        task.shard, key, v
-                    )
-                })?;
-                utxo_hashes.push(slot.hash);
-                slots.push(slot);
-            }
+            let utxo_hashes: Vec<_> = slots.iter().map(|s| s.hash).collect();
 
             // Serialize metadata (70 bytes with extended fields).
             let mut meta_buf = Vec::with_capacity(70);
@@ -5410,9 +4926,8 @@ fn collect_migration_delta_ops(
 
 /// Send delta ReplicaOps to the target on an existing stream and validate ACK.
 ///
-/// Used by both the reference `migrate_single_shard` path and the pipelined
-/// batch migration to close the baseline-to-fence redo window.
-#[allow(dead_code)]
+/// Used by the pipelined batch migration (`run_migration_batch` and the
+/// fenced-delta replay path) to close the baseline-to-fence redo window.
 fn send_delta_ops(
     stream: &mut TcpStream,
     shard: u16,
@@ -7344,6 +6859,145 @@ mod tests {
             .unwrap();
     }
 
+    /// C-3 regression: `read_record_snapshot` (used by `stream_shard_baseline`
+    /// for the migration baseline) must return a generation-consistent
+    /// snapshot even while a concurrent writer mutates the record. The
+    /// invariant we check is `count(SPENT slots) == meta.spent_utxos`: both
+    /// fields are bumped together under the stripe lock on each spend, so a
+    /// torn read (metadata at generation N, slots at generation N+1) would
+    /// observe a slot count that disagrees with the metadata counter. The
+    /// pre-fix code read metadata then each slot lock-free, which could tear;
+    /// `read_record_snapshot` holds the stripe across both reads so it cannot.
+    #[test]
+    fn read_record_snapshot_is_generation_consistent_under_concurrent_spend() {
+        use crate::record::UTXO_SPENT;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const N_OUTPUTS: usize = 16;
+
+        let engine = StdArc::new(test_engine());
+        let key = tx_key_for_shard(42, 7);
+
+        // Create a record with N distinct, known UTXO hashes so the writer can
+        // spend each output (a spend requires the matching utxo_hash).
+        let utxo_hashes: Vec<[u8; 32]> = (0..N_OUTPUTS)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[1] = 0xAB;
+                h
+            })
+            .collect();
+        engine
+            .create(&crate::ops::create::CreateRequest {
+                tx_id: key.txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 100,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .unwrap();
+
+        let done = StdArc::new(AtomicBool::new(false));
+
+        // Writer: spend the outputs one at a time. Each spend bumps the
+        // record generation, flips one slot to SPENT, and increments
+        // meta.spent_utxos — all under the stripe lock.
+        let writer = {
+            let engine = engine.clone();
+            let done = done.clone();
+            let hashes = utxo_hashes.clone();
+            std::thread::spawn(move || {
+                for (offset, hash) in hashes.iter().enumerate() {
+                    let mut spending_data = [0u8; 36];
+                    spending_data[0] = offset as u8;
+                    engine
+                        .spend(&crate::ops::spend::SpendRequest {
+                            tx_key: key,
+                            offset: offset as u32,
+                            utxo_hash: *hash,
+                            spending_data,
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 0,
+                            block_height_retention: 0,
+                        })
+                        .unwrap();
+                    // Brief pause to widen the interleaving window so a torn
+                    // read would be observable if the lock were missing.
+                    std::thread::yield_now();
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+
+        // Readers: hammer read_record_snapshot and assert the consistency
+        // invariant on every snapshot.
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let engine = engine.clone();
+            let done = done.clone();
+            readers.push(std::thread::spawn(move || {
+                let mut observed = 0u64;
+                loop {
+                    match engine.read_record_snapshot(&key) {
+                        Ok((meta, slots)) => {
+                            let spent_in_slots =
+                                slots.iter().filter(|s| s.status == UTXO_SPENT).count() as u32;
+                            assert_eq!(
+                                spent_in_slots,
+                                { meta.spent_utxos },
+                                "torn snapshot: {spent_in_slots} SPENT slots but meta.spent_utxos={} (generation {})",
+                                { meta.spent_utxos },
+                                { meta.generation },
+                            );
+                            assert_eq!(slots.len(), N_OUTPUTS, "slot count must be stable");
+                            observed += 1;
+                        }
+                        Err(e) => panic!("snapshot read failed: {e:?}"),
+                    }
+                    if done.load(Ordering::Acquire) {
+                        // One final post-completion read to cover the settled
+                        // state, then exit.
+                        if observed > 0 {
+                            break;
+                        }
+                    }
+                }
+                observed
+            }));
+        }
+
+        writer.join().unwrap();
+        let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(total > 0, "readers must have observed at least one snapshot");
+
+        // Final settled state: all outputs spent.
+        let (meta, slots) = engine.read_record_snapshot(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, N_OUTPUTS as u32);
+        assert_eq!(
+            slots.iter().filter(|s| s.status == UTXO_SPENT).count(),
+            N_OUTPUTS
+        );
+    }
+
     #[test]
     fn collect_manifest_entries_skips_missing_snapshot_keys() {
         let engine = test_engine();
@@ -8411,8 +8065,8 @@ mod tests {
     /// Pipelined-flow analogue of the legacy abort-completion-handshake
     /// test. On baseline streaming failure, the pipelined flow
     /// (`run_migration_batch`) does NOT emit a zero-record
-    /// OP_MIGRATION_COMPLETE abort frame — that is only the legacy
-    /// `migrate_single_shard` path's behavior via `fail_shard(true)`.
+    /// OP_MIGRATION_COMPLETE abort frame (the now-removed legacy per-shard
+    /// path emitted one via `fail_shard(true)`).
     /// Instead the pipelined flow marks the task failed locally and
     /// rolls back the shard table; the target eventually clears its
     /// provisional inbound state via `clear_stale_inbound`'s 30 s

@@ -4,7 +4,6 @@
 //! using the same idempotent mutation functions. Acknowledgment policies
 //! (WriteAll, WriteMajority) control durability guarantees.
 
-pub mod batching;
 pub mod durable;
 pub mod manager;
 pub mod protocol;

@@ -1,5 +1,17 @@
 //! Replication manager — orchestrates sending to multiple replicas
 //! with configurable acknowledgment policies.
+//!
+//! D-10 — TEST-ONLY MODULE. [`ReplicationManager`] is constructed only in test
+//! code (`cluster::coordinator` tests under `#[cfg(test)]` plus this module's
+//! own unit tests); it is NOT on the production replication path. Production
+//! replication is `server::dispatch::replicate_all_ops`, which fans out one
+//! `ReplicaBatch` per replica via `send_replica_batch_to` and counts ACKs with
+//! `classify_replication_outcome`; the receive side is
+//! `replication::receiver::handle_replica_batch_with_tracker`. This manager is
+//! retained as a tested reference implementation of the quorum/straggler/
+//! catch-up math. Do NOT wire it into the dispatch path without first
+//! reconciling its sequence-space and ACK semantics against the production
+//! path (Rule 6 two-implementation hazard).
 
 use crate::metrics::replication_metrics;
 use crate::observability::WireTraceContext;

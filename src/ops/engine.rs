@@ -3237,6 +3237,95 @@ impl Engine {
         Ok(true)
     }
 
+    /// Unconditionally prune a UTXO slot (set its status to `UTXO_PRUNED`)
+    /// under the per-tx stripe lock.
+    ///
+    /// This is the stripe-locked engine entry point for
+    /// [`crate::replication::protocol::ReplicaOp::PruneSlot`]. Pre-fix the
+    /// replica receiver performed this read-modify-write directly against the
+    /// device (`io::read_utxo_slot` → mutate → `io::write_utxo_slot`) with no
+    /// stripe lock, so it could race a concurrent mutation on the same record
+    /// and corrupt the slot region (C-4). Routing through the engine
+    /// serializes the prune against all other mutation handlers on `key`'s
+    /// stripe, matching how [`Self::prune_slot_if_spent_by_child`] is locked.
+    ///
+    /// Counter-neutral by design: like recovery's `RedoOp::PruneSlot` replay,
+    /// it flips only the slot status and does not touch `spent_utxos`,
+    /// `pruned_utxos`, or `generation` (the replica's generation is
+    /// reconciled separately via [`Self::set_record_generation`] when the op
+    /// carries a `master_generation`).
+    ///
+    /// Returns `true` if the slot was pruned, `false` if the key is absent,
+    /// the offset is out of range, or the slot was already pruned (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] on an index or device read/write
+    /// failure.
+    pub fn prune_slot(&self, key: &TxKey, offset: u32) -> Result<bool, SpendError> {
+        let _guard = self.locks.lock(key);
+        let entry = match self.index.read().lookup_checked(key).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            }
+        })? {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
+        let meta = self.read_metadata_fast(entry.record_offset)?;
+        if offset >= { meta.utxo_count } {
+            return Ok(false);
+        }
+        let mut slot = self.read_slot_fast(entry.record_offset, offset)?;
+        if slot.status == UTXO_PRUNED {
+            return Ok(false); // already pruned — idempotent
+        }
+        slot.status = UTXO_PRUNED;
+        self.write_slot_fast(entry.record_offset, offset, &slot)?;
+        Ok(true)
+    }
+
+    /// Set a record's generation counter to `generation` under the per-tx
+    /// stripe lock, and refresh the primary-index cache to match.
+    ///
+    /// This is the stripe-locked entry point for the replica receiver's
+    /// post-apply generation sync. Pre-fix the receiver read metadata,
+    /// overwrote `generation`, and wrote it back directly via
+    /// `io::read_metadata`/`io::write_metadata` with no stripe lock (C-4),
+    /// which could race a concurrent local mutation (e.g. a redo replay) on
+    /// the same record and lose either write. Holding the stripe makes the
+    /// read-modify-write atomic against all other mutation handlers, and
+    /// `sync_index_cache` keeps the cached generation in the primary index
+    /// consistent with the on-device metadata.
+    ///
+    /// Returns `true` if the generation was written, `false` if the key is
+    /// absent (skipped — the op will not be re-applied for a missing record).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] on an index or device read/write
+    /// failure.
+    pub fn set_record_generation(
+        &self,
+        key: &TxKey,
+        generation: u32,
+    ) -> Result<bool, SpendError> {
+        let _guard = self.locks.lock(key);
+        let entry = match self.index.read().lookup_checked(key).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            }
+        })? {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
+        let mut meta = self.read_metadata_fast(entry.record_offset)?;
+        meta.generation = generation;
+        self.write_metadata_fast(entry.record_offset, &meta)?;
+        self.sync_index_cache(key, &meta)?;
+        Ok(true)
+    }
+
     // -----------------------------------------------------------------------
     // Remaining operations (Phase 6)
     // -----------------------------------------------------------------------
@@ -4969,6 +5058,52 @@ impl Engine {
         // seen had they observed the post-unregister state.
         let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
         Ok(slots)
+    }
+
+    /// Read a transaction's metadata and all UTXO slots as one
+    /// generation-consistent snapshot, holding the per-tx stripe lock for the
+    /// duration of both reads.
+    ///
+    /// Unlike [`Self::read_metadata`] + per-slot [`Self::read_slot`] (which are
+    /// lock-free and can observe a torn snapshot if a concurrent mutation
+    /// changes the record between the metadata read and the slot reads), this
+    /// method serializes against all mutation handlers on `key`'s stripe. The
+    /// returned `(metadata, slots)` therefore reflect a single point in time:
+    /// `metadata.generation`, `metadata.utxo_count`, and every slot's status
+    /// are mutually consistent.
+    ///
+    /// C-3: migration baseline streaming uses this so a record mutated mid-scan
+    /// is captured atomically rather than as a half-old/half-new snapshot with
+    /// a drifting generation counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::TxNotFound`] if the key is absent (or was deleted
+    /// before the lock was acquired) and [`SpendError::StorageError`] on a
+    /// backend / device read failure.
+    pub fn read_record_snapshot(
+        &self,
+        key: &TxKey,
+    ) -> Result<(TxMetadata, Vec<UtxoSlot>), SpendError> {
+        // Take the stripe lock first so no mutation handler can change the
+        // record (and bump its generation) between the metadata and slot
+        // reads. All mutation paths acquire this same stripe as their first
+        // action, so once we hold it the record is frozen for our read.
+        let _stripe_guard = self.locks.lock(key);
+        let entry = self
+            .index
+            .read()
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        let meta = self.read_metadata_for_key(key, entry.record_offset)?;
+        let slots = io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
+        Ok((meta, slots))
     }
 
     /// Read one mined-block entry, including entries stored in overflow.

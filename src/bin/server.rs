@@ -119,6 +119,130 @@ static SWIM_METRICS: SwimMetrics = SwimMetrics::new();
 /// Device-space allocator metrics (Phase 5).
 static ALLOCATOR_METRICS: AllocatorMetrics = AllocatorMetrics::new();
 
+/// Shared handles needed to run a replication catch-up pass against a single
+/// replica. Captured once at startup and reused by both the one-shot startup
+/// pass and the runtime lag-monitor converge loop (D-7/D-8), so the two paths
+/// can never diverge in how they build, authenticate, and send catch-up
+/// batches.
+#[derive(Clone)]
+struct CatchupContext {
+    redo_log: Option<Arc<Mutex<RedoLog>>>,
+    engine: Arc<Engine>,
+    /// Live cluster topology epoch (shared atomic; re-read per chunk).
+    cluster_key_handle: Arc<std::sync::atomic::AtomicU64>,
+    /// Channel handle for posting a full-shard resync when the redo log has
+    /// wrapped past the replica's last-acked position.
+    resync_handle: teraslab::cluster::coordinator::ResyncSenderHandle,
+    /// Cluster HMAC secret (None in unsecured clusters).
+    auth_secret: Option<Vec<u8>>,
+    source_node_id: u64,
+}
+
+/// Run one bounded catch-up pass for a single replica and persist the new ACK
+/// position on success.
+///
+/// Streams redo entries in `[from_seq, current_seq)` (capped at
+/// `max_ops_per_pass`) to `addr` through the same authenticated, dense-stream
+/// fan-out used by steady-state replication, then records the achieved
+/// `through_sequence` into the process ACK tracker. On `RedoReclaimed` (the
+/// circular redo log wrapped past `from_seq`) it posts a full-shard resync
+/// request via the coordinator instead. Other transport errors are logged and
+/// left for the next pass to retry — the function is idempotent because the
+/// replica applies ops idempotently and the ACK tracker only advances on
+/// success.
+///
+/// Returns `true` if the replica's ACK advanced this pass (i.e. progress was
+/// made), `false` otherwise.
+fn run_one_catchup_pass(
+    ctx: &CatchupContext,
+    tracker: &teraslab::replication::durable::AckTracker,
+    addr: std::net::SocketAddr,
+    from_seq: u64,
+    current_seq: u64,
+    max_ops_per_pass: usize,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    if from_seq >= current_seq {
+        return false; // already caught up
+    }
+
+    let redo_ref = ctx.redo_log.clone();
+    let eng_ref = ctx.engine.clone();
+    let first_avail_seq = redo_ref
+        .as_ref()
+        .and_then(|rl| rl.lock().earliest_sequence().ok().flatten());
+    let cluster_key_handle = ctx.cluster_key_handle.clone();
+    let auth_secret = ctx.auth_secret.clone();
+
+    let result = teraslab::replication::durable::run_catchup_for_replica(
+        &addr,
+        from_seq,
+        current_seq,
+        1000,
+        max_ops_per_pass,
+        &|seq| {
+            let rl = match redo_ref.as_ref() {
+                Some(rl) => rl,
+                None => return Vec::new(),
+            };
+            let entries = match rl.lock().read_from_sequence(seq) {
+                Ok(e) => e,
+                Err(_) => return Vec::new(),
+            };
+            entries
+                .iter()
+                .filter_map(|e| {
+                    let tx_key = e.op.tx_key()?;
+                    let shard =
+                        teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
+                    teraslab::cluster::coordinator::redo_entry_to_replica_op(
+                        e, shard, &eng_ref,
+                    )
+                })
+                .collect()
+        },
+        first_avail_seq,
+        &move |chunk| {
+            teraslab::server::dispatch::send_replica_ops_to(
+                addr,
+                chunk,
+                std::time::Duration::from_secs(5),
+                auth_secret.as_deref(),
+                cluster_key_handle.load(Ordering::Acquire),
+                ctx.source_node_id,
+                0,
+            )
+        },
+    );
+
+    match result {
+        Ok(through) => {
+            if through >= from_seq {
+                tracing::info!(%addr, through, "catchup: replica advanced");
+            }
+            tracker.record_ack(addr, through);
+            tracker.flush();
+            through >= from_seq
+        }
+        Err(e) => {
+            tracing::warn!(%addr, err = %e, "catchup: replica catch-up failed");
+            if let teraslab::replication::durable::CatchupError::RedoReclaimed { .. } = e {
+                let queued = ctx.resync_handle.signal_for_addr(&addr, Vec::new());
+                if queued {
+                    tracing::info!(%addr, "catchup: posted full-shard resync request");
+                } else {
+                    tracing::warn!(
+                        %addr,
+                        "catchup: resync request dropped (unknown addr or coordinator stopped)",
+                    );
+                }
+            }
+            false
+        }
+    }
+}
+
 fn main() {
     // Parse config first so the observability section can drive the
     // subscriber (OTLP endpoint, sampling ratio, service name).
@@ -804,6 +928,12 @@ fn main() {
     let engine = Arc::new(engine);
 
     // 5. Start cluster if configured
+    //
+    // D-7/D-8: the catch-up handles built inside the cluster-start block are
+    // captured here so the runtime lag monitor (spawned further down) can run
+    // the same authenticated catch-up passes the startup pass uses. `None`
+    // when single-node / RF=1 (no replicas to repair).
+    let mut catchup_ctx: Option<CatchupContext> = None;
     let cluster = if config.is_clustered() {
         use teraslab::cluster::coordinator::{
             ClusterConfig, ClusterCoordinator, ReplicationRuntimeConfig,
@@ -1002,30 +1132,33 @@ fn main() {
         // Spawn background catch-up for replicas that are behind.
         // Reads persisted last_acked per replica and streams missing redo
         // entries. This runs asynchronously so it doesn't block startup.
+        //
+        // D-7/D-8: this one-shot startup pass and the runtime lag-monitor
+        // converge loop now share a single `CatchupContext` and the
+        // `run_one_catchup_pass` helper, so a replica that falls behind while
+        // the master stays up is repaired during normal operation — not only
+        // at master restart.
         if config.replication_factor > 1 {
-            let redo_for_catchup = redo_log.clone();
-            let engine_for_catchup = engine.clone();
             // Phase B3: each catch-up batch must carry the master's live
             // topology epoch so the receiver-side ERR_STALE_EPOCH gate
-            // accepts it. We clone the shared `Arc<AtomicU64>` so the
-            // background thread always reads the current epoch (and not a
-            // start-time snapshot that could go stale before the first
-            // batch is sent).
-            let cluster_key_handle = running.cluster_key_handle();
-            // Phase H — `Send`-able handle for posting `ResyncRequest`
-            // whenever catchup returns the truncation sentinel ("redo
-            // entries reclaimed; full resync required"). The handle
-            // wraps a clone of the coordinator's resync channel
-            // sender + the node-address map for addr → NodeId
-            // resolution; `RunningCluster` itself is not `Clone`.
-            let resync_handle = running.resync_sender_handle();
-            // R-D2/D-3 + catch-up auth fix: chunks are sent through
-            // `dispatch::send_replica_ops_to`, which shares the per-address
-            // dense stream cursor (and pooled, HMAC-authenticated
-            // connection) with the steady-state fan-out. Capture the
-            // cluster secret and our node id before the thread detaches.
-            let catchup_auth_secret = running.cluster_secret().map(|s| s.to_vec());
-            let catchup_source_node_id = config.node_id;
+            // accepts it; the shared `Arc<AtomicU64>` is re-read per chunk.
+            // Phase H: the resync handle posts a full-shard backfill when the
+            // redo log has wrapped past a replica's last-acked position.
+            // R-D2/D-3 + catch-up auth: chunks go through
+            // `send_replica_ops_to`, sharing the per-address dense stream
+            // cursor and pooled HMAC-authenticated connection with the
+            // steady-state fan-out.
+            let ctx = CatchupContext {
+                redo_log: redo_log.clone(),
+                engine: engine.clone(),
+                cluster_key_handle: running.cluster_key_handle(),
+                resync_handle: running.resync_sender_handle(),
+                auth_secret: running.cluster_secret().map(|s| s.to_vec()),
+                source_node_id: config.node_id,
+            };
+            // Stash for the runtime lag monitor (spawned after this block).
+            catchup_ctx = Some(ctx.clone());
+
             std::thread::spawn(move || {
                 // Use the process-wide ACK tracker installed by
                 // `init_ack_tracker` above — constructing a second
@@ -1039,7 +1172,8 @@ fn main() {
                     return; // No known replicas yet
                 }
 
-                let current_seq = redo_for_catchup
+                let current_seq = ctx
+                    .redo_log
                     .as_ref()
                     .map(|rl| rl.lock().current_sequence())
                     .unwrap_or(0);
@@ -1048,114 +1182,20 @@ fn main() {
                     if *last_acked >= current_seq {
                         continue; // Already caught up
                     }
-                    let lag = current_seq - last_acked;
                     tracing::info!(
                         %addr,
-                        lag,
+                        lag = current_seq - last_acked,
                         from_seq = last_acked + 1,
                         "catchup: replica behind, starting catch-up",
                     );
-
-                    let redo_ref = redo_for_catchup.clone();
-                    let eng_ref = engine_for_catchup.clone();
-
-                    // Determine the earliest available redo sequence for
-                    // truncation detection. If the redo log has wrapped past
-                    // the replica's last-acked position, catch-up is impossible
-                    // and the replica needs a full resync.
-                    let first_avail_seq = redo_ref
-                        .as_ref()
-                        .and_then(|rl| rl.lock().earliest_sequence().ok().flatten());
-
-                    let cluster_key_handle = cluster_key_handle.clone();
-                    let auth_secret = catchup_auth_secret.clone();
-                    let catchup_addr = *addr;
-
-                    let result = teraslab::replication::durable::run_catchup_for_replica(
-                        addr,
+                    run_one_catchup_pass(
+                        &ctx,
+                        tracker,
+                        *addr,
                         last_acked + 1,
                         current_seq,
-                        1000,
-                        10_000,
-                        &|from_seq| {
-                            let rl = match redo_ref.as_ref() {
-                                Some(rl) => rl,
-                                None => return Vec::new(),
-                            };
-                            let entries = match rl.lock().read_from_sequence(from_seq) {
-                                Ok(e) => e,
-                                Err(_) => return Vec::new(),
-                            };
-                            // Convert redo entries to ReplicaOps. Each entry's shard
-                            // is derived from its tx_key. The replica applies all
-                            // ops idempotently, gracefully skipping unknown records.
-                            entries
-                                .iter()
-                                .filter_map(|e| {
-                                    let tx_key = e.op.tx_key()?;
-                                    let shard =
-                                        teraslab::cluster::shards::ShardTable::shard_for_key(
-                                            tx_key,
-                                        );
-                                    teraslab::cluster::coordinator::redo_entry_to_replica_op(
-                                        e, shard, &eng_ref,
-                                    )
-                                })
-                                .collect()
-                        },
-                        first_avail_seq,
-                        &move |chunk| {
-                            // Per-replica dense stream labels are assigned
-                            // inside `send_replica_ops_to` (shared cursor
-                            // with steady-state replication). The live
-                            // cluster epoch is re-read per chunk so a
-                            // topology commit mid-pass is honored.
-                            teraslab::server::dispatch::send_replica_ops_to(
-                                catchup_addr,
-                                chunk,
-                                std::time::Duration::from_secs(5),
-                                auth_secret.as_deref(),
-                                cluster_key_handle.load(std::sync::atomic::Ordering::Acquire),
-                                catchup_source_node_id,
-                                0, // redo coverage recorded once per pass below
-                            )
-                        },
+                        10_000, // max_ops_per_pass
                     );
-
-                    match result {
-                        Ok(through) => {
-                            tracing::info!(%addr, through, "catchup: replica caught up");
-                            tracker.record_ack(*addr, through);
-                            tracker.flush();
-                        }
-                        Err(e) => {
-                            tracing::warn!(%addr, err = %e, "catchup: replica catch-up failed");
-                            // Phase H — when catchup returns the
-                            // truncation sentinel, post a resync
-                            // request so the coordinator synthesizes a
-                            // full-shard backfill. The match is on the
-                            // typed `CatchupError::RedoReclaimed` variant
-                            // (was previously a `String::contains` on the
-                            // rendered message — F-G10-017 / B-4).
-                            if let teraslab::replication::durable::CatchupError::RedoReclaimed {
-                                ..
-                            } = e
-                            {
-                                let queued = resync_handle.signal_for_addr(addr, Vec::new());
-                                if queued {
-                                    tracing::info!(
-                                        %addr,
-                                        "catchup: posted full-shard resync request",
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        %addr,
-                                        "catchup: resync request dropped (unknown addr or coordinator stopped)",
-                                    );
-                                }
-                            }
-                        }
-                    }
                 }
             });
         }
@@ -1342,12 +1382,44 @@ fn main() {
                         let redo = redo.clone();
                         std::sync::Arc::new(move || redo.lock().current_sequence())
                     };
+                    // D-7/D-8: drive runtime catch-up from the lag monitor.
+                    // When a replica's lag exceeds the warn threshold the
+                    // monitor runs one bounded catch-up pass for it; the next
+                    // tick re-evaluates lag, so the replica converges over
+                    // successive intervals without a master restart. The
+                    // callback is `None` when we have no catch-up context
+                    // (e.g. RF=1), preserving warn-only behavior.
+                    let on_lagging: Option<teraslab::replication::durable::OnLaggingReplica> =
+                        catchup_ctx.clone().map(|ctx| {
+                            let cb: teraslab::replication::durable::OnLaggingReplica =
+                                std::sync::Arc::new(
+                                    move |addr: std::net::SocketAddr,
+                                          last_acked: u64,
+                                          master_seq: u64| {
+                                        if let Some(t) =
+                                            teraslab::server::dispatch::ack_tracker_handle()
+                                        {
+                                            run_one_catchup_pass(
+                                                &ctx,
+                                                t,
+                                                addr,
+                                                last_acked + 1,
+                                                master_seq,
+                                                10_000, // max_ops_per_pass
+                                            );
+                                        }
+                                    },
+                                );
+                            cb
+                        });
                     Some(teraslab::replication::durable::spawn_lag_monitor(
                         tracker,
                         current_seq_fn,
                         shutdown_flag.clone(),
                         config.replica_lag_check_interval_secs,
                         config.replica_lag_warn_threshold_ops,
+                        config.replica_lag_warn_threshold_ops,
+                        on_lagging,
                     ))
                 }
                 _ => {

@@ -3472,7 +3472,11 @@ fn check_shard_ownership(
         crate::cluster::coordinator::MasterQueryResult::Yes => {
             // If we're the new master but still waiting for inbound migration
             // data, reject mutations so clients retry after migration completes.
-            // Reads are handled separately with a wait loop.
+            // F-5: reads do NOT wait — there is no wait loop. A read on a shard
+            // with pending inbound data returns ERR_MIGRATION_IN_PROGRESS
+            // immediately (via the same path below when `allow_if_migrating`
+            // is false), or is served locally during *outbound* migration
+            // (the `MasterQueryResult::No` arm) where the data is still present.
             if !allow_if_migrating && cluster.has_pending_inbound(&key) {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
                 tracing::debug!(
@@ -3544,10 +3548,27 @@ fn check_shard_ownership(
                         &addr.to_string(),
                         shard_table_version,
                     ),
-                    None => crate::protocol::codec::encode_redirect_with_version(
-                        "",
-                        shard_table_version,
-                    ),
+                    // F-4: the routing table names a master node but we have
+                    // no address for it (membership not yet learned, or the
+                    // node left between routing and address lookup). An
+                    // empty-address redirect is useless — the client cannot
+                    // connect to "". Return a retryable ERR_NO_QUORUM ("master
+                    // unknown, retry") instead so the client backs off and
+                    // retries once membership converges, rather than chasing a
+                    // blank target.
+                    None => {
+                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                        tracing::debug!(
+                            shard,
+                            node = ?node,
+                            "dispatch: master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
+                        );
+                        return Some(BatchItemError {
+                            item_index,
+                            error_code: ERR_NO_QUORUM,
+                            error_data: Vec::new(),
+                        });
+                    }
                 },
                 crate::cluster::shards::RouteDecision::HandleLocally => return None,
             };
@@ -6490,34 +6511,55 @@ fn handle_get_batch(
                 // The legacy form `[ERR_REDIRECT_byte:1][addr_bytes:N]` had no
                 // length prefix and no version, so any cluster-mid-topology-
                 // change cycle (A→B→C→A) was unobservable client-side.
-                let redirect_status = match route {
+                match route {
                     crate::cluster::shards::RouteDecision::RedirectTo {
                         node,
                         shard_table_version,
-                    } => {
-                        let addr_str = match cluster.node_addr(&node) {
-                            Some(a) => a.to_string(),
-                            None => String::new(),
-                        };
-                        let payload = crate::protocol::codec::encode_redirect_with_version(
-                            &addr_str,
-                            shard_table_version,
-                        );
-                        let mut data = Vec::with_capacity(1 + payload.len());
-                        data.push(ERR_REDIRECT as u8);
-                        data.extend_from_slice(&payload);
-                        data
+                    } => match cluster.node_addr(&node) {
+                        Some(addr) => {
+                            let payload = crate::protocol::codec::encode_redirect_with_version(
+                                &addr.to_string(),
+                                shard_table_version,
+                            );
+                            let mut data = Vec::with_capacity(1 + payload.len());
+                            data.push(ERR_REDIRECT as u8);
+                            data.extend_from_slice(&payload);
+                            // M10: count the stale-routed read.
+                            if let Some(m) = DISPATCH_METRICS.get() {
+                                m.stale_routing_request_total.inc();
+                            }
+                            results.push(WireGetResult {
+                                status: ERR_REDIRECT as u8,
+                                data,
+                            });
+                        }
+                        // F-4: routing names a master we have no address for.
+                        // An empty-address redirect is useless to the client;
+                        // return a retryable ERR_NO_QUORUM ("master unknown,
+                        // retry") so it backs off until membership converges.
+                        None => {
+                            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                            tracing::debug!(
+                                shard,
+                                node = ?node,
+                                "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
+                            );
+                            results.push(WireGetResult {
+                                status: ERR_NO_QUORUM as u8,
+                                data: vec![],
+                            });
+                        }
+                    },
+                    _ => {
+                        if let Some(m) = DISPATCH_METRICS.get() {
+                            m.stale_routing_request_total.inc();
+                        }
+                        results.push(WireGetResult {
+                            status: ERR_REDIRECT as u8,
+                            data: vec![ERR_REDIRECT as u8],
+                        });
                     }
-                    _ => vec![ERR_REDIRECT as u8],
-                };
-                // M10: count the stale-routed read.
-                if let Some(m) = DISPATCH_METRICS.get() {
-                    m.stale_routing_request_total.inc();
                 }
-                results.push(WireGetResult {
-                    status: ERR_REDIRECT as u8,
-                    data: redirect_status,
-                });
                 continue;
             }
 
@@ -11052,6 +11094,96 @@ mod tests {
             get_version,
             Some(STALE_VERSION),
             "R-041: GetBatch redirect must also carry the server's shard_table_version",
+        );
+    }
+
+    /// F-4 regression: when a shard routes to a remote master whose address is
+    /// unknown to this node (membership not yet learned, or the node left
+    /// between routing and address lookup), the dispatcher must return a
+    /// retryable `ERR_NO_QUORUM` rather than an empty-address `ERR_REDIRECT`.
+    /// An empty-address redirect is useless — the client cannot connect to ""
+    /// — and worse, it looks like a valid routing answer, so the client would
+    /// fail outright instead of backing off and retrying once membership
+    /// converges.
+    #[test]
+    fn redirect_to_master_with_unknown_address_returns_retryable_no_quorum() {
+        use crate::cluster::shards::NodeId;
+        use crate::cluster::shards::ShardTable;
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(73);
+        let shard = ShardTable::shard_for_key(&TxKey { txid });
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 9);
+        let master = table.target_assignment(shard).master;
+        // This node is NOT the master, so it must redirect.
+        let self_id = if master == NodeId(1) {
+            NodeId(2)
+        } else {
+            NodeId(1)
+        };
+        // Crucially: provide an address ONLY for self_id, not for the master.
+        // `node_addr(master)` therefore returns `None`, driving the F-4 path.
+        let self_addr: std::net::SocketAddr = if self_id == NodeId(1) {
+            "127.0.0.1:4801".parse().unwrap()
+        } else {
+            "127.0.0.1:4802".parse().unwrap()
+        };
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            self_id,
+            table,
+            &[(self_id, self_addr)], // master address intentionally absent
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        // Sanity: the master's address really is unknown to this node.
+        assert!(
+            cluster.node_addr(&master).is_none(),
+            "test precondition: master address must be unknown for the F-4 path",
+        );
+
+        // Read path (GET_BATCH): must surface ERR_NO_QUORUM, not ERR_REDIRECT.
+        let resp = h.request_with_cluster(
+            OP_GET_BATCH,
+            crate::protocol::codec::encode_get_batch(FieldMask::ALL_METADATA, &[txid]),
+            &cluster,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].status,
+            ERR_NO_QUORUM as u8,
+            "master address unknown must yield retryable ERR_NO_QUORUM, not an \
+             empty-address ERR_REDIRECT",
+        );
+        assert_ne!(
+            results[0].status, ERR_REDIRECT as u8,
+            "must NOT emit an ERR_REDIRECT when the redirect target address is unknown",
+        );
+
+        // Write path: `check_shard_ownership` is the per-item routing gate for
+        // every mutating batch op. Assert it directly — when the master
+        // address is unknown it must yield a retryable ERR_NO_QUORUM with no
+        // redirect payload, not an ERR_REDIRECT carrying an empty address.
+        let item_err = check_shard_ownership(&txid, 0, Some(&cluster), false)
+            .expect("non-owned key must produce a routing error");
+        assert_eq!(
+            item_err.error_code, ERR_NO_QUORUM,
+            "write path must return retryable ERR_NO_QUORUM for an unknown master address, \
+             not ERR_REDIRECT",
+        );
+        assert_ne!(
+            item_err.error_code, ERR_REDIRECT,
+            "write path must NOT emit ERR_REDIRECT when the redirect target address is unknown",
+        );
+        assert!(
+            item_err.error_data.is_empty(),
+            "ERR_NO_QUORUM carries no redirect target (no empty-address payload)",
         );
     }
 

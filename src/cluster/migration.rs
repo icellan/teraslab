@@ -6,14 +6,23 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Saturating-decrement of the active-migrations gauge.
+///
+/// C-8: uses `fetch_update` so the read-modify-write is atomic. The previous
+/// `load` then `store(prev - 1)` could lose a decrement under concurrency
+/// (two callers both read `prev`, both store `prev - 1`).
 fn dec_active(m: &MigrationMetrics) {
-    let prev = m.migration_active.load(Ordering::Relaxed);
-    if prev > 0 {
-        m.migration_active.store(prev - 1, Ordering::Relaxed);
-    }
+    let _ = m
+        .migration_active
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            prev.checked_sub(1)
+        });
 }
 
 /// Saturating-decrement of the phase gauge corresponding to `state`.
+///
+/// C-8: atomic via `fetch_update` (see [`dec_active`]). `checked_sub`
+/// returning `None` at zero makes `fetch_update` a no-op, preserving the
+/// saturating-at-zero semantics without a separate load.
 fn dec_phase_gauge(m: &MigrationMetrics, state: &MigrationState) {
     let gauge = match state {
         MigrationState::Preparing => &m.migration_phase_preparing,
@@ -22,10 +31,9 @@ fn dec_phase_gauge(m: &MigrationMetrics, state: &MigrationState) {
         MigrationState::Complete => &m.migration_phase_serving_new,
         MigrationState::Failed => return,
     };
-    let prev = gauge.load(Ordering::Relaxed);
-    if prev > 0 {
-        gauge.store(prev - 1, Ordering::Relaxed);
-    }
+    let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        prev.checked_sub(1)
+    });
 }
 
 // ---------------------------------------------------------------------------
