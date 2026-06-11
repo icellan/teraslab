@@ -503,3 +503,45 @@ Added this session — see for ordered execution plan.
   `tests/p3_4_frame_zero_copy_allocs.rs`: 1000 iterations of
   `OP_SPEND_BATCH` + `OP_CREATE_BATCH` decode @ 4 KiB payload — baseline
   2000 allocs / 8 192 000 bytes vs zero-copy 2 allocs / 48 bytes.
+
+---
+
+## E. From the 2026-06 audit-remediation campaign (AUDIT.md §8)
+
+New observations made by the remediation agents — none are audit
+findings; all are deferred follow-ups.
+
+### E-1. Replication receiver lacks the L-01 whole-frame deadline
+
+`src/replication/receiver.rs:302-469` has the same per-syscall-timeout
+frame-read pattern the server accept path had before the L-01 fix
+(`FRAME_ASSEMBLY_TIMEOUT` + `DeadlineReader` in `src/server/mod.rs`).
+Exposure is lower (inter-node, HMAC-authenticated peers), but a
+compromised or wedged peer can pin a receiver thread the same way.
+Port the `DeadlineReader` treatment.
+
+### E-2. `cluster_secret` split between `ServerConfig` and `ClusterConfig`
+
+`Server`/dispatch read `cluster_secret` from `ServerConfig`, not from
+the attached `RunningCluster`. Setting it only in `ClusterConfig`
+(programmatic construction, e.g. tests) leaves server responses
+unsigned, and topology proposals then fail HMAC verification forever
+with no surfaced error. Production TOML loading sets both, so this is
+a programmatic-construction footgun. Add a cross-check (validation or
+single source of truth).
+
+### E-3. `client/rust` crate is stale
+
+`client/rust/src/lib.rs:2280` constructs `ClusterConfig` without the
+`cluster_id` field and no longer compiles against the current
+`teraslab` crate (pre-existing before the campaign). Fix or mark the
+crate's build status explicitly.
+
+### E-4. `quiesce()` fabricated-voter commits trust the sender
+
+`ClusterCoordinator::quiesce()` fabricates a `TopologyCommit` whose
+voter list satisfies `has_quorum_voter_proof` without any real votes —
+fine for the E-01 threat model (SWIM-loss remnants never fabricate
+commits), but a single buggy/compromised *authenticated* peer could
+ship a shrinking commit. Worth revisiting if the threat model ever
+includes malicious cluster members.

@@ -10,6 +10,8 @@
 
 > **Tooling caveat (unchanged).** The synthesis session's tool channel intermittently suppressed some file reads; a few LOW findings below are marked "not-verified" because the dedicated verifier could not independently re-touch each one. Line numbers were anchored against current HEAD where readable.
 
+> **REMEDIATION COMPLETE (2026-06-11).** Every finding and action-plan item in this report has been fixed or test-pinned across a three-wave campaign. See **§8 Remediation ledger** at the end of this file for the finding → commit map, deliberate deviations, and residual gaps. Line numbers in the body below refer to audit HEAD `1e5659b` and have shifted since; the matrices under `audit/` are likewise point-in-time snapshots (notably, `error-code-matrix.md` T-3 listed the overflow mapping as 255 — the live mapping is `ERR_STORAGE_IO`(30), now wire-pinned).
+
 ---
 
 ## 1. Build / Test / Clippy Baseline (recon ground truth)
@@ -310,5 +312,49 @@ There is **no confirmed live data-loss CRITICAL** at HEAD. This milestone closes
 18. **F-01 / G-01 / G-02 / B-03 / B-04 / D-01 / E-03 / H-01 / H-02 / I-03 / J-02 / J-05 / L-01:** the remaining LOW hardening + coverage items.
 
 ---
+
+## 8. Remediation ledger (2026-06-11)
+
+All milestones in §7 are complete. Verification at completion: `cargo test --all` **2219 passed / 0 failed / 0 ignored**; `--features fault-injection` binaries 9/0; `cargo clippy --all-targets -- -D warnings` clean with and without `fault-injection`.
+
+### Wave 0 — Milestone-1 campaign (2026-06-10, commits `7b8c261`…`4535524`)
+| Finding | Resolution |
+|---|---|
+| N-01 / N-02 | Sim rewired onto real `recover_all_with_allocator`; `FlakyDevice` I/O-error injection; dead partition fields deleted (`a6e0609`) |
+| Replica-apply coverage hole (§4 #1) | 7 apply+idempotency tests incl. delete/F-X-022 (`d9bf6ee`) |
+| set_mined / mark_longest_chain redo-replay hole (§4 #3) | Crash-boundary tests (`d9bf6ee`) — exposed three real recovery bugs in overflow block-entry replay, fixed in `4535524` |
+| I-02 | `write_cold_data` bounded by record extent (`7b8c261`) |
+| E-02 | **Deviation: document + test-pin, not gate** (`bf22941`) — OP_REPLICA_ACK is a response payload already covered by response-frame HMAC verification (`tcp_transport.rs`); the TCP OP_HEARTBEAT handler mutates nothing and feeds no membership |
+| §1 flaky tracing test | `serial_test` — callsite-interest cache race (`7fc644a`) |
+| J-04 | `IoUringMetrics` removed (`4f1d99d`) |
+| §5 export/import CLI, README recipe + slot size | `9a398ef`, `bbf907c` |
+
+### Wave 1 (2026-06-11, merged `3ac7641`…`0a0a174`)
+| Finding | Resolution |
+|---|---|
+| E-01 defense-in-depth | Activation quorum = `max((proposal/2)+1, (peak/2)+1)`; peak observed from proposals/commits/restore; logic-level minority-remnant regression tests (`a882138`). Peak is never lowered (quiesce-drain bypasses activation quorum, so graceful scale-down is unaffected; scale-down below peak majority was already write-gated at audit HEAD) |
+| E-03 | Option B: Suspect stays in the alive view until Dead — polled view and event stream now agree by construction (`337857f`; Option A rejected: `on_membership_changed` has no debounce → suspicion flap would churn topology proposals) |
+| J-01 / J-02 / J-03 / J-05 | Buffer-address alignment enforced on **both** devices (one test misuser fixed); checked loop offsets; size arithmetic extracted into unit-tested pure helpers; non-unix path replaced with `compile_error!` (`dc97541`) |
+| M-01 / M-02 / D-01 | `tally_storage_abort()` covers **14** ERR_STORAGE_IO early-return sites (audit listed 7); `ready` flag actively false→true across recovery; degraded-ack log unhardcoded (`c3d146c`) |
+| I-01 / I-03 | `get_range` saturating clamp both impls; inclusive-boundary docs; dead `inline_threshold` field removed (`b5c05f8`) |
+| G-01 / G-02 / F-01 | Missing-sentinel reopen fails closed → startup auto-rebuilds from device scan (mirrors redb path); `unreachable!` → typed error; `compute_with_epoch` sorts internally (`2c44248`) |
+| H-01 / L-01 | `decode_frames` deleted (single test caller migrated); whole-frame assembly deadline 60 s via `DeadlineReader`, covering head-peek/HMAC-streaming/body reads (`b45aeb6`) |
+| B-02 / C-03 / M-03 / H-02 / §5 doc drift | All corrected against code, incl. README codes 28–35 + OP_HELLO and DURABILITY_CONTRACT trailing sections (`b217125`) |
+| N-03 / N-04 | proptest conservation suite (model-oracle, shrink-verified by sabotage) + cargo-fuzz scaffold + CI-enforced seeded wire-fuzz smoke over all 17 decoders (`5381cd6`) |
+| §5 dead CLI flags | All 8 removed (none implementable without new endpoints), spec/phases updated, rejection test added (`eb1b266`) |
+
+### Wave 2 (2026-06-11, merged `0a0a174`…`ba49399`)
+| Finding | Resolution |
+|---|---|
+| §4 T-1…T-6 | 7 wire-level conformance tests (`tests/error_code_conformance.rs`, `4a74b27`); no live mapping bug — matrix T-3 was stale (overflows → 30, not 255); stale `ReassignOverflow` doc comment fixed |
+| B-03 | Join was already in place (symmetric with blob_gc); added in-flight stop+join test (`958edcc`) |
+| B-04 | Snapshot-deletion device-scan rebuild: exact-state reassembly test + CRC-corrupt-header fail-closed test (`958edcc`) |
+| N-05 / F-02 / E-01 partition test | UDP+TCP partition/loss proxy fixture (asymmetric drops, topology-frame-aware cuts); live 3-node E-01 test (sabotage-verified: neutered guard → minority self-activates → test fails); F-02 fence both-arms test via `cfg`-gated fence hook (`62cadf7`) |
+
+### Residual gaps (explicitly NOT closed, by scope decision)
+1. **J-03**: the block-device ioctl syscall itself is still untested against a real `/dev/...` node (needs a root-only losetup/hdiutil CI job); the arithmetic it feeds is unit-tested.
+2. **N-04**: deep fuzzing is a manual nightly (`fuzz/README.md`); only the seeded smoke test is CI-enforced.
+3. **N-05**: proxy delay/reorder not implemented; per-link TCP attribution on loopback limited to the topology control plane (documented in `tests/net_proxy/mod.rs`).
+4. New follow-ups discovered during remediation are logged in `_review/follow_ups.md` §E (replication-receiver frame deadline parity, cluster_secret config cross-check, stale `client/rust` crate, quiesce fabricated-voter trust model).
 
 *End of report.*
