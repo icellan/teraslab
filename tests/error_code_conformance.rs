@@ -205,6 +205,31 @@ fn assert_single_sparse_error(
     errors[0].clone()
 }
 
+/// Like [`assert_single_sparse_error`] but for `OP_SET_MINED_BATCH`, whose
+/// response uses the partial-with-signals encoding (a success section followed
+/// by the error section) so it can carry per-item block IDs on the happy path.
+/// On a single-item failure the success section is empty and the error section
+/// holds exactly one item error.
+fn assert_single_set_mined_error(
+    resp: &ResponseFrame,
+    expected_index: u32,
+    expected_code: u16,
+) -> BatchItemError {
+    assert_eq!(
+        resp.status,
+        STATUS_PARTIAL_ERROR,
+        "expected STATUS_PARTIAL_ERROR carrying code {expected_code}, got status={} payload_len={}",
+        resp.status,
+        resp.payload.len()
+    );
+    let (successes, errors) = decode_partial_with_signals(&resp.payload).unwrap();
+    assert!(successes.is_empty(), "failed item must yield no success record");
+    assert_eq!(errors.len(), 1, "expected exactly one item error");
+    assert_eq!(errors[0].item_index, expected_index);
+    assert_eq!(errors[0].error_code, expected_code);
+    errors[0].clone()
+}
+
 /// Build the inline cold-data blob for a child transaction whose single
 /// extended input references `parent_txid` at `parent_vout`. Format
 /// matches `extract_parent_txids_from_cold_data`:
@@ -390,7 +415,7 @@ fn t3_set_mined_dah_overflow_returns_sparse_err_storage_io() {
     );
 
     assert_eq!(resp.request_id, 9302);
-    let err = assert_single_sparse_error(&resp, 0, ERR_STORAGE_IO);
+    let err = assert_single_set_mined_error(&resp, 0, ERR_STORAGE_IO);
     assert!(
         err.error_data.is_empty(),
         "DahOverflow carries no error payload, got {:?}",

@@ -3638,12 +3638,28 @@ fn handle_set_mined_batch(
 
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
+    // LP-2 / spec §3.6: the setMined response must carry the post-op block-ID
+    // list per item so the Go client (`txmetacache.SetMinedMulti`) can satisfy
+    // its coverage postcondition without an extra GET round-trip. LP-5: the DAH
+    // `signal` is surfaced in the same per-item record. `childCount`/#1037 is
+    // intentionally NOT emitted: it existed only to let the Aerospike client
+    // clear `locked` on pagination child records, which TeraSlab does not have
+    // (spec §2.2 — pagination eliminated). The master record's LOCKED flag is
+    // cleared server-side inside `set_mined_inner` (engine.rs), so there is
+    // nothing left for the client to unlock. `BatchItemSuccess` has no
+    // childCount field for the same reason.
+    let mut successes: Vec<BatchItemSuccess> = Vec::new();
     let mut succeeded: u64 = 0;
     for (v, result) in valid_items.iter().zip(results) {
         match result {
             Ok(resp) => {
                 succeeded += 1;
                 let mgen = resp.generation;
+                successes.push(BatchItemSuccess {
+                    item_index: v.idx as u32,
+                    signal: resp.signal.to_wire(),
+                    block_ids: resp.block_ids.clone(),
+                });
                 if params.unset_mined {
                     repl_ops_by_key.push((
                         v.key,
@@ -3732,7 +3748,42 @@ fn handle_set_mined_batch(
         m.set_mined_succeeded.inc();
     }
 
-    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
+    set_mined_response_with_signals(req.request_id, &successes, &errors, repl_outcome)
+}
+
+/// Build the `OP_SET_MINED_BATCH` wire response.
+///
+/// Unlike [`batch_response_with_outcome`] (errors-only), this carries the
+/// per-item `(signal, block_ids)` records required by spec §3.6 and consumed by
+/// `txmetacache.SetMinedMulti`. Encoding rules:
+///
+/// - When all items succeed and replication is fully durable, the status is
+///   `STATUS_OK` and the payload is the `encode_partial_with_signals` form
+///   (a populated success section, empty error section). The Go client always
+///   parses both sections, so the block-ID list is present on the happy path.
+/// - When replication is degraded, the status is `STATUS_DEGRADED_DURABILITY`
+///   but the payload still carries the block IDs (the mutation applied
+///   locally; the client must still learn the block IDs).
+/// - When any item failed, the status is `STATUS_PARTIAL_ERROR` and the
+///   payload carries both the per-item successes and the sparse error section.
+fn set_mined_response_with_signals(
+    request_id: u64,
+    successes: &[BatchItemSuccess],
+    errors: &[BatchItemError],
+    outcome: ReplicationOutcome,
+) -> ResponseFrame {
+    let status = if !errors.is_empty() {
+        STATUS_PARTIAL_ERROR
+    } else if outcome.is_degraded() {
+        STATUS_DEGRADED_DURABILITY
+    } else {
+        STATUS_OK
+    };
+    ResponseFrame {
+        request_id,
+        status,
+        payload: encode_partial_with_signals(successes, errors),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -11893,6 +11944,158 @@ mod tests {
             .expect("slot must remain readable");
         assert!(slot.is_spent());
         assert_eq!(slot.spending_data, stored_spending_data);
+    }
+
+    /// Helper: decode a `OP_SET_MINED_BATCH` response payload into its
+    /// (successes, errors) sections, failing the test on a malformed payload.
+    fn decode_set_mined_response(
+        payload: &[u8],
+    ) -> (Vec<BatchItemSuccess>, Vec<BatchItemError>) {
+        decode_partial_with_signals(payload)
+            .expect("set_mined response payload must decode as partial-with-signals")
+    }
+
+    /// LP-2 / spec §3.6: a successful setMined must return the post-op block-ID
+    /// list on the wire. Before the fix the handler returned an empty payload
+    /// (errors-only `batch_response_with_outcome`), so this asserts the exact
+    /// block-ID bytes the Go client (`txmetacache.SetMinedMulti`) consumes.
+    #[test]
+    fn set_mined_response_carries_block_ids() {
+        let _m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(80);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let params = SetMinedBatchParams {
+            block_id: 42,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let payload = encode_set_mined_batch(&params, &[txid]);
+        let resp = h.request(OP_SET_MINED_BATCH, payload);
+        assert_eq!(resp.status, STATUS_OK);
+
+        let (successes, errors) = decode_set_mined_response(&resp.payload);
+        assert!(errors.is_empty(), "no item should fail");
+        assert_eq!(successes.len(), 1, "exactly one success record");
+        assert_eq!(successes[0].item_index, 0);
+        // The current-block-IDs list must contain exactly the mined block.
+        assert_eq!(
+            successes[0].block_ids,
+            vec![42],
+            "response must carry the post-op block-ID list"
+        );
+        // A fresh single-UTXO mine is not all-spent → no DAH transition →
+        // Signal::None (wire byte 0). Pins the LP-5 signal behavior.
+        assert_eq!(
+            successes[0].signal,
+            crate::ops::signal::Signal::None.to_wire(),
+            "fresh non-all-spent mine emits no signal"
+        );
+    }
+
+    /// A tx mined into multiple blocks (reorg / parallel chains) must return
+    /// the full current block-ID list, in insertion order.
+    #[test]
+    fn set_mined_multiple_blocks_returns_all_block_ids() {
+        let _m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(81);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let mk = |block_id: u32, on_longest: bool| SetMinedBatchParams {
+            block_id,
+            block_height: 100 + block_id,
+            subtree_idx: 0,
+            on_longest_chain: on_longest,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        // Mine into block 42 (longest chain) then block 43 (a side chain).
+        let r1 = h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&mk(42, true), &[txid]));
+        assert_eq!(r1.status, STATUS_OK);
+        let (s1, _) = decode_set_mined_response(&r1.payload);
+        assert_eq!(s1[0].block_ids, vec![42]);
+
+        let r2 = h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&mk(43, false), &[txid]));
+        assert_eq!(r2.status, STATUS_OK);
+        let (s2, _) = decode_set_mined_response(&r2.payload);
+        assert_eq!(
+            s2[0].block_ids,
+            vec![42, 43],
+            "second mine must return both current block IDs"
+        );
+    }
+
+    /// unsetMined must return the block-ID list with the removed block gone.
+    /// Also pins the design decision that no childCount field is emitted: the
+    /// payload decodes cleanly as exactly (success, error) sections with the
+    /// remaining block IDs and nothing trailing.
+    #[test]
+    fn unset_mined_response_reflects_removal() {
+        let _m = test_metrics();
+        let _ = test_histograms();
+
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(82);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let set = |block_id: u32, on_longest: bool, unset: bool| SetMinedBatchParams {
+            block_id,
+            block_height: 100 + block_id,
+            subtree_idx: 0,
+            on_longest_chain: on_longest,
+            unset_mined: unset,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        // Mine into 42 and 43.
+        assert_eq!(
+            h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&set(42, true, false), &[txid]))
+                .status,
+            STATUS_OK
+        );
+        assert_eq!(
+            h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&set(43, false, false), &[txid]))
+                .status,
+            STATUS_OK
+        );
+
+        // Unset block 42; the response must reflect only block 43 remaining.
+        let r = h.request(
+            OP_SET_MINED_BATCH,
+            encode_set_mined_batch(&set(42, true, true), &[txid]),
+        );
+        assert_eq!(r.status, STATUS_OK);
+        let (successes, errors) = decode_set_mined_response(&r.payload);
+        assert!(errors.is_empty());
+        assert_eq!(successes.len(), 1);
+        assert_eq!(
+            successes[0].block_ids,
+            vec![43],
+            "unset must drop the removed block ID from the response"
+        );
+        // The payload is exactly the partial-with-signals form: re-encoding the
+        // decoded sections reproduces it byte-for-byte. No childCount/#1037
+        // field is present — by design (pagination eliminated; master lock is
+        // cleared server-side), so there is nothing trailing for the client to
+        // mis-parse.
+        let reencoded = encode_partial_with_signals(&successes, &errors);
+        assert_eq!(
+            reencoded, r.payload,
+            "response must be exactly the partial-with-signals form, no extra fields"
+        );
     }
 
     /// SetMined items should tick attempted/succeeded/failed per item.
