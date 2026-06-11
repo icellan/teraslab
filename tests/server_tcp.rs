@@ -474,17 +474,26 @@ fn tcp_error_code_triggerability_core_item_errors() {
     );
     assert_single_sparse_error(&resp, ERR_UTXO_NOT_FROZEN);
 
-    // 6 INVALID_SPEND: wrong unspend marker must not clear a real spend.
-    let unspend_txid = test_txid(1319);
-    let unspend_hash = test_utxo_hash(1319, 0);
+    // 6 INVALID_SPEND: a spend carrying the reserved all-`0xFF` spending_data
+    // sentinel is rejected with ERR_INVALID_SPEND (F-G2-002), carrying an empty
+    // forensic payload (real `InvalidSpend` carries the existing spend; the
+    // reserved-sentinel rejection has nothing to attach).
+    //
+    // Note: this used to drive code 6 via an unspend with a non-owned
+    // spending_data. Per LP-1 / teranode.lua, unspend on a spend the caller
+    // does not own is now a silent STATUS_OK no-op (so ProcessConflicting's
+    // idempotent unspends do not wedge); that contract is pinned by the unit
+    // and property suites. The reserved-sentinel spend is the stable wire-level
+    // code-6 trigger.
+    let reserved_txid = test_txid(1319);
+    let reserved_hash = test_utxo_hash(1319, 0);
     let resp = create_records(
         &mut stream,
-        &[make_create_item(unspend_txid, 1, 1319)],
+        &[make_create_item(reserved_txid, 1, 1319)],
         1319,
     );
     assert_eq!(resp.status, STATUS_OK);
-    let good_spending_data = [0x22; 36];
-    let resp = send_request(
+    let err = send_request(
         &mut stream,
         &RequestFrame {
             request_id: 1320,
@@ -498,39 +507,21 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     block_height_retention: 288,
                 },
                 &[WireSpendItem {
-                    txid: unspend_txid,
+                    txid: reserved_txid,
                     vout: 0,
-                    utxo_hash: unspend_hash,
-                    spending_data: good_spending_data,
-                }],
-            ).into(),
-
-        },
-    );
-    assert_eq!(resp.status, STATUS_OK);
-    let err = send_request(
-        &mut stream,
-        &RequestFrame {
-            request_id: 1321,
-            op_code: OP_UNSPEND_BATCH,
-            flags: 0,
-            payload: encode_unspend_batch(
-                &UnspendBatchParams {
-                    current_block_height: 1_000,
-                    block_height_retention: 288,
-                },
-                &[WireUnspendItem {
-                    txid: unspend_txid,
-                    vout: 0,
-                    utxo_hash: unspend_hash,
-                    spending_data: [0x33; 36],
+                    utxo_hash: reserved_hash,
+                    spending_data: [0xFF; 36],
                 }],
             ).into(),
 
         },
     );
     let err = assert_single_sparse_error(&err, ERR_INVALID_SPEND);
-    assert_eq!(err.error_data, good_spending_data);
+    assert!(
+        err.error_data.is_empty(),
+        "reserved-sentinel InvalidSpend carries no forensic payload, got {:?}",
+        err.error_data
+    );
 
     // 13 FROZEN_UNTIL: reassign cooldown blocks spend until the target height.
     let cooldown_txid = test_txid(1322);
