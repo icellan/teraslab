@@ -1946,3 +1946,112 @@ fn tcp_restart_resumes_watermark_no_double_apply_no_gap() {
     }
     receiver2.stop();
 }
+
+/// D-4: a replica that ACKed (and applied) the original op before a
+/// replication-policy failure must be reconciled to the rolled-back state by
+/// the compensating op — NOT left holding the "failed" mutation.
+///
+/// This exercises the reconciliation channel the D-4 fix relies on: the
+/// master's compensation produces an inverse op (here an `Unspend` reversing
+/// the `Spend`) and pushes it over the SAME `OP_REPLICA_BATCH` replication
+/// wire that carried the original. Pre-fix the compensation was local-only
+/// and cleared the intent, so the ACKed replica stayed `SPENT` forever
+/// (silent divergence on failover). After the fix the compensating op reaches
+/// the replica and the slot returns to `UNSPENT`.
+#[test]
+fn tcp_acked_replica_reconciled_by_compensating_op() {
+    let (_master_server, master_engine, _master_port) = start_test_server();
+    let (replica_server, replica_engine, replica_port) = start_test_server();
+
+    let txid = test_txid(900);
+    let key = key_from_txid(txid);
+    create_record_on_engine(&master_engine, txid, 1);
+    create_record_on_engine(&replica_engine, txid, 1);
+
+    let hash0 = test_utxo_hash(900, 0);
+    let mut sd = [0u8; 36];
+    sd[0] = 0xCC;
+
+    // Master applies the spend locally (as dispatch does before fan-out).
+    master_engine
+        .spend(&teraslab::ops::spend::SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: hash0,
+            spending_data: sd,
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        })
+        .unwrap();
+
+    // Replica ACKs and applies the original spend (the "ACKed replica").
+    let spend_batch = ReplicaBatch {
+        first_sequence: 1,
+        ops: vec![ReplicaOp::Spend {
+            tx_key: key,
+            offset: 0,
+            spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            master_generation: 0,
+        }],
+        trace_ctx: None,
+        source_node_id: None,
+        cluster_key: 0,
+    };
+    let ack = send_replica_batch_tcp(replica_port, &spend_batch);
+    assert_eq!(ack, ReplicaAck::Ok { through_sequence: 1 });
+    assert_eq!(
+        replica_engine.read_slot(&key, 0).unwrap().status,
+        UTXO_SPENT,
+        "precondition: replica applied the original spend",
+    );
+
+    // Master rolls back locally (replication policy failed). The compensating
+    // op (Unspend) is then pushed to the replica over the replication wire —
+    // this is the D-4 reconciliation the fix keeps outstanding until durable.
+    master_engine
+        .unspend(&teraslab::ops::unspend::UnspendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: hash0,
+            spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        })
+        .unwrap();
+
+    let comp_batch = ReplicaBatch {
+        first_sequence: 2,
+        ops: vec![ReplicaOp::Unspend {
+            tx_key: key,
+            offset: 0,
+            spending_data: sd,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            master_generation: 0,
+        }],
+        trace_ctx: None,
+        source_node_id: None,
+        cluster_key: 0,
+    };
+    let ack = send_replica_batch_tcp(replica_port, &comp_batch);
+    assert_eq!(ack, ReplicaAck::Ok { through_sequence: 2 });
+
+    // The replica is reconciled to the rolled-back state, NOT left diverged.
+    let slot = replica_engine.read_slot(&key, 0).unwrap();
+    assert_eq!(
+        slot.status, UTXO_UNSPENT,
+        "D-4: the ACKed replica must be reconciled to the rolled-back (unspent) state",
+    );
+    assert_eq!(
+        slot.status,
+        master_engine.read_slot(&key, 0).unwrap().status,
+        "master and replica must converge after compensation",
+    );
+
+    replica_server.shutdown();
+    _master_server.shutdown();
+}

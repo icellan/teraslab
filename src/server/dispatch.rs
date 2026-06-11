@@ -1400,16 +1400,23 @@ fn write_replicated_redo_ops_with_tracker(
     Ok(range)
 }
 
-fn commit_replication_intent(range: (u64, u64)) -> std::result::Result<(), String> {
+fn commit_replication_intent_with_tracker(
+    range: (u64, u64),
+    tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
+) -> std::result::Result<(), String> {
     if !valid_redo_range(range) {
         return Ok(());
     }
-    if let Some(tracker) = REPLICATION_INTENT_TRACKER.get() {
+    if let Some(tracker) = tracker {
         tracker
             .commit(range.0, range.1)
             .map_err(|e| format!("replication intent commit: {e}"))?;
     }
     Ok(())
+}
+
+fn commit_replication_intent(range: (u64, u64)) -> std::result::Result<(), String> {
+    commit_replication_intent_with_tracker(range, REPLICATION_INTENT_TRACKER.get())
 }
 
 fn clear_replication_intents_after_compensation(ranges: &[(u64, u64)]) {
@@ -2260,6 +2267,24 @@ fn push_repl_with_before_image(
 /// receives an error, and the local state is rolled back as if the write
 /// never happened.
 ///
+/// Returns `Ok(Some((first, last)))` with the redo-sequence range of the
+/// compensating entries when any were written, or `Ok(None)` when there
+/// were no ops to reverse. The caller (`compensate_replication_failure_or_error`)
+/// uses that range to register a durable compensation intent and replicate
+/// the compensating ops to the replicas that may have applied the original
+/// mutation (D-4) — the rolled-back state is pushed to divergent replicas
+/// rather than left local-only.
+///
+/// # DC-1: slot-restore write failures are surfaced, not swallowed
+///
+/// The reassign / prune rollback paths restore a slot via
+/// `crate::io::write_utxo_slot`. If that device write fails it is recorded
+/// and returned as `Err` *after* the compensating redo entries are made
+/// durable. A failed in-memory/device restore therefore leaves the system
+/// in a state the next recovery replay fixes (the redo log is the source of
+/// truth) while the caller fails the op with `ERR_INTERNAL` instead of
+/// reporting a clean rollback.
+///
 /// # Gap #8: bit-exact rollback via captured before-images
 ///
 /// `before_images[i].1[j]` carries the pre-apply state captured at
@@ -2299,8 +2324,17 @@ fn compensate_replication_failure(
     repl_ops: &[(TxKey, Vec<ReplicaOp>)],
     before_images: &[(TxKey, Vec<BeforeImage>)],
     redo_log: Option<&Mutex<RedoLog>>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<Option<(u64, u64)>, String> {
     let mut comp_redo: Vec<RedoOp> = Vec::new();
+    // DC-1: a slot-restore `write_utxo_slot` that fails must NOT be
+    // swallowed. We record the first such failure and surface it once the
+    // compensating redo entries are durable, so the redo log still drives a
+    // correct replay on restart while the caller learns the in-memory/device
+    // restore did not complete cleanly (the op must not report a clean
+    // rollback). Mirrors the R-004/R-035 "propagate the write error rather
+    // than log-and-continue" discipline already applied to engine slot
+    // writes and receiver metadata writes.
+    let mut restore_write_err: Option<String> = None;
 
     let before_shape_ok = before_images_match_repl_ops(repl_ops, before_images);
     if !before_shape_ok {
@@ -2516,12 +2550,22 @@ fn compensate_replication_failure(
                         && slot.hash == *new_hash
                     {
                         let restored = crate::record::UtxoSlot::new_unspent(restore_hash);
-                        let _ = crate::io::write_utxo_slot(
+                        // DC-1: do not swallow the restore write error. The
+                        // CompensateReassign redo entry below is still
+                        // emitted so recovery replays the correct restore on
+                        // restart; we record the failure so the caller fails
+                        // the op instead of reporting a clean rollback.
+                        if let Err(e) = crate::io::write_utxo_slot(
                             engine.device(),
                             entry.record_offset,
                             *offset,
                             &restored,
-                        );
+                        ) && restore_write_err.is_none()
+                        {
+                            restore_write_err = Some(format!(
+                                "reassign rollback slot-restore write failed: {e}"
+                            ));
+                        }
                     }
                     // Forward redo entry mirrors the engine call so a
                     // recovery replay re-applies the same hash restoration.
@@ -2566,12 +2610,20 @@ fn compensate_replication_failure(
                         && slot.status == crate::record::UTXO_PRUNED
                     {
                         slot.status = restore_status;
-                        let _ = crate::io::write_utxo_slot(
+                        // DC-1: surface the restore write failure rather than
+                        // swallowing it (see the reassign site above). The
+                        // CompensatePrune redo entry below still drives a
+                        // correct recovery replay.
+                        if let Err(e) = crate::io::write_utxo_slot(
                             engine.device(),
                             entry.record_offset,
                             *offset,
                             &slot,
-                        );
+                        ) && restore_write_err.is_none()
+                        {
+                            restore_write_err =
+                                Some(format!("prune rollback slot-restore write failed: {e}"));
+                        }
                     }
                     // Compensation-intent redo entry — only when a real
                     // before-image was captured. A crash mid-rollback
@@ -2689,36 +2741,167 @@ fn compensate_replication_failure(
         }
     }
 
-    if !comp_redo.is_empty() {
-        write_redo_ops(redo_log, &comp_redo)
-            .map(|_| ())
-            .map_err(|e| format!("replication compensation redo write failed: {e}"))?;
+    let comp_range = if comp_redo.is_empty() {
+        None
+    } else {
+        Some(
+            write_redo_ops(redo_log, &comp_redo)
+                .map_err(|e| format!("replication compensation redo write failed: {e}"))?,
+        )
+    };
+
+    // DC-1: surface a slot-restore write failure only AFTER the compensating
+    // redo entries are durable. The redo log is the source of truth: on
+    // restart, recovery replays the Compensate* entries and restores the
+    // slot bit-exactly, so leaving the in-memory/device slot momentarily
+    // wrong is fixed by the next recovery — not a silent divergence. The
+    // caller treats the returned error as a non-clean rollback (ERR_INTERNAL).
+    if let Some(cause) = restore_write_err {
+        return Err(cause);
     }
 
+    Ok(comp_range)
+}
+
+/// D-4: drive replication of a compensation redo range to the replicas that
+/// may have applied the now-rolled-back original op, using the same per-key
+/// fan-out + durable-intent machinery as a normal mutation.
+///
+/// The compensating ops are reconstructed from the comp redo range exactly
+/// the way startup recovery does (`recover_pending_replication_intents`),
+/// then handed to `replicate`. The intent is committed (cleared) only after
+/// `replicate` reaches its ACK-policy durability bar. If `replicate` fails
+/// the intent is left **pending** so startup / runtime catch-up re-drives the
+/// repair — the rolled-back state is never abandoned on a divergent replica.
+///
+/// `replicate` is injected so this is unit-testable without a `RunningCluster`;
+/// production passes a closure that calls [`replicate_all_ops`].
+fn replicate_compensation_intent<F>(
+    tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
+    redo_log: Option<&Mutex<RedoLog>>,
+    engine: &Engine,
+    comp_range: (u64, u64),
+    mut replicate: F,
+) -> std::result::Result<(), String>
+where
+    F: FnMut(&[(TxKey, Vec<ReplicaOp>)], (u64, u64)) -> std::result::Result<(), String>,
+{
+    if !valid_redo_range(comp_range) {
+        return Ok(());
+    }
+    let tracker = match tracker {
+        Some(t) => t,
+        // No durable intent tracker means no replication is configured
+        // (single-node / tests without a cluster) — nothing to reconcile.
+        None => return Ok(()),
+    };
+    // Register the compensation intent durably FIRST so a crash before the
+    // fan-out completes leaves a marker that startup recovery re-replicates.
+    begin_replication_intent_with_tracker(comp_range, Some(tracker))?;
+
+    let redo_log = match redo_log {
+        Some(r) => r,
+        None => {
+            // Intent is durable; without a redo log here we cannot
+            // reconstruct the ops inline, but recovery will from the comp
+            // range. Leave the intent pending.
+            return Ok(());
+        }
+    };
+
+    let entries = {
+        let log = redo_log.lock();
+        log.read_from_sequence(comp_range.0)
+            .map_err(|e| format!("read compensation redo for replication failed: {e}"))?
+    };
+    let mut ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for entry in &entries {
+        if entry.sequence < comp_range.0 || entry.sequence > comp_range.1 {
+            continue;
+        }
+        let Some(tx_key) = entry.op.tx_key().copied() else {
+            continue;
+        };
+        let shard = ShardTable::shard_for_key(&tx_key);
+        if let Some(op) = crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
+        {
+            ops_by_key.push((tx_key, vec![op]));
+        }
+    }
+
+    if ops_by_key.is_empty() {
+        // Nothing replicable in this range (e.g. only Compensate* markers
+        // that have no replica-op form). The local rollback stands on its
+        // own; clear the intent.
+        commit_replication_intent_with_tracker(comp_range, Some(tracker))?;
+        return Ok(());
+    }
+
+    // Replicate the compensating ops. Only on success do we clear the comp
+    // intent — until the compensating op reaches the same durability bar the
+    // original required, the intent stays outstanding and drives repair.
+    replicate(&ops_by_key, comp_range)?;
+    commit_replication_intent_with_tracker(comp_range, Some(tracker))?;
     Ok(())
 }
 
 fn compensate_replication_failure_or_error(
     request_id: u64,
+    cluster: Option<&RunningCluster>,
     engine: &Engine,
     repl_ops: &[(TxKey, Vec<ReplicaOp>)],
     before_images: &[(TxKey, Vec<BeforeImage>)],
     redo_log: Option<&Mutex<RedoLog>>,
     intent_ranges: &[(u64, u64)],
 ) -> Option<ResponseFrame> {
-    match compensate_replication_failure(engine, repl_ops, before_images, redo_log) {
-        Ok(()) => {
-            clear_replication_intents_after_compensation(intent_ranges);
-            None
-        }
+    let comp_range = match compensate_replication_failure(engine, repl_ops, before_images, redo_log)
+    {
+        Ok(range) => range,
         Err(cause) => {
             tracing::error!(
                 cause = %cause,
                 "replication compensation failed; leaving replication intent pending for operator recovery"
             );
-            Some(error_response(request_id, ERR_INTERNAL, &cause))
+            // DC-1: do not clear the original intent on a failed rollback —
+            // it must stay pending so recovery re-replays.
+            return Some(error_response(request_id, ERR_INTERNAL, &cause));
+        }
+    };
+
+    // D-4: the local rollback succeeded. If the compensating ops produced a
+    // redo range, push them to the replicas that may already hold the
+    // now-rolled-back original op, keeping the compensation intent
+    // outstanding until that reconciliation reaches its durability bar.
+    if let Some(comp_range) = comp_range {
+        let tracker = REPLICATION_INTENT_TRACKER.get();
+        let replicate_result = replicate_compensation_intent(
+            tracker,
+            redo_log,
+            engine,
+            comp_range,
+            |ops, range| replicate_all_ops(cluster, ops, range, &[]).map(|_| ()),
+        );
+        if let Err(cause) = replicate_result {
+            // The compensation intent (if registered) is durable and stays
+            // pending; startup / catch-up will re-drive the reconciliation.
+            // We still clear the original intent: the comp intent now carries
+            // the repair obligation (it reverses the same keys). The client
+            // already learns the op failed.
+            tracing::warn!(
+                cause = %cause,
+                comp_first = comp_range.0,
+                comp_last = comp_range.1,
+                "compensation reconciliation to replicas did not complete; intent left pending for catch-up",
+            );
         }
     }
+
+    // The original op's replication intent is cleared: any replica that
+    // applied it is reconciled by the compensating op above (whose intent
+    // remains outstanding until durable), so the original range no longer
+    // needs to be re-driven.
+    clear_replication_intents_after_compensation(intent_ranges);
+    None
 }
 
 /// Look up (or create) the per-address replication slot.
@@ -3673,6 +3856,7 @@ fn handle_spend_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -3885,6 +4069,7 @@ fn handle_unspend_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -4115,6 +4300,7 @@ fn handle_set_mined_batch(
             // fields so a crash mid-rollback can be replayed exactly.
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images_by_key,
@@ -4673,6 +4859,7 @@ fn handle_create_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -4798,6 +4985,7 @@ fn handle_freeze_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -4918,6 +5106,7 @@ fn handle_unfreeze_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -5060,6 +5249,7 @@ fn handle_reassign_batch(
             // zeros, no defaults.
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images_by_key,
@@ -5201,6 +5391,7 @@ fn handle_set_conflicting_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -5326,6 +5517,7 @@ fn handle_set_locked_batch(
         Err(e) => {
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images_by_key,
@@ -5452,6 +5644,7 @@ fn handle_preserve_until_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -5835,7 +6028,11 @@ fn handle_delete_batch(
                             &item_prune_before,
                             redo_log,
                         ) {
-                            Ok(()) => {}
+                            // Engine-op (prune) failure before any replication
+                            // was attempted: local rollback only, no replica
+                            // could have seen these ops, so the comp range is
+                            // discarded.
+                            Ok(_) => {}
                             Err(e) => {
                                 return error_response(req.request_id, ERR_INTERNAL, &e);
                             }
@@ -5870,7 +6067,9 @@ fn handle_delete_batch(
                         &item_prune_before,
                         redo_log,
                     ) {
-                        Ok(()) => {}
+                        // Engine-op (delete) failure before replication:
+                        // local rollback only, comp range discarded.
+                        Ok(_) => {}
                         Err(e) => {
                             return error_response(req.request_id, ERR_INTERNAL, &e);
                         }
@@ -6004,6 +6203,7 @@ fn handle_delete_batch(
             if !non_delete.is_empty() {
                 if let Some(resp) = compensate_replication_failure_or_error(
                     req.request_id,
+                    cluster,
                     engine,
                     &non_delete,
                     &non_delete_before,
@@ -6178,6 +6378,7 @@ fn handle_mark_longest_chain_batch(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -6737,6 +6938,7 @@ fn handle_preserve_transactions(
             let before_images = no_before_images(&repl_ops_by_key);
             if let Some(resp) = compensate_replication_failure_or_error(
                 req.request_id,
+                cluster,
                 engine,
                 &repl_ops_by_key,
                 &before_images,
@@ -15765,5 +15967,447 @@ mod tests {
             post_slot.hash, first_hash,
             "rollback of the second reassign must restore the first reassign's hash, not the original hash"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // DC-1: a slot-restore write failure during compensation must NOT be
+    // swallowed — the op must report a non-clean rollback (Err), and the
+    // compensating redo entry must still be durable so recovery replay fixes
+    // the slot on restart.
+    // -----------------------------------------------------------------------
+
+    /// Test-only device wrapper that injects `pwrite` failures behind any
+    /// [`BlockDevice`]. Reports `as_raw_ptr() == None` so the engine falls
+    /// back to the fallible trait I/O path (instead of direct mmap writes
+    /// that cannot fail), which is exactly the path
+    /// `crate::io::write_utxo_slot` uses during compensation.
+    struct WriteFailingDevice {
+        inner: Arc<MemoryDevice>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl WriteFailingDevice {
+        fn new(size: u64, alignment: usize) -> (Arc<Self>, Arc<std::sync::atomic::AtomicBool>) {
+            let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dev = Arc::new(Self {
+                inner: Arc::new(MemoryDevice::new(size, alignment).unwrap()),
+                fail: fail.clone(),
+            });
+            (dev, fail)
+        }
+    }
+
+    impl BlockDevice for WriteFailingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(crate::device::DeviceError::Io(std::io::Error::other(
+                    "simulated pwrite failure",
+                )));
+            }
+            self.inner.pwrite(buf, offset)
+        }
+
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
+    /// Build an engine + redo log over a write-failing data device. The
+    /// returned `fail` flag arms the device so subsequent `pwrite`s error.
+    fn write_failing_engine() -> (
+        Engine,
+        Arc<Mutex<crate::redo::RedoLog>>,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let (data_dev, fail) = WriteFailingDevice::new(64 * 1024 * 1024, 4096);
+        let alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Arc::new(Mutex::new(
+            crate::redo::RedoLog::open(redo_dev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024)
+                .unwrap(),
+        ));
+        (engine, redo_log, fail, metrics_test_lock())
+    }
+
+    /// DC-1: a failing `write_utxo_slot` in the reassign rollback path makes
+    /// `compensate_replication_failure` return `Err` (op reports a non-clean
+    /// rollback) instead of silently swallowing the device error — and the
+    /// compensating redo entries are still written so recovery can replay.
+    #[test]
+    fn reassign_rollback_surfaces_slot_restore_write_failure() {
+        use crate::ops::create::CreateRequest;
+        use crate::ops::remaining::{FreezeRequest, ReassignRequest};
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xD1;
+        let key = TxKey { txid };
+
+        // Seed a 1-slot record with a non-zero hash (writes succeed: fail off).
+        let original_hash = [0x42u8; 32];
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[original_hash],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+
+        // Apply reassign (needs FROZEN precondition) to move the slot to the
+        // new hash so compensation has something to restore.
+        let new_hash = [0x99u8; 32];
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: original_hash,
+            })
+            .expect("freeze");
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: original_hash,
+                new_utxo_hash: new_hash,
+                block_height: 700_000,
+                spendable_after: 100,
+            })
+            .expect("reassign");
+        assert_eq!(engine.read_slot(&key, 0).unwrap().hash, new_hash);
+
+        // Arm the device to fail the next pwrite (the slot-restore).
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Reassign {
+                tx_key: key,
+                offset: 0,
+                new_hash,
+                block_height: 700_000,
+                spendable_after: 100,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(
+            key,
+            vec![BeforeImage::Reassign {
+                prior_utxo_hash: original_hash,
+            }],
+        )];
+
+        let err = compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+            .expect_err("DC-1: a failed slot-restore write must surface as Err, not be swallowed");
+        assert!(
+            err.contains("reassign rollback slot-restore write failed"),
+            "error must identify the swallowed slot-restore write; got {err:?}"
+        );
+
+        // DC-1 durability: the CompensateReassign redo entry MUST still be in
+        // the log so a restart replays the correct restoration. Disarm the
+        // device first so the read path works.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        let has_compensate = entries.iter().any(|e| {
+            matches!(
+                &e.op,
+                RedoOp::CompensateReassign { tx_key, offset, prior_utxo_hash }
+                    if *tx_key == key && *offset == 0 && *prior_utxo_hash == original_hash
+            )
+        });
+        assert!(
+            has_compensate,
+            "compensating redo entry must be durable even when the in-line restore write fails"
+        );
+    }
+
+    /// DC-1: same invariant for the prune rollback path.
+    #[test]
+    fn prune_rollback_surfaces_slot_restore_write_failure() {
+        use crate::ops::create::CreateRequest;
+        use crate::record::{UTXO_PRUNED, UTXO_SPENT};
+
+        let (engine, redo_log, fail, _guard) = write_failing_engine();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xD2;
+        let key = TxKey { txid };
+
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: 0,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &[[0x55u8; 32]],
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .expect("seed create");
+
+        // Drive the slot to PRUNED via direct device writes (fail off).
+        let entry = engine.lookup(&key).expect("lookup");
+        let mut slot =
+            crate::io::read_utxo_slot(engine.device(), entry.record_offset, 0).expect("read slot");
+        slot.status = UTXO_SPENT;
+        crate::io::write_utxo_slot(engine.device(), entry.record_offset, 0, &slot)
+            .expect("write spent");
+        let mut pruned = slot;
+        pruned.status = UTXO_PRUNED;
+        crate::io::write_utxo_slot(engine.device(), entry.record_offset, 0, &pruned)
+            .expect("write pruned");
+
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::PruneSlot {
+                tx_key: key,
+                offset: 0,
+            }],
+        )];
+        let before_images = vec![(
+            key,
+            vec![BeforeImage::Prune {
+                prior_status: UTXO_SPENT,
+            }],
+        )];
+
+        let err = compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+            .expect_err("DC-1: prune slot-restore write failure must surface as Err");
+        assert!(
+            err.contains("prune rollback slot-restore write failed"),
+            "error must identify the swallowed prune restore write; got {err:?}"
+        );
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::CompensatePrune { tx_key, offset, prior_status }
+                    if *tx_key == key && *offset == 0 && *prior_status == UTXO_SPENT
+            )),
+            "compensating prune redo entry must be durable even when the restore write fails"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-4: the compensation intent lifecycle. On replication failure the
+    // compensating ops must be pushed to replicas via the same fan-out, and
+    // the compensation intent must NOT clear until that reconciliation
+    // reaches its durability bar.
+    // -----------------------------------------------------------------------
+
+    /// D-4: `replicate_compensation_intent` reconstructs the compensating ops
+    /// from the comp redo range and hands them to the injected `replicate`
+    /// closure, then commits (clears) the intent only after that closure
+    /// succeeds. Demonstrates the reconciliation that the OLD local-only
+    /// compensation never performed.
+    #[test]
+    fn compensation_intent_replicates_compensating_ops_and_clears_on_success() {
+        let h = RedoDispatchHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE4;
+        let key = rollback_seed_record(&h, txid, 1);
+
+        // Spend slot 0 locally so we have a real op to roll back.
+        let hash0 = h.engine.read_slot(&key, 0).expect("slot").hash;
+        let mut sd = [0u8; 36];
+        sd[0] = 0x7A;
+        h.engine
+            .spend(&crate::ops::spend::SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hash0,
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend");
+
+        // Compensate: this writes the Unspend comp redo entry and returns its
+        // redo range.
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data: sd,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = no_before_images(&repl_ops);
+        let comp_range =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect("compensation succeeds")
+                .expect("compensating ops produce a redo range");
+
+        // Drive the reconciliation through an in-memory intent tracker and a
+        // capturing closure.
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let captured: std::cell::RefCell<Vec<(TxKey, Vec<ReplicaOp>)>> =
+            std::cell::RefCell::new(Vec::new());
+        replicate_compensation_intent(
+            Some(&tracker),
+            Some(&h.redo_log),
+            &h.engine,
+            comp_range,
+            |ops, _range| {
+                captured.borrow_mut().extend(ops.iter().cloned());
+                Ok(())
+            },
+        )
+        .expect("compensation reconciliation succeeds");
+
+        // The compensating op pushed to replicas must be an Unspend of slot 0
+        // — i.e. the rolled-back state, NOT the original spend.
+        let pushed = captured.into_inner();
+        assert_eq!(pushed.len(), 1, "exactly one compensating op for the key");
+        assert!(
+            matches!(
+                &pushed[0].1[0],
+                ReplicaOp::Unspend { tx_key, offset: 0, .. } if *tx_key == key
+            ),
+            "compensation must replicate an Unspend (rolled-back state), got {:?}",
+            pushed[0].1[0]
+        );
+
+        // Durability bar reached → the comp intent is cleared.
+        assert!(
+            tracker.pending().is_empty(),
+            "comp intent must clear once the compensating op is durably replicated"
+        );
+    }
+
+    /// D-4: when the compensating-op replication does NOT reach its
+    /// durability bar (closure returns Err), the compensation intent stays
+    /// OUTSTANDING so startup / catch-up re-drives the repair — it is never
+    /// cleared on a failed reconciliation. Pre-fix, the intent was cleared
+    /// unconditionally, leaving any ACKed replica permanently diverged.
+    #[test]
+    fn compensation_intent_stays_pending_until_replication_durable() {
+        let h = RedoDispatchHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0xE5;
+        let key = rollback_seed_record(&h, txid, 1);
+
+        let hash0 = h.engine.read_slot(&key, 0).expect("slot").hash;
+        let mut sd = [0u8; 36];
+        sd[0] = 0x5B;
+        h.engine
+            .spend(&crate::ops::spend::SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hash0,
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend");
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data: sd,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = no_before_images(&repl_ops);
+        let comp_range =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect("compensation succeeds")
+                .expect("comp range");
+
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let result = replicate_compensation_intent(
+            Some(&tracker),
+            Some(&h.redo_log),
+            &h.engine,
+            comp_range,
+            |_ops, _range| Err("simulated replica fan-out failure".to_string()),
+        );
+        assert!(
+            result.is_err(),
+            "a failed reconciliation must propagate the error"
+        );
+
+        // The comp intent MUST remain pending so recovery / catch-up replays
+        // the compensating op to the still-diverged replica.
+        let pending = tracker.pending();
+        assert_eq!(
+            pending.len(),
+            1,
+            "comp intent must stay outstanding when reconciliation does not reach its durability bar"
+        );
+        assert_eq!(pending[0].first_sequence, comp_range.0);
+        assert_eq!(pending[0].last_sequence, comp_range.1);
     }
 }
