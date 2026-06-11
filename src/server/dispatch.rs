@@ -11892,8 +11892,18 @@ mod tests {
         assert_eq!(after.4 - before.4, 1, "one unspend batch");
     }
 
+    /// Unspend with spending data that does NOT match the stored spend is a
+    /// silent idempotent no-op (`STATUS_OK`), NOT an error — matching the Lua
+    /// `unspend` contract (`teranode.lua:513-540`): "never wipe a spend we
+    /// don't own", not "error on every no-op". The stored spend belongs to the
+    /// original spender, so the slot and counter must remain untouched, and the
+    /// Go `ProcessConflicting` loop (which aborts on any non-OK status other
+    /// than `TX_NOT_FOUND`) must see success.
     #[test]
-    fn handle_unspend_batch_rejects_wrong_spending_data() {
+    fn handle_unspend_batch_mismatch_is_noop_ok_not_error() {
+        let m = test_metrics();
+        let _ = test_histograms();
+
         let h = DispatchTestHarness::new();
         let txid = DispatchTestHarness::make_txid(53);
         assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
@@ -11917,33 +11927,58 @@ mod tests {
             STATUS_OK,
         );
 
+        // Counter is 1 spent UTXO after the spend.
+        let spent_before = h
+            .engine
+            .read_metadata(&TxKey { txid })
+            .expect("metadata readable")
+            .spent_utxos;
+        assert_eq!({ spent_before }, 1);
+
         let unspend_params = UnspendBatchParams {
             current_block_height: 1000,
             block_height_retention: 288,
         };
+        // Spending data 0x92.. belongs to a different tx than the stored 0x91..
         let unspend_item = WireUnspendItem {
             txid,
             vout: 0,
             utxo_hash: [0; 32],
             spending_data: [0x92; 36],
         };
+        let before = snapshot_unspend(m);
         let resp = h.request(
             OP_UNSPEND_BATCH,
             encode_unspend_batch(&unspend_params, &[unspend_item]),
         );
-        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
-        let errors = decode_sparse_errors(&resp.payload).unwrap();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].item_index, 0);
-        assert_eq!(errors[0].error_code, ERR_INVALID_SPEND);
-        assert_eq!(errors[0].error_data, stored_spending_data.to_vec());
+        let after = snapshot_unspend(m);
 
+        // No-op success: STATUS_OK with an empty (error-free) payload.
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(
+            resp.payload.is_empty(),
+            "mismatch must not produce a per-item error payload"
+        );
+
+        // Classified as idempotent, not succeeded, not failed.
+        assert_eq!(after.0 - before.0, 1, "items_attempted += 1");
+        assert_eq!(after.1 - before.1, 0, "no real unspend");
+        assert_eq!(after.2 - before.2, 1, "idempotent += 1");
+        assert_eq!(after.3 - before.3, 0, "no failures");
+
+        // Slot still spent by the original spender; counter unchanged.
         let slot = h
             .engine
             .read_slot(&TxKey { txid }, 0)
             .expect("slot must remain readable");
         assert!(slot.is_spent());
         assert_eq!(slot.spending_data, stored_spending_data);
+        let spent_after = h
+            .engine
+            .read_metadata(&TxKey { txid })
+            .expect("metadata readable")
+            .spent_utxos;
+        assert_eq!({ spent_after }, 1, "spent counter must be untouched");
     }
 
     /// Helper: decode a `OP_SET_MINED_BATCH` response payload into its

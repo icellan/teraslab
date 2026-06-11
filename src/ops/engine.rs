@@ -1666,8 +1666,28 @@ impl Engine {
 
     /// Unspend a UTXO — reverse a previous spend.
     ///
-    /// Clears the spending data and decrements the counter. If the UTXO
-    /// is already unspent, this is a no-op.
+    /// Implements the ownership-with-idempotent-semantics contract of the Lua
+    /// reference (`teranode.lua` lines 484–555). The slot is only cleared when
+    /// the caller owns the stored spend, i.e. the stored spending data is
+    /// present (slot is SPENT) and byte-equal to `req.spending_data`. When the
+    /// caller does **not** own the spend — the slot is already unspent (stored
+    /// is nil), the stored spend belongs to a different transaction, or the
+    /// slot carries the frozen marker (whose stored data is all-`0xFF` and can
+    /// never equal a real caller's expected data) — this is a silent no-op that
+    /// returns `STATUS_OK` after running the same DAH lifecycle housekeeping the
+    /// mutating path runs. The safety guarantee is "never wipe a spend we don't
+    /// own", not "error on every no-op": `ProcessConflicting` builds its unspend
+    /// set from every input of every losing tx, including parents whose stored
+    /// spend is nil or belongs to the conflict winner, and the Go caller aborts
+    /// the whole loop on any non-OK status other than `TX_NOT_FOUND`.
+    ///
+    /// Errors are reserved for: record not found (`TX_NOT_FOUND`), offset out of
+    /// range or hash mismatch (`UTXO_NOT_FOUND` / `UTXO_HASH_MISMATCH`, evaluated
+    /// before the ownership check), a `PRUNED` slot (chain history actually
+    /// diverged — TeraSlab postdates the Lua, which had no PRUNED state), an
+    /// owned-spend on a frozen slot (`FROZEN`, structurally unreachable since a
+    /// real caller's expected data is never the frozen marker, but preserved to
+    /// mirror the Lua), counter corruption, and storage failures.
     pub fn unspend(&self, req: &UnspendRequest) -> Result<UnspendResponse, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
@@ -1695,63 +1715,72 @@ impl Engine {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
 
-        // 5. Check status
-        match slot.status {
-            UTXO_UNSPENT => {
-                // Already unspent — no-op, no counter change, no generation bump
-                return Ok(UnspendResponse {
-                    signal: Signal::None,
-                    generation: { metadata.generation },
-                });
-            }
-            UTXO_SPENT => {
-                // Check if frozen (spending_data all 0xFF)
-                if slot.spending_data == [FROZEN_BYTE; 36] {
-                    return Err(SpendError::Frozen { offset: req.offset });
-                }
-                if slot.spending_data != req.spending_data {
-                    return Err(SpendError::InvalidSpend {
-                        offset: req.offset,
-                        spending_data: slot.spending_data,
-                    });
-                }
-                let current = { metadata.spent_utxos };
-                if current == 0 {
-                    return Err(SpendError::StorageError {
-                        detail: format!(
-                            "metadata spent_utxos is zero while slot {} is spent",
-                            req.offset
-                        ),
-                    });
-                }
-
-                // Valid unspend
-                let new_slot = UtxoSlot::new_unspent(req.utxo_hash);
-                self.write_slot_fast(record_offset, req.offset, &new_slot)?;
-                metadata.spent_utxos = current - 1;
-            }
-            UTXO_PRUNED => {
-                return Err(SpendError::Pruned {
-                    offset: req.offset,
-                    spending_data: slot.spending_data,
-                });
-            }
-            UTXO_FROZEN => {
-                return Err(SpendError::Frozen { offset: req.offset });
-            }
-            _ => {
-                return Err(SpendError::StorageError {
-                    detail: format!("unknown status: {:#04x}", slot.status),
-                });
-            }
+        // 5. Ownership decision (mirrors the Lua `callerOwnsSpend` check).
+        //
+        // PRUNED is a hard error in both directions — the Lua predates the
+        // PRUNED state, and a pruned slot means chain history actually
+        // diverged, which must not be silently reversed.
+        if slot.status == UTXO_PRUNED {
+            return Err(SpendError::Pruned {
+                offset: req.offset,
+                spending_data: slot.spending_data,
+            });
+        }
+        if slot.status != UTXO_UNSPENT
+            && slot.status != UTXO_SPENT
+            && slot.status != UTXO_FROZEN
+        {
+            return Err(SpendError::StorageError {
+                detail: format!("unknown status: {:#04x}", slot.status),
+            });
         }
 
-        // 6. Mutation bookkeeping
-        let old_dah = { metadata.delete_at_height };
-        metadata.generation = { metadata.generation }.wrapping_add(1);
-        metadata.updated_at = self.now_millis();
+        // `callerOwnsSpend = existingSpendingData ~= nil AND
+        //  bytes_equal(existingSpendingData, expectedSpendingData)`.
+        // The stored spend is "present" only on a SPENT slot; an UNSPENT slot
+        // has no stored spend (nil), and a FROZEN slot's stored data is the
+        // all-0xFF marker, which a real caller's expected data never matches.
+        let stored_is_frozen_marker =
+            slot.status == UTXO_FROZEN || slot.spending_data == [FROZEN_BYTE; 36];
+        let caller_owns_spend = slot.status == UTXO_SPENT
+            && !stored_is_frozen_marker
+            && slot.spending_data == req.spending_data;
 
-        // 7. Evaluate deleteAtHeight
+        if caller_owns_spend {
+            // Owned + frozen would be FROZEN per the Lua; structurally
+            // unreachable here because `stored_is_frozen_marker` already
+            // excludes it from `caller_owns_spend`, but kept explicit so the
+            // contract is auditable against the reference.
+            if stored_is_frozen_marker {
+                return Err(SpendError::Frozen { offset: req.offset });
+            }
+
+            let current = { metadata.spent_utxos };
+            if current == 0 {
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "metadata spent_utxos is zero while slot {} is spent",
+                        req.offset
+                    ),
+                });
+            }
+
+            // Valid unspend: clear the slot and decrement the counter.
+            let new_slot = UtxoSlot::new_unspent(req.utxo_hash);
+            self.write_slot_fast(record_offset, req.offset, &new_slot)?;
+            metadata.spent_utxos = current - 1;
+            metadata.generation = { metadata.generation }.wrapping_add(1);
+            metadata.updated_at = self.now_millis();
+        }
+        // else: silent no-op. The slot, counter, and generation are left
+        // untouched; we still fall through to DAH housekeeping exactly as the
+        // Lua does (`setDeleteAtHeight` runs on every non-error path).
+
+        // 6. Evaluate deleteAtHeight (runs on both the mutating and no-op paths,
+        //    matching the Lua which calls setDeleteAtHeight before every OK
+        //    return). On a pure no-op this may still forward-extend an
+        //    all-spent record's DAH.
+        let old_dah = { metadata.delete_at_height };
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
             req.current_block_height,
@@ -1762,18 +1791,25 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 8. Write metadata (targeted spend footer when direct, full otherwise)
-        if !self.device_ptr.is_null() {
-            unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
-        } else {
-            self.write_metadata_fast(record_offset, &metadata)?;
-        }
-
-        self.sync_index_cache(&req.tx_key, &metadata)?;
-
-        // 9. Update DAH secondary index (two-phase durable)
         let new_dah = { metadata.delete_at_height };
-        self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+
+        // 7. Persist only when something actually changed. The owned-spend path
+        //    always changed (slot + counter + generation). A no-op persists only
+        //    if DAH housekeeping moved the deleteAtHeight, and does so without
+        //    bumping the generation — keeping a pure no-op generation-stable so
+        //    the dispatch layer can still classify it as idempotent.
+        if caller_owns_spend || new_dah != old_dah {
+            if !self.device_ptr.is_null() {
+                unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
+            } else {
+                self.write_metadata_fast(record_offset, &metadata)?;
+            }
+
+            self.sync_index_cache(&req.tx_key, &metadata)?;
+
+            // Update DAH secondary index (two-phase durable).
+            self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
+        }
 
         Ok(UnspendResponse {
             signal,
@@ -6137,11 +6173,16 @@ mod tests {
     }
 
     #[test]
-    fn unspend_frozen_error() {
+    fn unspend_frozen_slot_is_noop_not_error() {
+        // The Lua only emits FROZEN inside the `callerOwnsSpend` branch. A
+        // frozen slot's stored spending data is the all-0xFF marker, which a
+        // real caller's expected data never equals, so ownership is false and
+        // the unspend is a silent no-op (STATUS_OK), leaving the slot frozen.
         let h = TestHarness::new(10, TxFlags::empty());
         let entry = h.engine.lookup(&h.key).unwrap();
         let frozen = UtxoSlot::new_frozen(h.slot_hash(3));
         io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &frozen).unwrap();
+        let g0 = { h.engine.read_metadata(&h.key).unwrap().generation };
 
         let req = UnspendRequest {
             tx_key: h.key,
@@ -6151,10 +6192,42 @@ mod tests {
             current_block_height: 1000,
             block_height_retention: 288,
         };
-        match h.engine.unspend(&req) {
-            Err(SpendError::Frozen { offset: 3 }) => {}
-            other => panic!("expected Frozen, got {other:?}"),
-        }
+        let resp = h.engine.unspend(&req).expect("frozen unspend must be a no-op OK");
+        assert_eq!(resp.signal, Signal::None);
+
+        // Slot stays frozen, generation unchanged.
+        let slot = h.engine.read_slot(&h.key, 3).unwrap();
+        assert!(slot.is_frozen());
+        assert_eq!({ h.engine.read_metadata(&h.key).unwrap().generation }, g0);
+    }
+
+    #[test]
+    fn unspend_spent_slot_with_frozen_marker_data_is_noop() {
+        // Defensive: a SPENT slot whose stored data is somehow the frozen
+        // marker AND whose caller's expected data is that same marker would
+        // hit the structural FROZEN branch. This is unreachable via legitimate
+        // writers (no real spend records all-0xFF) but pins the Lua-mirrored
+        // branch so it cannot silently rot.
+        let h = TestHarness::new(10, TxFlags::empty());
+        let entry = h.engine.lookup(&h.key).unwrap();
+        let spent_frozen = UtxoSlot::new_spent(h.slot_hash(3), [FROZEN_BYTE; 36]);
+        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &spent_frozen).unwrap();
+
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 3,
+            utxo_hash: h.slot_hash(3),
+            spending_data: [FROZEN_BYTE; 36],
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        // The frozen marker excludes ownership, so this is a no-op OK, not an
+        // error — the FROZEN branch is genuinely dead for real callers.
+        let resp = h.engine.unspend(&req).expect("frozen-marker unspend is a no-op OK");
+        assert_eq!(resp.signal, Signal::None);
+        let slot = h.engine.read_slot(&h.key, 3).unwrap();
+        assert!(slot.is_spent());
+        assert_eq!(slot.spending_data, [FROZEN_BYTE; 36]);
     }
 
     #[test]
@@ -6194,9 +6267,16 @@ mod tests {
     }
 
     #[test]
-    fn unspend_rejects_wrong_spending_data_without_mutating_slot() {
+    fn unspend_mismatched_spending_data_is_noop_without_mutating_slot() {
+        // Lua contract (`teranode.lua:513-540`): when the caller does NOT own
+        // the stored spend (stored 0xAB belongs to a different tx than the
+        // caller's 0xCD), unspend is a silent idempotent no-op returning
+        // STATUS_OK — "never wipe a spend we don't own", not "error on every
+        // no-op". The slot stays spent by the original spender, the counter is
+        // unchanged, and the generation is NOT bumped.
         let h = TestHarness::new(10, TxFlags::empty());
         h.engine.spend(&h.spend_req(5)).unwrap();
+        let g0 = { h.engine.read_metadata(&h.key).unwrap().generation };
 
         let wrong_spending_data = h.make_spending_data(0xCD);
         let req = UnspendRequest {
@@ -6208,18 +6288,19 @@ mod tests {
             block_height_retention: 288,
         };
 
-        match h.engine.unspend(&req) {
-            Err(SpendError::InvalidSpend {
-                offset: 5,
-                spending_data,
-            }) => assert_eq!(spending_data, h.make_spending_data(0xAB)),
-            other => panic!("expected InvalidSpend, got {other:?}"),
-        }
+        let resp = h
+            .engine
+            .unspend(&req)
+            .expect("mismatched spending data must be a no-op OK, not an error");
+        assert_eq!(resp.signal, Signal::None);
+        assert_eq!(resp.generation, g0, "no-op must not bump generation");
 
+        // Slot still spent by the original spender (0xAB); counter unchanged.
         let slot = h.engine.read_slot(&h.key, 5).unwrap();
         assert!(slot.is_spent());
         assert_eq!(slot.spending_data, h.make_spending_data(0xAB));
         assert_eq!({ h.engine.read_metadata(&h.key).unwrap().spent_utxos }, 1);
+        assert_eq!({ h.engine.read_metadata(&h.key).unwrap().generation }, g0);
     }
 
     #[test]
@@ -6319,6 +6400,62 @@ mod tests {
 
         // DAH should be cleared
         assert!(h.engine.dah_index().range_query(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn unspend_noop_still_runs_dah_housekeeping() {
+        // The Lua runs `setDeleteAtHeight` before every OK return, including the
+        // no-op path. Here we drive an all-spent record into a state where its
+        // DAH has not yet been set, then issue a NON-owning (mismatched) unspend
+        // and confirm the no-op path still evaluates and SETS the DAH — proving
+        // housekeeping runs even when no slot/counter mutation occurs.
+        let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+        });
+
+        // Spend both UTXOs → all-spent, DAH set to 1000 + 288 at height 1000.
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        h.engine.spend(&h.spend_req(1)).unwrap();
+
+        // Manually clear the DAH (and its index entry) to model a record that is
+        // all-spent but whose DAH housekeeping has not yet fired.
+        {
+            let entry = h.engine.lookup(&h.key).unwrap();
+            let mut meta = h.engine.read_metadata(&h.key).unwrap();
+            let old_dah = { meta.delete_at_height };
+            meta.delete_at_height = 0;
+            io::write_metadata(&*h.engine.device, entry.record_offset, &meta).unwrap();
+            h.engine.update_dah_index(&h.key, old_dah, 0).unwrap();
+        }
+        assert!(h.engine.dah_index().range_query(u32::MAX).is_empty());
+
+        // Non-owning unspend: stored spend on slot 0 is 0xAB, caller passes 0xCD.
+        let g0 = { h.engine.read_metadata(&h.key).unwrap().generation };
+        let req = UnspendRequest {
+            tx_key: h.key,
+            offset: 0,
+            utxo_hash: h.slot_hash(0),
+            spending_data: h.make_spending_data(0xCD),
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        h.engine.unspend(&req).unwrap();
+
+        // Slot/counter untouched (still all-spent), but housekeeping re-set DAH.
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert!(h.engine.read_slot(&h.key, 0).unwrap().is_spent());
+        assert_eq!({ meta.spent_utxos }, 2, "counter unchanged by no-op");
+        assert_eq!({ meta.delete_at_height }, 1288, "no-op ran DAH housekeeping");
+        assert!(!h.engine.dah_index().range_query(u32::MAX).is_empty());
+        // The no-op itself did not bump the generation; only the DAH housekeeping
+        // persisted (generation is left stable so the dispatch layer classifies
+        // it as idempotent).
+        assert_eq!({ meta.generation }, g0);
     }
 
     // -- Signal / deleteAtHeight tests --

@@ -2910,7 +2910,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_unspend_wrong_spending_data_rejected_without_mutation() {
+    fn apply_unspend_wrong_spending_data_is_noop_without_mutation() {
         let engine = make_engine();
         let k = key(51);
         create_record(&engine, k, 1);
@@ -2928,9 +2928,12 @@ mod tests {
         )
         .unwrap();
 
-        // An unspend whose spending_data does not match the recorded
-        // spend must fail loudly (divergence), not erase the spend.
-        let err = apply_op(
+        // An unspend whose spending_data does not match the recorded spend is a
+        // silent idempotent no-op (Lua `unspend` ownership contract), NOT a
+        // rejection — "never wipe a spend we don't own". The engine returns OK,
+        // so the receiver applies a no-op: the spent slot and counter stay
+        // exactly as the recorded spend left them.
+        apply_op(
             &engine,
             &ReplicaOp::Unspend {
                 tx_key: k,
@@ -2941,8 +2944,7 @@ mod tests {
                 master_generation: 1,
             },
         )
-        .unwrap_err();
-        assert!(err.contains("unspend"), "unexpected error: {err}");
+        .unwrap();
 
         let slot = engine.read_slot(&k, 0).unwrap();
         assert_eq!(slot.status, UTXO_SPENT);
