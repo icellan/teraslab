@@ -528,6 +528,14 @@ impl SwimRunner {
             let fd = socket.as_raw_fd();
             let size: libc::c_int = 1024 * 1024; // 1 MiB
             unsafe {
+                // SAFETY: `fd` is borrowed from a live `UdpSocket` that
+                // outlives this call, and `&size` points to an initialized
+                // `libc::c_int` that remains valid for the duration of the
+                // `setsockopt` call; the passed length matches its size.
+                // SOL_SOCKET / SO_RCVBUF are OS constants for the receive
+                // buffer. The error is intentionally ignored because the
+                // larger buffer is a best-effort packet-loss mitigation;
+                // the socket remains fully usable at the default size.
                 libc::setsockopt(
                     fd,
                     libc::SOL_SOCKET,

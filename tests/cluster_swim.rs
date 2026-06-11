@@ -684,3 +684,93 @@ fn after_membership_change_all_nodes_compute_same_shard_table() {
         }
     }
 }
+
+/// Bind a UDP socket to an ephemeral port, capture the port, and drop the
+/// socket — leaving a port that nothing is listening on. Used to model a
+/// DEAD seed entry. Binding-then-dropping (rather than guessing a fixed
+/// port) avoids colliding with the fixed ports the other tests use.
+fn dead_swim_port() -> u16 {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral");
+    let port = s.local_addr().expect("local_addr").port();
+    drop(s);
+    port
+}
+
+/// E-LOW: a cluster must still form when the seed list contains a DEAD
+/// seed alongside a live one. SWIM join is best-effort per seed (the
+/// initial join sends to every seed and ignores send errors), so an
+/// unreachable seed must not block discovery via the reachable seed.
+#[test]
+fn cluster_forms_with_one_dead_seed_among_live_seeds() {
+    // Live anchor node, no seeds of its own.
+    let n1 = start_swim(60, 15210, 15211, &[]);
+
+    // A guaranteed-dead seed port (nothing bound there).
+    let dead = dead_swim_port();
+
+    // Node 2's seed list contains the DEAD seed FIRST, then the live
+    // anchor. Ordering the dead seed first ensures we exercise the
+    // "skip the dead seed and keep going" path rather than getting lucky
+    // by hitting the live seed before the dead one matters.
+    let n2 = start_swim(61, 15212, 15213, &[dead, 15210]);
+
+    // Node 3 likewise seeds off the dead port plus the live anchor.
+    let n3 = start_swim(62, 15214, 15215, &[dead, 15210]);
+
+    // The anchor must discover BOTH peers despite the dead seed in their
+    // lists — proving the cluster formed via the live seed.
+    let events1 = wait_for(
+        &n1.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(61), _)))
+                && evts
+                    .iter()
+                    .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(62), _)))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        events1
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(61), _))),
+        "anchor must discover node 61 despite the dead seed, events: {events1:?}"
+    );
+    assert!(
+        events1
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(62), _))),
+        "anchor must discover node 62 despite the dead seed, events: {events1:?}"
+    );
+
+    // And each seeded node must discover the anchor (the live seed).
+    let events2 = wait_for(
+        &n2.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(60), _)))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        events2
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(60), _))),
+        "node 61 must reach the anchor via the live seed, events: {events2:?}"
+    );
+
+    let events3 = wait_for(
+        &n3.rx,
+        |evts| {
+            evts.iter()
+                .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(60), _)))
+        },
+        WAIT_CEILING,
+    );
+    assert!(
+        events3
+            .iter()
+            .any(|e| matches!(e, ClusterEvent::NodeJoined(NodeId(60), _))),
+        "node 62 must reach the anchor via the live seed, events: {events3:?}"
+    );
+}

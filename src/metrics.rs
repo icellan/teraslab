@@ -1300,6 +1300,48 @@ impl SwimMetrics {
     }
 }
 
+/// Inter-node authentication metrics (E-4 / E-5).
+///
+/// Counts the *distinct* reasons an authenticated SWIM/TCP frame is
+/// rejected by [`crate::cluster::auth`]. Keeping these separate is
+/// load-bearing for operators: a spike in
+/// [`Self::auth_skew_rejections_total`] points at an NTP/clock-skew
+/// partition (every node is reachable, all share the secret, but their
+/// wall-clocks disagree by more than the configured window), whereas a
+/// spike in [`Self::auth_hmac_rejections_total`] points at a wrong/rotated
+/// secret or an active forgery attempt. Conflating them as one
+/// "auth failed" counter (the pre-E-5 behaviour) makes a skew partition
+/// indistinguishable from a misconfigured secret on the dashboard.
+#[repr(align(128))]
+pub struct ClusterAuthMetrics {
+    /// Frames rejected because the HMAC tag did not verify (wrong secret,
+    /// tampered payload, or forgery). Maps to `io::ErrorKind::PermissionDenied`
+    /// from the verifier.
+    pub auth_hmac_rejections_total: PaddedCounter,
+    /// Frames whose HMAC tag was valid but whose embedded timestamp fell
+    /// outside the clock-skew window. A sustained climb means peer clocks
+    /// have drifted past [`crate::cluster::auth::max_clock_skew`] and the
+    /// cluster is partitioning purely on time, not on connectivity or
+    /// secret mismatch.
+    pub auth_skew_rejections_total: PaddedCounter,
+}
+
+impl Default for ClusterAuthMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClusterAuthMetrics {
+    /// Create a new, zero-initialized cluster-auth metrics table.
+    pub const fn new() -> Self {
+        Self {
+            auth_hmac_rejections_total: PaddedCounter::new(),
+            auth_skew_rejections_total: PaddedCounter::new(),
+        }
+    }
+}
+
 /// Device-space allocator metrics.
 ///
 /// Counters + gauges for every allocate/free call on [`crate::allocator::SlotAllocator`].
@@ -1379,6 +1421,7 @@ static REDO_METRICS: OnceLock<&'static RedoMetrics> = OnceLock::new();
 static MIGRATION_METRICS: OnceLock<&'static MigrationMetrics> = OnceLock::new();
 static SWIM_METRICS: OnceLock<&'static SwimMetrics> = OnceLock::new();
 static ALLOCATOR_METRICS: OnceLock<&'static AllocatorMetrics> = OnceLock::new();
+static CLUSTER_AUTH_METRICS: OnceLock<&'static ClusterAuthMetrics> = OnceLock::new();
 
 /// Install the process-wide replication metrics reference.
 ///
@@ -1431,6 +1474,19 @@ pub fn init_allocator_metrics(m: &'static AllocatorMetrics) {
 /// Borrow the process-wide allocator metrics, if installed.
 pub fn allocator_metrics() -> Option<&'static AllocatorMetrics> {
     ALLOCATOR_METRICS.get().copied()
+}
+
+/// Install the process-wide cluster-auth metrics reference.
+///
+/// Idempotent: subsequent calls are silently ignored so tests that run in
+/// parallel inside the same process do not panic.
+pub fn init_cluster_auth_metrics(m: &'static ClusterAuthMetrics) {
+    let _ = CLUSTER_AUTH_METRICS.set(m);
+}
+
+/// Borrow the process-wide cluster-auth metrics, if installed.
+pub fn cluster_auth_metrics() -> Option<&'static ClusterAuthMetrics> {
+    CLUSTER_AUTH_METRICS.get().copied()
 }
 
 #[cfg(test)]

@@ -5,6 +5,54 @@
 //! operations on different transactions do not contend.
 
 use crate::index::TxKey;
+use std::sync::OnceLock;
+
+/// Process-wide random seed mixed into [`StripedLocks::stripe_index`]
+/// (C-7).
+///
+/// # Why a seed
+///
+/// Before the seed existed, the lock stripe was selected from raw txid
+/// bytes (`txid[16..24] & mask`). Because those bytes are fully
+/// attacker-controlled, an adversary submitting transactions could grind
+/// txids whose bytes 16–23 all collide modulo the stripe count, funnelling
+/// every operation onto a single mutex and serialising the engine — a
+/// targeted contention / DoS. The index hashtable already defends against
+/// exactly this with a per-process seed (`bucket_index` in
+/// `src/index/hashtable.rs`); the lock table did not, so it inherited the
+/// weakness.
+///
+/// Mixing in a 64-bit process-local seed makes the stripe mapping
+/// unpredictable to a remote attacker (who cannot observe the seed) while
+/// staying perfectly deterministic *within* a process — a `lock(k)` always
+/// lands on the same stripe as a prior `lock(k)`, which is all the lock
+/// table requires for correctness (a stripe collision only costs
+/// contention, never safety).
+///
+/// Unlike the hashtable seed this value is never persisted and has no
+/// on-disk layout implications: lock striping is purely in-memory, so a
+/// fresh random seed every process start is free of compatibility concerns.
+fn stripe_seed() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| {
+        // Prefer the OS CSPRNG. Unlike the index hashtable — where a
+        // non-random seed would silently re-enable a DoS and therefore
+        // justifies a panic — a lock stripe collision only costs
+        // contention, never correctness. So on the (essentially
+        // impossible) `getrandom` failure we fall back to a still
+        // process-unpredictable seed derived from `RandomState` rather
+        // than aborting the process. No `expect()` in library code.
+        let mut buf = [0u8; 8];
+        if getrandom::getrandom(&mut buf).is_ok() {
+            return u64::from_le_bytes(buf);
+        }
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(0x9e37_79b9_7f4a_7c15);
+        h.finish()
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Record-offset striped RwLock — used by the direct-pointer I/O path in
@@ -92,16 +140,31 @@ impl StripedRwLocks {
 pub struct StripedLocks {
     locks: Vec<parking_lot::Mutex<()>>,
     mask: usize,
+    /// Process-local seed mixed into [`Self::stripe_index`] so an attacker
+    /// cannot grind txids to collide stripes (C-7).
+    seed: u64,
 }
 
 impl StripedLocks {
     /// Create a lock table with `stripe_count` stripes (rounded up to power of 2).
+    ///
+    /// The stripe mapping is seeded with a process-wide random value
+    /// (`stripe_seed`) so the txid→stripe assignment is unpredictable to
+    /// a remote attacker while staying deterministic within the process.
     pub fn new(stripe_count: usize) -> Self {
+        Self::with_seed(stripe_count, stripe_seed())
+    }
+
+    /// Create a lock table with an explicit `seed`. Exposed for tests that
+    /// need to compare the mapping under two distinct seeds; production
+    /// callers should use [`StripedLocks::new`].
+    pub fn with_seed(stripe_count: usize, seed: u64) -> Self {
         let count = stripe_count.next_power_of_two().max(16);
         let locks = (0..count).map(|_| parking_lot::Mutex::new(())).collect();
         Self {
             locks,
             mask: count - 1,
+            seed,
         }
     }
 
@@ -112,22 +175,27 @@ impl StripedLocks {
     }
 
     /// Compute which stripe a key maps to.
+    ///
+    /// Uses bytes 16–23 of the txid (different from bucket index [0–7] and
+    /// fingerprint [8–15]) XOR-mixed with the per-process `seed`
+    /// through a SplitMix64 finalizer (C-7). The mix both defeats
+    /// txid-grinding stripe-collision attacks and improves distribution
+    /// when operators configure more than 65,536 stripes (the raw bytes
+    /// alone only spread across the low bits).
     pub fn stripe_index(&self, key: &TxKey) -> usize {
-        // Use bytes 16–23 (different from bucket index [0–7] and fingerprint [8–15]).
-        // This preserves distribution when operators configure more than 65,536 stripes.
-        //
-        // F-G1-018: use the slice→array conversion so the compiler emits a
-        // single 8-byte load instead of the two-step `[0u8; 8]` +
-        // `copy_from_slice` shape. `txid` is always 32 bytes so the
-        // 16..24 slice is statically 8 bytes; the `try_into` will never
-        // fail. `expect` here is correct (a TxKey shorter than 32 bytes
-        // is structurally impossible — it's `[u8; 32]`).
-        let h = u64::from_le_bytes(
-            key.txid[16..24]
-                .try_into()
-                .expect("TxKey::txid is always 32 bytes; 16..24 is 8 bytes"),
-        ) as usize;
-        h & self.mask
+        // F-G1-018: the slice→array conversion lets the compiler emit a
+        // single 8-byte load. `txid` is always 32 bytes so the 16..24
+        // slice is statically 8 bytes; the `try_into` cannot fail. We map
+        // the impossible error to a 0 fallback rather than `expect` to keep
+        // library code panic-free — a 0 here would still be deterministic.
+        let raw = u64::from_le_bytes(key.txid[16..24].try_into().unwrap_or([0u8; 8]));
+        // SplitMix64 finalizer over (raw XOR seed): 2 multiplies + 2
+        // xorshifts, ~2 ns, mirroring `hashtable::bucket_index`.
+        let mut x = raw ^ self.seed;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^= x >> 31;
+        (x as usize) & self.mask
     }
 
     /// Number of stripes in the lock table.
@@ -213,6 +281,77 @@ mod tests {
         let high = make_key((1 << 16) + 1);
 
         assert_ne!(locks.stripe_index(&low), locks.stripe_index(&high));
+    }
+
+    // -- C-7: seeded stripe selection --
+
+    #[test]
+    fn stripe_selection_depends_on_seed() {
+        // Two lock tables with different seeds must (for at least some
+        // keys) map the same txid to different stripes — otherwise an
+        // attacker who knows the raw-byte mapping could grind collisions
+        // regardless of the seed. With 65,536 stripes over 256 keys a
+        // seed change moves the overwhelming majority; we only require
+        // that it moves *some*.
+        let a = StripedLocks::with_seed(65536, 0x1111_1111_1111_1111);
+        let b = StripedLocks::with_seed(65536, 0xEEEE_EEEE_EEEE_EEEE);
+        let mut differing = 0usize;
+        for i in 0..256u64 {
+            let k = make_key(i);
+            if a.stripe_index(&k) != b.stripe_index(&k) {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing > 200,
+            "seed must change the stripe mapping for most keys; only {differing}/256 differed"
+        );
+    }
+
+    #[test]
+    fn stripe_selection_is_stable_within_a_seed() {
+        // Determinism within a process: the same key+seed always lands on
+        // the same stripe (required for lock correctness).
+        let locks = StripedLocks::with_seed(65536, 0xABCD_1234_5678_9F00);
+        let k = make_key(7);
+        let first = locks.stripe_index(&k);
+        for _ in 0..1000 {
+            assert_eq!(locks.stripe_index(&k), first);
+        }
+    }
+
+    #[test]
+    fn raw_byte_collision_is_broken_by_seed() {
+        // Two txids whose bytes 16..24 are IDENTICAL collide under the old
+        // raw-byte scheme on EVERY stripe count. With the seed mix they
+        // still collide with each other (same input bytes → same stripe),
+        // which is correct — the seed defends against an attacker
+        // *predicting* the mapping, not against genuine byte-equality.
+        // This test pins the property that the mapping is a pure function
+        // of (bytes16..24, seed): identical bytes map identically, and a
+        // different seed relocates that shared stripe.
+        let mut t1 = make_key(1);
+        let mut t2 = make_key(2);
+        // Force bytes 16..24 equal but other bytes different.
+        t1.txid[16..24].copy_from_slice(&42u64.to_le_bytes());
+        t2.txid[16..24].copy_from_slice(&42u64.to_le_bytes());
+
+        let s1 = StripedLocks::with_seed(65536, 7);
+        assert_eq!(
+            s1.stripe_index(&t1),
+            s1.stripe_index(&t2),
+            "identical stripe bytes must map to the same stripe under one seed"
+        );
+
+        // The shared stripe should move under *some* other seed — the seed
+        // relocates it. We scan several seeds to make the assertion
+        // deterministic rather than relying on a single 1/65536 draw.
+        let base = s1.stripe_index(&t1);
+        let relocated = (9u64..30).any(|s| StripedLocks::with_seed(65536, s).stripe_index(&t1) != base);
+        assert!(
+            relocated,
+            "a different seed must relocate the stripe for the same bytes"
+        );
     }
 
     #[test]
