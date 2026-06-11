@@ -7307,6 +7307,27 @@ fn handle_stream_chunk(
         None => return error_response(req.request_id, ERR_INTERNAL, "blobstore not configured"),
     };
 
+    // H-1/LM-1: cap the number of concurrent in-progress streams per
+    // connection. A new stream (one this connection has not already opened)
+    // beyond the cap is rejected with `ERR_RATE_LIMITED` *before*
+    // `begin_stream` runs — so the rejected open never allocates a file
+    // descriptor or tmp file. Pre-fix a single connection could open one
+    // `OP_STREAM_CHUNK` (offset 0, one byte) for millions of distinct txids
+    // and exhaust the process fd table. Already-open streams are unaffected:
+    // the cap only gates the creation of a *new* session.
+    let is_new_stream = !conn_state.streams.contains_key(&chunk.txid);
+    if is_new_stream && !conn_state.can_open_new_stream() {
+        return error_response(
+            req.request_id,
+            ERR_RATE_LIMITED,
+            &format!(
+                "too many concurrent streams ({}): max {} per connection",
+                conn_state.streams.len(),
+                conn_state.max_active_streams,
+            ),
+        );
+    }
+
     // Get or create the stream session for this txid.
     //
     // F-G5-024: collapse the previous Vacant-insert + separate get_mut(...)
@@ -7322,6 +7343,9 @@ fn handle_stream_chunk(
             Ok(writer) => vacant.insert(super::ActiveStream {
                 writer,
                 bytes_received: 0,
+                // H-2: stamp creation time; refreshed below on each accepted
+                // chunk so the idle reaper measures inter-chunk gaps.
+                last_activity: std::time::Instant::now(),
             }),
             Err(e) => {
                 return error_response(
@@ -7386,6 +7410,9 @@ fn handle_stream_chunk(
     }
 
     stream.bytes_received = projected;
+    // H-2: refresh idle deadline on every accepted chunk so an actively
+    // uploading stream is never reaped mid-transfer.
+    stream.last_activity = std::time::Instant::now();
 
     ResponseFrame {
         request_id: req.request_id,
@@ -9017,6 +9044,263 @@ mod tests {
         assert!(
             !conn_state.streams.contains_key(&txid),
             "stream session must be removed after exceeding the cap",
+        );
+    }
+
+    /// H-1/LM-1: a connection may hold at most
+    /// `max_active_streams_per_connection` concurrent in-progress streams.
+    /// Opening one more (a fresh txid) is rejected with `ERR_RATE_LIMITED`
+    /// while the existing streams stay intact, and the rejected open must
+    /// not leak a session into the map.
+    #[test]
+    fn stream_chunk_rejects_new_stream_past_concurrent_cap() {
+        use crate::protocol::codec::{decode_error_payload, encode_stream_chunk};
+        use crate::protocol::opcodes::{ERR_RATE_LIMITED, OP_STREAM_CHUNK};
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+
+        let h = DispatchTestHarness::new();
+        let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
+
+        const CAP: usize = 4;
+        let mut conn_state =
+            crate::server::ConnectionState::new().with_max_active_streams(CAP);
+
+        // Helper: open a new stream by sending one chunk at offset 0.
+        let open_stream = |conn_state: &mut crate::server::ConnectionState, n: u8| -> ResponseFrame {
+            let txid = DispatchTestHarness::make_txid(n);
+            let req = RequestFrame {
+                request_id: n as u64,
+                op_code: OP_STREAM_CHUNK,
+                flags: 0,
+                payload: encode_stream_chunk(&txid, 0, &[0xABu8; 8]).into(),
+            };
+            handle_request(
+                &req,
+                &h.engine,
+                8192,
+                None,
+                None,
+                conn_state,
+                Some(&*blob_store),
+            )
+        };
+
+        // Open exactly CAP distinct streams — all must succeed.
+        for n in 0..CAP as u8 {
+            let resp = open_stream(&mut conn_state, n);
+            assert_eq!(
+                resp.status,
+                STATUS_OK,
+                "stream {n} under the cap must be accepted; payload: {:?}",
+                String::from_utf8_lossy(&resp.payload),
+            );
+        }
+        assert_eq!(
+            conn_state.streams.len(),
+            CAP,
+            "exactly CAP streams must be open before the rejection",
+        );
+
+        // The CAP+1-th distinct stream must be rejected with ERR_RATE_LIMITED.
+        let over_txid = DispatchTestHarness::make_txid(CAP as u8);
+        let resp = open_stream(&mut conn_state, CAP as u8);
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "opening past the concurrent-stream cap must be rejected",
+        );
+        let (code, msg) = decode_error_payload(&resp.payload).expect("typed error payload");
+        assert_eq!(
+            code, ERR_RATE_LIMITED,
+            "over-cap stream open must surface ERR_RATE_LIMITED, got msg: {msg}",
+        );
+
+        // The rejected open must NOT have leaked a session (no fd/tmp would
+        // have been allocated — `begin_stream` is never reached).
+        assert!(
+            !conn_state.streams.contains_key(&over_txid),
+            "rejected over-cap stream must not appear in the session map",
+        );
+        assert_eq!(
+            conn_state.streams.len(),
+            CAP,
+            "existing streams must be unaffected by the rejected open",
+        );
+
+        // An existing stream can still receive further chunks (offset 8).
+        let txid0 = DispatchTestHarness::make_txid(0);
+        let req = RequestFrame {
+            request_id: 100,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            payload: encode_stream_chunk(&txid0, 8, &[0xCDu8; 4]).into(),
+        };
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            None,
+            None,
+            &mut conn_state,
+            Some(&*blob_store),
+        );
+        assert_eq!(
+            resp.status,
+            STATUS_OK,
+            "existing stream must keep accepting chunks after an over-cap reject",
+        );
+    }
+
+    /// H-1/LM-1: a `max_active_streams` of `0` disables the concurrent-stream
+    /// cap entirely — many distinct streams open without rejection.
+    #[test]
+    fn stream_chunk_concurrent_cap_zero_disables_limit() {
+        use crate::protocol::codec::encode_stream_chunk;
+        use crate::protocol::opcodes::OP_STREAM_CHUNK;
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+
+        let h = DispatchTestHarness::new();
+        let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
+        let mut conn_state =
+            crate::server::ConnectionState::new().with_max_active_streams(0);
+
+        for n in 0..32u8 {
+            let txid = DispatchTestHarness::make_txid(n);
+            let req = RequestFrame {
+                request_id: n as u64,
+                op_code: OP_STREAM_CHUNK,
+                flags: 0,
+                payload: encode_stream_chunk(&txid, 0, &[0x11u8; 2]).into(),
+            };
+            let resp = handle_request(
+                &req,
+                &h.engine,
+                8192,
+                None,
+                None,
+                &mut conn_state,
+                Some(&*blob_store),
+            );
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "with cap disabled, stream {n} must be accepted",
+            );
+        }
+        assert_eq!(conn_state.streams.len(), 32, "all 32 streams must be open");
+    }
+
+    /// H-2: `reap_idle_streams` aborts streams whose `last_activity` is older
+    /// than the idle timeout (removing their tmp files via `abort`), leaves a
+    /// recently-active stream untouched, and a subsequent op on a reaped
+    /// stream id is treated as a fresh/unknown stream — not the old session.
+    #[test]
+    fn reap_idle_streams_removes_only_stale_sessions() {
+        use crate::protocol::codec::{decode_error_payload, encode_stream_chunk, encode_stream_end};
+        use crate::protocol::opcodes::{ERR_STREAM_NOT_FOUND, OP_STREAM_CHUNK, OP_STREAM_END};
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+        use std::time::{Duration, Instant};
+
+        let h = DispatchTestHarness::new();
+        let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
+        let mut conn_state = crate::server::ConnectionState::new()
+            .with_stream_idle_timeout(Some(Duration::from_secs(30)));
+
+        let stale_txid = DispatchTestHarness::make_txid(1);
+        let fresh_txid = DispatchTestHarness::make_txid(2);
+
+        // Open two streams.
+        for txid in [stale_txid, fresh_txid] {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: OP_STREAM_CHUNK,
+                flags: 0,
+                payload: encode_stream_chunk(&txid, 0, &[0x55u8; 4]).into(),
+            };
+            let resp = handle_request(
+                &req,
+                &h.engine,
+                8192,
+                None,
+                None,
+                &mut conn_state,
+                Some(&*blob_store),
+            );
+            assert_eq!(resp.status, STATUS_OK, "stream open must succeed");
+        }
+        assert_eq!(conn_state.streams.len(), 2);
+
+        // Backdate ONLY the stale stream's last_activity well past the
+        // timeout; leave the fresh one current.
+        if let Some(s) = conn_state.streams.get_mut(&stale_txid) {
+            s.last_activity = Instant::now() - Duration::from_secs(120);
+        }
+
+        let reaped = conn_state.reap_idle_streams(Instant::now());
+        assert_eq!(reaped, 1, "exactly the stale stream must be reaped");
+        assert!(
+            !conn_state.streams.contains_key(&stale_txid),
+            "stale stream's map entry must be gone after reap",
+        );
+        assert!(
+            conn_state.streams.contains_key(&fresh_txid),
+            "fresh stream must survive the reap",
+        );
+
+        // OP_STREAM_END on the reaped stream id must report it as unknown —
+        // the old session is gone, not silently resurrected.
+        let end_req = RequestFrame {
+            request_id: 9,
+            op_code: OP_STREAM_END,
+            flags: 0,
+            payload: encode_stream_end(&stale_txid, 4).into(),
+        };
+        let resp = handle_stream_end(&end_req, &mut conn_state);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).expect("typed error payload");
+        assert_eq!(
+            code, ERR_STREAM_NOT_FOUND,
+            "ending a reaped stream must surface ERR_STREAM_NOT_FOUND",
+        );
+    }
+
+    /// H-2: a `None` idle timeout disables the reaper — a stream stamped far
+    /// in the past survives `reap_idle_streams`.
+    #[test]
+    fn reap_idle_streams_disabled_keeps_all_sessions() {
+        use crate::protocol::codec::encode_stream_chunk;
+        use crate::protocol::opcodes::OP_STREAM_CHUNK;
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+        use std::time::{Duration, Instant};
+
+        let h = DispatchTestHarness::new();
+        let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
+        let mut conn_state =
+            crate::server::ConnectionState::new().with_stream_idle_timeout(None);
+
+        let txid = DispatchTestHarness::make_txid(7);
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            payload: encode_stream_chunk(&txid, 0, &[0x22u8; 4]).into(),
+        };
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            None,
+            None,
+            &mut conn_state,
+            Some(&*blob_store),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        if let Some(s) = conn_state.streams.get_mut(&txid) {
+            s.last_activity = Instant::now() - Duration::from_secs(86_400);
+        }
+        let reaped = conn_state.reap_idle_streams(Instant::now());
+        assert_eq!(reaped, 0, "disabled reaper must not remove anything");
+        assert!(
+            conn_state.streams.contains_key(&txid),
+            "stream must survive when the reaper is disabled",
         );
     }
 
