@@ -37,7 +37,7 @@ use teraslab::allocator::SlotAllocator;
 use teraslab::cluster::coordinator::{
     ClusterConfig, ClusterCoordinator, MasterQueryResult, ReplicationRuntimeConfig, RunningCluster,
 };
-use teraslab::cluster::shards::{NodeId, ShardTable};
+use teraslab::cluster::shards::{MigrationTask, NodeId, ShardTable};
 use teraslab::cluster::topology::ClusterId;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -427,6 +427,175 @@ fn fenced_shard_rejects_spend_serves_read_then_spend_succeeds_after_fence_lifts(
     assert_eq!(
         results[0].spending_data, spending_data,
         "spend applied after the fence lifted must be visible"
+    );
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+}
+
+/// Acked-write-loss regression for the migration completion window:
+/// a client write racing the completion of an outbound shard migration
+/// must either be rejected (`ERR_MIGRATION_IN_PROGRESS` while fenced, or
+/// `ERR_REDIRECT` once ownership has transferred) or reach the new
+/// master — it must NEVER be ACKed `STATUS_OK` by the source between
+/// manifest acceptance and the ownership commit, because such a write
+/// exists only on the source and is destroyed by orphan cleanup.
+///
+/// The test drives the PRODUCTION completion transition
+/// (`complete_migration_task_current_epoch`) for a deterministically
+/// fenced shard via the fault-injection hooks, and fires a real wire
+/// SPEND at the sync-point between the completion's two state
+/// transitions. With the historical unfence-before-commit ordering the
+/// spend lands in the gap and is ACKed `STATUS_OK` — exactly the lost
+/// write — so this test fails against that ordering.
+#[test]
+fn write_racing_completion_window_is_never_acked_then_lost() {
+    let node1 = create_node(443, &[], 1);
+    let node2 = create_node(444, &[node1.swim_port], 1);
+
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(20),
+    )
+    .expect("2-node topology should commit on both nodes");
+
+    // A key node1 masters in the committed 2-node table.
+    let mut key_txid = None;
+    for i in 0..8192u32 {
+        let txid = make_txid(960_000 + i);
+        if matches!(
+            node1.cluster.is_master(&TxKey { txid }),
+            MasterQueryResult::Yes
+        ) {
+            key_txid = Some(txid);
+            break;
+        }
+    }
+    let txid = key_txid.expect("node1 should master at least one of 8192 candidate keys");
+    let utxo_hash = make_txid(970_001);
+    let key = TxKey { txid };
+    let shard = ShardTable::shard_for_key(&key);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Seed the record before the migration fences the shard.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_payload(&txid, &utxo_hash).into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "create before the migration");
+
+    // Track + fence the outbound task exactly as the pipelined migration
+    // worker does after baseline streaming; from here the migration is at
+    // the point where the target has verified the manifest and the source
+    // runs the completion transition.
+    let task = MigrationTask {
+        shard,
+        from_node: NodeId(443),
+        to_node: NodeId(444),
+        is_master: true,
+    };
+    node1.cluster.test_track_outbound_fenced(&task);
+    assert!(
+        node1.cluster.is_shard_write_fenced(&key),
+        "fence must be visible on the hot-path bitmap"
+    );
+
+    // Run the production completion; at the midpoint between its two
+    // state transitions, fire a real wire SPEND at the source. No locks
+    // are held at the sync-point, so the request is served end-to-end by
+    // the production dispatch path.
+    let spending_data = [0xD7u8; 36];
+    let spend_payload = encode_spend_payload(&txid, &utxo_hash, &spending_data);
+    let node1_port = node1.tcp_port;
+    let mut midpoint_resp: Option<ResponseFrame> = None;
+    let completed = node1
+        .cluster
+        .test_complete_outbound_migration_with_midpoint(&task, true, || {
+            let mut racer =
+                TcpStream::connect(format!("127.0.0.1:{node1_port}")).unwrap();
+            racer
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            midpoint_resp = Some(send_request(
+                &mut racer,
+                &RequestFrame {
+                    request_id: 2,
+                    op_code: OP_SPEND_BATCH,
+                    flags: 0,
+                    payload: spend_payload.clone().into(),
+                },
+            ));
+        });
+    assert!(completed, "tracked current-epoch completion must succeed");
+
+    let resp = midpoint_resp.expect("midpoint spend must have run");
+    assert_ne!(
+        resp.status, STATUS_OK,
+        "LOST ACK: a write racing migration completion was ACKed STATUS_OK \
+         by the source after manifest acceptance — it exists nowhere after \
+         orphan cleanup"
+    );
+    let code = single_sparse_error_code(&resp, "spend racing migration completion");
+    assert!(
+        code == ERR_MIGRATION_IN_PROGRESS || code == ERR_REDIRECT,
+        "racing write must be fenced (code {ERR_MIGRATION_IN_PROGRESS}) or \
+         redirected (code {ERR_REDIRECT}), got {code}"
+    );
+
+    // After completion the fence is lifted; this node remains the routed
+    // master here (no table handoff was armed), so the identical SPEND now
+    // succeeds and is durably visible — the client retry path works.
+    assert!(
+        !node1.cluster.is_shard_write_fenced(&key),
+        "fence must be cleared after completion"
+    );
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 3,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: spend_payload.into(),
+        },
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "retried SPEND after completion must succeed (payload_len={})",
+        resp.payload.len()
+    );
+    let query = encode_get_spend_batch(&[WireGetSpendItem {
+        txid,
+        vout: 0,
+        utxo_hash,
+    }]);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 4,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: query.into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "post-spend GET_SPEND");
+    let results =
+        decode_get_spend_response(&resp.payload).expect("post-spend response must decode");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].spending_data, spending_data,
+        "retried spend must be durably visible"
     );
 
     shutdown_node(&node1);
