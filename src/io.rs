@@ -1009,6 +1009,14 @@ pub fn read_all_utxo_slots(
         })?;
     let total_read = align_up(intra_offset + slot_bytes, align);
 
+    // F-X-007 (BC-02): record-level read guard so a concurrent
+    // `write_record_bytes` (create into a reused region) or a slot write
+    // cannot be observed mid-copy. Keyed by the record's base offset —
+    // the same key every reader and writer of this record uses — so the
+    // guard excludes whole-record and slot writers regardless of which
+    // 4 KiB page the slot region itself lands in.
+    let _r = io_locks().read(record_offset);
+
     let mut buf = AlignedBuf::new(total_read, align);
     device.pread_exact_at(&mut buf, aligned_base)?;
 
@@ -1078,6 +1086,44 @@ pub fn write_full_record(
     }
 
     device.pwrite_all_at(&buf, record_offset)?;
+    Ok(())
+}
+
+/// Write a fully serialized record image (metadata + UTXO slots + optional
+/// cold data, already alignment-padded by the caller) at `record_offset`
+/// in one device write.
+///
+/// Used by the engine's create path, which builds the aligned record buffer
+/// itself (it interleaves cold data after the slots).
+///
+/// # Errors
+///
+/// Propagates any [`DeviceError`] from the underlying `pwrite`.
+///
+/// # Concurrency contract (F-X-007 / BC-02)
+///
+/// Acquires the process-wide `StripedRwLocks` *write* guard keyed by
+/// `record_offset` for the duration of the write. Creation was previously
+/// exempt from the record-level guard on the assumption that a record being
+/// created has no concurrent readers — that assumption is false when the
+/// allocator reuses a freed region: a lock-free reader still holding the old
+/// offset (obtained from the primary index before the previous occupant's
+/// delete unregistered it) reads the region while the new record's bytes are
+/// being copied in. If the region is re-created for the SAME txid the stale
+/// reader is verifying, the `meta.tx_id` defense (F-G2-001) passes while the
+/// slot region still carries the previous occupant's bytes — returning
+/// another transaction's slots under this key. Live repro:
+/// `tests/g2_delete_race.rs::delete_does_not_alias_concurrent_create`.
+/// Pairs with the read guards in `read_metadata_direct`,
+/// `read_utxo_slot_direct`, and `read_all_utxo_slots`.
+pub fn write_record_bytes(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+    buf: &[u8],
+) -> Result<()> {
+    // F-X-007 (BC-02): record-level write guard — see the doc comment.
+    let _w = io_locks().write(record_offset);
+    device.pwrite_all_at(buf, record_offset)?;
     Ok(())
 }
 

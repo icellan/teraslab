@@ -235,6 +235,23 @@ fn run_checkpoint_loop(
         match outcome {
             Ok(stats) => {
                 backoff = Duration::ZERO;
+                // Latch the re-arm on the checkpoint's own measured
+                // `usage_after` instead of waiting for a later poll to
+                // observe `usage <= low_water`: under sustained fast
+                // mutation bursts, usage can drop below low water (right
+                // after the compaction) and climb back above it between
+                // two polls. The crossing is then never sampled, the
+                // trigger never re-arms, and the log eventually bricks at
+                // 100 % usage with every append returning `LogFull` —
+                // defeating the task's whole purpose (BC-01; this was the
+                // intermittent failure of
+                // `sustained_mutations_never_brick_when_task_is_running`).
+                // Debounce is preserved: re-arming requires that this
+                // checkpoint actually reclaimed to low water, so the next
+                // trip still implies a full low→high climb.
+                if stats.reset_performed && stats.usage_after <= config.low_water {
+                    armed = true;
+                }
                 tracing::info!(
                     elapsed_ms = elapsed.as_millis() as u64,
                     entries_before = stats.entries_before,
@@ -737,16 +754,22 @@ mod tests {
             snapshot_path: dir.path().join("sustained.snap"),
         };
 
+        let high_water = cfg.high_water;
         let shutdown = Arc::new(AtomicBool::new(false));
         let handle = spawn_checkpoint_task(cfg, engine, redo.clone(), shutdown.clone());
 
         let mut log_full_errors = 0usize;
-        // 16 bursts of 500 entries each, with a 25 ms gap. That's
-        // 8000 total entries — comfortably past the 3000-entry
-        // bricking threshold for the pre-fix code path. Each burst
-        // pushes usage past high_water; the gap gives the
-        // checkpointer enough wall-clock to reclaim before the next
-        // burst.
+        // 16 bursts of 500 entries each. That's 8000 total entries —
+        // comfortably past the 3000-entry bricking threshold for the
+        // pre-fix code path. Each burst pushes usage past high_water;
+        // between bursts we wait (bounded) until the checkpointer has
+        // actually reclaimed below high water. A fixed 25 ms gap was
+        // flaky under load — the checkpointer thread is not guaranteed
+        // to be scheduled within an arbitrary wall-clock window on a
+        // busy machine. Pre-fix (delete the `spawn_checkpoint_task`
+        // line above) usage never drops, every wait times out at its
+        // bound, and the workload still bricks the log with thousands
+        // of `LogFull` errors — the test keeps its detection power.
         for _burst in 0..16 {
             for _ in 0..500 {
                 let result = {
@@ -757,7 +780,12 @@ mod tests {
                     log_full_errors += 1;
                 }
             }
-            std::thread::sleep(Duration::from_millis(25));
+            let reclaim_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while redo.lock().usage_fraction() >= high_water
+                && std::time::Instant::now() < reclaim_deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
         shutdown.store(true, Ordering::Relaxed);

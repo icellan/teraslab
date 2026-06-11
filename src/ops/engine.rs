@@ -709,6 +709,96 @@ impl Engine {
         Ok(())
     }
 
+    /// Register a primary-index entry only if `key` is not already present,
+    /// incrementing the matching shard count exactly like
+    /// [`Self::register_with_shard_count`].
+    ///
+    /// The existence check and the insert run inside the same primary-index
+    /// write-lock critical section, so check-then-insert can never interleave
+    /// with another writer. This matters because the backend `insert`
+    /// silently OVERWRITES an existing key (`hashtable.rs` `insert` returns
+    /// the old entry): a non-atomic lookup-then-register on the create path
+    /// let two concurrent creates of the same txid both succeed, orphaning
+    /// one record and leaking its allocation (audit A — create duplicate
+    /// guard). Mirrors the F-G3-013 hardening on `remove()`: the decision is
+    /// made inside the table's critical section, never from a stale earlier
+    /// read.
+    ///
+    /// Returns `Ok(true)` if the entry was inserted, `Ok(false)` if the key
+    /// already exists (the index and shard counts are left unmodified).
+    ///
+    /// # Errors
+    /// Returns [`IndexError`](crate::index::IndexError) from the underlying
+    /// primary backend. On error, neither the index nor `shard_counts` is
+    /// modified.
+    fn register_new_with_shard_count(
+        &self,
+        key: TxKey,
+        entry: TxIndexEntry,
+    ) -> Result<bool, crate::index::IndexError> {
+        // Test-only fault injection — same contract as
+        // `register_with_shard_count` (a failed register leaves the index
+        // and `shard_counts` untouched).
+        #[cfg(test)]
+        {
+            if self
+                .fail_next_register
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::index::IndexError::FormatError {
+                    detail: "injected register failure (test-only)".into(),
+                });
+            }
+        }
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
+        let resize_target = {
+            let mut guard = self.index.write();
+            // Reject-not-overwrite: the only safe insert-if-absent is a
+            // check under the same write lock that performs the insert.
+            if guard.lookup_checked(&key)?.is_some() {
+                return Ok(false);
+            }
+            let len_before = guard.len();
+            guard.register_without_resize(key, entry)?;
+            debug_assert!(
+                guard.len() > len_before,
+                "register_new_with_shard_count: insert did not grow the index \
+                 despite the key being absent under the same write lock"
+            );
+            let counts_initialized = self
+                .shard_counts_initialized
+                .load(std::sync::atomic::Ordering::Acquire);
+            if counts_initialized {
+                self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            guard.resize_target_capacity()
+        };
+        if let Some(target_capacity) = resize_target {
+            self.resize_primary_index_without_blocking_readers(target_capacity)?;
+        }
+        Ok(true)
+    }
+
+    /// Return a freshly allocated create region to the allocator after the
+    /// create failed before (or at) index registration.
+    ///
+    /// Best-effort: a failure to free is logged rather than propagated — the
+    /// caller is already on an error path and the original error is the one
+    /// it must surface. The record bytes at `record_offset` are unreachable
+    /// (no index entry points at them), so the worst case of a failed free
+    /// is the same leaked region this call is trying to reclaim.
+    fn free_create_allocation_best_effort(&self, record_offset: u64, total_size: u64) {
+        if let Err(e) = self.allocator.lock().free(record_offset, total_size) {
+            tracing::error!(
+                target: "teraslab::engine",
+                record_offset,
+                total_size,
+                err = %e,
+                "create rollback: failed to free reserved region; device space leaked",
+            );
+        }
+    }
+
     fn resize_primary_index_without_blocking_readers(
         &self,
         requested_capacity: usize,
@@ -2054,6 +2144,13 @@ impl Engine {
     /// Allocates space, writes the complete record (metadata + UTXO slots +
     /// optional cold data) in one I/O operation, and registers it in the
     /// index. The record is immediately available for spend/setMined.
+    ///
+    /// Holds the per-tx stripe lock across duplicate check → allocation →
+    /// write → registration, so concurrent creates of the same txid yield
+    /// exactly one `Ok` and N−1 [`CreateError::DuplicateTxId`], and a
+    /// same-txid delete can never interleave with those steps. On any
+    /// failure after allocation the reserved region is returned to the
+    /// allocator.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn create(&self, req: &CreateRequest) -> Result<CreateResponse, CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
@@ -2063,7 +2160,22 @@ impl Engine {
 
         let key = req.tx_key();
 
-        // Check for duplicate txid
+        // Serialize with every other mutating op on this txid (audit A —
+        // create was the only mutating op that took no stripe lock, so the
+        // duplicate check below could interleave with a concurrent create or
+        // delete of the same txid and both creates could "win"). The guard
+        // is held across duplicate check → allocation → record write →
+        // index registration so those steps are atomic with respect to this
+        // stripe; it is dropped before the parent-record updates at the end
+        // of this function because `append_conflicting_child_best_effort`
+        // takes the *parent's* stripe lock, which may collide with this
+        // key's stripe (self-deadlock on a non-reentrant mutex).
+        let stripe_guard = self.locks.lock(&key);
+
+        // Check for duplicate txid. The authoritative recheck happens
+        // atomically inside `register_new_with_shard_count`; this early
+        // return avoids allocating and writing for the common
+        // already-exists case.
         if self.index.read().lookup(&key).is_some() {
             return Err(CreateError::DuplicateTxId);
         }
@@ -2150,8 +2262,15 @@ impl Engine {
             })
             .collect();
 
-        // Write complete record in one operation
-        self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+        // Write complete record in one operation. On failure, return the
+        // freshly allocated region — the bytes at `record_offset` are
+        // unreachable without an index entry and would otherwise leak
+        // (audit A — create leaks its allocation on post-allocation failure).
+        if let Err(e) = self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)
+        {
+            self.free_create_allocation_best_effort(record_offset, total_size);
+            return Err(e);
+        }
 
         // Register in index
         let index_entry = TxIndexEntry {
@@ -2167,10 +2286,26 @@ impl Engine {
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
-        self.register_with_shard_count(key, index_entry)
-            .map_err(|e| CreateError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        // `register_new_with_shard_count` rejects (never overwrites) an
+        // existing key atomically with the insert; together with the stripe
+        // guard this guarantees exactly one create can win for a txid.
+        let inserted = match self.register_new_with_shard_count(key, index_entry) {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                self.free_create_allocation_best_effort(record_offset, total_size);
+                return Err(CreateError::StorageError {
+                    detail: format!("{e}"),
+                });
+            }
+        };
+        if !inserted {
+            // Defense in depth: the stripe guard means no same-txid writer
+            // can have registered since the lookup above, but if it ever
+            // happens, refuse to overwrite the live entry and release the
+            // losing reservation instead of leaking it.
+            self.free_create_allocation_best_effort(record_offset, total_size);
+            return Err(CreateError::DuplicateTxId);
+        }
 
         // Update unmined secondary index if applicable (two-phase durable).
         if meta.unmined_since != 0 {
@@ -2180,7 +2315,10 @@ impl Engine {
                 })?;
         }
 
-        // Update parent records' conflicting-children lists
+        // Update parent records' conflicting-children lists. Drop the stripe
+        // guard first: `append_conflicting_child_best_effort` locks each
+        // parent's stripe, and a parent txid may hash to this key's stripe.
+        drop(stripe_guard);
         if req.conflicting {
             for parent_txid in req.parent_txids {
                 let parent_key = TxKey { txid: *parent_txid };
@@ -2210,6 +2348,16 @@ impl Engine {
         }
 
         let key = req.tx_key();
+
+        // Take the stripe lock for the duplicate check + reservation so this
+        // snapshot cannot interleave with a same-txid create/delete that is
+        // mid-mutation (audit A). The guard does NOT extend to the later
+        // `create_at_offset` call — the authoritative, atomic duplicate
+        // rejection lives in `create_at_offset_inner`, which re-takes the
+        // stripe and registers via insert-if-absent; a duplicate detected
+        // there surfaces as `DuplicateTxId` and the caller releases this
+        // reservation.
+        let _stripe_guard = self.locks.lock(&key);
 
         // Check for duplicate txid
         if self.index.read().lookup(&key).is_some() {
@@ -2289,8 +2437,16 @@ impl Engine {
 
         let key = req.tx_key();
 
+        // Serialize with every other mutating op on this txid (audit A —
+        // see `create`). Held across duplicate check → record write → index
+        // registration; dropped before the parent-record updates below
+        // because the parent's stripe may collide with this key's stripe.
+        let stripe_guard = self.locks.lock(&key);
+
         // Duplicate check — another thread may have created it between
-        // pre_allocate and now.
+        // pre_allocate and now. (`register_new_with_shard_count` below
+        // re-checks atomically; this early return skips the device write
+        // for the common case.)
         if self.index.read().lookup(&key).is_some() {
             return Err(CreateError::DuplicateTxId);
         }
@@ -2398,10 +2554,20 @@ impl Engine {
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
-        self.register_with_shard_count(key, index_entry)
+        // `register_new_with_shard_count` rejects (never overwrites) an
+        // existing key atomically with the insert.
+        let inserted = self
+            .register_new_with_shard_count(key, index_entry)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("{e}"),
             })?;
+        if !inserted {
+            // The reservation at `record_offset` is owned by the caller
+            // (`pre_allocate_create` contract / dispatch batch path), which
+            // releases it on any `Err` — do not free it here, that would be
+            // a double free.
+            return Err(CreateError::DuplicateTxId);
+        }
 
         if meta.unmined_since != 0 {
             self.update_unmined_index(&key, 0, meta.unmined_since)
@@ -2410,6 +2576,10 @@ impl Engine {
                 })?;
         }
 
+        // Drop the stripe guard before touching parent records:
+        // `append_conflicting_child_best_effort` locks each parent's stripe,
+        // and a parent txid may hash to this key's stripe.
+        drop(stripe_guard);
         if req.conflicting {
             for parent_txid in req.parent_txids {
                 let parent_key = TxKey { txid: *parent_txid };
@@ -2578,11 +2748,16 @@ impl Engine {
             buf[cold_offset..cold_offset + cold_data.len()].copy_from_slice(cold_data);
         }
 
-        self.device
-            .pwrite_all_at(&buf, record_offset)
-            .map_err(|e| CreateError::StorageError {
+        // F-X-007: the write must hold the record-level write guard. When
+        // the allocator hands create a *reused* region, a lock-free reader
+        // can still hold this offset from the previous occupant's index
+        // entry and would otherwise observe this record half-written —
+        // see `io::write_record_bytes` for the full aliasing scenario.
+        io::write_record_bytes(&*self.device, record_offset, &buf).map_err(|e| {
+            CreateError::StorageError {
                 detail: format!("{e}"),
-            })?;
+            }
+        })?;
 
         Ok(())
     }
@@ -11527,6 +11702,7 @@ mod tests {
 
         // All 10 threads try to create the same txid
         let (_, create_req) = make_create_req(230, 5);
+        let used_baseline = engine.allocator_stats().used_bytes;
 
         let results: Vec<Result<_, _>> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..10)
@@ -11549,20 +11725,14 @@ mod tests {
             }
         }
 
-        // At least one thread must succeed
-        assert!(
-            successes >= 1,
-            "at least one thread should succeed creating the txid"
-        );
-        // Some threads should observe the duplicate
-        assert!(
-            duplicates > 0,
-            "at least some threads should get DuplicateTxId"
-        );
+        // Audit A (create duplicate guard): the pre-fix non-atomic
+        // lookup-then-insert allowed multiple concurrent creates of the same
+        // txid to all return Ok, overwriting the index entry and orphaning
+        // the losers' records. Exactly one winner is the contract.
+        assert_eq!(successes, 1, "exactly one create may win for a given txid");
         assert_eq!(
-            successes + duplicates,
-            10,
-            "all threads should either succeed or get DuplicateTxId"
+            duplicates, 9,
+            "all other concurrent creates must observe DuplicateTxId"
         );
 
         // After all threads complete, exactly one record should exist in the index
@@ -11574,6 +11744,101 @@ mod tests {
         );
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.utxo_count }, 5);
+
+        // No allocation leak: the losing creates must not retain device
+        // space. Deleting the single winner must return `used_bytes` to the
+        // pre-race baseline — any orphaned region from a losing create would
+        // leave it permanently inflated.
+        let used_after_race = engine.allocator_stats().used_bytes;
+        engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        assert_eq!(
+            engine.allocator_stats().used_bytes,
+            used_baseline,
+            "losing creates leaked allocator space (used after race: {used_after_race})"
+        );
+    }
+
+    #[test]
+    fn concurrent_create_delete_same_txid_no_leak_no_alias() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(231, 3);
+        let key = req.tx_key();
+        let used_baseline = engine.allocator_stats().used_bytes;
+
+        // Hammer create/delete on one txid from several threads. The stripe
+        // lock serializes each create's duplicate-check + allocation +
+        // register against each delete's tombstone + unregister + free, so
+        // the store quiesces in one of exactly two states: record present
+        // (one live allocation) or absent (baseline) — never an orphaned
+        // region, and never an index entry pointing at another record.
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let engine = &engine;
+                let req = &req;
+                s.spawn(move || {
+                    for _ in 0..200 {
+                        match engine.create(req) {
+                            Ok(_) | Err(CreateError::DuplicateTxId) => {}
+                            Err(e) => panic!("unexpected create error: {e:?}"),
+                        }
+                        match engine.delete(&DeleteRequest { tx_key: key }) {
+                            Ok(()) | Err(SpendError::TxNotFound) => {}
+                            Err(e) => panic!("unexpected delete error: {e:?}"),
+                        }
+                    }
+                });
+            }
+        });
+
+        // Quiesced: if the record survived, its metadata must belong to this
+        // txid; drain it so the allocator must be back at baseline.
+        if engine.lookup(&key).is_some() {
+            let meta = engine.read_metadata(&key).unwrap();
+            assert_eq!(
+                { meta.tx_id },
+                key.txid,
+                "index entry aliases another transaction's record"
+            );
+            engine.delete(&DeleteRequest { tx_key: key }).unwrap();
+        }
+        assert_eq!(
+            engine.allocator_stats().used_bytes,
+            used_baseline,
+            "create/delete race leaked allocator space"
+        );
+    }
+
+    #[test]
+    fn create_register_failure_releases_allocation() {
+        let engine = create_engine();
+        let used_baseline = engine.allocator_stats().used_bytes;
+
+        engine
+            .fail_next_register
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (_, req) = make_create_req(232, 2);
+        match engine.create(&req) {
+            Err(CreateError::StorageError { detail }) => {
+                assert!(
+                    detail.contains("injected register failure"),
+                    "unexpected error detail: {detail}"
+                );
+            }
+            other => panic!("expected injected StorageError, got {other:?}"),
+        }
+
+        // Audit A (allocation leak on register failure): the failed create
+        // must roll its reservation back — no index entry, no retained space.
+        assert!(
+            engine.lookup(&req.tx_key()).is_none(),
+            "failed create must not leave an index entry"
+        );
+        assert_eq!(
+            engine.allocator_stats().used_bytes,
+            used_baseline,
+            "failed create leaked its allocation"
+        );
     }
 
     #[test]
