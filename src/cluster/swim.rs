@@ -125,6 +125,17 @@ pub struct SwimConfig {
     /// Piggybacked on gossip messages so lagging nodes can detect
     /// they're behind and trigger a catch-up.
     pub committed_term: Arc<std::sync::atomic::AtomicU64>,
+    /// Externally reachable SWIM (UDP) address to advertise in gossip
+    /// instead of the locally derived one.
+    ///
+    /// When `None` (the default), the gossiped self address is computed
+    /// by [`effective_swim_gossip_addr`] from `self_addr`/`bind_addr` —
+    /// correct for flat networks. Set this when peers must reach this
+    /// node through an intermediary (NAT, container port mapping, or a
+    /// test-harness network proxy): the advertised address is what other
+    /// nodes will use for probes and third-party gossip, while the local
+    /// socket still binds to `bind_addr`.
+    pub swim_advertise_addr: Option<SocketAddr>,
 }
 
 /// State of a pending direct probe awaiting an ACK.
@@ -1196,8 +1207,12 @@ impl SwimRunner {
         let mut buf = Vec::new();
         let mut entries: Vec<(NodeId, u8, u64, String, String)> = Vec::new();
 
-        // Always include self as alive.
-        let self_swim = effective_swim_gossip_addr(self.config.self_addr, self.config.bind_addr);
+        // Always include self as alive. Prefer the explicitly configured
+        // advertise address (NAT / proxy deployments); otherwise derive
+        // the gossiped address from the bind/self addresses.
+        let self_swim = self.config.swim_advertise_addr.unwrap_or_else(|| {
+            effective_swim_gossip_addr(self.config.self_addr, self.config.bind_addr)
+        });
         entries.push((
             self.config.self_id,
             0, // Alive
@@ -1449,6 +1464,7 @@ mod tests {
             self_id,
             self_addr,
             bind_addr: bind,
+            swim_advertise_addr: None,
             seed_nodes: vec![],
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(5),
@@ -1648,6 +1664,7 @@ mod tests {
             self_id: NodeId(1),
             self_addr: bind,
             bind_addr: bind,
+            swim_advertise_addr: None,
             seed_nodes: vec![],
             probe_interval: Duration::from_millis(100),
             suspicion_timeout: Duration::from_secs(5),

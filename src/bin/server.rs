@@ -855,6 +855,7 @@ fn main() {
             self_id: NodeId(config.node_id),
             self_addr,
             swim_bind,
+            swim_advertise_addr: None,
             seed_nodes: seed_addrs,
             replication_factor: config.replication_factor,
             probe_interval,

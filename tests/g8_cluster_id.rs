@@ -108,6 +108,7 @@ fn create_node_with_cluster_id(
         self_id: NodeId(node_id),
         self_addr: format!("127.0.0.1:{tcp_port}").parse().unwrap(),
         swim_bind: format!("127.0.0.1:{swim_port}").parse().unwrap(),
+        swim_advertise_addr: None,
         seed_nodes: seeds,
         replication_factor: rf,
         probe_interval: Duration::from_millis(100),

@@ -466,6 +466,13 @@ pub struct ClusterConfig {
     pub self_id: NodeId,
     pub self_addr: SocketAddr,
     pub swim_bind: SocketAddr,
+    /// Externally reachable SWIM (UDP) address advertised to peers in
+    /// gossip instead of the locally derived bind address. `None` (the
+    /// default) keeps the flat-network behavior. Set when peers must
+    /// reach this node through an intermediary (NAT, container port
+    /// mapping, or a test-harness network proxy). See
+    /// [`crate::cluster::swim::SwimConfig::swim_advertise_addr`].
+    pub swim_advertise_addr: Option<SocketAddr>,
     pub seed_nodes: Vec<SocketAddr>,
     pub replication_factor: u8,
     pub probe_interval: Duration,
@@ -582,6 +589,7 @@ impl ClusterCoordinator {
             self_id: config.self_id,
             self_addr: config.self_addr,
             bind_addr: config.swim_bind,
+            swim_advertise_addr: config.swim_advertise_addr,
             seed_nodes: config.seed_nodes.clone(),
             probe_interval: config.probe_interval,
             suspicion_timeout: config.suspicion_timeout,
@@ -6252,6 +6260,32 @@ impl RunningCluster {
         }
         if changed && let Some(ref path) = self.inbound_state_path {
             crate::cluster::migration::persist_inbound_state(path, mgr);
+        }
+    }
+
+    /// Test-only (F-02) — engage the outbound write fence for `shard`,
+    /// exactly as the delta-streaming migration path does when a shard
+    /// enters [`crate::cluster::migration::MigrationState::Fenced`]
+    /// (`MigrationManager::fence_shard` + atomic-bitmap sync). Lets
+    /// integration tests hold the fenced state open deterministically
+    /// to assert the write-reject / read-passthrough pair without
+    /// racing a real migration's fence window.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn test_fence_shard(&self, shard: u16) {
+        let mut mgr = self.migration.lock();
+        mgr.fence_shard(shard);
+        self.fenced_bitmap.set(shard);
+    }
+
+    /// Test-only (F-02) — release the outbound write fence for `shard`,
+    /// mirroring migration completion (`MigrationManager::unfence_shard`
+    /// + atomic-bitmap clear). Counterpart of [`RunningCluster::test_fence_shard`].
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn test_unfence_shard(&self, shard: u16) {
+        let mut mgr = self.migration.lock();
+        mgr.unfence_shard(shard);
+        if !mgr.is_shard_fenced(shard) {
+            self.fenced_bitmap.clear(shard);
         }
     }
 

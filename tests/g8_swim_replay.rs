@@ -26,6 +26,7 @@ fn config(self_id: NodeId, self_addr: SocketAddr, secret: Option<Vec<u8>>) -> Sw
         self_id,
         self_addr,
         bind_addr: self_addr,
+        swim_advertise_addr: None,
         seed_nodes: vec![],
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(5),
