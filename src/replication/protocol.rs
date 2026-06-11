@@ -807,6 +807,23 @@ pub enum ReplicaAck {
         failed_sequence: u64,
         message: String,
     },
+    /// Sequence-gap NAK (R-D1/D-3): the batch's `first_sequence` is ahead
+    /// of the receiver's next-expected per-stream sequence. Nothing was
+    /// applied and the receiver's watermark did NOT advance. The sender
+    /// must re-send relabeled at `expected_sequence` (benign hole left by
+    /// a failed/compensated earlier batch) or run catch-up.
+    ///
+    /// Wire note: this is an additive ack tag (2) introduced together
+    /// with the dense per-replica sequence space. A pre-upgrade master
+    /// decodes it as [`ProtocolError::UnknownOp`] and treats the batch
+    /// as failed — safe (no false ACK), mirroring how the V2 batch
+    /// version byte was introduced (one-version compat, fail closed).
+    Gap {
+        /// The receiver's next-expected sequence (applied watermark + 1).
+        expected_sequence: u64,
+        /// The `first_sequence` the offending batch carried.
+        received_first_sequence: u64,
+    },
 }
 
 /// Sent by a replica to request catchup from the master.
@@ -987,6 +1004,14 @@ impl ReplicaAck {
                 buf.extend_from_slice(&(message_bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(message_bytes);
             }
+            ReplicaAck::Gap {
+                expected_sequence,
+                received_first_sequence,
+            } => {
+                buf.push(2);
+                buf.extend_from_slice(&expected_sequence.to_le_bytes());
+                buf.extend_from_slice(&received_first_sequence.to_le_bytes());
+            }
         }
         buf
     }
@@ -1010,6 +1035,13 @@ impl ReplicaAck {
                 Ok(ReplicaAck::Error {
                     failed_sequence: seq,
                     message: msg,
+                })
+            }
+            2 => {
+                need(data, 17)?;
+                Ok(ReplicaAck::Gap {
+                    expected_sequence: u64::from_le_bytes(data[1..9].try_into().unwrap()),
+                    received_first_sequence: u64::from_le_bytes(data[9..17].try_into().unwrap()),
                 })
             }
             _ => Err(ProtocolError::UnknownOp(data[0])),
@@ -1633,6 +1665,33 @@ mod tests {
                 );
             }
             other => panic!("expected Error variant, got {other:?}"),
+        }
+    }
+
+    /// R-D1: the sequence-gap NAK round-trips on the wire. Tag 2 is
+    /// additive — pre-upgrade decoders reject it as `UnknownOp` and
+    /// treat the batch as failed (no false ACK), the same fail-closed
+    /// posture as the V2 batch version byte.
+    #[test]
+    fn ack_gap_round_trip() {
+        let ack = ReplicaAck::Gap {
+            expected_sequence: 42,
+            received_first_sequence: 99,
+        };
+        let bytes = ack.serialize();
+        assert_eq!(bytes.len(), 17, "tag(1) + expected(8) + received(8)");
+        assert_eq!(bytes[0], 2, "Gap NAK uses ack tag 2");
+        let decoded = ReplicaAck::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, ack);
+
+        // Truncated Gap frames must error, not mis-decode.
+        let err = ReplicaAck::deserialize(&bytes[..16]).unwrap_err();
+        match err {
+            ProtocolError::BufferTooShort { need, have } => {
+                assert_eq!(need, 17);
+                assert_eq!(have, 16);
+            }
+            other => panic!("expected BufferTooShort, got {other:?}"),
         }
     }
 

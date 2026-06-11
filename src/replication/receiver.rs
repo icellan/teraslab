@@ -542,7 +542,7 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
                 &request,
                 engine,
                 last_applied,
-                applied.as_ref(),
+                Some(applied.as_ref()),
                 &stream_key,
                 local_cluster_key.load(Ordering::Acquire),
             )
@@ -598,9 +598,9 @@ pub fn handle_replica_batch(
 ///
 /// Used by [`crate::server::dispatch`] when
 /// `init_replica_applied_tracker` has not been called (e.g. test
-/// harnesses, single-stream setups). The tracker remains thread-local
-/// (so parallel tests do not collide on a process-wide high-water
-/// mark) but the cluster-key view propagates from the
+/// harnesses, single-stream setups). Batches are applied UNTRACKED
+/// (no stream-sequence dedup or gap detection) — see the body comment
+/// for the safety argument; the cluster-key view propagates from the
 /// `RunningCluster::local_cluster_key()` accessor.
 pub fn handle_replica_batch_with_cluster_key(
     request: &RequestFrame,
@@ -608,41 +608,24 @@ pub fn handle_replica_batch_with_cluster_key(
     last_applied: &AtomicU64,
     local_cluster_key: u64,
 ) -> ResponseFrame {
-    // Lazily construct an in-memory tracker — this path is used by
-    // synchronous tests and single-stream setups where crossing-restart
-    // persistence is not required. Per-thread isolation is required
-    // here because cargo runs unit tests in parallel; a shared tracker
-    // would silently skip "already applied" sequences across unrelated
-    // tests and break their assertions.
-    //
-    // F-G7-013: the tracker lives in a `thread_local!` slot, so it
-    // is owned by each worker thread for that thread's lifetime.
-    // This is intentional for the test path (cargo test workers are
-    // short-lived) but DOES leak one tracker per worker until the
-    // thread exits. Production paths must go through
-    // `init_replica_applied_tracker` so the receiver shares a single
-    // process-wide `ReplicaAppliedTracker`; the fallback path here
-    // is reserved for non-production single-stream callers and
-    // tests. If you find this fallback being exercised by a
-    // long-lived server thread, switch the caller to explicit
-    // tracker injection — do not rely on this slot for steady-state
-    // production use.
-    thread_local! {
-        static IN_MEMORY_TRACKER: std::cell::RefCell<Option<Arc<ReplicaAppliedTracker>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    let tracker = IN_MEMORY_TRACKER.with(|slot| {
-        let mut borrow = slot.borrow_mut();
-        if borrow.is_none() {
-            *borrow = Some(Arc::new(ReplicaAppliedTracker::in_memory()));
-        }
-        borrow.as_ref().unwrap().clone()
-    });
+    // R-D1/D-3: this fallback runs UNTRACKED — no per-stream watermark,
+    // no duplicate skip, no gap NAK. Every op in every batch is applied
+    // (op-level idempotency — the per-record generation guard plus the
+    // create-payload dedup — absorbs re-deliveries). The previous
+    // implementation kept a `thread_local!` in-memory tracker
+    // (F-G7-013), which gave each worker thread its own high-water
+    // mark: useless as dedup (a re-send on another thread re-applied
+    // anyway) and actively harmful once the dense-sequence contract
+    // landed, because per-thread watermarks see "gaps" that are just
+    // other threads' batches. Production paths go through
+    // `init_replica_applied_tracker` and get the real per-stream
+    // tracker; this entry point is reserved for tests, single-stream
+    // harnesses, and the in-process compensation path.
     handle_replica_batch_with_tracker(
         request,
         engine,
         last_applied,
-        tracker.as_ref(),
+        None,
         DEFAULT_STREAM_KEY,
         local_cluster_key,
     )
@@ -663,14 +646,37 @@ pub fn handle_replica_batch_with_cluster_key(
 /// 2. If the batch carried a W3C trace context (Phase 4), attach it as a
 ///    remote parent to the span created around this handler so the replica's
 ///    work is stitched into the leader's trace.
-/// 3. Look up the highest sequence previously applied for
-///    `stream_key` in `applied`. If the entire incoming batch is at
-///    or below that sequence, ACK immediately without touching the
-///    engine. If only a prefix overlaps, skip that prefix and apply
-///    the remaining suffix.
+/// 3. R-D1/D-3 dense per-stream sequence contract (when `applied` is
+///    `Some` and the batch is neither a migration batch nor an
+///    out-of-band batch). With `watermark = applied.get(stream)` and
+///    `expected = watermark + 1`:
+///    * empty `ops` → watermark **probe**: ACK `Ok { watermark }`
+///      without touching the engine. Masters send a probe to adopt the
+///      replica's authoritative position before assigning sequences.
+///    * `last_sequence() <= watermark` → true duplicate (idempotent
+///      re-send): ACK `Ok { watermark }` without applying.
+///    * `first_sequence > expected` → sequence **gap**: NAK with
+///      [`ReplicaAck::Gap`] (STATUS_ERROR). Nothing is applied, the
+///      watermark does not advance, and the master must re-send
+///      relabeled at `expected` or run catch-up. This is what makes
+///      out-of-order delivery and lost batches detectable instead of
+///      silently ACK-dropped (audit finding D-1).
+///    * otherwise apply, skipping any already-applied prefix
+///      (`first_sequence <= watermark < last_sequence()`).
 /// 4. Apply the surviving ops via [`apply_op`].
 /// 5. `applied.set(stream_key, through_sequence)` and `applied.flush()`
 ///    BEFORE ACK, so durability is guaranteed on the wire.
+///
+/// Out-of-band batches (`first_sequence == 0` with non-empty `ops`)
+/// bypass the tracker entirely: every op is applied and the watermark
+/// is untouched. Sequence numbers in the dense stream space start at 1,
+/// so 0 is reserved for unsequenced internal traffic (the in-process
+/// compensation path and migration deltas). Op-level idempotency (the
+/// per-record generation guard) keeps re-application safe.
+///
+/// When `applied` is `None` the batch is applied UNTRACKED — no dedup,
+/// no gap detection — for test harnesses and single-stream callers that
+/// never initialized a tracker.
 ///
 /// `local_cluster_key` is the receiver's view of the current cluster
 /// epoch (typically loaded from the coordinator-owned atomic shared
@@ -680,7 +686,7 @@ pub fn handle_replica_batch_with_tracker(
     request: &RequestFrame,
     engine: &Engine,
     last_applied: &AtomicU64,
-    applied: &ReplicaAppliedTracker,
+    applied: Option<&ReplicaAppliedTracker>,
     stream_key: &str,
     local_cluster_key: u64,
 ) -> ResponseFrame {
@@ -808,7 +814,6 @@ pub fn handle_replica_batch_with_tracker(
     let _entered = recv_span.enter();
 
     let through = batch.last_sequence();
-    let already_applied = applied.get(&effective_stream_key);
 
     // Migration batches are coordinated out-of-band by the migration
     // pipeline (see `stream_shard_baseline`) and always start at
@@ -829,18 +834,82 @@ pub fn handle_replica_batch_with_tracker(
     // tracker.
     let is_migration = request.flags & FLAG_MIGRATION_BATCH != 0;
 
-    // Whole batch already applied — ACK with the existing high-water
-    // mark so the master knows the data is durable on this replica.
-    // Skipped for migration batches (see above).
-    if !is_migration && through <= already_applied {
-        let ack = ReplicaAck::Ok {
-            through_sequence: already_applied,
-        };
-        return ResponseFrame {
-            request_id: request.request_id,
-            status: STATUS_OK,
-            payload: ack.serialize(),
-        };
+    // R-D1/D-3: out-of-band batches. The dense per-stream space starts
+    // at sequence 1, so `first_sequence == 0` with non-empty ops marks
+    // unsequenced internal traffic (the in-process compensation path).
+    // Apply every op without consulting or advancing the tracker —
+    // exactly like a migration batch. Pre-fix, such batches fell into
+    // the high-water-mark dedup and were silently skipped whenever the
+    // tracker had advanced, dropping compensation ops.
+    let is_out_of_band = batch.first_sequence == 0 && !batch.ops.is_empty();
+
+    // `true` when the per-stream dense-sequence bookkeeping applies.
+    let tracked = !is_migration && !is_out_of_band;
+
+    let already_applied = applied
+        .map(|t| t.get(&effective_stream_key))
+        .unwrap_or(0);
+
+    if tracked && applied.is_some() {
+        // Watermark probe: an empty batch never applies anything and
+        // always ACKs the current per-stream watermark. Masters use it
+        // to adopt the replica's authoritative position before
+        // assigning dense sequence numbers (e.g. after a restart).
+        if batch.ops.is_empty() {
+            let ack = ReplicaAck::Ok {
+                through_sequence: already_applied,
+            };
+            return ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: ack.serialize(),
+            };
+        }
+
+        // True duplicate — the ENTIRE batch range is at or below the
+        // watermark, so every position is provably applied. ACK with
+        // the existing watermark so the master knows the data is
+        // durable on this replica.
+        if through <= already_applied {
+            let ack = ReplicaAck::Ok {
+                through_sequence: already_applied,
+            };
+            return ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: ack.serialize(),
+            };
+        }
+
+        // Sequence gap — the batch starts ahead of the next-expected
+        // sequence. NAK without applying and without advancing the
+        // watermark: ACKing here is exactly the acked-but-never-applied
+        // divergence of audit finding D-1. The master heals a benign
+        // hole (positions burned by a failed/compensated batch) by
+        // re-sending relabeled at `expected_sequence`; a real content
+        // gap is repaired by catch-up.
+        let expected = already_applied + 1;
+        if batch.first_sequence > expected {
+            if let Some(m) = crate::metrics::replication_metrics() {
+                m.replica_rejected_sequence_gap.inc();
+            }
+            tracing::warn!(
+                stream_key = %effective_stream_key,
+                expected_sequence = expected,
+                received_first_sequence = batch.first_sequence,
+                ops_len = batch.ops.len(),
+                "replica NAK: sequence gap — batch ahead of next-expected",
+            );
+            let ack = ReplicaAck::Gap {
+                expected_sequence: expected,
+                received_first_sequence: batch.first_sequence,
+            };
+            return ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_ERROR,
+                payload: ack.serialize(),
+            };
+        }
     }
 
     // Refresh the cached clock once per batch so replicated mutations
@@ -849,9 +918,11 @@ pub fn handle_replica_batch_with_tracker(
     engine.refresh_clock();
 
     // Determine where in the batch real work starts. If `first_sequence`
-    // is already covered by `already_applied`, skip the duplicate prefix.
-    // Migration batches bypass this skip — every op applies.
-    let skip_count = if is_migration {
+    // is already covered by `already_applied`, skip the duplicate prefix
+    // (positions at or below the watermark are provably applied in the
+    // dense stream space). Migration / out-of-band / untracked batches
+    // bypass this skip — every op applies.
+    let skip_count = if !tracked || applied.is_none() {
         0
     } else if batch.first_sequence <= already_applied {
         // `already_applied` is the highest sequence number already
@@ -918,25 +989,27 @@ pub fn handle_replica_batch_with_tracker(
         };
     }
 
-    // Migration batches do not participate in the normal-replication
-    // sequence space — don't let their `first_sequence: 0` overwrite
-    // the receiver's high-water mark, and skip the flush on their
-    // behalf.
-    if !is_migration {
-        // Persist the new high-water mark BEFORE ACKing. A flush failure
-        // becomes a batch-level error so the master treats the replica
-        // as not-yet-durable and will retry.
-        applied.set(&effective_stream_key, through);
-        if let Err(e) = applied.flush() {
-            let ack = ReplicaAck::Error {
-                failed_sequence: through,
-                message: format!("flush applied tracker: {e}"),
-            };
-            return ResponseFrame {
-                request_id: request.request_id,
-                status: STATUS_ERROR,
-                payload: ack.serialize(),
-            };
+    // Migration and out-of-band batches do not participate in the
+    // normal-replication sequence space — don't let their
+    // `first_sequence: 0` overwrite the receiver's high-water mark,
+    // and skip the flush on their behalf.
+    if tracked {
+        if let Some(applied) = applied {
+            // Persist the new high-water mark BEFORE ACKing. A flush failure
+            // becomes a batch-level error so the master treats the replica
+            // as not-yet-durable and will retry.
+            applied.set(&effective_stream_key, through);
+            if let Err(e) = applied.flush() {
+                let ack = ReplicaAck::Error {
+                    failed_sequence: through,
+                    message: format!("flush applied tracker: {e}"),
+                };
+                return ResponseFrame {
+                    request_id: request.request_id,
+                    status: STATUS_ERROR,
+                    payload: ack.serialize(),
+                };
+            }
         }
 
         // Use fetch_max to ensure monotonic advancement. Multiple master
@@ -947,11 +1020,7 @@ pub fn handle_replica_batch_with_tracker(
     }
 
     let ack = ReplicaAck::Ok {
-        through_sequence: if is_migration {
-            already_applied
-        } else {
-            through
-        },
+        through_sequence: if tracked { through } else { already_applied },
     };
     ResponseFrame {
         request_id: request.request_id,
@@ -3799,13 +3868,17 @@ mod tests {
 
         let batch = make_spend_batch(10, key(42), 0..3, 1);
         let stream_key = "peer-A:5000";
+        // R-D1: the dense-sequence contract NAKs batches ahead of
+        // watermark+1, so seed the stream watermark at 9 to make
+        // first_sequence=10 the next-expected position.
+        tracker.set(stream_key, 9);
 
         // First application: all three spends go through.
         let resp_1 = handle_replica_batch_with_tracker(
             &batch_request(&batch, 1),
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -3841,7 +3914,7 @@ mod tests {
             &batch_request(&batch, 2),
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -3883,12 +3956,14 @@ mod tests {
         // --- First lifecycle: apply, persist, drop.
         {
             let tracker = ReplicaAppliedTracker::load(tracker_path.clone()).unwrap();
+            // R-D1: seed the watermark so first_sequence=100 is next-expected.
+            tracker.set(stream_key, 99);
             let batch = make_spend_batch(100, key(43), 0..2, 1);
             let resp = handle_replica_batch_with_tracker(
                 &batch_request(&batch, 1),
                 &engine,
                 &last_applied,
-                &tracker,
+                Some(&tracker),
                 stream_key,
                 0,
             );
@@ -3913,7 +3988,7 @@ mod tests {
             &batch_request(&batch, 2),
             &engine,
             &new_last_applied,
-            &reopened_tracker,
+            Some(&reopened_tracker),
             stream_key,
             0,
         );
@@ -3942,13 +4017,15 @@ mod tests {
 
         {
             let tracker = ReplicaAppliedTracker::load(tracker_path.clone()).unwrap();
+            // R-D1: seed the source-node stream so 500 is next-expected.
+            tracker.set("node:7", 499);
             let mut batch = make_spend_batch(500, key(46), 0..2, 1);
             batch.source_node_id = Some(7);
             let resp = handle_replica_batch_with_tracker(
                 &batch_request(&batch, 1),
                 &engine,
                 &last_applied,
-                &tracker,
+                Some(&tracker),
                 "127.0.0.1:41000",
                 0,
             );
@@ -3967,7 +4044,7 @@ mod tests {
             &batch_request(&batch, 2),
             &engine,
             &Arc::new(AtomicU64::new(0)),
-            &tracker,
+            Some(&tracker),
             "127.0.0.1:42000",
             0,
         );
@@ -4004,12 +4081,14 @@ mod tests {
         // --- First session: spend slots 0..2 → tracker = seq 201.
         {
             let tracker = ReplicaAppliedTracker::load(tracker_path.clone()).unwrap();
+            // R-D1: seed the watermark so first_sequence=200 is next-expected.
+            tracker.set(stream_key, 199);
             let batch = make_spend_batch(200, key(44), 0..2, 1);
             handle_replica_batch_with_tracker(
                 &batch_request(&batch, 1),
                 &engine,
                 &last_applied,
-                &tracker,
+                Some(&tracker),
                 stream_key,
                 0,
             );
@@ -4030,7 +4109,7 @@ mod tests {
             &batch_request(&batch, 10),
             &engine,
             &new_last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -4062,13 +4141,15 @@ mod tests {
         let tracker = ReplicaAppliedTracker::in_memory();
         let stream_key = "peer-D:5300";
 
+        // R-D1: seed the watermark so first_sequence=300 is next-expected.
+        tracker.set(stream_key, 299);
         // First: apply seqs 300..302 (slots 0,1,2).
         let batch_a = make_spend_batch(300, key(45), 0..3, 1);
         handle_replica_batch_with_tracker(
             &batch_request(&batch_a, 1),
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -4086,7 +4167,7 @@ mod tests {
             &batch_request(&batch_b, 2),
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -4102,6 +4183,220 @@ mod tests {
         assert_eq!(engine.read_slot(&key(45), 3).unwrap().status, UTXO_SPENT);
         assert_eq!(engine.read_slot(&key(45), 4).unwrap().status, UTXO_SPENT);
         assert_eq!(tracker.get(stream_key), 304);
+    }
+
+    // -------------------------------------------------------------------
+    // R-D1/D-3: dense per-stream sequence contract
+    // -------------------------------------------------------------------
+
+    /// D-1 regression: out-of-order delivery. The batch labeled 11..20
+    /// arrives before 1..10. PRE-FIX the receiver applied the early
+    /// batch (advancing the high-water mark to 20) and then ACK-dropped
+    /// the late batch 1..10 — acked but never applied, a silent
+    /// permanent divergence. POST-FIX the ahead-of-expected batch is
+    /// NAKed with `ReplicaAck::Gap`; once the sender re-delivers in
+    /// order, both batches apply and the final state is complete.
+    #[test]
+    fn out_of_order_batch_naks_gap_then_applies_in_order() {
+        let engine = make_engine();
+        create_record(&engine, key(80), 4);
+        create_record(&engine, key(81), 4);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "node:9";
+
+        let batch_first = make_spend_batch(1, key(80), 0..2, 1); // seqs 1..2
+        let batch_second = make_spend_batch(3, key(81), 0..2, 1); // seqs 3..4
+
+        // Out-of-order: the SECOND batch arrives first → Gap NAK.
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch_second, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_ERROR, "gap must NOT be ACKed");
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Gap {
+                expected_sequence: 1,
+                received_first_sequence: 3,
+            },
+        );
+        // NAK must not apply anything or advance any watermark.
+        assert_eq!(engine.read_slot(&key(81), 0).unwrap().status, UTXO_UNSPENT);
+        assert_eq!(tracker.get(stream_key), 0);
+        assert_eq!(last_applied.load(Ordering::Relaxed), 0);
+
+        // In-order delivery: batch 1..2 applies.
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch_first, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            ReplicaAck::deserialize(&resp.payload).unwrap(),
+            ReplicaAck::Ok {
+                through_sequence: 2
+            },
+        );
+
+        // Re-send of the previously NAKed batch now applies.
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch_second, 3),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            ReplicaAck::deserialize(&resp.payload).unwrap(),
+            ReplicaAck::Ok {
+                through_sequence: 4
+            },
+        );
+
+        // Final state complete: all four ops applied.
+        for (k, off) in [(80u8, 0u32), (80, 1), (81, 0), (81, 1)] {
+            assert_eq!(
+                engine.read_slot(&key(k), off).unwrap().status,
+                UTXO_SPENT,
+                "op on key {k} offset {off} must be applied after in-order re-delivery",
+            );
+        }
+        assert_eq!(tracker.get(stream_key), 4);
+    }
+
+    /// A watermark probe (empty batch, `first_sequence: 0`) must ACK the
+    /// current per-stream applied watermark without touching the engine
+    /// or the tracker — both on a fresh stream (watermark 0) and after
+    /// real batches have applied. Masters use the probe to adopt the
+    /// replica's authoritative position before assigning dense labels.
+    #[test]
+    fn empty_batch_probe_acks_current_watermark() {
+        let engine = make_engine();
+        create_record(&engine, key(82), 2);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "node:5";
+
+        let probe = ReplicaBatch {
+            first_sequence: 0,
+            ops: vec![],
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+
+        // Fresh stream → watermark 0.
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&probe, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            ReplicaAck::deserialize(&resp.payload).unwrap(),
+            ReplicaAck::Ok {
+                through_sequence: 0
+            },
+        );
+        assert_eq!(tracker.get(stream_key), 0, "probe must not advance tracker");
+
+        // Apply seqs 1..2, then probe again → watermark 2.
+        let batch = make_spend_batch(1, key(82), 0..2, 1);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&probe, 3),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            ReplicaAck::deserialize(&resp.payload).unwrap(),
+            ReplicaAck::Ok {
+                through_sequence: 2
+            },
+        );
+        assert_eq!(tracker.get(stream_key), 2);
+    }
+
+    /// Out-of-band batches (`first_sequence: 0` with non-empty ops — the
+    /// in-process compensation path) must apply ALL ops regardless of the
+    /// stream watermark and must not advance it. PRE-FIX such batches
+    /// fell into the high-water-mark dedup: with any advanced watermark
+    /// the whole batch (or its first op) was silently skipped while the
+    /// caller saw STATUS_OK.
+    #[test]
+    fn out_of_band_zero_sequence_batch_applies_despite_high_watermark() {
+        let engine = make_engine();
+        create_record(&engine, key(83), 3);
+
+        let last_applied = Arc::new(AtomicU64::new(0));
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = DEFAULT_STREAM_KEY;
+
+        // Advance the stream watermark with a normal batch (seq 1).
+        let batch = make_spend_batch(1, key(83), 0..1, 1);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(tracker.get(stream_key), 1);
+
+        // Out-of-band single-op batch at first_sequence 0: must apply
+        // even though through (0) <= watermark (1).
+        let oob = make_spend_batch(0, key(83), 2..3, 1);
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&oob, 2),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        assert_eq!(
+            engine.read_slot(&key(83), 2).unwrap().status,
+            UTXO_SPENT,
+            "out-of-band (first_sequence=0) ops must apply regardless of the watermark",
+        );
+        assert_eq!(
+            tracker.get(stream_key),
+            1,
+            "out-of-band batches must not advance the stream watermark",
+        );
     }
 
     /// Pattern A root-cause regression: a migration batch uses
@@ -4135,6 +4430,8 @@ mod tests {
         // Step 1: normal-replication batch at sequences 100..=102 that
         // spends slot 0. This pushes the tracker's high-water mark up to
         // 102 for `stream_key`.
+        // R-D1: seed the watermark so first_sequence=100 is next-expected.
+        tracker.set(stream_key, 99);
         let normal_batch = make_spend_batch(100, key(60), 0..1, 1);
         let normal_req = RequestFrame {
             op_code: OP_REPLICA_BATCH,
@@ -4146,7 +4443,7 @@ mod tests {
             &normal_req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -4171,7 +4468,7 @@ mod tests {
             &migration_req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -4218,7 +4515,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             /* local_cluster_key */ 0,
         );
@@ -4237,7 +4534,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             stream_key,
             0,
         );
@@ -4336,7 +4633,7 @@ mod tests {
                 &req,
                 &engine,
                 &last_applied,
-                &applied,
+                Some(&applied),
                 "test-stream",
                 0,
             );
@@ -4404,7 +4701,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             0,
         );
@@ -4461,7 +4758,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             local_cluster_key,
         );
@@ -4508,6 +4805,8 @@ mod tests {
         let tracker = ReplicaAppliedTracker::in_memory();
         let local_cluster_key: u64 = 7;
 
+        // R-D1: seed the watermark so first_sequence=20 is next-expected.
+        tracker.set(DEFAULT_STREAM_KEY, 19);
         let batch = batch_with_cluster_key(20, key(71), 0..2, 1, /* matching */ 7);
         let through = batch.last_sequence();
         let req = batch_request(&batch, 1);
@@ -4516,7 +4815,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             local_cluster_key,
         );
@@ -4553,6 +4852,8 @@ mod tests {
         let tracker = ReplicaAppliedTracker::in_memory();
         let local_cluster_key: u64 = 7;
 
+        // R-D1: seed the watermark so first_sequence=30 is next-expected.
+        tracker.set(DEFAULT_STREAM_KEY, 29);
         let batch = batch_with_cluster_key(30, key(72), 0..1, 1, /* future */ 9);
         let through = batch.last_sequence();
         let req = batch_request(&batch, 1);
@@ -4561,7 +4862,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             local_cluster_key,
         );
@@ -4595,6 +4896,8 @@ mod tests {
         let tracker = ReplicaAppliedTracker::in_memory();
         let local_cluster_key: u64 = 7;
 
+        // R-D1: seed the watermark so first_sequence=40 is next-expected.
+        tracker.set(DEFAULT_STREAM_KEY, 39);
         let batch = batch_with_cluster_key(40, key(73), 0..1, 1, /* unknown */ 0);
         let through = batch.last_sequence();
         let req = batch_request(&batch, 1);
@@ -4603,7 +4906,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             local_cluster_key,
         );
@@ -4644,7 +4947,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             local_cluster_key,
         );
@@ -4689,7 +4992,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             local_cluster_key,
         );
@@ -4731,7 +5034,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             /* local_cluster_key */ 0,
         );
@@ -4814,7 +5117,7 @@ mod tests {
             &req,
             &engine,
             &last_applied,
-            &tracker,
+            Some(&tracker),
             DEFAULT_STREAM_KEY,
             local_cluster_key,
         );
@@ -5005,8 +5308,11 @@ mod tests {
                     "error message must include diagnostic detail"
                 );
             }
-            ReplicaAck::Ok { .. } => {
-                panic!("R-035: replica must NOT ACK Ok when an on-device metadata write failed")
+            ReplicaAck::Ok { .. } | ReplicaAck::Gap { .. } => {
+                panic!(
+                    "R-035: replica must NOT ACK Ok (or NAK Gap) when an on-device \
+                     metadata write failed"
+                )
             }
         }
         assert_eq!(

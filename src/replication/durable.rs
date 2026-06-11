@@ -1,8 +1,18 @@
 //! Persistent replication ACK tracking.
 //!
-//! Tracks per-replica `last_acked` sequences durably to disk so that after
-//! a master restart, the master knows where each replica left off and can
+//! Tracks per-replica ACKed positions durably to disk so that after a
+//! master restart, the master knows where each replica left off and can
 //! stream the missing redo entries instead of requiring a full resync.
+//!
+//! R-D1/D-3 sequence-space note: the [`AckTracker`] records positions in
+//! the master's **redo-log space** (the highest redo sequence whose ops
+//! were covered by a batch this replica ACKed) — this is the cursor that
+//! catch-up and lag monitoring need. The **dense per-replica stream
+//! sequence** used for wire-level ordering/dedup is NOT persisted here;
+//! the master re-adopts it from the receiver's authoritative applied
+//! watermark via an empty-batch probe on first contact (see
+//! `server::dispatch::send_replica_ops_to`), which keeps both sides
+//! consistent across restarts by construction.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -54,10 +64,13 @@ fn write_durable_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Manages persistent per-replica ACK tracking.
 ///
-/// The `last_acked` map records the highest replication sequence number
-/// that each replica has durably acknowledged. This is written to disk
-/// periodically (at most once per second) to amortize I/O while ensuring
-/// reasonable recovery bounds.
+/// The `last_acked` map records, per replica, the highest **redo-log**
+/// sequence whose ops were covered by a batch that replica durably
+/// acknowledged (conservative: a replica may additionally hold later
+/// ranges it ACKed out of redo order — re-replaying those during
+/// catch-up is idempotent). This is written to disk periodically (at
+/// most once per second) to amortize I/O while ensuring reasonable
+/// recovery bounds.
 pub struct AckTracker {
     path: PathBuf,
     inner: Mutex<AckTrackerInner>,
@@ -98,15 +111,16 @@ const INTENT_COMMIT_FLUSH_INTERVAL_MS: u128 = 1000;
 /// commit flushes can only leave stale ranges that recovery replays
 /// idempotently.
 ///
-/// F-G7-004 contract: the deferred `commit()` durability is safe ONLY
-/// when the master-side recovery replay path consults the receiver's
-/// `ReplicaAppliedTracker` before re-applying each range. Recovery
-/// MUST NOT bypass the dedup tracker (including for batches flagged
-/// `FLAG_MIGRATION_BATCH`; F-G7-005 enforces a non-zero cluster_key
-/// gate on those paths in clustered mode). If a future change to the
-/// recovery loop skips dedup, this constant must be set to 1 to make
-/// every commit immediately durable so stale ranges never reach
-/// recovery replay.
+/// F-G7-004 contract (revised by R-D1/D-3): the deferred `commit()`
+/// durability is safe because recovery replay of a stale range is
+/// absorbed at the **op level** — the receiver's per-record generation
+/// guard plus the create-payload dedup make re-application a no-op.
+/// (Pre-fix this comment claimed the receiver's sequence-dedup tracker
+/// as the safety net; that no longer holds, since recovery re-sends are
+/// assigned fresh per-replica stream labels and are re-applied, not
+/// sequence-skipped.) If a future change weakens op-level idempotency,
+/// this constant must be set to 1 to make every commit immediately
+/// durable so stale ranges never reach recovery replay.
 const INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD: u32 = 100;
 
 impl AckTracker {
@@ -641,9 +655,7 @@ impl ReplicaAppliedTracker {
 // Catch-up runner
 // ---------------------------------------------------------------------------
 
-use crate::replication::manager::ReplicaTransport;
-use crate::replication::protocol::{ReplicaBatch, ReplicaOp};
-use crate::replication::tcp_transport::TcpReplicaTransport;
+use crate::replication::protocol::ReplicaOp;
 
 /// Structured failure modes for [`run_catchup_for_replica`].
 ///
@@ -676,13 +688,11 @@ pub enum CatchupError {
     )]
     RedoReclaimed { from: u64, available: Option<u64> },
 
-    /// The TCP transport to the replica failed at connect / send / recv time.
+    /// Sending a catch-up chunk to the replica failed (transport error,
+    /// replica-side error ack, or sequence renegotiation failure — the
+    /// `send_chunk` callback flattens these into one detail string).
     #[error("transport to {addr}: {detail}")]
     Transport { addr: SocketAddr, detail: String },
-
-    /// The replica returned an `ERR` ack instead of `OK`.
-    #[error("replica {addr} returned error: {message}")]
-    ReplicaError { addr: SocketAddr, message: String },
 }
 
 /// Check whether the redo log has been truncated past a requested sequence.
@@ -708,50 +718,32 @@ pub fn check_redo_truncation(
     Ok(())
 }
 
-/// Build a single catch-up `ReplicaBatch` stamped with the caller-supplied
-/// `local_cluster_key`.
-///
-/// Extracted from [`run_catchup_for_replica`] so the cluster-epoch tagging
-/// can be unit-tested without spinning up a TCP transport. The receiver-side
-/// gate added in Phase B2 (see [`ERR_STALE_EPOCH`]) rejects any batch whose
-/// `cluster_key` neither matches the local epoch nor is the V1-compat
-/// sentinel `0`, so catch-up batches must carry the master's live epoch
-/// just like the steady-state path.
-///
-/// `first_sequence` is the sequence number of the first op in `chunk`;
-/// `chunk` is non-empty (an empty chunk would still produce a valid batch
-/// but the catch-up loop never builds one).
-///
-/// [`ERR_STALE_EPOCH`]: crate::protocol::opcodes::ERR_STALE_EPOCH
-pub fn build_catchup_batch(
-    first_sequence: u64,
-    chunk: &[ReplicaOp],
-    local_cluster_key: u64,
-) -> ReplicaBatch {
-    ReplicaBatch {
-        first_sequence,
-        ops: chunk.to_vec(),
-        trace_ctx: crate::observability::WireTraceContext::from_current_span(),
-        source_node_id: None,
-        cluster_key: local_cluster_key,
-    }
-}
-
 /// Run catch-up replication for a single replica, streaming redo-derived
-/// ops from `from_seq` to the current master sequence.
+/// ops from `from_seq` (a real redo-log sequence) to the current master
+/// sequence in chunks of `batch_size` ops.
 ///
-/// Returns `Ok(through_seq)` on success with the final ACKed sequence, or
-/// a [`CatchupError`] variant identifying the failure mode. Callers that
-/// need to dispatch on the failure (e.g. "redo wrapped — request a full
-/// resync") MUST `match` on the variant rather than substring-matching on
-/// the rendered message — see `bin/server.rs` for the canonical pattern.
+/// R-D2/D-3: this runner deals exclusively in **redo space** (which ops
+/// the replica is missing). Wire labeling on the **per-replica dense
+/// sequence stream** is the `send_chunk` callback's job — production
+/// wires it to `server::dispatch::send_replica_ops_to`, which assigns
+/// contiguous labels under the same per-address cursor the steady-state
+/// fan-out uses (so catch-up chunks and concurrent live batches share
+/// one densely numbered stream, and the pre-fix off-by-one that dropped
+/// the first op of every chunk after the first cannot recur — labels no
+/// longer derive from ACK arithmetic in this loop).
 ///
-/// `local_cluster_key` is the master's current topology epoch (snapshot of
-/// [`RunningCluster::local_cluster_key`]); every batch is stamped with it so
-/// the receiver's epoch gate (Phase B2) accepts the catch-up the same way
-/// it accepts steady-state batches. Pass `0` only from test fixtures where
-/// the receiver-side gate is intentionally bypassed via the V1-compat
-/// sentinel.
+/// `send_chunk(chunk)` must return `Ok(())` only once the replica has
+/// durably applied (or provably already applied) every op in `chunk`.
+///
+/// Returns `Ok(through_redo_seq)` on success: the highest redo sequence
+/// covered by the pass, computed conservatively as
+/// `from_seq + ops_sent - 1` (redo entries that produce no `ReplicaOp`
+/// are under-counted; re-replaying them later is idempotent). Callers
+/// record this against the [`AckTracker`]. Failure modes are the typed
+/// [`CatchupError`] variants; callers that dispatch on "redo wrapped —
+/// request a full resync" MUST `match` on `RedoReclaimed` rather than
+/// substring-matching the rendered message — see `bin/server.rs` for the
+/// canonical pattern.
 ///
 /// The `ops_from_seq` callback should read redo entries starting at the
 /// given sequence and convert them to `ReplicaOp`s. It returns an empty
@@ -761,8 +753,6 @@ pub fn build_catchup_batch(
 /// earliest available redo entry, or `None` if the log is empty. Used to
 /// detect redo log truncation: if the earliest entry is beyond `from_seq`,
 /// the log has wrapped and a full resync is required instead.
-///
-/// [`RunningCluster::local_cluster_key`]: crate::cluster::coordinator::RunningCluster::local_cluster_key
 #[allow(clippy::too_many_arguments)]
 pub fn run_catchup_for_replica(
     addr: &std::net::SocketAddr,
@@ -772,7 +762,7 @@ pub fn run_catchup_for_replica(
     max_ops_per_pass: usize,
     ops_from_seq: &dyn Fn(u64) -> Vec<ReplicaOp>,
     first_available_seq: Option<u64>,
-    local_cluster_key: u64,
+    send_chunk: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String>,
 ) -> std::result::Result<u64, CatchupError> {
     if from_seq >= current_seq {
         return Ok(from_seq); // already caught up
@@ -805,42 +795,17 @@ pub fn run_catchup_for_replica(
         ops.truncate(max_ops_per_pass);
     }
 
-    let mut transport =
-        TcpReplicaTransport::connect(&addr.to_string(), std::time::Duration::from_secs(5))
-            .map_err(|e| CatchupError::Transport {
-                addr: *addr,
-                detail: format!("connect: {e}"),
-            })?;
-
-    let mut last_acked = from_seq;
+    let batch_size = batch_size.max(1);
+    let mut sent: u64 = 0;
     for chunk in ops.chunks(batch_size) {
-        let batch = build_catchup_batch(last_acked, chunk, local_cluster_key);
-        transport
-            .send_batch(&batch)
-            .map_err(|e| CatchupError::Transport {
-                addr: *addr,
-                detail: format!("send_batch: {e}"),
-            })?;
-        match transport.recv_ack(std::time::Duration::from_secs(5)) {
-            Ok(crate::replication::protocol::ReplicaAck::Ok { through_sequence }) => {
-                last_acked = through_sequence;
-            }
-            Ok(crate::replication::protocol::ReplicaAck::Error { message, .. }) => {
-                return Err(CatchupError::ReplicaError {
-                    addr: *addr,
-                    message,
-                });
-            }
-            Err(e) => {
-                return Err(CatchupError::Transport {
-                    addr: *addr,
-                    detail: format!("recv_ack: {e}"),
-                });
-            }
-        }
+        send_chunk(chunk).map_err(|detail| CatchupError::Transport {
+            addr: *addr,
+            detail,
+        })?;
+        sent += chunk.len() as u64;
     }
 
-    Ok(last_acked)
+    Ok(from_seq + sent - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,49 +1384,107 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Catch-up batch construction — Phase B3 cluster_key wiring
+    // Catch-up runner
     // -------------------------------------------------------------------
 
+    /// R-D2 regression (unit level): the catch-up runner must deliver
+    /// every op exactly once across chunk boundaries and report redo
+    /// coverage as `from_seq + ops_sent - 1`. Pre-fix the runner
+    /// labeled chunk N+1 with the last ACKED sequence instead of
+    /// acked+1, so the receiver's dedup dropped the first op of every
+    /// chunk after the first. Labeling now lives in the `send_chunk`
+    /// callback (the dispatch-side dense stream cursor); this test pins
+    /// that the runner itself hands over contiguous, complete,
+    /// non-overlapping chunks.
     #[test]
-    fn catchup_batch_attaches_caller_supplied_cluster_key() {
-        // Phase B3 fixup: catch-up batches must carry the master's live
-        // topology epoch so the receiver-side ERR_STALE_EPOCH gate accepts
-        // them. Previously the catch-up path hard-coded cluster_key: 0,
-        // which only worked while the receiver still treated 0 as the
-        // V1-compat "unknown" sentinel.
+    fn run_catchup_chunks_cover_all_ops_without_skips_or_overlap() {
         use crate::index::TxKey;
 
-        let tx_key = TxKey::from_bytes([7u8; 32]);
-        let ops = vec![ReplicaOp::Delete { tx_key }];
+        let addr: SocketAddr = "127.0.0.1:65533".parse().unwrap();
+        // 10 distinguishable ops: Delete on tx_key marked by index.
+        let make_ops = |n: u8| -> Vec<ReplicaOp> {
+            (0..n)
+                .map(|i| ReplicaOp::Delete {
+                    tx_key: TxKey::from_bytes([i + 1; 32]),
+                })
+                .collect()
+        };
+        let all_ops = make_ops(10);
+        let ops_for_cb = all_ops.clone();
 
-        let batch = build_catchup_batch(123, &ops, 42);
+        let delivered: std::sync::Mutex<Vec<ReplicaOp>> = std::sync::Mutex::new(Vec::new());
+        let chunk_sizes: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+        let result = run_catchup_for_replica(
+            &addr,
+            5,  // from_seq (redo space)
+            15, // current_seq
+            3,  // batch_size → chunks of 3,3,3,1
+            10_000,
+            &move |_from| ops_for_cb.clone(),
+            Some(5),
+            &|chunk| {
+                chunk_sizes.lock().unwrap().push(chunk.len());
+                delivered.lock().unwrap().extend_from_slice(chunk);
+                Ok(())
+            },
+        );
 
         assert_eq!(
-            batch.cluster_key, 42,
-            "catch-up batch must propagate caller-supplied local_cluster_key",
+            result.unwrap(),
+            14,
+            "redo coverage must be from_seq + ops_sent - 1 = 5 + 10 - 1",
         );
-        assert_eq!(batch.first_sequence, 123);
-        assert_eq!(batch.ops.len(), 1);
-        assert!(
-            batch.source_node_id.is_none(),
-            "catch-up batches do not stamp a source node id",
+        assert_eq!(*chunk_sizes.lock().unwrap(), vec![3, 3, 3, 1]);
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            all_ops,
+            "every op must be delivered exactly once, in order, across chunk boundaries",
         );
     }
 
+    /// A chunk-send failure must abort the pass with a typed
+    /// `CatchupError::Transport` carrying the callback's detail string,
+    /// and no further chunks may be sent.
     #[test]
-    fn catchup_batch_zero_cluster_key_is_v1_compat_path() {
-        // Tests are still permitted to construct cluster_key: 0 batches —
-        // the receiver-side gate treats 0 as the V1-compat sentinel. This
-        // test pins that the helper does not silently rewrite 0 to some
-        // other value (e.g. a default epoch).
+    fn run_catchup_send_failure_aborts_with_transport_error() {
         use crate::index::TxKey;
 
-        let tx_key = TxKey::from_bytes([0u8; 32]);
-        let ops = vec![ReplicaOp::Delete { tx_key }];
+        let addr: SocketAddr = "127.0.0.1:65532".parse().unwrap();
+        let ops: Vec<ReplicaOp> = (0..6u8)
+            .map(|i| ReplicaOp::Delete {
+                tx_key: TxKey::from_bytes([i + 1; 32]),
+            })
+            .collect();
+        let calls = std::sync::atomic::AtomicU64::new(0);
 
-        let batch = build_catchup_batch(1, &ops, 0);
+        let err = run_catchup_for_replica(
+            &addr,
+            1,
+            7,
+            2,
+            10_000,
+            &move |_from| ops.clone(),
+            Some(1),
+            &|_chunk| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 1 {
+                    Err("replica error: boom".to_string())
+                } else {
+                    assert!(n < 2, "no chunk may be sent after a failure");
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("second chunk fails — pass must abort");
 
-        assert_eq!(batch.cluster_key, 0);
+        match err {
+            CatchupError::Transport { addr: a, detail } => {
+                assert_eq!(a, addr);
+                assert_eq!(detail, "replica error: boom");
+            }
+            other => panic!("expected CatchupError::Transport, got {other:?}"),
+        }
     }
 
     /// F-G10-017 / B-4 — `run_catchup_for_replica` MUST surface a typed
@@ -1481,11 +1504,13 @@ mod tests {
     fn run_catchup_returns_typed_redo_reclaimed_when_log_wrapped() {
         let addr: SocketAddr = "127.0.0.1:65535".parse().unwrap();
         let no_ops: &dyn Fn(u64) -> Vec<ReplicaOp> = &|_| Vec::new();
+        let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
+            &|_| panic!("send_chunk must not be called when redo wrapped");
 
         // Path 1: explicit truncation signal — `first_available_seq` is
         // ahead of `from_seq` so `check_redo_truncation` short-circuits
         // before any transport work happens. `from = 10`, `available = 50`.
-        let err1 = run_catchup_for_replica(&addr, 10, 100, 16, 100, no_ops, Some(50), 0)
+        let err1 = run_catchup_for_replica(&addr, 10, 100, 16, 100, no_ops, Some(50), no_send)
             .expect_err("must error when redo wrapped past from_seq");
         match err1 {
             CatchupError::RedoReclaimed { from, available } => {
@@ -1502,7 +1527,7 @@ mod tests {
         // Path 2: `first_available_seq = None` — log reports it has no
         // earliest entry yet `ops_from_seq` returns nothing. This is the
         // wrap-without-witness case the original string error covered.
-        let err2 = run_catchup_for_replica(&addr, 7, 42, 16, 100, no_ops, None, 0)
+        let err2 = run_catchup_for_replica(&addr, 7, 42, 16, 100, no_ops, None, no_send)
             .expect_err("must error when ops_from_seq returns empty");
         match err2 {
             CatchupError::RedoReclaimed { from, available } => {
@@ -1537,11 +1562,13 @@ mod tests {
     fn run_catchup_already_caught_up_returns_ok() {
         let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
         let no_ops: &dyn Fn(u64) -> Vec<ReplicaOp> = &|_| Vec::new();
+        let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
+            &|_| panic!("send_chunk must not be called when already caught up");
 
-        let result = run_catchup_for_replica(&addr, 100, 100, 16, 100, no_ops, Some(50), 0);
+        let result = run_catchup_for_replica(&addr, 100, 100, 16, 100, no_ops, Some(50), no_send);
         assert_eq!(result.unwrap(), 100);
 
-        let result = run_catchup_for_replica(&addr, 200, 100, 16, 100, no_ops, Some(50), 0);
+        let result = run_catchup_for_replica(&addr, 200, 100, 16, 100, no_ops, Some(50), no_send);
         assert_eq!(result.unwrap(), 200);
     }
 }

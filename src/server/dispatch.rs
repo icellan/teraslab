@@ -41,9 +41,23 @@ use std::time::Duration;
 /// own independent mutex, so concurrent sends to different replicas never
 /// contend on a single lock. At millions of ops/sec with RF=3, this
 /// eliminates the serialization point that a single global pool creates.
+///
+/// R-D1/D-3: the slot also owns the master→replica **dense stream
+/// cursor** (`next_sequence`). Sequence assignment, send, and ACK all
+/// happen under this slot's mutex, so each replica address observes a
+/// strictly ordered, densely numbered batch stream regardless of how
+/// many dispatch threads fan out concurrently.
 struct PerAddrSlot {
     connection: Option<TcpReplicaTransport>,
+    /// Highest per-stream sequence this replica has ACKed (diagnostic).
     last_acked: u64,
+    /// Next per-replica stream sequence to assign. `None` until the
+    /// cursor has been synced to the replica's authoritative applied
+    /// watermark via an empty-batch probe (process start / first
+    /// contact). Positions consumed by failed sends are burned —
+    /// never reused — so a position at or below the replica's
+    /// watermark always refers to content the replica has applied.
+    next_sequence: Option<u64>,
 }
 
 /// Per-address connection pool. The outer HashMap is locked briefly for
@@ -560,7 +574,7 @@ pub(crate) fn handle_request(
                     request,
                     engine,
                     &DISPATCH_REPLICA_LAST_APPLIED,
-                    applied,
+                    Some(applied),
                     DEFAULT_STREAM_KEY,
                     local_cluster_key,
                 )
@@ -1338,9 +1352,12 @@ fn clear_replication_intents_after_success(ranges: &[(u64, u64)]) {
 
 /// Send replication operations to replica nodes for the given keys.
 ///
-/// Uses the redo sequence range from `write_redo_ops()` to tag batches so
-/// that replica ACK tracking and catch-up use the same sequence space as
-/// the durable redo log.
+/// R-D1/D-3: each replica address receives batches on its own dense
+/// per-replica sequence stream (see [`send_replica_ops_to`]); the
+/// master-global redo range from `write_redo_ops()` is NOT used as the
+/// wire label (each address only carries a per-address op subset), but
+/// its high end is recorded per ACK in the durable `AckTracker` so
+/// catch-up and lag monitoring operate in real redo space.
 ///
 /// When ACK policy enforcement is enabled (RF >= 2 with a non-best_effort
 /// policy), replication failures are returned as errors so the caller can
@@ -1533,15 +1550,21 @@ fn replicate_all_ops(
                     if ops.is_empty() {
                         return (addr, Ok(()));
                     }
-                    let batch = ReplicaBatch {
-                        first_sequence: redo_seq_range.0,
-                        ops,
-                        trace_ctx: crate::observability::WireTraceContext::from_current_span(),
-                        source_node_id: Some(source_node_id),
+                    // R-D1/D-3: per-replica dense stream labels are
+                    // assigned inside `send_replica_ops_to` under the
+                    // per-address slot mutex — NOT the master-global
+                    // redo range, which covers ops this address never
+                    // receives. The redo range's high end is recorded
+                    // against the ACK for catch-up/lag bookkeeping.
+                    let res = send_replica_ops_to(
+                        addr,
+                        &ops,
+                        ack_timeout,
+                        auth_secret.as_deref(),
                         cluster_key,
-                    };
-                    let res =
-                        send_replica_batch_to(addr, &batch, ack_timeout, auth_secret.as_deref());
+                        source_node_id,
+                        redo_seq_range.1,
+                    );
                     (addr, res)
                 }));
             }
@@ -2400,36 +2423,77 @@ fn compensate_replication_failure_or_error(
     }
 }
 
-/// Send a `ReplicaBatch` to a replica node via TCP using the wire protocol.
+/// Look up (or create) the per-address replication slot.
+fn repl_slot_for(addr: SocketAddr) -> std::sync::Arc<Mutex<PerAddrSlot>> {
+    // The outer pool lock is held only for the HashMap lookup/insert,
+    // not during I/O.
+    let mut pool = REPL_POOL.lock();
+    pool.entry(addr)
+        .or_insert_with(|| {
+            std::sync::Arc::new(Mutex::new(PerAddrSlot {
+                connection: None,
+                last_acked: 0,
+                next_sequence: None,
+            }))
+        })
+        .clone()
+}
+
+/// Drop the cached per-address replication state (pooled connection AND
+/// dense-sequence cursor) for `addr`.
 ///
-/// Reuses a persistent connection from the per-address pool. If no cached
-/// connection exists or the cached one has failed, a fresh TCP connection
-/// is established. The per-address mutex ensures that concurrent sends to
-/// the SAME replica are serialized (correct: TCP is ordered), while sends
-/// to DIFFERENT replicas proceed in parallel without contention.
-fn send_replica_batch_to(
+/// The next [`send_replica_ops_to`] re-probes the replica's applied
+/// watermark before assigning sequence numbers — exactly what a fresh
+/// master process does on first contact. Integration tests use this to
+/// emulate a master restart against a live replica; it is also safe to
+/// call operationally (the probe/relabel protocol re-converges).
+pub fn reset_replica_stream(addr: SocketAddr) {
+    let slot = {
+        let mut pool = REPL_POOL.lock();
+        pool.remove(&addr)
+    };
+    // Lock (and immediately drop) the slot so an in-flight send on the
+    // removed slot finishes before the connection closes underneath it.
+    if let Some(slot) = slot {
+        let mut guard = slot.lock();
+        guard.connection = None;
+        guard.next_sequence = None;
+    }
+}
+
+/// Drop only the pooled connection for `addr`, KEEPING the
+/// dense-sequence cursor.
+///
+/// Used when the replica process restarted (its old connection is dead
+/// or would be served by a defunct handler) but the master's stream
+/// position remains valid: the next send reconnects and continues at
+/// the same cursor, and the receiver's persisted watermark makes the
+/// first post-restart batch an exact next-expected match.
+pub fn drop_replica_connection(addr: SocketAddr) {
+    let slot = {
+        let pool = REPL_POOL.lock();
+        pool.get(&addr).cloned()
+    };
+    if let Some(slot) = slot {
+        slot.lock().connection = None;
+    }
+}
+
+/// Send one `ReplicaBatch` frame on the slot's pooled connection and wait
+/// for the replica's `ReplicaAck`.
+///
+/// Reuses the cached connection if healthy, otherwise reconnects (once on
+/// a failed send). Returns the decoded ack on success; `Err` covers
+/// connect/send/recv transport failures. The caller holds the slot lock,
+/// so concurrent sends to the SAME replica are serialized (correct: TCP
+/// is ordered) while different replicas proceed in parallel.
+fn exchange_replica_batch(
+    slot_guard: &mut PerAddrSlot,
     addr: SocketAddr,
     batch: &ReplicaBatch,
     ack_timeout: Duration,
     auth_secret: Option<&[u8]>,
-) -> std::result::Result<(), String> {
-    // Get or create the per-address slot. The outer pool lock is held
-    // only for the HashMap lookup/insert, not during I/O.
-    let slot = {
-        let mut pool = REPL_POOL.lock();
-        pool.entry(addr)
-            .or_insert_with(|| {
-                std::sync::Arc::new(Mutex::new(PerAddrSlot {
-                    connection: None,
-                    last_acked: 0,
-                }))
-            })
-            .clone()
-    };
-
-    // Lock only this address's slot. Other addresses are uncontended.
-    let mut slot_guard = slot.lock();
-
+) -> std::result::Result<ReplicaAck, String> {
     let mut transport = match slot_guard.connection.take() {
         Some(t) if t.is_connected() && t.auth_secret_matches(auth_secret) => t,
         _ => TcpReplicaTransport::connect_with_auth(
@@ -2457,21 +2521,183 @@ fn send_replica_batch_to(
     }
 
     match transport.recv_ack(ack_timeout) {
-        Ok(ReplicaAck::Ok { through_sequence }) => {
+        Ok(ack) => {
             slot_guard.connection = Some(transport);
-            slot_guard.last_acked = through_sequence;
-            // Persist the ACK sequence for crash-safe catch-up.
-            if let Some(tracker) = ACK_TRACKER.get() {
-                tracker.record_ack(addr, through_sequence);
-            }
-            Ok(())
-        }
-        Ok(ReplicaAck::Error { message, .. }) => {
-            slot_guard.connection = Some(transport);
-            Err(format!("replica error: {message}"))
+            Ok(ack)
         }
         Err(e) => Err(format!("recv_ack: {e}")),
     }
+}
+
+/// Maximum send attempts per batch inside [`send_replica_ops_to`]: the
+/// initial send plus one relabeled retry after a cursor-resync signal
+/// (`ReplicaAck::Gap` or a duplicate-skip ACK whose `through_sequence`
+/// is ahead of the batch). The receiver's watermark can only move via
+/// this slot's own serialized sends, so a single renegotiation round
+/// always converges; a second disagreement is a hard error.
+const MAX_SEQUENCE_RENEGOTIATIONS: usize = 2;
+
+/// Send replica ops to one replica address on that address's **dense
+/// per-replica sequence stream** (R-D1/D-3).
+///
+/// Behavior, all under the per-address slot mutex:
+///
+/// 1. If the slot's stream cursor is unsynced (first contact since
+///    process start), send an empty-batch **probe**; the receiver ACKs
+///    its authoritative per-stream applied watermark and the cursor is
+///    adopted as `watermark + 1`. This is what keeps the master's
+///    per-replica next-sequence consistent with the receiver's persisted
+///    watermark across restarts of either side.
+/// 2. Label the batch `first_sequence = cursor` and send.
+/// 3. ACK handling:
+///    * `Ok { through == last_sequence }` — success: advance the cursor,
+///      record `redo_high` (the redo-log position this batch covers) in
+///      the durable [`crate::replication::durable::AckTracker`] for
+///      catch-up/lag bookkeeping.
+///    * `Gap { expected_sequence }` — the replica is missing positions
+///      below the label (burned by an earlier failed batch): relabel at
+///      `expected_sequence` and retry once.
+///    * `Ok { through > last_sequence }` — duplicate-skip against a
+///      watermark ahead of the cursor (cursor desync): adopt
+///      `through + 1` and retry once. The batch content was NOT applied,
+///      so this is never treated as success.
+///    * transport / replica error — fail the batch and **burn** the
+///      assigned positions (advance the cursor past them). The replica
+///      may or may not have applied the frame; burning guarantees a
+///      position is never reused for different content, and the benign
+///      hole (if any) heals on the next send via the Gap/relabel path.
+///
+/// `redo_high` is the highest master redo-log sequence whose ops are
+/// covered by this batch — pass `0` when not applicable (e.g. catch-up
+/// chunks whose redo progress the caller records itself).
+///
+/// Returns `Ok(())` once the replica has durably applied (or provably
+/// already applied) every op in `ops`; `Err(message)` otherwise.
+pub fn send_replica_ops_to(
+    addr: SocketAddr,
+    ops: &[ReplicaOp],
+    ack_timeout: Duration,
+    auth_secret: Option<&[u8]>,
+    cluster_key: u64,
+    source_node_id: u64,
+    redo_high: u64,
+) -> std::result::Result<(), String> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let slot = repl_slot_for(addr);
+    // Lock only this address's slot. Other addresses are uncontended.
+    let mut slot_guard = slot.lock();
+
+    // Sync the stream cursor on first contact: adopt the replica's
+    // authoritative applied watermark. Initializing from any master-side
+    // persisted value instead could label NEW ops at positions the
+    // replica already covers, which the receiver would dedup-skip and
+    // ACK — silent drop. The probe makes that impossible by
+    // construction.
+    let mut next = match slot_guard.next_sequence {
+        Some(n) => n,
+        None => {
+            let probe = ReplicaBatch {
+                first_sequence: 0,
+                ops: Vec::new(),
+                trace_ctx: None,
+                source_node_id: Some(source_node_id),
+                cluster_key,
+            };
+            match exchange_replica_batch(&mut slot_guard, addr, &probe, ack_timeout, auth_secret)?
+            {
+                ReplicaAck::Ok { through_sequence } => {
+                    let n = through_sequence + 1;
+                    slot_guard.next_sequence = Some(n);
+                    n
+                }
+                other => {
+                    return Err(format!("watermark probe rejected: {other:?}"));
+                }
+            }
+        }
+    };
+
+    for attempt in 0..MAX_SEQUENCE_RENEGOTIATIONS {
+        let batch = ReplicaBatch {
+            first_sequence: next,
+            ops: ops.to_vec(),
+            trace_ctx: crate::observability::WireTraceContext::from_current_span(),
+            source_node_id: Some(source_node_id),
+            cluster_key,
+        };
+        let last = batch.last_sequence();
+
+        let ack = match exchange_replica_batch(&mut slot_guard, addr, &batch, ack_timeout, auth_secret)
+        {
+            Ok(ack) => ack,
+            Err(e) => {
+                // Burn the assigned positions: the frame may have been
+                // applied with the ACK lost in flight. Reusing the
+                // positions for different content could be dedup-skipped
+                // by the receiver; a hole heals via Gap/relabel instead.
+                slot_guard.next_sequence = Some(last + 1);
+                return Err(e);
+            }
+        };
+
+        match ack {
+            ReplicaAck::Ok { through_sequence } if through_sequence == last => {
+                slot_guard.next_sequence = Some(last + 1);
+                slot_guard.last_acked = through_sequence;
+                // Persist the redo-log coverage for crash-safe catch-up
+                // and lag monitoring (real redo space, not the stream
+                // labels — see AckTracker docs).
+                if redo_high > 0
+                    && let Some(tracker) = ACK_TRACKER.get()
+                {
+                    tracker.record_ack(addr, redo_high);
+                }
+                return Ok(());
+            }
+            ReplicaAck::Ok { through_sequence } => {
+                // Duplicate-skip against a watermark ahead of our cursor:
+                // nothing from THIS batch was applied. Adopt and retry.
+                tracing::warn!(
+                    %addr,
+                    attempt,
+                    sent_first = next,
+                    sent_last = last,
+                    replica_through = through_sequence,
+                    "replication: cursor behind replica watermark; resyncing and relabeling",
+                );
+                slot_guard.next_sequence = Some(through_sequence + 1);
+                next = through_sequence + 1;
+            }
+            ReplicaAck::Gap {
+                expected_sequence, ..
+            } => {
+                // Benign hole left by burned positions; relabel down to
+                // the replica's next-expected sequence and retry.
+                tracing::warn!(
+                    %addr,
+                    attempt,
+                    sent_first = next,
+                    expected_sequence,
+                    "replication: replica NAKed sequence gap; relabeling and re-sending",
+                );
+                slot_guard.next_sequence = Some(expected_sequence);
+                next = expected_sequence;
+            }
+            ReplicaAck::Error { message, .. } => {
+                // Burn the positions — the replica may have applied a
+                // prefix before failing.
+                slot_guard.next_sequence = Some(last + 1);
+                return Err(format!("replica error: {message}"));
+            }
+        }
+    }
+
+    Err(format!(
+        "replication to {addr}: sequence renegotiation did not converge after \
+         {MAX_SEQUENCE_RENEGOTIATIONS} attempts",
+    ))
 }
 
 // ---------------------------------------------------------------------------

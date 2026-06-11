@@ -3,8 +3,8 @@
 //! Wraps a `TcpStream` and uses the TeraSlab wire protocol frames:
 //! - Master to Replica: `RequestFrame` with `op_code=OP_REPLICA_BATCH`, payload = batch bytes
 //! - Replica to Master: `ResponseFrame` with `status=STATUS_OK` for
-//!   `ReplicaAck::Ok` and `status=STATUS_ERROR` for `ReplicaAck::Error`,
-//!   payload = ack bytes
+//!   `ReplicaAck::Ok` and `status=STATUS_ERROR` for `ReplicaAck::Error`
+//!   and the sequence-gap NAK `ReplicaAck::Gap`, payload = ack bytes
 
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
