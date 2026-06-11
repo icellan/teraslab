@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use teraslab::allocator::SlotAllocator;
 use teraslab::config::{IndexBackendMode, IndexConfig};
-use teraslab::device::{BlockDevice, MemoryDevice};
+use teraslab::device::{AlignedBuf, BlockDevice, MemoryDevice};
 use teraslab::index::{
     DahBackend, DahIndex, Index, PrimaryBackend, TxKey, UnminedBackend, UnminedIndex,
 };
@@ -25,6 +25,9 @@ use teraslab::ops::set_mined::*;
 use teraslab::ops::spend::*;
 use teraslab::ops::unspend::*;
 use teraslab::record::*;
+use teraslab::server::startup::{
+    RebuildError, load_primary_index_in_memory, rebuild_in_memory_secondaries,
+};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -1400,4 +1403,282 @@ fn snapshot_index_and_persist_allocator_on_shutdown() {
         let resp = engine.get_spend(&req).unwrap();
         assert_eq!(resp.status, 0x00, "UTXO should be unspent");
     }
+}
+
+// ---------------------------------------------------------------------------
+// B-04: snapshot-loss device-scan rebuild (last-resort recovery)
+// ---------------------------------------------------------------------------
+
+/// Like [`create_tx`] but with `frozen: true`, so every slot is created
+/// in the `UTXO_FROZEN` state with `FROZEN_BYTE` spending data.
+fn create_frozen_tx(engine: &Engine, n: u32, utxo_count: usize) -> TxKey {
+    let tx_id = make_tx_id(n);
+    let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count as u32)
+        .map(|v| make_utxo_hash(n, v))
+        .collect();
+    let req = CreateRequest {
+        tx_id,
+        tx_version: 1,
+        locktime: 0,
+        fee: 500,
+        size_in_bytes: 250,
+        extended_size: 0,
+        is_coinbase: false,
+        spending_height: 0,
+        utxo_hashes: &utxo_hashes,
+        inputs: None,
+        outputs: None,
+        inpoints: None,
+        is_external: false,
+        created_at: 1710000000000,
+        block_height: 1000,
+        mined_block_infos: &[],
+        frozen: true,
+        conflicting: false,
+        locked: false,
+        external_ref: None,
+        parent_txids: &[],
+    };
+    engine.create(&req).unwrap();
+    TxKey { txid: tx_id }
+}
+
+#[test]
+fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
+    // B-04: the in-memory backend's last-resort recovery. The bin's
+    // startup branch keys off `snap_path.exists()` — when the snapshot
+    // file is gone, the ONLY possible source of index state is the
+    // device scan (`load_primary_index_in_memory` +
+    // `rebuild_in_memory_secondaries`, the exact functions the bin
+    // calls in that branch). Every record must re-register with its
+    // exact cached fields; secondaries must be repopulated.
+    const UNMINED_N: u32 = 0x7100;
+    const MINED_N: u32 = 0x7101;
+    const FROZEN_N: u32 = 0x7102;
+    const RETENTION: u32 = 288;
+    const EXPECTED_DAH: u32 = 2000 + RETENTION;
+
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let dir = TempDir::new().unwrap();
+    let snap_path = dir.path().join("index.snap");
+
+    let (unmined_key, mined_key, frozen_key, expected_entries) = {
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = create_engine_with_backends(
+            dev.clone(),
+            alloc,
+            PrimaryBackend::new_in_memory(10_000).unwrap(),
+            DahBackend::new_in_memory(),
+            UnminedBackend::new_in_memory(),
+        );
+
+        // Mix of states: an unmined tx with one spent slot, a mined tx
+        // spent to all-spent (drives delete_at_height), and a frozen tx.
+        let unmined_key = create_tx(&engine, UNMINED_N, 3);
+        spend_utxo(&engine, unmined_key, UNMINED_N, 1);
+        let mined_key = create_mined_tx(&engine, MINED_N, 2, MINED_N, 2000);
+        spend_utxo(&engine, mined_key, MINED_N, 0);
+        spend_utxo(&engine, mined_key, MINED_N, 1);
+        let frozen_key = create_frozen_tx(&engine, FROZEN_N, 2);
+
+        // Capture the live cached entries before shutdown — these are the
+        // ground truth the rebuilt index must reproduce.
+        let expected_entries: Vec<_> = [unmined_key, mined_key, frozen_key]
+            .into_iter()
+            .map(|k| {
+                let entry = engine.lookup_cached(&k).expect("created tx must be cached");
+                (k, entry)
+            })
+            .collect();
+
+        // Clean shutdown: snapshot the index and persist the allocator,
+        // exactly what the bin's shutdown path does.
+        engine.snapshot_index(&snap_path).unwrap();
+        engine.persist_allocator().unwrap();
+        (unmined_key, mined_key, frozen_key, expected_entries)
+    };
+
+    // Lose the snapshot. With the file gone there is provably no source
+    // for the assertions below other than the device scan.
+    std::fs::remove_file(&snap_path).unwrap();
+    assert!(
+        !snap_path.exists(),
+        "snapshot must be gone to force the device-scan path"
+    );
+
+    let alloc = SlotAllocator::recover(dev.clone()).unwrap();
+    let primary = load_primary_index_in_memory(&*dev, &alloc)
+        .expect("snapshot loss must fall back to a successful device-scan rebuild");
+    assert_eq!(primary.backend_name(), "memory");
+    assert_eq!(
+        primary.len(),
+        3,
+        "every device record must re-register after snapshot loss"
+    );
+
+    // Cached fields that the device scan restores from record headers
+    // must match the pre-shutdown live entries exactly. (`dah_or_preserve`
+    // and `unmined_since` are intentionally NOT compared on the primary
+    // entry: the device rebuild leaves them 0 — that state lives in the
+    // secondary indexes, asserted below.)
+    for (key, exp) in &expected_entries {
+        let got = primary
+            .lookup(key)
+            .expect("record missing from rebuilt index");
+        assert_eq!(got.record_offset, exp.record_offset, "offset for {key:?}");
+        assert_eq!(got.utxo_count, exp.utxo_count, "utxo_count for {key:?}");
+        assert_eq!(got.spent_utxos, exp.spent_utxos, "spent_utxos for {key:?}");
+        assert_eq!(
+            got.block_entry_count, exp.block_entry_count,
+            "block_entry_count for {key:?}"
+        );
+        assert_eq!(got.tx_flags, exp.tx_flags, "tx_flags for {key:?}");
+    }
+
+    let secondaries = rebuild_in_memory_secondaries(&*dev, &alloc);
+    assert!(
+        secondaries.status.dah_ok,
+        "DAH rebuild must succeed on a healthy device"
+    );
+    assert!(
+        secondaries.status.unmined_ok,
+        "unmined rebuild must succeed on a healthy device"
+    );
+
+    let engine = create_engine_with_backends(
+        dev.clone(),
+        alloc,
+        primary,
+        secondaries.dah,
+        secondaries.unmined,
+    );
+
+    // Unmined tx: metadata, slot states, and unmined-index membership.
+    let meta = engine.read_metadata(&unmined_key).unwrap();
+    assert_eq!({ meta.unmined_since }, 1000, "rebuilt unmined_since");
+    assert_eq!({ meta.spent_utxos }, 1, "rebuilt unmined spent count");
+    let slot = engine.read_slot(&unmined_key, 1).unwrap();
+    assert_eq!(slot.status, UTXO_SPENT, "rebuilt spent slot status");
+    assert_eq!(
+        slot.spending_data[0..4],
+        (UNMINED_N + 10000).to_le_bytes(),
+        "rebuilt spending data"
+    );
+    let slot = engine.read_slot(&unmined_key, 0).unwrap();
+    assert_eq!(slot.status, UTXO_UNSPENT, "rebuilt unspent slot status");
+    assert_eq!(
+        slot.hash,
+        make_utxo_hash(UNMINED_N, 0),
+        "rebuilt unspent slot hash"
+    );
+    assert_unmined_contains(&engine, unmined_key, 1000, "rebuilt unmined index");
+
+    // Mined all-spent tx: DAH metadata and DAH-index membership.
+    let meta = engine.read_metadata(&mined_key).unwrap();
+    assert_eq!(
+        { meta.delete_at_height },
+        EXPECTED_DAH,
+        "rebuilt delete_at_height"
+    );
+    assert_eq!({ meta.spent_utxos }, 2, "rebuilt mined spent count");
+    assert_dah_contains(&engine, mined_key, EXPECTED_DAH, "rebuilt DAH index");
+    assert!(
+        !engine
+            .unmined_index()
+            .range_query(u32::MAX)
+            .contains(&mined_key),
+        "mined tx must not re-register as unmined"
+    );
+
+    // Frozen tx: slot state survives the rebuild.
+    let slot = engine.read_slot(&frozen_key, 0).unwrap();
+    assert_eq!(slot.status, UTXO_FROZEN, "rebuilt frozen slot status");
+    assert_eq!(
+        slot.spending_data,
+        [FROZEN_BYTE; 36],
+        "rebuilt frozen spending data"
+    );
+}
+
+#[test]
+fn snapshot_deletion_with_corrupt_header_fails_closed() {
+    // B-04 companion: when the snapshot is lost AND a record header on
+    // the device is CRC-corrupt, the device-scan rebuild must fail
+    // closed with `RebuildError::InMemoryPrimary` — never return an
+    // empty or partial index that silently drops the corrupt record.
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+    let dir = TempDir::new().unwrap();
+    let snap_path = dir.path().join("index.snap");
+
+    let corrupt_offset = {
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = create_engine_with_backends(
+            dev.clone(),
+            alloc,
+            PrimaryBackend::new_in_memory(10_000).unwrap(),
+            DahBackend::new_in_memory(),
+            UnminedBackend::new_in_memory(),
+        );
+        for n in 0..3u32 {
+            create_tx(&engine, 0x7200 + n, 2);
+        }
+        let victim = TxKey {
+            txid: make_tx_id(0x7201),
+        };
+        let offset = engine
+            .lookup_cached(&victim)
+            .expect("victim must be cached")
+            .record_offset;
+        engine.snapshot_index(&snap_path).unwrap();
+        engine.persist_allocator().unwrap();
+        offset
+    };
+
+    std::fs::remove_file(&snap_path).unwrap();
+    assert!(
+        !snap_path.exists(),
+        "snapshot must be gone to force the device-scan path"
+    );
+
+    // CRC-corrupt the victim's header: zero the magic bytes WITHOUT
+    // restamping the CRC, so `TxMetadata::from_bytes` rejects the header
+    // on checksum during the scan.
+    let align = dev.alignment();
+    let mut buf = AlignedBuf::new(align, align);
+    dev.pread_exact_at(&mut buf, corrupt_offset).unwrap();
+    buf[0..4].copy_from_slice(&[0u8; 4]);
+    dev.pwrite_all_at(&buf, corrupt_offset).unwrap();
+
+    let alloc = SlotAllocator::recover(dev.clone()).unwrap();
+    let err = load_primary_index_in_memory(&*dev, &alloc)
+        .expect_err("a CRC-corrupt header must fail the rebuild closed");
+    match err {
+        RebuildError::InMemoryPrimary { ref rebuild_err } => {
+            assert!(
+                rebuild_err.contains("corrupt metadata at allocated offset"),
+                "rebuild error must identify header corruption: {rebuild_err}"
+            );
+            assert!(
+                rebuild_err.contains(&corrupt_offset.to_string()),
+                "rebuild error must name the corrupt offset: {rebuild_err}"
+            );
+        }
+        other => panic!("expected RebuildError::InMemoryPrimary, got {other:?}"),
+    }
+
+    // The secondary rebuild over the same corrupt device must degrade
+    // explicitly (flags false, empty fallbacks gated by
+    // ERR_INDEX_DEGRADED) — not silently drop the corrupt record.
+    let outcome = rebuild_in_memory_secondaries(&*dev, &alloc);
+    assert!(!outcome.status.dah_ok, "DAH must be flagged degraded");
+    assert!(
+        !outcome.status.unmined_ok,
+        "unmined must be flagged degraded"
+    );
+    assert_eq!(outcome.dah.len(), 0, "degraded DAH fallback must be empty");
+    assert_eq!(
+        outcome.unmined.len(),
+        0,
+        "degraded unmined fallback must be empty"
+    );
 }
