@@ -294,41 +294,13 @@ impl ResponseFrame {
     }
 }
 
-/// Decode multiple frames from a byte stream.
-///
-/// Returns all complete frames found and the number of bytes consumed.
-///
-/// **Important**: this helper does not distinguish "buffer ends mid-frame
-/// (partial — retry after more bytes arrive)" from "trailing bytes are
-/// invalid (corrupt — caller should disconnect)". Both cases stop the
-/// loop and return `(frames_so_far, pos)`. Callers that need that
-/// distinction should use [`try_decode_frames`], which surfaces the
-/// inner [`FrameError`] for any non-truncated parse failure.
-///
-/// This function is retained only for backwards compatibility with the
-/// existing in-module tests; new code should reach for `try_decode_frames`.
-pub fn decode_frames(data: &[u8]) -> (Vec<RequestFrame>, usize) {
-    let mut frames = Vec::new();
-    let mut pos = 0;
-    while pos < data.len() {
-        match RequestFrame::decode(&data[pos..]) {
-            Ok((frame, consumed)) => {
-                frames.push(frame);
-                pos += consumed;
-            }
-            Err(_) => break,
-        }
-    }
-    (frames, pos)
-}
-
 /// Decode multiple frames from a byte stream, distinguishing partial
 /// reads (retry) from corrupt input (disconnect).
 ///
-/// F-G5-020: pre-fix [`decode_frames`] swallowed any inner [`FrameError`],
-/// so a malformed trailing frame was indistinguishable from "the buffer
-/// ends mid-frame, give me more bytes". This helper surfaces the
-/// distinction:
+/// F-G5-020 / H-01: the legacy `decode_frames` helper (since deleted)
+/// swallowed any inner [`FrameError`], so a malformed trailing frame was
+/// indistinguishable from "the buffer ends mid-frame, give me more
+/// bytes". This helper surfaces the distinction:
 ///
 /// - On [`FrameError::Truncated`] (declared length exceeds the buffer),
 ///   returns `Ok((frames_so_far, pos))` — caller refills the buffer.
@@ -513,7 +485,8 @@ mod tests {
         let mut stream = f1.encode();
         stream.extend_from_slice(&f2.encode());
 
-        let (frames, consumed) = decode_frames(&stream);
+        let (frames, consumed) =
+            try_decode_frames(&stream).expect("two well-formed frames should decode");
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].request_id, 1);
         assert_eq!(frames[1].request_id, 2);
