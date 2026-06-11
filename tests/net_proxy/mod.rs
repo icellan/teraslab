@@ -8,9 +8,44 @@
 //! * **UDP (SWIM membership)** — per *directed* link rules: `pass`
 //!   (default) or `drop`. Dropping one direction only models an
 //!   asymmetric partition; dropping both models a full partition.
+//!   Additionally, per directed link: **delay** (hold every datagram a
+//!   fixed duration before delivery) and **reorder** (buffer datagrams
+//!   and release them out of order within a configurable window/
+//!   probability). Delay and reorder compose with each other and with
+//!   the drop rules; a dropped datagram is never buffered or delivered.
 //! * **TCP (replication / migration / topology RPC)** — per-node
 //!   inbound `pass`/`drop`. Engaging `drop` refuses new connections AND
-//!   tears down established relay connections.
+//!   tears down established relay connections. Per-node inbound
+//!   **delay** holds each forwarded request chunk for a fixed duration
+//!   (segment/chunk granularity — see the delay/reorder section below).
+//!
+//! ## Delay & reorder (determinism)
+//!
+//! All non-determinism is driven by a single SEEDED PRNG ([`SplitMix64`])
+//! constructed with a fixed constant in [`ProxyNet::new`]; there is no
+//! use of system randomness or wall-clock entropy anywhere in the fault
+//! injection, so a given sequence of rule toggles produces an identical
+//! datagram schedule on every run.
+//!
+//! * **UDP delay** — per directed `(from → to)` link, every forwarded
+//!   datagram is held in a release buffer until `enqueue_time + delay`,
+//!   then delivered. Granularity is *per datagram*: SWIM sends discrete
+//!   messages, so this is exact.
+//! * **UDP reorder** — per directed link, with probability `p` a
+//!   datagram's effective release time is pulled *earlier* by a random
+//!   fraction of the configured reorder `window`, so a later datagram
+//!   can overtake an earlier one within that window. The buffer is a
+//!   min-heap on effective release time, so ordering is the realistic
+//!   "datagrams arrive out of order but none is lost" model SWIM must
+//!   tolerate (incarnation numbers, not arrival order, decide truth).
+//!   With delay==0 and reorder set, datagrams are still reordered using
+//!   the window as the spread.
+//! * **TCP delay** — the request-relay path forwards whole frames; a
+//!   per-node inbound delay sleeps before forwarding each frame
+//!   (segment/chunk granularity, not per-byte). This is enough to delay
+//!   connection establishment and every relayed control frame; it does
+//!   not attempt sub-frame byte-stream delay (a TCP byte stream has no
+//!   datagram boundaries to hold individually).
 //!
 //! Wiring: each node binds its real SWIM/TCP sockets to private ports
 //! and *advertises* the proxy endpoints instead
@@ -62,19 +97,113 @@
 //! migration) from an isolated node are not attributable and therefore
 //! not cut. Under quorum loss the isolated node never generates them
 //! (writes are rejected with `ERR_NO_QUORUM` before replication), so
-//! this does not weaken the partition scenarios modeled here.
+//! this does not weaken the partition scenarios modeled here. The same
+//! loopback-attribution limit applies to TCP delay: it is enforced
+//! per-destination-node on the inbound request path (the topology
+//! control plane), not per directed link. UDP delay/reorder, by
+//! contrast, *is* per directed link because every SWIM datagram is
+//! attributable by source address.
 
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum SWIM datagram size the relay buffers (mirrors the SWIM
 /// implementation's `MAX_MSG_SIZE` of 1400 with headroom).
 const UDP_BUF: usize = 2048;
+
+/// Fixed seed for the fixture's deterministic PRNG. Reorder decisions
+/// are driven entirely by this so every test run is reproducible.
+const PRNG_SEED: u64 = 0x5EED_1A5E_F00D_C0DE;
+
+/// Deterministic, dependency-free PRNG (SplitMix64). Used to drive
+/// reorder decisions; seeded once per fixture so the datagram schedule
+/// is identical across runs. NOT cryptographic — reproducibility, not
+/// unpredictability, is the goal.
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        SplitMix64 { state: seed }
+    }
+
+    /// Next pseudo-random `u64` (the canonical SplitMix64 step).
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform `f64` in `[0, 1)`.
+    fn next_f64(&mut self) -> f64 {
+        // 53-bit mantissa precision.
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// Per directed-link delay/reorder configuration.
+#[derive(Clone, Copy, Default)]
+struct LinkTiming {
+    /// Hold every forwarded datagram this long before delivery.
+    delay: Duration,
+    /// Probability `[0,1]` a datagram is pulled earlier (reordered).
+    reorder_prob: f64,
+    /// Maximum amount a reordered datagram's release is pulled earlier.
+    reorder_window: Duration,
+}
+
+impl LinkTiming {
+    fn is_active(&self) -> bool {
+        self.delay > Duration::ZERO
+            || (self.reorder_prob > 0.0 && self.reorder_window > Duration::ZERO)
+    }
+}
+
+/// A datagram buffered for delayed/reordered delivery on one UDP relay.
+/// Ordered as a min-heap on `release_at` (earliest first), with `seq`
+/// as a deterministic FIFO tie-break for datagrams sharing a release
+/// instant.
+struct DelayedDatagram {
+    release_at: Instant,
+    seq: u64,
+    dst: SocketAddr,
+    /// The NAT socket key to send from (peer's real addr), or `None`
+    /// to send from the main relay path toward `dst` via that key.
+    via_peer_real: SocketAddr,
+    data: Vec<u8>,
+}
+
+impl PartialEq for DelayedDatagram {
+    fn eq(&self, other: &Self) -> bool {
+        self.release_at == other.release_at && self.seq == other.seq
+    }
+}
+impl Eq for DelayedDatagram {}
+impl PartialOrd for DelayedDatagram {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for DelayedDatagram {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // Reverse so BinaryHeap (a max-heap) yields the EARLIEST
+        // release first; break ties on seq, also reversed.
+        other
+            .release_at
+            .cmp(&self.release_at)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
 
 #[derive(Clone, Copy)]
 struct NodeAddrs {
@@ -97,6 +226,11 @@ pub struct ProxyEndpoints {
 struct Rules {
     /// Directed UDP links currently dropping all datagrams.
     udp_drop: std::collections::HashSet<(u64, u64)>,
+    /// Per directed UDP link delay/reorder timing (absent ⇒ pass-through).
+    udp_timing: HashMap<(u64, u64), LinkTiming>,
+    /// Per-destination-node inbound TCP request-frame delay (loopback
+    /// attribution limits this to per-node, not per-link — see docs).
+    tcp_delay: HashMap<u64, Duration>,
     /// Nodes whose inter-node TCP inbound is blocked.
     tcp_block: std::collections::HashSet<u64>,
     /// Directed `(sender, dest)` pairs whose topology control frames
@@ -104,6 +238,15 @@ struct Rules {
     /// relay. Sender attribution comes from the NodeId embedded in the
     /// frame payload (see module docs).
     tcp_topology_block: std::collections::HashSet<(u64, u64)>,
+}
+
+impl Rules {
+    fn udp_timing_for(&self, from: u64, to: u64) -> Option<LinkTiming> {
+        self.udp_timing
+            .get(&(from, to))
+            .copied()
+            .filter(LinkTiming::is_active)
+    }
 }
 
 struct Shared {
@@ -115,6 +258,9 @@ struct Shared {
     /// Live TCP relay stream pairs per destination node, retained so an
     /// inbound block can tear down established connections.
     tcp_conns: Mutex<HashMap<u64, Vec<TcpStream>>>,
+    /// Seeded PRNG driving reorder decisions (shared across all relays
+    /// behind a mutex so the schedule is a single deterministic stream).
+    prng: Mutex<SplitMix64>,
     shutdown: AtomicBool,
 }
 
@@ -132,6 +278,7 @@ impl ProxyNet {
                 swim_index: Mutex::new(HashMap::new()),
                 rules: Mutex::new(Rules::default()),
                 tcp_conns: Mutex::new(HashMap::new()),
+                prng: Mutex::new(SplitMix64::new(PRNG_SEED)),
                 shutdown: AtomicBool::new(false),
             }),
             threads: Mutex::new(Vec::new()),
@@ -196,6 +343,50 @@ impl ProxyNet {
             .remove(&(from, to));
     }
 
+    /// Delay every UDP datagram flowing `from → to` by `delay` before
+    /// delivery (per-datagram granularity). Composes with reorder; pass
+    /// `Duration::ZERO` to clear the delay while keeping any reorder.
+    pub fn delay_udp_one_way(&self, from: u64, to: u64, delay: Duration) {
+        let mut rules = self.shared.rules.lock().unwrap();
+        rules.udp_timing.entry((from, to)).or_default().delay = delay;
+    }
+
+    /// Reorder UDP datagrams flowing `from → to`: with probability `prob`
+    /// a datagram's effective release is pulled earlier by a seeded
+    /// random fraction of `window`, so later datagrams can overtake
+    /// earlier ones within that window. Composes with delay. Reordering
+    /// never drops a datagram — it only changes delivery order.
+    pub fn reorder_udp_one_way(&self, from: u64, to: u64, prob: f64, window: Duration) {
+        let mut rules = self.shared.rules.lock().unwrap();
+        let t = rules.udp_timing.entry((from, to)).or_default();
+        t.reorder_prob = prob.clamp(0.0, 1.0);
+        t.reorder_window = window;
+    }
+
+    /// Clear all delay/reorder timing on `from → to` (drop rules, if any,
+    /// are unaffected).
+    pub fn clear_udp_timing(&self, from: u64, to: u64) {
+        self.shared
+            .rules
+            .lock()
+            .unwrap()
+            .udp_timing
+            .remove(&(from, to));
+    }
+
+    /// Delay each inbound inter-node TCP request frame to `node` by
+    /// `delay` before forwarding (segment/chunk granularity — see module
+    /// docs for the loopback per-node attribution limit). `Duration::ZERO`
+    /// clears the delay.
+    pub fn delay_tcp_inbound(&self, node: u64, delay: Duration) {
+        let mut rules = self.shared.rules.lock().unwrap();
+        if delay == Duration::ZERO {
+            rules.tcp_delay.remove(&node);
+        } else {
+            rules.tcp_delay.insert(node, delay);
+        }
+    }
+
     /// Block inter-node TCP inbound to `node`: refuse new relay
     /// connections and tear down established ones.
     pub fn block_tcp_inbound(&self, node: u64) {
@@ -233,10 +424,13 @@ impl ProxyNet {
         self.block_tcp_inbound(node);
     }
 
-    /// Remove every drop/block rule (heal all partitions).
+    /// Remove every drop/block/delay/reorder rule (heal all partitions
+    /// and clear all injected timing).
     pub fn heal_all(&self) {
         let mut rules = self.shared.rules.lock().unwrap();
         rules.udp_drop.clear();
+        rules.udp_timing.clear();
+        rules.tcp_delay.clear();
         rules.tcp_block.clear();
         rules.tcp_topology_block.clear();
     }
@@ -287,6 +481,32 @@ fn udp_relay_loop(n: u64, main: UdpSocket, shared: &Shared) {
         None => return,
     };
 
+    // Release buffer for delayed/reordered datagrams (min-heap on
+    // effective release time). Datagrams on pass-through links bypass it
+    // entirely; only delayed/reordered ones land here.
+    let mut buffered: BinaryHeap<DelayedDatagram> = BinaryHeap::new();
+    let mut seq: u64 = 0;
+
+    // Compute a datagram's effective release `Instant` for a directed
+    // link's timing: base delay plus, with the seeded reorder
+    // probability, an earlier pull within the reorder window so a later
+    // datagram can overtake an earlier one.
+    let release_instant = |timing: &LinkTiming| -> Instant {
+        let now = Instant::now();
+        let mut release = now + timing.delay;
+        if timing.reorder_prob > 0.0 && timing.reorder_window > Duration::ZERO {
+            let mut prng = shared.prng.lock().unwrap();
+            if prng.next_f64() < timing.reorder_prob {
+                let frac = prng.next_f64();
+                let pull = timing.reorder_window.mul_f64(frac);
+                // Never pull earlier than `now` — a reordered datagram
+                // still cannot be delivered before it arrived.
+                release = release.checked_sub(pull).unwrap_or(now).max(now);
+            }
+        }
+        release
+    };
+
     while !shared.shutdown.load(Ordering::Relaxed) {
         let mut progressed = false;
 
@@ -299,24 +519,37 @@ fn udp_relay_loop(n: u64, main: UdpSocket, shared: &Shared) {
             if peer == n || udp_dropped(shared, peer, n) {
                 continue;
             }
-            let sock = nat
-                .entry(src)
-                .or_insert_with(|| {
-                    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-                    s.set_nonblocking(true).unwrap();
-                    s
-                });
-            let _ = sock.send_to(&buf[..len], my_real);
+            nat.entry(src).or_insert_with(new_relay_socket);
+            let timing = shared.rules.lock().unwrap().udp_timing_for(peer, n);
+            forward_or_buffer(
+                &nat,
+                src,
+                my_real,
+                buf[..len].to_vec(),
+                timing,
+                &release_instant,
+                &mut buffered,
+                &mut seq,
+            );
         }
 
         // Inbound on NAT sockets. Collect forwarding actions first to
         // avoid mutating `nat` while iterating it.
         enum Action {
             /// Forward n's outbound packet to the peer's real bind.
-            ToPeer { peer_real: SocketAddr, data: Vec<u8> },
+            /// `via`==`dst`==peer_real; link is `n → peer`.
+            ToPeer {
+                peer_real: SocketAddr,
+                peer: u64,
+                data: Vec<u8>,
+            },
             /// Forward a (possibly third-party) packet to n, attributed
-            /// to `src` (the sender's real bind).
-            ToSelf { src: SocketAddr, data: Vec<u8> },
+            /// to `src` (the sender's real bind). link is `x → n`.
+            ToSelf {
+                src: SocketAddr,
+                from: u64,
+                data: Vec<u8>,
+            },
         }
         let mut actions: Vec<Action> = Vec::new();
         for (&peer_real, sock) in nat.iter() {
@@ -331,6 +564,7 @@ fn udp_relay_loop(n: u64, main: UdpSocket, shared: &Shared) {
                     if !udp_dropped(shared, n, peer) {
                         actions.push(Action::ToPeer {
                             peer_real,
+                            peer,
                             data: buf[..len].to_vec(),
                         });
                     }
@@ -340,6 +574,7 @@ fn udp_relay_loop(n: u64, main: UdpSocket, shared: &Shared) {
                     if x != n && !udp_dropped(shared, x, n) {
                         actions.push(Action::ToSelf {
                             src,
+                            from: x,
                             data: buf[..len].to_vec(),
                         });
                     }
@@ -349,24 +584,99 @@ fn udp_relay_loop(n: u64, main: UdpSocket, shared: &Shared) {
         }
         for action in actions {
             match action {
-                Action::ToPeer { peer_real, data } => {
-                    if let Some(sock) = nat.get(&peer_real) {
-                        let _ = sock.send_to(&data, peer_real);
-                    }
+                Action::ToPeer {
+                    peer_real,
+                    peer,
+                    data,
+                } => {
+                    let timing = shared.rules.lock().unwrap().udp_timing_for(n, peer);
+                    forward_or_buffer(
+                        &nat,
+                        peer_real,
+                        peer_real,
+                        data,
+                        timing,
+                        &release_instant,
+                        &mut buffered,
+                        &mut seq,
+                    );
                 }
-                Action::ToSelf { src, data } => {
-                    let sock = nat.entry(src).or_insert_with(|| {
-                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-                        s.set_nonblocking(true).unwrap();
-                        s
-                    });
-                    let _ = sock.send_to(&data, my_real);
+                Action::ToSelf { src, from, data } => {
+                    nat.entry(src).or_insert_with(new_relay_socket);
+                    let timing = shared.rules.lock().unwrap().udp_timing_for(from, n);
+                    forward_or_buffer(
+                        &nat,
+                        src,
+                        my_real,
+                        data,
+                        timing,
+                        &release_instant,
+                        &mut buffered,
+                        &mut seq,
+                    );
                 }
             }
         }
 
+        // Release any buffered datagrams whose hold has elapsed. Sending
+        // from the same NAT socket the live path uses preserves source
+        // attribution at the receiver.
+        let now = Instant::now();
+        while buffered.peek().is_some_and(|d| d.release_at <= now) {
+            if let Some(d) = buffered.pop() {
+                progressed = true;
+                if let Some(sock) = nat.get(&d.via_peer_real) {
+                    let _ = sock.send_to(&d.data, d.dst);
+                }
+            }
+        }
+
+        // Idle nap when nothing moved. When datagrams are still pending
+        // in the buffer, the same 1ms cadence polls their release
+        // promptly without busy-spinning.
         if !progressed {
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// Create a non-blocking NAT relay socket.
+fn new_relay_socket() -> UdpSocket {
+    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.set_nonblocking(true).unwrap();
+    s
+}
+
+/// Either send a datagram immediately (no active timing) or buffer it
+/// for delayed/reordered release. `via` is the NAT-socket key to send
+/// from; `dst` is the destination address.
+#[allow(clippy::too_many_arguments)]
+fn forward_or_buffer(
+    nat: &HashMap<SocketAddr, UdpSocket>,
+    via: SocketAddr,
+    dst: SocketAddr,
+    data: Vec<u8>,
+    timing: Option<LinkTiming>,
+    release_instant: &dyn Fn(&LinkTiming) -> Instant,
+    buffered: &mut BinaryHeap<DelayedDatagram>,
+    seq: &mut u64,
+) {
+    match timing {
+        None => {
+            if let Some(sock) = nat.get(&via) {
+                let _ = sock.send_to(&data, dst);
+            }
+        }
+        Some(t) => {
+            let release_at = release_instant(&t);
+            *seq = seq.wrapping_add(1);
+            buffered.push(DelayedDatagram {
+                release_at,
+                seq: *seq,
+                dst,
+                via_peer_real: via,
+                data,
+            });
         }
     }
 }
@@ -422,6 +732,8 @@ fn tcp_accept_loop(n: u64, listener: TcpListener, shared: &Arc<Shared>) {
 /// frames, severing the connection when a topology control frame
 /// (`OP_TOPOLOGY_PROPOSE`/`VOTE`/`COMMIT`, opcodes 251-253) carries an
 /// embedded sender NodeId with an active `(sender → n)` topology block.
+/// A per-node inbound delay (if set) is applied per forwarded frame
+/// (segment/chunk granularity — see module docs).
 ///
 /// Frame layout (request): `[total_len:4][request_id:8][op_code:2]
 /// [flags:2][payload…]`; for the three topology opcodes the payload
@@ -448,20 +760,29 @@ fn relay_requests(mut from: TcpStream, mut to: TcpStream, n: u64, shared: &Share
         if from.read_exact(&mut body).is_err() {
             break;
         }
-        if body.len() >= 28 {
-            let op = u16::from_le_bytes([body[8], body[9]]);
-            if (OP_TOPOLOGY_MIN..=OP_TOPOLOGY_MAX).contains(&op) {
-                let sender = u64::from_le_bytes(body[20..28].try_into().unwrap());
-                let blocked = shared
-                    .rules
-                    .lock()
-                    .unwrap()
-                    .tcp_topology_block
-                    .contains(&(sender, n));
-                if blocked {
-                    break; // sever — models the partition cutting the dial
+        // Snapshot the topology-block decision and inbound delay under a
+        // single rules lock, then release it before any sleep so runtime
+        // toggles never block on a delayed frame.
+        let (blocked, delay) = {
+            let rules = shared.rules.lock().unwrap();
+            let blocked = if body.len() >= 28 {
+                let op = u16::from_le_bytes([body[8], body[9]]);
+                if (OP_TOPOLOGY_MIN..=OP_TOPOLOGY_MAX).contains(&op) {
+                    let sender = u64::from_le_bytes(body[20..28].try_into().unwrap());
+                    rules.tcp_topology_block.contains(&(sender, n))
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
+            (blocked, rules.tcp_delay.get(&n).copied())
+        };
+        if blocked {
+            break; // sever — models the partition cutting the dial
+        }
+        if let Some(d) = delay {
+            std::thread::sleep(d);
         }
         if to.write_all(&len_buf).is_err() || to.write_all(&body).is_err() {
             break;
