@@ -1,6 +1,18 @@
 //! Storage tier definitions for cold data placement.
 
+use crate::record::{METADATA_SIZE, UTXO_SLOT_SIZE};
 use crate::storage::blobstore::BlobDigest;
+
+/// Byte offset, from the start of a record, where inline cold data begins:
+/// `METADATA_SIZE + utxo_count * UTXO_SLOT_SIZE`.
+///
+/// This is the production read path's anchor for inline cold data (used by
+/// [`crate::ops::engine::Engine::read_cold_data`]). The on-disk layout places
+/// the metadata header first, then the fixed-size UTXO slots, then any inline
+/// cold data — so the cold-data region starts immediately after the slots.
+pub fn inline_cold_offset(utxo_count: u32) -> u64 {
+    METADATA_SIZE as u64 + utxo_count as u64 * UTXO_SLOT_SIZE as u64
+}
 
 /// Cold data up to and including this serialized size (`<=` 8 KiB = 8192
 /// bytes, i.e. 8180 bytes of user data plus the 12-byte `ColdData` length
@@ -133,6 +145,19 @@ impl ColdData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{METADATA_SIZE, UTXO_SLOT_SIZE};
+
+    #[test]
+    fn inline_cold_offset_matches_layout_formula() {
+        // The inline cold-data region begins immediately after the metadata
+        // header and the fixed-size UTXO slots.
+        for utxo_count in [0u32, 1, 7, 10, 1000] {
+            assert_eq!(
+                inline_cold_offset(utxo_count),
+                METADATA_SIZE as u64 + utxo_count as u64 * UTXO_SLOT_SIZE as u64,
+            );
+        }
+    }
 
     #[test]
     fn tier_inline() {

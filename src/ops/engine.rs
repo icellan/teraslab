@@ -2906,10 +2906,21 @@ impl Engine {
             .lookup(key)
             .ok_or(SpendError::TxNotFound)?;
 
-        // Check if cold data is in external blobstore.
-        if entry.tx_flags & TxFlags::EXTERNAL.bits() != 0
-            && let Some(ref blob_store) = self.blob_store
-        {
+        // Check if cold data is in the external blobstore.
+        //
+        // F-IJ-005: branch on the EXTERNAL flag ALONE — not on the flag AND a
+        // configured blob store. An EXTERNAL record whose store is `None`
+        // previously fell through to the inline branch, where
+        // `record_size == metadata + slots` yields `cold_size == 0` and the
+        // call returned `Ok(vec![])` — the resurrected pre-F-G9-001 "silent
+        // empty" bug. There is no inline cold data for an EXTERNAL record, so
+        // an unresolvable external blob is a typed integrity error, never
+        // empty bytes.
+        if entry.tx_flags & TxFlags::EXTERNAL.bits() != 0 {
+            let Some(ref blob_store) = self.blob_store else {
+                // F-IJ-005: no store configured to resolve the external blob.
+                return Err(SpendError::BlobNotFound { txid: key.txid });
+            };
             let meta = self.read_metadata_for_key(key, entry.record_offset)?;
             match blob_store.get(&key.txid) {
                 Ok(Some(data)) => {
@@ -2931,7 +2942,13 @@ impl Engine {
                     }
                     return Ok(data);
                 }
-                Ok(None) => return Err(SpendError::TxNotFound),
+                // F-IJ-001: a missing blob for an existing EXTERNAL record is
+                // a data-integrity violation, NOT a missing transaction. The
+                // record and its UTXOs are present and spendable; only the
+                // cold data is gone. Surface `BlobNotFound` so the dispatcher
+                // maps it to `ERR_BLOB_NOT_FOUND` (17) instead of
+                // `ERR_TX_NOT_FOUND`, which would mask the loss.
+                Ok(None) => return Err(SpendError::BlobNotFound { txid: key.txid }),
                 Err(e) => {
                     return Err(SpendError::StorageError {
                         detail: format!("blobstore read: {e}"),
@@ -2942,8 +2959,7 @@ impl Engine {
 
         // Read metadata to determine record_size, then compute inline cold offset.
         let meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        let cold_intra =
-            crate::storage::manager::StorageManager::inline_cold_offset(entry.utxo_count);
+        let cold_intra = crate::storage::tiers::inline_cold_offset(entry.utxo_count);
         let cold_size = (meta.record_size as u64).saturating_sub(cold_intra);
         if cold_size == 0 {
             return Ok(vec![]);
@@ -9497,19 +9513,79 @@ mod tests {
         assert_eq!(actual, external_ref);
     }
 
+    #[test]
+    fn external_record_missing_blob_returns_blob_not_found_not_tx_not_found() {
+        // IJ-1: an EXTERNAL record that exists in the index but whose blob is
+        // absent from the configured store must surface a typed
+        // `SpendError::BlobNotFound` — NOT `TxNotFound`, which would tell the
+        // caller the transaction never existed and mask the data loss.
+        let mut engine = create_engine_inner();
+        let blob = Arc::new(crate::storage::blobstore::MemoryBlobStore::new());
+        engine.set_blob_store(blob);
+        let engine = Arc::new(engine);
+
+        let (_, mut req) = make_create_req(80, 2);
+        req.is_external = true;
+        req.inputs = None;
+        req.outputs = None;
+        req.inpoints = None;
+        req.external_ref = Some(test_external_ref(req.tx_id));
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // The record is registered (the tx exists), but no blob was ever
+        // uploaded for it — exactly the lost/GC'd/never-written case.
+        assert!(engine.lookup(&key).is_some());
+
+        match engine.read_cold_data(&key) {
+            Err(SpendError::BlobNotFound { txid }) => {
+                assert_eq!(txid, req.tx_id);
+            }
+            other => panic!("expected BlobNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn external_record_with_no_blob_store_configured_errors_not_empty() {
+        // IJ-5: an engine with NO blob store configured must NOT silently
+        // return empty cold data for an EXTERNAL record (the resurrected
+        // pre-F-G9-001 "silent empty" bug). It must error.
+        let engine = create_engine(); // no blob store set
+        let (_, mut req) = make_create_req(81, 2);
+        req.is_external = true;
+        req.inputs = None;
+        req.outputs = None;
+        req.inpoints = None;
+        req.external_ref = Some(test_external_ref(req.tx_id));
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        assert!(engine.lookup(&key).is_some());
+
+        match engine.read_cold_data(&key) {
+            Err(SpendError::BlobNotFound { txid }) => {
+                assert_eq!(txid, req.tx_id);
+            }
+            other => panic!("expected BlobNotFound for unconfigured store, got {other:?}"),
+        }
+    }
+
     fn create_engine() -> Arc<Engine> {
+        Arc::new(create_engine_inner())
+    }
+
+    fn create_engine_inner() -> Engine {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
-        Arc::new(Engine::new(
+        Engine::new(
             dev,
             index,
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
             UnminedIndex::new(),
-        ))
+        )
     }
 
     fn create_engine_without_direct_ptr() -> Arc<Engine> {

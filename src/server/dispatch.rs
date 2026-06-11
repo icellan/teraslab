@@ -6642,6 +6642,13 @@ fn handle_get_batch(
                 // retry instead of trusting the synthesized bytes.
                 // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
                 let mut inner_read_failed = false;
+                // F-IJ-001: track a missing external cold-data blob distinctly
+                // from generic sub-read corruption. A record that exists but
+                // whose blob is gone must surface ERR_BLOB_NOT_FOUND (17), not
+                // ERR_TX_NOT_FOUND (which would say the tx never existed) nor
+                // ERR_STORAGE_IO (a transient I/O fault the client would
+                // retry).
+                let mut blob_not_found = false;
                 if field_mask.has(FieldMask::UTXO_SLOTS) {
                     let utxo_count = { meta.utxo_count };
                     data.extend_from_slice(&utxo_count.to_le_bytes());
@@ -6670,6 +6677,12 @@ fn handle_get_batch(
                         Ok(cold) => {
                             data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
                             data.extend_from_slice(&cold);
+                        }
+                        // F-IJ-001: missing external blob → ERR_BLOB_NOT_FOUND,
+                        // not the generic ERR_STORAGE_IO path below.
+                        Err(SpendError::BlobNotFound { .. }) => {
+                            blob_not_found = true;
+                            data.extend_from_slice(&0u32.to_le_bytes());
                         }
                         Err(_) => {
                             inner_read_failed = true;
@@ -6702,7 +6715,13 @@ fn handle_get_batch(
                         }
                     }
                 }
-                let status = if inner_read_failed {
+                let status = if blob_not_found {
+                    // F-IJ-001: existing record, missing external cold-data
+                    // blob. Takes precedence over ERR_STORAGE_IO: it is the
+                    // specific, actionable failure (the bytes are gone, not a
+                    // transient device fault).
+                    ERR_BLOB_NOT_FOUND as u8
+                } else if inner_read_failed {
                     // ERR_STORAGE_IO on the wire — distinguishes sub-read
                     // corruption from a clean `Ok(0)` case. (P3.10 /
                     // F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
@@ -7531,6 +7550,10 @@ fn batch_response_with_outcome(
 fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemError {
     let (code, data) = match err {
         SpendError::TxNotFound => (ERR_TX_NOT_FOUND, vec![]),
+        // F-IJ-001: an existing EXTERNAL record whose cold-data blob is
+        // missing/unresolvable is a data-integrity failure, distinct from a
+        // missing transaction — surface the dedicated wire code (17).
+        SpendError::BlobNotFound { .. } => (ERR_BLOB_NOT_FOUND, vec![]),
         SpendError::Conflicting => (ERR_CONFLICTING, vec![]),
         SpendError::Locked => (ERR_LOCKED, vec![]),
         SpendError::CoinbaseImmature {
@@ -7620,6 +7643,9 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         | SpendError::NotFrozen { .. } => Outcome::ErrFrozen,
         SpendError::StorageError { .. }
         | SpendError::DahOverflow { .. }
+        // F-IJ-001: a missing external blob is a storage-integrity failure
+        // (the bytes are gone), bucketed with the other storage errors.
+        | SpendError::BlobNotFound { .. }
         | SpendError::ReassignOverflow { .. } => Outcome::ErrStorage,
         SpendError::CoinbaseImmature { .. }
         | SpendError::UtxoNotFound { .. }
@@ -14235,6 +14261,10 @@ mod tests {
                     child_count: 1,
                 },
                 Outcome::ErrConflicting,
+            ),
+            (
+                SpendError::BlobNotFound { txid: [0xCD; 32] },
+                Outcome::ErrStorage,
             ),
         ];
         for (err, expected) in cases {
