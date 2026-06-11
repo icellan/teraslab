@@ -27,7 +27,7 @@
 //! crash). Recovery replays every entry after the last checkpoint:
 //!
 //! * `RedoOp::CreateV2` carries the full record bytes (metadata header + UTXO slots + cold data) so replay can reconstruct the on-device record byte-for-byte. The legacy `RedoOp::Create` (logs predating gap #2) registers the index only — old logs continue to replay for back-compat.
-//! * `RedoOp::Spend` / `RedoOp::Unspend` carry the post-mutation `new_spent_count`. Recovery overwrites `meta.spent_utxos` with this value; previously the dispatcher wrote `0` here, corrupting the counter on crash-replay even when the slot transition was correct.
+//! * `RedoOp::Spend` / `RedoOp::Unspend` carry a `new_spent_count`, but recovery does NOT trust it: the dispatcher snapshots it before taking the per-tx lock, so it can be stale, and accumulating `±1` per entry is not idempotent across spend→unspend→respend (reorg) histories. Instead, replay writes the absolute slot state and then RECOMPUTES `meta.spent_utxos` from the count of SPENT slots (B-4). This converges to the same counter no matter how much of the log was already applied before the crash, and prevents an over-counted record from satisfying the all-spent condition and getting a stale `delete_at_height` while a UTXO is still live.
 //! * Other ops carry the same per-key payload they always did and replay against the on-device metadata header.
 //!
 //! All replays are idempotent: each entry reads the current device or
@@ -737,6 +737,31 @@ struct ReplayDerivedContext {
     updated_at: u64,
 }
 
+/// Count the SPENT slots of a record by reading its on-device slot set.
+///
+/// This is the authoritative source for `spent_utxos`: the counter is, by
+/// definition, the number of slots in `UTXO_SPENT` status. Recomputing it
+/// from the slots (rather than accumulating `±1` per replayed redo entry)
+/// is what makes Spend/Unspend replay idempotent — replaying an already
+/// applied prefix, or replaying the whole log twice, converges to the same
+/// counter because the slot states are absolute, not incremental. A drifted
+/// on-device counter (e.g. from a spend→unspend→respend reorg history where
+/// some entries were already applied before the crash) is corrected here
+/// rather than perpetuated.
+///
+/// `utxo_count` is the record's slot count (from the metadata header).
+/// Returns `Err(())` on any device read error so the caller can map it to
+/// [`ReplayCause::IoError`].
+fn count_spent_slots(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+    utxo_count: u32,
+) -> Result<u32, ()> {
+    let slots = io::read_all_utxo_slots(device, record_offset, utxo_count).map_err(|_| ())?;
+    let spent = slots.iter().filter(|s| s.status == UTXO_SPENT).count();
+    Ok(spent as u32)
+}
+
 fn apply_replay_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
     metadata.delete_at_height = patch.new_delete_at_height;
     if patch.last_spent_all {
@@ -990,16 +1015,21 @@ fn replay_spend(
         return ReplayResult::Failed(ReplayCause::IoError);
     }
 
-    // R-010 (BC-04): re-derive the counter from on-device state by
-    // incrementing rather than overwriting with `new_spent_count`. The
-    // dispatcher computes `new_spent_count` from `engine.lookup` BEFORE
-    // taking the per-tx stripe lock, so two concurrent spend/unspend
-    // batches on the same record can compute conflicting absolute
-    // counts. Recovery now re-derives by counting the slot transition
-    // we just made (UNSPENT → SPENT means +1). The per-entry slot-state
-    // check at the top of this function makes the redo entry idempotent
-    // — a re-played already-spent entry exits via Skipped before
-    // reaching this point.
+    // R-010 (BC-04) / B-4: re-derive the counter from on-device state by
+    // RECOMPUTING it from the slots rather than overwriting with
+    // `new_spent_count` or accumulating `±1` per entry. The dispatcher
+    // computes `new_spent_count` from `engine.lookup` BEFORE taking the
+    // per-tx stripe lock, so two concurrent spend/unspend batches on the
+    // same record can compute conflicting absolute counts — so the redo
+    // snapshot can't be trusted. The previous fix incremented by `+1`,
+    // but that is NOT idempotent across spend→unspend→respend (reorg)
+    // histories: replaying a prefix already reflected on-device
+    // double-counts and drifts the counter `+1` per cycle, which can
+    // satisfy the all-spent condition and stamp `delete_at_height` on a
+    // record that still has a live (unspent) UTXO. The counter is, by
+    // definition, the number of SPENT slots; recomputing it from the
+    // slots after writing the slot above makes replay converge to the
+    // same value regardless of how much of the log was already applied.
     //
     // R-013 (A-06 / BC-12): metadata read AND write errors propagate as
     // ReplayResult::Failed. Pre-fix this used `if let Ok(mut meta)` and
@@ -1011,7 +1041,10 @@ fn replay_spend(
         Ok(m) => m,
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
-    meta.spent_utxos = { meta.spent_utxos }.saturating_add(1);
+    meta.spent_utxos = match count_spent_slots(device, ie.record_offset, meta.utxo_count) {
+        Ok(c) => c,
+        Err(()) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
     if let Some(ctx) = derived {
         meta.generation = ctx.target_generation;
         meta.updated_at = ctx.updated_at;
@@ -1071,14 +1104,18 @@ fn replay_unspend(
         return ReplayResult::Failed(ReplayCause::IoError);
     }
 
-    // R-010 (BC-04): see `replay_spend` — re-derive counter rather than
-    // trusting the redo entry's pre-lock snapshot.
+    // R-010 (BC-04) / B-4: see `replay_spend` — recompute the counter from
+    // the SPENT slots (after writing the unspent slot above) rather than
+    // accumulating `-1`, so replay is idempotent across re-spend histories.
     // R-013: propagate read AND write errors instead of dropping them.
     let mut meta = match io::read_metadata(device, ie.record_offset) {
         Ok(m) => m,
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
-    meta.spent_utxos = { meta.spent_utxos }.saturating_sub(1);
+    meta.spent_utxos = match count_spent_slots(device, ie.record_offset, meta.utxo_count) {
+        Ok(c) => c,
+        Err(()) => return ReplayResult::Failed(ReplayCause::IoError),
+    };
     if let Some(ctx) = derived {
         meta.generation = ctx.target_generation;
         meta.updated_at = ctx.updated_at;
@@ -2433,14 +2470,14 @@ mod tests {
         );
     }
 
-    /// R-010 (BC-04): the per-entry `new_spent_count` carried in
+    /// R-010 (BC-04) / B-4: the per-entry `new_spent_count` carried in
     /// `RedoOp::Spend` and `RedoOp::Unspend` is computed from a
     /// pre-lock `engine.lookup` snapshot, so concurrent batches on the
     /// same record can compute conflicting absolute counts and persist
     /// redo entries whose `new_spent_count` is wrong by the time
     /// replay runs. Replay must therefore re-derive the counter from
-    /// on-device state — adding `+1` for each Spend it actually
-    /// applies and `-1` for each Unspend — rather than overwriting
+    /// on-device state — recomputing it as the number of SPENT slots
+    /// after writing the slot transition — rather than overwriting
     /// `meta.spent_utxos` with the redo entry's snapshot.
     #[test]
     fn replay_spend_rederives_counter_ignoring_redo_snapshot() {
@@ -2448,12 +2485,20 @@ mod tests {
         let key = h.create_record(0xA0, 5);
         let ie = h.index.lookup(&key).unwrap();
 
-        // Stamp the metadata's spent_utxos to a known prior value.
-        // The redo entry below will carry a totally wrong
-        // `new_spent_count = 99`; replay must IGNORE that value and
-        // produce `prior + 1 = 4`.
+        // On-device truth: slots 1,2,3 already SPENT (3 spent), slot 0
+        // about to be spent by the redo entry below. Replay must IGNORE
+        // the redo snapshot's `new_spent_count = 99` and instead recompute
+        // the counter from the slots: after applying the spend of slot 0
+        // there are 4 SPENT slots. The metadata counter is deliberately
+        // stamped to a WRONG value (3) to prove the recompute does not
+        // trust the on-device counter either.
+        for i in 1..4u32 {
+            let s = io::read_utxo_slot(&*h.data_dev, ie.record_offset, i).unwrap();
+            let spent = UtxoSlot::new_spent(s.hash, [0x11; 36]);
+            io::write_utxo_slot(&*h.data_dev, ie.record_offset, i, &spent).unwrap();
+        }
         let mut prior_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        prior_meta.spent_utxos = 3;
+        prior_meta.spent_utxos = 99;
         io::write_metadata(&*h.data_dev, ie.record_offset, &prior_meta).unwrap();
 
         let mut redo = h.redo_log();
@@ -2472,7 +2517,7 @@ mod tests {
         assert_eq!(
             { post_meta.spent_utxos },
             4,
-            "replay must re-derive spent_utxos from prior+1, not trust the redo snapshot's 99"
+            "replay must recompute spent_utxos from the SPENT-slot count, not trust the redo snapshot's 99"
         );
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
         assert!(slot.is_spent());
@@ -2480,21 +2525,25 @@ mod tests {
 
     /// Companion to `replay_spend_rederives_counter_ignoring_redo_snapshot`
     /// for the unspend path. The redo entry carries
-    /// `new_spent_count = 99` (wrong); replay must produce
-    /// `prior - 1 = 4`.
+    /// `new_spent_count = 99` (wrong); replay must recompute the counter
+    /// from the SPENT-slot count after unspending slot 0.
     #[test]
     fn replay_unspend_rederives_counter_ignoring_redo_snapshot() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(0xA1, 5);
         let ie = h.index.lookup(&key).unwrap();
 
-        // Pre-state: slot 0 is SPENT (so unspend has work to do) and
-        // metadata.spent_utxos = 5.
-        let slot0 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
-        let spent = UtxoSlot::new_spent(slot0.hash, [0xEE; 36]);
-        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &spent).unwrap();
+        // On-device truth: all 5 slots SPENT. After unspending slot 0 the
+        // recomputed counter must be 4 (the four remaining SPENT slots).
+        // The metadata counter is stamped to a WRONG value (99) to prove
+        // replay does not trust it.
+        for i in 0..5u32 {
+            let s = io::read_utxo_slot(&*h.data_dev, ie.record_offset, i).unwrap();
+            let spent = UtxoSlot::new_spent(s.hash, [0xEE; 36]);
+            io::write_utxo_slot(&*h.data_dev, ie.record_offset, i, &spent).unwrap();
+        }
         let mut prior_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        prior_meta.spent_utxos = 5;
+        prior_meta.spent_utxos = 99;
         io::write_metadata(&*h.data_dev, ie.record_offset, &prior_meta).unwrap();
 
         let mut redo = h.redo_log();
@@ -2513,10 +2562,235 @@ mod tests {
         assert_eq!(
             { post_meta.spent_utxos },
             4,
-            "replay must re-derive spent_utxos from prior-1, not trust the redo snapshot's 99"
+            "replay must recompute spent_utxos from the SPENT-slot count, not trust the redo snapshot's 99"
         );
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
         assert!(slot.is_unspent());
+    }
+
+    /// B-4 (HIGH): a spend→unspend→respend (reorg) history that is ALREADY
+    /// fully applied on-device before the crash must replay idempotently —
+    /// `spent_utxos` must equal the true SPENT-slot count (1), not drift up
+    /// by `+1` per cycle. Before the fix (incremental `±1`), replaying the
+    /// three entries against the already-applied state yields 2 (drift +1).
+    #[test]
+    fn replay_spend_unspend_respend_history_does_not_drift_counter() {
+        let mut h = RecoveryTestHarness::new();
+        // 2-slot record. The reorg history acts on slot 0; slot 1 stays
+        // UNSPENT throughout (the "live UTXO").
+        let key = h.create_record(0xB4, 2);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // On-device truth (all three entries already applied before crash):
+        // slot 0 = SPENT with spending_data B, slot 1 = UNSPENT, counter = 1.
+        let slot0 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let spent_b = UtxoSlot::new_spent(slot0.hash, [0xBB; 36]);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &spent_b).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.spent_utxos = 1;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        // Redo log: Spend(A) -> Unspend(A) -> Spend(B). All three already
+        // reflected on-device, so replaying them must not change the counter.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Spend {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAA; 36],
+            new_spent_count: 1,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::Unspend {
+            tx_key: key,
+            offset: 0,
+            spending_data: Some([0xAA; 36]),
+            new_spent_count: 0,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::Spend {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xBB; 36],
+            new_spent_count: 1,
+        })
+        .unwrap();
+
+        recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+
+        let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!(
+            { post_meta.spent_utxos },
+            1,
+            "spend->unspend->respend replay must recompute the counter to the true SPENT-slot count (1), not drift",
+        );
+        // Slot states converge to the final history state.
+        let s0 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let s1 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 1).unwrap();
+        assert!(s0.is_spent());
+        assert!(s1.is_unspent());
+    }
+
+    /// B-4: replaying the FULL spend/unspend/respend log twice (e.g. a
+    /// crash mid-recovery re-runs the whole log on top of a state that
+    /// already reflects a prefix) must converge to the identical final
+    /// state — counter, slot statuses, and `delete_at_height`.
+    #[test]
+    fn replay_spend_history_double_replay_is_idempotent() {
+        let build = || {
+            let mut h = RecoveryTestHarness::new();
+            let key = h.create_record(0xB5, 2);
+            // Record has blocks + on longest chain so DAH would be set IF
+            // (and only if) all slots were spent.
+            let ie = h.index.lookup(&key).unwrap();
+            let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+            meta.block_entry_count = 1;
+            meta.block_entries_inline[0] = BlockEntry {
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+            io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+            h.index
+                .update_cached_fields(&key, 0, 1, 0, 0, 0, 0)
+                .unwrap();
+            (h, key)
+        };
+
+        let make_log = |h: &RecoveryTestHarness, key: TxKey| {
+            let mut redo = h.redo_log();
+            redo.append_and_flush(RedoOp::SpendV2 {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0xAA; 36],
+                new_spent_count: 1,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                target_generation: 1,
+                updated_at: 10,
+            })
+            .unwrap();
+            redo.append_and_flush(RedoOp::UnspendV2 {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0xAA; 36],
+                new_spent_count: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                target_generation: 2,
+                updated_at: 20,
+            })
+            .unwrap();
+            redo.append_and_flush(RedoOp::SpendV2 {
+                tx_key: key,
+                offset: 0,
+                spending_data: [0xBB; 36],
+                new_spent_count: 1,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                target_generation: 3,
+                updated_at: 30,
+            })
+            .unwrap();
+            redo
+        };
+
+        // Pass 1: replay once.
+        let (mut h, key) = build();
+        let ie = h.index.lookup(&key).unwrap();
+        let offset = ie.record_offset;
+        let redo = make_log(&h, key);
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+        let after_one = io::read_metadata(&*h.data_dev, offset).unwrap();
+
+        // Pass 2: replay the same full log AGAIN on top of the post-pass-1
+        // state (simulating a crash that forces a from-scratch re-replay).
+        let redo2 = make_log(&h, key);
+        let mut dah2 = DahBackend::new_in_memory();
+        let mut unmined2 = UnminedBackend::new_in_memory();
+        recover_all(&*h.data_dev, &redo2, &mut h.index, &mut dah2, &mut unmined2).unwrap();
+        let after_two = io::read_metadata(&*h.data_dev, offset).unwrap();
+
+        assert_eq!(
+            { after_one.spent_utxos },
+            { after_two.spent_utxos },
+            "double replay must not drift spent_utxos",
+        );
+        assert_eq!({ after_one.spent_utxos }, 1);
+        assert_eq!(
+            { after_one.delete_at_height },
+            { after_two.delete_at_height },
+            "double replay must produce the same delete_at_height",
+        );
+        // slot 1 is still live (unspent) → record is NOT all-spent → no DAH.
+        assert_eq!(
+            { after_two.delete_at_height },
+            0,
+            "a record with a live UTXO must never get delete_at_height stamped on replay",
+        );
+        let s1 = io::read_utxo_slot(&*h.data_dev, offset, 1).unwrap();
+        assert!(s1.is_unspent());
+    }
+
+    /// B-4: a record left partially-spent after replay (one live UTXO) must
+    /// not get `delete_at_height` set, even if a stale/over-counted metadata
+    /// counter would have satisfied the all-spent condition pre-fix.
+    #[test]
+    fn replay_partially_spent_record_does_not_get_dah() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xB6, 2);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Record has blocks + on longest chain. Pre-stamp an OVER-COUNTED
+        // counter (2 == utxo_count) that would falsely read "all spent",
+        // while only slot 0 is actually spent and slot 1 is live.
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.block_entry_count = 1;
+        meta.block_entries_inline[0] = BlockEntry {
+            block_id: 1,
+            block_height: 900,
+            subtree_idx: 0,
+        };
+        meta.spent_utxos = 2; // over-counted: pretends all-spent
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+        h.index
+            .update_cached_fields(&key, 0, 1, 0, 0, 0, 0)
+            .unwrap();
+
+        // Spend only slot 0 via replay. Recompute must yield 1 (not 2), so
+        // the all-spent condition is NOT satisfied and no DAH is stamped.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAA; 36],
+            new_spent_count: 2, // wrong snapshot claiming all-spent
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 5,
+            updated_at: 50,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+
+        let post = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ post.spent_utxos }, 1, "recompute must reflect only slot 0 spent");
+        assert_eq!(
+            { post.delete_at_height },
+            0,
+            "partially-spent record must not get delete_at_height",
+        );
+        assert!(
+            !post.flags.contains(TxFlags::LAST_SPENT_ALL),
+            "LAST_SPENT_ALL must not be set while a UTXO is live",
+        );
+        assert!(dah.range_query(u32::MAX).is_empty(), "no DAH index entry");
+        let s1 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 1).unwrap();
+        assert!(s1.is_unspent());
     }
 
     #[test]
