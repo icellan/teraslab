@@ -62,6 +62,7 @@ fn start_test_http_server_with_admin(
         active_connections: Arc::new(AtomicUsize::new(0)),
         http_port: 0,
         replica_lag_warn_threshold_ops: 10_000,
+        replica_lag_cache: std::sync::atomic::AtomicU64::new(0),
     });
 
     let addr = format!("127.0.0.1:{port}");

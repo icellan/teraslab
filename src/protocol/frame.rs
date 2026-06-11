@@ -428,7 +428,12 @@ mod tests {
         };
         let encoded = frame.encode();
         let result = RequestFrame::decode(&encoded[..encoded.len() / 2]);
-        assert!(result.is_err());
+        // The length prefix declares the full frame but the buffer is half
+        // that → FrameError::Truncated (N-LOW: assert the variant).
+        assert!(
+            matches!(result, Err(FrameError::Truncated { .. })),
+            "expected Truncated for half-buffer decode, got {result:?}",
+        );
     }
 
     #[test]
@@ -454,9 +459,34 @@ mod tests {
             &(MAX_FRAME_SIZE + 1).to_le_bytes(),
         ];
 
+        // Each corpus entry trips a different length guard (too-short prefix,
+        // below-minimum body, or too-large declared length); pin that every
+        // one is rejected with a typed FrameError of the malformed family —
+        // not a bare is_err() (N-LOW).
+        fn is_malformed_frame_error(e: &FrameError) -> bool {
+            matches!(
+                e,
+                FrameError::TooShort { .. }
+                    | FrameError::BelowMinimum { .. }
+                    | FrameError::TooLarge { .. }
+                    | FrameError::Truncated { .. }
+            )
+        }
         for data in corpus {
-            assert!(RequestFrame::decode(data).is_err());
-            assert!(ResponseFrame::decode(data).is_err());
+            match RequestFrame::decode(data) {
+                Err(e) => assert!(
+                    is_malformed_frame_error(&e),
+                    "request decode of {data:?} returned unexpected error {e:?}",
+                ),
+                Ok(_) => panic!("malformed request frame {data:?} must be rejected"),
+            }
+            match ResponseFrame::decode(data) {
+                Err(e) => assert!(
+                    is_malformed_frame_error(&e),
+                    "response decode of {data:?} returned unexpected error {e:?}",
+                ),
+                Ok(_) => panic!("malformed response frame {data:?} must be rejected"),
+            }
         }
 
         let mut truncated_request = Vec::new();

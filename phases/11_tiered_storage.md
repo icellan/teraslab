@@ -256,6 +256,22 @@ pub fn read_input_refs(
 
 ### 11.7 Integration with creation path
 
+> **As-implemented (IJ-3):** The shipped creation path does **not** consult
+> `tier_for_size` / `INLINE_THRESHOLD` to choose a tier. Tiering is
+> **client-driven**: the client sets the `FLAG_EXTERNAL_BLOB` request flag to
+> route cold data to the external blob store (the payload having been
+> pre-uploaded via the streaming chunk protocol); without the flag, cold data
+> is written inline in the same NVMe allocation as the hot record. The server
+> does not re-derive placement from size — by the time the frame arrives the
+> client has already committed to inline-vs-streamed. The `SeparateNvme` tier
+> below was never enabled (no durable offset/length metadata fields exist for
+> it), and the `uploader.rs` / storage-manager components described in 11.8
+> were removed. `tier_for_size` / `INLINE_THRESHOLD` / `StorageTier` remain in
+> `src/storage/tiers.rs` as an **advisory client-side size guideline**, not a
+> server-enforced threshold. Only `inline_cold_offset` is on a live path (the
+> read path's inline-region anchor). Steps 2–5 below are the original design,
+> retained for historical context.
+
 Modify `create` (Phase 5) to use the storage manager:
 
 1. Compute total cold data size: `len(inputs) + len(outputs) + len(inpoints)` plus length-prefix overhead

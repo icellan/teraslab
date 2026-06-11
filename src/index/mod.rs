@@ -1065,7 +1065,13 @@ mod tests {
         std::fs::write(&snap_path, &data[..data.len() / 2]).unwrap();
 
         let result = Index::restore(&snap_path);
-        assert!(result.is_err());
+        // A half-truncated snapshot fails the "file too small" body-length
+        // guard before the checksum step → FormatError (N-LOW: assert the
+        // variant, not a bare is_err()).
+        assert!(
+            matches!(result, Err(IndexError::FormatError { .. })),
+            "expected FormatError for truncated snapshot, got {result:?}",
+        );
     }
 
     #[test]
@@ -1143,7 +1149,12 @@ mod tests {
     fn snapshot_nonwritable_path() {
         let idx = Index::new(16).unwrap();
         let result = idx.snapshot(std::path::Path::new("/nonexistent/dir/snap"));
-        assert!(result.is_err());
+        // Writing into a nonexistent directory surfaces the underlying
+        // filesystem error as IndexError::Io (N-LOW: assert the variant).
+        assert!(
+            matches!(result, Err(IndexError::Io(_))),
+            "expected Io error for nonwritable snapshot path, got {result:?}",
+        );
     }
 
     // -- Snapshot all with secondary indexes --

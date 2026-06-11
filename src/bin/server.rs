@@ -1204,6 +1204,7 @@ fn main() {
         active_connections: active_connections.clone(),
         http_port,
         replica_lag_warn_threshold_ops: config.replica_lag_warn_threshold_ops,
+        replica_lag_cache: std::sync::atomic::AtomicU64::new(0),
     });
     // M-02: recovery (step 4) and engine construction completed
     // synchronously above, so this node can serve traffic — mark ready

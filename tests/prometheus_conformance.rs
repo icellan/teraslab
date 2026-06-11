@@ -155,6 +155,7 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
         active_connections: Arc::new(AtomicUsize::new(0)),
         http_port: port,
         replica_lag_warn_threshold_ops: 10_000,
+        replica_lag_cache: std::sync::atomic::AtomicU64::new(0),
     });
 
     let state_clone = state.clone();

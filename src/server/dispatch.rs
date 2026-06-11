@@ -719,9 +719,15 @@ pub(crate) fn handle_request(
                 let entry_count = match le_u32_at(&request.payload, 56) {
                     Some(n) => n as usize,
                     None => {
+                        // H-LOW: a wire-decode failure is a hard "your bytes
+                        // are wrong" error, not a transient/retryable one.
+                        // Match the batched sibling (OP_MIGRATION_BATCH_COMPLETE),
+                        // which uses ERR_PAYLOAD_MALFORMED for the identical
+                        // decode failures, so a peer doesn't retry malformed
+                        // bytes forever.
                         return error_response(
                             request.request_id,
-                            ERR_MIGRATION_IN_PROGRESS,
+                            ERR_PAYLOAD_MALFORMED,
                             "malformed exact-manifest entry count",
                         );
                     }
@@ -739,9 +745,12 @@ pub(crate) fn handle_request(
                 {
                     Some(n) => n,
                     None => {
+                        // H-LOW: overflowing entry_count is malformed bytes,
+                        // not transient — ERR_PAYLOAD_MALFORMED for parity
+                        // with the batched sibling.
                         return error_response(
                             request.request_id,
-                            ERR_MIGRATION_IN_PROGRESS,
+                            ERR_PAYLOAD_MALFORMED,
                             &format!(
                                 "shard {shard} entry_count overflow ({entry_count}); rejecting frame",
                             ),
@@ -749,9 +758,12 @@ pub(crate) fn handle_request(
                     }
                 };
                 if request.payload.len() < needed {
+                    // H-LOW: a declared entry_count that doesn't match the
+                    // frame length is malformed bytes — ERR_PAYLOAD_MALFORMED
+                    // for parity with the batched sibling.
                     return error_response(
                         request.request_id,
-                        ERR_MIGRATION_IN_PROGRESS,
+                        ERR_PAYLOAD_MALFORMED,
                         &format!(
                             "shard {shard} malformed exact-manifest payload: need {needed} bytes, got {}",
                             request.payload.len(),
@@ -765,9 +777,11 @@ pub(crate) fn handle_request(
                     txid.copy_from_slice(&request.payload[pos..pos + 32]);
                     pos += 32;
                     let Some(generation) = le_u32_at(&request.payload, pos) else {
+                        // H-LOW: ERR_PAYLOAD_MALFORMED for parity with the
+                        // batched sibling — malformed bytes, not transient.
                         return error_response(
                             request.request_id,
-                            ERR_MIGRATION_IN_PROGRESS,
+                            ERR_PAYLOAD_MALFORMED,
                             "malformed exact-manifest generation",
                         );
                     };
@@ -778,9 +792,11 @@ pub(crate) fn handle_request(
                     match le_u64_at(&request.payload, needed) {
                         Some(node) => Some(NodeId(node)),
                         None => {
+                            // H-LOW: ERR_PAYLOAD_MALFORMED for parity with the
+                            // batched sibling — malformed bytes, not transient.
                             return error_response(
                                 request.request_id,
-                                ERR_MIGRATION_IN_PROGRESS,
+                                ERR_PAYLOAD_MALFORMED,
                                 "malformed migration completion source node",
                             );
                         }

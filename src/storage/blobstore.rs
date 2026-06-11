@@ -1487,7 +1487,12 @@ mod tests {
     fn file_put_non_writable_dir() {
         let store = FileBlobStore::new(Path::new("/nonexistent/path/blobs"), 2);
         let result = store.put(&test_key(1), b"data");
-        assert!(result.is_err());
+        // Writing into a non-writable directory surfaces the filesystem
+        // failure as BlobError::Io (N-LOW: assert the variant).
+        assert!(
+            matches!(result, Err(BlobError::Io(_))),
+            "expected Io error for non-writable blob dir, got {result:?}",
+        );
     }
 
     // -- Integrity tests --

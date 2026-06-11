@@ -1043,7 +1043,8 @@ mod tests {
             ..IndexConfig::default()
         };
         let result = PrimaryBackend::restore_redb(&config);
-        assert!(result.is_err());
+        // N-LOW: the following match is the real variant check; the bare
+        // assert!(result.is_err()) it replaced was redundant.
         match result.unwrap_err() {
             IndexError::FormatError { detail } => {
                 assert!(detail.contains("not found"), "error was: {detail}");
@@ -1323,7 +1324,12 @@ mod tests {
         let snap_path = dir.path().join("does_not_exist.snap");
 
         let result = PrimaryBackend::restore(&snap_path);
-        assert!(result.is_err());
+        // Restore reads the file; a missing file surfaces as IndexError::Io
+        // (the #[from] std::io::Error) (N-LOW: assert the variant).
+        assert!(
+            matches!(result, Err(IndexError::Io(_))),
+            "expected Io error for missing snapshot, got {result:?}",
+        );
     }
 
     #[test]
@@ -1332,7 +1338,14 @@ mod tests {
         let snap_path = dir.path().join("does_not_exist.snap");
 
         let result = PrimaryBackend::restore_all(&snap_path);
-        assert!(result.is_err());
+        // Same as restore(): a missing file is an IndexError::Io. (The Ok
+        // tuple is not Debug, so match on the error variant directly rather
+        // than formatting the whole Result.)
+        match result {
+            Err(IndexError::Io(_)) => {}
+            Err(other) => panic!("expected Io error for missing snapshot, got {other:?}"),
+            Ok(_) => panic!("restore_all of a missing snapshot must fail"),
+        }
     }
 
     #[test]
@@ -1491,7 +1504,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.idx");
         let result = PrimaryBackend::restore_file_backed(&path, 1000);
-        assert!(result.is_err());
+        // N-LOW: the following match is the real variant check; the bare
+        // assert!(result.is_err()) it replaced was redundant.
         match result.unwrap_err() {
             IndexError::FormatError { detail } => {
                 assert!(detail.contains("not found"), "error was: {detail}");

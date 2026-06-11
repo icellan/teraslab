@@ -189,7 +189,7 @@ block_height_retention = 288          # Blocks to retain fully-spent mined recor
                                       # client-supplied OP_QUERY_OLD_UNMINED cutoff, not by this knob.
 
 # --- Cold data ---
-blobstore_path = "./teraslab-blobstore" # Directory for large transaction blobs (cold data >8 KiB serialized)
+blobstore_path = "./teraslab-blobstore" # Directory for large transaction blobs (cold data the client routes external via FLAG_EXTERNAL_BLOB)
 
 # --- Cluster (set node_id > 0 to enable) ---
 node_id = 0                           # 0 = single-node mode
@@ -653,7 +653,7 @@ Each transaction occupies a contiguous region on the block device:
 ### Tiered storage
 
 - **Hot path** (NVMe): Metadata + UTXO slots. All spend/setMined/freeze operations touch only this tier.
-- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Stored inline if the serialized cold data is ≤ 8 KiB (8192 bytes, inclusive), otherwise in the external blob store. The earlier separate-device middle tier is not enabled because current metadata has no durable offset/length fields for it.
+- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Placement is **client-driven**: the client sets the `FLAG_EXTERNAL_BLOB` request flag to route cold data to the external blob store (pre-uploaded via the streaming chunk protocol); without the flag, cold data is written inline in the same NVMe allocation as the hot record. The server does not second-guess this choice — by the time it receives the frame, the client has already decided whether to stream the payload externally or inline it on the wire (inline payloads are bounded by `MAX_COLD_DATA_PER_ITEM` at the wire decoder). The `tier_for_size` / `INLINE_THRESHOLD` (8 KiB) helpers in `src/storage/tiers.rs` are an **advisory size guideline** for clients, not a server-enforced threshold. The earlier separate-device middle tier is not enabled because current metadata has no durable offset/length fields for it.
 
 ### Crash recovery
 

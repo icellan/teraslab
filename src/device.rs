@@ -963,8 +963,16 @@ impl DirectDevice {
         {
             use std::os::unix::io::AsRawFd;
             // F_NOCACHE = 48 on macOS
-            unsafe {
-                libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+            let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+            if rc == -1 {
+                // Best-effort: failing to disable the page cache degrades the
+                // O_DIRECT approximation (extra buffering) but is not fatal —
+                // macOS is the development target, not production. Surface the
+                // errno so a silently-cached dev run is at least observable.
+                tracing::warn!(
+                    errno = %std::io::Error::last_os_error(),
+                    "fcntl(F_NOCACHE) failed; device I/O will use the page cache",
+                );
             }
         }
 
