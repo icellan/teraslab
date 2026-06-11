@@ -490,28 +490,26 @@ Operations return signals that drive follow-up actions:
 - `txid: [u8; 32]`
 - `vout: u32` (offset into UTXO slots)
 - `utxo_hash: [u8; 32]`
+- `spending_data: [u8; 36]` (`expectedSpendingData` — the spend the caller claims to own)
 - `current_block_height: u32`
 - `block_height_retention: u32`
 
-**Validation rules (from `teranode.lua` lines 478-540):**
+**Validation rules (from `teranode.lua` lines 484-555):**
 1. Record must exist → `TX_NOT_FOUND`
 2. Hash must match → `UTXO_HASH_MISMATCH`
-3. If status == `0x00` (unspent) → no-op (already unspent)
-4. If status == `0x02` (pruned) → `INVALID_SPEND` (terminal state, cannot unspend)
-5. If status == `0xFF` (frozen) → `FROZEN`
-6. Must be spent (status == `0x01`) to proceed
+3. If status == `0x02` (pruned) → `INVALID_SPEND` (terminal state, cannot unspend; postdates the Lua, which had no pruned state)
+4. Ownership check (mirrors the Lua `callerOwnsSpend`): the caller owns the spend iff the slot is spent (status == `0x01`) AND the stored `spending_data` byte-equals the request `spending_data`. The frozen marker (all-`0xFF`) never equals a real caller's expected data, so a frozen slot is never owned.
 
 **Behavior:**
 1. Acquire per-txid lock
-2. Read slot at offset
-3. Validate
-4. `pwrite` 69 bytes: hash unchanged, status=`0x00`, spending_data zeroed
-5. Atomic decrement `spent_utxos`
-6. Evaluate `setDeleteAtHeight`
-7. Release lock
+2. Read slot at offset; validate (rules 1-3 above)
+3. If the caller owns the spend: `pwrite` 69 bytes (hash unchanged, status=`0x00`, spending_data zeroed) and atomically decrement `spent_utxos`. If that owned slot were frozen → `FROZEN` (structurally unreachable, since the frozen marker excludes ownership; preserved to mirror the Lua).
+4. If the caller does NOT own the spend (slot already unspent, stored spend belongs to a different tx, or slot frozen): **silent no-op returning `STATUS_OK`** — no slot or counter mutation, generation not bumped.
+5. On both paths, evaluate `setDeleteAtHeight` housekeeping (Lua runs it before every OK return)
+6. Release lock
 
 **Atomicity**: Per-record.
-**Idempotency**: Unspending an already-unspent UTXO is a no-op.
+**Idempotency**: This is an *ownership check with idempotent semantics* — "never wipe a spend we don't own", not "error on every no-op". Unspending an already-unspent UTXO, a UTXO spent by a different transaction, or a frozen UTXO is a no-op success, not an error. This is load-bearing: `ProcessConflicting` builds its unspend set from every input of every losing tx — including parents whose stored spend is nil or belongs to the conflict winner — and the Go caller aborts the whole loop on any non-OK status other than `TX_NOT_FOUND`.
 
 **Disk regions written**: UTXO slot (UTXO slots region), spent_utxos (metadata).
 
