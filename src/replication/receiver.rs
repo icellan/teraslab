@@ -435,11 +435,15 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
                 0
             };
             let head_slice = &head_buf[..head_to_read];
-            // E-1: the chunked verify reads also run through the deadline
+            // `verify_signed_body_streaming` synthesises its OWN 4-byte
+            // length prefix from `frame_len` (auth.rs), so the reader we
+            // hand it must yield the BODY ONLY — the peeked head followed
+            // by the remaining body bytes. Chaining `len_buf` here would
+            // double-prefix the HMAC input and reject every honest signed
+            // frame. E-1: the chunked verify reads run through the deadline
             // reader so a drip-fed signed body cannot outlive the deadline.
-            let mut chained = std::io::Cursor::new(&len_buf)
-                .chain(std::io::Cursor::new(head_slice))
-                .chain(&mut deadline_stream);
+            let mut chained =
+                std::io::Cursor::new(head_slice).chain(&mut deadline_stream);
             // Pre-seed a 4-byte length-prefix slot so the resulting
             // buffer matches the `[payload_len:4][payload]` shape
             // `RequestFrame::decode` expects.
@@ -2291,6 +2295,91 @@ mod tests {
         full.extend_from_slice(&body);
         let (frame, _) = ResponseFrame::decode(&full).unwrap();
         frame
+    }
+
+    /// Spawn a receiver whose connection requires HMAC-signed inter-node
+    /// frames (`auth_secret` set), driving the streaming-verify path.
+    fn spawn_receiver_with_secret(
+        frame_deadline: Duration,
+        secret: Vec<u8>,
+    ) -> (TcpStream, Arc<Engine>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = make_engine();
+
+        let server_engine = engine.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, peer_addr) = listener.accept().unwrap();
+            let running = AtomicBool::new(true);
+            let last_applied = AtomicU64::new(0);
+            let applied = Arc::new(ReplicaAppliedTracker::in_memory());
+            let local_cluster_key = Arc::new(AtomicU64::new(0));
+            let ctx = ConnectionContext {
+                engine: &server_engine,
+                running: &running,
+                last_applied: &last_applied,
+                applied,
+                local_cluster_key,
+                auth_secret: Some(Arc::new(secret)),
+                frame_deadline,
+            };
+            handle_connection(stream, peer_addr, ctx);
+        });
+
+        let client = TcpStream::connect(addr).unwrap();
+        (client, engine, handle)
+    }
+
+    /// Read one length-prefixed frame off `stream`, returning the raw
+    /// `[len][body]` bytes (caller verifies/decodes them).
+    fn read_framed_raw(stream: &mut TcpStream) -> Vec<u8> {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).unwrap();
+        let mut full = Vec::with_capacity(4 + len);
+        full.extend_from_slice(&len_buf);
+        full.extend_from_slice(&body);
+        full
+    }
+
+    /// An HMAC-signed `OP_REPLICA_BATCH` must pass the receiver's
+    /// streaming verify, apply, and produce a signed ACK. Pins the fix
+    /// for the double-length-prefix bug in the streaming-verify reader
+    /// (`verify_signed_body_streaming` synthesises its own prefix). Before
+    /// the fix the receiver chained `len_buf` ahead of the body, so every
+    /// honest signed frame failed HMAC with `ERR_CLUSTER_AUTH_FAILED`.
+    #[test]
+    fn signed_replica_batch_verified_and_applied() {
+        let secret = b"receiver-secret".to_vec();
+        let (mut client, engine, handle) =
+            spawn_receiver_with_secret(Duration::from_secs(5), secret.clone());
+        create_record(&engine, key(223), 2);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let batch = make_spend_batch(1, key(223), 0..2, 1);
+        let request = batch_request(&batch, 41);
+        let signed = crate::cluster::auth::sign_frame(&secret, &request.encode()).unwrap();
+        client.write_all(&signed).unwrap();
+
+        // The ACK is itself signed; verify then decode it.
+        let raw = read_framed_raw(&mut client);
+        let verified = crate::cluster::auth::verify_frame(&secret, &raw).unwrap();
+        let (response, consumed) = ResponseFrame::decode(&verified).unwrap();
+        assert_eq!(consumed, verified.len());
+        assert_eq!(response.request_id, 41);
+        assert_eq!(response.status, STATUS_OK);
+        let ack = ReplicaAck::deserialize(&response.payload).unwrap();
+        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 2 });
+
+        let slot = engine.read_slot(&key(223), 0).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT);
+
+        drop(client);
+        assert!(wait_for_join(&handle, Duration::from_secs(2)));
     }
 
     /// Poll a join handle until it finishes or `timeout` elapses.
