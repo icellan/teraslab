@@ -2207,6 +2207,7 @@ mod tests {
         RunningCluster,
     };
     use teraslab::cluster::shards::{NodeId, ShardTable};
+    use teraslab::cluster::topology::ClusterId;
     use teraslab::config::ServerConfig;
     use teraslab::device::{BlockDevice, MemoryDevice};
     use teraslab::index::{DahIndex, Index, UnminedIndex};
@@ -2218,6 +2219,13 @@ mod tests {
         server: Arc<Server>,
         cluster: Arc<RunningCluster>,
     }
+
+    /// All in-process test nodes share this cluster_id so the P1.1
+    /// `membership_change_is_safe` check takes the matching-cluster_id fast
+    /// path (skips the slower F-G8-001 ever-seen fallback), keeping the
+    /// 3-node clusters in these tests converging within their sleep windows.
+    /// Mirrors `tests/cluster_tcp.rs::TEST_CLUSTER_ID`.
+    const TEST_CLUSTER_ID: ClusterId = ClusterId([0xA5; 16]);
 
     fn reserve_tcp_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2281,6 +2289,7 @@ mod tests {
             self_id: NodeId(node_id),
             self_addr: format!("127.0.0.1:{tcp_port}").parse().unwrap(),
             swim_bind: format!("127.0.0.1:{swim_port}").parse().unwrap(),
+            swim_advertise_addr: None,
             seed_nodes: seeds,
             replication_factor,
             probe_interval: Duration::from_millis(100),
@@ -2291,6 +2300,7 @@ mod tests {
             migration_pool_size: 4,
             migration_batch_size: 100,
             persisted_incarnation: 0,
+            cluster_id: TEST_CLUSTER_ID,
         };
 
         let coordinator = ClusterCoordinator::new(cluster_config, 1);
@@ -2311,6 +2321,13 @@ mod tests {
             max_connections: 64,
             max_batch_size: 4096,
             node_id,
+            // F-X-002 flipped the production default to `strict_auth = true`,
+            // and `OP_GET_PARTITION_MAP` (the client's bootstrap op) is an
+            // inter-node auth opcode. These nodes use `cluster_secret: None`
+            // in their ClusterConfig, so strict_auth would reject the
+            // client's partition-map fetch with ERR_CLUSTER_AUTH_FAILED.
+            // Stay on the trusted-overlay opt-out — mirrors tests/cluster_tcp.rs.
+            strict_auth: false,
             ..Default::default()
         };
 
@@ -2354,8 +2371,15 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let current_table = node2.cluster.shard_table().read().clone();
-        let stale_table =
-            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(2)], 2, 999);
+        // Build a *divergent* stale table for node1 to hold. `compute_with_epoch`
+        // sorts its member list (F-01), so reordering the same 3 members yields an
+        // identical table — the old `[1,3,2]` trick no longer diverges. Instead
+        // compute over a 2-node membership `[2,3]`: masters then alternate 2,3,2,3…
+        // while the real 3-node table cycles 1,2,3,1,2,3…, so many shards whose
+        // real master is 2 or 3 get the *other* (still real, still reachable)
+        // remote node as their stale master. That is exactly the misroute this
+        // test needs: node1's map points the shard at the wrong remote peer.
+        let stale_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 999);
         let (shard, actual_master, stale_master) = (0..teraslab::cluster::shards::NUM_SHARDS
             as u16)
             .find_map(|shard| {
