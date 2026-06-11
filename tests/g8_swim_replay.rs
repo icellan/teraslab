@@ -22,6 +22,19 @@ fn bind_localhost() -> (SocketAddr, UdpSocket) {
 }
 
 fn config(self_id: NodeId, self_addr: SocketAddr, secret: Option<Vec<u8>>) -> SwimConfig {
+    config_with_incarnation(self_id, self_addr, secret, 0)
+}
+
+/// Like [`config`] but lets a test simulate a reboot by pinning the
+/// persisted incarnation. The runner starts at `persisted_incarnation + 1`,
+/// so a fresh runner with a higher `persisted_incarnation` models the same
+/// NodeId coming back at a higher incarnation with its seq counter reset.
+fn config_with_incarnation(
+    self_id: NodeId,
+    self_addr: SocketAddr,
+    secret: Option<Vec<u8>>,
+    persisted_incarnation: u64,
+) -> SwimConfig {
     SwimConfig {
         self_id,
         self_addr,
@@ -31,7 +44,7 @@ fn config(self_id: NodeId, self_addr: SocketAddr, secret: Option<Vec<u8>>) -> Sw
         probe_interval: Duration::from_millis(100),
         suspicion_timeout: Duration::from_secs(5),
         cluster_secret: secret,
-        persisted_incarnation: 0,
+        persisted_incarnation,
         committed_term: Arc::new(AtomicU64::new(0)),
     }
 }
@@ -137,4 +150,83 @@ fn out_of_order_within_window_accepted_once_each() {
     // Replay of seq 2 — must be rejected.
     let events = peer_b.handle_message_for_test(&msg2, addr_a, &sock_b);
     assert!(events.is_empty(), "replay of late-but-accepted seq must fail");
+}
+
+/// E-1 regression: a rebooted node must rejoin.
+///
+/// Node A runs for a while (incarnation 1) and B advances its replay
+/// window's `highest` for A into the thousands. A then reboots: the same
+/// NodeId comes back at incarnation 2 with its outbound seq counter reset
+/// to 1. Under the old NodeId-only keying those low seqs were measured
+/// against the stale `highest` and silently dropped, so B never re-learned
+/// A. Keyed by `(NodeId, incarnation)`, the higher incarnation resets the
+/// seq space and the reboot message is accepted.
+#[test]
+fn rebooted_node_rejoins_after_high_seq_run() {
+    let secret = b"shared-cluster-secret-for-test".to_vec();
+
+    let (addr_a, _sock_a) = bind_localhost();
+    let (addr_b, sock_b) = bind_localhost();
+
+    // First run of A at incarnation 1.
+    let mut peer_a = SwimRunner::new(config(NodeId(1), addr_a, Some(secret.clone())));
+    let mut peer_b = SwimRunner::new(config(NodeId(2), addr_b, Some(secret.clone())));
+
+    // Drive B's replay window for A far forward (highest ≈ 2000), the
+    // exact long-lived-node condition that breaks the old keying.
+    let mut last = None;
+    for _ in 0..2000 {
+        let msg = peer_a.encode_message_for_test(1, &[]);
+        last = Some(msg.clone());
+        let _ = peer_b.handle_message_for_test(&msg, addr_a, &sock_b);
+    }
+    assert!(
+        peer_b.alive_members().contains(&NodeId(1)),
+        "A must be alive in B after its first run",
+    );
+
+    // Sanity / anti-replay: re-feeding the LAST run-1 message (same
+    // incarnation, already-seen seq) is still dropped — the window has
+    // not been widened so far that real replays pass.
+    let replay = last.expect("captured a run-1 message");
+    let replay_events = peer_b.handle_message_for_test(&replay, addr_a, &sock_b);
+    assert!(
+        replay_events.is_empty(),
+        "same-incarnation replay of an already-seen seq must still be rejected",
+    );
+
+    // Reboot A: same NodeId, incarnation 2 (persisted_incarnation=1 ⇒
+    // runner starts at 2), outbound seq restarts at 1.
+    let mut peer_a2 = SwimRunner::new(config_with_incarnation(
+        NodeId(1),
+        addr_a,
+        Some(secret),
+        1,
+    ));
+    // seq=1 from the fresh run. Under the old keying this is <= highest
+    // (2000) and would be dropped; under (NodeId, incarnation) keying the
+    // higher incarnation resets the window and it is accepted.
+    let join = peer_a2.encode_message_for_test(1, &[]);
+    let events = peer_b.handle_message_for_test(&join, addr_a, &sock_b);
+
+    // The reboot message must be PROCESSED, not seq-dropped: B re-learns
+    // A's address and A stays alive. (Empty events would prove the drop.)
+    assert!(
+        peer_b.peer_addrs_snapshot().contains_key(&NodeId(1)),
+        "B must process the rebooted node's message (address re-registered)",
+    );
+    assert!(
+        peer_b.alive_members().contains(&NodeId(1)),
+        "rebooted node (higher incarnation, seq reset to 1) must remain known/alive, \
+         not be silently seq-dropped: events={events:?}",
+    );
+
+    // And the fresh run's own seq space now enforces replay protection:
+    // re-feeding the reboot message (incarnation 2, seq 1, already seen)
+    // is rejected.
+    let events2 = peer_b.handle_message_for_test(&join, addr_a, &sock_b);
+    assert!(
+        events2.is_empty(),
+        "replay within the rebooted run's seq space must be rejected",
+    );
 }
