@@ -5,5 +5,6 @@
 //! per-item errors in sparse format.
 
 pub mod codec;
+pub(crate) mod deadline;
 pub mod frame;
 pub mod opcodes;
