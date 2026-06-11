@@ -176,28 +176,29 @@ fn memory_device_pwrite_rejects_offset_buf_overflow() {
     }
 }
 
-/// F-G1-018 regression: `StripedLocks::stripe_index` must hash off
-/// bytes 16..24 of the txid; replacing the `[0u8; 8] +
-/// copy_from_slice` shape with `try_into().expect(...)` is a pure
-/// codegen change and must not alter the computed stripe for any
-/// txid. Pin a few known inputs against the documented derivation.
+/// F-G1-018 / C-7 regression: `StripedLocks::stripe_index` derives the
+/// stripe from bytes 16..24 of the txid mixed with a per-process seed
+/// (the C-7 hardening that breaks txid-grinding stripe collisions —
+/// see the seeded-selection tests in `src/locks.rs`). The exact stripe
+/// value is therefore process-dependent and intentionally NOT pinned
+/// here; the surviving invariants are: only bytes 16..24 feed the
+/// selection (bytes 0..15 are ignored), the result is in range, and it
+/// is deterministic within a process.
 #[test]
 fn stripe_index_matches_documented_byte_range_post_refactor() {
     let locks = StripedLocks::new(65536);
 
-    // txid with a known little-endian u64 at bytes 16..24.
     let mut txid = [0u8; 32];
     txid[16..24].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
     let key = TxKey { txid };
     let idx = locks.stripe_index(&key);
-    let expected = (0x0123_4567_89AB_CDEFu64 as usize) & (locks.stripe_count() - 1);
-    assert_eq!(
-        idx, expected,
-        "stripe_index must hash bytes 16..24 as u64-LE & mask"
-    );
 
-    // Distinct bytes 0..15 must not affect the stripe (bytes 16..24 are
-    // the only input).
+    // In range, and deterministic within the process.
+    assert!(idx < locks.stripe_count(), "stripe must be in range");
+    assert_eq!(locks.stripe_index(&key), idx, "stripe must be deterministic");
+
+    // Distinct bytes 0..15 must not affect the stripe (only bytes 16..24
+    // plus the fixed per-process seed are inputs).
     let mut txid2 = [0xFFu8; 32];
     txid2[16..24].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
     let key2 = TxKey { txid: txid2 };
