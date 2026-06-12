@@ -2934,7 +2934,7 @@ impl ManifestHasher {
     /// then SHA-256 hash the concatenated `(txid ++ generation_le)` pairs.
     pub fn finalize(&self) -> [u8; 32] {
         let mut sorted = self.entries.clone();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted.sort_by_key(|e| e.0);
 
         let mut buf = Vec::with_capacity(sorted.len() * 36);
         for (txid, generation) in &sorted {
@@ -3787,7 +3787,7 @@ fn run_migration_batch(
                                 self_id,
                                 auth_secret,
                             );
-                        for (task, delivered) in verified_tasks.iter().zip(delivered.into_iter()) {
+                        for (task, delivered) in verified_tasks.iter().zip(delivered) {
                             if !delivered {
                                 tracing::warn!(
                                     shard = task.shard,

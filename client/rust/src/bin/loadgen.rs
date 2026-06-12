@@ -110,11 +110,9 @@ async fn main() {
         std::collections::VecDeque::with_capacity(100_000),
     ));
 
-    let interval_us = if args.rate > 0 {
-        (1_000_000u64 * args.workers as u64) / args.rate
-    } else {
-        0
-    };
+    let interval_us = (1_000_000u64 * args.workers as u64)
+        .checked_div(args.rate)
+        .unwrap_or(0);
 
     eprintln!(
         "Running: {} ops/s target, {} workers, {}s duration\n",

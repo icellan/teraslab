@@ -2187,11 +2187,10 @@ fn aggregate_snapshots(nodes: &[serde_json::Value]) -> serde_json::Value {
             weighted_sum += (c as u128) * (m as u128);
         }
         let total_count_u64: u64 = total_count.min(u128::from(u64::MAX)) as u64;
-        let weighted_mean: u64 = if total_count > 0 {
-            (weighted_sum / total_count).min(u128::from(u64::MAX)) as u64
-        } else {
-            0
-        };
+        let weighted_mean: u64 = weighted_sum
+            .checked_div(total_count)
+            .map(|v| v.min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
         let max_p50: u64 = nodes
             .iter()
             .filter_map(|n| n["latency"][*lk]["p50_ns"].as_u64())

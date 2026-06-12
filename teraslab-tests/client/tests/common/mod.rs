@@ -1070,7 +1070,7 @@ async fn reconcile_existing_seed_records(
     let old_meta = std::mem::take(remaining_meta);
     let mut reconciled = 0usize;
 
-    for (idx, (item, meta)) in old_items.into_iter().zip(old_meta.into_iter()).enumerate() {
+    for (idx, (item, meta)) in old_items.into_iter().zip(old_meta).enumerate() {
         if idx < results.len() && results.found(idx) {
             succeeded_meta.push(meta);
             reconciled += 1;

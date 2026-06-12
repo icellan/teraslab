@@ -934,8 +934,8 @@ pub fn handle_replica_batch_with_tracker(
         0
     };
 
-    let mut seq = batch.first_sequence + skip_count as u64;
-    for op in batch.ops.iter().skip(skip_count) {
+    let start_seq = batch.first_sequence + skip_count as u64;
+    for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
         if let Err(msg) = apply_op(engine, op) {
             let ack = ReplicaAck::Error {
                 failed_sequence: seq,
@@ -947,7 +947,6 @@ pub fn handle_replica_batch_with_tracker(
                 payload: ack.serialize(),
             };
         }
-        seq += 1;
     }
 
     // F-G7-016 (batched): sync the engine's block device + flush the

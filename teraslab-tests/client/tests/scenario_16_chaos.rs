@@ -737,12 +737,9 @@ async fn verify_replication_sample(
                     if status == STATUS_OK && resp_payload.len() >= 5 =>
                 {
                     // Parse per-item result: [count:4][status:1][...]
-                    if resp_payload.len() >= 5 {
-                        let count =
-                            u32::from_le_bytes(resp_payload[0..4].try_into().unwrap_or([0; 4]));
-                        if count >= 1 && resp_payload[4] == 0 {
-                            holders += 1;
-                        }
+                    let count = u32::from_le_bytes(resp_payload[0..4].try_into().unwrap_or([0; 4]));
+                    if count >= 1 && resp_payload[4] == 0 {
+                        holders += 1;
                     }
                 }
                 _ => {

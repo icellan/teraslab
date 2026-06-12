@@ -690,8 +690,7 @@ impl LatencyHistogram {
 
     /// Mean latency in nanoseconds, or 0 if no values recorded.
     pub fn mean_ns(&self) -> u64 {
-        let c = self.count();
-        if c == 0 { 0 } else { self.sum_ns() / c }
+        self.sum_ns().checked_div(self.count()).unwrap_or(0)
     }
 
     /// Approximate percentile (0.0–1.0). Returns the upper bound of the
