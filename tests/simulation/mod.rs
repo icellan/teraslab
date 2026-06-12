@@ -171,8 +171,7 @@ impl FlakyDevice {
         self.probability_bits
             .store(probability.to_bits(), Ordering::Relaxed);
         *self.rng.lock() = SimRng::new(seed);
-        self.enabled
-            .store(probability > 0.0, Ordering::Relaxed);
+        self.enabled.store(probability > 0.0, Ordering::Relaxed);
     }
 
     /// Enable/disable injection; returns the previous state.
@@ -493,8 +492,7 @@ impl Simulation {
                     parent_txids: &[],
                 };
 
-                let Ok((record_bytes, built_count)) = engine.build_create_record_bytes(&req)
-                else {
+                let Ok((record_bytes, built_count)) = engine.build_create_record_bytes(&req) else {
                     continue;
                 };
                 debug_assert_eq!(built_count, utxo_count);
@@ -545,8 +543,7 @@ impl Simulation {
                     .filter(|(_, (count, spent, _))| *spent < *count)
                     .map(|(id, _)| *id)
                     .collect();
-                let Some(&txid) =
-                    txids.get(self.rng.next_u32() as usize % txids.len().max(1))
+                let Some(&txid) = txids.get(self.rng.next_u32() as usize % txids.len().max(1))
                 else {
                     continue;
                 };
@@ -626,8 +623,7 @@ impl Simulation {
             } else if roll < 0.8 {
                 // SetMined (WAL-first, mirrors dispatch handle_set_mined_batch)
                 let txids: Vec<[u8; 32]> = reference.keys().copied().collect();
-                let Some(&txid) =
-                    txids.get(self.rng.next_u32() as usize % txids.len().max(1))
+                let Some(&txid) = txids.get(self.rng.next_u32() as usize % txids.len().max(1))
                 else {
                     continue;
                 };

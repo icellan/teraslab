@@ -46,9 +46,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use teraslab::allocator::SlotAllocator;
-use teraslab::cluster::migration::{
-    MigrationManager, load_inbound_state, persist_inbound_state,
-};
+use teraslab::cluster::migration::{MigrationManager, load_inbound_state, persist_inbound_state};
 use teraslab::cluster::shards::ShardTable;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahBackend, PrimaryBackend, TxKey, UnminedBackend};
@@ -56,9 +54,9 @@ use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
 use teraslab::recovery::recover_all_with_allocator;
+use teraslab::redo::RedoLog;
 use teraslab::replication::protocol::ReplicaOp;
 use teraslab::replication::receiver::apply_op;
-use teraslab::redo::RedoLog;
 
 const DATA_SIZE: u64 = 32 * 1024 * 1024;
 const REDO_SIZE: u64 = 1024 * 1024;
@@ -123,11 +121,10 @@ impl Node {
         // or falls back to a fresh allocator when the header region is all
         // zeros (a node that crashed before its first checkpoint — exactly the
         // crash-mid-migration case, where no checkpoint had run yet).
-        let (mut alloc, _origin) =
-            teraslab::server::startup::recover_or_create_allocator(
-                self.data_dev.clone() as Arc<dyn BlockDevice>,
-            )
-            .expect("allocator recover/create");
+        let (mut alloc, _origin) = teraslab::server::startup::recover_or_create_allocator(
+            self.data_dev.clone() as Arc<dyn BlockDevice>,
+        )
+        .expect("allocator recover/create");
         let mut index =
             PrimaryBackend::rebuild(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         let (dah_idx, unmined_idx) =
@@ -279,7 +276,11 @@ fn crash_mid_migration_no_loss_no_dup_no_dual_master() {
     let shard = ShardTable::shard_for_key(&keys[0]);
     // Sanity: every record landed in the same shard.
     for k in &keys {
-        assert_eq!(ShardTable::shard_for_key(k), shard, "all records share a shard");
+        assert_eq!(
+            ShardTable::shard_for_key(k),
+            shard,
+            "all records share a shard"
+        );
     }
     let original: BTreeSet<[u8; 32]> = keys.iter().map(|k| k.txid).collect();
 
@@ -332,7 +333,13 @@ fn crash_mid_migration_no_loss_no_dup_no_dual_master() {
     );
 
     // Compute each node's master-visible record set.
-    let old_set = master_record_set(&old.engine, &keys, &new_mgr_source(), shard, old_committed_master);
+    let old_set = master_record_set(
+        &old.engine,
+        &keys,
+        &new_mgr_source(),
+        shard,
+        old_committed_master,
+    );
     let new_set = master_record_set(
         &new_recovered,
         &keys,
@@ -431,5 +438,8 @@ fn clean_migration_completes_with_single_master() {
     let new_set = master_record_set(&new.engine, &keys, &new_mgr, shard, true);
     let old_set = master_record_set(&old.engine, &keys, &new_mgr_source(), shard, false);
     assert!(old_set.is_empty(), "old master committed the handoff away");
-    assert_eq!(new_set, original, "new master serves every record, none lost");
+    assert_eq!(
+        new_set, original,
+        "new master serves every record, none lost"
+    );
 }

@@ -581,10 +581,7 @@ fn hmac_rejection() -> io::Error {
     if let Some(m) = crate::metrics::cluster_auth_metrics() {
         m.auth_hmac_rejections_total.inc();
     }
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "HMAC verification failed",
-    )
+    io::Error::new(io::ErrorKind::PermissionDenied, "HMAC verification failed")
 }
 
 /// Build the `InvalidData` "stale timestamp" error, bump the distinct

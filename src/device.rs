@@ -163,15 +163,11 @@ fn block_device_size_from_geometry(block_count: u64, block_size: u32) -> Result<
     let total = block_count
         .checked_mul(u64::from(block_size))
         .ok_or_else(|| DeviceError::InvalidBlockDeviceGeometry {
-            detail: format!(
-                "block count {block_count} x block size {block_size} overflows u64"
-            ),
+            detail: format!("block count {block_count} x block size {block_size} overflows u64"),
         })?;
     if total == 0 {
         return Err(DeviceError::InvalidBlockDeviceGeometry {
-            detail: format!(
-                "block count {block_count} x block size {block_size} is 0 bytes"
-            ),
+            detail: format!("block count {block_count} x block size {block_size} is 0 bytes"),
         });
     }
     Ok(total)
@@ -603,8 +599,9 @@ impl MemoryDevice {
     /// non-power-of-two or sub-512 alignment.
     pub fn new_volatile(size: u64, alignment: usize) -> Result<Self> {
         let mut dev = Self::new(size, alignment)?;
-        dev.durable_shadow =
-            Some(parking_lot::Mutex::new(vec![0u8; size as usize].into_boxed_slice()));
+        dev.durable_shadow = Some(parking_lot::Mutex::new(
+            vec![0u8; size as usize].into_boxed_slice(),
+        ));
         Ok(dev)
     }
 
@@ -648,8 +645,7 @@ impl Drop for MemoryDevice {
         // construction-time `vec![0u8; size as usize]` would already
         // have panicked before reaching here.
         unsafe {
-            let slice_ptr =
-                std::ptr::slice_from_raw_parts_mut(self.raw_ptr, self.len as usize);
+            let slice_ptr = std::ptr::slice_from_raw_parts_mut(self.raw_ptr, self.len as usize);
             drop(Box::from_raw(slice_ptr));
         }
     }

@@ -1223,8 +1223,8 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(10));
         let events = m.expire_suspects();
-        let payload = last_membership_changed(&events)
-            .expect("suspect expiry must emit MembershipChanged");
+        let payload =
+            last_membership_changed(&events).expect("suspect expiry must emit MembershipChanged");
         assert_eq!(payload, vec![NodeId(1)], "dead node removed from payload");
         assert_eq!(
             payload,

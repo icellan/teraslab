@@ -7,9 +7,9 @@
 use crate::cluster::membership::{ClusterEvent, Membership};
 use crate::cluster::shards::NodeId;
 use crate::metrics::swim_metrics;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -772,7 +772,11 @@ impl SwimRunner {
         if removed.is_some() {
             // O(n) but the queue is bounded by PING_REQ_FORWARDING_MAX
             // and removal happens once per matched ACK.
-            if let Some(pos) = self.ping_req_forwarding_order.iter().position(|n| n == target_id) {
+            if let Some(pos) = self
+                .ping_req_forwarding_order
+                .iter()
+                .position(|n| n == target_id)
+            {
                 self.ping_req_forwarding_order.remove(pos);
             }
         }
@@ -839,21 +843,15 @@ impl SwimRunner {
         };
 
         // Register the sender's TCP address (for client routing / migration)
-        self.peer_addrs
-            .lock()
-            .insert(sender_id, sender_tcp_addr);
+        self.peer_addrs.lock().insert(sender_id, sender_tcp_addr);
 
         // Register the sender's SWIM address (from the actual UDP source)
-        self.swim_peer_addrs
-            .lock()
-            .insert(sender_id, from_addr);
+        self.swim_peer_addrs.lock().insert(sender_id, from_addr);
 
-        let mut events = self.membership.lock().mark_alive(
-            sender_id,
-            sender_tcp_addr,
-            sender_incarnation,
-            true,
-        );
+        let mut events =
+            self.membership
+                .lock()
+                .mark_alive(sender_id, sender_tcp_addr, sender_incarnation, true);
 
         // Process piggybacked membership updates
         // Wire format per entry:
@@ -1169,12 +1167,7 @@ impl SwimRunner {
         // Get the suspect's SWIM address for the PING_REQ payload
         // Get the suspect's SWIM address. If we don't know it, we can't
         // ask others to probe it on our behalf.
-        let suspect_swim_addr = match self
-            .swim_peer_addrs
-            .lock()
-            .get(&suspect_id)
-            .copied()
-        {
+        let suspect_swim_addr = match self.swim_peer_addrs.lock().get(&suspect_id).copied() {
             Some(a) => a,
             None => return,
         };
@@ -1782,8 +1775,14 @@ mod tests {
     #[test]
     fn replay_window_same_incarnation_rejects_old_seq() {
         let mut w = ReplayWindow::default();
-        assert!(w.check_and_record_for_incarnation(7, 1), "first seq accepted");
-        assert!(w.check_and_record_for_incarnation(7, 2), "next seq accepted");
+        assert!(
+            w.check_and_record_for_incarnation(7, 1),
+            "first seq accepted"
+        );
+        assert!(
+            w.check_and_record_for_incarnation(7, 2),
+            "next seq accepted"
+        );
         assert!(
             !w.check_and_record_for_incarnation(7, 1),
             "replay of seq 1 in same incarnation must be rejected",
@@ -1811,8 +1810,14 @@ mod tests {
             "rebooted peer (incarnation+1, seq=1) must be accepted, not seq-dropped",
         );
         assert_eq!(w.incarnation, 4, "window must adopt the new incarnation");
-        assert_eq!(w.highest, 1, "seq space must have been reset for the new run");
-        assert!(w.check_and_record_for_incarnation(4, 2), "subsequent seq accepted");
+        assert_eq!(
+            w.highest, 1,
+            "seq space must have been reset for the new run"
+        );
+        assert!(
+            w.check_and_record_for_incarnation(4, 2),
+            "subsequent seq accepted"
+        );
     }
 
     /// A message from an *old* incarnation, replayed after we have already
@@ -1827,6 +1832,9 @@ mod tests {
             !w.check_and_record_for_incarnation(8, 999_999),
             "old-incarnation message must be rejected as a stale-run replay",
         );
-        assert_eq!(w.incarnation, 9, "old-run replay must not regress the window");
+        assert_eq!(
+            w.incarnation, 9,
+            "old-run replay must not regress the window"
+        );
     }
 }

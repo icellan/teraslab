@@ -11,12 +11,12 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use teraslab::cluster::shards::NodeId;
-use teraslab::cluster::swim::{ping_req_dropped_total, SwimConfig, SwimRunner};
-use teraslab::metrics::{init_swim_metrics, SwimMetrics};
+use teraslab::cluster::swim::{SwimConfig, SwimRunner, ping_req_dropped_total};
+use teraslab::metrics::{SwimMetrics, init_swim_metrics};
 
 /// P2.4: the `swim_ping_req_dropped_total` counter now lives on
 /// `SwimMetrics` rather than as a process-wide static. Install a test

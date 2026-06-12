@@ -2433,7 +2433,10 @@ fn write_recovery_overflow_entries(
     let old_block_size = if old_total <= INLINE_BLOCK_ENTRIES {
         alignment
     } else {
-        io::align_up((old_total - INLINE_BLOCK_ENTRIES) * BLOCK_ENTRY_SIZE, alignment)
+        io::align_up(
+            (old_total - INLINE_BLOCK_ENTRIES) * BLOCK_ENTRY_SIZE,
+            alignment,
+        )
     };
 
     let new_total = INLINE_BLOCK_ENTRIES
@@ -2838,10 +2841,16 @@ mod tests {
 
         // Redo log touches only A and B.
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::Freeze { tx_key: a, offset: 0 })
-            .unwrap();
-        redo.append_and_flush(RedoOp::Freeze { tx_key: b, offset: 0 })
-            .unwrap();
+        redo.append_and_flush(RedoOp::Freeze {
+            tx_key: a,
+            offset: 0,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::Freeze {
+            tx_key: b,
+            offset: 0,
+        })
+        .unwrap();
         drop(redo);
         let entries = h.redo_log().recover().unwrap();
 
@@ -2941,7 +2950,10 @@ mod tests {
         ));
         // But the non-fatal wrapper swallows it.
         let r = mark_recovery_progress_non_fatal(&mut log, last_seq);
-        assert!(r.is_ok(), "marker append must be non-fatal on a full log: {r:?}");
+        assert!(
+            r.is_ok(),
+            "marker append must be non-fatal on a full log: {r:?}"
+        );
     }
 
     /// B-6: a full recovery on a near-full redo log completes instead of
@@ -2957,8 +2969,11 @@ mod tests {
         let mut log = RedoLog::open(redo_dev.clone(), 0, 64 * 1024).unwrap();
 
         // One genuinely replayable, progress-safe entry.
-        log.append_and_flush(RedoOp::Freeze { tx_key: key, offset: 0 })
-            .unwrap();
+        log.append_and_flush(RedoOp::Freeze {
+            tx_key: key,
+            offset: 0,
+        })
+        .unwrap();
 
         // Pad the rest of the log to capacity so the end-of-recovery
         // marker append will hit LogFull.
@@ -3471,7 +3486,11 @@ mod tests {
         recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
 
         let post = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        assert_eq!({ post.spent_utxos }, 1, "recompute must reflect only slot 0 spent");
+        assert_eq!(
+            { post.spent_utxos },
+            1,
+            "recompute must reflect only slot 0 spent"
+        );
         assert_eq!(
             { post.delete_at_height },
             0,

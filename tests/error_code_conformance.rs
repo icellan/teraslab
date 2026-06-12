@@ -225,7 +225,10 @@ fn assert_single_set_mined_error(
         resp.payload.len()
     );
     let (successes, errors) = decode_partial_with_signals(&resp.payload).unwrap();
-    assert!(successes.is_empty(), "failed item must yield no success record");
+    assert!(
+        successes.is_empty(),
+        "failed item must yield no success record"
+    );
     assert_eq!(errors.len(), 1, "expected exactly one item error");
     assert_eq!(errors[0].item_index, expected_index);
     assert_eq!(errors[0].error_code, expected_code);
@@ -368,7 +371,10 @@ fn t2_spend_apply_dah_overflow_returns_batch_wide_err_storage_io() {
     assert_eq!(resp.request_id, 9202);
     assert_eq!(resp.status, STATUS_ERROR);
     let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-    assert_eq!(code, ERR_STORAGE_IO, "expected wire code 30 (ERR_STORAGE_IO)");
+    assert_eq!(
+        code, ERR_STORAGE_IO,
+        "expected wire code 30 (ERR_STORAGE_IO)"
+    );
     assert!(
         msg.contains("DAH_OVERFLOW"),
         "error message must carry the DAH_OVERFLOW detail, got: {msg}"
@@ -822,7 +828,10 @@ fn n6_topology_propose_on_single_node_returns_err_not_clustered() {
     assert_eq!(resp.request_id, 4242);
     assert_eq!(resp.status, STATUS_ERROR);
     let (code, msg) = decode_error_payload(&resp.payload).unwrap();
-    assert_eq!(code, ERR_NOT_CLUSTERED, "expected wire code 32 (ERR_NOT_CLUSTERED)");
+    assert_eq!(
+        code, ERR_NOT_CLUSTERED,
+        "expected wire code 32 (ERR_NOT_CLUSTERED)"
+    );
     assert_eq!(msg, "not clustered");
 
     server.shutdown();
@@ -929,7 +938,10 @@ fn n6_migration_complete_without_manifest_returns_manifest_required() {
         code, ERR_MIGRATION_MANIFEST_REQUIRED,
         "expected wire code 21 (ERR_MIGRATION_MANIFEST_REQUIRED)"
     );
-    assert!(msg.contains("requires manifest"), "unexpected message: {msg}");
+    assert!(
+        msg.contains("requires manifest"),
+        "unexpected message: {msg}"
+    );
 
     server.shutdown();
 }
@@ -974,7 +986,10 @@ fn n6_migration_complete_manifest_hash_mismatch_returns_manifest_mismatch() {
         code, ERR_MIGRATION_MANIFEST_MISMATCH,
         "expected wire code 22 (ERR_MIGRATION_MANIFEST_MISMATCH)"
     );
-    assert!(msg.contains("manifest hash mismatch"), "unexpected message: {msg}");
+    assert!(
+        msg.contains("manifest hash mismatch"),
+        "unexpected message: {msg}"
+    );
 
     server.shutdown();
 }

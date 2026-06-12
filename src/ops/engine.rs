@@ -285,9 +285,7 @@ impl Engine {
     /// exclusive side from before-apply through replication-ack /
     /// compensation, and reads are blocked for the full window. Among
     /// themselves, reads are concurrent.
-    pub(crate) fn acquire_dispatch_visibility_guard(
-        &self,
-    ) -> parking_lot::RwLockReadGuard<'_, ()> {
+    pub(crate) fn acquire_dispatch_visibility_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
         self.dispatch_visibility_barrier.read()
     }
 
@@ -1535,10 +1533,8 @@ impl Engine {
                         let deleted_count = { metadata.deleted_children_count };
                         if deleted_count > 0 {
                             let deleted_offset = { metadata.deleted_children_offset };
-                            let deleted = self.read_deleted_children_at(
-                                deleted_count as usize,
-                                deleted_offset,
-                            )?;
+                            let deleted = self
+                                .read_deleted_children_at(deleted_count as usize, deleted_offset)?;
                             let mut child_txid = [0u8; 32];
                             child_txid.copy_from_slice(&item.spending_data[..32]);
                             if deleted.contains(&child_txid) {
@@ -1732,10 +1728,8 @@ impl Engine {
                     let deleted_count = { metadata.deleted_children_count };
                     if deleted_count > 0 {
                         let deleted_offset = { metadata.deleted_children_offset };
-                        let deleted = self.read_deleted_children_at(
-                            deleted_count as usize,
-                            deleted_offset,
-                        )?;
+                        let deleted =
+                            self.read_deleted_children_at(deleted_count as usize, deleted_offset)?;
                         let mut child_txid = [0u8; 32];
                         child_txid.copy_from_slice(&req.spending_data[..32]);
                         if deleted.contains(&child_txid) {
@@ -1889,10 +1883,7 @@ impl Engine {
                 spending_data: slot.spending_data,
             });
         }
-        if slot.status != UTXO_UNSPENT
-            && slot.status != UTXO_SPENT
-            && slot.status != UTXO_FROZEN
-        {
+        if slot.status != UTXO_UNSPENT && slot.status != UTXO_SPENT && slot.status != UTXO_FROZEN {
             return Err(SpendError::StorageError {
                 detail: format!("unknown status: {:#04x}", slot.status),
             });
@@ -2078,7 +2069,11 @@ impl Engine {
                 let mut tf = meta.flags;
                 tf.remove(TxFlags::LOCKED); // setMined clears LOCKED
                 let meta_unmined = { meta.unmined_since };
-                let new_unmined = if req.on_longest_chain { 0u32 } else { meta_unmined };
+                let new_unmined = if req.on_longest_chain {
+                    0u32
+                } else {
+                    meta_unmined
+                };
                 let old_unmined = meta_unmined;
                 let preserve = { meta.preserve_until };
                 let has_preserve = preserve != 0;
@@ -2610,8 +2605,7 @@ impl Engine {
         // freshly allocated region — the bytes at `record_offset` are
         // unreachable without an index entry and would otherwise leak
         // (audit A — create leaks its allocation on post-allocation failure).
-        if let Err(e) = self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)
-        {
+        if let Err(e) = self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data) {
             self.free_create_allocation_best_effort(record_offset, total_size);
             return Err(e);
         }
@@ -3338,7 +3332,11 @@ impl Engine {
         // the parent lock internally via the same CAS-retry pattern as
         // `append_conflicting_child` (R-143).
         drop(_guard);
-        self.append_deleted_child_best_effort(parent_key, child_txid, "prune_slot_if_spent_by_child");
+        self.append_deleted_child_best_effort(
+            parent_key,
+            child_txid,
+            "prune_slot_if_spent_by_child",
+        );
         Ok(true)
     }
 
@@ -3369,14 +3367,17 @@ impl Engine {
     /// failure.
     pub fn prune_slot(&self, key: &TxKey, offset: u32) -> Result<bool, SpendError> {
         let _guard = self.locks.lock(key);
-        let entry = match self.index.read().lookup_checked(key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(entry) => entry,
-            None => return Ok(false),
-        };
+        let entry =
+            match self
+                .index
+                .read()
+                .lookup_checked(key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(entry) => entry,
+                None => return Ok(false),
+            };
         let meta = self.read_metadata_fast(entry.record_offset)?;
         if offset >= { meta.utxo_count } {
             return Ok(false);
@@ -3410,20 +3411,19 @@ impl Engine {
     ///
     /// Returns [`SpendError::StorageError`] on an index or device read/write
     /// failure.
-    pub fn set_record_generation(
-        &self,
-        key: &TxKey,
-        generation: u32,
-    ) -> Result<bool, SpendError> {
+    pub fn set_record_generation(&self, key: &TxKey, generation: u32) -> Result<bool, SpendError> {
         let _guard = self.locks.lock(key);
-        let entry = match self.index.read().lookup_checked(key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(entry) => entry,
-            None => return Ok(false),
-        };
+        let entry =
+            match self
+                .index
+                .read()
+                .lookup_checked(key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(entry) => entry,
+                None => return Ok(false),
+            };
         let mut meta = self.read_metadata_fast(entry.record_offset)?;
         meta.generation = generation;
         self.write_metadata_fast(entry.record_offset, &meta)?;
@@ -3747,13 +3747,11 @@ impl Engine {
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would free the freshly-allocated block as
                 // if the parent vanished). Surface it as a storage error.
-                let looked_up =
-                    self.index
-                        .read()
-                        .lookup_checked(parent_key)
-                        .map_err(|e| SpendError::StorageError {
-                            detail: format!("index lookup failed: {e}"),
-                        })?;
+                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("index lookup failed: {e}"),
+                    }
+                })?;
                 match looked_up {
                     None => {
                         parent_gone = true;
@@ -3792,9 +3790,7 @@ impl Engine {
                     // the leak via a high-cardinality tracing event so
                     // operators can correlate and reclaim manually (see
                     // R-049 orphan-blob GC for the periodic sweep).
-                    if let Err(err) =
-                        self.free_conflicting_children_block(offset, count)
-                    {
+                    if let Err(err) = self.free_conflicting_children_block(offset, count) {
                         tracing::error!(
                             target: "teraslab::engine::orphan",
                             orphan = true,
@@ -3885,8 +3881,7 @@ impl Engine {
             // the leak via tracing (we still need to return the
             // original pwrite error to the caller) so operators can
             // correlate against the R-049 orphan-blob sweep.
-            if let Err(free_err) =
-                self.free_conflicting_children_block(new_offset, children.len())
+            if let Err(free_err) = self.free_conflicting_children_block(new_offset, children.len())
             {
                 tracing::error!(
                     target: "teraslab::engine::orphan",
@@ -4083,13 +4078,11 @@ impl Engine {
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would free the freshly-allocated block as
                 // if the parent vanished). Surface it as a storage error.
-                let looked_up =
-                    self.index
-                        .read()
-                        .lookup_checked(parent_key)
-                        .map_err(|e| SpendError::StorageError {
-                            detail: format!("index lookup failed: {e}"),
-                        })?;
+                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("index lookup failed: {e}"),
+                    }
+                })?;
                 match looked_up {
                     None => {
                         parent_gone = true;
@@ -4183,10 +4176,7 @@ impl Engine {
         Ok(children)
     }
 
-    fn allocate_deleted_children_block(
-        &self,
-        children: &[[u8; 32]],
-    ) -> Result<u64, SpendError> {
+    fn allocate_deleted_children_block(&self, children: &[[u8; 32]]) -> Result<u64, SpendError> {
         let new_size = (children.len() * 32) as u64;
         let new_offset =
             self.allocator
@@ -4205,9 +4195,7 @@ impl Engine {
             wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
         }
         if let Err(err) = self.device.pwrite_all_at(&wbuf, aligned_base) {
-            if let Err(free_err) =
-                self.free_deleted_children_block(new_offset, children.len())
-            {
+            if let Err(free_err) = self.free_deleted_children_block(new_offset, children.len()) {
                 tracing::error!(
                     target: "teraslab::engine::orphan",
                     orphan = true,
@@ -5015,14 +5003,17 @@ impl Engine {
         }
         let _guard = self.locks.lock(key);
         // G-4: a backend read error must not collapse to "absent".
-        let entry = match self.index.read().lookup_checked(key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(e) => e,
-            None => return Ok(false),
-        };
+        let entry =
+            match self
+                .index
+                .read()
+                .lookup_checked(key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(e) => e,
+                None => return Ok(false),
+            };
         let ro = entry.record_offset;
 
         let mut meta = self.read_metadata_for_key(key, ro)?;
@@ -7023,7 +7014,10 @@ mod tests {
             current_block_height: 1000,
             block_height_retention: 288,
         };
-        let resp = h.engine.unspend(&req).expect("frozen unspend must be a no-op OK");
+        let resp = h
+            .engine
+            .unspend(&req)
+            .expect("frozen unspend must be a no-op OK");
         assert_eq!(resp.signal, Signal::None);
 
         // Slot stays frozen, generation unchanged.
@@ -7054,7 +7048,10 @@ mod tests {
         };
         // The frozen marker excludes ownership, so this is a no-op OK, not an
         // error — the FROZEN branch is genuinely dead for real callers.
-        let resp = h.engine.unspend(&req).expect("frozen-marker unspend is a no-op OK");
+        let resp = h
+            .engine
+            .unspend(&req)
+            .expect("frozen-marker unspend is a no-op OK");
         assert_eq!(resp.signal, Signal::None);
         let slot = h.engine.read_slot(&h.key, 3).unwrap();
         assert!(slot.is_spent());
@@ -7281,7 +7278,11 @@ mod tests {
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert!(h.engine.read_slot(&h.key, 0).unwrap().is_spent());
         assert_eq!({ meta.spent_utxos }, 2, "counter unchanged by no-op");
-        assert_eq!({ meta.delete_at_height }, 1288, "no-op ran DAH housekeeping");
+        assert_eq!(
+            { meta.delete_at_height },
+            1288,
+            "no-op ran DAH housekeeping"
+        );
         assert!(!h.engine.dah_index().range_query(u32::MAX).is_empty());
         // The no-op itself did not bump the generation; only the DAH housekeeping
         // persisted (generation is left stable so the dispatch layer classifies
@@ -8127,11 +8128,11 @@ mod tests {
                 .update_cached_fields(
                     &h.key,
                     TxFlags::empty().bits(), // no HAS_PRESERVE_UNTIL
-                    0,                        // block_entry_count
-                    0,                        // spent_utxos
-                    1288,                     // stale dah_or_preserve (as DAH)
-                    0,                        // unmined_since
-                    0,                        // generation
+                    0,                       // block_entry_count
+                    0,                       // spent_utxos
+                    1288,                    // stale dah_or_preserve (as DAH)
+                    0,                       // unmined_since
+                    0,                       // generation
                 )
                 .unwrap();
             assert!(updated, "cache poison must hit the entry");
@@ -8190,16 +8191,8 @@ mod tests {
         // Poison cache: stale DAH 1288, no preserve discriminant.
         {
             let mut idx = h.engine.index.write();
-            idx.update_cached_fields(
-                &h.key,
-                TxFlags::empty().bits(),
-                0,
-                0,
-                1288,
-                0,
-                0,
-            )
-            .unwrap();
+            idx.update_cached_fields(&h.key, TxFlags::empty().bits(), 0, 0, 1288, 0, 0)
+                .unwrap();
         }
 
         let req = SetMinedRequest {
@@ -8223,7 +8216,11 @@ mod tests {
             "preserved record must not gain a DAH on setMined",
         );
         assert_eq!({ meta.preserve_until }, 5000);
-        assert_eq!({ meta.block_entry_count }, 1, "block entry must be recorded");
+        assert_eq!(
+            { meta.block_entry_count },
+            1,
+            "block entry must be recorded"
+        );
 
         let entry = h.engine.index.read().lookup(&h.key).unwrap();
         assert_eq!(
@@ -8678,7 +8675,10 @@ mod tests {
     fn read_deleted_children_returns_empty_vec_when_count_zero() {
         let h = TestHarness::new(3, TxFlags::empty());
         let children = h.engine.read_deleted_children(&h.key).unwrap();
-        assert!(children.is_empty(), "fresh record must have no deleted children");
+        assert!(
+            children.is_empty(),
+            "fresh record must have no deleted children"
+        );
 
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert_eq!({ meta.deleted_children_count }, 0);
@@ -8834,10 +8834,7 @@ mod tests {
         // prune. The deleted-children list is the only thing standing
         // between this re-spend and an accidental accept.
         let entry = h.engine.index.read().lookup(&h.key).unwrap();
-        let mut slot = h
-            .engine
-            .read_slot_fast(entry.record_offset, 1)
-            .unwrap();
+        let mut slot = h.engine.read_slot_fast(entry.record_offset, 1).unwrap();
         slot.status = UTXO_SPENT;
         slot.spending_data = h.make_spending_data(0xAB);
         h.engine
@@ -8849,13 +8846,14 @@ mod tests {
         // deleted-children list and reject.
         let resp = h.engine.spend(&h.spend_req(1));
         match resp {
-            Err(SpendError::DeletedChildren { offset, child_count }) => {
+            Err(SpendError::DeletedChildren {
+                offset,
+                child_count,
+            }) => {
                 assert_eq!(offset, 1);
                 assert_eq!(child_count, 1);
             }
-            other => panic!(
-                "expected SpendError::DeletedChildren, got {other:?}"
-            ),
+            other => panic!("expected SpendError::DeletedChildren, got {other:?}"),
         }
     }
 
@@ -9108,7 +9106,10 @@ mod tests {
         assert!(!h.engine.dah_index().range_query(u32::MAX).is_empty());
 
         // Delete the record
-        let del_req = DeleteRequest { tx_key: h.key, due_guard: None };
+        let del_req = DeleteRequest {
+            tx_key: h.key,
+            due_guard: None,
+        };
         h.engine.delete(&del_req).unwrap();
 
         // DAH index should be clean
@@ -10694,9 +10695,9 @@ mod tests {
         };
         match engine.spend(&req) {
             Err(SpendError::StorageError { .. }) => {}
-            Err(SpendError::TxNotFound) => panic!(
-                "G-4: backend read error collapsed to TX_NOT_FOUND for a present record"
-            ),
+            Err(SpendError::TxNotFound) => {
+                panic!("G-4: backend read error collapsed to TX_NOT_FOUND for a present record")
+            }
             other => panic!("expected StorageError, got {other:?}"),
         }
     }
@@ -10722,9 +10723,9 @@ mod tests {
                 "G-4: backend read error during dup-check should surface as StorageError, \
                  not be (coincidentally) caught as DuplicateTxId by a later layer"
             ),
-            Ok(_) => panic!(
-                "G-4: backend read error collapsed to 'absent' and wrote a duplicate record"
-            ),
+            Ok(_) => {
+                panic!("G-4: backend read error collapsed to 'absent' and wrote a duplicate record")
+            }
             other => panic!("expected StorageError, got {other:?}"),
         }
 
@@ -11122,7 +11123,12 @@ mod tests {
         let key = req.tx_key();
 
         engine.create(&req).unwrap();
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
 
         // Should succeed — txid can be reused after deletion
         engine.create(&req).unwrap();
@@ -11925,7 +11931,11 @@ mod tests {
         // all-spent — spent_utxos stays 0 while the slot is unspent — so it
         // cannot be DAH-deleted.
         let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!({ meta.spent_utxos }, 0, "reassigned slot is live, not spent");
+        assert_eq!(
+            { meta.spent_utxos },
+            0,
+            "reassigned slot is live, not spent"
+        );
         assert_eq!(
             { meta.delete_at_height },
             0,
@@ -11959,8 +11969,7 @@ mod tests {
             "LP-3: a reassigned record must never be DAH'd, even after final spend"
         );
         assert!(
-            !engine
-                .is_due_for_sweep(&key, 100_000),
+            !engine.is_due_for_sweep(&key, 100_000),
             "reassigned record must never be due for the sweep (LP-3)"
         );
     }
@@ -12041,7 +12050,11 @@ mod tests {
             })
             .unwrap();
         let slot = engine.read_slot(&key, 0).unwrap();
-        assert_eq!(slot.reassignment_cooldown(), 1100, "cooldown set by reassign");
+        assert_eq!(
+            slot.reassignment_cooldown(),
+            1100,
+            "cooldown set by reassign"
+        );
 
         // Freeze the reassigned (unspent, cooled-down) slot, then unfreeze.
         engine
@@ -12093,7 +12106,9 @@ mod tests {
                 spendable_at_height: 1100,
                 ..
             }) => {}
-            other => panic!("cooldown must survive freeze/unfreeze; expected FrozenUntil(1100), got {other:?}"),
+            other => panic!(
+                "cooldown must survive freeze/unfreeze; expected FrozenUntil(1100), got {other:?}"
+            ),
         }
 
         // And spendable at the cooldown height (1100).
@@ -12643,7 +12658,12 @@ mod tests {
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
         assert!(engine.lookup(&key).is_none());
     }
 
@@ -12668,7 +12688,12 @@ mod tests {
         engine.create(&req).unwrap();
 
         syncs.store(0, Ordering::SeqCst);
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
 
         assert!(
             syncs.load(Ordering::SeqCst) >= 1,
@@ -12682,7 +12707,12 @@ mod tests {
         let (_, req) = make_create_req(121, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
 
         match engine.read_metadata(&key) {
             Err(SpendError::TxNotFound) => {}
@@ -12710,7 +12740,12 @@ mod tests {
         let resp1 = engine.create(&req1).unwrap();
         let offset1 = resp1.record_offset;
 
-        engine.delete(&DeleteRequest { tx_key: key1, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key1,
+                due_guard: None,
+            })
+            .unwrap();
 
         // Create another record — should reuse the freed space
         let (_, req2) = make_create_req(123, 100);
@@ -12725,7 +12760,12 @@ mod tests {
         let (_, req) = make_create_req(124, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
 
         let rebuilt = PrimaryBackend::rebuild(&*engine.device, &engine.allocator.lock()).unwrap();
         assert!(
@@ -12741,7 +12781,12 @@ mod tests {
         let key = req.tx_key();
         let created = engine.create(&req).unwrap();
 
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
 
         let align = engine.device.alignment();
         let mut buf = AlignedBuf::new(io::align_up(METADATA_SIZE, align), align);
@@ -12974,7 +13019,12 @@ mod tests {
         let e1 = engine.clone();
         let hash0 = req.utxo_hashes[0];
 
-        let h1 = std::thread::spawn(move || e1.delete(&DeleteRequest { tx_key: key, due_guard: None }));
+        let h1 = std::thread::spawn(move || {
+            e1.delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+        });
 
         let e2 = engine.clone();
         let h2 = std::thread::spawn(move || {
@@ -13282,7 +13332,12 @@ mod tests {
         assert!(!cold.is_empty(), "cold data should be present");
 
         // Delete
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
 
         // Verify lookup returns None
         assert!(engine.lookup(&key).is_none());
@@ -13510,7 +13565,12 @@ mod tests {
         // pre-race baseline — any orphaned region from a losing create would
         // leave it permanently inflated.
         let used_after_race = engine.allocator_stats().used_bytes;
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
         assert_eq!(
             engine.allocator_stats().used_bytes,
             used_baseline,
@@ -13541,7 +13601,10 @@ mod tests {
                             Ok(_) | Err(CreateError::DuplicateTxId) => {}
                             Err(e) => panic!("unexpected create error: {e:?}"),
                         }
-                        match engine.delete(&DeleteRequest { tx_key: key, due_guard: None }) {
+                        match engine.delete(&DeleteRequest {
+                            tx_key: key,
+                            due_guard: None,
+                        }) {
                             Ok(()) | Err(SpendError::TxNotFound) => {}
                             Err(e) => panic!("unexpected delete error: {e:?}"),
                         }
@@ -13559,7 +13622,12 @@ mod tests {
                 key.txid,
                 "index entry aliases another transaction's record"
             );
-            engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+            engine
+                .delete(&DeleteRequest {
+                    tx_key: key,
+                    due_guard: None,
+                })
+                .unwrap();
         }
         assert_eq!(
             engine.allocator_stats().used_bytes,

@@ -33,8 +33,8 @@ use teraslab::protocol::frame::RequestFrame;
 use teraslab::protocol::opcodes::{OP_REPLICA_BATCH, STATUS_OK};
 use teraslab::record::UTXO_SPENT;
 use teraslab::replication::durable::ReplicaAppliedTracker;
-use teraslab::replication::receiver::handle_replica_batch_with_tracker;
 use teraslab::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
+use teraslab::replication::receiver::handle_replica_batch_with_tracker;
 
 fn make_engine() -> Arc<Engine> {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -147,7 +147,12 @@ fn replica_batch_replay_is_idempotent() {
     );
     assert_eq!(resp_1.status, STATUS_OK);
     let ack_1 = ReplicaAck::deserialize(&resp_1.payload).unwrap();
-    assert_eq!(ack_1, ReplicaAck::Ok { through_sequence: 10 });
+    assert_eq!(
+        ack_1,
+        ReplicaAck::Ok {
+            through_sequence: 10
+        }
+    );
     assert_eq!(engine.read_slot(&key(7), 0).unwrap().status, UTXO_SPENT);
     let gen_after_first = engine.read_metadata(&key(7)).unwrap().generation;
 
@@ -177,7 +182,9 @@ fn replica_batch_replay_is_idempotent() {
     let ack_2 = ReplicaAck::deserialize(&resp_2.payload).unwrap();
     assert_eq!(
         ack_2,
-        ReplicaAck::Ok { through_sequence: 10 },
+        ReplicaAck::Ok {
+            through_sequence: 10
+        },
         "replay re-ACKs the existing watermark"
     );
 

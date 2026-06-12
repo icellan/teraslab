@@ -459,8 +459,8 @@ fn get_spend_wire_validates_utxo_hash() {
                 txid,
                 vout: 0,
                 utxo_hash: wrong_hash,
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -511,8 +511,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: test_utxo_hash(1312, 9),
                     spending_data: [0x11; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_single_sparse_error(&resp, ERR_VOUT_OUT_OF_RANGE);
@@ -574,8 +574,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: reassign_hash,
                     new_utxo_hash: test_utxo_hash(99_999, 0),
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_single_sparse_error(&resp, ERR_UTXO_NOT_FROZEN);
@@ -618,8 +618,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: reserved_hash,
                     spending_data: [0xFF; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     let err = assert_single_sparse_error(&err, ERR_INVALID_SPEND);
@@ -649,8 +649,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                 txid: cooldown_txid,
                 vout: 0,
                 utxo_hash: cooldown_hash,
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -671,8 +671,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: cooldown_hash,
                     new_utxo_hash: cooldown_new_hash,
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -695,8 +695,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: cooldown_new_hash,
                     spending_data: [0x44; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     let err = assert_single_sparse_error(&err, ERR_FROZEN_UNTIL);
@@ -728,8 +728,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: spent_hash,
                     spending_data: winner_spending_data,
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -752,8 +752,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: spent_hash,
                     spending_data: [0x66; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     let err = assert_single_sparse_error(&err, ERR_ALREADY_SPENT);
@@ -785,8 +785,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: frozen_spend_hash,
                     spending_data: [0x77; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_single_sparse_error(&err, ERR_FROZEN);
@@ -817,8 +817,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: conflicting_hash,
                     spending_data: [0x88; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_single_sparse_error(&err, ERR_CONFLICTING);
@@ -849,8 +849,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: locked_hash,
                     spending_data: [0x99; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_single_sparse_error(&err, ERR_LOCKED);
@@ -882,8 +882,8 @@ fn tcp_error_code_triggerability_core_item_errors() {
                     utxo_hash: coinbase_hash,
                     spending_data: [0xAA; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     let err = assert_single_sparse_error(&err, ERR_COINBASE_IMMATURE);
@@ -945,8 +945,8 @@ fn create_spend_get_spend() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(2, 0),
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -998,8 +998,8 @@ fn create_spend_across_multiple_txids_then_get() {
                     block_height_retention: 288,
                 },
                 &spend_items,
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1012,7 +1012,8 @@ fn create_spend_across_multiple_txids_then_get() {
             request_id: 302,
             op_code: OP_GET_BATCH,
             flags: 0,
-            payload: encode_get_batch(FieldMask::ALL_METADATA | FieldMask::UTXO_SLOTS, &txids).into(),
+            payload: encode_get_batch(FieldMask::ALL_METADATA | FieldMask::UTXO_SLOTS, &txids)
+                .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1088,8 +1089,8 @@ fn create_set_mined_delete() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(3, 0),
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1129,8 +1130,8 @@ fn create_set_mined_mark_longest_chain() {
                     block_height_retention: 288,
                 },
                 &[txid],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1197,8 +1198,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: hash0,
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1214,8 +1215,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(4, 0),
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1232,8 +1233,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: hash0,
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1249,8 +1250,8 @@ fn freeze_unfreeze_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(4, 0),
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1290,8 +1291,8 @@ fn freeze_reassign_get_spend() {
                 txid,
                 vout: 0,
                 utxo_hash: hash0,
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1314,8 +1315,8 @@ fn freeze_reassign_get_spend() {
                     utxo_hash: hash0,
                     new_utxo_hash: new_hash,
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1331,8 +1332,8 @@ fn freeze_reassign_get_spend() {
                 txid,
                 vout: 0,
                 utxo_hash: new_hash,
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1414,7 +1415,6 @@ fn create_set_locked() {
             flags: 0,
             payload: encode_txid_batch(&[txid], &[1u8]).into(), // value=true
         },
-
     );
     assert_eq!(resp.status, STATUS_OK);
 
@@ -1523,8 +1523,8 @@ fn batch_spend_1024_items() {
                     block_height_retention: 288,
                 },
                 &items,
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1552,8 +1552,8 @@ fn batch_spend_1024_items() {
                     vout: 1023,
                     utxo_hash: test_utxo_hash(5, 1023),
                 },
-            ]).into(),
-
+            ])
+            .into(),
         },
     );
     let results = decode_get_spend_response(&resp.payload).unwrap();
@@ -1605,8 +1605,8 @@ fn batch_spend_100_same_txid() {
                     block_height_retention: 288,
                 },
                 &items,
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -1695,8 +1695,8 @@ fn multiple_concurrent_connections() {
                                     utxo_hash: test_utxo_hash(100 + i, v),
                                     spending_data: sd,
                                 }],
-                            ).into(),
-
+                            )
+                            .into(),
                         },
                     );
                     assert_eq!(resp.status, STATUS_OK, "spend failed: client {i} vout {v}");
@@ -1767,7 +1767,6 @@ fn malformed_payload_returns_error() {
             flags: 0,
             payload: vec![0x01, 0x02].into(), // Way too short
         },
-
     );
     assert_eq!(resp.status, STATUS_ERROR);
 
@@ -1814,8 +1813,8 @@ fn request_for_nonexistent_tx_partial_error() {
                         spending_data: [0xBB; 36],
                     },
                 ],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
@@ -2029,8 +2028,8 @@ fn pipelined_requests_5_batches() {
                 txid: test_txid(1200 + i),
                 vout: 0,
                 utxo_hash: test_utxo_hash(1200 + i, 0),
-            }]).into(),
-
+            }])
+            .into(),
         };
         let bytes = frame.encode();
         stream.write_all(&bytes).unwrap();
@@ -2137,8 +2136,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                     utxo_hash: test_utxo_hash(1500, 0),
                     spending_data: [0xAA; 36],
                 }],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2161,8 +2160,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                     block_height_retention: 288,
                 },
                 &[txid],
-            ).into(),
-
+            )
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2178,8 +2177,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                 txid,
                 vout: 1,
                 utxo_hash: test_utxo_hash(1500, 1),
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2195,8 +2194,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                 txid,
                 vout: 1,
                 utxo_hash: test_utxo_hash(1500, 1),
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2268,8 +2267,8 @@ fn all_operations_from_phases_3_through_6_over_tcp() {
                 txid,
                 vout: 0,
                 utxo_hash: test_utxo_hash(1500, 0),
-            }]).into(),
-
+            }])
+            .into(),
         },
     );
     assert_eq!(resp.status, STATUS_OK);
@@ -2356,8 +2355,8 @@ fn per_ip_connection_cap_rejects_excess_and_recovers_on_close() {
     //    OS having only completed the TCP handshake).
     let mut conns: Vec<TcpStream> = Vec::with_capacity(MAX_PER_IP);
     for i in 0..MAX_PER_IP {
-        let mut stream = TcpStream::connect(&addr)
-            .unwrap_or_else(|e| panic!("connect {i} failed: {e}"));
+        let mut stream =
+            TcpStream::connect(&addr).unwrap_or_else(|e| panic!("connect {i} failed: {e}"));
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
@@ -2406,7 +2405,8 @@ fn per_ip_connection_cap_rejects_excess_and_recovers_on_close() {
     let mut buf = [0u8; 64];
     let n = over_quota.read(&mut buf).unwrap_or(0);
     assert_eq!(
-        n, 0,
+        n,
+        0,
         "over-quota connection should be silently closed with no bytes written, \
          but read {n} bytes: {:?}",
         &buf[..n.min(buf.len())],
@@ -2464,7 +2464,9 @@ fn per_ip_connection_cap_rejects_excess_and_recovers_on_close() {
 /// healthy.
 fn read_response_or_panic(stream: &mut TcpStream) -> ResponseFrame {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).expect("read response length");
+    stream
+        .read_exact(&mut len_buf)
+        .expect("read response length");
     let total_length = u32::from_le_bytes(len_buf) as usize;
     let mut body = vec![0u8; total_length];
     stream.read_exact(&mut body).expect("read response body");
@@ -2490,8 +2492,8 @@ fn per_ip_connection_cap_disabled_when_set_to_zero() {
 
     let mut conns: Vec<TcpStream> = Vec::with_capacity(NUM_CONNS);
     for i in 0..NUM_CONNS {
-        let mut stream = TcpStream::connect(&addr)
-            .unwrap_or_else(|e| panic!("connect {i} failed: {e}"));
+        let mut stream =
+            TcpStream::connect(&addr).unwrap_or_else(|e| panic!("connect {i} failed: {e}"));
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
@@ -2504,7 +2506,10 @@ fn per_ip_connection_cap_disabled_when_set_to_zero() {
         stream.write_all(&ping.encode()).unwrap();
         let resp = read_response_or_panic(&mut stream);
         assert_eq!(resp.request_id, 200 + i as u64);
-        assert_eq!(resp.status, STATUS_OK, "conn {i}: per-IP cap disabled but request failed");
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "conn {i}: per-IP cap disabled but request failed"
+        );
         conns.push(stream);
     }
 
@@ -2849,7 +2854,10 @@ fn backend_create_spend_unspend(mode: &IndexBackendMode) {
     );
     assert_eq!(resp.status, STATUS_OK, "get_spend(post-unspend) {mode:?}");
     let results = decode_get_spend_response(&resp.payload).unwrap();
-    assert_eq!(results[0].slot_status, 0x00, "unspent after unspend {mode:?}");
+    assert_eq!(
+        results[0].slot_status, 0x00,
+        "unspent after unspend {mode:?}"
+    );
 
     guard.server.shutdown();
 }

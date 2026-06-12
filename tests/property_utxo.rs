@@ -177,7 +177,10 @@ fn block_id(block: u8) -> u32 {
 #[derive(Debug, Clone)]
 enum Op {
     /// Create a regular (non-coinbase) record.
-    Create { tx: u8, utxo_count: u8 },
+    Create {
+        tx: u8,
+        utxo_count: u8,
+    },
     /// Create a coinbase record with a maturity height. When `immature` is
     /// true the maturity height is above [`CURRENT_BLOCK_HEIGHT`], so every
     /// spend before maturity must yield `CoinbaseImmature`.
@@ -222,10 +225,21 @@ enum Op {
         vout: u8,
         spendable_after: u8,
     },
-    SetMined { tx: u8, block: u8 },
-    SetConflicting { tx: u8, value: bool },
-    SetLocked { tx: u8, value: bool },
-    Delete { tx: u8 },
+    SetMined {
+        tx: u8,
+        block: u8,
+    },
+    SetConflicting {
+        tx: u8,
+        value: bool,
+    },
+    SetLocked {
+        tx: u8,
+        value: bool,
+    },
+    Delete {
+        tx: u8,
+    },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -353,13 +367,17 @@ fn seq_strategy(min: usize, max: usize) -> impl Strategy<Value = Vec<Op>> {
 /// little-endian cooldown height) during final-state comparison.
 #[derive(Debug, Clone, PartialEq)]
 enum SlotState {
-    Unspent { spendable_height: u32 },
+    Unspent {
+        spendable_height: u32,
+    },
     Spent([u8; 36]),
     /// LP-4: a frozen slot preserves any reassign cooldown (the
     /// `spendable_height` it had while unspent) so a freeze/unfreeze cycle
     /// cannot wipe it. `cooldown == 0` is an ordinary frozen slot whose
     /// on-device representation is the all-`0xFF` marker.
-    Frozen { cooldown: u32 },
+    Frozen {
+        cooldown: u32,
+    },
 }
 
 impl SlotState {
@@ -928,7 +946,10 @@ fn run_engine(engine: &Engine, op: &Op) -> Outcome {
         }
 
         Op::Delete { tx } => {
-            let req = DeleteRequest { tx_key: tx_key(tx), due_guard: None };
+            let req = DeleteRequest {
+                tx_key: tx_key(tx),
+                due_guard: None,
+            };
             match engine.delete(&req) {
                 Ok(()) => Outcome::Ok,
                 Err(e) => spend_error_outcome(e),
@@ -938,7 +959,13 @@ fn run_engine(engine: &Engine, op: &Op) -> Outcome {
 }
 
 /// Build and submit a create request (regular or coinbase).
-fn run_create(engine: &Engine, tx: u8, utxo_count: u8, is_coinbase: bool, spending_height: u32) -> Outcome {
+fn run_create(
+    engine: &Engine,
+    tx: u8,
+    utxo_count: u8,
+    is_coinbase: bool,
+    spending_height: u32,
+) -> Outcome {
     let hashes: Vec<[u8; 32]> = (0..utxo_count).map(|v| utxo_hash(tx, v)).collect();
     let req = CreateRequest {
         tx_id: txid(tx),
@@ -1240,7 +1267,8 @@ const CRASH_DEVICE_SIZE: u64 = 8 * 1024 * 1024;
 const CRASH_DEVICE_ALIGN: usize = 4096;
 
 fn make_volatile_harness() -> VolatileHarness {
-    let device = Arc::new(MemoryDevice::new_volatile(CRASH_DEVICE_SIZE, CRASH_DEVICE_ALIGN).unwrap());
+    let device =
+        Arc::new(MemoryDevice::new_volatile(CRASH_DEVICE_SIZE, CRASH_DEVICE_ALIGN).unwrap());
     let dev_dyn: Arc<dyn BlockDevice> = device.clone();
     let alloc = SlotAllocator::new(dev_dyn.clone()).unwrap();
     let index = Index::new(4096).unwrap();
@@ -1450,7 +1478,11 @@ fn immature_coinbase_spend_triggers_coinbase_immature() {
         }
     );
     let meta = engine.read_metadata(&tx_key(0)).unwrap();
-    assert_eq!({ meta.spent_utxos }, 0, "immature coinbase spend must not mutate");
+    assert_eq!(
+        { meta.spent_utxos },
+        0,
+        "immature coinbase spend must not mutate"
+    );
 }
 
 #[test]
@@ -1645,7 +1677,11 @@ fn deterministic_unspend_wrong_hash_is_hard_error() {
         run_engine(&engine, op);
     }
     let meta = engine.read_metadata(&tx_key(1)).unwrap();
-    assert_eq!({ meta.spent_utxos }, 1, "wrong-hash unspend must not unspend");
+    assert_eq!(
+        { meta.spent_utxos },
+        1,
+        "wrong-hash unspend must not unspend"
+    );
 }
 
 #[test]

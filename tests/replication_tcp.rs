@@ -1286,10 +1286,7 @@ fn write_majority_early_return_does_not_wait_for_slow_replica() {
     use teraslab::index::TxKey;
 
     // Helper: replica that sleeps `delay` before ACKing each batch.
-    fn spawn_delayed_ack(
-        rt: InMemoryTransport,
-        delay: Duration,
-    ) -> std::thread::JoinHandle<()> {
+    fn spawn_delayed_ack(rt: InMemoryTransport, delay: Duration) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             while let Ok(batch) = rt.recv_batch(Duration::from_secs(5)) {
                 std::thread::sleep(delay);
@@ -1341,7 +1338,8 @@ fn write_majority_early_return_does_not_wait_for_slow_replica() {
     }];
 
     let start = std::time::Instant::now();
-    mgr.replicate_batch(&ops).expect("majority ACK should succeed");
+    mgr.replicate_batch(&ops)
+        .expect("majority ACK should succeed");
     let elapsed = start.elapsed();
 
     // The two fast replicas ack at ~5ms; the slow one at ~500ms. With
@@ -1380,10 +1378,7 @@ fn write_majority_early_return_does_not_wait_for_slow_replica() {
 fn write_majority_early_return_with_slow_replica_first() {
     use teraslab::index::TxKey;
 
-    fn spawn_delayed_ack(
-        rt: InMemoryTransport,
-        delay: Duration,
-    ) -> std::thread::JoinHandle<()> {
+    fn spawn_delayed_ack(rt: InMemoryTransport, delay: Duration) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             while let Ok(batch) = rt.recv_batch(Duration::from_secs(5)) {
                 std::thread::sleep(delay);
@@ -1424,7 +1419,8 @@ fn write_majority_early_return_with_slow_replica_first() {
     }];
 
     let start = std::time::Instant::now();
-    mgr.replicate_batch(&ops).expect("majority ACK should succeed");
+    mgr.replicate_batch(&ops)
+        .expect("majority ACK should succeed");
     let elapsed = start.elapsed();
 
     assert!(
@@ -1651,7 +1647,10 @@ fn tcp_multi_replica_dense_streams_and_slow_replica_isolation() {
         node_id,
         0,
     );
-    assert!(err.is_err(), "send to a dead replica must fail, not fake-ACK");
+    assert!(
+        err.is_err(),
+        "send to a dead replica must fail, not fake-ACK"
+    );
 
     send_replica_ops_to(addr_a, &ops_n(6, 8), timeout, None, 0, node_id, 0).unwrap();
     assert_eq!(
@@ -1682,9 +1681,8 @@ fn tcp_burned_positions_heal_via_gap_nak_relabel() {
     // observable (idempotent across tests in this binary).
     static METRICS: std::sync::OnceLock<&'static teraslab::metrics::ReplicationMetrics> =
         std::sync::OnceLock::new();
-    let metrics = *METRICS.get_or_init(|| {
-        Box::leak(Box::new(teraslab::metrics::ReplicationMetrics::new()))
-    });
+    let metrics =
+        *METRICS.get_or_init(|| Box::leak(Box::new(teraslab::metrics::ReplicationMetrics::new())));
     teraslab::metrics::init_replication_metrics(metrics);
     let metrics = teraslab::metrics::replication_metrics().unwrap();
 
@@ -1782,10 +1780,7 @@ fn tcp_catchup_chunk_boundary_no_skip() {
             .spend(&teraslab::ops::spend::SpendRequest {
                 tx_key: key_from_txid(txid),
                 offset: 0,
-                utxo_hash: test_utxo_hash(
-                    u32::from_le_bytes(txid[0..4].try_into().unwrap()),
-                    0,
-                ),
+                utxo_hash: test_utxo_hash(u32::from_le_bytes(txid[0..4].try_into().unwrap()), 0),
                 spending_data: sd,
                 ignore_conflicting: false,
                 ignore_locked: false,
@@ -1807,17 +1802,7 @@ fn tcp_catchup_chunk_boundary_no_skip() {
         10_000,
         &move |_from| ops_for_cb.clone(),
         Some(1),
-        &|chunk| {
-            send_replica_ops_to(
-                addr,
-                chunk,
-                Duration::from_secs(5),
-                None,
-                0,
-                node_id,
-                0,
-            )
-        },
+        &|chunk| send_replica_ops_to(addr, chunk, Duration::from_secs(5), None, 0, node_id, 0),
     );
     assert_eq!(result.unwrap(), 12, "catch-up must cover redo seqs 1..=12");
 
@@ -1896,11 +1881,9 @@ fn tcp_restart_resumes_watermark_no_double_apply_no_gap() {
         let mut last_err = String::new();
         let mut started = None;
         for _ in 0..50 {
-            let r = ReplicationReceiver::with_ack_state(
-                replica_engine.clone(),
-                tracker_path.clone(),
-            )
-            .unwrap();
+            let r =
+                ReplicationReceiver::with_ack_state(replica_engine.clone(), tracker_path.clone())
+                    .unwrap();
             match r.start(&addr.to_string()) {
                 Ok(()) => {
                     started = Some(r);
@@ -1942,7 +1925,10 @@ fn tcp_restart_resumes_watermark_no_double_apply_no_gap() {
             .read_slot(&key_from_txid(test_txid(2500 + i)), 0)
             .unwrap();
         assert_eq!(slot.status, UTXO_SPENT, "op {i} applied");
-        assert_eq!(slot.spending_data[0], i as u8, "op {i} applied exactly once");
+        assert_eq!(
+            slot.spending_data[0], i as u8,
+            "op {i} applied exactly once"
+        );
     }
     receiver2.stop();
 }
@@ -2002,7 +1988,12 @@ fn tcp_acked_replica_reconciled_by_compensating_op() {
         cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &spend_batch);
-    assert_eq!(ack, ReplicaAck::Ok { through_sequence: 1 });
+    assert_eq!(
+        ack,
+        ReplicaAck::Ok {
+            through_sequence: 1
+        }
+    );
     assert_eq!(
         replica_engine.read_slot(&key, 0).unwrap().status,
         UTXO_SPENT,
@@ -2038,7 +2029,12 @@ fn tcp_acked_replica_reconciled_by_compensating_op() {
         cluster_key: 0,
     };
     let ack = send_replica_batch_tcp(replica_port, &comp_batch);
-    assert_eq!(ack, ReplicaAck::Ok { through_sequence: 2 });
+    assert_eq!(
+        ack,
+        ReplicaAck::Ok {
+            through_sequence: 2
+        }
+    );
 
     // The replica is reconciled to the rolled-back state, NOT left diverged.
     let slot = replica_engine.read_slot(&key, 0).unwrap();

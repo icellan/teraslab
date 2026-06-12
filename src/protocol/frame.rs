@@ -162,9 +162,7 @@ impl RequestFrame {
 /// the wire (length prefix + body). Shared between `decode` (borrowed)
 /// and `decode_bytes` (shared `Bytes`) so the validation logic stays
 /// single-source.
-fn parse_request_header(
-    data: &[u8],
-) -> Result<(u64, u16, u16, std::ops::Range<usize>, usize)> {
+fn parse_request_header(data: &[u8]) -> Result<(u64, u16, u16, std::ops::Range<usize>, usize)> {
     if data.len() < 4 {
         return Err(FrameError::TooShort {
             need: 4,
@@ -211,11 +209,10 @@ fn parse_request_header(
             declared: frame_size,
             actual: data.len(),
         })?);
-    let flags =
-        u16::from_le_bytes(data[14..16].try_into().map_err(|_| FrameError::Truncated {
-            declared: frame_size,
-            actual: data.len(),
-        })?);
+    let flags = u16::from_le_bytes(data[14..16].try_into().map_err(|_| FrameError::Truncated {
+        declared: frame_size,
+        actual: data.len(),
+    })?);
     Ok((request_id, op_code, flags, 16..frame_size, frame_size))
 }
 

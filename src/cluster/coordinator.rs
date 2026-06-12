@@ -10,9 +10,9 @@ use crate::ops::engine::Engine;
 use crate::protocol::frame::{RequestFrame, ResponseFrame};
 use crate::protocol::opcodes::*;
 use crate::redo::RedoLog;
+use parking_lot::{Mutex, RwLock};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 // All cluster-control-plane locks are parking_lot::{Mutex,RwLock}:
@@ -882,8 +882,7 @@ impl ClusterCoordinator {
                                 voter_current_term: topo_authority_event.committed_term(),
                             };
                             if let Some(commit) = topo_authority_event.handle_vote(&self_vote) {
-                                let active_members =
-                                    active_topology_members_event.read().clone();
+                                let active_members = active_topology_members_event.read().clone();
                                 if topology_commit_already_activated(
                                     commit.term,
                                     last_activated_term,
@@ -1170,10 +1169,7 @@ impl ClusterCoordinator {
                         persist_cluster_state(path, peak, term);
                     }
                     if let Some(ref path) = outbound_state_path_event {
-                        crate::cluster::migration::persist_outbound_state(
-                            path,
-                            &migration.lock(),
-                        );
+                        crate::cluster::migration::persist_outbound_state(path, &migration.lock());
                     }
                 }
 
@@ -1232,10 +1228,7 @@ impl ClusterCoordinator {
                         persist_cluster_state(path, peak, term);
                     }
                     if let Some(ref path) = outbound_state_path_event {
-                        crate::cluster::migration::persist_outbound_state(
-                            path,
-                            &migration.lock(),
-                        );
+                        crate::cluster::migration::persist_outbound_state(path, &migration.lock());
                     }
                 }
 
@@ -2997,11 +2990,9 @@ pub fn run_migration_chaos_test_batch(
     let migration = Arc::new(Mutex::new(MigrationManager::new()));
     let populated: std::collections::HashSet<u16> =
         keys.iter().map(ShardTable::shard_for_key).collect();
-    migration.lock().start_outbound(
-        std::slice::from_ref(&task),
-        task.from_node,
-        &populated,
-    );
+    migration
+        .lock()
+        .start_outbound(std::slice::from_ref(&task), task.from_node, &populated);
 
     let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
     let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -4032,7 +4023,10 @@ fn run_orphan_cleanup(
             format!("orphan_cleanup deleting {} key(s)", keys.len(),),
         );
         for key in &keys {
-            match engine.delete(&DeleteRequest { tx_key: *key, due_guard: None }) {
+            match engine.delete(&DeleteRequest {
+                tx_key: *key,
+                due_guard: None,
+            }) {
                 Ok(()) => total_deleted += 1,
                 Err(crate::ops::error::SpendError::TxNotFound) => {}
                 Err(e) => {
@@ -4098,7 +4092,10 @@ fn cleanup_orphaned_shard_if_settled(
     let keys = engine.keys_for_shard(shard);
     let mut deleted = 0u64;
     for key in &keys {
-        match engine.delete(&DeleteRequest { tx_key: *key, due_guard: None }) {
+        match engine.delete(&DeleteRequest {
+            tx_key: *key,
+            due_guard: None,
+        }) {
             Ok(()) => deleted += 1,
             Err(crate::ops::error::SpendError::TxNotFound) => {}
             Err(e) => {
@@ -6987,7 +6984,10 @@ mod tests {
 
         writer.join().unwrap();
         let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
-        assert!(total > 0, "readers must have observed at least one snapshot");
+        assert!(
+            total > 0,
+            "readers must have observed at least one snapshot"
+        );
 
         // Final settled state: all outputs spent.
         let (meta, slots) = engine.read_record_snapshot(&key).unwrap();
@@ -8159,11 +8159,9 @@ mod tests {
 
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
-        migration.lock().start_outbound(
-            std::slice::from_ref(&task),
-            old_master,
-            &populated,
-        );
+        migration
+            .lock()
+            .start_outbound(std::slice::from_ref(&task), old_master, &populated);
 
         let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -8377,11 +8375,9 @@ mod tests {
 
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
-        migration.lock().start_outbound(
-            std::slice::from_ref(&task),
-            old_master,
-            &populated,
-        );
+        migration
+            .lock()
+            .start_outbound(std::slice::from_ref(&task), old_master, &populated);
 
         let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -8561,11 +8557,9 @@ mod tests {
 
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let populated: std::collections::HashSet<u16> = [shard].into_iter().collect();
-        migration.lock().start_outbound(
-            std::slice::from_ref(&task),
-            old_master,
-            &populated,
-        );
+        migration
+            .lock()
+            .start_outbound(std::slice::from_ref(&task), old_master, &populated);
 
         let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
         let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());

@@ -67,7 +67,8 @@ impl RamDisk {
         };
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+            let stderr =
+                String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
             eprintln!(
                 "J-03 skip: `hdiutil attach -nomount {spec}` failed (status {:?}): {}",
                 output.status.code(),

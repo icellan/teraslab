@@ -71,6 +71,10 @@ mod tests {
         let mut sorted = all.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), all.len(), "wire signal bytes must be distinct");
+        assert_eq!(
+            sorted.len(),
+            all.len(),
+            "wire signal bytes must be distinct"
+        );
     }
 }

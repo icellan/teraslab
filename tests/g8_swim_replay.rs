@@ -149,7 +149,10 @@ fn out_of_order_within_window_accepted_once_each() {
 
     // Replay of seq 2 — must be rejected.
     let events = peer_b.handle_message_for_test(&msg2, addr_a, &sock_b);
-    assert!(events.is_empty(), "replay of late-but-accepted seq must fail");
+    assert!(
+        events.is_empty(),
+        "replay of late-but-accepted seq must fail"
+    );
 }
 
 /// E-1 regression: a rebooted node must rejoin.
@@ -197,12 +200,7 @@ fn rebooted_node_rejoins_after_high_seq_run() {
 
     // Reboot A: same NodeId, incarnation 2 (persisted_incarnation=1 ⇒
     // runner starts at 2), outbound seq restarts at 1.
-    let mut peer_a2 = SwimRunner::new(config_with_incarnation(
-        NodeId(1),
-        addr_a,
-        Some(secret),
-        1,
-    ));
+    let mut peer_a2 = SwimRunner::new(config_with_incarnation(NodeId(1), addr_a, Some(secret), 1));
     // seq=1 from the fresh run. Under the old keying this is <= highest
     // (2000) and would be dropped; under (NodeId, incarnation) keying the
     // higher incarnation resets the window and it is accepted.

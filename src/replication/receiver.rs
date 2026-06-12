@@ -396,8 +396,11 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
         // and would otherwise pin this handler thread and its
         // inflight-bytes reservation indefinitely. Mirrors the server
         // accept path's L-01 fix.
-        let mut deadline_stream =
-            DeadlineReader::new(&stream, Instant::now() + frame_deadline, RECEIVER_READ_TIMEOUT);
+        let mut deadline_stream = DeadlineReader::new(
+            &stream,
+            Instant::now() + frame_deadline,
+            RECEIVER_READ_TIMEOUT,
+        );
         // `verified_frame` carries the verified `[payload_len:4][payload]`
         // buffer when the auth path runs. The non-auth path leaves it
         // empty and `request_frame_bytes` borrows from `frame_bytes`.
@@ -441,8 +444,7 @@ fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: Connecti
             // double-prefix the HMAC input and reject every honest signed
             // frame. E-1: the chunked verify reads run through the deadline
             // reader so a drip-fed signed body cannot outlive the deadline.
-            let mut chained =
-                std::io::Cursor::new(head_slice).chain(&mut deadline_stream);
+            let mut chained = std::io::Cursor::new(head_slice).chain(&mut deadline_stream);
             // Pre-seed a 4-byte length-prefix slot so the resulting
             // buffer matches the `[payload_len:4][payload]` shape
             // `RequestFrame::decode` expects.
@@ -845,9 +847,7 @@ pub fn handle_replica_batch_with_tracker(
     // `true` when the per-stream dense-sequence bookkeeping applies.
     let tracked = !is_migration && !is_out_of_band;
 
-    let already_applied = applied
-        .map(|t| t.get(&effective_stream_key))
-        .unwrap_or(0);
+    let already_applied = applied.map(|t| t.get(&effective_stream_key)).unwrap_or(0);
 
     if tracked && applied.is_some() {
         // Watermark probe: an empty batch never applies anything and
@@ -1082,7 +1082,10 @@ fn apply_create_replica(
         Err(CreateError::DuplicateTxId)
             if existing_create_payload_matches(engine, create_req, metadata_bytes.len() >= 46) => {}
         Err(CreateError::DuplicateTxId) => {
-            match engine.delete(&DeleteRequest { tx_key: *tx_key, due_guard: None }) {
+            match engine.delete(&DeleteRequest {
+                tx_key: *tx_key,
+                due_guard: None,
+            }) {
                 Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
                 Err(e) => return Err(format!("replace duplicate create delete: {e}")),
             }
@@ -1695,7 +1698,10 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             apply_create_replica(engine, tx_key, &create_req, metadata_bytes, cold_data)
         }
         ReplicaOp::Delete { tx_key } => {
-            let req = DeleteRequest { tx_key: *tx_key, due_guard: None };
+            let req = DeleteRequest {
+                tx_key: *tx_key,
+                due_guard: None,
+            };
             match engine.delete(&req) {
                 Ok(()) => Ok(()),
                 Err(crate::ops::error::SpendError::TxNotFound) => Ok(()),
@@ -1796,9 +1802,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
             .set_record_generation(&tx_key, master_gen)
             .map_err(|e| format!("generation sync: {e}"))?
         {
-            return Err(format!(
-                "generation sync: tx {tx_key:?} absent after apply"
-            ));
+            return Err(format!("generation sync: tx {tx_key:?} absent after apply"));
         }
     }
 
@@ -2475,7 +2479,12 @@ mod tests {
         assert_eq!(response.request_id, 41);
         assert_eq!(response.status, STATUS_OK);
         let ack = ReplicaAck::deserialize(&response.payload).unwrap();
-        assert_eq!(ack, ReplicaAck::Ok { through_sequence: 2 });
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 2
+            }
+        );
 
         let slot = engine.read_slot(&key(223), 0).unwrap();
         assert_eq!(slot.status, UTXO_SPENT);
@@ -2618,12 +2627,26 @@ mod tests {
         create_record(&engine, k, 4);
 
         // Apply PruneSlot for offset 2 via the receiver.
-        apply_op(&engine, &ReplicaOp::PruneSlot { tx_key: k, offset: 2 }).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::PruneSlot {
+                tx_key: k,
+                offset: 2,
+            },
+        )
+        .unwrap();
         let slot = engine.read_slot(&k, 2).unwrap();
         assert_eq!(slot.status, UTXO_PRUNED, "PruneSlot must prune the slot");
 
         // Idempotent re-apply: already pruned → still pruned, no error.
-        apply_op(&engine, &ReplicaOp::PruneSlot { tx_key: k, offset: 2 }).unwrap();
+        apply_op(
+            &engine,
+            &ReplicaOp::PruneSlot {
+                tx_key: k,
+                offset: 2,
+            },
+        )
+        .unwrap();
         assert_eq!(engine.read_slot(&k, 2).unwrap().status, UTXO_PRUNED);
 
         // Missing tx → skip (no error).
@@ -5780,8 +5803,7 @@ mod tests {
     /// index entry exactly as the fully-cached GET fast path
     /// (`handle_get_batch`) does, so the test asserts what a client would see.
     fn cached_dah_preserve(entry: &TxIndexEntry) -> (u32, u32) {
-        let has_preserve =
-            entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
+        let has_preserve = entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
         if has_preserve {
             (0, entry.dah_or_preserve)
         } else {
@@ -5818,7 +5840,9 @@ mod tests {
         );
 
         // Primary cached field matches the slow path.
-        let entry = engine.lookup(&k).expect("entry present after migrated create");
+        let entry = engine
+            .lookup(&k)
+            .expect("entry present after migrated create");
         assert_eq!(
             entry.unmined_since,
             { meta.unmined_since },
@@ -5835,12 +5859,7 @@ mod tests {
         let k = key(2);
         let dah = 800_000u32;
 
-        apply_migrated_create(
-            &engine,
-            k,
-            migration_metadata_bytes(3, 999, 0, dah, 0),
-        )
-        .unwrap();
+        apply_migrated_create(&engine, k, migration_metadata_bytes(3, 999, 0, dah, 0)).unwrap();
 
         let meta = engine.read_metadata(&k).unwrap();
         assert_eq!({ meta.delete_at_height }, dah);
@@ -5854,7 +5873,10 @@ mod tests {
         );
         // At a height before the DAH, it must NOT be due yet.
         let not_due = engine.dah_index().range_query(dah - 1);
-        assert!(!not_due.contains(&k), "DAH record not due before its height");
+        assert!(
+            !not_due.contains(&k),
+            "DAH record not due before its height"
+        );
 
         // Primary cached field reflects the DAH.
         let entry = engine.lookup(&k).expect("entry present");
@@ -5872,12 +5894,8 @@ mod tests {
         let k = key(3);
         let preserve = 900_000u32;
 
-        apply_migrated_create(
-            &engine,
-            k,
-            migration_metadata_bytes(5, 555, 0, 0, preserve),
-        )
-        .unwrap();
+        apply_migrated_create(&engine, k, migration_metadata_bytes(5, 555, 0, 0, preserve))
+            .unwrap();
 
         let meta = engine.read_metadata(&k).unwrap();
         assert_eq!({ meta.preserve_until }, preserve);
@@ -5886,10 +5904,7 @@ mod tests {
         // Preserved record carries delete_at_height = 0, so it must be absent
         // from the DAH sweep even at u32::MAX.
         let due = engine.dah_index().range_query(u32::MAX);
-        assert!(
-            !due.contains(&k),
-            "preserved record must not be DAH-swept",
-        );
+        assert!(!due.contains(&k), "preserved record must not be DAH-swept",);
 
         // Cached path surfaces preserve_until via the HAS_PRESERVE_UNTIL bit.
         let entry = engine.lookup(&k).expect("entry present");
@@ -5898,7 +5913,10 @@ mod tests {
             "HAS_PRESERVE_UNTIL discriminant must be set in the cached flags",
         );
         let (cached_dah, cached_preserve) = cached_dah_preserve(&entry);
-        assert_eq!(cached_preserve, preserve, "cached preserve_until must match");
+        assert_eq!(
+            cached_preserve, preserve,
+            "cached preserve_until must match"
+        );
         assert_eq!(cached_dah, 0);
     }
 

@@ -253,8 +253,7 @@ impl RedoHeader {
         } else {
             (0u64, 28)
         };
-        let stored_crc =
-            u32::from_le_bytes(data[crc_off..crc_off + 4].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(data[crc_off..crc_off + 4].try_into().unwrap());
         let computed = crc32fast::hash(&data[..crc_off]);
         if stored_crc != computed {
             return Err(RedoError::HeaderCrcMismatch {
@@ -4776,7 +4775,10 @@ mod tests {
         }
         // Retain only the final entry → small copy that fits the front gap.
         log.compact_prefix_through(seq - 1).unwrap();
-        assert_eq!(log.logical_start, 0, "second compaction reused the front gap");
+        assert_eq!(
+            log.logical_start, 0,
+            "second compaction reused the front gap"
+        );
         let high = log.current_sequence();
         drop(log);
 

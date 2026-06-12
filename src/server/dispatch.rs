@@ -856,7 +856,10 @@ pub(crate) fn handle_request(
                     if expected_keys.contains(&key) {
                         continue;
                     }
-                    match engine.delete(&crate::ops::remaining::DeleteRequest { tx_key: key, due_guard: None }) {
+                    match engine.delete(&crate::ops::remaining::DeleteRequest {
+                        tx_key: key,
+                        due_guard: None,
+                    }) {
                         Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
                         Err(e) => {
                             return error_response(
@@ -2580,9 +2583,8 @@ fn compensate_replication_failure(
                             &restored,
                         ) && restore_write_err.is_none()
                         {
-                            restore_write_err = Some(format!(
-                                "reassign rollback slot-restore write failed: {e}"
-                            ));
+                            restore_write_err =
+                                Some(format!("reassign rollback slot-restore write failed: {e}"));
                         }
                     }
                     // Forward redo entry mirrors the engine call so a
@@ -2711,7 +2713,10 @@ fn compensate_replication_failure(
                     });
                 }
                 ReplicaOp::Create { .. } => {
-                    let req = crate::ops::remaining::DeleteRequest { tx_key: *key, due_guard: None };
+                    let req = crate::ops::remaining::DeleteRequest {
+                        tx_key: *key,
+                        due_guard: None,
+                    };
                     let _ = engine.delete(&req);
                     comp_redo.push(RedoOp::Delete {
                         tx_key: *key,
@@ -2841,7 +2846,8 @@ where
             continue;
         };
         let shard = ShardTable::shard_for_key(&tx_key);
-        if let Some(op) = crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
+        if let Some(op) =
+            crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
         {
             ops_by_key.push((tx_key, vec![op]));
         }
@@ -2892,13 +2898,10 @@ fn compensate_replication_failure_or_error(
     // outstanding until that reconciliation reaches its durability bar.
     if let Some(comp_range) = comp_range {
         let tracker = REPLICATION_INTENT_TRACKER.get();
-        let replicate_result = replicate_compensation_intent(
-            tracker,
-            redo_log,
-            engine,
-            comp_range,
-            |ops, range| replicate_all_ops(cluster, ops, range, &[]).map(|_| ()),
-        );
+        let replicate_result =
+            replicate_compensation_intent(tracker, redo_log, engine, comp_range, |ops, range| {
+                replicate_all_ops(cluster, ops, range, &[]).map(|_| ())
+            });
         if let Err(cause) = replicate_result {
             // The compensation intent (if registered) is durable and stays
             // pending; startup / catch-up will re-drive the reconciliation.
@@ -3104,8 +3107,7 @@ pub fn send_replica_ops_to(
                 source_node_id: Some(source_node_id),
                 cluster_key,
             };
-            match exchange_replica_batch(&mut slot_guard, addr, &probe, ack_timeout, auth_secret)?
-            {
+            match exchange_replica_batch(&mut slot_guard, addr, &probe, ack_timeout, auth_secret)? {
                 ReplicaAck::Ok { through_sequence } => {
                     let n = through_sequence + 1;
                     slot_guard.next_sequence = Some(n);
@@ -3128,18 +3130,18 @@ pub fn send_replica_ops_to(
         };
         let last = batch.last_sequence();
 
-        let ack = match exchange_replica_batch(&mut slot_guard, addr, &batch, ack_timeout, auth_secret)
-        {
-            Ok(ack) => ack,
-            Err(e) => {
-                // Burn the assigned positions: the frame may have been
-                // applied with the ACK lost in flight. Reusing the
-                // positions for different content could be dedup-skipped
-                // by the receiver; a hole heals via Gap/relabel instead.
-                slot_guard.next_sequence = Some(last + 1);
-                return Err(e);
-            }
-        };
+        let ack =
+            match exchange_replica_batch(&mut slot_guard, addr, &batch, ack_timeout, auth_secret) {
+                Ok(ack) => ack,
+                Err(e) => {
+                    // Burn the assigned positions: the frame may have been
+                    // applied with the ACK lost in flight. Reusing the
+                    // positions for different content could be dedup-skipped
+                    // by the receiver; a hole heals via Gap/relabel instead.
+                    slot_guard.next_sequence = Some(last + 1);
+                    return Err(e);
+                }
+            };
 
         match ack {
             ReplicaAck::Ok { through_sequence } if through_sequence == last => {
@@ -7272,18 +7274,17 @@ fn handle_process_expired(
     };
     // C-1: forward the exclusive visibility barrier so the nested delete
     // releases it before its own replication fan-out.
-    let delete_resp =
-        handle_delete_batch(
-            &delete_req,
-            engine,
-            max_batch,
-            cluster,
-            redo_log,
-            barrier,
-            // KO-3: gate each delete on a fresh under-lock due re-validation
-            // so a preservation that lands between Phase 1 and here wins.
-            Some(current_height),
-        );
+    let delete_resp = handle_delete_batch(
+        &delete_req,
+        engine,
+        max_batch,
+        cluster,
+        redo_log,
+        barrier,
+        // KO-3: gate each delete on a fresh under-lock due re-validation
+        // so a preservation that lands between Phase 1 and here wins.
+        Some(current_height),
+    );
 
     // Collapse the OP_DELETE_BATCH response shape into the legacy
     // (deleted:u32, failed:u32) format that
@@ -8240,9 +8241,7 @@ mod tests {
     use crate::device::{BlockDevice, MemoryDevice, ReadFailingDevice};
     use crate::index::redb_dah::RedbDahIndex;
     use crate::index::redb_unmined::RedbUnminedIndex;
-    use crate::index::{
-        DahBackend, DahIndex, Index, PrimaryBackend, UnminedBackend, UnminedIndex,
-    };
+    use crate::index::{DahBackend, DahIndex, Index, PrimaryBackend, UnminedBackend, UnminedIndex};
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
     use std::sync::Arc;
@@ -8832,7 +8831,10 @@ mod tests {
             })
             .collect();
         let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &items));
-        assert_eq!(resp.status, STATUS_OK, "spend-all must succeed for {txid:?}");
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "spend-all must succeed for {txid:?}"
+        );
     }
 
     /// Encode the `OP_PROCESS_EXPIRED_PRESERVATIONS` payload with an explicit
@@ -8901,7 +8903,10 @@ mod tests {
         );
         assert_eq!(resp.status, STATUS_OK);
         let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
-        assert_eq!(deleted, 0, "expired preservation is scheduled, not yet swept");
+        assert_eq!(
+            deleted, 0,
+            "expired preservation is scheduled, not yet swept"
+        );
         let meta = h.engine.read_metadata(&key).unwrap();
         assert_eq!(
             { meta.preserve_until },
@@ -8995,7 +9000,10 @@ mod tests {
         );
         assert_eq!(resp.status, STATUS_OK);
         let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
-        assert_eq!(deleted, 1, "conflicting record with due DAH must be deleted");
+        assert_eq!(
+            deleted, 1,
+            "conflicting record with due DAH must be deleted"
+        );
         assert!(
             h.engine.lookup(&key).is_none(),
             "conflicting record swept (KO-2)"
@@ -9148,7 +9156,10 @@ mod tests {
                 spending_data: [(0xC0 + i as u8); 36],
             })
             .collect();
-        let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&spend_params, &spend_items));
+        let resp = h.request(
+            OP_SPEND_BATCH,
+            encode_spend_batch(&spend_params, &spend_items),
+        );
         assert_eq!(resp.status, STATUS_OK, "spend must succeed on {mode:?}");
         assert_eq!(
             { h.engine.read_metadata(&key).unwrap().spent_utxos },
@@ -9572,28 +9583,28 @@ mod tests {
         let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
 
         const CAP: usize = 4;
-        let mut conn_state =
-            crate::server::ConnectionState::new().with_max_active_streams(CAP);
+        let mut conn_state = crate::server::ConnectionState::new().with_max_active_streams(CAP);
 
         // Helper: open a new stream by sending one chunk at offset 0.
-        let open_stream = |conn_state: &mut crate::server::ConnectionState, n: u8| -> ResponseFrame {
-            let txid = DispatchTestHarness::make_txid(n);
-            let req = RequestFrame {
-                request_id: n as u64,
-                op_code: OP_STREAM_CHUNK,
-                flags: 0,
-                payload: encode_stream_chunk(&txid, 0, &[0xABu8; 8]).into(),
+        let open_stream =
+            |conn_state: &mut crate::server::ConnectionState, n: u8| -> ResponseFrame {
+                let txid = DispatchTestHarness::make_txid(n);
+                let req = RequestFrame {
+                    request_id: n as u64,
+                    op_code: OP_STREAM_CHUNK,
+                    flags: 0,
+                    payload: encode_stream_chunk(&txid, 0, &[0xABu8; 8]).into(),
+                };
+                handle_request(
+                    &req,
+                    &h.engine,
+                    8192,
+                    None,
+                    None,
+                    conn_state,
+                    Some(&*blob_store),
+                )
             };
-            handle_request(
-                &req,
-                &h.engine,
-                8192,
-                None,
-                None,
-                conn_state,
-                Some(&*blob_store),
-            )
-        };
 
         // Open exactly CAP distinct streams — all must succeed.
         for n in 0..CAP as u8 {
@@ -9654,8 +9665,7 @@ mod tests {
             Some(&*blob_store),
         );
         assert_eq!(
-            resp.status,
-            STATUS_OK,
+            resp.status, STATUS_OK,
             "existing stream must keep accepting chunks after an over-cap reject",
         );
     }
@@ -9670,8 +9680,7 @@ mod tests {
 
         let h = DispatchTestHarness::new();
         let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
-        let mut conn_state =
-            crate::server::ConnectionState::new().with_max_active_streams(0);
+        let mut conn_state = crate::server::ConnectionState::new().with_max_active_streams(0);
 
         for n in 0..32u8 {
             let txid = DispatchTestHarness::make_txid(n);
@@ -9704,7 +9713,9 @@ mod tests {
     /// stream id is treated as a fresh/unknown stream — not the old session.
     #[test]
     fn reap_idle_streams_removes_only_stale_sessions() {
-        use crate::protocol::codec::{decode_error_payload, encode_stream_chunk, encode_stream_end};
+        use crate::protocol::codec::{
+            decode_error_payload, encode_stream_chunk, encode_stream_end,
+        };
         use crate::protocol::opcodes::{ERR_STREAM_NOT_FOUND, OP_STREAM_CHUNK, OP_STREAM_END};
         use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
         use std::time::{Duration, Instant};
@@ -9783,8 +9794,7 @@ mod tests {
 
         let h = DispatchTestHarness::new();
         let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(MemoryBlobStore::new());
-        let mut conn_state =
-            crate::server::ConnectionState::new().with_stream_idle_timeout(None);
+        let mut conn_state = crate::server::ConnectionState::new().with_stream_idle_timeout(None);
 
         let txid = DispatchTestHarness::make_txid(7);
         let req = RequestFrame {
@@ -11053,9 +11063,8 @@ mod tests {
         // redirect error is read from the error section of that envelope
         // rather than the bare sparse-error form.
         assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
-        let (_successes, errs) =
-            crate::protocol::codec::decode_partial_with_signals(&resp.payload)
-                .expect("set_mined redirect response must decode as partial-with-signals");
+        let (_successes, errs) = crate::protocol::codec::decode_partial_with_signals(&resp.payload)
+            .expect("set_mined redirect response must decode as partial-with-signals");
         assert_eq!(errs.len(), 1, "exactly one redirected item");
         assert_eq!(errs[0].error_code, ERR_REDIRECT);
 
@@ -11181,8 +11190,7 @@ mod tests {
         let results = crate::protocol::codec::decode_get_response(&resp.payload).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].status,
-            ERR_NO_QUORUM as u8,
+            results[0].status, ERR_NO_QUORUM as u8,
             "master address unknown must yield retryable ERR_NO_QUORUM, not an \
              empty-address ERR_REDIRECT",
         );
@@ -12779,7 +12787,10 @@ mod tests {
                             ResponseFrame {
                                 request_id: req.request_id,
                                 status: STATUS_OK,
-                                payload: ReplicaAck::Ok { through_sequence: 0 }.serialize(),
+                                payload: ReplicaAck::Ok {
+                                    through_sequence: 0,
+                                }
+                                .serialize(),
                             }
                         } else {
                             match behaviour {
@@ -14254,9 +14265,7 @@ mod tests {
 
     /// Helper: decode a `OP_SET_MINED_BATCH` response payload into its
     /// (successes, errors) sections, failing the test on a malformed payload.
-    fn decode_set_mined_response(
-        payload: &[u8],
-    ) -> (Vec<BatchItemSuccess>, Vec<BatchItemError>) {
+    fn decode_set_mined_response(payload: &[u8]) -> (Vec<BatchItemSuccess>, Vec<BatchItemError>) {
         decode_partial_with_signals(payload)
             .expect("set_mined response payload must decode as partial-with-signals")
     }
@@ -14328,12 +14337,18 @@ mod tests {
         };
 
         // Mine into block 42 (longest chain) then block 43 (a side chain).
-        let r1 = h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&mk(42, true), &[txid]));
+        let r1 = h.request(
+            OP_SET_MINED_BATCH,
+            encode_set_mined_batch(&mk(42, true), &[txid]),
+        );
         assert_eq!(r1.status, STATUS_OK);
         let (s1, _) = decode_set_mined_response(&r1.payload);
         assert_eq!(s1[0].block_ids, vec![42]);
 
-        let r2 = h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&mk(43, false), &[txid]));
+        let r2 = h.request(
+            OP_SET_MINED_BATCH,
+            encode_set_mined_batch(&mk(43, false), &[txid]),
+        );
         assert_eq!(r2.status, STATUS_OK);
         let (s2, _) = decode_set_mined_response(&r2.payload);
         assert_eq!(
@@ -14368,13 +14383,19 @@ mod tests {
 
         // Mine into 42 and 43.
         assert_eq!(
-            h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&set(42, true, false), &[txid]))
-                .status,
+            h.request(
+                OP_SET_MINED_BATCH,
+                encode_set_mined_batch(&set(42, true, false), &[txid])
+            )
+            .status,
             STATUS_OK
         );
         assert_eq!(
-            h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&set(43, false, false), &[txid]))
-                .status,
+            h.request(
+                OP_SET_MINED_BATCH,
+                encode_set_mined_batch(&set(43, false, false), &[txid])
+            )
+            .status,
             STATUS_OK
         );
 
@@ -17216,8 +17237,11 @@ mod tests {
             }],
         )];
 
-        let err = compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
-            .expect_err("DC-1: a failed slot-restore write must surface as Err, not be swallowed");
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err(
+                    "DC-1: a failed slot-restore write must surface as Err, not be swallowed",
+                );
         assert!(
             err.contains("reassign rollback slot-restore write failed"),
             "error must identify the swallowed slot-restore write; got {err:?}"
@@ -17306,8 +17330,9 @@ mod tests {
             }],
         )];
 
-        let err = compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
-            .expect_err("DC-1: prune slot-restore write failure must surface as Err");
+        let err =
+            compensate_replication_failure(&engine, &repl_ops, &before_images, Some(&redo_log))
+                .expect_err("DC-1: prune slot-restore write failure must surface as Err");
         assert!(
             err.contains("prune rollback slot-restore write failed"),
             "error must identify the swallowed prune restore write; got {err:?}"

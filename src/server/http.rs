@@ -8,8 +8,8 @@ use crate::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
 use crate::index::TxKey;
 use crate::metrics::{
     LatencyHistogram, MAX_REPLICAS, MigrationLabel, OpCode, OpOutcomeCounters, Outcome,
-    SwimChurnKind, ThreadHistograms, ThreadMetrics, allocator_metrics,
-    migration_metrics, redo_metrics, replication_metrics, swim_metrics,
+    SwimChurnKind, ThreadHistograms, ThreadMetrics, allocator_metrics, migration_metrics,
+    redo_metrics, replication_metrics, swim_metrics,
 };
 use crate::observability::WireTraceContext;
 use crate::ops::engine::Engine;
@@ -3195,9 +3195,9 @@ mod tests {
     #[test]
     fn prometheus_emits_all_new_metrics() {
         use crate::metrics::{
-            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
-            SwimMetrics, init_allocator_metrics, init_migration_metrics,
-            init_redo_metrics, init_replication_metrics, init_swim_metrics,
+            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics,
+            init_allocator_metrics, init_migration_metrics, init_redo_metrics,
+            init_replication_metrics, init_swim_metrics,
         };
         use std::sync::OnceLock;
 
@@ -3269,9 +3269,9 @@ mod tests {
         use crate::index::{DahIndex, Index, UnminedIndex};
         use crate::locks::StripedLocks;
         use crate::metrics::{
-            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
-            SwimMetrics, init_allocator_metrics, init_migration_metrics,
-            init_redo_metrics, init_replication_metrics, init_swim_metrics,
+            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics,
+            init_allocator_metrics, init_migration_metrics, init_redo_metrics,
+            init_replication_metrics, init_swim_metrics,
         };
         use crate::ops::engine::Engine;
         use std::sync::OnceLock;
@@ -3355,9 +3355,9 @@ mod tests {
         use crate::index::{DahIndex, Index, UnminedIndex};
         use crate::locks::StripedLocks;
         use crate::metrics::{
-            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
-            SwimMetrics, init_allocator_metrics, init_migration_metrics,
-            init_redo_metrics, init_replication_metrics, init_swim_metrics,
+            AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics,
+            init_allocator_metrics, init_migration_metrics, init_redo_metrics,
+            init_replication_metrics, init_swim_metrics,
         };
         use crate::ops::engine::Engine;
         use std::sync::OnceLock;
@@ -3779,11 +3779,15 @@ mod tests {
 
         // Instance A: cached verdict "exceeds = true".
         let state_a = make_state();
-        state_a.replica_lag_cache.store(seed_true, Ordering::Relaxed);
+        state_a
+            .replica_lag_cache
+            .store(seed_true, Ordering::Relaxed);
 
         // Instance B: cached verdict "exceeds = false".
         let state_b = make_state();
-        state_b.replica_lag_cache.store(seed_false, Ordering::Relaxed);
+        state_b
+            .replica_lag_cache
+            .store(seed_false, Ordering::Relaxed);
 
         // Each instance must return ITS OWN cached verdict within the TTL.
         // A process-global cache would make both read whichever was stored

@@ -480,7 +480,10 @@ fn wire_parsers_survive_random_and_mutated_input() {
     );
 
     let total_inputs = (RANDOM_ITERS + produced) as u64;
-    eprintln!("wire_fuzz_smoke: {total_inputs} inputs through {} decoders", counts.0.len());
+    eprintln!(
+        "wire_fuzz_smoke: {total_inputs} inputs through {} decoders",
+        counts.0.len()
+    );
     for name in expected_decoders {
         let t = counts.0.get(name).copied().unwrap_or_default();
         eprintln!("  {name}: ok={} err={}", t.ok, t.err);
@@ -489,8 +492,14 @@ fn wire_parsers_survive_random_and_mutated_input() {
             total_inputs,
             "{name}: was not invoked on every input"
         );
-        assert!(t.ok > 0, "{name}: never returned Ok — harness lacks valid input for it");
-        assert!(t.err > 0, "{name}: never returned Err — harness lacks hostile input for it");
+        assert!(
+            t.ok > 0,
+            "{name}: never returned Ok — harness lacks valid input for it"
+        );
+        assert!(
+            t.err > 0,
+            "{name}: never returned Err — harness lacks hostile input for it"
+        );
     }
 }
 

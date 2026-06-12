@@ -317,7 +317,8 @@ impl ProxyNet {
         let shared = self.shared.clone();
         let udp_handle = std::thread::spawn(move || udp_relay_loop(node_id, udp_main, &shared));
         let shared = self.shared.clone();
-        let tcp_handle = std::thread::spawn(move || tcp_accept_loop(node_id, tcp_listener, &shared));
+        let tcp_handle =
+            std::thread::spawn(move || tcp_accept_loop(node_id, tcp_listener, &shared));
         let mut threads = self.threads.lock().unwrap();
         threads.push(udp_handle);
         threads.push(tcp_handle);
@@ -330,7 +331,12 @@ impl ProxyNet {
 
     /// Drop all UDP datagrams flowing `from → to` (one direction only).
     pub fn drop_udp_one_way(&self, from: u64, to: u64) {
-        self.shared.rules.lock().unwrap().udp_drop.insert((from, to));
+        self.shared
+            .rules
+            .lock()
+            .unwrap()
+            .udp_drop
+            .insert((from, to));
     }
 
     /// Restore UDP passing `from → to`.

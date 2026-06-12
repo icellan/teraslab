@@ -808,7 +808,10 @@ mod tests {
         }
         let primary = RedbPrimary::open(&db_path, 64 * 1024 * 1024).unwrap();
         assert_eq!(primary.len(), 50, "all flushed entries must survive reopen");
-        let e = primary.lookup(&make_key(7)).unwrap().expect("entry present");
+        let e = primary
+            .lookup(&make_key(7))
+            .unwrap()
+            .expect("entry present");
         assert_eq!(e.record_offset, 7 * 4096);
     }
 

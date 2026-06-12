@@ -807,8 +807,7 @@ impl SlotAllocator {
                 // calls would silently leave fragmentation. Coalescing
                 // here keeps the freelist invariant ("no two adjacent
                 // free regions") in lockstep with `free()`.
-                let (final_offset, final_size) =
-                    self.coalesce_adjacent(alloc_offset, region_size);
+                let (final_offset, final_size) = self.coalesce_adjacent(alloc_offset, region_size);
                 self.freelist.insert(final_offset, final_size);
                 self.freelist.maybe_promote();
             }
@@ -2491,7 +2490,10 @@ mod tests {
         alloc.__test_force_push_free_region(base + 2 * 4096, 4096);
 
         let (off, sz) = alloc.coalesce_adjacent(base + 4096, 4096);
-        assert_eq!(off, base, "coalesce must extend backward to the prev region");
+        assert_eq!(
+            off, base,
+            "coalesce must extend backward to the prev region"
+        );
         assert_eq!(sz, 12288, "all three contiguous regions must merge");
         assert_eq!(
             alloc.free_region_count(),

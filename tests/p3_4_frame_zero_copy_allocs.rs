@@ -129,8 +129,8 @@ fn decode_bytes_allocates_strictly_less_than_decode() {
         baseline_bytes >= zero_copy_bytes,
         "baseline must allocate at least as many bytes as zero-copy: {baseline_bytes} vs {zero_copy_bytes}"
     );
-    let saved = baseline_bytes.saturating_sub(zero_copy_bytes) as f64
-        / baseline_bytes.max(1) as f64;
+    let saved =
+        baseline_bytes.saturating_sub(zero_copy_bytes) as f64 / baseline_bytes.max(1) as f64;
     assert!(
         saved >= 0.20,
         "expected ≥20% byte-allocation reduction on hot opcodes, observed {:.1}% \

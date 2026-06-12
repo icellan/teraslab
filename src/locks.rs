@@ -347,7 +347,8 @@ mod tests {
         // relocates it. We scan several seeds to make the assertion
         // deterministic rather than relying on a single 1/65536 draw.
         let base = s1.stripe_index(&t1);
-        let relocated = (9u64..30).any(|s| StripedLocks::with_seed(65536, s).stripe_index(&t1) != base);
+        let relocated =
+            (9u64..30).any(|s| StripedLocks::with_seed(65536, s).stripe_index(&t1) != base);
         assert!(
             relocated,
             "a different seed must relocate the stripe for the same bytes"

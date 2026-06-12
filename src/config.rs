@@ -789,8 +789,7 @@ impl Default for ServerConfig {
             max_connections: 1024,
             max_connections_per_ip: 64,
             max_stream_total_bytes: Self::DEFAULT_MAX_STREAM_TOTAL_BYTES,
-            max_active_streams_per_connection:
-                Self::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+            max_active_streams_per_connection: Self::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
             stream_idle_timeout_secs: Self::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             max_inflight_request_bytes: 256 * 1024 * 1024,
             http_listen_addr: "127.0.0.1:9100".to_string(),
@@ -2218,13 +2217,8 @@ replication_factor = 1
 
     #[test]
     fn split_cluster_secret_cluster_only_is_rejected() {
-        let err = check_cluster_secret_agreement(
-            None,
-            Some(b"0123456789abcdef"),
-            true,
-            true,
-        )
-        .expect_err("cluster secret set but server secret unset must be rejected");
+        let err = check_cluster_secret_agreement(None, Some(b"0123456789abcdef"), true, true)
+            .expect_err("cluster secret set but server secret unset must be rejected");
         match err {
             ConfigError::ClusterSecretMismatch {
                 server_state,

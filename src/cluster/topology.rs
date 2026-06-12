@@ -2684,8 +2684,8 @@ mod tests {
     /// barrier maximises the overlap of the decision windows.
     #[test]
     fn handle_propose_grants_at_most_one_vote_per_term_concurrently() {
-        use std::sync::atomic::AtomicU64 as TestAtomicU64;
         use std::sync::Barrier;
+        use std::sync::atomic::AtomicU64 as TestAtomicU64;
 
         const THREADS: usize = 8;
         const ROUNDS: usize = 2_000;

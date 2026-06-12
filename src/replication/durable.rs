@@ -1094,9 +1094,9 @@ mod tests {
             tracker_static,
             current_seq_fn,
             shutdown.clone(),
-            1,         // 1s interval
-            u64::MAX,  // suppress warn lines
-            10,        // catch-up threshold: 10 ops
+            1,        // 1s interval
+            u64::MAX, // suppress warn lines
+            10,       // catch-up threshold: 10 ops
             Some(on_lagging),
         );
 

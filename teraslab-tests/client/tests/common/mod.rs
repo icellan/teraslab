@@ -2126,8 +2126,7 @@ pub async fn wait_migrations_complete_with_diag(
                 .iter()
                 .map(|&n| format!("127.0.0.1:{}", docker.client_port(n)))
                 .collect();
-            let dump =
-                collect_admin_diagnose_dump(client, &node_addrs, &node_nums, &failing).await;
+            let dump = collect_admin_diagnose_dump(client, &node_addrs, &node_nums, &failing).await;
             let base = match &e {
                 ClientError::Connection(s) => s.clone(),
                 other => other.to_string(),

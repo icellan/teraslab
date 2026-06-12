@@ -1300,7 +1300,11 @@ fn cmd_export_index(
                  before exporting",
                 cfg.index_snapshot_path.display()
             );
-            (primary, DahBackend::from(dah), UnminedBackend::from(unmined))
+            (
+                primary,
+                DahBackend::from(dah),
+                UnminedBackend::from(unmined),
+            )
         }
         IndexBackendMode::FileBacked => {
             return Err(CliError::Other(
@@ -1409,8 +1413,7 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
         IndexBackendMode::Redb => {
             if teraslab::index::migration::import_in_progress(&cfg.index) {
                 return Err(CliError::Other(
-                    "a previous import-index was interrupted; resolve it before repair"
-                        .to_string(),
+                    "a previous import-index was interrupted; resolve it before repair".to_string(),
                 ));
             }
             PrimaryBackend::restore_redb(&cfg.index)?
@@ -1453,9 +1456,7 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
         let unrecoverable: Vec<serde_json::Value> = report
             .unrecoverable
             .iter()
-            .map(|(txid, slot)| {
-                serde_json::json!({ "txid": hex_encode(txid), "slot": slot })
-            })
+            .map(|(txid, slot)| serde_json::json!({ "txid": hex_encode(txid), "slot": slot }))
             .collect();
         println!(
             "{}",
@@ -1467,8 +1468,14 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
             })
         );
     } else {
-        println!("scanned {} spend/unspend redo entries", report.entries_scanned);
-        println!("repaired {} torn slot(s) from the redo log", report.slots_repaired);
+        println!(
+            "scanned {} spend/unspend redo entries",
+            report.entries_scanned
+        );
+        println!(
+            "repaired {} torn slot(s) from the redo log",
+            report.slots_repaired
+        );
         if report.missing_primary > 0 {
             println!(
                 "{} entr(ies) had no primary index record (deleted later) — skipped",

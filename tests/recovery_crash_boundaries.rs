@@ -846,7 +846,11 @@ fn boundary_unset_mined_inline_entry_pulls_overflow_into_inline() {
     assert_eq!({ m.block_entry_count }, 3);
     let mut ids = inline_block_ids(&m);
     ids.sort_unstable();
-    assert_eq!(ids, vec![1, 3, 4], "overflow entry 4 pulled inline after 2 removed");
+    assert_eq!(
+        ids,
+        vec![1, 3, 4],
+        "overflow entry 4 pulled inline after 2 removed"
+    );
     assert_eq!({ m.block_overflow_offset }, 0);
 }
 

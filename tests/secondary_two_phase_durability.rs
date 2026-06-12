@@ -418,8 +418,7 @@ fn restart_rebuilds_primary_from_device_then_reconciles_secondaries() {
     // and the persisted allocator high-water mark survive. Reconstruct the
     // primary from a device scan, just like startup's rebuild path.
     let idx_path = dir.path().join("primary.idx");
-    let mut primary =
-        PrimaryBackend::rebuild_file_backed(&idx_path, &*data_dev, &alloc).unwrap();
+    let mut primary = PrimaryBackend::rebuild_file_backed(&idx_path, &*data_dev, &alloc).unwrap();
 
     // The rebuilt primary must contain both records found on the device.
     assert!(

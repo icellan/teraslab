@@ -873,9 +873,8 @@ mod tests {
             128,
             500,
         );
-        let cfg: ServerConfig = toml::from_str(&rendered).expect(
-            "rendered docker node config must be a valid ServerConfig TOML payload",
-        );
+        let cfg: ServerConfig = toml::from_str(&rendered)
+            .expect("rendered docker node config must be a valid ServerConfig TOML payload");
         // The opt-out must be present in the rendered TOML and must
         // round-trip through `serde::Deserialize` into the in-memory
         // struct. Without it, `validate_safe_defaults` would reject
@@ -913,8 +912,7 @@ mod tests {
             cfg.node_id, 0,
             "default config must be single-node (node_id = 0)",
         );
-        cfg.validate_safe_defaults().expect(
-            "F-X-002: single-node default config must validate without a cluster_secret",
-        );
+        cfg.validate_safe_defaults()
+            .expect("F-X-002: single-node default config must validate without a cluster_secret");
     }
 }

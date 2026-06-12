@@ -251,7 +251,12 @@ pub fn stress_device_fill_and_churn() {
         let key = TxKey {
             txid: make_tx_id(i),
         };
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
     }
 
     // Re-create in freed space

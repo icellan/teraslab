@@ -87,8 +87,8 @@ use teraslab::ops::remaining::{
 use teraslab::ops::set_mined::SetMinedRequest;
 use teraslab::ops::spend::SpendRequest;
 use teraslab::ops::unspend::UnspendRequest;
-use teraslab::recovery::recover_all_with_allocator;
 use teraslab::record::{TxMetadata, UTXO_FROZEN, UTXO_SPENT, UtxoSlot};
+use teraslab::recovery::recover_all_with_allocator;
 use teraslab::redo::{RedoLog, RedoOp};
 
 const DATA_SIZE: u64 = 16 * 1024 * 1024;
@@ -435,7 +435,10 @@ fn sweep_spend() {
         assert!(spent <= 1, "spend touches a single slot ({crash:?})");
         if crash.intent_durable() {
             let slot = rec.read_slot(&k, 0).unwrap();
-            assert_eq!(slot.status, UTXO_SPENT, "durable spend must replay ({crash:?})");
+            assert_eq!(
+                slot.status, UTXO_SPENT,
+                "durable spend must replay ({crash:?})"
+            );
             assert_eq!(
                 slot.spending_data, sd,
                 "replayed spending_data must match journaled intent ({crash:?})",
@@ -931,7 +934,12 @@ fn sweep_delete() {
                     .ok();
             },
             |engine| {
-                engine.delete(&DeleteRequest { tx_key: k, due_guard: None }).ok();
+                engine
+                    .delete(&DeleteRequest {
+                        tx_key: k,
+                        due_guard: None,
+                    })
+                    .ok();
             },
         );
 

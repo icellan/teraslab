@@ -1006,8 +1006,12 @@ fn error_responses_use_structured_json_envelope() {
     );
 
     // ----- 400 Bad Request: invalid log level body. -----
-    let (status, body) =
-        http_put_auth(port, "/debug/log-level", "definitely-not-a-level", R056_TEST_TOKEN);
+    let (status, body) = http_put_auth(
+        port,
+        "/debug/log-level",
+        "definitely-not-a-level",
+        R056_TEST_TOKEN,
+    );
     assert_eq!(status, 400);
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed["code"], "invalid_log_level");

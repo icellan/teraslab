@@ -112,7 +112,13 @@ fn txid(n: u32) -> [u8; 32] {
     t
 }
 
-fn stream_chunk(stream: &mut TcpStream, req_id: u64, t: &[u8; 32], offset: u64, data: &[u8]) -> ResponseFrame {
+fn stream_chunk(
+    stream: &mut TcpStream,
+    req_id: u64,
+    t: &[u8; 32],
+    offset: u64,
+    data: &[u8],
+) -> ResponseFrame {
     send_request(
         stream,
         &RequestFrame {
@@ -262,7 +268,10 @@ fn idle_stream_reaped_on_live_connection_and_tmp_removed() {
     // dispatched and must abort the idle stream (removing its tmp file).
     std::thread::sleep(Duration::from_millis(1500));
     let resp = ping(&mut client, 2);
-    assert_eq!(resp.status, STATUS_OK, "ping must succeed on the live connection");
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "ping must succeed on the live connection"
+    );
 
     // Give the post-ping abort a beat to flush the unlink, then assert the
     // tmp file is gone even though the connection never closed.
@@ -314,7 +323,8 @@ fn normal_stream_completes_with_caps_enabled() {
     let total = (part1.len() + part2.len()) as u64;
     let resp = stream_end(&mut client, 3, &t, total);
     assert_eq!(
-        resp.status, STATUS_OK,
+        resp.status,
+        STATUS_OK,
         "stream end must commit the blob: {:?}",
         String::from_utf8_lossy(&resp.payload),
     );
@@ -332,7 +342,10 @@ fn normal_stream_completes_with_caps_enabled() {
         .expect("committed blob must be present after stream end");
     let mut expected = part1.clone();
     expected.extend_from_slice(&part2);
-    assert_eq!(bytes, expected, "blob payload must match the streamed chunks");
+    assert_eq!(
+        bytes, expected,
+        "blob payload must match the streamed chunks"
+    );
 
     server.shutdown();
 }

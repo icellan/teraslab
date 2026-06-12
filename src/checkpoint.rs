@@ -144,9 +144,7 @@ pub fn spawn_checkpoint_task_with_reset_guard(
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("teraslab-checkpoint".to_string())
-        .spawn(move || {
-            run_checkpoint_loop(config, engine, redo_log, shutdown, reset_guard)
-        })
+        .spawn(move || run_checkpoint_loop(config, engine, redo_log, shutdown, reset_guard))
         .expect("spawn checkpoint thread")
 }
 
@@ -231,15 +229,14 @@ fn run_checkpoint_loop(
         );
 
         let started = std::time::Instant::now();
-        let outcome = perform_checkpoint_with_reset_guard(
-            &config,
-            &engine,
-            &redo_log,
-            |floor_sequence| reset_guard(floor_sequence),
-        );
+        let outcome =
+            perform_checkpoint_with_reset_guard(&config, &engine, &redo_log, |floor_sequence| {
+                reset_guard(floor_sequence)
+            });
         let elapsed = started.elapsed();
         if let Some(m) = crate::metrics::redo_metrics() {
-            m.redo_checkpoint_duration_ns.record_ns(elapsed.as_nanos() as u64);
+            m.redo_checkpoint_duration_ns
+                .record_ns(elapsed.as_nanos() as u64);
         }
 
         match outcome {
@@ -308,11 +305,7 @@ fn next_backoff(current: Duration, config: &CheckpointConfig) -> Duration {
 /// Sleep up to `total` in `slice`-sized chunks, returning early if
 /// `shutdown` is set. Returns `false` if shutdown was observed
 /// (caller should exit), `true` if the full duration elapsed.
-fn sleep_with_shutdown(
-    total: Duration,
-    shutdown: &Arc<AtomicBool>,
-    slice: Duration,
-) -> bool {
+fn sleep_with_shutdown(total: Duration, shutdown: &Arc<AtomicBool>, slice: Duration) -> bool {
     if total.is_zero() {
         return !shutdown.load(Ordering::Relaxed);
     }
@@ -411,9 +404,7 @@ where
     //      volatile write cache; sync the device so a power loss after
     //      compaction cannot silently revert acked mutations whose only
     //      durable copy was the just-reclaimed redo prefix.
-    crate::fault_injection::check(
-        crate::fault_injection::SyncPoint::BeforeCheckpointDataSync,
-    );
+    crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeCheckpointDataSync);
     engine
         .flush_index_durable()
         .map_err(|e| format!("index durable flush: {e}"))?;
@@ -645,8 +636,9 @@ mod tests {
             .unwrap();
 
         // Acked mutation 1: create (WAL-first).
-        let mut record_bytes =
-            Vec::with_capacity(crate::record::METADATA_SIZE + slots.len() * crate::record::UTXO_SLOT_SIZE);
+        let mut record_bytes = Vec::with_capacity(
+            crate::record::METADATA_SIZE + slots.len() * crate::record::UTXO_SLOT_SIZE,
+        );
         let mut meta_bytes = [0u8; crate::record::METADATA_SIZE];
         meta.to_bytes(&mut meta_bytes);
         record_bytes.extend_from_slice(&meta_bytes);
@@ -746,7 +738,10 @@ mod tests {
 
         let cfg = CheckpointConfig::new(snap_path.clone());
         let stats = perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
-        assert!(stats.reset_performed, "redo prefix must have been reclaimed");
+        assert!(
+            stats.reset_performed,
+            "redo prefix must have been reclaimed"
+        );
 
         // Power loss: every data-device write not covered by a sync is gone.
         assert!(data_dev.simulate_power_loss(), "device must be volatile");
@@ -775,11 +770,22 @@ mod tests {
         assert_eq!(entry.record_offset, record_offset);
         let meta_after = crate::io::read_metadata(&*data_dev, record_offset)
             .expect("record metadata must be durable after checkpoint + power loss");
-        assert_eq!({ meta_after.tx_id }, key.txid, "metadata must belong to the record");
-        assert_eq!({ meta_after.spent_utxos }, 1, "acked spend count must survive");
+        assert_eq!(
+            { meta_after.tx_id },
+            key.txid,
+            "metadata must belong to the record"
+        );
+        assert_eq!(
+            { meta_after.spent_utxos },
+            1,
+            "acked spend count must survive"
+        );
         let slot0 = crate::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
         assert!(slot0.is_spent(), "acked spend must not silently revert");
-        assert_eq!(slot0.spending_data, spending_data, "spending data must survive");
+        assert_eq!(
+            slot0.spending_data, spending_data,
+            "spending data must survive"
+        );
         let slot1 = crate::io::read_utxo_slot(&*data_dev, record_offset, 1).unwrap();
         assert!(slot1.is_unspent(), "untouched slot must stay unspent");
     }
@@ -798,8 +804,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("redb-gate.snap");
 
-        let dev: Arc<dyn BlockDevice> =
-            Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let primary = RedbPrimary::open(&dir.path().join("primary.redb"), 1024 * 1024).unwrap();
         primary.arm_fail_next_flush();
@@ -812,8 +817,7 @@ mod tests {
             UnminedIndex::new(),
         );
 
-        let redo_dev: Arc<dyn BlockDevice> =
-            Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
         let log = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
         let redo = Mutex::new(log);
         {
@@ -922,7 +926,10 @@ mod tests {
             let _ = perform_checkpoint(&cfg, &engine, &redo);
         }));
         fault_injection::disarm();
-        assert!(result.is_err(), "checkpoint must have crashed at the sync point");
+        assert!(
+            result.is_err(),
+            "checkpoint must have crashed at the sync point"
+        );
 
         // Power loss on top of the crash.
         assert!(data_dev.simulate_power_loss(), "device must be volatile");
@@ -952,7 +959,9 @@ mod tests {
         )
         .expect("recovery must succeed");
 
-        let entry = index2.lookup(&key).expect("replay must re-register the record");
+        let entry = index2
+            .lookup(&key)
+            .expect("replay must re-register the record");
         assert_eq!(entry.record_offset, record_offset);
         let meta_after = crate::io::read_metadata(&*data_dev, record_offset).unwrap();
         assert_eq!({ meta_after.tx_id }, key.txid);

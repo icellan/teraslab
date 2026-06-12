@@ -168,7 +168,9 @@ pub enum SpendError {
     /// the requested child but the deleted-children list contradicts
     /// it. Callers MUST treat this as a hard rejection and re-validate
     /// chain state before retrying.
-    #[error("DELETED_CHILDREN at offset {offset}: child txid present in deleted_children list ({child_count} total)")]
+    #[error(
+        "DELETED_CHILDREN at offset {offset}: child txid present in deleted_children list ({child_count} total)"
+    )]
     DeletedChildren {
         /// The slot offset the request targeted.
         offset: u32,

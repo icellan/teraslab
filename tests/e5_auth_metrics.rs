@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use serial_test::serial;
 use teraslab::cluster::auth::{
-    DEFAULT_MAX_CLOCK_SKEW, set_max_clock_skew, sign_with_timestamp, verify_frame_streaming_with_now,
-    verify_with_now,
+    DEFAULT_MAX_CLOCK_SKEW, set_max_clock_skew, sign_with_timestamp,
+    verify_frame_streaming_with_now, verify_with_now,
 };
 use teraslab::metrics::{ClusterAuthMetrics, cluster_auth_metrics, init_cluster_auth_metrics};
 

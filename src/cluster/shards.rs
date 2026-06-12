@@ -632,7 +632,10 @@ mod tests {
             a.version, b.version,
             "permuted member list must yield the same version",
         );
-        assert_eq!(a.version, c.version, "version must be permutation-invariant");
+        assert_eq!(
+            a.version, c.version,
+            "version must be permutation-invariant"
+        );
         // And the assignments must match too (already true, but assert it).
         for i in 0..NUM_SHARDS {
             assert_eq!(a.assignments[i], b.assignments[i]);

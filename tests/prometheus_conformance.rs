@@ -29,10 +29,10 @@ use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
-    AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
-    SwimMetrics, ThreadHistograms, ThreadMetrics, allocator_metrics, init_allocator_metrics,
-    init_migration_metrics, init_redo_metrics, init_replication_metrics,
-    init_swim_metrics, migration_metrics, redo_metrics, replication_metrics, swim_metrics,
+    AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics,
+    ThreadHistograms, ThreadMetrics, allocator_metrics, init_allocator_metrics,
+    init_migration_metrics, init_redo_metrics, init_replication_metrics, init_swim_metrics,
+    migration_metrics, redo_metrics, replication_metrics, swim_metrics,
 };
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;

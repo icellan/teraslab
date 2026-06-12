@@ -106,7 +106,6 @@ static SERVER_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 /// Replication subsystem metrics (Phase 5).
 static REPLICATION_METRICS: ReplicationMetrics = ReplicationMetrics::new();
 
-
 /// Redo log metrics (Phase 5).
 static REDO_METRICS: RedoMetrics = RedoMetrics::new();
 
@@ -194,11 +193,8 @@ fn run_one_catchup_pass(
                 .iter()
                 .filter_map(|e| {
                     let tx_key = e.op.tx_key()?;
-                    let shard =
-                        teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
-                    teraslab::cluster::coordinator::redo_entry_to_replica_op(
-                        e, shard, &eng_ref,
-                    )
+                    let shard = teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
+                    teraslab::cluster::coordinator::redo_entry_to_replica_op(e, shard, &eng_ref)
                 })
                 .collect()
         },
@@ -1309,8 +1305,7 @@ fn main() {
         // in unchecked.
         cfg.high_water = config.checkpoint_high_water;
         cfg.low_water = config.checkpoint_low_water;
-        cfg.poll_interval =
-            std::time::Duration::from_millis(config.checkpoint_poll_interval_ms);
+        cfg.poll_interval = std::time::Duration::from_millis(config.checkpoint_poll_interval_ms);
         if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {

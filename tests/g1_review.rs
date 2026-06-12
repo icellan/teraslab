@@ -195,7 +195,11 @@ fn stripe_index_matches_documented_byte_range_post_refactor() {
 
     // In range, and deterministic within the process.
     assert!(idx < locks.stripe_count(), "stripe must be in range");
-    assert_eq!(locks.stripe_index(&key), idx, "stripe must be deterministic");
+    assert_eq!(
+        locks.stripe_index(&key),
+        idx,
+        "stripe must be deterministic"
+    );
 
     // Distinct bytes 0..15 must not affect the stripe (only bytes 16..24
     // plus the fixed per-process seed are inputs).

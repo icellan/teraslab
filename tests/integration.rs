@@ -596,7 +596,12 @@ fn full_lifecycle_single_tx() {
     assert_eq!(meta.block_entry_count, 1);
 
     // Delete
-    engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+    engine
+        .delete(&DeleteRequest {
+            tx_key: key,
+            due_guard: None,
+        })
+        .unwrap();
     assert!(engine.lookup(&key).is_none());
 }
 
@@ -681,7 +686,12 @@ fn engine_lifecycle_for_backend(mode: IndexBackendMode) {
     );
 
     // Delete.
-    engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+    engine
+        .delete(&DeleteRequest {
+            tx_key: key,
+            due_guard: None,
+        })
+        .unwrap();
     assert!(engine.lookup(&key).is_none(), "deleted on {mode:?}");
     assert!(
         engine.read_metadata(&key).is_err(),
@@ -1396,7 +1406,12 @@ fn delete_cleans_secondary_indexes() {
     // Should be in unmined index (created without block info)
     assert!(!engine.unmined_index().range_query(u32::MAX).is_empty());
 
-    engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+    engine
+        .delete(&DeleteRequest {
+            tx_key: key,
+            due_guard: None,
+        })
+        .unwrap();
 
     // Secondary indexes should be clean
     assert!(engine.unmined_index().range_query(u32::MAX).is_empty());
@@ -1698,8 +1713,7 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
     let slot = engine.read_slot(&frozen_key, 0).unwrap();
     assert_eq!(slot.status, UTXO_FROZEN, "rebuilt frozen slot status");
     assert_eq!(
-        slot.spending_data,
-        [FROZEN_BYTE; 36],
+        slot.spending_data, [FROZEN_BYTE; 36],
         "rebuilt frozen spending data"
     );
 }

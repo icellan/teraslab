@@ -259,7 +259,8 @@ fn send_request(stream: &mut TcpStream, frame: &RequestFrame) -> ResponseFrame {
 /// return the error code.
 fn single_sparse_error_code(resp: &ResponseFrame, context: &str) -> u16 {
     assert_eq!(
-        resp.status, STATUS_PARTIAL_ERROR,
+        resp.status,
+        STATUS_PARTIAL_ERROR,
         "{context}: expected STATUS_PARTIAL_ERROR, got status={} payload_len={}",
         resp.status,
         resp.payload.len()
@@ -406,7 +407,8 @@ fn fenced_shard_rejects_spend_serves_read_then_spend_succeeds_after_fence_lifts(
         },
     );
     assert_eq!(
-        resp.status, STATUS_OK,
+        resp.status,
+        STATUS_OK,
         "the same SPEND must succeed after the fence lifts (payload_len={})",
         resp.payload.len()
     );
@@ -523,8 +525,7 @@ fn write_racing_completion_window_is_never_acked_then_lost() {
     let completed = node1
         .cluster
         .test_complete_outbound_migration_with_midpoint(&task, true, || {
-            let mut racer =
-                TcpStream::connect(format!("127.0.0.1:{node1_port}")).unwrap();
+            let mut racer = TcpStream::connect(format!("127.0.0.1:{node1_port}")).unwrap();
             racer
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -571,7 +572,8 @@ fn write_racing_completion_window_is_never_acked_then_lost() {
         },
     );
     assert_eq!(
-        resp.status, STATUS_OK,
+        resp.status,
+        STATUS_OK,
         "retried SPEND after completion must succeed (payload_len={})",
         resp.payload.len()
     );

@@ -1116,11 +1116,7 @@ pub fn write_full_record(
 /// `tests/g2_delete_race.rs::delete_does_not_alias_concurrent_create`.
 /// Pairs with the read guards in `read_metadata_direct`,
 /// `read_utxo_slot_direct`, and `read_all_utxo_slots`.
-pub fn write_record_bytes(
-    device: &dyn BlockDevice,
-    record_offset: u64,
-    buf: &[u8],
-) -> Result<()> {
+pub fn write_record_bytes(device: &dyn BlockDevice, record_offset: u64, buf: &[u8]) -> Result<()> {
     // F-X-007 (BC-02): record-level write guard — see the doc comment.
     let _w = io_locks().write(record_offset);
     device.pwrite_all_at(buf, record_offset)?;

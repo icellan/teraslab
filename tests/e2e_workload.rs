@@ -652,7 +652,12 @@ fn tiered_storage_mixed_workload() {
         let key = TxKey {
             txid: make_tx_id(i),
         };
-        engine.delete(&DeleteRequest { tx_key: key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
         assert!(engine.lookup(&key).is_none());
     }
 }
@@ -877,7 +882,12 @@ fn stability_device_fill_and_churn() {
 
     let half = created as usize / 2;
     for key in keys.iter().take(half) {
-        engine.delete(&DeleteRequest { tx_key: *key, due_guard: None }).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: *key,
+                due_guard: None,
+            })
+            .unwrap();
     }
 
     let mut new_created = 0u32;

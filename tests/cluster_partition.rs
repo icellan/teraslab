@@ -38,10 +38,10 @@ use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
+use teraslab::protocol::codec::WireGetSpendItem;
 use teraslab::protocol::codec::{
     WireCreateItem, decode_get_spend_response, encode_create_batch, encode_get_spend_batch,
 };
-use teraslab::protocol::codec::WireGetSpendItem;
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
 use teraslab::server::Server;
@@ -429,8 +429,11 @@ fn one_way_udp_drop_creates_asymmetric_partition_and_heals() {
     net.drop_udp_one_way(431, 432);
 
     // 432's failure detector fires: alive count collapses to self.
-    wait_until(|| node2.cluster.alive_node_count() == 1, Duration::from_secs(20))
-        .expect("node 432 should mark node 431 dead under the one-way drop");
+    wait_until(
+        || node2.cluster.alive_node_count() == 1,
+        Duration::from_secs(20),
+    )
+    .expect("node 432 should mark node 431 dead under the one-way drop");
 
     // The reverse direction still passes: 431 keeps hearing 432's
     // probes and holds it alive (suspicion from its own unACKed pings
@@ -489,12 +492,7 @@ fn partitioned_minority_never_self_activates_topology() {
     let net = ProxyNet::new();
     let node1 = create_proxied_node(&net, 401, 2, &[]);
     let node2 = create_proxied_node(&net, 402, 2, &[node1.proxy.swim]);
-    let node3 = create_proxied_node(
-        &net,
-        403,
-        2,
-        &[node1.proxy.swim, node2.proxy.swim],
-    );
+    let node3 = create_proxied_node(&net, 403, 2, &[node1.proxy.swim, node2.proxy.swim]);
     let nodes = [&node1, &node2, &node3];
 
     // Full 3-node convergence on every node.
@@ -527,8 +525,11 @@ fn partitioned_minority_never_self_activates_topology() {
 
     // Wait past the SWIM suspicion timeout on both sides of the cut:
     // node 1 sees only itself; the majority re-commits a 2-node topology.
-    wait_until(|| node1.cluster.alive_node_count() == 1, Duration::from_secs(20))
-        .expect("partitioned node 1 should mark both peers dead (alive_node_count == 1)");
+    wait_until(
+        || node1.cluster.alive_node_count() == 1,
+        Duration::from_secs(20),
+    )
+    .expect("partitioned node 1 should mark both peers dead (alive_node_count == 1)");
     wait_until(
         || {
             node2.cluster.committed_topology_members().len() == 2
@@ -609,7 +610,8 @@ fn partitioned_minority_never_self_activates_topology() {
         },
     );
     assert_eq!(
-        resp.status, STATUS_OK,
+        resp.status,
+        STATUS_OK,
         "majority-side write for a self-mastered shard must succeed (payload_len={})",
         resp.payload.len()
     );
@@ -851,14 +853,17 @@ fn udp_delay_perturbs_failure_detection_observably() {
     // The delay alone drives 452 to declare 451 dead (alive → 1). This
     // would NOT happen on the pass-through link (asserted as the control
     // above), so the fault is observably perturbing timing.
-    wait_until(|| node2.cluster.alive_node_count() == 1, Duration::from_secs(15))
-        .unwrap_or_else(|_| {
-            panic!(
-                "heavy delay must drive 452 to mark 451 dead (alive==1), got {} | {}",
-                cluster_diag("node451", &node1),
-                cluster_diag("node452", &node2),
-            )
-        });
+    wait_until(
+        || node2.cluster.alive_node_count() == 1,
+        Duration::from_secs(15),
+    )
+    .unwrap_or_else(|_| {
+        panic!(
+            "heavy delay must drive 452 to mark 451 dead (alive==1), got {} | {}",
+            cluster_diag("node451", &node1),
+            cluster_diag("node452", &node2),
+        )
+    });
 
     // E-01 side-effect under the delay: the 1-of-2 remnant must NOT
     // self-activate a shrunken topology (peak=2 → activation quorum 2).
@@ -899,7 +904,10 @@ fn tcp_inbound_delay_slows_relayed_request_only() {
     // Baseline: PING through the proxy relay with no delay is fast.
     let mut via_proxy = connect(node1.proxy.tcp.port());
     let t0 = std::time::Instant::now();
-    assert!(ping_ok(&mut via_proxy), "baseline relayed PING must succeed");
+    assert!(
+        ping_ok(&mut via_proxy),
+        "baseline relayed PING must succeed"
+    );
     let baseline = t0.elapsed();
     drop(via_proxy);
 
