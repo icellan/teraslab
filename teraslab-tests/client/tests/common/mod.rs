@@ -29,8 +29,24 @@ const POLL_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 fn poll_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
+        // Attach the test-only admin bearer token on EVERY request: the
+        // gated /admin/* and /debug/* routes require it (401 otherwise),
+        // and the public routes (/status, /health/*, /metrics) have no
+        // auth middleware, so they ignore the extra header. The token
+        // matches the `admin_token` written into the generated node
+        // configs by `render_node_config`.
+        let mut headers = reqwest::header::HeaderMap::new();
+        let bearer = format!(
+            "Bearer {}",
+            teraslab_test_client::helpers::DOCKER_TEST_ADMIN_TOKEN
+        );
+        let mut auth = reqwest::header::HeaderValue::from_str(&bearer)
+            .expect("admin token must be a valid header value");
+        auth.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, auth);
         reqwest::Client::builder()
             .timeout(POLL_HTTP_TIMEOUT)
+            .default_headers(headers)
             .build()
             .expect("failed to build poll HTTP client")
     })
@@ -169,8 +185,9 @@ pub async fn http_status(
 pub async fn http_quiesce(docker: &DockerHelpers, node_num: u32) -> Result<(), ClientError> {
     let port = docker.http_port(node_num);
     let url = format!("http://127.0.0.1:{port}/admin/quiesce");
-    let client = reqwest::Client::new();
-    let resp = client
+    // Use the shared poll client so the request carries the admin bearer
+    // token — /admin/quiesce is on the gated router and 401s without it.
+    let resp = poll_http_client()
         .put(&url)
         .send()
         .await

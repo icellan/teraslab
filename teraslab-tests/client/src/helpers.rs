@@ -64,6 +64,20 @@ fn swim_timing_for_scenario(scenario_id: u16) -> (u32, u32) {
     }
 }
 
+/// Fixed bearer token for the `/admin/*` and `/debug/*` HTTP surface on
+/// docker test nodes.
+///
+/// TEST-ONLY CREDENTIAL: this value is public by design. It is acceptable
+/// only because the nodes' HTTP ports are reachable solely on the private
+/// per-scenario docker network and the loopback host port mapping. The
+/// constant is shared between the generated node configs
+/// ([`render_node_config`]) and the test HTTP client
+/// (`tests/common/mod.rs`), which attaches it as
+/// `Authorization: Bearer <token>` on every poll. It must be at least 16
+/// bytes — `ServerConfig::MIN_REMOTE_ADMIN_TOKEN_LEN` applies because the
+/// test configs also set `enable_remote_bind = true`.
+pub const DOCKER_TEST_ADMIN_TOKEN: &str = "teraslab-docker-test-token";
+
 fn render_node_config(
     node_id: u32,
     node_ip: &str,
@@ -119,7 +133,16 @@ cluster_id = "ababababababababababababababab01"
 # warn naming the opt-out so the audit trail surfaces the missing
 # secret.
 strict_auth = false
-"#
+# Register the /admin/* and /debug/* HTTP routes the test harness polls
+# (/admin/migration_status, /debug/redo, /admin/quiesce, ...). Without
+# this the routes 404 and every migration-activity gate in the tests is
+# vacuous. The token is the fixed, public DOCKER_TEST_ADMIN_TOKEN test
+# credential — see its doc comment; it only guards a private docker
+# network and must be >= 16 bytes because enable_remote_bind = true.
+enable_admin_endpoints = true
+admin_token = "{admin_token}"
+"#,
+        admin_token = DOCKER_TEST_ADMIN_TOKEN,
     )
 }
 
@@ -935,6 +958,26 @@ mod tests {
             !cfg.strict_auth,
             "rendered docker config must emit `strict_auth = false` (F-X-002 opt-out); \
              without it, the multi-node test cluster cannot start without a cluster_secret",
+        );
+        // The harness polls /admin/migration_status and /debug/redo; both
+        // routes are only registered when the admin surface is enabled
+        // with a token. If a future edit drops either key, every
+        // migration-activity gate in the docker tests goes vacuous again
+        // (the original CI blind spot this config exists to prevent).
+        assert!(
+            cfg.enable_admin_endpoints,
+            "rendered docker config must set enable_admin_endpoints = true so the \
+             /admin/* and /debug/* routes the test harness polls are registered",
+        );
+        assert_eq!(
+            cfg.admin_token.as_ref().map(|s| s.as_str()),
+            Some(DOCKER_TEST_ADMIN_TOKEN),
+            "rendered docker config admin_token must match the constant the test \
+             HTTP client sends as its bearer token",
+        );
+        assert!(
+            DOCKER_TEST_ADMIN_TOKEN.len() >= ServerConfig::MIN_REMOTE_ADMIN_TOKEN_LEN,
+            "test admin token must satisfy the remote-bind minimum length",
         );
         cfg.validate_safe_defaults().expect(
             "rendered docker node config must pass safe-defaults validation under the \
