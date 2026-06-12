@@ -155,6 +155,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache the test-client workspace too — its target/ holds the
+          # scenario test binaries prebuilt by run_all.sh.
+          workspaces: |
+            . -> target
+            teraslab-tests/client -> target
 
       - name: Build Docker image
         run: docker build -t teraslab:test -f teraslab-tests/docker/Dockerfile .

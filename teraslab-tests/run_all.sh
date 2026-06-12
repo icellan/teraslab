@@ -48,10 +48,17 @@ scenario_name() {
         17) echo "Failure Recovery Hardening" ;; *) echo "Scenario $1" ;;
     esac
 }
+# Invariant: external = scenario-internal timeout + 60s headroom so the
+# in-test teardown/diagnostics run before we SIGKILL.
 scenario_timeout() {
     case "$1" in
-        01) echo 120 ;;  05) echo 600 ;;  10) echo 900 ;;  12) echo 900 ;;
-        14|15|17) echo 1200 ;;  08|16) echo 900 ;;  *) echo 300 ;;
+        01) echo 300 ;;                       # internal 240
+        02|03|04|06|07) echo 360 ;;           # internal 300
+        05|09|11|12|13) echo 660 ;;           # internal 600
+        08|14|16) echo 960 ;;                 # internal 900
+        10) echo 240 ;;                       # internal 180 (60s load + 120s)
+        15|17) echo 1260 ;;                   # internal 1200
+        *) echo 360 ;;
     esac
 }
 
@@ -101,6 +108,13 @@ docker build -t teraslab:test -f "$SCRIPT_DIR/docker/Dockerfile" "$PROJECT_ROOT"
 echo ""
 echo "Building test client..."
 cd client && cargo build --release 2>&1 | tail -5 && cd ..
+
+# Prebuild ALL test binaries outside any scenario timeout window. Without
+# this, the first scenario's `cargo test` pays the full compile cost inside
+# its `timeout` budget and gets SIGKILLed on cold caches.
+echo ""
+echo "Prebuilding test binaries (untimed)..."
+cargo test --manifest-path client/Cargo.toml --release --no-run 2>&1 | tail -5
 
 PASS=0
 FAIL=0
