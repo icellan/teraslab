@@ -19,6 +19,11 @@ _plans/
 # Generated Docker compose files and configs (runtime artifacts)
 /docker/
 
+# Per-scenario E2E compose files and node configs — regenerated at test
+# runtime by DockerHelpers (teraslab-tests/client/src/helpers.rs)
+/teraslab-tests/docker/docker-compose.ts*.yml
+/teraslab-tests/docker/config/ts*-node*.toml
+
 # Coverage reports
 tarpaulin-report.json
 
