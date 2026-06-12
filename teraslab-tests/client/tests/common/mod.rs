@@ -1135,8 +1135,9 @@ pub async fn seed_records(
         // Only record in verifier AFTER the create succeeds, to avoid
         // phantom records when the create fails (e.g., during degradation).
         // Retry on transient errors from SWIM instability, dead nodes,
-        // or cluster topology changes. Uses exponential backoff with up to
-        // 8 attempts (~30s total) to ride out post-topology-change settle.
+        // or cluster topology changes. Uses exponential backoff
+        // (500ms * 2^min(n,3), capped at 4s) with up to 16 attempts
+        // (~52s total backoff) to ride out post-topology-change settle.
         //
         // On partial success, only retry the failed items (not items that
         // already succeeded — re-sending those would cause ERR_ALREADY_EXISTS).
@@ -1541,7 +1542,7 @@ async fn force_cleanup(scenario_id: u16) {
 }
 
 /// Wait until a single node's HTTP health endpoint responds.
-/// Polls `GET /health/live` every 100ms, returns as soon as it gets a 200,
+/// Polls `GET /health/live` every 50ms, returns as soon as it gets a 200,
 /// or after `timeout` elapses.
 pub async fn wait_node_healthy(
     docker: &DockerHelpers,

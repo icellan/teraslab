@@ -758,7 +758,8 @@ async fn test_cascading_recovery() -> Result<(), ClientError> {
         .await
         .unwrap_or_else(|e| eprintln!("[15.8] wait_specific_nodes_ready warning: {e}"));
     // Wait for the 2-node topology to stabilize and migrations to finish.
-    common::wait_specific_migrations_complete(&docker, &[1, 3], Duration::from_secs(30))
+    // Node1 is dead here -- poll only the survivors (node2, node3).
+    common::wait_specific_migrations_complete(&docker, &[2, 3], Duration::from_secs(30))
         .await
         .unwrap_or_else(|e| eprintln!("[15.8] migration wait (after node1 kill) warning: {e}"));
     common::wait_specific_replication_settled(&docker, &[2, 3], Duration::from_secs(5)).await?;

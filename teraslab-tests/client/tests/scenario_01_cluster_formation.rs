@@ -17,7 +17,11 @@ macro_rules! tlog {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_01_cluster_formation() {
-    let result = tokio::time::timeout(Duration::from_secs(120), run_scenario()).await;
+    // Internal budget: 240s. The scenario runs four full cluster lifecycles
+    // (simultaneous, staggered, late join, wrong config), each with worst-case
+    // formation of ~60s on a 2-core CI runner. The harness's external budget
+    // is 300s, preserving the invariant external = internal + 60.
+    let result = tokio::time::timeout(Duration::from_secs(240), run_scenario()).await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -26,7 +30,7 @@ async fn scenario_01_cluster_formation() {
         }
         Err(_) => {
             common::teardown_all(SID).await;
-            panic!("scenario timed out after 120s");
+            panic!("scenario timed out after 240s");
         }
     }
 }
@@ -519,10 +523,41 @@ async fn test_wrong_config_rejected() -> Result<(), ClientError> {
         "  [wrong] rogue node up, waiting for discovery attempt..."
     );
 
-    // Wait long enough for the rogue node to attempt discovery.
-    // SWIM probe interval is 150ms, so 3s covers ~20 probe cycles.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    tlog!(t0, "  [wrong] wait done");
+    // Before asserting the rogue node never joined, wait until the
+    // legitimate cluster is demonstrably settled: poll each node's /status
+    // every 250ms until cluster_size == 3 on all three nodes for 8
+    // consecutive polls (2s of observed stability). The rogue node's SWIM
+    // seed-retry backoff is capped at 5s, so the 15s deadline (3x the cap)
+    // guarantees at least one full retry window elapses, and the trailing
+    // 2s of stability shows the join attempts are being rejected rather
+    // than merely not yet attempted.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut stable_polls = 0u32;
+        loop {
+            let mut all_at_3 = true;
+            for node_num in 1..=3u32 {
+                let size = match common::http_status(&docker, node_num).await {
+                    Ok(status) => status["cluster_size"].as_u64().unwrap_or(0),
+                    Err(_) => 0,
+                };
+                if size != 3 {
+                    all_at_3 = false;
+                }
+            }
+            stable_polls = if all_at_3 { stable_polls + 1 } else { 0 };
+            if stable_polls >= 8 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Test 1.10: legitimate cluster did not hold cluster_size=3 \
+                 for 2s within 15s of rogue node start"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+    tlog!(t0, "  [wrong] cluster stable at 3 nodes for 2s");
 
     // Verify the original cluster still has exactly 3 nodes -- the rogue
     // node should not have been able to join.
