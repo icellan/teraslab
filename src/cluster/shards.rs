@@ -80,6 +80,21 @@ pub struct ShardTable {
     /// data. A subset master must not be treated as authoritative until
     /// migration completes — `is_master()` returns `Transitioning` for these.
     master_subset: Vec<bool>,
+    /// P4/R4 — nodes that moved data in the most recent topology
+    /// transition: for every shard whose assignment changed in
+    /// `begin_handoff_with`, the old and new master (when they differ)
+    /// plus any node that gained or lost a replica role. This is the
+    /// cluster-wide mover set derived from the committed table diff, so
+    /// every node computes the same set — unlike `handoff_state`, whose
+    /// `Copying` entries only cover shards THIS node sources (see
+    /// `should_begin_handoff_for_shard` in the coordinator).
+    ///
+    /// Deliberately NOT cleared when the local `all_serving` fast path
+    /// clears `handoff_state`: on a sender with nothing to copy this set
+    /// is the only local record that a remote replica is absorbing
+    /// migration data. It is replaced wholesale by the next
+    /// `begin_handoff_with` (empty if nothing changed).
+    transition_nodes: std::collections::HashSet<NodeId>,
 }
 
 impl ShardTable {
@@ -139,6 +154,7 @@ impl ShardTable {
             version: epoch,
             rf: replication_factor,
             master_subset: vec![false; NUM_SHARDS],
+            transition_nodes: std::collections::HashSet::new(),
         }
     }
 
@@ -162,13 +178,34 @@ impl ShardTable {
     ) {
         let mut handoff = vec![ShardHandoff::ServingNew; NUM_SHARDS];
         let mut master_subset = vec![false; NUM_SHARDS];
+        let mut transition_nodes = std::collections::HashSet::new();
         for (shard, h_state) in handoff.iter_mut().enumerate() {
-            let old_master = self.assignments[shard].master;
-            let new_master = new_table.assignments[shard].master;
+            let old = &self.assignments[shard];
+            let new = &new_table.assignments[shard];
+            let old_master = old.master;
+            let new_master = new.master;
             if old_master != new_master {
                 master_subset[shard] = true;
                 if shard_has_data(shard as u16) {
                     *h_state = ShardHandoff::Copying;
+                }
+                // Master moved: the old master streams data out, the new
+                // master absorbs it.
+                transition_nodes.insert(old_master);
+                transition_nodes.insert(new_master);
+            }
+            // Replica role changes: a node gaining a replica receives
+            // inbound replica-migration data; a node losing one may source
+            // it. Nodes covered by the master move above are skipped (an
+            // old master demoted to replica already holds the data).
+            for r in &new.replicas {
+                if *r != old_master && !old.replicas.contains(r) {
+                    transition_nodes.insert(*r);
+                }
+            }
+            for r in &old.replicas {
+                if *r != new_master && !new.replicas.contains(r) {
+                    transition_nodes.insert(*r);
                 }
             }
         }
@@ -177,6 +214,7 @@ impl ShardTable {
         self.assignments = new_table.assignments.clone();
         self.handoff_state = Some(handoff);
         self.master_subset = master_subset;
+        self.transition_nodes = transition_nodes;
         self.version = new_table.version;
 
         // If no shards need copying, clear handoff state immediately.
@@ -289,6 +327,36 @@ impl ShardTable {
                 .count(),
             None => 0,
         }
+    }
+
+    /// Nodes that moved data (source or target, master or replica role) in
+    /// the most recent topology transition — see the field doc on
+    /// `transition_nodes`. Empty when the last activation changed nothing.
+    pub fn transition_nodes(&self) -> &std::collections::HashSet<NodeId> {
+        &self.transition_nodes
+    }
+
+    /// Returns `true` if `node` moved data in the current topology
+    /// transition AND this table still has transition state pending —
+    /// some shard not yet `ServingNew`, or a subset master still awaiting
+    /// inbound migration data.
+    ///
+    /// P4/R4 — chosen surface for the replication ACK timeout escalation.
+    /// The shard table is preferred over the coordinator's
+    /// `MigrationManager` because the manager only tracks tasks THIS node
+    /// participates in, while the table diff captured at `begin_handoff`
+    /// names every mover in the committed cluster-wide plan, with no
+    /// extra wire traffic. `pending_handoff_count()` alone is also not
+    /// enough: `Copying` entries are only created for shards this node
+    /// sources, so an uninvolved sender clears its handoff state
+    /// immediately — callers must pair this check with a grace window
+    /// stamped when the table swaps (see
+    /// `RunningCluster::migration_pressure_active_for`).
+    pub fn node_in_active_transition(&self, node: NodeId) -> bool {
+        if !self.transition_nodes.contains(&node) {
+            return false;
+        }
+        self.handoff_state.is_some() || self.master_subset.iter().any(|s| *s)
     }
 
     /// Returns `true` if the new master for `shard` is still in the subset
@@ -1628,5 +1696,111 @@ mod tests {
             !active.is_subset_master(changed_shard),
             "shard {changed_shard} must not be subset when no inbound migration runs"
         );
+    }
+
+    /// Build an old/new table pair where exactly one shard's master moves
+    /// from node 1 to node 2 (its RF=2 replica), leaving nodes 3 and 4
+    /// completely uninvolved. Returns (old, new, changed_shard).
+    fn single_shard_master_move() -> (ShardTable, ShardTable, u16) {
+        let members = nodes(&[1, 2, 3, 4]);
+        let old = ShardTable::compute_with_epoch(&members, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = old.target_assignment(s);
+                a.master == NodeId(1) && a.replicas == vec![NodeId(2)]
+            })
+            .expect("expected a shard mastered by 1 with replica 2");
+        let mut new = old.clone();
+        new.set_master_for_shard(shard, NodeId(2));
+        new.version = 2;
+        (old, new, shard)
+    }
+
+    #[test]
+    fn transition_nodes_capture_master_movers_only() {
+        let (old, new, _shard) = single_shard_master_move();
+        let mut active = old;
+        active.begin_handoff_with(&new, |_| true);
+        let movers = active.transition_nodes();
+        assert!(movers.contains(&NodeId(1)), "old master is a source");
+        assert!(movers.contains(&NodeId(2)), "new master is a target");
+        assert!(!movers.contains(&NodeId(3)), "node 3 moved nothing");
+        assert!(!movers.contains(&NodeId(4)), "node 4 moved nothing");
+        assert_eq!(movers.len(), 2);
+    }
+
+    #[test]
+    fn transition_nodes_capture_replica_gainers() {
+        // Growing [1,2] → [1,2,3] makes node 3 a new master and/or replica
+        // for many shards: it receives inbound data and must be a mover.
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
+        let mut active = old;
+        active.begin_handoff_with(&new, |_| true);
+        assert!(active.transition_nodes().contains(&NodeId(3)));
+    }
+
+    #[test]
+    fn transition_nodes_survive_local_all_serving_clear() {
+        // A sender with no local data for the moved shard clears its
+        // handoff state immediately (all_serving fast path), but the
+        // transition movers must be retained: they are the only sender-
+        // local record that a remote replica is absorbing migration data.
+        let (old, new, shard) = single_shard_master_move();
+        let mut active = old;
+        active.begin_handoff_with(&new, |_| false);
+        assert_eq!(active.pending_handoff_count(), 0);
+        assert!(!active.is_subset_master(shard));
+        let movers = active.transition_nodes();
+        assert!(movers.contains(&NodeId(1)));
+        assert!(movers.contains(&NodeId(2)));
+        assert!(!movers.contains(&NodeId(4)));
+    }
+
+    #[test]
+    fn transition_nodes_cleared_by_noop_handoff() {
+        // A later topology activation with no assignment changes must
+        // replace the stale mover set with an empty one.
+        let (old, new, _shard) = single_shard_master_move();
+        let mut active = old;
+        active.begin_handoff_with(&new, |_| true);
+        assert!(!active.transition_nodes().is_empty());
+        let mut same = new.clone();
+        same.version = 3;
+        active.begin_handoff_with(&same, |_| true);
+        assert!(active.transition_nodes().is_empty());
+    }
+
+    #[test]
+    fn node_in_active_transition_tracks_pending_handoff() {
+        let (old, new, shard) = single_shard_master_move();
+        let mut active = old;
+        active.begin_handoff_with(&new, |s| s == shard);
+        assert_eq!(active.pending_handoff_count(), 1);
+        assert!(active.node_in_active_transition(NodeId(1)));
+        assert!(active.node_in_active_transition(NodeId(2)));
+        assert!(
+            !active.node_in_active_transition(NodeId(4)),
+            "uninvolved node must not report transition pressure"
+        );
+
+        active.commit_shard(shard);
+        assert_eq!(active.pending_handoff_count(), 0);
+        assert!(
+            !active.node_in_active_transition(NodeId(2)),
+            "after the last shard commits there is no active transition"
+        );
+    }
+
+    #[test]
+    fn node_in_active_transition_false_without_local_handoff_state() {
+        // Uninvolved sender: handoff state cleared at begin (no local
+        // data) → no ACTIVE transition is locally observable even though
+        // the mover set is retained. The coordinator's per-node grace map
+        // covers this window instead.
+        let (old, new, _shard) = single_shard_master_move();
+        let mut active = old;
+        active.begin_handoff_with(&new, |_| false);
+        assert!(!active.node_in_active_transition(NodeId(2)));
     }
 }
