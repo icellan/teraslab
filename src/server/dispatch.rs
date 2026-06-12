@@ -112,30 +112,160 @@ static REPL_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("failed to create replication tokio runtime")
 });
 
+/// Global sum bound on concurrent `replicate_all_ops` fan-outs. Each
+/// in-flight fan-out clones per-address op buffers and parks one caller
+/// thread (plus `spawn_blocking` tasks on [`REPL_RUNTIME`]) for up to the
+/// ack timeout, so the cap bounds memory and thread pressure. P7/R5: this
+/// is deliberately a SUM bound over the per-address slots below — it is no
+/// longer the only admission gate, so one wedged replica cannot exhaust it
+/// for healthy ones.
 const MAX_REPLICATION_FANOUTS_IN_FLIGHT: usize = 128;
-static REPLICATION_FANOUT_PERMITS: LazyLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
-    LazyLock::new(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()));
 
-struct ReplicationFanoutPermit;
+/// Minimum per-address fan-out budget regardless of cluster size, so a
+/// replica in a large cluster still gets useful pipelining depth.
+const MIN_PER_ADDR_FANOUTS_IN_FLIGHT: usize = 8;
 
-fn acquire_replication_fanout_permit() -> ReplicationFanoutPermit {
+/// Extra slack added on top of the fan-out ack timeout to form the permit
+/// admission deadline. A permit holder blocks for at most its own ack
+/// timeout per send attempt, so `ack_timeout + margin` covers the worst
+/// case of waiting behind a holder that just started, plus scheduling
+/// jitter — after that, waiting longer cannot succeed against a wedged
+/// replica and the client should fast-fail instead.
+const FANOUT_ADMISSION_MARGIN: Duration = Duration::from_millis(250);
+
+/// Per-address fan-out cap: divide the global pool across the known
+/// replica addresses (floored at [`MIN_PER_ADDR_FANOUTS_IN_FLIGHT`]).
+/// With 0–1 known replicas this equals the full global pool, so small
+/// clusters keep the exact pre-partition throughput.
+fn per_addr_fanout_cap(known_replica_addrs: usize) -> usize {
+    MIN_PER_ADDR_FANOUTS_IN_FLIGHT
+        .max(MAX_REPLICATION_FANOUTS_IN_FLIGHT / known_replica_addrs.max(1))
+}
+
+/// Two-level fan-out admission state: total in-flight fan-outs (global
+/// sum bound) and in-flight fan-outs per target replica address.
+struct FanoutPermitState {
+    total: usize,
+    per_addr: HashMap<SocketAddr, usize>,
+}
+
+static REPLICATION_FANOUT_PERMITS: LazyLock<(
+    std::sync::Mutex<FanoutPermitState>,
+    std::sync::Condvar,
+)> = LazyLock::new(|| {
+    (
+        std::sync::Mutex::new(FanoutPermitState {
+            total: 0,
+            per_addr: HashMap::new(),
+        }),
+        std::sync::Condvar::new(),
+    )
+});
+
+/// Error from replication fan-out admission control (P7/R5).
+///
+/// Surfaced to clients through the existing `ERR_REPLICATION_FAILED` path:
+/// `replicate_all_ops` returns `Err(String)` and every mutation handler
+/// maps that to `ERR_REPLICATION_FAILED`. A dedicated wire error code
+/// would require extending the protocol surface and every client decoder
+/// for a condition clients handle exactly like any other replication
+/// failure (fail the write, retry with backoff), so the distinguishable
+/// `Display` message is the contract instead of a new code.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum FanoutAdmissionError {
+    /// No permit became available before the deadline. `saturated` names
+    /// the first target address whose per-address slots were exhausted,
+    /// or `None` when the global sum bound was what blocked admission.
+    #[error(
+        "replication fan-out admission timed out after {waited_ms} ms: \
+         {in_flight}/{global_cap} fan-outs in flight, saturated address: \
+         {saturated:?} (a replica is likely wedged in ack timeouts)"
+    )]
+    Timeout {
+        waited_ms: u64,
+        in_flight: usize,
+        global_cap: usize,
+        saturated: Option<SocketAddr>,
+    },
+}
+
+/// RAII permit for one in-flight fan-out covering `addrs`.
+#[derive(Debug)]
+struct ReplicationFanoutPermit {
+    addrs: Vec<SocketAddr>,
+}
+
+/// Acquire admission for one fan-out targeting `addrs`, waiting at most
+/// `max_wait`.
+///
+/// Admission requires, atomically under one lock (all-or-nothing, so
+/// partial holds can never deadlock): the global total below
+/// [`MAX_REPLICATION_FANOUTS_IN_FLIGHT`] AND every target address below
+/// `per_addr_cap`. On deadline expiry returns
+/// [`FanoutAdmissionError::Timeout`] so the caller fails fast instead of
+/// blocking unboundedly behind a wedged replica (P7/R5).
+fn acquire_replication_fanout_permits(
+    addrs: &[SocketAddr],
+    per_addr_cap: usize,
+    max_wait: Duration,
+) -> std::result::Result<ReplicationFanoutPermit, FanoutAdmissionError> {
     let (lock, cvar) = &*REPLICATION_FANOUT_PERMITS;
-    let mut in_flight = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    while *in_flight >= MAX_REPLICATION_FANOUTS_IN_FLIGHT {
-        in_flight = cvar
-            .wait(in_flight)
+    let start = std::time::Instant::now();
+    let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        let global_ok = state.total < MAX_REPLICATION_FANOUTS_IN_FLIGHT;
+        let blocked_addr = addrs
+            .iter()
+            .find(|a| state.per_addr.get(a).copied().unwrap_or(0) >= per_addr_cap);
+        if global_ok && blocked_addr.is_none() {
+            state.total += 1;
+            for a in addrs {
+                *state.per_addr.entry(*a).or_insert(0) += 1;
+            }
+            return Ok(ReplicationFanoutPermit {
+                addrs: addrs.to_vec(),
+            });
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= max_wait {
+            return Err(FanoutAdmissionError::Timeout {
+                waited_ms: elapsed.as_millis() as u64,
+                in_flight: state.total,
+                global_cap: MAX_REPLICATION_FANOUTS_IN_FLIGHT,
+                saturated: if global_ok {
+                    blocked_addr.copied()
+                } else {
+                    None
+                },
+            });
+        }
+        let (next, _timed_out) = cvar
+            .wait_timeout(state, max_wait - elapsed)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state = next;
     }
-    *in_flight += 1;
-    ReplicationFanoutPermit
 }
 
 impl Drop for ReplicationFanoutPermit {
     fn drop(&mut self) {
         let (lock, cvar) = &*REPLICATION_FANOUT_PERMITS;
-        let mut in_flight = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        *in_flight = in_flight.saturating_sub(1);
-        cvar.notify_one();
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.total = state.total.saturating_sub(1);
+        for a in &self.addrs {
+            if let Some(count) = state.per_addr.get_mut(a) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    state.per_addr.remove(a);
+                }
+            }
+        }
+        drop(state);
+        // Waiters have heterogeneous predicates (different address sets),
+        // so notify_one could wake a waiter this release does not unblock
+        // while the one it does unblock keeps sleeping. notify_all is
+        // required for correctness; the pool is small (≤128 holders) so
+        // the thundering herd is bounded.
+        cvar.notify_all();
     }
 }
 
@@ -1658,10 +1788,11 @@ fn replicate_all_ops_with_barrier(
         clear_replication_intents_after_success(intent_ranges);
         return Ok(ReplicationOutcome::NotApplicable);
     }
-    let _fanout_permit = acquire_replication_fanout_permit();
-
     // Group all ops by target replica address — including any dual-write
     // expansion for shards currently migrating outbound (Phase E).
+    // (P7/R5: the fan-out admission permit is acquired AFTER the plan is
+    // built — admission is per target address — and after the barrier is
+    // released, so a bounded permit wait never stalls concurrent reads.)
     let plan = build_replication_targets(cluster, ops_by_key)?;
     let ReplicationPlan {
         by_addr,
@@ -1702,6 +1833,22 @@ fn replicate_all_ops_with_barrier(
         cluster.migration_pressure_active(),
         cluster.replication_timeout_during_migration(),
     );
+
+    // P7/R5: bounded, per-address fan-out admission. A wedged replica can
+    // hold at most its own per-address slot budget; fan-outs to healthy
+    // addresses keep flowing on the remaining global capacity. The wait is
+    // bounded by the same ack timeout this fan-out would use plus a small
+    // margin — a permit holder frees its slots within its own ack timeout,
+    // so waiting longer than that cannot succeed and the client must see a
+    // fast ERR_REPLICATION_FAILED instead of an unbounded stall.
+    let target_addrs: Vec<SocketAddr> = by_addr.keys().copied().collect();
+    let known_replica_addrs = cluster.alive_node_count().saturating_sub(1);
+    let _fanout_permit = acquire_replication_fanout_permits(
+        &target_addrs,
+        per_addr_fanout_cap(known_replica_addrs),
+        ack_timeout + FANOUT_ADMISSION_MARGIN,
+    )
+    .map_err(|e| e.to_string())?;
     // Phase B3: stamp every outbound batch with the live coordinator
     // epoch so the receiver's gate can reject stale-cluster writes.
     let cluster_key = cluster.local_cluster_key();
@@ -8273,30 +8420,198 @@ mod tests {
         );
     }
 
+    /// Serializes the fan-out permit tests. The permit pool is a process-wide
+    /// singleton; tests that exhaust the global pool (or assert immediate
+    /// admission) would interfere if run in parallel.
+    fn permit_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
-    fn replication_backpressure_bounded_by_permit_pool() {
+    fn replication_backpressure_bounded_by_global_permit_pool() {
+        let _serial = permit_test_lock();
+        let addr_a: SocketAddr = "10.99.3.1:7000".parse().unwrap();
+        let addr_b: SocketAddr = "10.99.3.2:7000".parse().unwrap();
+        // Per-address cap == global cap so only the global sum bound binds.
         let mut permits = Vec::new();
         for _ in 0..MAX_REPLICATION_FANOUTS_IN_FLIGHT {
-            permits.push(acquire_replication_fanout_permit());
+            permits.push(
+                acquire_replication_fanout_permits(
+                    &[addr_a],
+                    MAX_REPLICATION_FANOUTS_IN_FLIGHT,
+                    std::time::Duration::from_secs(5),
+                )
+                .expect("filling the global pool must succeed"),
+            );
         }
 
+        // Global exhaustion blocks even a DIFFERENT address (sum bound
+        // preserved) and reports the distinct timeout error with no
+        // saturated address (the global cap is what binds).
+        let err = acquire_replication_fanout_permits(
+            &[addr_b],
+            MAX_REPLICATION_FANOUTS_IN_FLIGHT,
+            std::time::Duration::from_millis(50),
+        )
+        .expect_err("global pool exhaustion must time out");
+        let FanoutAdmissionError::Timeout {
+            in_flight,
+            global_cap,
+            saturated,
+            ..
+        } = &err;
+        assert_eq!(*in_flight, MAX_REPLICATION_FANOUTS_IN_FLIGHT);
+        assert_eq!(*global_cap, MAX_REPLICATION_FANOUTS_IN_FLIGHT);
+        assert_eq!(*saturated, None, "global cap binds, not a per-addr cap");
+        assert!(
+            err.to_string()
+                .contains("replication fan-out admission timed out"),
+            "client-visible message must be distinguishable: {err}"
+        );
+
+        // A waiter parked inside its deadline is woken by a permit drop.
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
-            let permit = acquire_replication_fanout_permit();
+            let permit = acquire_replication_fanout_permits(
+                &[addr_b],
+                MAX_REPLICATION_FANOUTS_IN_FLIGHT,
+                std::time::Duration::from_secs(10),
+            )
+            .expect("waiter must be admitted once a permit frees up");
             tx.send(()).unwrap();
             drop(permit);
         });
-
         assert!(
             rx.recv_timeout(std::time::Duration::from_millis(50))
                 .is_err(),
             "a new replication fan-out must block while all permits are held"
         );
         permits.pop();
-        rx.recv_timeout(std::time::Duration::from_secs(1))
+        rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("dropping a permit should release one waiting fan-out");
         drop(permits);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn fanout_admission_times_out_per_address_without_cross_address_damage() {
+        let _serial = permit_test_lock();
+        let addr_a: SocketAddr = "10.99.1.1:7000".parse().unwrap();
+        let addr_b: SocketAddr = "10.99.1.2:7000".parse().unwrap();
+        let cap = 3;
+        let held: Vec<_> = (0..cap)
+            .map(|_| {
+                acquire_replication_fanout_permits(
+                    &[addr_a],
+                    cap,
+                    std::time::Duration::from_secs(5),
+                )
+                .expect("filling addr A up to its per-address cap must succeed")
+            })
+            .collect();
+
+        // Addr A is saturated: acquisition fails fast with the distinct
+        // timeout error naming the saturated address, after (at least)
+        // the requested bound — never an unbounded wait.
+        let deadline = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let err = acquire_replication_fanout_permits(&[addr_a], cap, deadline)
+            .expect_err("addr A at per-address cap must time out");
+        assert!(
+            start.elapsed() >= deadline,
+            "timeout must not fire before the deadline"
+        );
+        let FanoutAdmissionError::Timeout { saturated, .. } = &err;
+        assert_eq!(*saturated, Some(addr_a));
+
+        // Addr B is NOT affected: admitted with a tiny wait budget.
+        let permit_b = acquire_replication_fanout_permits(
+            &[addr_b],
+            cap,
+            std::time::Duration::from_millis(1),
+        )
+        .expect("addr B must be admitted while addr A is saturated");
+        drop(permit_b);
+        drop(held);
+
+        // Once A's holders release, A is admitted again.
+        let permit_a = acquire_replication_fanout_permits(
+            &[addr_a],
+            cap,
+            std::time::Duration::from_millis(1),
+        )
+        .expect("addr A must be admitted again after its permits release");
+        drop(permit_a);
+    }
+
+    #[test]
+    fn wedged_address_does_not_block_healthy_address_acquisitions() {
+        let _serial = permit_test_lock();
+        let addr_a: SocketAddr = "10.99.2.1:7000".parse().unwrap();
+        let addr_b: SocketAddr = "10.99.2.2:7000".parse().unwrap();
+        let cap = 4;
+        // `holding` synchronizes "all N wedged holders acquired their
+        // A-permit"; `release` synchronizes "main thread finished its
+        // assertions, holders may drop". No fixed sleeps anywhere.
+        let holding = Arc::new(std::sync::Barrier::new(cap + 1));
+        let release = Arc::new(std::sync::Barrier::new(cap + 1));
+        let holders: Vec<_> = (0..cap)
+            .map(|_| {
+                let holding = Arc::clone(&holding);
+                let release = Arc::clone(&release);
+                std::thread::spawn(move || {
+                    let permit = acquire_replication_fanout_permits(
+                        &[addr_a],
+                        cap,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .expect("wedged holder must acquire its A-permit");
+                    holding.wait();
+                    release.wait();
+                    drop(permit);
+                })
+            })
+            .collect();
+        holding.wait();
+
+        // All A-slots are wedged. B proceeds with a tiny wait budget.
+        let permit_b = acquire_replication_fanout_permits(
+            &[addr_b],
+            cap,
+            std::time::Duration::from_millis(1),
+        )
+        .expect("healthy addr B must be admitted while addr A is wedged");
+        drop(permit_b);
+
+        // A fails after the bound with the distinct error.
+        let deadline = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let err = acquire_replication_fanout_permits(&[addr_a], cap, deadline)
+            .expect_err("wedged addr A must time out");
+        assert!(start.elapsed() >= deadline);
+        let FanoutAdmissionError::Timeout { saturated, .. } = &err;
+        assert_eq!(*saturated, Some(addr_a));
+
+        release.wait();
+        for h in holders {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn per_addr_fanout_cap_scales_with_replica_count() {
+        // Small clusters keep the full pool per address (no throughput
+        // regression vs the pre-partition single pool).
+        assert_eq!(per_addr_fanout_cap(0), MAX_REPLICATION_FANOUTS_IN_FLIGHT);
+        assert_eq!(per_addr_fanout_cap(1), MAX_REPLICATION_FANOUTS_IN_FLIGHT);
+        assert_eq!(
+            per_addr_fanout_cap(2),
+            MAX_REPLICATION_FANOUTS_IN_FLIGHT / 2
+        );
+        // Large clusters floor at the minimum per-address budget.
+        assert_eq!(per_addr_fanout_cap(64), MIN_PER_ADDR_FANOUTS_IN_FLIGHT);
+        assert_eq!(per_addr_fanout_cap(1000), MIN_PER_ADDR_FANOUTS_IN_FLIGHT);
     }
 
     /// Test harness for Layer 1 dispatch testing.
