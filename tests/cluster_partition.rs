@@ -366,14 +366,18 @@ fn proxied_cluster_converges_and_tcp_block_partitions_inbound() {
     // The write may land in a buffer, but no response can ever arrive.
     let _ = via_proxy.write_all(&ping);
     let mut buf = [0u8; 4];
-    via_proxy
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let read_result = via_proxy.read(&mut buf);
-    let dead = matches!(read_result, Ok(0) | Err(_));
+    // The inbound block tears down the relay connection. On a fast/loaded
+    // host the socket may already be dead by the time we get here, so
+    // `set_read_timeout` can itself fail — that IS the "connection torn
+    // down" outcome the test asserts, so treat a failed set_read_timeout as
+    // dead rather than unwrapping (which raced into a panic under CI load).
+    let dead = match via_proxy.set_read_timeout(Some(Duration::from_secs(2))) {
+        Ok(()) => matches!(via_proxy.read(&mut buf), Ok(0) | Err(_)),
+        Err(_) => true,
+    };
     assert!(
         dead,
-        "established relay connection must be torn down by the TCP block, got {read_result:?}"
+        "established relay connection must be torn down by the TCP block"
     );
 
     // New connections through the proxy are accepted then dropped: a

@@ -702,6 +702,30 @@ fn route_or_handle_coordinator_level() {
     // Wait for SWIM discovery + 2-node topology commit + shard-table install.
     let _ = wait_for_shard_split(&node1, Duration::from_secs(15));
 
+    // CI hardening: `wait_for_shard_split` returns as soon as ONE non-owned
+    // key exists, which can be observed mid-formation — under a loaded CI
+    // runner the shard table may still be settling, racing the per-key
+    // `is_master`/`route` reads below (a transient table briefly maps a shard
+    // to an unexpected node). Poll until the 2-node topology is committed AND
+    // the shard-table version is quiescent (unchanged across two reads) so the
+    // routing assertions run against a stable table.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut prev_version: Option<u64> = None;
+        loop {
+            let members = node1.cluster.committed_topology_members().len();
+            let version = node1.cluster.shard_table_version();
+            if members >= 2 && prev_version == Some(version) {
+                break;
+            }
+            prev_version = Some(version);
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     let mut found_local = false;
     let mut found_redirect = false;
 
