@@ -569,18 +569,28 @@ pub async fn wait_migrations_complete(
                 if inbound_pending > 0 {
                     node_details.push(format!("node{i}:inbound={inbound_pending}"));
                 }
+            } else {
+                node_details.push(format!("node{i}:migration-status-unavailable"));
             }
             let status_url = format!("http://127.0.0.1:{port}/status");
             if let Ok(json) = poll_json(&status_url).await {
-                if let Some(m) = json["master_shard_count"].as_u64() {
-                    total_masters += m;
-                }
+                // Always record per-node master counts: a node silently
+                // skipped here is indistinguishable from one reporting
+                // masters=0, and that ambiguity has already cost a CI
+                // failure investigation its evidence.
+                let cluster_size = json["cluster_size"].as_u64().unwrap_or(0);
+                let version = json["shard_table_version"].as_u64().unwrap_or(0);
+                let m = json["master_shard_count"].as_u64().unwrap_or(0);
+                total_masters += m;
+                node_details.push(format!("node{i}:size={cluster_size},ver={version},m={m}"));
                 if let Some(h) = json["pending_handoff_shards"].as_u64() {
                     total_pending_handoffs += h;
                     if h > 0 {
                         node_details.push(format!("node{i}:handoff={h}"));
                     }
                 }
+            } else {
+                node_details.push(format!("node{i}:status-unavailable"));
             }
         }
         let masters_ok = total_masters == 4096;
@@ -608,15 +618,9 @@ pub async fn wait_migrations_complete(
             mig_last_log = std::time::Instant::now();
         }
         if start.elapsed() >= timeout {
-            let detail = if !node_details.is_empty() {
-                format!(" [{}]", node_details.join(", "))
-            } else {
-                format!(
-                    " [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}]"
-                )
-            };
             return Err(ClientError::Connection(format!(
-                "migrations still active after {timeout:?}{detail}"
+                "migrations still active after {timeout:?} [masters={total_masters}/4096, handoffs={total_pending_handoffs}, inbound={total_inbound_pending}] [{}]",
+                node_details.join(", ")
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1426,6 +1430,51 @@ pub async fn teardown_all(scenario_id: u16) {
     force_cleanup(scenario_id).await;
     let first_http_port = 19000 + scenario_id * 10;
     wait_ports_free(first_http_port, scenario_id, 5).await;
+}
+
+/// Capture container logs and HTTP state snapshots for a failed scenario
+/// BEFORE teardown destroys the containers.
+///
+/// Writes into the directory named by `TERASLAB_DIAG_DIR` (exported per
+/// scenario by run_all.sh, so CI artifacts pick it up); silently does nothing
+/// when the variable is unset (e.g. direct `cargo test` runs). The
+/// harness-side collect_logs.sh cannot do this: the in-test teardown on the
+/// failure path removes the containers before it runs.
+pub async fn collect_failure_diagnostics(scenario_id: u16) {
+    let Ok(dir) = std::env::var("TERASLAB_DIAG_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for n in 1..=5u16 {
+        let name = format!("ts{scenario_id:02}-node{n}");
+        if let Ok(out) = std::process::Command::new("docker")
+            .args(["logs", &name])
+            .output()
+        {
+            let mut buf = out.stdout;
+            buf.extend_from_slice(&out.stderr);
+            if !buf.is_empty() {
+                let _ = std::fs::write(dir.join(format!("{name}.log")), &buf);
+            }
+        }
+        let port = 19000 + scenario_id * 10 + (n - 1);
+        for (ep, fname) in [
+            ("status", "status"),
+            ("admin/migration_status", "migration_status"),
+        ] {
+            let url = format!("http://127.0.0.1:{port}/{ep}");
+            if let Ok(json) = poll_json(&url).await {
+                let _ = std::fs::write(dir.join(format!("node{n}_{fname}.json")), json.to_string());
+            }
+        }
+    }
+    eprintln!(
+        "  [diag] in-test failure diagnostics written to {}",
+        dir.display()
+    );
 }
 
 async fn docker_output_timeout(args: &[String], timeout: Duration) -> Option<std::process::Output> {

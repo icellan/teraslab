@@ -1160,6 +1160,7 @@ async fn scenario_02_basic_operations() {
     match timeout_guard.await {
         Ok(()) => {}
         Err(_) => {
+            common::collect_failure_diagnostics(SID).await;
             common::teardown_all(SID).await;
             panic!("scenario_02_basic_operations timed out after 300s");
         }

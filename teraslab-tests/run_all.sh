@@ -140,6 +140,11 @@ for NUM in "${SCENARIOS[@]}"; do
     TIMEOUT_CMD="timeout"
     command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD="gtimeout"
     SCENARIO_START=$(date +%s)
+    # In-test failure diagnostics land here (collect_failure_diagnostics in
+    # tests/common/mod.rs). The in-test teardown on the failure path removes
+    # the containers before collect_logs.sh below can see them, so the test
+    # itself must capture container logs/status first.
+    export TERASLAB_DIAG_DIR="$SCRIPT_DIR/$RESULTS_DIR/${TEST_NAME}_intest"
     # Pipe stdout/stderr through the timestamp filter before redirecting
     # into the log so a wedged scenario can be distinguished from a
     # slow-but-progressing one during post-mortem review.
