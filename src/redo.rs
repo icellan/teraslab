@@ -352,7 +352,7 @@ const OP_APPEND_DELETED_CHILD: u8 = 34;
 /// `utxo_hash = None`.
 const OP_SPEND_V3: u8 = 35;
 /// B-5: Unspend redo entry carrying the slot's `utxo_hash`. See
-/// [`OP_SPEND_V3`].
+/// `OP_SPEND_V3`.
 const OP_UNSPEND_V3: u8 = 36;
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
@@ -388,7 +388,7 @@ pub enum RedoOp {
         updated_at: u64,
         /// B-5: the spent slot's `utxo_hash`. `Some` for entries written
         /// in the V3 format (carries the hash, serialized under
-        /// [`OP_SPEND_V3`]); `None` for legacy V2 entries that predate
+        /// `OP_SPEND_V3`); `None` for legacy V2 entries that predate
         /// the hash. When present, recovery can rebuild a CRC-failing
         /// slot from this intent instead of fail-closed-bricking.
         utxo_hash: Option<[u8; 32]>,
@@ -411,7 +411,7 @@ pub enum RedoOp {
         target_generation: u32,
         updated_at: u64,
         /// B-5: the slot's `utxo_hash`. `Some` for V3 entries
-        /// (serialized under [`OP_UNSPEND_V3`]), `None` for legacy V2.
+        /// (serialized under `OP_UNSPEND_V3`), `None` for legacy V2.
         /// Lets recovery rebuild a CRC-failing slot to UNSPENT with the
         /// correct hash instead of fail-closed-bricking.
         utxo_hash: Option<[u8; 32]>,

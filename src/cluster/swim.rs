@@ -129,7 +129,7 @@ pub struct SwimConfig {
     /// instead of the locally derived one.
     ///
     /// When `None` (the default), the gossiped self address is computed
-    /// by [`effective_swim_gossip_addr`] from `self_addr`/`bind_addr` —
+    /// by `effective_swim_gossip_addr` from `self_addr`/`bind_addr` —
     /// correct for flat networks. Set this when peers must reach this
     /// node through an intermediary (NAT, container port mapping, or a
     /// test-harness network proxy): the advertised address is what other

@@ -620,7 +620,7 @@ impl Engine {
     ///
     /// This entry point writes the lifecycle fields to the device footer and
     /// then routes the index updates through
-    /// [`Self::sync_primary_and_both_secondary_atomic`] — the same helper the
+    /// `Self::sync_primary_and_both_secondary_atomic` — the same helper the
     /// normal mutation path uses — so the DAH index, unmined index, and primary
     /// cached fields all land for migrated records exactly as for locally
     /// created ones. Mined records (`unmined_since == 0`,
@@ -799,7 +799,7 @@ impl Engine {
     /// lock is released.
     ///
     /// # Errors
-    /// Returns [`IndexError`](crate::index::IndexError) from the underlying
+    /// Returns `IndexError`(crate::index::IndexError) from the underlying
     /// primary backend. On error, `shard_counts` is left unchanged.
     fn register_with_shard_count(
         &self,
@@ -862,7 +862,7 @@ impl Engine {
     /// already exists (the index and shard counts are left unmodified).
     ///
     /// # Errors
-    /// Returns [`IndexError`](crate::index::IndexError) from the underlying
+    /// Returns `IndexError`(crate::index::IndexError) from the underlying
     /// primary backend. On error, neither the index nor `shard_counts` is
     /// modified.
     fn register_new_with_shard_count(
@@ -962,7 +962,7 @@ impl Engine {
     /// same index write-lock critical section.
     ///
     /// Returns the removed entry (or `None` if the key was not present), or
-    /// an [`IndexError`] if the (redb) backend's write transaction fails.
+    /// an `IndexError` if the (redb) backend's write transaction fails.
     /// After lazy initialization, the shard count is only decremented when an
     /// entry was actually removed. Before initialization, the first
     /// `shard_record_count` call will scan the primary index after any active
@@ -1226,7 +1226,7 @@ impl Engine {
     /// Look up a transaction in the index, propagating backend read errors.
     ///
     /// Returns `Ok(Some(entry))` if present, `Ok(None)` if absent, and an
-    /// [`IndexError`] if the (redb) backend's read transaction fails.
+    /// `IndexError` if the (redb) backend's read transaction fails.
     /// Client-visible read paths MUST use this variant so a transient
     /// backend error is reported as a storage error rather than being
     /// collapsed into "transaction not found" (G-4).
@@ -4791,7 +4791,7 @@ impl Engine {
     /// final delete still re-checks under the lock via `due_guard` as
     /// defense-in-depth.
     ///
-    /// Returns `true` iff [`Self::record_due_for_sweep`] holds for the
+    /// Returns `true` iff `Self::record_due_for_sweep` holds for the
     /// freshly-read metadata. A missing / aliased record returns `false`.
     pub fn is_due_for_sweep(&self, key: &TxKey, current_block_height: u32) -> bool {
         let _guard = self.locks.lock(key);
@@ -5144,7 +5144,7 @@ impl Engine {
     /// (see [`crate::protocol::codec::FieldMask::fully_cached`]).
     ///
     /// Propagates backend read errors (G-4): a transient redb failure
-    /// surfaces as an [`IndexError`] rather than collapsing to `None`,
+    /// surfaces as an `IndexError` rather than collapsing to `None`,
     /// which on a client GET path would falsely report the transaction as
     /// absent.
     pub fn lookup_cached_checked(
