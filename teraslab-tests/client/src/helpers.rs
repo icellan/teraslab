@@ -46,12 +46,32 @@ fn docker_migration_batch_size_from_env() -> Result<usize, ClientError> {
     }
 }
 
+/// Per-scenario SWIM failure-detection timing: `(probe_interval_ms, suspicion_timeout_ms)`.
+///
+/// Rule: aggressive timing (150/1000) ONLY for scenarios where failure-detection
+/// speed is itself under test — they kill/partition/pause nodes and have wait
+/// bounds or failure-rate windows that assume ~1.5s death detection (04, 05,
+/// 08, 09, 12, 14, 15, 16, 17). Every other scenario gets the shipped defaults
+/// (200/5000, see `src/config.rs`) so CPU starvation on CI runners doesn't
+/// cause false node-death declarations, each of which triggers two full
+/// shard-migration storms (death + rejoin). Scenarios 07 and 11 do kill/remove
+/// a node but all their post-kill wait bounds are >= 30s, which comfortably
+/// covers the 5s default suspicion timeout.
+fn swim_timing_for_scenario(scenario_id: u16) -> (u32, u32) {
+    match scenario_id {
+        4 | 5 | 8 | 9 | 12 | 14 | 15 | 16 | 17 => (150, 1000),
+        _ => (200, 5000),
+    }
+}
+
 fn render_node_config(
     node_id: u32,
     node_ip: &str,
     seeds_str: &str,
     migration_pool_size: usize,
     migration_batch_size: usize,
+    swim_probe_interval_ms: u32,
+    swim_suspicion_timeout_ms: u32,
 ) -> String {
     format!(
         r#"node_id = {node_id}
@@ -62,8 +82,8 @@ seed_nodes = [{seeds_str}]
 replication_factor = 2
 migration_pool_size = {migration_pool_size}
 migration_batch_size = {migration_batch_size}
-swim_probe_interval_ms = 150
-swim_suspicion_timeout_ms = 1000
+swim_probe_interval_ms = {swim_probe_interval_ms}
+swim_suspicion_timeout_ms = {swim_suspicion_timeout_ms}
 device_paths = ["/data/teraslab.dat"]
 device_size = 2147483648
 device_alignment = 4096
@@ -373,6 +393,8 @@ services:
         let config_dir = format!("{}/config", self.compose_dir);
         let migration_pool_size = docker_migration_pool_size_from_env()?;
         let migration_batch_size = docker_migration_batch_size_from_env()?;
+        let (swim_probe_interval_ms, swim_suspicion_timeout_ms) =
+            swim_timing_for_scenario(self.scenario_id);
 
         // Create config directory if it doesn't exist
         let _ = tokio::fs::create_dir_all(&config_dir).await;
@@ -391,6 +413,8 @@ services:
                 &seeds_str,
                 migration_pool_size,
                 migration_batch_size,
+                swim_probe_interval_ms,
+                swim_suspicion_timeout_ms,
             );
 
             let path = format!("{config_dir}/ts{:02}-node{n}.toml", self.scenario_id);
@@ -439,7 +463,8 @@ services:
         Ok(())
     }
 
-    /// Gracefully stops a node container with a 10-second timeout.
+    /// Gracefully stops a node container with a 1-second grace period
+    /// (SIGTERM, then SIGKILL after 1s).
     ///
     /// # Parameters
     /// - `name`: Node name (e.g. "node1").
@@ -845,6 +870,8 @@ mod tests {
             "\"172.38.0.11:3301\", \"172.38.0.13:3301\"",
             96,
             2048,
+            150,
+            1000,
         );
 
         assert!(config.contains("node_id = 2"));
@@ -852,6 +879,29 @@ mod tests {
         assert!(config.contains("migration_pool_size = 96"));
         assert!(config.contains("migration_batch_size = 2048"));
         assert!(config.contains("seed_nodes = [\"172.38.0.11:3301\", \"172.38.0.13:3301\"]"));
+        assert!(config.contains("swim_probe_interval_ms = 150"));
+        assert!(config.contains("swim_suspicion_timeout_ms = 1000"));
+    }
+
+    /// W0.4: aggressive SWIM timing only where failure-detection speed is
+    /// under test; shipped defaults everywhere else so CI CPU starvation
+    /// doesn't cause false node-death declarations.
+    #[test]
+    fn swim_timing_aggressive_only_for_failure_detection_scenarios() {
+        for sid in [4u16, 5, 8, 9, 12, 14, 15, 16, 17] {
+            assert_eq!(
+                swim_timing_for_scenario(sid),
+                (150, 1000),
+                "scenario {sid} must use aggressive SWIM timing",
+            );
+        }
+        for sid in [1u16, 2, 3, 6, 7, 10, 11, 13, 99] {
+            assert_eq!(
+                swim_timing_for_scenario(sid),
+                (200, 5000),
+                "scenario {sid} must use shipped-default SWIM timing",
+            );
+        }
     }
 
     /// F-X-002 regression: the rendered docker-test config must pass
@@ -872,6 +922,8 @@ mod tests {
             "\"172.38.0.12:3301\", \"172.38.0.13:3301\"",
             128,
             500,
+            200,
+            5000,
         );
         let cfg: ServerConfig = toml::from_str(&rendered)
             .expect("rendered docker node config must be a valid ServerConfig TOML payload");
