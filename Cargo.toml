@@ -12,6 +12,10 @@
 name = "teraslab"
 version = "0.1.0"
 edition = "2024"
+# Server application, not a published library — prevents accidental
+# `cargo publish` and lets cargo-deny's `licenses.private` skip the
+# first-party crate's (absent) SPDX license field.
+publish = false
 
 [[bin]]
 name = "teraslab-server"

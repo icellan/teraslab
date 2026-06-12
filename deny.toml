@@ -18,6 +18,13 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Yanked crates indicate the maintainer pulled the release for a reason
 # (typically a CVE or correctness bug). Warn so we notice and update.
 yanked = "warn"
+# Justified advisory exceptions (review before adding):
+#   RUSTSEC-2024-0436 — `paste` is unmaintained. It is a pulled in
+#   transitively by `ratatui` (the admin-CLI TUI) and is a compile-time
+#   proc-macro only (no runtime surface); there is no safe upgrade or
+#   maintained drop-in replacement. Tracked; re-evaluate when ratatui
+#   drops the dependency.
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 # License allow-list. New crates with licenses outside this list will be
@@ -36,10 +43,20 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "OpenSSL",
+    # Community Data License Agreement — Permissive 2.0. Used by
+    # `webpki-roots` (the Mozilla CA-certificate bundle) pulled in
+    # transitively via the OTLP exporter's reqwest/rustls stack. A
+    # permissive data license; safe to allow.
+    "CDLA-Permissive-2.0",
 ]
 # A confidence threshold below 0.8 usually means the detected license is
 # a fuzzy match — manual review recommended.
 confidence-threshold = 0.8
+# The workspace crate (`teraslab`) is a server application, not a
+# published library, so it carries no SPDX `license` field. Skip
+# license enforcement for our own non-published crate; this only
+# affects first-party crates marked `publish = false`.
+private = { ignore = true }
 
 [bans]
 # Banned crates. None today; placeholder for future policy (e.g. ban
