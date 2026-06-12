@@ -101,9 +101,11 @@ fn create_node_with_replication_runtime(
         rf,
         replication,
         TEST_CLUSTER_ID,
+        4,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_node_full(
     node_id: u64,
     tcp_port: u16,
@@ -112,6 +114,7 @@ fn create_node_full(
     rf: u8,
     replication: ReplicationRuntimeConfig,
     cluster_id: ClusterId,
+    migration_pool_size: usize,
 ) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
@@ -157,7 +160,7 @@ fn create_node_full(
         cluster_secret: None,
         max_migration_threads: 16,
         topology_propose_timeout: Duration::from_millis(300),
-        migration_pool_size: 4,
+        migration_pool_size,
         migration_batch_size: 100,
         persisted_incarnation: 0,
         cluster_id,
@@ -1119,6 +1122,191 @@ fn no_records_lost_during_migration() {
         total, before_count as u32,
         "all records should be assigned to exactly one node (n1={n1_accessible}, n2={n2_accessible}, expected={before_count})"
     );
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+}
+
+#[test]
+fn migration_fence_window_bounded_by_pipeline_sub_batch() {
+    // W1.4 (audit P14/B4): the pipelined migration must fence shards in
+    // sub-batches of at most 32 shards (MIGRATION_PIPELINE_SUB_BATCH),
+    // not the whole connection chunk. With migration_pool_size=1 the
+    // single worker's chunk is ALL migrating data shards; if the whole
+    // chunk were fenced at once (the regression), every data shard would
+    // be write-blocked for the duration of the entire transfer.
+    //
+    // RF=1: writes on node1 alone before node2 joins.
+    let node1 = create_node_full(
+        271,
+        0,
+        0,
+        &[],
+        1,
+        ReplicationRuntimeConfig {
+            ack_policy: None,
+            best_effort: true,
+            timeout: Duration::from_secs(3),
+            timeout_during_migration: Duration::from_secs(30),
+        },
+        TEST_CLUSTER_ID,
+        1, // single connection => one chunk containing all data shards
+    );
+
+    let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
+    stream1
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Create 400 records spread over ~380 distinct shards so the data
+    // chunk spans many sub-batches (N >> 32).
+    let records: Vec<([u8; 32], [u8; 32])> = (0..400u32)
+        .map(|i| (make_txid(i + 700_000), make_txid(i + 710_000)))
+        .collect();
+    for chunk in records.chunks(50) {
+        let payload = encode_multi_create_payload(chunk);
+        let resp = send_request(
+            &mut stream1,
+            &RequestFrame {
+                request_id: 1,
+                op_code: OP_CREATE_BATCH,
+                flags: 0,
+                payload: payload.into(),
+            },
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "create batch should succeed on single node"
+        );
+    }
+
+    let data_shards: std::collections::HashSet<u16> = records
+        .iter()
+        .map(|(txid, _)| ShardTable::shard_for_key(&TxKey { txid: *txid }))
+        .collect();
+    assert!(
+        data_shards.len() > 96,
+        "need many data shards for a meaningful sub-batch test, got {}",
+        data_shards.len()
+    );
+
+    // Sample node1's fenced bitmap from a tight polling thread and track
+    // the maximum number of *data* shards fenced simultaneously. Empty
+    // shards are excluded: the empty-shard fast path intentionally fences
+    // them en masse for a brief emptiness recheck and is not the data
+    // pipeline under test.
+    let fenced_bm = node1.cluster.fenced_bitmap().clone();
+    let shards_to_watch: Vec<u16> = data_shards.iter().copied().collect();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_fenced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let poller = {
+        let stop = stop.clone();
+        let max_fenced = max_fenced.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let n = shards_to_watch
+                    .iter()
+                    .filter(|s| fenced_bm.test(**s))
+                    .count();
+                max_fenced.fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    // Join node2 — triggers rebalance + data migration of ~half the shards.
+    let node2 = create_node(272, 0, 0, &[node1.swim_port], 1);
+
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(15),
+    )
+    .expect("2-node topology should commit on both nodes");
+
+    // Wait until the migration fully settles: every record is mastered by
+    // exactly one node (a node with a pending inbound fence does not
+    // answer Yes), and no outbound/inbound migration state remains.
+    wait_until(
+        || {
+            let all_owned = records.iter().all(|(txid, _)| {
+                let key = TxKey { txid: *txid };
+                matches!(node1.cluster.is_master(&key), MasterQueryResult::Yes)
+                    ^ matches!(node2.cluster.is_master(&key), MasterQueryResult::Yes)
+            });
+            all_owned
+                && node1.cluster.active_migrations() == 0
+                && node1.cluster.fenced_shard_count() == 0
+                && node2.cluster.inbound_pending_count() == 0
+        },
+        Duration::from_secs(30),
+    )
+    .expect("migration should settle with every record owned by exactly one node");
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    poller.join().unwrap();
+    let max_observed = max_fenced.load(std::sync::atomic::Ordering::Relaxed);
+
+    // The bound is only meaningful if the migration actually moved a
+    // multi-sub-batch number of data shards to node2.
+    let table2 = node2.cluster.shard_table();
+    let moved = data_shards
+        .iter()
+        .filter(|s| table2.read().assignment(**s).master == NodeId(272))
+        .count();
+    assert!(
+        moved > 32,
+        "expected more than one sub-batch of data shards to move, moved={moved}"
+    );
+
+    assert!(
+        max_observed >= 1,
+        "poller should have observed at least one fenced data shard during migration"
+    );
+    assert!(
+        max_observed <= 32,
+        "fence window must be bounded by the pipeline sub-batch (32): \
+         observed {max_observed} simultaneously fenced data shards"
+    );
+
+    // All data arrived intact: every record is readable via
+    // GET_SPEND_BATCH on whichever node masters it.
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
+    stream2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    for (i, (txid, hash)) in records.iter().enumerate() {
+        let key = TxKey { txid: *txid };
+        let stream = if matches!(node1.cluster.is_master(&key), MasterQueryResult::Yes) {
+            &mut stream1
+        } else {
+            &mut stream2
+        };
+        let mut q = Vec::new();
+        q.extend_from_slice(&1u32.to_le_bytes()); // count
+        q.extend_from_slice(txid);
+        q.extend_from_slice(&0u32.to_le_bytes()); // vout=0
+        q.extend_from_slice(hash);
+        let resp = send_request(
+            stream,
+            &RequestFrame {
+                request_id: 1000 + i as u64,
+                op_code: OP_GET_SPEND_BATCH,
+                flags: 0,
+                payload: q.into(),
+            },
+        );
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "record {i} must survive migration intact"
+        );
+        assert!(
+            !resp.payload.is_empty(),
+            "get_spend for record {i} should return data"
+        );
+    }
 
     shutdown_node(&node1);
     shutdown_node(&node2);
