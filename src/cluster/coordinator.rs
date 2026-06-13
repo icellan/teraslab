@@ -902,6 +902,11 @@ impl ClusterCoordinator {
             // through multiple channels (e.g., deterministic proposer
             // commit + fallback proposer timeout firing simultaneously).
             let mut last_activated_term: u64 = 0;
+            // W1.5 — highest committed term for which the prompt catch-up has
+            // already spawned an exchange phase. Prevents re-spawning the
+            // exchange on every 100 ms tick while the first exchange is in
+            // flight; cleared implicitly by advancing as the term advances.
+            let mut prompt_exchange_term: u64 = 0;
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
@@ -1129,6 +1134,79 @@ impl ClusterCoordinator {
                 // *activation* path (reactivation, commit signals,
                 // exchange results). Always false in production.
                 let activation_held = activation_hold_event.load(Ordering::Acquire);
+
+                // W1.5 — PROMPT term catch-up. Root cause of the 3-node
+                // formation deadlock: the late node's authority commits the
+                // 3-member term (its dispatch worker applies OP_TOPOLOGY_COMMIT
+                // / catch-up advances `committed_term`), but the
+                // migration-bearing activation never runs on the event loop —
+                // the queued commit signal is deduped against an earlier
+                // `topology_epoch` bump, or the loop was CPU-starved past the
+                // channel drain. The active shard table then lags the committed
+                // term, and the ONLY recovery used to be the 30 s same-term
+                // reactivation cooldown (`normal_reactivation_due` below) — far
+                // too slow: the sources abandon the handoff after the FIX-A
+                // handshake budget (40 × 100 ms ≈ 4 s) and ~1365 shards strand
+                // masterless.
+                //
+                // This catch-up is distinct from same-term mismatch repair: it
+                // fires only when the committed *term* is strictly ahead of the
+                // active table version, so it is NOT gated by the 30 s cooldown
+                // (which throttles same-term repair to avoid migration storms).
+                // It re-uses the SAME exchange-phase activation as the
+                // commit-signal path (`run_exchange_phase` →
+                // `exchange_complete_tx`), so the late node collects the peers'
+                // partition view and runs the IDENTICAL election-refined
+                // activation the sources ran — the resulting master assignments
+                // match byte-for-byte (a bare round-robin `activate_topology`
+                // would diverge from the sources' election-refined table and
+                // never converge without repeated FIX-B repair). Latency is one
+                // event-loop tick (≤100 ms) plus the bounded exchange RTT, well
+                // under the sources' ~4 s handoff budget so the original
+                // push-based handoff still lands. `prompt_exchange_term` debounces
+                // re-spawns while the exchange is in flight; FIX A/FIX B remain
+                // as defense-in-depth.
+                if !activation_held {
+                    let committed_term = topo_authority_event.committed_term();
+                    let active_version = shard_table.read().version;
+                    let committed_members = topo_authority_event.committed_members();
+                    if should_promptly_activate_committed_term(
+                        committed_term,
+                        active_version,
+                        committed_members.len(),
+                    ) && committed_term > last_activated_term
+                        && committed_term > prompt_exchange_term
+                    {
+                        tracing::info!(
+                            term = committed_term,
+                            active_version,
+                            members = committed_members.len(),
+                            "cluster: prompt activation — committed term ahead of active table, running exchange",
+                        );
+                        prompt_exchange_term = committed_term;
+                        let exchange_tx = exchange_complete_tx.clone();
+                        let node_addrs_x = node_addrs.clone();
+                        let engine_x = engine.clone();
+                        let shard_table_x = shard_table.clone();
+                        let inbound_bm_x = inbound_bm_event.clone();
+                        let secret_x = cluster_secret_event.clone();
+                        let members_x = committed_members.clone();
+                        std::thread::spawn(move || {
+                            let view = Self::run_exchange_phase(
+                                &members_x,
+                                self_id,
+                                committed_term,
+                                &node_addrs_x,
+                                &engine_x,
+                                &shard_table_x,
+                                &inbound_bm_x,
+                                std::time::Duration::from_millis(2000),
+                                &secret_x,
+                            );
+                            let _ = exchange_tx.send((members_x, committed_term, view));
+                        });
+                    }
+                }
 
                 // Re-activate topology if the shard table has rolled-back shards
                 // from failed migrations that don't match the committed topology.
@@ -1683,6 +1761,8 @@ impl ClusterCoordinator {
             topology_state_path,
             swim_incarnation: swim_incarnation_for_cluster,
             startup_reactivation_needed,
+            #[cfg(any(test, feature = "fault-injection"))]
+            drop_commit_signals: Arc::new(AtomicBool::new(false)),
             _swim_handle: swim_handle,
             _event_handle: event_handle,
         }
@@ -2823,6 +2903,37 @@ fn should_trigger_topology_reactivation(
 ) -> bool {
     startup_reactivation_due
         || (normal_reactivation_due && (mismatched_shards > 0 || pending_handoffs > 0))
+}
+
+/// W1.5 — decide whether this node must *promptly* activate a newly-committed
+/// topology term, independent of the 30 s same-term reactivation cooldown.
+///
+/// The same-term reactivation path (`should_trigger_topology_reactivation`)
+/// repairs shard *mismatches* within an already-active term and is throttled
+/// to 30 s to avoid migration storms. It is the wrong tool for the case this
+/// gates: a node whose authority has *committed a strictly higher term*
+/// (`committed_term > active_version`) but whose active shard table is still on
+/// the old term — e.g. the term-2 `OP_TOPOLOGY_COMMIT` signal was delivered to
+/// the dispatch worker (advancing `committed_term`) but the migration-bearing
+/// activation never ran on the event loop (signal deduped against a
+/// `topology_epoch` bump, or the loop was CPU-starved past the drain). Such a
+/// node is not repairing a mismatch — it has simply not caught up to the term,
+/// and waiting 30 s strands every shard the sources tried to hand it (the
+/// sources give up after the FIX-A handshake budget, ≈4 s).
+///
+/// Returns `true` when `committed_term > active_version` and the committed term
+/// is a real multi-node term (`committed_members > 1`) that has not already
+/// been activated locally (`active_version < committed_term`). The caller runs
+/// the exchange phase and activates on the next event-loop tick (≤100 ms plus
+/// the bounded exchange RTT), bounding the catch-up far under the sources'
+/// handoff retry budget. Same-term repair (`committed_term == active_version`)
+/// returns `false` and stays on the throttled path.
+fn should_promptly_activate_committed_term(
+    committed_term: u64,
+    active_version: u64,
+    committed_members_len: usize,
+) -> bool {
+    committed_members_len > 1 && committed_term > active_version
 }
 
 fn migration_workers_can_be_preserved(current_table_epoch: u64, activation_epoch: u64) -> bool {
@@ -6163,6 +6274,17 @@ pub struct RunningCluster {
     /// SWIM incarnation counter shared with the event loop for persistence.
     swim_incarnation: Arc<std::sync::atomic::AtomicU64>,
     startup_reactivation_needed: Arc<AtomicBool>,
+    /// Test-only: when set, [`RunningCluster::signal_topology_committed`]
+    /// drops the signal instead of queuing it. Models the production race
+    /// where a node's authority commits a new term (via the dispatch
+    /// `OP_TOPOLOGY_COMMIT` apply) but the migration-bearing activation
+    /// never reaches the event loop — the signal is deduped against an
+    /// earlier `topology_epoch` bump, or the loop is CPU-starved past the
+    /// channel drain. Lets the W1.5 regression test exercise the
+    /// committed-term-ahead-of-active-table catch-up without a queued signal
+    /// masking the deadlock. Always false in production.
+    #[cfg(any(test, feature = "fault-injection"))]
+    drop_commit_signals: Arc<AtomicBool>,
     _swim_handle: std::thread::JoinHandle<()>,
     _event_handle: std::thread::JoinHandle<()>,
 }
@@ -7175,7 +7297,27 @@ impl RunningCluster {
     /// The coordinator event loop picks this up and activates the shard
     /// table with the committed members, triggering any needed migrations.
     pub fn signal_topology_committed(&self, members: Vec<NodeId>, term: u64) {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.drop_commit_signals.load(Ordering::Acquire) {
+            // Fault injection: model the production race where the term is
+            // committed (authority advanced) but the activation signal never
+            // reaches the event loop. The committed-term-ahead prompt
+            // catch-up must recover the node without this signal.
+            return;
+        }
         let _ = self.topology_commit_tx.send((members, term));
+    }
+
+    /// Test-only handle to the "drop commit signals" fault-injection gate.
+    ///
+    /// While set, [`Self::signal_topology_committed`] silently drops every
+    /// signal instead of queuing it for the event loop — modelling a node
+    /// whose authority commits a new term but whose migration-bearing
+    /// activation never runs (deduped signal / CPU-starved event loop). Used
+    /// by the W1.5 regression test.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn drop_commit_signals_handle(&self) -> Arc<AtomicBool> {
+        self.drop_commit_signals.clone()
     }
 
     /// Phase H — post a resync request to the coordinator's event loop.
@@ -7450,6 +7592,8 @@ pub(crate) fn new_test_running_cluster(
         topology_state_path: None,
         swim_incarnation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
+        #[cfg(any(test, feature = "fault-injection"))]
+        drop_commit_signals: Arc::new(AtomicBool::new(false)),
         _swim_handle: std::thread::spawn(|| {}),
         _event_handle: std::thread::spawn(|| {}),
     }
@@ -9575,6 +9719,32 @@ mod tests {
         assert!(should_trigger_topology_reactivation(false, true, 0, 1));
         assert!(should_trigger_topology_reactivation(false, true, 2, 0));
         assert!(!should_trigger_topology_reactivation(false, true, 0, 0));
+    }
+
+    #[test]
+    fn prompt_activation_fires_only_when_committed_term_is_ahead() {
+        // committed_term ahead of the active table version → prompt activate.
+        assert!(
+            should_promptly_activate_committed_term(2, 1, 3),
+            "a node whose committed term (2) is ahead of its active table (1) \
+             must activate promptly, not wait for the 30s reactivation cooldown",
+        );
+        // Same term — this is same-term mismatch repair, which must stay on
+        // the throttled reactivation path, not the prompt path.
+        assert!(
+            !should_promptly_activate_committed_term(2, 2, 3),
+            "an already-activated term must NOT re-fire the prompt path",
+        );
+        // Active table somehow ahead of committed (stale read) → never fire.
+        assert!(!should_promptly_activate_committed_term(1, 2, 3));
+        // Single-node committed term carries no peers to migrate from; the
+        // single-node commit-signal path handles it directly.
+        assert!(
+            !should_promptly_activate_committed_term(2, 1, 1),
+            "a single-member committed term must not take the multi-node prompt path",
+        );
+        // No commit yet (term 0) → never fire.
+        assert!(!should_promptly_activate_committed_term(0, 0, 3));
     }
 
     #[test]

@@ -390,3 +390,186 @@ fn delayed_third_node_activation_converges_without_masterless_shards() {
         n.cluster.shutdown();
     }
 }
+
+/// W1.5 regression — the late node must activate a newly-committed topology
+/// term *promptly* (within one event-loop tick), independent of the 30 s
+/// same-term reactivation cooldown.
+///
+/// Root cause of the residual 3-node formation deadlock: the late node's
+/// authority commits the 3-member term (its dispatch worker applies
+/// `OP_TOPOLOGY_COMMIT`, advancing `committed_term`), but the
+/// migration-bearing activation never runs on the event loop — the commit
+/// signal is deduped against a `topology_epoch` bump or the loop is starved
+/// past the channel drain. The active shard table then lags the committed
+/// term, and the ONLY pre-fix recovery was the 30 s reactivation cooldown.
+/// The sources, meanwhile, abandon the handoff after their FIX-A handshake
+/// budget (≈4 s), so ~1365 shards strand masterless until the 30 s timer.
+///
+/// This test reproduces that precondition deterministically and WITHOUT a
+/// queued commit signal driving the recovery:
+/// 1. node1+node2 form a settled 2-member cluster (term 1);
+/// 2. node3 joins with activation HELD — it votes and the sources commit the
+///    3-member term, but node3 never installs it;
+/// 3. node3's active table is forced to the 2-member term-1 snapshot
+///    (`test_install_active_routing_snapshot`) — active_version = term 1;
+/// 4. node3's authority is advanced to the 3-member term by applying the
+///    quorum-proof commit DIRECTLY (`handle_commit`), exactly as the catch-up
+///    path does — but no `signal_topology_committed` is issued, modelling the
+///    lost / deduped commit signal;
+/// 5. node3 is released. With committed_term (term 3) strictly ahead of its
+///    active table version (term 1) and NO pending commit signal, only the
+///    prompt per-tick catch-up can recover it before the 30 s cooldown.
+///
+/// Assertion: Σ master_shard_count == 4096 across all three nodes within
+/// **15 s** — far under both the 30 s cooldown and the 120 s CI budget.
+/// FAILS on pre-fix code (node3 stays masterless until the 30 s reactivation,
+/// blowing the 15 s bound); PASSES after the prompt-activation fix.
+#[test]
+fn committed_term_ahead_of_active_table_activates_promptly() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    // Phase 1 — two-node settled cluster (term 1).
+    let n1 = create_node(1, &[], false);
+    let n2 = create_node(2, &[n1.swim_port], false);
+    wait_until(
+        || {
+            n1.cluster.shard_table_version() >= 1
+                && n2.cluster.shard_table_version() >= 1
+                && node_settled(&n1)
+                && node_settled(&n2)
+                && n1.cluster.active_migrations() == 0
+                && n2.cluster.active_migrations() == 0
+        },
+        Duration::from_secs(30),
+        "2-node cluster to settle",
+    )
+    .unwrap();
+    let two_member_term = n1.cluster.shard_table_version();
+
+    // Phase 2 — third node joins with activation HELD *and* with its commit
+    // signal dropped. It still votes and its authority commits the 3-member
+    // term via the dispatch `OP_TOPOLOGY_COMMIT` apply (advancing
+    // committed_term), but `signal_topology_committed` is a no-op — so NO
+    // activation is ever queued for its event loop. This is the production
+    // race the prompt catch-up must close: committed_term advances while the
+    // migration-bearing activation never runs.
+    let n3 = create_node(3, &[n1.swim_port, n2.swim_port], true);
+    n3.cluster
+        .drop_commit_signals_handle()
+        .store(true, Ordering::Release);
+    wait_until(
+        || {
+            n1.cluster.shard_table_version() > two_member_term
+                && n2.cluster.shard_table_version() > two_member_term
+        },
+        Duration::from_secs(30),
+        "3-member topology term to commit on the sources",
+    )
+    .unwrap();
+    let three_member_term = n1.cluster.shard_table_version();
+
+    // Let the sources run their plans against the held target and go idle —
+    // the CI state where the sources believe the handoff is done.
+    wait_until(
+        || n1.cluster.active_migrations() == 0 && n2.cluster.active_migrations() == 0,
+        Duration::from_secs(60),
+        "sources to finish their migration attempts against the held target",
+    )
+    .unwrap();
+
+    // node3's authority must have committed the 3-member term via the
+    // dispatch apply (its signal was dropped, but `handle_commit` still ran).
+    wait_until(
+        || n3.cluster.shard_table_version() >= three_member_term,
+        Duration::from_secs(30),
+        "node3 authority to commit the 3-member term (signal dropped)",
+    )
+    .unwrap();
+
+    // node3 must not have activated the 3-member term yet (hold in effect).
+    {
+        let v = n3.cluster.shard_table().read().version;
+        assert!(
+            v < three_member_term,
+            "activation hold failed: n3 activated term {v} >= {three_member_term}"
+        );
+    }
+
+    // Phase 3 — force node3 into the exact deadlock precondition:
+    //   active table   = 2-member term-1 snapshot (active_version = term 1)
+    //   committed_term = 3-member term (advanced via dispatch handle_commit)
+    //   pending signal = NONE (dropped at the source)
+    assert!(
+        n3.cluster
+            .test_install_active_routing_snapshot(&[NodeId(1), NodeId(2)], two_member_term),
+        "routing snapshot install must succeed"
+    );
+    assert_eq!(
+        n3.cluster.shard_table_version(),
+        three_member_term,
+        "precondition: committed_term ahead of active table version",
+    );
+    assert!(
+        n3.cluster.shard_table().read().version < three_member_term,
+        "precondition: active table still on the old term",
+    );
+
+    // Phase 4 — release node3. With committed_term strictly ahead of the
+    // active table version and NO pending commit signal, only the prompt
+    // per-tick catch-up can converge the cluster before the 30 s cooldown.
+    n3.hold.store(false, Ordering::Release);
+
+    let nodes = [&n1, &n2, &n3];
+    wait_until(
+        || {
+            if !nodes
+                .iter()
+                .all(|n| node_settled(n) && n.cluster.shard_table_version() >= three_member_term)
+            {
+                return false;
+            }
+            let t1 = n1.cluster.shard_table();
+            let t2 = n2.cluster.shard_table();
+            let t3 = n3.cluster.shard_table();
+            let (t1, t2, t3) = (t1.read(), t2.read(), t3.read());
+            let mut n3_masters = 0usize;
+            for s in 0..NUM_SHARDS as u16 {
+                let m1 = t1.target_assignment(s).master;
+                if m1 != t2.target_assignment(s).master || m1 != t3.target_assignment(s).master {
+                    return false;
+                }
+                if m1 == NodeId(3) {
+                    n3_masters += 1;
+                }
+            }
+            n3_masters > 1000
+        },
+        // 15 s: comfortably above the prompt path's true latency (one 100 ms
+        // tick + the handoff round-trips) yet far below the 30 s reactivation
+        // cooldown that is the ONLY pre-fix recovery here.
+        Duration::from_secs(15),
+        "cluster to converge promptly to one consistent 3-node table",
+    )
+    .unwrap_or_else(|e| {
+        for (i, n) in nodes.iter().enumerate() {
+            let table = n.cluster.shard_table();
+            let table = table.read();
+            eprintln!(
+                "node{}: committed={} table_version={} pending_handoffs={} pending_inbound={} active_migrations={}",
+                i + 1,
+                n.cluster.shard_table_version(),
+                table.version,
+                table.pending_handoff_count(),
+                n.cluster.inbound_pending_count(),
+                n.cluster.active_migrations(),
+            );
+        }
+        panic!("{e}");
+    });
+
+    for n in nodes {
+        n.cluster.shutdown();
+    }
+}
