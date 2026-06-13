@@ -101,9 +101,11 @@ jobs:
 
       - name: Run fault-injection tests
         # Behind a feature flag so production builds stay zero-cost.
-        # `cargo test --all` does not enable features; run this target
-        # explicitly so the fault_injection integration tests execute.
-        run: cargo test --features fault-injection --test fault_injection
+        # `cargo test --all` does not enable features; run these targets
+        # explicitly so the feature-gated integration tests execute.
+        # cluster_delayed_activation is the W1.1 regression test for the
+        # delayed-topology-activation masterless-shard deadlock.
+        run: cargo test --features fault-injection --test fault_injection --test cluster_delayed_activation
 
       - name: Run Rust client crate tests
         run: cargo test --manifest-path client/rust/Cargo.toml --all

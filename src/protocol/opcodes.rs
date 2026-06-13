@@ -182,6 +182,16 @@ pub const OP_MIGRATION_COMPLETE: u16 = 242;
 /// round-trip overhead that made empty-shard completions take seconds
 /// instead of milliseconds.
 pub const OP_MIGRATION_BATCH_COMPLETE: u16 = 243;
+/// Pull-based migration repair (W1.1 FIX B): a node whose committed
+/// topology says it should be receiving shard data — but which has
+/// pending inbound migrations and no incoming pushes (e.g. it activated
+/// the topology term after the sources already ran their plans) — sends
+/// this to each source node. Payload:
+/// `[topology_epoch:8][requester_node:8][shard_count:4][shard_id:2 × count]`.
+/// The source validates the epoch against its own activated shard-table
+/// version and re-runs the normal outbound migration (or re-sends the
+/// completion handshake) for the listed shards. Fully idempotent.
+pub const OP_MIGRATION_TRANSFER_REQUEST: u16 = 244;
 
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;
@@ -392,6 +402,19 @@ pub const ERR_DELETED_CHILDREN: u16 = 35;
 /// is unconditional and never returns this code.
 pub const ERR_NOT_DUE: u16 = 36;
 
+/// W1.1 FIX A — a migration completion handshake (`OP_MIGRATION_COMPLETE`
+/// or `OP_MIGRATION_BATCH_COMPLETE`) or a transfer request
+/// (`OP_MIGRATION_TRANSFER_REQUEST`) arrived stamped with a topology
+/// epoch the receiver has NOT yet activated (its shard-table version is
+/// behind the frame's epoch). The receiver cannot meaningfully
+/// acknowledge a handoff for a topology it has not installed: doing so
+/// previously let a source commit a master move against a CPU-starved
+/// target that never registered the inbound shards, leaving them
+/// permanently masterless. Retryable: the sender must treat this as
+/// pending (the target will activate the term shortly) — never as a
+/// completed handoff.
+pub const ERR_MIGRATION_TARGET_NOT_READY: u16 = 37;
+
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
 /// `1` is the historical implicit version: legacy clients and servers do
@@ -525,6 +548,7 @@ pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
             | OP_REPLICA_BATCH
             | OP_MIGRATION_COMPLETE
             | OP_MIGRATION_BATCH_COMPLETE
+            | OP_MIGRATION_TRANSFER_REQUEST
             | OP_TOPOLOGY_PROPOSE
             | OP_TOPOLOGY_VOTE
             | OP_TOPOLOGY_COMMIT

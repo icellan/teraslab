@@ -825,6 +825,25 @@ pub(crate) fn handle_request(
                         ),
                     );
                 }
+                // W1.1 FIX A — the inverse direction: this node has NOT
+                // yet activated the epoch the migration belongs to (its
+                // shard table predates the handoff), so it cannot
+                // meaningfully acknowledge the completion: the inbound
+                // shard registration and the post-handoff assignment do
+                // not exist locally yet. Acknowledging anyway let a
+                // source commit a master move that a slow target never
+                // recorded, leaving the shard permanently masterless.
+                // Retryable — the source holds the handoff as pending.
+                let local_version = cluster.shard_table().read().version;
+                if local_version < migration_epoch {
+                    return error_response(
+                        request.request_id,
+                        ERR_MIGRATION_TARGET_NOT_READY,
+                        &format!(
+                            "shard {shard} target shard-table version {local_version} has not activated migration epoch {migration_epoch}"
+                        ),
+                    );
+                }
             }
 
             let verify_only = request.flags & FLAG_MIGRATION_VERIFY_ONLY != 0;
@@ -996,7 +1015,9 @@ pub(crate) fn handle_request(
         OP_MIGRATION_BATCH_COMPLETE => {
             // Batched migration-complete: marks multiple shards as done
             // in a single TCP frame. Wire format:
-            //   [shard_count:4][shard_id:2 × count][from_node:8]
+            //   [shard_count:4][shard_id:2 × count][from_node:8][topology_epoch:8]
+            // The trailing topology_epoch (W1.1 FIX A) is optional for
+            // backward compatibility with pre-FIX-A senders.
             if request.payload.len() < 4 {
                 return error_response(
                     request.request_id,
@@ -1061,6 +1082,43 @@ pub(crate) fn handle_request(
                 );
             };
             let from_node = NodeId(from_node_id);
+            // W1.1 FIX A — optional trailing topology epoch stamped by
+            // the source's activation. Absent on legacy frames.
+            let migration_epoch = le_u64_at(&request.payload, from_node_off + 8).unwrap_or(0);
+
+            if migration_epoch > 0
+                && let Some(cluster) = cluster
+            {
+                // Mirror the OP_MIGRATION_COMPLETE stale-source check
+                // (2 epochs of slack for in-flight re-activation cycles).
+                let current_epoch = cluster.topology_epoch();
+                if current_epoch > migration_epoch + 2 {
+                    return error_response(
+                        request.request_id,
+                        ERR_MIGRATION_IN_PROGRESS,
+                        &format!(
+                            "stale migration epoch {migration_epoch} < current {current_epoch}"
+                        ),
+                    );
+                }
+                // W1.1 FIX A — this node has not activated the epoch the
+                // handoff belongs to: its shard table has neither the
+                // post-handoff assignments nor the pending-inbound
+                // registrations, so "completing" here would let the
+                // source commit a master move this node never recorded
+                // (the CI-confirmed masterless-shard deadlock).
+                // Retryable: the source treats it as pending.
+                let local_version = cluster.shard_table().read().version;
+                if local_version < migration_epoch {
+                    return error_response(
+                        request.request_id,
+                        ERR_MIGRATION_TARGET_NOT_READY,
+                        &format!(
+                            "target shard-table version {local_version} has not activated migration epoch {migration_epoch}"
+                        ),
+                    );
+                }
+            }
 
             if let Some(cluster) = cluster {
                 cluster.mark_inbound_complete_many_from_source(&shards, from_node);
@@ -1079,6 +1137,102 @@ pub(crate) fn handle_request(
                 let _ = from_node; // Used for audit logging if needed
             }
 
+            ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload: Vec::new(),
+            }
+        }
+        OP_MIGRATION_TRANSFER_REQUEST => {
+            // W1.1 FIX B — a migration target whose committed topology
+            // says it should hold the listed shards, but which has
+            // pending inbound migrations and no incoming pushes, asks
+            // this node to (re-)run the outbound migration for them.
+            // Wire format:
+            //   [topology_epoch:8][requester_node:8][shard_count:4][shard_id:2 × count]
+            let cluster = match cluster {
+                Some(c) => c,
+                None => {
+                    return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered");
+                }
+            };
+            let (Some(epoch), Some(requester_id), Some(shard_count)) = (
+                le_u64_at(&request.payload, 0),
+                le_u64_at(&request.payload, 8),
+                le_u32_at(&request.payload, 16),
+            ) else {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    "transfer-request: truncated header",
+                );
+            };
+            let shard_count = shard_count as usize;
+            if shard_count == 0 || shard_count > crate::cluster::shards::NUM_SHARDS {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    &format!("transfer-request: shard count {shard_count} out of range"),
+                );
+            }
+            if request.payload.len() < 20 + shard_count * 2 {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    &format!(
+                        "transfer-request: need {} bytes, got {}",
+                        20 + shard_count * 2,
+                        request.payload.len()
+                    ),
+                );
+            }
+            let mut shards = Vec::with_capacity(shard_count);
+            for i in 0..shard_count {
+                let Some(shard) = le_u16_at(&request.payload, 20 + i * 2) else {
+                    return error_response(
+                        request.request_id,
+                        ERR_PAYLOAD_MALFORMED,
+                        "transfer-request: malformed shard id",
+                    );
+                };
+                shards.push(shard);
+            }
+            // Both sides must have activated the same topology term:
+            // - behind → this node cannot serve a handoff it has not
+            //   activated yet (the requester retries on its next cycle);
+            // - ahead → the requester's view is stale; it must re-fetch
+            //   the committed topology before asking again.
+            let local_version = cluster.shard_table().read().version;
+            if local_version < epoch {
+                return error_response(
+                    request.request_id,
+                    ERR_MIGRATION_TARGET_NOT_READY,
+                    &format!(
+                        "source shard-table version {local_version} has not activated epoch {epoch}"
+                    ),
+                );
+            }
+            if local_version > epoch {
+                return error_response(
+                    request.request_id,
+                    ERR_STALE_EPOCH,
+                    &format!("transfer-request epoch {epoch} behind local version {local_version}"),
+                );
+            }
+            let queued = cluster.signal_shard_transfer_request(
+                crate::cluster::coordinator::ShardTransferRequest {
+                    epoch,
+                    requester: NodeId(requester_id),
+                    shards,
+                },
+            );
+            if !queued {
+                return error_response(
+                    request.request_id,
+                    ERR_INTERNAL,
+                    "transfer-request: coordinator shutting down",
+                );
+            }
             ResponseFrame {
                 request_id: request.request_id,
                 status: STATUS_OK,
@@ -13529,6 +13683,279 @@ mod tests {
             "batch completion from one source must not clear other sources"
         );
         assert!(cluster.has_pending_inbound_shard(shard));
+    }
+
+    /// W1.1 FIX A — a completion handshake stamped with a topology epoch
+    /// this node has NOT activated yet must be rejected as retryable
+    /// (`ERR_MIGRATION_TARGET_NOT_READY`), leaving inbound state and the
+    /// shard table untouched. Pre-fix the handler returned STATUS_OK,
+    /// letting the source commit a master move the target never recorded.
+    #[test]
+    fn migration_batch_complete_rejected_when_target_has_not_activated_epoch() {
+        let h = DispatchTestHarness::new();
+        let shard = 36u16;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        // Target's activated shard-table version is 5...
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 5);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4707".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+        assert_eq!(cluster.inbound_pending_count(), 1);
+
+        // ...but the source's handshake is stamped with epoch 6.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&shard.to_le_bytes());
+        payload.extend_from_slice(&crate::cluster::shards::NodeId(2).0.to_le_bytes());
+        payload.extend_from_slice(&6u64.to_le_bytes());
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_MIGRATION_BATCH_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(
+            code, ERR_MIGRATION_TARGET_NOT_READY,
+            "not-yet-activated epoch must be a retryable rejection, got: {msg}"
+        );
+        assert!(
+            cluster.has_pending_inbound_shard(shard),
+            "a rejected handshake must not clear inbound migration state"
+        );
+    }
+
+    /// W1.1 FIX A — a batch completion stamped with the epoch this node
+    /// HAS activated is accepted, and the trailing epoch bytes parse
+    /// correctly alongside the legacy fields.
+    #[test]
+    fn migration_batch_complete_with_matching_epoch_clears_inbound() {
+        let h = DispatchTestHarness::new();
+        let shard = 37u16;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 9);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4708".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&shard.to_le_bytes());
+        payload.extend_from_slice(&crate::cluster::shards::NodeId(2).0.to_le_bytes());
+        payload.extend_from_slice(&9u64.to_le_bytes());
+        let req = RequestFrame {
+            request_id: 0,
+            op_code: OP_MIGRATION_BATCH_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(
+            !cluster.has_pending_inbound_shard(shard),
+            "matching-epoch completion must clear the pending inbound state"
+        );
+    }
+
+    /// W1.1 FIX A — same gate for the per-shard OP_MIGRATION_COMPLETE
+    /// (the data-bearing handshake): an epoch the target has not
+    /// activated is rejected with `ERR_MIGRATION_TARGET_NOT_READY`.
+    #[test]
+    fn migration_complete_rejected_when_target_has_not_activated_epoch() {
+        let h = DispatchTestHarness::new();
+        let shard = 38u16;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 3);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4709".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+
+        // Empty-shard completion with manifest evidence, stamped epoch 4
+        // while the target activated only epoch 3.
+        let payload = build_migration_complete_payload(
+            0,
+            0,
+            4,
+            Some(compute_manifest_for_entries(&[])),
+            Some(&[]),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(
+            code, ERR_MIGRATION_TARGET_NOT_READY,
+            "not-yet-activated epoch must be a retryable rejection, got: {msg}"
+        );
+        assert!(
+            cluster.has_pending_inbound_shard(shard),
+            "a rejected completion must not clear inbound migration state"
+        );
+    }
+
+    /// W1.1 FIX B — OP_MIGRATION_TRANSFER_REQUEST epoch validation and
+    /// queueing: matching epoch queues a `ShardTransferRequest` for the
+    /// event loop; a requester ahead of this node gets
+    /// `ERR_MIGRATION_TARGET_NOT_READY` (retryable); a stale requester
+    /// gets `ERR_STALE_EPOCH`.
+    #[test]
+    fn migration_transfer_request_validates_epoch_and_queues() {
+        let h = DispatchTestHarness::new();
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 7);
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4710".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        let rx = cluster.test_take_transfer_request_rx();
+
+        let encode = |epoch: u64, shards: &[u16]| -> Vec<u8> {
+            let mut p = Vec::new();
+            p.extend_from_slice(&epoch.to_le_bytes());
+            p.extend_from_slice(&3u64.to_le_bytes()); // requester = NodeId(3)
+            p.extend_from_slice(&(shards.len() as u32).to_le_bytes());
+            for &s in shards {
+                p.extend_from_slice(&s.to_le_bytes());
+            }
+            p
+        };
+        let send = |cluster: &crate::cluster::coordinator::RunningCluster,
+                    payload: Vec<u8>|
+         -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 0,
+                op_code: OP_MIGRATION_TRANSFER_REQUEST,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut conn_state = crate::server::ConnectionState::new();
+            handle_request(
+                &req,
+                &h.engine,
+                8192,
+                Some(cluster),
+                None,
+                &mut conn_state,
+                None,
+            )
+        };
+
+        // Requester ahead of this node (epoch 8 > local 7): retryable.
+        let resp = send(&cluster, encode(8, &[10, 11]));
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_MIGRATION_TARGET_NOT_READY);
+
+        // Requester behind this node (epoch 6 < local 7): stale.
+        let resp = send(&cluster, encode(6, &[10, 11]));
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STALE_EPOCH);
+
+        // Matching epoch: accepted and queued verbatim.
+        let resp = send(&cluster, encode(7, &[10, 11]));
+        assert_eq!(resp.status, STATUS_OK);
+        let queued = rx.try_recv().expect("request must be queued");
+        assert_eq!(queued.epoch, 7);
+        assert_eq!(queued.requester, crate::cluster::shards::NodeId(3));
+        assert_eq!(queued.shards, vec![10, 11]);
+
+        // Nothing else queued by the two rejected frames.
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
