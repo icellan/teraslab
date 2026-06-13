@@ -1670,6 +1670,10 @@ pub(crate) struct ReplicationPlan {
     /// Keys appear in input order; a key whose shard has no resolvable
     /// regular replica addresses carries an empty set.
     pub key_targets: Vec<(TxKey, Vec<SocketAddr>)>,
+    /// P4/R4: reverse map of every fan-out address to the NodeId it was
+    /// resolved from, so the sender can select a per-TARGET ACK timeout
+    /// (`migration_pressure_active_for`) instead of a sender-local one.
+    pub addr_nodes: HashMap<SocketAddr, NodeId>,
 }
 
 pub(crate) fn build_replication_targets(
@@ -1688,6 +1692,8 @@ pub(crate) fn build_replication_targets(
     let self_id = cluster.self_id();
     // D-6: per-key regular replica address set, in input order.
     let mut key_targets: Vec<(TxKey, Vec<SocketAddr>)> = Vec::with_capacity(ops_by_key.len());
+    // P4/R4: addr → NodeId for per-target ACK timeout selection.
+    let mut addr_nodes: HashMap<SocketAddr, NodeId> = HashMap::new();
 
     for (key, ops) in ops_by_key {
         let shard = ShardTable::shard_for_key(key);
@@ -1721,6 +1727,7 @@ pub(crate) fn build_replication_targets(
                 Some(addr) => {
                     by_addr.entry(addr).or_default().extend(ops.clone());
                     regular_addrs.insert(addr);
+                    addr_nodes.insert(addr, *replica_id);
                     if !this_key_regular.contains(&addr) {
                         this_key_regular.push(addr);
                     }
@@ -1741,6 +1748,7 @@ pub(crate) fn build_replication_targets(
             if let Some(addr) = cluster.node_addr(extra) {
                 by_addr.entry(addr).or_default().extend(ops.clone());
                 dual_write_addrs.insert(addr);
+                addr_nodes.insert(addr, *extra);
             }
         }
         key_targets.push((*key, this_key_regular));
@@ -1766,6 +1774,7 @@ pub(crate) fn build_replication_targets(
         by_addr,
         dual_write_only: dual_write_addrs,
         key_targets,
+        addr_nodes,
     })
 }
 
@@ -1821,6 +1830,7 @@ fn replicate_all_ops_with_barrier(
         by_addr,
         dual_write_only,
         key_targets,
+        addr_nodes,
     } = plan;
     let rf = cluster.shard_table().read().replication_factor();
 
@@ -1851,11 +1861,29 @@ fn replicate_all_ops_with_barrier(
     // runtime. Each send runs on a blocking task (reusing pooled threads)
     // instead of spawning a new OS thread per replication call.
     let source_node_id = cluster.self_id().0;
-    let ack_timeout = replication_ack_timeout_for(
-        cluster.replication_timeout(),
-        cluster.migration_pressure_active(),
-        cluster.replication_timeout_during_migration(),
-    );
+    // P4/R4: the ACK timeout is selected PER TARGET, not sender-locally.
+    // `migration_pressure_active_for` escalates when local migration
+    // pressure is active OR the target replica itself is a mover in the
+    // current topology transition (it may be drowning in inbound
+    // migration batches even though this sender migrates nothing).
+    let base_timeout = cluster.replication_timeout();
+    let migration_timeout_floor = cluster.replication_timeout_during_migration();
+    let ack_timeouts: HashMap<SocketAddr, Duration> = by_addr
+        .keys()
+        .map(|addr| {
+            let pressure = match addr_nodes.get(addr) {
+                Some(node) => cluster.migration_pressure_active_for(*node),
+                // Address with no resolved NodeId (defensive — every
+                // fan-out addr is inserted with its node): fall back to
+                // the sender-local check.
+                None => cluster.migration_pressure_active(),
+            };
+            (
+                *addr,
+                replication_ack_timeout_for(base_timeout, pressure, migration_timeout_floor),
+            )
+        })
+        .collect();
     // Phase B3: stamp every outbound batch with the live coordinator
     // epoch so the receiver's gate can reject stale-cluster writes.
     let cluster_key = cluster.local_cluster_key();
@@ -1867,6 +1895,7 @@ fn replicate_all_ops_with_barrier(
             let mut handles = Vec::with_capacity(by_addr.len());
             for (addr, ops) in by_addr {
                 let auth_secret = auth_secret.clone();
+                let ack_timeout = ack_timeouts.get(&addr).copied().unwrap_or(base_timeout);
                 handles.push(tokio::task::spawn_blocking(move || {
                     if ops.is_empty() {
                         return (addr, Ok(()));
@@ -12087,6 +12116,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replication_timeout_escalates_for_migrating_target_replica() {
+        // P4/R4: the SENDER (node 3) has no local migration pressure, but
+        // replica X (node 2) is absorbing a master handoff committed in
+        // the latest table swap while replica Y (node 4) is uninvolved.
+        // The ACK timeout must be per-target: 30s for X, 3s for Y.
+        use crate::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let old = ShardTable::compute_with_epoch(&members, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = old.target_assignment(s);
+                a.master == NodeId(1) && a.replicas == vec![NodeId(2)]
+            })
+            .expect("expected a shard mastered by 1 with replica 2");
+        let mut new = old.clone();
+        new.set_master_for_shard(shard, NodeId(2));
+        new.version = 2;
+        let mut table = old;
+        // Sender holds no data for the moved shard: its local handoff
+        // state clears immediately — the exact CI failure scenario.
+        table.begin_handoff_with(&new, |_| false);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            NodeId(3),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:8801".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:8802".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:8803".parse().unwrap()),
+                (NodeId(4), "127.0.0.1:8804".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            4,
+        );
+
+        // Sender-local pressure is OFF — pre-fix, this forced 3s for ALL
+        // targets including the drowning replica.
+        assert!(!cluster.migration_pressure_active());
+        assert_eq!(cluster.replication_timeout(), Duration::from_secs(3));
+
+        let timeout_for = |node: NodeId| {
+            replication_ack_timeout_for(
+                cluster.replication_timeout(),
+                cluster.migration_pressure_active_for(node),
+                cluster.replication_timeout_during_migration(),
+            )
+        };
+        assert_eq!(
+            timeout_for(NodeId(2)),
+            Duration::from_secs(30),
+            "replica absorbing inbound migration must get the migration timeout"
+        );
+        assert_eq!(
+            timeout_for(NodeId(4)),
+            Duration::from_secs(3),
+            "uninvolved replica must keep the base timeout"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Status-byte mapping (batch_response_with_outcome).
     //
@@ -12710,6 +12801,11 @@ mod tests {
             "n2 is a regular replica; must not appear in dual_write_only: {:?}",
             plan.dual_write_only,
         );
+        // P4/R4: every fan-out address (regular AND dual-write) must be
+        // mapped back to its NodeId for per-target ACK timeout selection.
+        assert_eq!(plan.addr_nodes.get(&n2_addr), Some(&n2));
+        assert_eq!(plan.addr_nodes.get(&n3_addr), Some(&n3));
+        assert!(!plan.addr_nodes.contains_key(&n1_addr));
     }
 
     /// Phase E: outside an active migration, the dual-write window is empty

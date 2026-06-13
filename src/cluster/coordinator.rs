@@ -1601,6 +1601,8 @@ impl ClusterCoordinator {
                 .timeout_during_migration
                 .max(Duration::from_millis(1)),
             last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+            node_migration_pressure_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            node_pressure_stamped_version: Arc::new(AtomicU64::new(0)),
             migration_throttle: self.migration_throttle.clone(),
             cluster_secret,
             committed_cluster_key: self.committed_cluster_key.clone(),
@@ -6024,6 +6026,16 @@ pub struct RunningCluster {
     repl_timeout_during_migration: Duration,
     /// Last time this node observed local migration pressure.
     last_migration_pressure_ms: Arc<AtomicU64>,
+    /// P4/R4 — per-TARGET-node migration-involvement grace map for the
+    /// replication ACK timeout escalation: node → last millis the node
+    /// was seen as a mover in a topology transition. Stamped for every
+    /// mover when a new shard-table version is first observed, refreshed
+    /// per node while the table still reports an active transition. Keyed
+    /// by `NodeId`; bounded by cluster size, entries are never removed.
+    node_migration_pressure_ms: Arc<Mutex<std::collections::HashMap<NodeId, u64>>>,
+    /// Shard-table version whose transition movers were last stamped into
+    /// `node_migration_pressure_ms` (guarded by that map's mutex).
+    node_pressure_stamped_version: Arc<AtomicU64>,
     /// Phase G — outbound migration byte throttle, shared with every
     /// migration worker so concurrent outbound bytes stay under
     /// `TERASLAB_MAX_BYTES_EMIGRATING` (default 32 MiB). Workers
@@ -6718,6 +6730,68 @@ impl RunningCluster {
         last != 0 && now.saturating_sub(last) <= MIGRATION_PRESSURE_GRACE.as_millis() as u64
     }
 
+    /// P4/R4 — whether replication to `target` is currently likely to
+    /// contend with migration, considering BOTH this node's local
+    /// pressure ([`migration_pressure_active`](Self::migration_pressure_active))
+    /// and the TARGET replica's own migration involvement.
+    ///
+    /// Sender-local escalation alone is wrong: a master with no local
+    /// migration keeps the short foreground ACK timeout exactly when its
+    /// replica is drowning in inbound migration batches, failing every
+    /// write to it with `ERR_REPLICATION_FAILED`. The target's
+    /// involvement is derived from state the sender already has — the
+    /// shard-table diff captured at topology activation
+    /// ([`ShardTable::transition_nodes`]) — with no new wire traffic.
+    ///
+    /// Grace semantics mirror the local check (same 120s window): every
+    /// mover is stamped into a per-node last-seen map when a new table
+    /// version is first observed here, and re-stamped while the table
+    /// still reports an active transition, so the escalation holds for
+    /// `MIGRATION_PRESSURE_GRACE` after the handoff clears instead of
+    /// flapping back to the short timeout while the replica drains.
+    pub fn migration_pressure_active_for(&self, target: NodeId) -> bool {
+        let now = now_millis_since_epoch();
+        let (version, target_in_transition, movers) = {
+            let table = self.shard_table.read();
+            let version = table.version;
+            let stamp_all =
+                version != self.node_pressure_stamped_version.load(Ordering::Relaxed);
+            (
+                version,
+                table.node_in_active_transition(target),
+                stamp_all.then(|| table.transition_nodes().clone()),
+            )
+        };
+        let target_pressure = {
+            let mut map = self.node_migration_pressure_ms.lock();
+            if let Some(movers) = movers {
+                // First query against this table version: stamp every
+                // mover of the transition so an uninvolved sender (whose
+                // local handoff state cleared immediately) still extends
+                // the timeout for replicas absorbing migration data.
+                for node in movers {
+                    map.insert(node, now);
+                }
+                self.node_pressure_stamped_version
+                    .store(version, Ordering::Relaxed);
+            }
+            if target_in_transition {
+                map.insert(target, now);
+                true
+            } else {
+                map.get(&target).is_some_and(|&last| {
+                    now.saturating_sub(last) <= MIGRATION_PRESSURE_GRACE.as_millis() as u64
+                })
+            }
+        };
+        // Evaluate the local check unconditionally: it refreshes the
+        // local last-seen timestamp as a side effect, and short-circuiting
+        // it behind `target_pressure` would silently shorten the local
+        // grace window.
+        let local_pressure = self.migration_pressure_active();
+        target_pressure || local_pressure
+    }
+
     /// Access the topology authority for handling propose/vote/commit messages.
     pub fn topology_authority(&self) -> &crate::cluster::topology::TopologyAuthority {
         &self.topology_authority
@@ -7294,6 +7368,8 @@ pub(crate) fn new_test_running_cluster(
         repl_timeout: Duration::from_secs(3),
         repl_timeout_during_migration: Duration::from_secs(30),
         last_migration_pressure_ms: Arc::new(AtomicU64::new(0)),
+        node_migration_pressure_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        node_pressure_stamped_version: Arc::new(AtomicU64::new(0)),
         migration_throttle: Arc::new(crate::cluster::migration::MigrationThrottle::from_env()),
         cluster_secret: None,
         committed_cluster_key: topology_authority.committed_term_shared(),
@@ -7809,6 +7885,154 @@ mod tests {
             .last_migration_pressure_ms
             .store(expired, Ordering::Relaxed);
         assert!(!cluster.migration_pressure_active());
+    }
+
+    /// P4/R4 test fixture: a 4-node cluster where one shard's master moved
+    /// from node 1 to node 2 in the latest topology activation, observed by
+    /// SENDER node 3 which has no data for the shard — so its local handoff
+    /// state cleared immediately (the exact CI scenario: sender-local
+    /// pressure is off while replica n2 absorbs inbound migration).
+    /// Returns (cluster, moved_shard).
+    fn uninvolved_sender_with_remote_handoff() -> (RunningCluster, u16) {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let old = ShardTable::compute_with_epoch(&members, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = old.target_assignment(s);
+                a.master == NodeId(1) && a.replicas == vec![NodeId(2)]
+            })
+            .expect("expected a shard mastered by 1 with replica 2");
+        let mut new = old.clone();
+        new.set_master_for_shard(shard, NodeId(2));
+        new.version = 2;
+        let mut table = old;
+        table.begin_handoff_with(&new, |_| false); // sender holds no data
+        assert_eq!(table.pending_handoff_count(), 0, "fixture precondition");
+        let cluster = new_test_running_cluster(
+            NodeId(3),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:3300".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:3301".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:3302".parse().unwrap()),
+                (NodeId(4), "127.0.0.1:3303".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            4,
+        );
+        (cluster, shard)
+    }
+
+    #[test]
+    fn target_migration_pressure_escalates_for_transition_movers() {
+        let (cluster, _shard) = uninvolved_sender_with_remote_handoff();
+
+        // No LOCAL pressure — this is precisely the buggy P4/R4 case.
+        assert!(!cluster.migration_pressure_active());
+
+        // Both movers of the committed transition escalate; an
+        // uninvolved replica does not.
+        assert!(
+            cluster.migration_pressure_active_for(NodeId(2)),
+            "replica absorbing the master handoff must escalate the ACK timeout"
+        );
+        assert!(
+            cluster.migration_pressure_active_for(NodeId(1)),
+            "handoff source must escalate the ACK timeout"
+        );
+        assert!(
+            !cluster.migration_pressure_active_for(NodeId(4)),
+            "replica uninvolved in the transition must keep the base timeout"
+        );
+    }
+
+    #[test]
+    fn target_migration_pressure_grace_expires_per_node() {
+        let (cluster, _shard) = uninvolved_sender_with_remote_handoff();
+
+        assert!(cluster.migration_pressure_active_for(NodeId(2)));
+
+        // Mid-grace: a fresh stamp keeps the escalation on.
+        cluster
+            .node_migration_pressure_ms
+            .lock()
+            .insert(NodeId(2), now_millis_since_epoch());
+        assert!(cluster.migration_pressure_active_for(NodeId(2)));
+
+        // Expired: past the 120s grace the base timeout returns.
+        let expired = now_millis_since_epoch()
+            .saturating_sub(MIGRATION_PRESSURE_GRACE.as_millis() as u64 + 1);
+        cluster
+            .node_migration_pressure_ms
+            .lock()
+            .insert(NodeId(2), expired);
+        assert!(
+            !cluster.migration_pressure_active_for(NodeId(2)),
+            "per-node grace must expire after MIGRATION_PRESSURE_GRACE"
+        );
+        // Node 1's stamp is untouched and still within grace.
+        assert!(cluster.migration_pressure_active_for(NodeId(1)));
+    }
+
+    #[test]
+    fn target_migration_pressure_refreshes_while_handoff_pending() {
+        // Sender IS involved this time (it sources the shard), so its
+        // table keeps Copying state: the per-node stamp must be refreshed
+        // on every query while the transition is still active, extending
+        // the grace window past long migrations.
+        let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        let old = ShardTable::compute_with_epoch(&members, 2, 1);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = old.target_assignment(s);
+                a.master == NodeId(1) && a.replicas == vec![NodeId(2)]
+            })
+            .expect("expected a shard mastered by 1 with replica 2");
+        let mut new = old.clone();
+        new.set_master_for_shard(shard, NodeId(2));
+        new.version = 2;
+        let mut table = old;
+        table.begin_handoff_with(&new, |s| s == shard);
+        assert_eq!(table.pending_handoff_count(), 1);
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[
+                (NodeId(1), "127.0.0.1:3300".parse().unwrap()),
+                (NodeId(2), "127.0.0.1:3301".parse().unwrap()),
+                (NodeId(3), "127.0.0.1:3302".parse().unwrap()),
+                (NodeId(4), "127.0.0.1:3303".parse().unwrap()),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            4,
+        );
+
+        assert!(cluster.migration_pressure_active_for(NodeId(2)));
+
+        // Force-expire node 2's stamp: while the handoff is pending the
+        // query path must re-stamp it (no flapping mid-migration).
+        let expired = now_millis_since_epoch()
+            .saturating_sub(MIGRATION_PRESSURE_GRACE.as_millis() as u64 + 1);
+        cluster
+            .node_migration_pressure_ms
+            .lock()
+            .insert(NodeId(2), expired);
+        assert!(cluster.migration_pressure_active_for(NodeId(2)));
+        let restamped = *cluster
+            .node_migration_pressure_ms
+            .lock()
+            .get(&NodeId(2))
+            .unwrap();
+        assert!(
+            restamped > expired,
+            "pending handoff must refresh the per-node stamp"
+        );
     }
 
     #[test]
