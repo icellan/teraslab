@@ -309,6 +309,22 @@ struct InboundMigration {
     from_node: NodeId,
     /// True once `OP_MIGRATION_COMPLETE` confirmed data arrived.
     completed: bool,
+    /// W1.1 residual fix — wall-clock instant at which this node last sent
+    /// an `OP_MIGRATION_TRANSFER_REQUEST` for this shard (the pull-based
+    /// repair). `None` means no outstanding request.
+    ///
+    /// The settled-inbound GC (which reaps inbound entries orphaned by a
+    /// source that died mid-migration) must NOT reap an entry whose resend
+    /// is still in flight: the source honours the request and pushes
+    /// AFTER the request returns, so a freshly-requested entry that gets
+    /// GC'd leaves the shard with the request's completion arriving at a
+    /// node that no longer expects it. This stamp lets the GC skip
+    /// recently-requested entries for a bounded grace window.
+    ///
+    /// Not serialized: an outstanding request does not survive a restart
+    /// (the requester re-derives and re-sends from `pending_inbound_entries`
+    /// after restore), so this is process-local timing state only.
+    transfer_requested_at: Option<std::time::Instant>,
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +572,7 @@ impl MigrationManager {
                         shard: task.shard,
                         from_node: task.from_node,
                         completed: false,
+                        transfer_requested_at: None,
                     });
                     self.inbound_bitmap.set(task.shard);
                 }
@@ -577,6 +594,7 @@ impl MigrationManager {
             shard,
             from_node: NodeId(0),
             completed: false,
+            transfer_requested_at: None,
         });
         self.inbound_bitmap.set(shard);
         true
@@ -834,6 +852,7 @@ impl MigrationManager {
             shard,
             from_node,
             completed: true,
+            transfer_requested_at: None,
         });
     }
 
@@ -1037,6 +1056,62 @@ impl MigrationManager {
             .collect()
     }
 
+    /// W1.1 residual fix — stamp the listed pending inbound shards with the
+    /// current instant, recording that this node has just sent an
+    /// `OP_MIGRATION_TRANSFER_REQUEST` (pull-based repair) for them.
+    ///
+    /// The settled-inbound GC consults this stamp via
+    /// [`Self::pending_inbound_shards_excluding_recent_requests`] so it will
+    /// not reap an entry whose resend is still in flight.
+    pub fn mark_inbound_requested(&mut self, shards: &std::collections::HashSet<u16>) {
+        let now = std::time::Instant::now();
+        for m in &mut self.inbound_migrations {
+            if !m.completed && shards.contains(&m.shard) {
+                m.transfer_requested_at = Some(now);
+            }
+        }
+    }
+
+    /// W1.1 residual fix — the set of pending inbound shards that the
+    /// settled-inbound fast-path GC is allowed to reap right now: those
+    /// with no outstanding transfer request, OR whose last request is older
+    /// than `request_grace` (so a lost request still gets reaped eventually
+    /// and the normal pull-based retry takes over).
+    ///
+    /// Entries requested within `request_grace` are EXCLUDED: their source
+    /// honours the request and pushes the completion handshake AFTER the
+    /// request RPC returns, so reaping them mid-flight strands the shard.
+    pub fn pending_inbound_shards_excluding_recent_requests(
+        &self,
+        request_grace: std::time::Duration,
+    ) -> std::collections::HashSet<u16> {
+        let now = std::time::Instant::now();
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed)
+            .filter(|m| match m.transfer_requested_at {
+                Some(at) => now.duration_since(at) >= request_grace,
+                None => true,
+            })
+            .map(|m| m.shard)
+            .collect()
+    }
+
+    /// W1.1 residual fix — number of pending inbound shards with an
+    /// outstanding (within-grace) transfer request. Test/diagnostic helper.
+    pub fn pending_inbound_requested_count(&self, request_grace: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        self.inbound_migrations
+            .iter()
+            .filter(|m| !m.completed)
+            .filter(|m| {
+                m.transfer_requested_at
+                    .map(|at| now.duration_since(at) < request_grace)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
     /// Number of shards with active write fences.
     pub fn fenced_count(&self) -> usize {
         self.fenced_shards.count()
@@ -1101,6 +1176,7 @@ impl MigrationManager {
                     shard,
                     from_node,
                     completed: false,
+                    transfer_requested_at: None,
                 });
                 self.inbound_bitmap.set(shard);
             }
@@ -2295,12 +2371,14 @@ mod tests {
             shard: 10,
             from_node: NodeId(1),
             completed: false,
+            transfer_requested_at: None,
         });
         mgr.inbound_bitmap.set(10);
         mgr.inbound_migrations.push(InboundMigration {
             shard: 20,
             from_node: NodeId(0),
             completed: false,
+            transfer_requested_at: None,
         });
         mgr.inbound_bitmap.set(20);
 
@@ -2309,6 +2387,72 @@ mod tests {
         assert!(mgr.has_pending_inbound(10));
         assert!(mgr.has_pending_inbound(20));
         assert_eq!(mgr.inbound_count(), 2);
+    }
+
+    /// W1.1 residual fix (FIX 1) — the settled-inbound fast-path GC must
+    /// not reap an inbound entry whose transfer request is still in flight.
+    /// This is the exact race that left fresh-cluster shards masterless:
+    /// the requester registered an inbound entry, sent
+    /// OP_MIGRATION_TRANSFER_REQUEST, and the GC fired before the source's
+    /// resend arrived.
+    #[test]
+    fn settled_gc_skips_recently_requested_inbound() {
+        let mut mgr = MigrationManager::new();
+        // Two inbound entries: shard 10 from node 1, shard 20 from node 2.
+        mgr.inbound_migrations.push(InboundMigration {
+            shard: 10,
+            from_node: NodeId(1),
+            completed: false,
+            transfer_requested_at: None,
+        });
+        mgr.inbound_bitmap.set(10);
+        mgr.inbound_migrations.push(InboundMigration {
+            shard: 20,
+            from_node: NodeId(2),
+            completed: false,
+            transfer_requested_at: None,
+        });
+        mgr.inbound_bitmap.set(20);
+
+        let grace = Duration::from_secs(10);
+
+        // Before any request: both are reapable (orphaned-source case).
+        let reapable = mgr.pending_inbound_shards_excluding_recent_requests(grace);
+        assert_eq!(reapable, std::collections::HashSet::from([10, 20]));
+        assert_eq!(mgr.pending_inbound_requested_count(grace), 0);
+
+        // Request a resend for shard 10 only.
+        mgr.mark_inbound_requested(&std::collections::HashSet::from([10]));
+
+        // Shard 10 is now protected; shard 20 (no request) stays reapable.
+        let reapable = mgr.pending_inbound_shards_excluding_recent_requests(grace);
+        assert_eq!(
+            reapable,
+            std::collections::HashSet::from([20]),
+            "freshly-requested shard 10 must be excluded from the settled GC"
+        );
+        assert_eq!(mgr.pending_inbound_requested_count(grace), 1);
+
+        // Simulate the settled fast-path GC running in the resend window:
+        // it must remove only shard 20, leaving shard 10 to receive its
+        // in-flight resend.
+        let removed = mgr.clear_pending_inbound_for_shards(&reapable);
+        assert_eq!(removed, 1, "only the unrequested shard is reaped");
+        assert!(
+            mgr.has_pending_inbound(10),
+            "the requested shard's inbound entry must survive the GC"
+        );
+        assert!(!mgr.has_pending_inbound(20));
+
+        // With a zero grace (request older than grace), the protection
+        // lapses so a genuinely-lost request is still eventually reaped.
+        let reapable_no_grace =
+            mgr.pending_inbound_shards_excluding_recent_requests(Duration::ZERO);
+        assert_eq!(
+            reapable_no_grace,
+            std::collections::HashSet::from([10]),
+            "once the request grace lapses the entry becomes reapable again"
+        );
     }
 
     #[test]

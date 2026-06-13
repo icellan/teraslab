@@ -321,6 +321,44 @@ fn committed_topology_reactivation_metrics(
     (mismatched, table.pending_handoff_count())
 }
 
+/// W1.1 residual fix (FIX 2) — self-heal backstop signal for the topology
+/// reactivation loop.
+///
+/// Counts shards for which `self_id` is the assigned AND intended master
+/// but which are still stuck in the `master_subset` (Transitioning) state
+/// with NOTHING in flight to complete them — no active migration and no
+/// pending inbound entry. Such a shard will never clear its subset flag on
+/// its own: the node owns it on paper (so the steady-state mismatch metric
+/// reads zero) yet cannot serve it. Folding this count into the
+/// reactivation trigger forces a rebuild of the inbound plan and a fresh
+/// round of transfer requests, recovering the masterless-shard deadlock
+/// even when the settled-inbound GC reaped the inbound entry before its
+/// resend arrived.
+///
+/// Shards backed by a live inbound migration or an active migration are
+/// EXCLUDED — those are legitimately in progress and the pull-based request
+/// loop already drives them, so they must not trigger spurious
+/// reactivation.
+fn stuck_subset_master_count(
+    table: &ShardTable,
+    mgr: &MigrationManager,
+    self_id: NodeId,
+) -> usize {
+    let pending_inbound_shards: std::collections::HashSet<u16> = mgr
+        .pending_inbound_entries()
+        .into_iter()
+        .map(|(shard, _)| shard)
+        .collect();
+    let active_shards: std::collections::HashSet<u16> = mgr
+        .active_migrations()
+        .iter()
+        .map(|p| p.shard)
+        .collect();
+    table.stuck_subset_shards_for(self_id, |shard| {
+        pending_inbound_shards.contains(&shard) || active_shards.contains(&shard)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_active_routing_snapshot(
     routing: &crate::cluster::routing::RoutingInfo,
@@ -1041,11 +1079,22 @@ impl ClusterCoordinator {
                             table.pending_handoff_count() == 0
                         };
                         let removed = if clear_settled_inbound {
-                            let settled_shards: std::collections::HashSet<u16> = mgr
-                                .pending_inbound_entries()
-                                .into_iter()
-                                .map(|(shard, _)| shard)
-                                .collect();
+                            // W1.1 residual fix (FIX 1) — only reap inbound
+                            // entries that are genuinely orphaned (a source
+                            // that died mid-migration). Entries for which
+                            // this node has an outstanding transfer request
+                            // (pull-based repair) within the request grace
+                            // are EXCLUDED: the source honours the request
+                            // and pushes the completion handshake AFTER the
+                            // request RPC returns, so reaping mid-flight
+                            // strands the shard masterless. The grace equals
+                            // the request re-fire interval, so a lost
+                            // request is still reaped on the cycle after the
+                            // next re-fire would have re-stamped it.
+                            let settled_shards = mgr
+                                .pending_inbound_shards_excluding_recent_requests(
+                                    TRANSFER_REQUEST_INTERVAL,
+                                );
                             mgr.clear_pending_inbound_for_shards(&settled_shards)
                         } else {
                             mgr.clear_stale_inbound(Duration::from_secs(30))
@@ -1099,20 +1148,25 @@ impl ClusterCoordinator {
                     let committed_members = topo_authority_event.committed_members();
                     if committed_members.len() > 1 {
                         let committed_term = topo_authority_event.committed_term();
-                        let (mismatched, pending_handoffs) = {
+                        let (mismatched, pending_handoffs, stuck_subset) = {
+                            let mgr = migration.lock();
                             let table = shard_table.read();
-                            committed_topology_reactivation_metrics(
-                                &table,
-                                &committed_members,
-                                rf,
-                                committed_term,
-                            )
+                            let (mismatched, pending_handoffs) =
+                                committed_topology_reactivation_metrics(
+                                    &table,
+                                    &committed_members,
+                                    rf,
+                                    committed_term,
+                                );
+                            // W1.1 residual fix (FIX 2) — self-heal backstop.
+                            let stuck_subset = stuck_subset_master_count(&table, &mgr, self_id);
+                            (mismatched, pending_handoffs, stuck_subset)
                         };
 
                         if should_trigger_topology_reactivation(
                             startup_reactivation_due,
                             normal_reactivation_due,
-                            mismatched,
+                            mismatched.saturating_add(stuck_subset as u32),
                             pending_handoffs,
                         ) {
                             topology_epoch.store(committed_term, Ordering::Relaxed);
@@ -1122,6 +1176,7 @@ impl ClusterCoordinator {
                                     term = committed_term,
                                     pending_handoffs,
                                     mismatched,
+                                    stuck_subset,
                                     "cluster: re-activating topology after restored outbound migration state",
                                 );
                             } else {
@@ -1129,6 +1184,7 @@ impl ClusterCoordinator {
                                     term = committed_term,
                                     pending_handoffs,
                                     mismatched,
+                                    stuck_subset,
                                     "cluster: re-activating topology",
                                 );
                             }
@@ -1532,6 +1588,14 @@ impl ClusterCoordinator {
                                 std::collections::HashMap::new();
                             for (shard, from) in pending {
                                 by_source.entry(from).or_default().push(shard);
+                            }
+                            // W1.1 residual fix (FIX 1) — stamp the requested
+                            // shards so the settled-inbound GC will not reap
+                            // these entries while their resend is in flight.
+                            {
+                                let requested: std::collections::HashSet<u16> =
+                                    by_source.values().flatten().copied().collect();
+                                migration.lock().mark_inbound_requested(&requested);
                             }
                             let addrs = node_addrs.read().clone();
                             let secret = cluster_secret_event.clone();
@@ -9822,6 +9886,107 @@ mod tests {
         assert!(
             !tasks.iter().any(|t| t.shard == rolled_back_shard),
             "diverged shards are repaired via re-activation, not direct tasks"
+        );
+    }
+
+    /// W1.1 residual fix (FIX 2) — the self-heal backstop. After the
+    /// settled-inbound GC reaps a late node's inbound plan, the node is left
+    /// as the assigned+intended master of shards stuck in master_subset but
+    /// with NO pending inbound and NO active migration. The steady-state
+    /// mismatch metric reads zero in that state (target == intended), so
+    /// reactivation would NOT re-fire on `mismatched` alone — the node would
+    /// sit masterless forever. `stuck_subset_master_count` must detect these
+    /// shards so the trigger fires; and it must NOT fire while a pending
+    /// inbound entry / active migration still covers them.
+    #[test]
+    fn stuck_subset_count_re_fires_reactivation_after_inbound_gc() {
+        let rf = 2;
+        let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let committed_term = 2u64;
+        let new_table = ShardTable::compute_with_epoch(&committed, rf, committed_term);
+
+        // Build node 3's table exactly as a late reactivation does: handoff
+        // from the 2-member term-1 table to the 3-member term-2 table, with
+        // one shard data-carrying so the handoff stays active and the
+        // master_subset flags persist for every shard node 3 now masters.
+        let mut table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1);
+        let any_n3 = (0..NUM_SHARDS as u16)
+            .find(|&s| new_table.target_assignment(s).master == NodeId(3))
+            .expect("node 3 must master some shard");
+        table.begin_handoff_with(&new_table, |s| s == any_n3);
+        // The single data-carrying shard's handoff completes (its resend
+        // arrived), draining the handoff state to zero pending entries — but
+        // the OTHER shards node 3 masters stay flagged in master_subset.
+        // This is the real CI deadlock state: pending_handoffs == 0,
+        // mismatched == 0, yet ~1364 shards stuck masterless.
+        table.commit_shard(any_n3);
+
+        // The committed term IS activated locally (version == committed_term)
+        // and target == intended for node 3's shards, so the steady-state
+        // mismatch metric is zero — reactivation would never fire on it.
+        let (mismatched, pending_handoffs) =
+            committed_topology_reactivation_metrics(&table, &committed, rf, committed_term);
+        assert_eq!(
+            mismatched, 0,
+            "post-activation mismatch must be zero (the bug: nothing re-fires)"
+        );
+        assert_eq!(
+            pending_handoffs, 0,
+            "the only handoff completed; nothing else triggers reactivation"
+        );
+
+        // CASE A — inbound entries still present (the healthy in-progress
+        // state right after reactivation, before the GC race): node 3 has a
+        // pending inbound entry for every shard it masters. stuck_subset
+        // must be ZERO — the pull-based request loop owns recovery, not the
+        // reactivation backstop.
+        let mut mgr_inflight = MigrationManager::new();
+        let inflight_tasks: Vec<MigrationTask> = (0..NUM_SHARDS as u16)
+            .filter(|&s| new_table.target_assignment(s).master == NodeId(3))
+            .map(|s| MigrationTask {
+                shard: s,
+                from_node: NodeId(1),
+                to_node: NodeId(3),
+                is_master: true,
+            })
+            .collect();
+        mgr_inflight.start_outbound(&inflight_tasks, NodeId(3), &std::collections::HashSet::new());
+        assert!(mgr_inflight.inbound_count() > 1000, "test precondition");
+        assert_eq!(
+            stuck_subset_master_count(&table, &mgr_inflight, NodeId(3)),
+            0,
+            "shards with a live inbound entry must NOT count as stuck"
+        );
+        assert!(
+            !should_trigger_topology_reactivation(false, true, mismatched, pending_handoffs),
+            "no reactivation while inbound entries are live"
+        );
+
+        // CASE B — the settled GC has reaped every inbound entry (the race):
+        // node 3 now has NO pending inbound and NO active migration, yet
+        // still owns those shards stuck in master_subset. stuck_subset must
+        // be large, and folding it into the trigger must re-fire
+        // reactivation — the self-heal that recovers from the GC race.
+        let mgr_empty = MigrationManager::new();
+        let stuck = stuck_subset_master_count(&table, &mgr_empty, NodeId(3));
+        assert!(
+            stuck > 1000,
+            "after the GC reaped inbound, every owned subset master is stuck (stuck={stuck})"
+        );
+        // Pre-FIX-2 behaviour: trigger on `mismatched` alone stays false.
+        assert!(
+            !should_trigger_topology_reactivation(false, true, mismatched, pending_handoffs),
+            "pre-fix: reactivation does not fire — the masterless deadlock"
+        );
+        // Post-FIX-2: folding stuck_subset into the count re-fires it.
+        assert!(
+            should_trigger_topology_reactivation(
+                false,
+                true,
+                mismatched.saturating_add(stuck as u32),
+                pending_handoffs,
+            ),
+            "post-fix: stuck subset masters re-fire reactivation"
         );
     }
 

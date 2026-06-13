@@ -494,6 +494,31 @@ impl ShardTable {
         self.intended_masters[shard as usize]
     }
 
+    /// W1.1 residual fix (FIX 2) — shards for which `node` is the assigned
+    /// AND intended master but which are still stuck in the `master_subset`
+    /// (Transitioning) state, filtered by `keep`.
+    ///
+    /// `keep(shard)` returns `true` for shards the caller still considers
+    /// legitimately in-progress (an active inbound migration or an
+    /// outstanding transfer request); those are excluded so a healthy
+    /// migration is never mistaken for a stuck one. A shard returned here is
+    /// one this node owns on paper but cannot serve, with nothing in flight
+    /// to complete it — the self-heal backstop must re-fire reactivation to
+    /// rebuild its inbound plan.
+    pub fn stuck_subset_shards_for<F>(&self, node: NodeId, mut keep: F) -> usize
+    where
+        F: FnMut(u16) -> bool,
+    {
+        (0..NUM_SHARDS as u16)
+            .filter(|&shard| {
+                self.master_subset[shard as usize]
+                    && self.assignments[shard as usize].master == node
+                    && self.intended_masters[shard as usize] == node
+                    && !keep(shard)
+            })
+            .count()
+    }
+
     /// Count how many shards each node masters.
     pub fn shard_counts(&self) -> std::collections::HashMap<NodeId, usize> {
         let mut counts = std::collections::HashMap::new();
@@ -699,6 +724,93 @@ mod tests {
             table.target_assignment(moved).master,
             table.intended_master(moved),
             "rollback restores the old assignment but must NOT rewrite the intent"
+        );
+    }
+
+    /// W1.1 residual fix (FIX 2) — `stuck_subset_shards_for` is the
+    /// self-heal backstop signal: a node that is the assigned+intended
+    /// master of shards still stuck in master_subset (Transitioning), with
+    /// nothing in flight to complete them, must trigger reactivation. The
+    /// same shards WITH an active inbound migration / pending request
+    /// (signalled via the `keep` closure) must NOT — they are legitimately
+    /// in progress.
+    #[test]
+    fn stuck_subset_shards_for_detects_only_settled_subset_masters() {
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
+        let new_table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
+        // A shard whose master moves to node 3 when node 3 joins.
+        let moved = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                old.target_assignment(s).master != new_table.target_assignment(s).master
+                    && new_table.target_assignment(s).master == NodeId(3)
+            })
+            .expect("adding node 3 must move some master to it");
+
+        let mut table = old.clone();
+        // Mark `moved` as data-carrying so it enters Copying. This keeps the
+        // handoff active (not the all_serving shortcut), so master_subset
+        // stays set for EVERY shard whose master moved to node 3 — exactly
+        // the CI deadlock state where node 3 owns ~1365 shards on paper but
+        // none of them are servable.
+        table.begin_handoff_with(&new_table, |s| s == moved);
+        assert!(table.is_subset_master(moved), "test precondition");
+        assert_eq!(table.target_assignment(moved).master, NodeId(3));
+        assert_eq!(table.intended_master(moved), NodeId(3));
+
+        // The full set of shards node 3 newly masters — all stuck in subset.
+        let node3_moved: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| new_table.target_assignment(s).master == NodeId(3))
+            .collect();
+        let stuck_total = node3_moved.len();
+        assert!(stuck_total > 1000, "node 3 must own a large share");
+
+        // With nothing in flight (keep returns false), every subset master
+        // node 3 owns is reported stuck.
+        assert_eq!(
+            table.stuck_subset_shards_for(NodeId(3), |_| false),
+            stuck_total,
+            "settled subset masters with nothing in flight must all be flagged"
+        );
+        // The count is scoped per node: node 1's stuck count covers only
+        // shards node 1 newly masters, never node 3's — and the two sets
+        // are disjoint.
+        let node1_stuck = table.stuck_subset_shards_for(NodeId(1), |_| false);
+        let node1_moved: std::collections::HashSet<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                table.is_subset_master(s) && table.target_assignment(s).master == NodeId(1)
+            })
+            .collect();
+        assert_eq!(
+            node1_stuck,
+            node1_moved.len(),
+            "the count is scoped to the queried node's own assignments"
+        );
+        assert!(
+            node3_moved.is_disjoint(&node1_moved),
+            "a shard cannot be a subset master for two different nodes"
+        );
+        // With every moved shard backed by a live inbound migration /
+        // pending request (keep returns true for node 3's shards), NONE are
+        // flagged — they are legitimately in progress.
+        assert_eq!(
+            table.stuck_subset_shards_for(NodeId(3), |s| node3_moved.contains(&s)),
+            0,
+            "subset masters with a live inbound/request must not be flagged stuck"
+        );
+        // Mixed: only `moved` has a live request; the rest are stuck.
+        assert_eq!(
+            table.stuck_subset_shards_for(NodeId(3), |s| s == moved),
+            stuck_total - 1,
+            "the one in-flight shard is excluded, the rest are stuck"
+        );
+
+        // Committing a shard clears its subset flag — no longer stuck.
+        table.commit_shard(moved);
+        assert!(!table.is_subset_master(moved));
+        assert_eq!(
+            table.stuck_subset_shards_for(NodeId(3), |_| false),
+            stuck_total - 1,
+            "a committed shard drops out of the stuck set"
         );
     }
 
