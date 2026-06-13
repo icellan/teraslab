@@ -25,6 +25,12 @@ use std::time::Duration;
 
 const MIGRATION_PRESSURE_GRACE: Duration = Duration::from_secs(120);
 const MIGRATION_TCP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+/// W1.1 FIX B — pacing for the requester-side shard transfer requests.
+/// Shorter than the 15 s reactivation cooldown so a node stalled on
+/// pending inbound migrations repairs itself before (and independently
+/// of) the next reactivation cycle; long enough that a healthy in-flight
+/// push (sources stream within ~1 s of activation) is never spammed.
+const TRANSFER_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
@@ -274,18 +280,44 @@ fn complete_migration_task_current_epoch_with_midpoint(
     true
 }
 
+/// Compute the (mismatched_masters, pending_handoffs) pair that gates the
+/// topology reactivation loop.
+///
+/// The loop's purpose (commit b5990b3) is to repair *divergence from the
+/// activation's own intent* — shards rolled back after failed migrations —
+/// never to revert the activation. Master election (`apply_master_election`,
+/// Phase F) deliberately deviates masters from the raw round-robin
+/// `compute_with_epoch` result, so the comparison baseline is the
+/// election-refined intent recorded on the table at activation time
+/// (`ShardTable::intended_master`), NOT a recomputed round-robin table.
+/// A settled cluster therefore yields `mismatched == 0` and the loop is a
+/// no-op (W1.1 FIX C).
+///
+/// When the table has not activated the committed term at all
+/// (`table.version != committed_term`, e.g. a node that missed the commit
+/// signal), there is no recorded intent for that term; report at least one
+/// mismatch so reactivation fires and installs the committed topology.
 fn committed_topology_reactivation_metrics(
     table: &ShardTable,
     committed_members: &[NodeId],
     rf: u8,
-    _committed_term: u64,
+    committed_term: u64,
 ) -> (u32, usize) {
-    let expected = ShardTable::compute_with_epoch(committed_members, rf, 0);
-    let mismatched = (0..crate::cluster::shards::NUM_SHARDS as u16)
-        .filter(|&shard| {
-            table.target_assignment(shard).master != expected.target_assignment(shard).master
-        })
-        .count() as u32;
+    let mismatched = if table.version != committed_term {
+        let expected = ShardTable::compute_with_epoch(committed_members, rf, 0);
+        let count = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .filter(|&shard| {
+                table.target_assignment(shard).master != expected.target_assignment(shard).master
+            })
+            .count() as u32;
+        // The stale version alone mandates reactivation even if every
+        // master coincidentally matches the round-robin expectation.
+        count.max(1)
+    } else {
+        (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .filter(|&shard| table.target_assignment(shard).master != table.intended_master(shard))
+            .count() as u32
+    };
     (mismatched, table.pending_handoff_count())
 }
 
@@ -605,6 +637,15 @@ pub struct ClusterCoordinator {
     migration_throttle: Arc<crate::cluster::migration::MigrationThrottle>,
     /// Shared HMAC secret for authenticated inter-node TCP frames.
     cluster_secret: Option<Arc<Vec<u8>>>,
+    /// Test instrumentation: while `true`, the event loop defers topology
+    /// *activation* (commit-signal and exchange-result draining plus the
+    /// reactivation block). Commit handling in dispatch (voting,
+    /// committed-term advancement, persistence) is unaffected — this
+    /// models a CPU-starved node that learns the committed term but
+    /// activates it late (the W1.1 CI deadlock). Always `false` in
+    /// production; only the gated
+    /// [`ClusterCoordinator::activation_hold_handle`] can flip it.
+    activation_hold: Arc<AtomicBool>,
 }
 
 impl ClusterCoordinator {
@@ -683,7 +724,23 @@ impl ClusterCoordinator {
             swim_incarnation,
             migration_throttle: Arc::new(crate::cluster::migration::MigrationThrottle::from_env()),
             cluster_secret: config.cluster_secret.map(Arc::new),
+            activation_hold: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Test instrumentation — handle to the activation-hold gate.
+    ///
+    /// While the returned flag is `true`, the event loop defers topology
+    /// activation processing (commit signals, exchange results, and the
+    /// reactivation block stay queued); dispatch-side voting and
+    /// committed-term advancement continue normally. Lets integration
+    /// tests deterministically reproduce a node that activates a
+    /// committed term late (ordering control, no sleeps). Flip back to
+    /// `false` to release; queued signals are drained on the next event
+    /// loop tick (≤ 100 ms).
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn activation_hold_handle(&self) -> Arc<AtomicBool> {
+        self.activation_hold.clone()
     }
 
     /// Start the coordinator: launches SWIM and the event processing loop.
@@ -740,6 +797,15 @@ impl ClusterCoordinator {
         let (resync_request_tx, resync_request_rx) =
             std::sync::mpsc::channel::<crate::replication::manager::ResyncRequest>();
         let resync_request_tx_for_cluster = resync_request_tx.clone();
+        // W1.1 FIX B — shard transfer-request channel. The dispatch
+        // handler for OP_MIGRATION_TRANSFER_REQUEST posts requests from
+        // migration targets; the event loop drains them and re-runs the
+        // outbound migration (or re-sends the completion handshake) for
+        // the requested shards.
+        let (transfer_request_tx, transfer_request_rx) =
+            std::sync::mpsc::channel::<ShardTransferRequest>();
+        let transfer_request_tx_for_cluster = transfer_request_tx.clone();
+        let activation_hold_event = self.activation_hold.clone();
         // Phase D: exchange phase channel.
         // After every multi-node topology commit, an exchange thread collects
         // OP_PARTITION_VERSION_REPORT from peers, then signals back here so
@@ -787,6 +853,12 @@ impl ClusterCoordinator {
             let mut last_reactivation_at = std::time::Instant::now();
             let mut last_activation_at = std::time::Instant::now();
             let mut last_inbound_clear = std::time::Instant::now();
+            // W1.1 FIX B — last time this node requested missing shard
+            // transfers from sources. `None` = never, so the first
+            // detection of the stalled-inbound condition fires
+            // immediately; afterwards re-fires are paced by
+            // TRANSFER_REQUEST_INTERVAL while the condition persists.
+            let mut last_transfer_request_at: Option<std::time::Instant> = None;
             // Track the last topology term that was activated to prevent
             // duplicate activations when the same commit signal arrives
             // through multiple channels (e.g., deterministic proposer
@@ -1004,6 +1076,11 @@ impl ClusterCoordinator {
                     }
                 }
 
+                // Test instrumentation: while held, defer every topology
+                // *activation* path (reactivation, commit signals,
+                // exchange results). Always false in production.
+                let activation_held = activation_hold_event.load(Ordering::Acquire);
+
                 // Re-activate topology if the shard table has rolled-back shards
                 // from failed migrations that don't match the committed topology.
                 // Only fires when: no active migrations, cooldown elapsed, and
@@ -1016,7 +1093,7 @@ impl ClusterCoordinator {
                 let normal_reactivation_due = migration.lock().active_count() == 0
                     && last_reactivation_at.elapsed() >= Duration::from_secs(15)
                     && last_activation_at.elapsed() >= Duration::from_secs(30);
-                if startup_reactivation_due || normal_reactivation_due {
+                if !activation_held && (startup_reactivation_due || normal_reactivation_due) {
                     // Use the committed topology members, not SWIM live members.
                     // This avoids false mismatches during topology transitions.
                     let committed_members = topo_authority_event.committed_members();
@@ -1082,7 +1159,7 @@ impl ClusterCoordinator {
                 }
 
                 // Poll topology commit signals from dispatch or proposer threads.
-                while let Ok((members, term)) = topology_commit_rx.try_recv() {
+                while !activation_held && let Ok((members, term)) = topology_commit_rx.try_recv() {
                     // Guard: skip if this term was already activated. This
                     // prevents double activation when two commit signals for
                     // the same term arrive close together (e.g., deterministic
@@ -1177,7 +1254,9 @@ impl ClusterCoordinator {
                 // thread completes (or times out, returning a partial view),
                 // build the migration plan against the collected partition
                 // view and activate.
-                while let Ok((members, term, partition_view)) = exchange_complete_rx.try_recv() {
+                while !activation_held
+                    && let Ok((members, term, partition_view)) = exchange_complete_rx.try_recv()
+                {
                     let active_members = active_topology_members_event.read().clone();
                     if topology_commit_already_activated(
                         term,
@@ -1292,6 +1371,216 @@ impl ClusterCoordinator {
                         );
                     });
                 }
+
+                // W1.1 FIX B (source side) — drain shard transfer
+                // requests posted by the OP_MIGRATION_TRANSFER_REQUEST
+                // dispatch handler. A migration target that activated
+                // the committed term late is asking this node to
+                // (re-)push shards; honour the request only when both
+                // sides are on the same activated epoch.
+                while let Ok(req) = transfer_request_rx.try_recv() {
+                    let committed_term = topo_authority_event.committed_term();
+                    let table_version = shard_table.read().version;
+                    if req.epoch != committed_term || table_version != committed_term {
+                        tracing::info!(
+                            requester = req.requester.0,
+                            req_epoch = req.epoch,
+                            committed_term,
+                            table_version,
+                            "cluster: ignoring shard transfer request for non-current epoch",
+                        );
+                        continue;
+                    }
+                    let (mut resend_tasks, diverged) = {
+                        let table = shard_table.read();
+                        split_transfer_request_tasks(&table, self_id, req.requester, &req.shards)
+                    };
+                    // Idempotency: never duplicate a live tracked
+                    // migration worker for the same (shard → requester).
+                    {
+                        let mgr = migration.lock();
+                        resend_tasks.retain(|t| {
+                            !mgr.active_migrations().iter().any(|p| {
+                                p.shard == t.shard
+                                    && p.to_node == t.to_node
+                                    && p.state != crate::cluster::migration::MigrationState::Complete
+                                    && p.state != crate::cluster::migration::MigrationState::Failed
+                            })
+                        });
+                    }
+                    if resend_tasks.is_empty() && diverged == 0 {
+                        continue;
+                    }
+                    tracing::info!(
+                        requester = req.requester.0,
+                        epoch = req.epoch,
+                        resend = resend_tasks.len(),
+                        diverged,
+                        "cluster: honouring shard transfer request",
+                    );
+                    if !resend_tasks.is_empty() {
+                        let shard_set: std::collections::HashSet<u16> =
+                            resend_tasks.iter().map(|t| t.shard).collect();
+                        let populated: std::collections::HashSet<u16> = shard_set
+                            .iter()
+                            .copied()
+                            .filter(|&s| engine.shard_record_count(s) > 0)
+                            .collect();
+                        migration
+                            .lock()
+                            .start_outbound(&resend_tasks, self_id, &populated);
+                        let keys_map = engine.keys_by_shard_filtered(&shard_set);
+                        let all_keys: Vec<TxKey> =
+                            keys_map.values().flat_map(|v| v.iter().copied()).collect();
+                        let migration_ref = migration.clone();
+                        let node_addrs_ref = node_addrs.clone();
+                        let eng = engine.clone();
+                        let redo = redo_for_events.clone();
+                        let st = shard_table.clone();
+                        let fb = fenced_bm_event.clone();
+                        let mb = migrating_bm_event.clone();
+                        let ib = inbound_bm_event.clone();
+                        let throttle_ref = migration_throttle_event.clone();
+                        let secret_ref = cluster_secret_event.clone();
+                        std::thread::spawn(move || {
+                            Self::run_migration_tasks_with_global_limit(
+                                resend_tasks,
+                                all_keys,
+                                node_addrs_ref,
+                                eng,
+                                migration_ref,
+                                st,
+                                redo,
+                                committed_term,
+                                max_migration_threads,
+                                migration_pool_size,
+                                migration_batch_size,
+                                fb,
+                                mb,
+                                ib,
+                                self_id,
+                                throttle_ref,
+                                secret_ref,
+                            );
+                        });
+                    }
+                    if diverged > 0 && !activation_held {
+                        // Some requested shards were rolled back after a
+                        // failed handoff: the local table no longer names
+                        // the requester even though the activation intent
+                        // did. Re-run the committed activation now — it
+                        // rebuilds the handoff state and re-pushes — rather
+                        // than waiting out the reactivation cooldown.
+                        let committed_members = topo_authority_event.committed_members();
+                        if committed_members.len() > 1 {
+                            topology_epoch.store(committed_term, Ordering::Relaxed);
+                            last_reactivation_at = std::time::Instant::now();
+                            last_activation_at = std::time::Instant::now();
+                            Self::activate_topology(
+                                &committed_members,
+                                committed_term,
+                                self_id,
+                                rf,
+                                &shard_table,
+                                &migration,
+                                &node_addrs,
+                                &engine,
+                                &redo_for_events,
+                                max_migration_threads,
+                                migration_pool_size,
+                                migration_batch_size,
+                                &fenced_bm_event,
+                                &migrating_bm_event,
+                                &inbound_bm_event,
+                                &active_topology_members_event,
+                                &migration_throttle_event,
+                                &cluster_secret_event,
+                            );
+                        }
+                    }
+                }
+
+                // W1.1 FIX B (requester side) — the migration protocol is
+                // push-based, so a node that holds pending inbound
+                // migrations while nothing is flowing must actively
+                // request the missing transfers from each source. This
+                // fires when: the committed term is activated locally, no
+                // local outbound migration is running, and pending
+                // inbound entries name concrete sources. Re-fires every
+                // TRANSFER_REQUEST_INTERVAL while the condition persists,
+                // bounding retry of lost requests.
+                let transfer_request_due = last_transfer_request_at
+                    .map(|at: std::time::Instant| at.elapsed() >= TRANSFER_REQUEST_INTERVAL)
+                    .unwrap_or(true);
+                if transfer_request_due {
+                    let pending: Vec<(u16, NodeId)> = {
+                        let mgr = migration.lock();
+                        if mgr.active_count() == 0 {
+                            mgr.pending_inbound_entries()
+                                .into_iter()
+                                .filter(|(_, from)| *from != self_id && *from != NodeId(0))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    if !pending.is_empty() {
+                        let committed_term = topo_authority_event.committed_term();
+                        let table_version = shard_table.read().version;
+                        if committed_term > 0 && table_version == committed_term {
+                            let mut by_source: std::collections::HashMap<NodeId, Vec<u16>> =
+                                std::collections::HashMap::new();
+                            for (shard, from) in pending {
+                                by_source.entry(from).or_default().push(shard);
+                            }
+                            let addrs = node_addrs.read().clone();
+                            let secret = cluster_secret_event.clone();
+                            tracing::info!(
+                                sources = by_source.len(),
+                                epoch = committed_term,
+                                "cluster: requesting missing shard transfers from sources",
+                            );
+                            std::thread::spawn(move || {
+                                for (source, shards) in by_source {
+                                    let Some(addr) = addrs.get(&source).copied() else {
+                                        tracing::warn!(
+                                            source = source.0,
+                                            shards = shards.len(),
+                                            "cluster: no address for transfer-request source",
+                                        );
+                                        continue;
+                                    };
+                                    let payload = encode_transfer_request_payload(
+                                        committed_term,
+                                        self_id,
+                                        &shards,
+                                    );
+                                    match send_topology_frame(
+                                        addr,
+                                        OP_MIGRATION_TRANSFER_REQUEST,
+                                        &payload,
+                                        secret.as_deref().map(Vec::as_slice),
+                                    ) {
+                                        Ok(_) => tracing::info!(
+                                            source = source.0,
+                                            shards = shards.len(),
+                                            epoch = committed_term,
+                                            "cluster: shard transfer request accepted",
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            source = source.0,
+                                            shards = shards.len(),
+                                            epoch = committed_term,
+                                            err = %e,
+                                            "cluster: shard transfer request failed",
+                                        ),
+                                    }
+                                }
+                            });
+                            last_transfer_request_at = Some(std::time::Instant::now());
+                        }
+                    }
+                }
             }
         });
 
@@ -1324,6 +1613,7 @@ impl ClusterCoordinator {
             migrating_bitmap,
             topology_commit_tx,
             resync_request_tx: resync_request_tx_for_cluster,
+            transfer_request_tx: transfer_request_tx_for_cluster,
             topology_state_path,
             swim_incarnation: swim_incarnation_for_cluster,
             startup_reactivation_needed,
@@ -3195,7 +3485,13 @@ fn run_migration_batch(
             %addr,
             "cluster: shards already serving — sending completion handshakes",
         );
-        let delivered = send_completion_only_handshakes(addr, &skipped_tasks, self_id, auth_secret);
+        let delivered = send_completion_only_handshakes(
+            addr,
+            &skipped_tasks,
+            self_id,
+            topology_epoch,
+            auth_secret,
+        );
         for (task, delivered) in skipped_tasks.iter().zip(delivered) {
             if delivered {
                 if complete_migration_task_current_epoch(
@@ -3286,7 +3582,13 @@ fn run_migration_batch(
         if instant_count > 0 {
             tracing::info!(shards = instant_count, %addr, "cluster: empty shards committed instantly");
             let delivered =
-                send_completion_only_handshakes(addr, &ready_empty_tasks, self_id, auth_secret);
+                send_completion_only_handshakes(
+                    addr,
+                    &ready_empty_tasks,
+                    self_id,
+                    topology_epoch,
+                    auth_secret,
+                );
             for (task, delivered) in ready_empty_tasks.iter().zip(delivered) {
                 if delivered {
                     let should_commit_local_handoff = {
@@ -3785,6 +4087,7 @@ fn run_migration_batch(
                                 addr,
                                 &verified_tasks,
                                 self_id,
+                                topology_epoch,
                                 auth_secret,
                             );
                         for (task, delivered) in verified_tasks.iter().zip(delivered) {
@@ -4426,10 +4729,19 @@ fn send_migration_complete(
 /// that required one TCP round-trip per shard (~2730 round-trips ≈ 3-15s).
 /// The batched version sends all shard IDs in one `OP_MIGRATION_BATCH_COMPLETE`
 /// frame for a single round-trip (~1ms).
+///
+/// `topology_epoch` stamps the frame with the activation epoch the tasks
+/// belong to (W1.1 FIX A). A target that has not yet activated that epoch
+/// rejects the handshake with `ERR_MIGRATION_TARGET_NOT_READY`; this is
+/// treated as retryable-pending (bounded by `MAX_RETRIES × RETRY_DELAY`
+/// ≈ 4 s plus per-attempt I/O timeouts), and on exhaustion the batch is
+/// reported NOT delivered so the caller fails + rolls back the tasks
+/// instead of committing a handoff the target never acknowledged.
 fn send_completion_only_handshakes(
     target_addr: SocketAddr,
     tasks: &[MigrationTask],
     from_node: NodeId,
+    topology_epoch: u64,
     auth_secret: Option<&[u8]>,
 ) -> Vec<bool> {
     if tasks.is_empty() {
@@ -4447,13 +4759,15 @@ fn send_completion_only_handshakes(
     // Collect all shard IDs for the batch.
     let shards: Vec<u16> = tasks.iter().map(|t| t.shard).collect();
 
-    // Wire format: [shard_count:4][shard_id:2 × count][from_node:8]
-    let mut payload = Vec::with_capacity(4 + shards.len() * 2 + 8);
+    // Wire format:
+    //   [shard_count:4][shard_id:2 × count][from_node:8][topology_epoch:8]
+    let mut payload = Vec::with_capacity(4 + shards.len() * 2 + 16);
     payload.extend_from_slice(&(shards.len() as u32).to_le_bytes());
     for &shard in &shards {
         payload.extend_from_slice(&shard.to_le_bytes());
     }
     payload.extend_from_slice(&from_node.0.to_le_bytes());
+    payload.extend_from_slice(&topology_epoch.to_le_bytes());
 
     let request = RequestFrame {
         request_id: 0,
@@ -4490,24 +4804,37 @@ fn send_completion_only_handshakes(
                 if response.status == STATUS_OK {
                     return vec![true; tasks.len()];
                 }
-                // Parse per-shard results from response payload if present.
-                // Response format: [count:4][shard:2 + ok:1] × count
-                if response.payload.len() >= 4 {
-                    let count =
-                        u32::from_le_bytes(response.payload[..4].try_into().unwrap()) as usize;
-                    if count == tasks.len() && response.payload.len() >= 4 + count * 3 {
-                        let mut delivered = vec![false; tasks.len()];
-                        for (i, slot) in delivered.iter_mut().enumerate().take(count) {
-                            let off = 4 + i * 3;
-                            // shard at off..off+2, ok at off+2
-                            *slot = response.payload[off + 2] != 0;
-                        }
-                        return delivered;
-                    }
+                // Error responses carry [code:2][msg_len:2][msg:N].
+                let code = if response.payload.len() >= 2 {
+                    Some(u16::from_le_bytes(response.payload[..2].try_into().unwrap()))
+                } else {
+                    None
+                };
+                if code == Some(ERR_MIGRATION_TARGET_NOT_READY) {
+                    // W1.1 FIX A: the target has not activated this
+                    // topology epoch yet. The handoff is PENDING, not
+                    // complete — keep retrying within the bounded window.
+                    tracing::info!(
+                        %target_addr,
+                        attempt = attempt + 1,
+                        max_retries = MAX_RETRIES,
+                        topology_epoch,
+                        "cluster: batch-complete target not on epoch yet — retrying",
+                    );
+                    continue;
                 }
-                // Fallback: treat entire batch as delivered on non-OK
-                // (the target processed what it could).
-                return vec![true; tasks.len()];
+                // Any other rejection is a hard NO from the target. The
+                // pre-fix code treated every non-OK response as
+                // "delivered", which let a source commit master moves
+                // that the target never acknowledged (W1.1 FIX A).
+                tracing::warn!(
+                    %target_addr,
+                    status = response.status,
+                    code = code.unwrap_or(0),
+                    shards = tasks.len(),
+                    "cluster: batch-complete rejected by target",
+                );
+                return vec![false; tasks.len()];
             }
             Err(e) => {
                 tracing::warn!(
@@ -4998,6 +5325,19 @@ pub fn persist_failure_count() -> u64 {
     PERSIST_FAILURES.load(Ordering::Relaxed)
 }
 
+/// Create `path`'s parent directory (and ancestors) if missing.
+///
+/// Idempotent; a `path` with no parent component (bare filename) is a
+/// no-op. Used by the cluster/topology persist helpers so a persist
+/// that races data-directory creation at boot succeeds instead of
+/// failing with `NotFound` (W1.1 FIX D).
+fn ensure_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
+    }
+}
+
 /// Persist the cluster state (peak size + topology epoch) to disk.
 ///
 /// File format: `[peak:8 LE][epoch:8 LE]`.
@@ -5008,6 +5348,7 @@ fn persist_cluster_state(path: &std::path::Path, peak: u64, epoch: u64) {
     use std::io::Write as _;
     let tmp = path.with_extension("cluster.tmp");
     let result = (|| -> std::io::Result<()> {
+        ensure_parent_dir(path)?;
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&peak.to_le_bytes())?;
         f.write_all(&epoch.to_le_bytes())?;
@@ -5036,6 +5377,13 @@ fn persist_topology_state(
     let tmp = path.with_extension("cluster.tmp");
     let data = state.serialize();
     let result = (|| -> std::io::Result<()> {
+        // W1.1 FIX D: the first persist can race data-dir creation at
+        // boot (the vote handler persists as soon as a proposal arrives,
+        // which can precede the server's directory setup). A missing
+        // parent directory turned a safety-critical persist into
+        // `ERR_TOPOLOGY_PERSIST_FAILED`, delaying the node's topology
+        // activation by a full retry cycle. Create it idempotently.
+        ensure_parent_dir(path)?;
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(&data)?;
         f.sync_all()?;
@@ -5286,6 +5634,87 @@ pub fn synthesize_resync_migration_tasks(
             is_master: false,
         })
         .collect()
+}
+
+/// W1.1 FIX B — a pull-based migration repair request.
+///
+/// Posted by the dispatch handler for [`OP_MIGRATION_TRANSFER_REQUEST`]
+/// and drained by the coordinator event loop on the *source* node. The
+/// requester is a migration target whose committed topology says it
+/// should hold `shards` but which has pending inbound migrations and no
+/// incoming pushes (e.g. it activated the topology term after the
+/// sources already ran — and completed — their outbound plans).
+#[derive(Debug, Clone)]
+pub struct ShardTransferRequest {
+    /// The topology epoch (quorum-committed term) the requester has
+    /// activated. The source only honours requests matching its own
+    /// activated shard-table version.
+    pub epoch: u64,
+    /// The node requesting the transfers (the migration target).
+    pub requester: NodeId,
+    /// Shards the requester is missing from this source.
+    pub shards: Vec<u16>,
+}
+
+/// Encode an [`OP_MIGRATION_TRANSFER_REQUEST`] payload.
+///
+/// Wire format (little-endian):
+///   `[topology_epoch:8][requester_node:8][shard_count:4][shard_id:2 × count]`
+fn encode_transfer_request_payload(epoch: u64, requester: NodeId, shards: &[u16]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(20 + shards.len() * 2);
+    payload.extend_from_slice(&epoch.to_le_bytes());
+    payload.extend_from_slice(&requester.0.to_le_bytes());
+    payload.extend_from_slice(&(shards.len() as u32).to_le_bytes());
+    for &shard in shards {
+        payload.extend_from_slice(&shard.to_le_bytes());
+    }
+    payload
+}
+
+/// W1.1 FIX B — translate an inbound [`ShardTransferRequest`] into the
+/// outbound migration tasks this source should (re-)run, plus a count of
+/// *diverged* shards.
+///
+/// For each requested shard:
+/// - If the source's active table already names the requester as the
+///   shard's target master (or a target replica), the handoff either
+///   completed earlier (the source committed but the requester never
+///   acknowledged — re-running the migration re-sends the completion
+///   handshake idempotently) or is mid-flight. A task is synthesized;
+///   the caller filters out shards with a live tracked migration so an
+///   in-flight worker is never duplicated.
+/// - If the table does NOT name the requester but the activation's
+///   *intent* did (`intended_master` — i.e. the handoff was rolled back
+///   after a failed completion), the shard is counted as diverged. The
+///   caller repairs divergence by re-running the full topology
+///   activation, which rebuilds the handoff and re-pushes.
+/// - Shards where the requester is neither a current target holder nor
+///   the intended master are ignored (stale or malicious request).
+fn split_transfer_request_tasks(
+    table: &ShardTable,
+    self_id: NodeId,
+    requester: NodeId,
+    shards: &[u16],
+) -> (Vec<MigrationTask>, u32) {
+    let mut tasks = Vec::new();
+    let mut diverged = 0u32;
+    for &shard in shards {
+        if (shard as usize) >= NUM_SHARDS {
+            continue;
+        }
+        let assignment = table.target_assignment(shard);
+        if assignment.master == requester || assignment.replicas.contains(&requester) {
+            tasks.push(MigrationTask {
+                shard,
+                from_node: self_id,
+                to_node: requester,
+                is_master: assignment.master == requester,
+            });
+        } else if table.intended_master(shard) == requester {
+            diverged += 1;
+        }
+    }
+    (tasks, diverged)
 }
 
 /// Phase F — apply election scoring on top of the round-robin
@@ -5624,6 +6053,12 @@ pub struct RunningCluster {
     /// full-shard backfill `MigrationTask` per shard the replica
     /// should hold.
     resync_request_tx: std::sync::mpsc::Sender<crate::replication::manager::ResyncRequest>,
+    /// W1.1 FIX B — shard transfer-request channel. The dispatch handler
+    /// for `OP_MIGRATION_TRANSFER_REQUEST` posts requests from migration
+    /// targets that activated the committed term after this node already
+    /// completed its outbound plan; the event loop drains them and
+    /// re-runs the outbound migration for the requested shards.
+    transfer_request_tx: std::sync::mpsc::Sender<ShardTransferRequest>,
     /// Path for persisting full topology state (voted_term, committed_members).
     topology_state_path: Option<std::path::PathBuf>,
     /// SWIM incarnation counter shared with the event loop for persistence.
@@ -6599,6 +7034,61 @@ impl RunningCluster {
         self.resync_request_tx.send(req).is_ok()
     }
 
+    /// W1.1 FIX B — queue a [`ShardTransferRequest`] for the coordinator
+    /// event loop. Posted by the `OP_MIGRATION_TRANSFER_REQUEST` dispatch
+    /// handler after epoch validation; the event loop re-validates the
+    /// epoch against the activated shard table before re-running any
+    /// outbound migration.
+    ///
+    /// Returns `true` when queued; `false` means the coordinator is
+    /// shutting down and the caller should report a transient error.
+    pub fn signal_shard_transfer_request(&self, req: ShardTransferRequest) -> bool {
+        self.transfer_request_tx.send(req).is_ok()
+    }
+
+    /// Test-only — replace the transfer-request channel and return its
+    /// receiver, so dispatch tests can observe what the
+    /// `OP_MIGRATION_TRANSFER_REQUEST` handler queues for the event loop.
+    #[cfg(test)]
+    pub(crate) fn test_take_transfer_request_rx(
+        &mut self,
+    ) -> std::sync::mpsc::Receiver<ShardTransferRequest> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.transfer_request_tx = tx;
+        rx
+    }
+
+    /// Test instrumentation — install an active routing snapshot exactly
+    /// as the topology catch-up thread does when it fetches a peer's
+    /// partition map (`install_active_routing_snapshot`): the shard table
+    /// becomes the round-robin table over `members` at `version`, and all
+    /// migration state is reset. Lets integration tests deterministically
+    /// model a node that caught up to a *prior* term's table before
+    /// missing the next term's activation (the W1.1 CI deadlock), instead
+    /// of racing the real catch-up thread against the next commit.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn test_install_active_routing_snapshot(&self, members: &[NodeId], version: u64) -> bool {
+        let routing = crate::cluster::routing::RoutingInfo {
+            shard_table_version: version,
+            nodes: Vec::new(),
+            shard_assignments: Vec::new(),
+            committed_members: members.to_vec(),
+        };
+        let rf = self.shard_table.read().replication_factor();
+        install_active_routing_snapshot(
+            &routing,
+            rf,
+            &self.shard_table,
+            &self.migration,
+            &self.fenced_bitmap,
+            &self.migrating_bitmap,
+            &self.inbound_atomic,
+            &self.active_topology_members,
+            self.inbound_state_path.as_ref(),
+            self.outbound_state_path.as_ref(),
+        )
+    }
+
     /// Phase H — owned-by-thread handle that lets a background loop
     /// post resync requests without holding a `&RunningCluster`.
     /// Returns a small `Send`-able struct cloning only the channel
@@ -6761,6 +7251,7 @@ pub(crate) fn new_test_running_cluster(
 
     let (topology_commit_tx, _topology_commit_rx) = std::sync::mpsc::channel();
     let (resync_request_tx, _resync_request_rx) = std::sync::mpsc::channel();
+    let (transfer_request_tx, _transfer_request_rx) = std::sync::mpsc::channel();
 
     RunningCluster {
         self_id,
@@ -6792,6 +7283,7 @@ pub(crate) fn new_test_running_cluster(
         migrating_bitmap,
         topology_commit_tx,
         resync_request_tx,
+        transfer_request_tx,
         topology_state_path: None,
         swim_incarnation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         startup_reactivation_needed: Arc::new(AtomicBool::new(false)),
@@ -8789,6 +9281,327 @@ mod tests {
             "a shard table that already matches the committed term must not trigger reactivation"
         );
         assert_eq!(pending_handoffs, 0);
+    }
+
+    /// W1.1 FIX C — the reactivation mismatch metric must compare the
+    /// active table against the activation's *election-refined* intent,
+    /// not raw round-robin. Repro recipe 3: a partition view in which one
+    /// node holds all the data drives `apply_master_election` away from
+    /// the round-robin picks; a settled cluster must then report
+    /// `mismatched == 0` so the reactivation loop never fires spuriously.
+    #[test]
+    fn reactivation_metrics_zero_after_master_election_refinement() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2;
+        let term = 7;
+        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 6);
+        let mut table = ShardTable::compute_with_epoch(&members, rf, term);
+
+        // Node 1 reports full data for every shard; the other candidates
+        // report nothing — the election prefers node 1 wherever it is in
+        // the candidate set, deviating from round-robin.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(1),
+            (0..NUM_SHARDS as u16)
+                .map(|shard| PartitionVersionEntry {
+                    shard,
+                    flags: 0,
+                    replica_count: 1,
+                    last_applied_seq: 5,
+                })
+                .collect(),
+        );
+        view.insert(NodeId(2), Vec::new());
+        view.insert(NodeId(3), Vec::new());
+        apply_master_election(
+            &mut table,
+            &prev,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+
+        // Sanity: the election actually deviated from round-robin,
+        // otherwise this test would not exercise FIX C at all.
+        let round_robin = ShardTable::compute_with_epoch(&members, rf, term);
+        let deviated = (0..NUM_SHARDS as u16).any(|s| {
+            table.target_assignment(s).master != round_robin.target_assignment(s).master
+        });
+        assert!(
+            deviated,
+            "election with a one-node-holds-all view must deviate from round-robin"
+        );
+
+        let (mismatched, pending_handoffs) =
+            committed_topology_reactivation_metrics(&table, &members, rf, term);
+        assert_eq!(
+            mismatched, 0,
+            "an election-refined settled table must never trigger reactivation"
+        );
+        assert_eq!(pending_handoffs, 0);
+    }
+
+    /// W1.1 FIX C — the metric must still flag genuine divergence from
+    /// the activation's intent: a handoff rolled back after a failed
+    /// migration leaves the shard's assignment differing from
+    /// `intended_master`, and reactivation must fire to repair it.
+    #[test]
+    fn reactivation_metrics_flag_rolled_back_handoff() {
+        let old_members = vec![NodeId(1), NodeId(2)];
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let rf = 2;
+        let new_table = ShardTable::compute_with_epoch(&new_members, rf, 2);
+        let mut table = ShardTable::compute_with_epoch(&old_members, rf, 1);
+        let moved_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master != new_table.target_assignment(s).master
+            })
+            .expect("a shard must change master when a third node joins");
+        table.begin_handoff_with(&new_table, |s| s == moved_shard);
+
+        // The handoff fails: roll the shard back to the old assignment.
+        table.rollback_shard(moved_shard);
+        assert_ne!(
+            table.target_assignment(moved_shard).master,
+            table.intended_master(moved_shard),
+            "rollback must leave the shard diverged from the activation intent"
+        );
+
+        let (mismatched, _pending) =
+            committed_topology_reactivation_metrics(&table, &new_members, rf, 2);
+        assert!(
+            mismatched >= 1,
+            "a rolled-back handoff must keep triggering reactivation (got {mismatched})"
+        );
+    }
+
+    /// W1.1 FIX C — a node whose shard table never activated the
+    /// committed term (the CI deadlock's node3) must report a mismatch
+    /// even before any per-shard comparison, so reactivation installs
+    /// the committed topology.
+    #[test]
+    fn reactivation_metrics_force_reactivation_when_term_not_activated() {
+        let rf = 2;
+        let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        // Active table is the stale 2-member term-1 table.
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1);
+        let (mismatched, _pending) =
+            committed_topology_reactivation_metrics(&table, &committed_members, rf, 2);
+        assert!(
+            mismatched >= 1,
+            "a table behind the committed term must trigger reactivation"
+        );
+    }
+
+    /// W1.1 FIX A (sender) — a target replying
+    /// `ERR_MIGRATION_TARGET_NOT_READY` (it has not activated the
+    /// migration's epoch yet) is retryable-pending: the sender must keep
+    /// retrying and succeed once the target acknowledges, never treating
+    /// the rejection as "delivered".
+    #[test]
+    fn batch_complete_retries_not_ready_target_until_acknowledged() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            // First connection: reject with ERR_MIGRATION_TARGET_NOT_READY.
+            // Second connection: acknowledge with STATUS_OK.
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut header = [0u8; 4];
+                stream.read_exact(&mut header).unwrap();
+                let len = u32::from_le_bytes(header) as usize;
+                let mut rest = vec![0u8; len];
+                stream.read_exact(&mut rest).unwrap();
+                let mut frame_bytes = header.to_vec();
+                frame_bytes.extend_from_slice(&rest);
+                let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
+                assert_eq!(request.op_code, OP_MIGRATION_BATCH_COMPLETE);
+                // The frame must carry the trailing topology epoch.
+                let count =
+                    u32::from_le_bytes(request.payload[..4].try_into().unwrap()) as usize;
+                let epoch_off = 4 + count * 2 + 8;
+                let epoch = u64::from_le_bytes(
+                    request.payload[epoch_off..epoch_off + 8].try_into().unwrap(),
+                );
+                assert_eq!(epoch, 42, "sender must stamp the activation epoch");
+                let response = if attempt == 0 {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&ERR_MIGRATION_TARGET_NOT_READY.to_le_bytes());
+                    payload.extend_from_slice(&0u16.to_le_bytes());
+                    ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_ERROR,
+                        payload,
+                    }
+                } else {
+                    ResponseFrame {
+                        request_id: request.request_id,
+                        status: STATUS_OK,
+                        payload: Vec::new(),
+                    }
+                };
+                stream.write_all(&response.encode()).unwrap();
+            }
+        });
+
+        let tasks = vec![MigrationTask {
+            shard: 17,
+            from_node: NodeId(1),
+            to_node: NodeId(3),
+            is_master: true,
+        }];
+        let delivered = send_completion_only_handshakes(target_addr, &tasks, NodeId(1), 42, None);
+        assert_eq!(
+            delivered,
+            vec![true],
+            "after the target activates the epoch, the retried handshake must succeed"
+        );
+        receiver.join().unwrap();
+    }
+
+    /// W1.1 FIX A (sender) — any other rejection is a hard NO: the batch
+    /// must be reported NOT delivered (pre-fix every non-OK response was
+    /// treated as delivered, silently completing unacknowledged handoffs).
+    #[test]
+    fn batch_complete_hard_rejection_is_not_treated_as_delivered() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let len = u32::from_le_bytes(header) as usize;
+            let mut rest = vec![0u8; len];
+            stream.read_exact(&mut rest).unwrap();
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&rest);
+            let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&ERR_PAYLOAD_MALFORMED.to_le_bytes());
+            payload.extend_from_slice(&0u16.to_le_bytes());
+            let response = ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_ERROR,
+                payload,
+            };
+            stream.write_all(&response.encode()).unwrap();
+        });
+
+        let tasks = vec![
+            MigrationTask {
+                shard: 5,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            },
+            MigrationTask {
+                shard: 6,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: false,
+            },
+        ];
+        let delivered = send_completion_only_handshakes(target_addr, &tasks, NodeId(1), 3, None);
+        assert_eq!(
+            delivered,
+            vec![false, false],
+            "a hard rejection must never be reported as delivered"
+        );
+        receiver.join().unwrap();
+    }
+
+    /// W1.1 FIX B — `split_transfer_request_tasks` classification:
+    /// requester-as-target-master → master task; requester-as-replica →
+    /// replica task; rolled-back shard (intent says requester, table no
+    /// longer does) → diverged; unrelated shard → ignored.
+    #[test]
+    fn split_transfer_request_tasks_classifies_shards() {
+        let rf = 2;
+        let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let new_table = ShardTable::compute_with_epoch(&new_members, rf, 2);
+        let mut table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1);
+
+        let master_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| new_table.target_assignment(s).master == NodeId(3))
+            .expect("node 3 must master some shard");
+        let replica_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                new_table.target_assignment(s).master != NodeId(3)
+                    && new_table.target_assignment(s).replicas.contains(&NodeId(3))
+            })
+            .expect("node 3 must replicate some shard");
+        let unrelated_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = new_table.target_assignment(s);
+                a.master != NodeId(3) && !a.replicas.contains(&NodeId(3))
+            })
+            .expect("some shard must not involve node 3");
+        let rolled_back_shard = (master_shard + 3..NUM_SHARDS as u16)
+            .find(|&s| new_table.target_assignment(s).master == NodeId(3))
+            .expect("node 3 must master another shard");
+
+        table.begin_handoff_with(&new_table, |s| {
+            s == master_shard || s == rolled_back_shard
+        });
+        table.rollback_shard(rolled_back_shard);
+
+        let (tasks, diverged) = split_transfer_request_tasks(
+            &table,
+            NodeId(1),
+            NodeId(3),
+            &[master_shard, replica_shard, unrelated_shard, rolled_back_shard],
+        );
+        assert_eq!(diverged, 1, "the rolled-back shard must count as diverged");
+        assert_eq!(tasks.len(), 2);
+        let master_task = tasks.iter().find(|t| t.shard == master_shard).unwrap();
+        assert!(master_task.is_master);
+        assert_eq!(master_task.from_node, NodeId(1));
+        assert_eq!(master_task.to_node, NodeId(3));
+        let replica_task = tasks.iter().find(|t| t.shard == replica_shard).unwrap();
+        assert!(!replica_task.is_master);
+        assert!(
+            !tasks.iter().any(|t| t.shard == unrelated_shard),
+            "shards the requester does not own must be ignored"
+        );
+        assert!(
+            !tasks.iter().any(|t| t.shard == rolled_back_shard),
+            "diverged shards are repaired via re-activation, not direct tasks"
+        );
+    }
+
+    /// W1.1 FIX D — persisting topology state must succeed even when the
+    /// parent directory does not exist yet (persist racing data-dir
+    /// creation at boot produced `No such file or directory`, failing the
+    /// H10 vote persist and delaying the node's topology activation).
+    #[test]
+    fn persist_topology_state_creates_missing_parent_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("data")
+            .join("cluster")
+            .join("node.cluster.topo");
+        assert!(!path.parent().unwrap().exists());
+
+        let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            NodeId(1),
+            Duration::from_secs(1),
+        ));
+        let state = authority.persisted_state(3, 1);
+        persist_topology_state(&path, &state).expect("persist must create missing parent dirs");
+        assert!(path.exists(), "topology state file must exist after persist");
+
+        let loaded = load_topology_state(&path);
+        assert_eq!(loaded.peak_cluster_size, 3);
     }
 
     #[test]

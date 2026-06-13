@@ -80,6 +80,14 @@ pub struct ShardTable {
     /// data. A subset master must not be treated as authoritative until
     /// migration completes — `is_master()` returns `Transitioning` for these.
     master_subset: Vec<bool>,
+    /// Per-shard master the most recent activation *intended* to install
+    /// (after master election refined the round-robin pick). Updated by
+    /// `compute_with_epoch`, `begin_handoff_with`, and
+    /// `set_master_for_shard`; deliberately NOT touched by
+    /// `rollback_shard`, so a rolled-back shard's divergence from the
+    /// activation's intent stays observable (the reactivation loop
+    /// compares `target_assignment(s).master` against this).
+    intended_masters: Vec<NodeId>,
 }
 
 impl ShardTable {
@@ -132,6 +140,7 @@ impl ShardTable {
             assignments.push(ShardAssignment { master, replicas });
         }
 
+        let intended_masters = assignments.iter().map(|a| a.master).collect();
         ShardTable {
             assignments,
             prev_assignments: None,
@@ -139,6 +148,7 @@ impl ShardTable {
             version: epoch,
             rf: replication_factor,
             master_subset: vec![false; NUM_SHARDS],
+            intended_masters,
         }
     }
 
@@ -178,6 +188,9 @@ impl ShardTable {
         self.handoff_state = Some(handoff);
         self.master_subset = master_subset;
         self.version = new_table.version;
+        // Record the activation's intent so later divergence (e.g. a
+        // rolled-back handoff) is detectable by the reactivation loop.
+        self.intended_masters = new_table.assignments.iter().map(|a| a.master).collect();
 
         // If no shards need copying, clear handoff state immediately.
         // Also clear master_subset: no inbound migration will run, so these
@@ -398,6 +411,19 @@ impl ShardTable {
         };
         let demoted = std::mem::replace(&mut current.master, new_master);
         current.replicas[replica_idx] = demoted;
+        // Election runs on a freshly built target table before
+        // `begin_handoff_with`; keep the recorded intent in sync with the
+        // elected master so the reactivation mismatch metric treats the
+        // election result (not the round-robin pick) as authoritative.
+        self.intended_masters[idx] = new_master;
+    }
+
+    /// The master the most recent activation intended for `shard`
+    /// (election-refined). Diverges from `target_assignment(shard).master`
+    /// only when a handoff was rolled back after a failed migration —
+    /// exactly the condition the topology reactivation loop must repair.
+    pub fn intended_master(&self, shard: u16) -> NodeId {
+        self.intended_masters[shard as usize]
     }
 
     /// Count how many shards each node masters.
@@ -570,6 +596,64 @@ mod tests {
 
     fn nodes(ids: &[u64]) -> Vec<NodeId> {
         ids.iter().map(|&id| NodeId(id)).collect()
+    }
+
+    /// W1.1 FIX C — `intended_masters` tracks the activation's intent:
+    /// set by `compute_with_epoch` and `begin_handoff_with`, kept in sync
+    /// by `set_master_for_shard` (master election), and deliberately NOT
+    /// reverted by `rollback_shard` so post-rollback divergence stays
+    /// observable.
+    #[test]
+    fn intended_master_tracks_activation_intent_through_rollback() {
+        let members3 = nodes(&[1, 2, 3]);
+        let new_table = ShardTable::compute_with_epoch(&members3, 2, 2);
+        for shard in [0u16, 1, 2, 4095] {
+            assert_eq!(
+                new_table.intended_master(shard),
+                new_table.target_assignment(shard).master,
+                "a freshly computed table's intent is its own assignment"
+            );
+        }
+
+        let mut table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
+        let moved = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master != new_table.target_assignment(s).master)
+            .expect("adding a member must move some master");
+        table.begin_handoff_with(&new_table, |s| s == moved);
+        assert_eq!(
+            table.intended_master(moved),
+            new_table.target_assignment(moved).master,
+            "begin_handoff_with must record the new table as intent"
+        );
+
+        table.rollback_shard(moved);
+        assert_ne!(
+            table.target_assignment(moved).master,
+            table.intended_master(moved),
+            "rollback restores the old assignment but must NOT rewrite the intent"
+        );
+    }
+
+    /// W1.1 FIX C — election overrides update the recorded intent so the
+    /// elected master (not the round-robin pick) is the reactivation
+    /// baseline.
+    #[test]
+    fn set_master_for_shard_updates_intended_master() {
+        let members = nodes(&[1, 2, 3]);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 3);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| !table.target_assignment(s).replicas.is_empty())
+            .expect("rf=2 over 3 members must give replicas");
+        let replica = table.target_assignment(shard).replicas[0];
+        assert_ne!(replica, table.target_assignment(shard).master);
+
+        table.set_master_for_shard(shard, replica);
+        assert_eq!(table.target_assignment(shard).master, replica);
+        assert_eq!(
+            table.intended_master(shard),
+            replica,
+            "election override must move the intent with the assignment"
+        );
     }
 
     #[test]
