@@ -34,6 +34,44 @@ use std::time::{Duration, Instant};
 /// silently accepted (still subject to the per-frame size / rate caps).
 static UNAUTHENTICATED_INTER_NODE_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Minimum interval between `teraslab::security` warnings about
+/// unauthenticated inter-node frames *from the same peer*. The warning is
+/// per-peer rate-limited rather than per-frame: in trusted-overlay mode
+/// (no `cluster_secret`) EVERY inter-node frame — every replica batch
+/// (op 240), migration frame, SWIM/topology frame — is unauthenticated, so
+/// a per-frame `warn!` produces millions of identical lines that drown all
+/// real diagnostic signal. The per-frame *rate* is still observable via the
+/// `replica_unauthenticated_accept_total` counter; the log only needs to
+/// surface WHICH peers are sending unsigned frames, periodically.
+const UNAUTH_WARN_PER_PEER_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Last time an unauthenticated-accept warning was emitted for each peer IP,
+/// keyed by source IP (not `SocketAddr`: source ports churn every
+/// reconnect, and the meaningful identity is the source node). Bounded by
+/// the cluster's node count.
+static UNAUTH_WARN_LAST_BY_PEER: Mutex<Option<HashMap<std::net::IpAddr, Instant>>> =
+    Mutex::new(None);
+
+/// Returns `true` if a warning should be emitted now for `peer` (first time
+/// seen, or the per-peer interval has elapsed), updating the bookkeeping.
+fn should_warn_unauthenticated(peer: Option<std::net::IpAddr>) -> bool {
+    let Some(ip) = peer else {
+        // Unknown peer address — fall back to the legacy one-shot so we
+        // still surface the condition exactly once without spamming.
+        return !UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel);
+    };
+    let now = Instant::now();
+    let mut guard = UNAUTH_WARN_LAST_BY_PEER.lock();
+    let map = guard.get_or_insert_with(HashMap::new);
+    match map.get(&ip) {
+        Some(last) if now.duration_since(*last) < UNAUTH_WARN_PER_PEER_INTERVAL => false,
+        _ => {
+            map.insert(ip, now);
+            true
+        }
+    }
+}
+
 const READ_BUF_RETAINED_SIZE: usize = 256 * 1024;
 
 /// Bytes peeked off the wire AFTER the 4-byte length prefix but BEFORE
@@ -712,8 +750,9 @@ struct ConnectionOptions<'a> {
     /// F-G5-001 (CRITICAL): when `true`, an inter-node opcode that arrives
     /// without a `cluster_secret` configured is rejected with
     /// `ERR_CLUSTER_AUTH_FAILED`. When `false` (the default trusted-overlay
-    /// behaviour), the frame is accepted unauthenticated — a one-shot
-    /// warning is emitted via [`UNAUTHENTICATED_INTER_NODE_WARNED`].
+    /// behaviour), the frame is accepted unauthenticated — a per-peer
+    /// rate-limited warning is emitted (see `should_warn_unauthenticated`)
+    /// and the `replica_unauthenticated_accept_total` counter ticks.
     ///
     /// Orchestrator-wired: G10 owns `ServerConfig::strict_auth` and the
     /// CLI `--strict-auth` flag; this field is the local read-site.
@@ -912,25 +951,26 @@ fn handle_connection_inner(
                 repl.replica_unauthenticated_accept_total.inc();
             }
             let op_code = peeked_op.unwrap_or(0);
-            // Per-event `warn` so operators see the peer and opcode that
-            // triggered each accept — silent post-first-event behaviour
-            // before this fix made it impossible to tell whether the
-            // counter spike came from one stuck peer or a flapping fleet.
-            tracing::warn!(
-                target: "teraslab::security",
-                op_code,
-                peer = ?stream.peer_addr().ok(),
-                "unauthenticated replica accept: inter-node opcode \
-                 received without cluster_secret configured — \
-                 accepting frame (trusted-overlay default). Configure \
-                 `cluster_secret` or pass `--strict-auth` to enforce.",
-            );
-            // Preserve the legacy one-shot semantics for the pre-existing
-            // `UNAUTHENTICATED_INTER_NODE_WARNED` flag in case downstream
-            // observers (log scrapers) key off the first-occurrence
-            // marker. The flag flips once; subsequent unauthenticated
-            // accepts still emit the per-event `warn` above plus the
-            // counter bump.
+            // Per-PEER rate-limited `warn` so operators see which peers send
+            // unsigned frames, without the per-frame flood (every inter-node
+            // frame is unauthenticated in trusted-overlay mode). The counter
+            // above already exposes the per-frame rate for dashboards; the
+            // log only needs the distinct offenders, re-surfaced every
+            // `UNAUTH_WARN_PER_PEER_INTERVAL`. The legacy one-shot flag is
+            // still flipped so first-occurrence log scrapers keep working.
+            let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+            if should_warn_unauthenticated(peer_ip) {
+                tracing::warn!(
+                    target: "teraslab::security",
+                    op_code,
+                    peer = ?peer_ip,
+                    "unauthenticated replica accept: inter-node opcode \
+                     received without cluster_secret configured — \
+                     accepting frame (trusted-overlay default). Configure \
+                     `cluster_secret` or pass `--strict-auth` to enforce. \
+                     (further frames from this peer suppressed for 5m)",
+                );
+            }
             let _ = UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel);
         }
         // Two body-read paths now diverge based on whether the frame
@@ -1107,6 +1147,48 @@ mod tests {
     use crate::device::{BlockDevice, MemoryDevice};
     use crate::index::{DahIndex, Index, UnminedIndex};
     use crate::locks::StripedLocks;
+
+    #[test]
+    fn unauthenticated_warn_is_rate_limited_per_peer() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Unique IPs so this test is independent of any other test that
+        // might touch the shared rate-limit map.
+        let a = Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)));
+        let b = Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 2)));
+
+        // First sighting of each peer warns; immediate repeats are
+        // suppressed (the per-peer interval has not elapsed).
+        assert!(should_warn_unauthenticated(a), "first frame from A must warn");
+        assert!(
+            !should_warn_unauthenticated(a),
+            "second frame from A within the interval must be suppressed"
+        );
+        assert!(
+            !should_warn_unauthenticated(a),
+            "third frame from A within the interval must be suppressed"
+        );
+        // A distinct peer warns independently — one stuck peer does not mask
+        // a different offender.
+        assert!(should_warn_unauthenticated(b), "first frame from B must warn");
+        assert!(!should_warn_unauthenticated(b), "B repeat suppressed");
+
+        // A peer whose last-warn instant is older than the interval warns
+        // again (forces re-surfacing of a persistent offender).
+        let c = IpAddr::V4(Ipv4Addr::new(10, 99, 0, 3));
+        {
+            let mut guard = UNAUTH_WARN_LAST_BY_PEER.lock();
+            let map = guard.get_or_insert_with(HashMap::new);
+            map.insert(c, Instant::now() - UNAUTH_WARN_PER_PEER_INTERVAL - Duration::from_secs(1));
+        }
+        assert!(
+            should_warn_unauthenticated(Some(c)),
+            "peer past the interval must warn again"
+        );
+        assert!(
+            !should_warn_unauthenticated(Some(c)),
+            "and then be suppressed again"
+        );
+    }
 
     fn test_engine() -> Engine {
         let dev: Arc<dyn BlockDevice> =
