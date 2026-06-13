@@ -3392,6 +3392,24 @@ fn drain_in_flight_mutations(engine: &Engine) {
     drop(engine.acquire_dispatch_visibility_guard());
 }
 
+/// Maximum number of shards a migration worker fences together in one
+/// pipelined sub-batch.
+///
+/// Each shard's write fence is raised in Phase 2 of its sub-batch and
+/// stays up until that shard commits in Phase 4 — so the continuous
+/// write-blocked window per shard is bounded by the time its SUB-BATCH
+/// takes to finish delta capture, manifest verification, and the batched
+/// completion handshake, NOT by the time the whole connection chunk takes.
+/// Smaller values shorten that window; larger values amortize the fixed
+/// per-sub-batch costs (one fence lock acquisition, one
+/// `drain_in_flight_mutations` dispatch barrier, one redo-sequence read,
+/// one batched completion round-trip — ~10ms total) over more shards.
+/// At 32, the per-shard share of that overhead is ~0.3ms while the fence
+/// window stays bounded by ~32 shards' worth of transfer instead of a
+/// chunk that can span the entire migration (audit P14/B4: with small
+/// pools or large clusters a chunk can be the whole transfer).
+const MIGRATION_PIPELINE_SUB_BATCH: usize = 32;
+
 /// 1. Streams baseline records
 /// 2. Fences source writes
 /// 3. Streams redo deltas
@@ -3776,14 +3794,19 @@ fn run_migration_batch(
                 };
 
                 // Pipelined migration: process shards in sub-batches of
-                // up to 32 shards. For each sub-batch:
+                // up to MIGRATION_PIPELINE_SUB_BATCH shards. For each
+                // sub-batch:
                 // 1. Stream ALL baselines (one TCP round-trip per shard)
                 // 2. Fence ALL shards at once (one lock acquisition)
                 // 3. Send batched completion (one TCP round-trip total)
-                // This reduces per-shard lock overhead from ~700ms to ~10ms.
-                // Process ALL shards on this connection in one pass to avoid
-                // redundant fence/unfence cycles across sub-batches.
-                let pipeline_batch: usize = chunk.len();
+                // This reduces per-shard lock overhead from ~700ms to ~10ms
+                // while keeping each shard's write-fence window bounded by
+                // its sub-batch, not the whole chunk (see the constant's
+                // doc comment for the tradeoff). Shards in later
+                // sub-batches keep serving writes until their own Phase 2;
+                // per-shard snapshot sequences (Phase 1) plus late-key and
+                // delta streaming (Phase 3) make each shard's transfer
+                // independent of when its sub-batch starts.
                 let mut task_idx = 0;
                 while task_idx < chunk.len() {
                     if !migration_epoch_current(shard_table, topology_epoch) {
@@ -3794,7 +3817,7 @@ fn run_migration_batch(
                         );
                         return;
                     }
-                    let sub_end = (task_idx + pipeline_batch).min(chunk.len());
+                    let sub_end = (task_idx + MIGRATION_PIPELINE_SUB_BATCH).min(chunk.len());
                     let sub_batch = &chunk[task_idx..sub_end];
                     let sub_count = sub_batch.len();
 
