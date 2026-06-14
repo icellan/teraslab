@@ -118,6 +118,9 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], hold_activation: bool) -> 
         cluster_secret: None,
         max_migration_threads: 16,
         topology_propose_timeout: Duration::from_millis(300),
+        // Short debounce keeps these in-process tests fast while still
+        // exercising the W3.3 coalescing path.
+        topology_debounce: Duration::from_millis(100),
         migration_pool_size: 4,
         migration_batch_size: 100,
         persisted_incarnation: 0,

@@ -116,6 +116,9 @@ fn create_node_with_cluster_id(
         cluster_secret: None,
         max_migration_threads: 16,
         topology_propose_timeout: Duration::from_millis(300),
+        // Short debounce keeps these in-process tests fast while still
+        // exercising the W3.3 coalescing path.
+        topology_debounce: Duration::from_millis(100),
         migration_pool_size: 4,
         migration_batch_size: 100,
         persisted_incarnation: 0,
