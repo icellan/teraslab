@@ -602,6 +602,13 @@ pub struct ClusterConfig {
     /// Timeout for topology proposal (how long non-proposer waits).
     /// Default: max(3x probe_interval, 500 ms) unless explicitly configured.
     pub topology_propose_timeout: Duration,
+    /// W3.3 — trailing-edge debounce window for coalescing SWIM membership
+    /// changes before proposing a new topology term. A burst of changes
+    /// (staggered boot, node flap) collapses into ONE proposal once the
+    /// membership has been stable for this long. See
+    /// [`crate::cluster::topology::TopologyDebounce`] and
+    /// [`crate::config::ServerConfig::resolved_topology_debounce_ms`].
+    pub topology_debounce: Duration,
     /// Number of parallel TCP connections per migration target. Default: 128.
     pub migration_pool_size: usize,
     /// Records per baseline streaming batch during migration. Default: 500.
@@ -684,6 +691,10 @@ pub struct ClusterCoordinator {
     /// production; only the gated
     /// [`ClusterCoordinator::activation_hold_handle`] can flip it.
     activation_hold: Arc<AtomicBool>,
+    /// W3.3 — trailing-edge debounce window for coalescing SWIM membership
+    /// changes before the event loop proposes a new topology term. Consumed
+    /// when the event loop starts to build its [`TopologyDebounce`].
+    topology_debounce: Duration,
 }
 
 impl ClusterCoordinator {
@@ -763,6 +774,7 @@ impl ClusterCoordinator {
             migration_throttle: Arc::new(crate::cluster::migration::MigrationThrottle::from_env()),
             cluster_secret: config.cluster_secret.map(Arc::new),
             activation_hold: Arc::new(AtomicBool::new(false)),
+            topology_debounce: config.topology_debounce,
         }
     }
 
@@ -885,6 +897,9 @@ impl ClusterCoordinator {
         // outbound migration spawn on `try_admit`.
         let migration_throttle_event = migration_throttle.clone();
         let cluster_secret_event = cluster_secret.clone();
+        // W3.3 — debounce window for coalescing membership changes before
+        // proposing a new topology term.
+        let topology_debounce_window = self.topology_debounce;
 
         // Event processing thread
         let event_handle = std::thread::spawn(move || {
@@ -907,6 +922,14 @@ impl ClusterCoordinator {
             // exchange on every 100 ms tick while the first exchange is in
             // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
+            // W3.3 — trailing-edge debounce: SWIM membership changes are
+            // coalesced here and only fed to the propose path once the
+            // membership has been stable for `topology_debounce_window`
+            // (capped at 4× so continuous churn still proposes). A window
+            // of zero degrades to immediate (legacy) behavior — the first
+            // `take_due` after an `observe` at the same instant fires.
+            let mut topology_debounce =
+                crate::cluster::topology::TopologyDebounce::from_window(topology_debounce_window);
             while !shutdown.load(Ordering::Relaxed) {
                 match event_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
@@ -914,53 +937,58 @@ impl ClusterCoordinator {
                             let current = members.len();
                             peak_size_event.fetch_max(current, Ordering::Relaxed);
                             // E-01: mirror the peak into the topology
-                            // authority BEFORE handle_event runs the
-                            // propose path, so the activation quorum is
-                            // derived from the same observation.
+                            // authority on EVERY raw change (monotonic
+                            // fetch_max), so even a transient burst member
+                            // raises the activation-quorum peak before the
+                            // debounced proposal fires. This must NOT wait
+                            // for the trailing edge — it is a guard input,
+                            // not a proposal.
                             topo_authority_event.observe_peak_cluster_size(current as u64);
-                        }
-                        Self::handle_event(
-                            &event,
-                            self_id,
-                            rf,
-                            max_migration_threads,
-                            &shard_table,
-                            &migration,
-                            &node_addrs,
-                            &engine,
-                            &redo_for_events,
-                            &topology_epoch,
-                            migration_pool_size,
-                            migration_batch_size,
-                            &fenced_bm_event,
-                            &migrating_bm_event,
-                            &inbound_bm_event,
-                            &topo_authority_event,
-                            &node_addrs_for_topo,
-                            &topology_commit_tx_event,
-                            &topo_state_path_event,
-                            &inbound_state_path_event,
-                            &outbound_state_path_event,
-                            &peak_size_event,
-                            &swim_incarnation_event,
-                            &active_topology_members_event,
-                            &migration_throttle_event,
-                            &cluster_secret_event,
-                        );
-                        let activated_term = topology_epoch.load(Ordering::Relaxed);
-                        if activated_term > last_activated_term {
-                            last_activated_term = activated_term;
-                        }
-                        // Track last activation for settle-time guard.
-                        // handle_event may call activate_topology for
-                        // MembershipChanged or TopologyStale events.
-                        last_activation_at = std::time::Instant::now();
-                        if matches!(&event, ClusterEvent::MembershipChanged(_))
-                            && let Some(ref path) = cluster_state_path
-                        {
-                            let peak = peak_size_event.load(Ordering::Relaxed) as u64;
-                            let epoch = topology_epoch.load(Ordering::Relaxed);
-                            persist_cluster_state(path, peak, epoch);
+                            // W3.3 — coalesce: arm/re-arm the trailing-edge
+                            // timer with the latest membership instead of
+                            // proposing immediately. The actual propose runs
+                            // below (and in the timeout branch) once the
+                            // membership has settled. node_addrs is owned by
+                            // NodeJoined/NodeLeft, not MembershipChanged, so
+                            // deferring the propose here changes nothing else.
+                            topology_debounce.observe(members, std::time::Instant::now());
+                        } else {
+                            Self::handle_event(
+                                &event,
+                                self_id,
+                                rf,
+                                max_migration_threads,
+                                &shard_table,
+                                &migration,
+                                &node_addrs,
+                                &engine,
+                                &redo_for_events,
+                                &topology_epoch,
+                                migration_pool_size,
+                                migration_batch_size,
+                                &fenced_bm_event,
+                                &migrating_bm_event,
+                                &inbound_bm_event,
+                                &topo_authority_event,
+                                &node_addrs_for_topo,
+                                &topology_commit_tx_event,
+                                &topo_state_path_event,
+                                &inbound_state_path_event,
+                                &outbound_state_path_event,
+                                &peak_size_event,
+                                &swim_incarnation_event,
+                                &active_topology_members_event,
+                                &migration_throttle_event,
+                                &cluster_secret_event,
+                            );
+                            let activated_term = topology_epoch.load(Ordering::Relaxed);
+                            if activated_term > last_activated_term {
+                                last_activated_term = activated_term;
+                            }
+                            // Track last activation for settle-time guard.
+                            // handle_event may call activate_topology for
+                            // TopologyStale events.
+                            last_activation_at = std::time::Instant::now();
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1062,6 +1090,57 @@ impl ClusterCoordinator {
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                // W3.3 — fire a debounced topology proposal once the
+                // membership has settled (stable for the window, or the
+                // max-wait cap elapsed). Runs every iteration so a burst
+                // that ends with no further events still proposes after the
+                // window. This is the ONLY membership-change propose path
+                // now; it is distinct from the prompt-activation block below
+                // (which acts on an ALREADY-committed term and stays
+                // immediate). Synthesizing a MembershipChanged event reuses
+                // the unchanged propose body in `handle_event`.
+                if let Some(settled) = topology_debounce.take_due(std::time::Instant::now()) {
+                    let settled_event = ClusterEvent::MembershipChanged(settled);
+                    Self::handle_event(
+                        &settled_event,
+                        self_id,
+                        rf,
+                        max_migration_threads,
+                        &shard_table,
+                        &migration,
+                        &node_addrs,
+                        &engine,
+                        &redo_for_events,
+                        &topology_epoch,
+                        migration_pool_size,
+                        migration_batch_size,
+                        &fenced_bm_event,
+                        &migrating_bm_event,
+                        &inbound_bm_event,
+                        &topo_authority_event,
+                        &node_addrs_for_topo,
+                        &topology_commit_tx_event,
+                        &topo_state_path_event,
+                        &inbound_state_path_event,
+                        &outbound_state_path_event,
+                        &peak_size_event,
+                        &swim_incarnation_event,
+                        &active_topology_members_event,
+                        &migration_throttle_event,
+                        &cluster_secret_event,
+                    );
+                    let activated_term = topology_epoch.load(Ordering::Relaxed);
+                    if activated_term > last_activated_term {
+                        last_activated_term = activated_term;
+                    }
+                    last_activation_at = std::time::Instant::now();
+                    if let Some(ref path) = cluster_state_path {
+                        let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                        let epoch = topology_epoch.load(Ordering::Relaxed);
+                        persist_cluster_state(path, peak, epoch);
+                    }
                 }
 
                 // Periodically prune completed inbound migrations so the

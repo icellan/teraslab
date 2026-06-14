@@ -1033,6 +1033,9 @@ fn main() {
             topology_propose_timeout: std::time::Duration::from_millis(
                 config.resolved_topology_propose_timeout_ms(),
             ),
+            topology_debounce: std::time::Duration::from_millis(
+                config.resolved_topology_debounce_ms(),
+            ),
             migration_pool_size: config.migration_pool_size,
             migration_batch_size: config.migration_batch_size,
             persisted_incarnation: topo_state.incarnation,

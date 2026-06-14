@@ -1421,6 +1421,147 @@ impl TopologyAuthority {
 }
 
 // ---------------------------------------------------------------------------
+// Topology-proposal debounce (W3.3 / audit F5)
+// ---------------------------------------------------------------------------
+
+/// Trailing-edge debounce for SWIM membership changes feeding the topology
+/// proposer.
+///
+/// SWIM fires a `MembershipChanged` event for *every* join/leave it
+/// observes. Proposing a new topology term on each one turns a staggered
+/// N-node boot into up to `N-1` sequential terms, and a single node flap
+/// (dead→alive within a short window) into two full migration rounds (shrink
+/// then grow). Round-robin placement reshuffles ~(1-1/n)·4096 shards per
+/// term, so that churn is enormously expensive.
+///
+/// This type coalesces a *burst* of membership changes into ONE proposal
+/// against the settled membership:
+///
+///   * [`observe`](Self::observe) records the latest member set and (re)arms
+///     a trailing-edge timer — the proposal is deferred until the membership
+///     has been *stable* (unchanged) for `window`.
+///   * [`take_due`](Self::take_due) returns the settled member set exactly
+///     once, when either the membership has been stable for `window`
+///     (the common case) or the burst has run longer than `max_wait`
+///     (the cap, so continuous flapping still eventually proposes).
+///
+/// A flap that returns to the previously-pending set re-arms the timer but
+/// leaves the target set unchanged, so when it finally fires the membership
+/// is stable-equal and (via [`TopologyAuthority::on_membership_changed`]'s
+/// identical-membership skip) produces ZERO net topology change.
+///
+/// Purely a *propose-side* gate: it never touches the committed term, the
+/// quorum guards, or the prompt-activation path (which acts on an
+/// already-committed term and must stay immediate). Time is injected so the
+/// decision logic is deterministic in tests — production passes
+/// `Instant::now()`.
+#[derive(Debug)]
+pub struct TopologyDebounce {
+    /// Stable-membership window: propose only after the observed set has
+    /// been unchanged for this long.
+    window: Duration,
+    /// Hard cap on total deferral so continuous churn cannot starve
+    /// topology progress. Measured from the first observation in the
+    /// current burst.
+    max_wait: Duration,
+    /// In-flight burst state (`None` = nothing pending).
+    pending: Option<DebouncePending>,
+}
+
+#[derive(Debug, Clone)]
+struct DebouncePending {
+    /// Latest observed member set (the proposal target).
+    members: Vec<NodeId>,
+    /// When the current burst started (drives the `max_wait` cap).
+    first_observed: Instant,
+    /// When `members` last *changed* (drives the trailing-edge `window`).
+    last_changed: Instant,
+}
+
+impl TopologyDebounce {
+    /// Create a debounce with a stable-membership `window` and a total
+    /// deferral `max_wait` cap. `max_wait` is clamped to be at least
+    /// `window` (a cap below the window would defeat the debounce).
+    pub fn new(window: Duration, max_wait: Duration) -> Self {
+        Self {
+            window,
+            max_wait: max_wait.max(window),
+            pending: None,
+        }
+    }
+
+    /// Convenience constructor deriving `max_wait = 4 × window` (the W3.3
+    /// default cap). A continuously-flapping cluster still proposes within
+    /// four debounce windows.
+    pub fn from_window(window: Duration) -> Self {
+        Self::new(window, window.saturating_mul(4))
+    }
+
+    /// Record an observed membership at `now`.
+    ///
+    /// If `members` differs from the currently-pending target, the
+    /// trailing-edge timer is (re)armed (`last_changed = now`) and the new
+    /// set becomes the target. If it equals the pending target, the timer
+    /// is *not* re-armed — an idempotent SWIM re-fire of the same set lets
+    /// the window keep counting down toward a proposal. Starting a fresh
+    /// burst also stamps `first_observed` for the `max_wait` cap.
+    ///
+    /// Empty member sets are ignored (SWIM never proposes an empty cluster;
+    /// matches [`TopologyAuthority::on_membership_changed`]).
+    pub fn observe(&mut self, members: &[NodeId], now: Instant) {
+        if members.is_empty() {
+            return;
+        }
+        match self.pending.as_mut() {
+            Some(p) if p.members == members => {
+                // Same set re-observed: keep counting down, do not re-arm.
+            }
+            Some(p) => {
+                p.members = members.to_vec();
+                p.last_changed = now;
+            }
+            None => {
+                self.pending = Some(DebouncePending {
+                    members: members.to_vec(),
+                    first_observed: now,
+                    last_changed: now,
+                });
+            }
+        }
+    }
+
+    /// Whether a pending burst is due to propose at `now`: stable for
+    /// `window`, or older than `max_wait`. Does not consume the state.
+    pub fn is_due(&self, now: Instant) -> bool {
+        match &self.pending {
+            None => false,
+            Some(p) => {
+                now.duration_since(p.last_changed) >= self.window
+                    || now.duration_since(p.first_observed) >= self.max_wait
+            }
+        }
+    }
+
+    /// If a pending burst is due at `now`, consume and return its settled
+    /// member set; otherwise return `None` and leave the state intact. The
+    /// caller feeds the returned set to
+    /// [`TopologyAuthority::on_membership_changed`].
+    pub fn take_due(&mut self, now: Instant) -> Option<Vec<NodeId>> {
+        if self.is_due(now) {
+            self.pending.take().map(|p| p.members)
+        } else {
+            None
+        }
+    }
+
+    /// Whether anything is currently pending (used by the event loop to
+    /// decide whether the per-tick due-check needs to run at all).
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2907,5 +3048,168 @@ mod tests {
         );
         assert_eq!(auth.committed_term(), 5);
         assert_eq!(auth.committed_members(), local_members);
+    }
+
+    // -----------------------------------------------------------------
+    // W3.3 — topology-proposal debounce
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn debounce_staggered_boot_burst_yields_one_proposal() {
+        // 5-node boot whose MembershipChanged events all land WITHIN the
+        // debounce window must collapse into exactly ONE proposal against
+        // the final, settled membership (vs up to 4 today).
+        let window = Duration::from_millis(500);
+        let mut deb = TopologyDebounce::from_window(window);
+        let t0 = Instant::now();
+
+        // Burst: {1,2} → {1,2,3} → {1,2,3,4} → {1,2,3,4,5}, each ~100ms
+        // apart (all inside the 500ms window, each re-arms the timer).
+        deb.observe(&members(&[1, 2]), t0);
+        deb.observe(&members(&[1, 2, 3]), t0 + Duration::from_millis(100));
+        deb.observe(&members(&[1, 2, 3, 4]), t0 + Duration::from_millis(200));
+        deb.observe(&members(&[1, 2, 3, 4, 5]), t0 + Duration::from_millis(300));
+
+        // Before the window elapses past the LAST change: not due.
+        assert!(!deb.is_due(t0 + Duration::from_millis(700)));
+        assert_eq!(deb.take_due(t0 + Duration::from_millis(700)), None);
+
+        // 500ms after the last change (t0+300 → t0+800): due, ONCE, with
+        // the settled 5-member set.
+        let fired = deb.take_due(t0 + Duration::from_millis(800));
+        assert_eq!(fired, Some(members(&[1, 2, 3, 4, 5])));
+        // Consumed: a second take returns nothing.
+        assert_eq!(deb.take_due(t0 + Duration::from_millis(800)), None);
+        assert!(!deb.has_pending());
+    }
+
+    #[test]
+    fn debounce_changes_spanning_window_yield_multiple_proposals() {
+        // Events spaced FURTHER apart than the window each settle and fire
+        // on their own — the debounce only coalesces a contiguous burst.
+        let window = Duration::from_millis(500);
+        let mut deb = TopologyDebounce::from_window(window);
+        let t0 = Instant::now();
+
+        deb.observe(&members(&[1, 2]), t0);
+        // Window elapses with {1,2} stable → first proposal.
+        assert_eq!(
+            deb.take_due(t0 + Duration::from_millis(600)),
+            Some(members(&[1, 2])),
+        );
+
+        // A later, separate change settles and fires independently.
+        deb.observe(&members(&[1, 2, 3]), t0 + Duration::from_millis(1000));
+        assert_eq!(deb.take_due(t0 + Duration::from_millis(1400)), None);
+        assert_eq!(
+            deb.take_due(t0 + Duration::from_millis(1600)),
+            Some(members(&[1, 2, 3])),
+        );
+    }
+
+    #[test]
+    fn debounce_flap_within_window_produces_stable_equal_set() {
+        // A node leaves then rejoins inside the window: the trailing-edge
+        // set equals the pre-flap set, so the proposal target is unchanged.
+        // Fed to on_membership_changed (identical-membership skip) this is
+        // ZERO net topology change.
+        let window = Duration::from_millis(500);
+        let mut deb = TopologyDebounce::from_window(window);
+        let t0 = Instant::now();
+
+        // Settled cluster {1,2,3}; node 3 flaps out then back in.
+        deb.observe(&members(&[1, 2, 3]), t0);
+        deb.observe(&members(&[1, 2]), t0 + Duration::from_millis(100)); // 3 dies
+        deb.observe(&members(&[1, 2, 3]), t0 + Duration::from_millis(200)); // 3 back
+
+        // Last change at t0+200; fires at t0+700 with the ORIGINAL set.
+        let fired = deb.take_due(t0 + Duration::from_millis(700));
+        assert_eq!(fired, Some(members(&[1, 2, 3])));
+
+        // Prove the net-zero property end-to-end: feeding this to an
+        // authority already committed on {1,2,3} produces NO proposal.
+        let auth = TopologyAuthority::new(NodeId(1), Duration::from_secs(1));
+        // Establish committed {1,2,3} (single observe + self/quorum commit
+        // via the test commit helper would be heavier; instead drive the
+        // on_membership_changed identical-skip directly after a first
+        // commit). First commit the set.
+        let term = auth
+            .on_membership_changed(&members(&[1, 2, 3]))
+            .expect("proposer proposes first term");
+        let commit = TopologyCommit {
+            term: term.term,
+            proposer: NodeId(1),
+            members: term.members.clone(),
+            cluster_id: term.cluster_id,
+            digest: term.digest,
+            voters: term.members.clone(),
+        };
+        assert!(auth.handle_commit(&commit).is_some());
+        assert_eq!(auth.committed_members(), members(&[1, 2, 3]));
+        // Now the debounced (flap-settled) set is identical → no proposal.
+        assert!(
+            auth.on_membership_changed(&fired.unwrap()).is_none(),
+            "flap that settles back to the committed set must not re-propose",
+        );
+    }
+
+    #[test]
+    fn debounce_max_wait_cap_fires_under_continuous_churn() {
+        // A cluster that changes membership every tick — never stable for a
+        // full window — must still propose once the max-wait cap elapses.
+        let window = Duration::from_millis(500);
+        let max_wait = Duration::from_millis(2000); // 4× window
+        let mut deb = TopologyDebounce::new(window, max_wait);
+        let t0 = Instant::now();
+
+        // Churn every 100ms (always < window since last change) for 2s.
+        let mut n = 2u64;
+        let mut now = t0;
+        for step in 0..19 {
+            now = t0 + Duration::from_millis(100 * step);
+            // Alternate set so each observe re-arms the trailing-edge timer.
+            let set: Vec<u64> = (1..=n).collect();
+            deb.observe(&members(&set), now);
+            n = if n == 2 { 3 } else { 2 };
+            // Never due via the stable-window path while churning.
+            if now.duration_since(t0) < max_wait {
+                assert!(
+                    !deb.is_due(now),
+                    "should not fire via window while churning at {now:?}",
+                );
+            }
+        }
+
+        // Past the cap (measured from first_observed = t0): force-fires
+        // even though the membership is still churning.
+        assert!(deb.is_due(t0 + max_wait));
+        assert!(
+            deb.take_due(t0 + max_wait).is_some(),
+            "max-wait cap must force a proposal under continuous churn",
+        );
+        let _ = now;
+    }
+
+    #[test]
+    fn debounce_empty_set_is_ignored() {
+        let mut deb = TopologyDebounce::from_window(Duration::from_millis(500));
+        let t0 = Instant::now();
+        deb.observe(&[], t0);
+        assert!(!deb.has_pending());
+        assert_eq!(deb.take_due(t0 + Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn debounce_max_wait_clamped_to_window() {
+        // A max_wait below the window would defeat the debounce — it is
+        // clamped up to the window.
+        let mut deb =
+            TopologyDebounce::new(Duration::from_millis(500), Duration::from_millis(10));
+        let t0 = Instant::now();
+        deb.observe(&members(&[1, 2]), t0);
+        // At 10ms (the requested-but-clamped cap) it must NOT yet be due.
+        assert!(!deb.is_due(t0 + Duration::from_millis(10)));
+        // The effective cap is the 500ms window.
+        assert!(deb.is_due(t0 + Duration::from_millis(500)));
     }
 }

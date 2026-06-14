@@ -606,6 +606,39 @@ pub struct ServerConfig {
     /// `max(swim_probe_interval_ms * 3, 500)`.
     pub topology_propose_timeout_ms: u64,
 
+    /// Debounce window in milliseconds for coalescing SWIM membership
+    /// changes before proposing a new topology term (W3.3 / audit F5).
+    ///
+    /// A burst of membership changes — a staggered N-node boot, or a node
+    /// flap (dead→alive within a short window) — would otherwise fire one
+    /// topology proposal per change, each carrying a full ~(1-1/n)·4096
+    /// shard migration round. With round-robin placement that churn is
+    /// enormous (a 5-node staggered boot worst-cases into 4 sequential
+    /// terms). This window makes the proposer wait until the observed
+    /// membership has been *stable* for the debounce period (trailing-edge
+    /// debounce) before proposing, so the burst collapses into ONE proposal
+    /// against the settled membership.
+    ///
+    /// `0` (the default) means derive from
+    /// `max(swim_probe_interval_ms * 2, swim_suspicion_timeout_ms / 2)`:
+    ///   * `2 × probe_interval` lets straggling JOINs in a staggered boot
+    ///     arrive before the first proposal.
+    ///   * `suspicion_timeout / 2` ensures a flapping node's re-join is
+    ///     absorbed before a shrink is proposed on its (transient) LEAVE.
+    ///
+    /// A single window covers both join and leave; the larger of the two
+    /// terms dominates. With the shipped SWIM defaults (200/5000) this is
+    /// 2500 ms; with the docker kill-scenario timing (150/1000) it is
+    /// 500 ms — small enough that suspicion (1000) + debounce (500) +
+    /// exchange + migration still fits the scenarios' 30 s ready / 60 s
+    /// migration post-kill bounds.
+    ///
+    /// To bound deferral when a cluster flaps continuously, the proposer
+    /// also force-proposes once the *first* un-proposed change in a burst
+    /// is older than `4 ×` this window (the max-wait cap), so churn can
+    /// never starve topology progress indefinitely.
+    pub topology_debounce_ms: u64,
+
     /// 16-byte cluster instance UUID, encoded as 32 lowercase hex
     /// characters (no dashes, no `0x` prefix). All nodes in the same
     /// cluster must use the same value; mismatched ids reject
@@ -804,6 +837,7 @@ impl Default for ServerConfig {
             swim_probe_interval_ms: 200,
             swim_suspicion_timeout_ms: 5000,
             topology_propose_timeout_ms: 0,
+            topology_debounce_ms: 0,
             cluster_id: None,
             blobstore_path: PathBuf::from("./teraslab-blobstore"),
             blob_gc_interval_secs: 3600,
@@ -875,6 +909,20 @@ impl ServerConfig {
             self.swim_probe_interval_ms.saturating_mul(3).max(500)
         } else {
             self.topology_propose_timeout_ms
+        }
+    }
+
+    /// Resolve the topology-proposal debounce window (W3.3). `0` derives
+    /// `max(swim_probe_interval_ms * 2, swim_suspicion_timeout_ms / 2)`; an
+    /// explicit non-zero value is used verbatim. See
+    /// [`Self::topology_debounce_ms`] for the derivation rationale.
+    pub fn resolved_topology_debounce_ms(&self) -> u64 {
+        if self.topology_debounce_ms == 0 {
+            self.swim_probe_interval_ms
+                .saturating_mul(2)
+                .max(self.swim_suspicion_timeout_ms / 2)
+        } else {
+            self.topology_debounce_ms
         }
     }
 
@@ -1711,6 +1759,41 @@ backend = ""
             ..ServerConfig::default()
         };
         assert_eq!(explicit.resolved_topology_propose_timeout_ms(), 2_500);
+    }
+
+    #[test]
+    fn topology_debounce_default_derives_from_swim_timing() {
+        // Shipped SWIM defaults (200/5000): suspicion/2 = 2500 dominates
+        // 2×probe = 400.
+        let shipped = ServerConfig::default();
+        assert_eq!(shipped.resolved_topology_debounce_ms(), 2_500);
+
+        // Docker kill-scenario timing (150/1000): 2×probe = 300 vs
+        // suspicion/2 = 500 → 500 wins, still well inside the 30s/60s
+        // post-kill wait bounds.
+        let kill_scenario = ServerConfig {
+            swim_probe_interval_ms: 150,
+            swim_suspicion_timeout_ms: 1_000,
+            ..ServerConfig::default()
+        };
+        assert_eq!(kill_scenario.resolved_topology_debounce_ms(), 500);
+
+        // Aggressive probe with no suspicion: 2×probe dominates.
+        let fast_probe = ServerConfig {
+            swim_probe_interval_ms: 400,
+            swim_suspicion_timeout_ms: 100,
+            ..ServerConfig::default()
+        };
+        assert_eq!(fast_probe.resolved_topology_debounce_ms(), 800);
+
+        // Explicit value is used verbatim, ignoring the derivation.
+        let explicit = ServerConfig {
+            swim_probe_interval_ms: 200,
+            swim_suspicion_timeout_ms: 5_000,
+            topology_debounce_ms: 750,
+            ..ServerConfig::default()
+        };
+        assert_eq!(explicit.resolved_topology_debounce_ms(), 750);
     }
 
     #[test]
