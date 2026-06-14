@@ -535,7 +535,8 @@ pub(crate) fn handle_request(
         return err_resp;
     }
 
-    let mut _visibility_guard = acquire_dispatch_visibility_guard(engine, request.op_code);
+    let mut _visibility_guard =
+        acquire_dispatch_visibility_guard(engine, request.op_code, request.flags);
     // C-1: for mutation ops, borrow the exclusive barrier out as a
     // releasable handle so the handler can drop it after local apply +
     // redo durability, before the replication network round-trip. Read
@@ -3675,11 +3676,56 @@ impl MutationBarrier<'_> {
 fn acquire_dispatch_visibility_guard(
     engine: &Engine,
     op: u16,
+    flags: u16,
 ) -> Option<DispatchVisibilityGuard<'_>> {
     if !needs_dispatch_visibility_barrier(op) {
         return None;
     }
-    if needs_exclusive_visibility_barrier(op) {
+    // W2/P3: a migration-flagged OP_REPLICA_BATCH takes the SHARED side of
+    // the barrier instead of the EXCLUSIVE side that normal replica batches
+    // (and all mutations) take. Migration applies funnel many concurrent
+    // batches at one target; on the exclusive side they serialize end-to-end
+    // (≤1000 ops + device fsync + redo flush each), starving foreground
+    // master→replica ACKs and client reads → error 20. Moving them to the
+    // shared side lets them run concurrently with each other and with client
+    // reads, and (parking_lot is write-preferring) a waiting foreground
+    // normal-replica batch or client mutation still drains them within one
+    // in-flight apply, not behind a deep queue.
+    //
+    // This is safe WITHOUT the exclusive side because three independent
+    // invariants already cover what the barrier would have:
+    //   1. Checkpoint coordination is preserved: `perform_checkpoint_with_
+    //      reset_guard` (src/checkpoint.rs) holds the EXCLUSIVE `.write()`
+    //      across snapshot_index + persist_allocator, which still excludes
+    //      every shared holder including these migration applies — so the
+    //      snapshot cannot tear across a migrated record. (A full bypass —
+    //      "no guard" — would race the checkpoint snapshot and could drop a
+    //      migrated record whose redo entry is pre-fence but whose index
+    //      update missed the snapshot; the SHARED guard closes that.)
+    //   2. Torn-read fence: a shard being migrated has its inbound bit set,
+    //      so `is_master` returns Transitioning and GET_BATCH /
+    //      GET_SPEND_BATCH / mutations on that shard return
+    //      ERR_MIGRATION_IN_PROGRESS before they ever reach the engine. No
+    //      client read can observe the migrated shard's intermediate state,
+    //      even though the shared side admits concurrent reads.
+    //   3. Per-record integrity: every ReplicaOp variant in
+    //      `receiver::apply_op` routes through a stripe-locked engine method
+    //      (spend/create/delete/prune_slot/prune_slot_if_spent_by_child/
+    //      mark_on_longest_chain/set_record_generation all take
+    //      `self.locks.lock(key)`). The route is pinned by the load-bearing
+    //      tests `apply_prune_slot_routes_through_stripe_lock` and
+    //      `generation_sync_routes_through_stripe_lock` in receiver.rs.
+    // The migration flag itself is authenticated: the receiver requires the
+    // cluster key (F-G7-005) and dispatch rejects a request_id whose high
+    // bits are non-zero, so an unauthenticated/forged batch cannot reach the
+    // shared branch.
+    //
+    // Normal (non-migration) replica batches KEEP the exclusive guard: their
+    // shards are NOT fenced, so a torn read of a partially-applied batch IS
+    // client-observable. Only the migration flag downgrades the side.
+    let is_migration_replica_batch =
+        op == OP_REPLICA_BATCH && (flags & FLAG_MIGRATION_BATCH != 0);
+    if needs_exclusive_visibility_barrier(op) && !is_migration_replica_batch {
         Some(DispatchVisibilityGuard::Exclusive(Some(
             engine.acquire_mutation_visibility_guard(),
         )))
@@ -12806,7 +12852,8 @@ mod tests {
 
         let engine = Arc::new(DispatchTestHarness::new().engine);
         let reader_engine = Arc::clone(&engine);
-        let mut mutation_guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH);
+        let mut mutation_guard =
+            acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH, 0);
         assert!(
             mutation_guard.is_some(),
             "mutation op should acquire the visibility barrier",
@@ -12819,7 +12866,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             reader_entered_thread.store(true, Ordering::SeqCst);
             let _read_guard =
-                acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH)
+                acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH, 0)
                     .expect("read op should acquire the visibility barrier");
             reader_finished_thread.store(true, Ordering::SeqCst);
         });
@@ -13505,7 +13552,7 @@ mod tests {
         let engine = Arc::new(DispatchTestHarness::new().engine);
         let reader_engine = Arc::clone(&engine);
 
-        let mut guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH);
+        let mut guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH, 0);
         let barrier = mutation_barrier_from(&mut guard)
             .expect("exclusive op yields a releasable MutationBarrier");
 
@@ -13522,7 +13569,7 @@ mod tests {
             loop {
                 if let Some(t0) = *started_thread.lock() {
                     let _read_guard =
-                        acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH);
+                        acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH, 0);
                     reader_wait_thread.store(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
                     return;
                 }
@@ -13562,6 +13609,271 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    /// W2/P3 — torn-visibility property test. This is the test that
+    /// JUSTIFIES downgrading migration-flagged OP_REPLICA_BATCH applies to
+    /// the SHARED visibility guard: the change is safe ONLY because the
+    /// inbound-migration fence keeps a shard being migrated client-invisible
+    /// regardless of which side of the barrier the apply takes.
+    ///
+    /// We set a shard's inbound bit (the same state
+    /// `mark_inbound_active`/`new_test_running_cluster(inbound_shards=…)`
+    /// produces when the first migration batch arrives), run a concurrent
+    /// stream of migration `apply_op`s for keys on that shard directly
+    /// against the engine — exactly what a SHARED-side migration batch would
+    /// do — and assert every concurrent client `GET_BATCH`/`GET_SPEND_BATCH`
+    /// for those keys returns `ERR_MIGRATION_IN_PROGRESS`. Never partial
+    /// data, never a not-found→found flicker. This pins the FENCE (the
+    /// load-bearing invariant), not the barrier: even though the shared side
+    /// now admits concurrent reads, none can observe the migrated shard's
+    /// intermediate state.
+    #[test]
+    fn migration_inbound_shard_reads_are_fenced_during_concurrent_apply() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build the engine directly (not via the harness) so it can live in
+        // an `Arc` shared with the concurrent migration-apply thread. Hold
+        // the metrics test lock for the harness-equivalent global isolation.
+        let _metrics_guard = metrics_test_lock();
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10000).unwrap();
+        let locks = StripedLocks::new(1024);
+        let dah = DahIndex::new();
+        let unmined = UnminedIndex::new();
+        let engine = Arc::new(Engine::new(dev, index, alloc, locks, dah, unmined));
+
+        let shard = 33u16;
+        // Keys all hash to the migrating shard.
+        let keys: Vec<[u8; 32]> = (0..8u8).map(|i| txid_for_shard(shard, 100 + i)).collect();
+
+        // Single-node cluster that masters `shard` but has its inbound bit
+        // set — i.e. a subset master mid-migration. `is_master` returns
+        // Transitioning for keys on this shard, so reads must be fenced.
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 42);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4733".parse().unwrap(),
+            )],
+            &members,
+            &[shard], // inbound_shards — the migration fence
+            &[],
+            &[],
+            1,
+        );
+
+        // Concurrent migration apply stream: create then delete each key
+        // directly via the receiver's `apply_op`, mimicking a SHARED-side
+        // migration batch mutating the engine while reads run.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
+        let writer_engine = Arc::clone(&engine);
+        let writer_keys = keys.clone();
+        let writer = std::thread::spawn(move || {
+            // Every apply_op routes through stripe-locked engine methods, so
+            // concurrent reads of the same record are serialized at the
+            // io-lock layer — this thread mutates engine state freely while
+            // the reader hammers the fence.
+            let mut round = 0u64;
+            while !stop_writer.load(Ordering::SeqCst) {
+                for k in &writer_keys {
+                    let tx_key = TxKey { txid: *k };
+                    let create = crate::replication::protocol::ReplicaOp::Create {
+                        tx_key,
+                        metadata_bytes: vec![],
+                        utxo_hashes: vec![[0u8; 32]],
+                        cold_data: None,
+                        is_external: false,
+                    };
+                    let _ = crate::replication::receiver::apply_op(writer_engine.as_ref(), &create);
+                    let del = crate::replication::protocol::ReplicaOp::Delete { tx_key };
+                    let _ = crate::replication::receiver::apply_op(writer_engine.as_ref(), &del);
+                }
+                round += 1;
+                if round > 10_000 {
+                    break; // bounded — the reader loop drives the test length
+                }
+            }
+        });
+
+        // While the writer churns, hammer reads. Every read of a key on the
+        // fenced shard MUST be rejected — never STATUS_OK-with-data, never a
+        // not-found→found flicker leaking the intermediate engine state.
+        for _ in 0..400 {
+            // GET_BATCH: per-item WireGetResult.status carries the fence code.
+            {
+                let payload = crate::protocol::codec::encode_get_batch(
+                    FieldMask::ALL_METADATA,
+                    std::slice::from_ref(&keys[0]),
+                );
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_GET_BATCH,
+                    flags: 0,
+                    payload: payload.into(),
+                };
+                let mut conn_state = crate::server::ConnectionState::new();
+                let resp = handle_request(
+                    &req, engine.as_ref(), 8192, Some(&cluster), None, &mut conn_state, None,
+                );
+                let results = crate::protocol::codec::decode_get_response(&resp.payload)
+                    .expect("get_batch response decodes");
+                assert_eq!(results.len(), 1, "single key queried");
+                assert_eq!(
+                    results[0].status,
+                    ERR_MIGRATION_IN_PROGRESS as u8,
+                    "GET_BATCH on an inbound-migrating shard must be fenced \
+                     (ERR_MIGRATION_IN_PROGRESS), never observe intermediate apply state",
+                );
+            }
+            // GET_SPEND_BATCH: different wire format — per-item
+            // WireGetSpendResult.error_code carries the fence code.
+            {
+                let item = crate::protocol::codec::WireGetSpendItem {
+                    txid: keys[0],
+                    vout: 0,
+                    utxo_hash: [0u8; 32],
+                };
+                let payload = crate::protocol::codec::encode_get_spend_batch(
+                    std::slice::from_ref(&item),
+                );
+                let req = RequestFrame {
+                    request_id: 1,
+                    op_code: OP_GET_SPEND_BATCH,
+                    flags: 0,
+                    payload: payload.into(),
+                };
+                let mut conn_state = crate::server::ConnectionState::new();
+                let resp = handle_request(
+                    &req, engine.as_ref(), 8192, Some(&cluster), None, &mut conn_state, None,
+                );
+                let results = crate::protocol::codec::decode_get_spend_response(&resp.payload)
+                    .expect("get_spend_batch response decodes");
+                assert_eq!(results.len(), 1, "single key queried");
+                assert_eq!(
+                    results[0].error_code,
+                    ERR_MIGRATION_IN_PROGRESS,
+                    "GET_SPEND_BATCH on an inbound-migrating shard must be fenced \
+                     (ERR_MIGRATION_IN_PROGRESS), never observe intermediate apply state",
+                );
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        writer.join().expect("migration apply writer joins");
+    }
+
+    /// W2/P3 — foreground progress under a migration-apply pool (structural
+    /// form). The latency assertion of the design is encoded structurally to
+    /// stay deterministic: a migration apply in flight holds only the SHARED
+    /// side of the visibility barrier, so a concurrent EXCLUSIVE acquire (a
+    /// normal-replication batch or a client mutation) succeeds WITHOUT
+    /// waiting for the migration apply to finish.
+    ///
+    /// Fail-before: pre-fix the migration batch took the exclusive side, so
+    /// the exclusive acquire below would block until the migration guard
+    /// dropped (the deep-funnel starvation that produced error 20).
+    /// Pass-after: the migration guard is shared, so the exclusive side is
+    /// free and the foreground acquire returns immediately.
+    ///
+    /// Companion negative: a NORMAL (non-migration) OP_REPLICA_BATCH still
+    /// takes the exclusive side, so it DOES block a concurrent exclusive
+    /// acquire — proving only the migration flag downgrades the side.
+    #[test]
+    fn migration_replica_batch_holds_shared_guard_not_exclusive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let engine = Arc::new(DispatchTestHarness::new().engine);
+
+        // A migration-flagged OP_REPLICA_BATCH guard must be the SHARED side.
+        let migration_guard = acquire_dispatch_visibility_guard(
+            engine.as_ref(),
+            OP_REPLICA_BATCH,
+            FLAG_MIGRATION_BATCH,
+        )
+        .expect("OP_REPLICA_BATCH takes a visibility barrier");
+        assert!(
+            matches!(migration_guard, DispatchVisibilityGuard::Shared(_)),
+            "migration-flagged OP_REPLICA_BATCH must take the SHARED guard",
+        );
+
+        // The real concurrency win: with one migration (SHARED) guard held,
+        // a SECOND migration apply AND a concurrent client READ — both also
+        // SHARED — acquire immediately without blocking. Before W2 migration
+        // applies took the EXCLUSIVE side and serialized end-to-end against
+        // each other and against reads; that deep funnel is what starved
+        // foreground replication ACKs into error 20. A foreground EXCLUSIVE
+        // batch still drains in-flight shared holders before proceeding —
+        // correct RwLock behaviour, bounded to one batch by parking_lot
+        // write-preference — so that is deliberately NOT asserted here.
+        let second_migration = acquire_dispatch_visibility_guard(
+            engine.as_ref(),
+            OP_REPLICA_BATCH,
+            FLAG_MIGRATION_BATCH,
+        )
+        .expect("second migration batch takes a visibility barrier");
+        assert!(
+            matches!(second_migration, DispatchVisibilityGuard::Shared(_)),
+            "a second concurrent migration apply also takes the SHARED guard",
+        );
+        let concurrent_read =
+            acquire_dispatch_visibility_guard(engine.as_ref(), OP_GET_BATCH, 0)
+                .expect("read takes a visibility barrier");
+        assert!(
+            matches!(concurrent_read, DispatchVisibilityGuard::Shared(_)),
+            "a client read runs concurrently with migration applies (no starvation)",
+        );
+        drop(concurrent_read);
+        drop(second_migration);
+        drop(migration_guard);
+
+        // Negative control: a NORMAL OP_REPLICA_BATCH (no migration flag)
+        // takes the exclusive side and therefore blocks a concurrent
+        // exclusive acquire until it is released.
+        let normal_guard =
+            acquire_dispatch_visibility_guard(engine.as_ref(), OP_REPLICA_BATCH, 0)
+                .expect("normal OP_REPLICA_BATCH takes a visibility barrier");
+        assert!(
+            matches!(normal_guard, DispatchVisibilityGuard::Exclusive(_)),
+            "a non-migration OP_REPLICA_BATCH must keep the EXCLUSIVE guard",
+        );
+        let blocked_engine = Arc::clone(&engine);
+        let entered = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let entered_t = Arc::clone(&entered);
+        let finished_t = Arc::clone(&finished);
+        let blocked = std::thread::spawn(move || {
+            entered_t.store(true, Ordering::SeqCst);
+            let _g =
+                acquire_dispatch_visibility_guard(blocked_engine.as_ref(), OP_SPEND_BATCH, 0)
+                    .expect("mutation takes a visibility barrier");
+            finished_t.store(true, Ordering::SeqCst);
+        });
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Spin a bounded number of yields; the blocked acquire must still be
+        // waiting because the normal-batch holds the exclusive side.
+        for _ in 0..10_000 {
+            std::thread::yield_now();
+        }
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "a concurrent exclusive acquire must block while a NORMAL replica \
+             batch holds the exclusive guard",
+        );
+        drop(normal_guard);
+        blocked.join().expect("blocked exclusive acquire joins");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the blocked acquire proceeds once the normal-batch exclusive guard releases",
+        );
     }
 
     #[test]
