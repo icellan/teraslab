@@ -622,16 +622,10 @@ impl SwimRunner {
                 if let Some(m) = swim_metrics() {
                     m.swim_probe_timeouts_total.inc();
                 }
-                let mut mem = self.membership.lock();
-                // Use the member's current incarnation for local suspicion.
-                // This is not a gossipped suspicion — it's our own probe
-                // failure, so we always know the current incarnation.
-                let inc = mem
-                    .member_info(&pending.target)
-                    .map(|i| i.incarnation)
-                    .unwrap_or(0);
-                let events = mem.mark_suspect(pending.target, inc);
-                drop(mem);
+                // W3.2 — mark suspect AND immediately arm a fresh direct
+                // re-probe of the suspect (a real second chance) instead of
+                // passively waiting out the suspicion timeout.
+                let events = self.declare_suspect_and_reprobe(pending.target, &socket);
                 for event in events {
                     let _ = event_tx.send(event);
                 }
@@ -897,6 +891,28 @@ impl SwimRunner {
 
                 if let Ok(tcp_addr) = tcp_str.parse::<SocketAddr>() {
                     if nid == self.config.self_id {
+                        // W3.1 — incarnation refutation (SWIM §4.2). A node
+                        // never marks *itself* Suspect/Dead from gossip, but
+                        // it MUST notice when a peer believes it is and
+                        // refute. On seeing self gossiped as Suspect(1) or
+                        // Dead(2) at an incarnation >= our own, bump our
+                        // incarnation past it. Every outgoing gossip carries
+                        // Alive(self, self.incarnation) as entry 0 (see
+                        // `collect_member_updates`), so the bumped value
+                        // disseminates the Alive refutation on the very next
+                        // message — including the immediate ACK to this PING
+                        // — and peers clear the suspicion via the
+                        // higher-incarnation `dominated` path in
+                        // `Membership::mark_alive`.
+                        if (state == 1 || state == 2) && inc >= self.incarnation {
+                            self.incarnation = inc + 1;
+                            tracing::debug!(
+                                self_id = self.config.self_id.0,
+                                refuted_incarnation = inc,
+                                new_incarnation = self.incarnation,
+                                "SWIM: refuting self-suspicion with higher incarnation",
+                            );
+                        }
                         continue;
                     }
                     self.peer_addrs.lock().insert(nid, tcp_addr);
@@ -1195,6 +1211,72 @@ impl SwimRunner {
         }
     }
 
+    /// Declare `target` Suspect after a failed probe round and arm a fresh
+    /// direct re-probe of it (W3.2 — suspect confirm-round / second chance).
+    ///
+    /// The original behavior marked a node Suspect after a single failed
+    /// probe round and then waited passively for the suspicion timeout to
+    /// declare it Dead — a transiently CPU-stalled node had no further
+    /// chance to ACK or refute. This wires a real additional probe round:
+    /// after marking Suspect we send a new direct PING to the suspect and
+    /// install a fresh `pending_probe`. That re-probe is driven by the same
+    /// timeout machinery as any other (direct → indirect → no-op re-suspect),
+    /// so a node that comes back to life mid-suspicion ACKs the re-probe and
+    /// is cleared via the same-incarnation-direct path in
+    /// [`Membership::mark_alive`]; a higher-incarnation Alive refutation
+    /// (W3.1) clears it via the `dominated` path.
+    ///
+    /// Death remains bounded: the suspicion timer in
+    /// [`Membership::expire_suspects`] runs from the *first* suspicion
+    /// (`mark_suspect` is a no-op once already Suspect, so `state_changed_at`
+    /// is not reset), so a genuinely dead node is still declared Dead within
+    /// `suspicion_timeout` (plus up to one probe interval of expire-check
+    /// cadence) — the second chance lives entirely inside that window.
+    ///
+    /// Returns the membership events from the suspicion transition for the
+    /// caller to forward on the cluster-event channel.
+    fn declare_suspect_and_reprobe(
+        &mut self,
+        target: NodeId,
+        socket: &UdpSocket,
+    ) -> Vec<ClusterEvent> {
+        // Mark the target Suspect using its current incarnation (our own
+        // probe failure, so the incarnation is known and the guard passes).
+        let mut mem = self.membership.lock();
+        let inc = mem
+            .member_info(&target)
+            .map(|i| i.incarnation)
+            .unwrap_or(0);
+        let events = mem.mark_suspect(target, inc);
+        drop(mem);
+
+        if events.is_empty() {
+            // Already Suspect/Dead or unknown — nothing newly suspected, so
+            // no second chance to arm (avoids resetting an in-flight probe).
+            return events;
+        }
+
+        // Arm a fresh direct re-probe of the suspect. No-op if we don't
+        // know its SWIM address (cannot send a direct UDP probe).
+        let target_swim = self.swim_peer_addrs.lock().get(&target).copied();
+        if let Some(addr) = target_swim {
+            let updates = self.collect_member_updates();
+            let ping = self.encode_message(MSG_PING, &updates);
+            let _ = socket.send_to(&ping, addr);
+            if let Some(m) = swim_metrics() {
+                m.swim_probes_sent_total.inc();
+            }
+            self.pending_probe = Some(PendingProbe {
+                target,
+                started: Instant::now(),
+                indirect_sent: false,
+                indirect_attempts: 0,
+            });
+        }
+
+        events
+    }
+
     fn encode_message(&mut self, msg_type: u8, piggybacked_updates: &[u8]) -> Vec<u8> {
         let addr_str = self.config.self_addr.to_string();
         let addr_bytes = addr_str.as_bytes();
@@ -1398,6 +1480,19 @@ impl SwimRunner {
     #[cfg(test)]
     fn test_swim_addr(&self, id: NodeId) -> Option<SocketAddr> {
         self.swim_peer_addrs.lock().get(&id).copied()
+    }
+
+    #[cfg(test)]
+    fn test_incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
+    #[cfg(test)]
+    fn test_member_state(
+        &self,
+        id: NodeId,
+    ) -> Option<crate::cluster::membership::NodeState> {
+        self.membership.lock().member_info(&id).map(|i| i.state)
     }
 }
 
@@ -1835,6 +1930,336 @@ mod tests {
         assert_eq!(
             w.incarnation, 9,
             "old-run replay must not regress the window"
+        );
+    }
+
+    // ── W3.1: incarnation refutation (SWIM self-suspicion) ──────────────
+
+    /// Build a gossip message from `sender` carrying a single piggybacked
+    /// membership update about `subject` with the given state byte
+    /// (0=Alive, 1=Suspect, 2=Dead) and incarnation. Mirrors the on-wire
+    /// per-entry format used by `collect_member_updates`:
+    /// `[count:2]([id:8][state:1][inc:8][tcp_len:2][tcp][swim_len:2][swim:M])`.
+    fn encode_gossip_about(
+        sender: &mut SwimRunner,
+        subject: NodeId,
+        state_byte: u8,
+        incarnation: u64,
+        subject_tcp: &str,
+        subject_swim: &str,
+    ) -> Vec<u8> {
+        let mut updates = Vec::new();
+        updates.extend_from_slice(&1u16.to_le_bytes()); // update_count = 1
+        updates.extend_from_slice(&subject.0.to_le_bytes());
+        updates.push(state_byte);
+        updates.extend_from_slice(&incarnation.to_le_bytes());
+        let tcp = subject_tcp.as_bytes();
+        updates.extend_from_slice(&(tcp.len() as u16).to_le_bytes());
+        updates.extend_from_slice(tcp);
+        let swim = subject_swim.as_bytes();
+        updates.extend_from_slice(&(swim.len() as u16).to_le_bytes());
+        updates.extend_from_slice(swim);
+        sender.encode_message(MSG_PING, &updates)
+    }
+
+    /// Reads the incarnation of the self-entry (entry 0, always Alive self)
+    /// from a `collect_member_updates` payload.
+    fn parse_first_entry_incarnation(buf: &[u8]) -> u64 {
+        // [count:2][id:8][state:1][inc:8]...
+        let pos = 2 + 8 + 1;
+        u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap())
+    }
+
+    /// W3.1: a node that receives gossip marking *itself* Suspect at an
+    /// incarnation >= its own must bump its incarnation and disseminate an
+    /// Alive(self, higher_incarnation) refutation on the next gossip.
+    #[test]
+    fn self_suspect_gossip_triggers_incarnation_refutation() {
+        let self_addr: SocketAddr = "127.0.0.1:7100".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let start_inc = node.test_incarnation();
+
+        // A peer (NodeId 2) gossips that NodeId(1) — us — is Suspect at our
+        // current incarnation.
+        let peer_addr: SocketAddr = "10.0.0.2:5100".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9000".parse().unwrap());
+        let msg = encode_gossip_about(
+            &mut peer,
+            NodeId(1),
+            1, // Suspect
+            start_inc,
+            &self_addr.to_string(),
+            &self_addr.to_string(),
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        assert_eq!(
+            node.test_incarnation(),
+            start_inc + 1,
+            "self-suspicion at our incarnation must bump our incarnation by 1",
+        );
+
+        // The next outgoing gossip carries Alive(self) at the bumped value.
+        let updates = node.collect_member_updates_for_test();
+        assert_eq!(
+            parse_first_entry_incarnation(&updates),
+            start_inc + 1,
+            "refutation must ride the next gossip as Alive(self, bumped incarnation)",
+        );
+    }
+
+    /// W3.1: a self-Dead gossip is refuted the same way as self-Suspect.
+    #[test]
+    fn self_dead_gossip_triggers_incarnation_refutation() {
+        let self_addr: SocketAddr = "127.0.0.1:7101".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        let start_inc = node.test_incarnation();
+
+        let peer_addr: SocketAddr = "10.0.0.2:5101".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9000".parse().unwrap());
+        // Gossip claims us Dead at a strictly-higher incarnation than ours.
+        let msg = encode_gossip_about(
+            &mut peer,
+            NodeId(1),
+            2, // Dead
+            start_inc + 3,
+            &self_addr.to_string(),
+            &self_addr.to_string(),
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        assert_eq!(
+            node.test_incarnation(),
+            start_inc + 4,
+            "self-death at incarnation i must bump our incarnation to i+1",
+        );
+    }
+
+    /// W3.1: stale self-suspicion (claimed at an incarnation strictly below
+    /// ours) is ignored — we already superseded it, no bump needed.
+    #[test]
+    fn stale_self_suspect_gossip_does_not_bump_incarnation() {
+        let self_addr: SocketAddr = "127.0.0.1:7102".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+        // Force our incarnation above the gossiped value.
+        node.incarnation = 10;
+
+        let peer_addr: SocketAddr = "10.0.0.2:5102".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9000".parse().unwrap());
+        let msg = encode_gossip_about(
+            &mut peer,
+            NodeId(1),
+            1, // Suspect at incarnation 5 < 10
+            5,
+            &self_addr.to_string(),
+            &self_addr.to_string(),
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        assert_eq!(
+            node.test_incarnation(),
+            10,
+            "stale self-suspicion below our incarnation must not bump it",
+        );
+    }
+
+    /// W3.1 peer side: a node that has marked a peer Suspect clears the
+    /// suspicion when it receives a higher-incarnation Alive for that peer
+    /// (the refutation propagating back). This exercises the
+    /// `dominated`-incarnation path in `Membership::mark_alive` from gossip.
+    #[test]
+    fn higher_incarnation_alive_gossip_clears_suspect() {
+        let self_addr: SocketAddr = "127.0.0.1:7103".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+
+        // Establish NodeId(2) as a known Alive member at incarnation 1.
+        let subject = NodeId(2);
+        let subject_tcp: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        {
+            let mut mem = node.membership.lock();
+            mem.mark_alive(subject, subject_tcp, 1, true);
+            // Locally suspect it (our probe failed).
+            let evts = mem.mark_suspect(subject, 1);
+            assert!(
+                evts.iter()
+                    .any(|e| matches!(e, crate::cluster::membership::ClusterEvent::NodeSuspect(NodeId(2)))),
+                "precondition: subject must be Suspect",
+            );
+        }
+        assert_eq!(
+            node.test_member_state(subject),
+            Some(crate::cluster::membership::NodeState::Suspect),
+        );
+
+        // A third node (relay) gossips Alive(subject) at a higher
+        // incarnation — the refutation. node must clear the suspicion.
+        let relay_addr: SocketAddr = "10.0.0.3:5103".parse().unwrap();
+        let mut relay = test_runner_id(NodeId(3), relay_addr, "10.0.0.3:9000".parse().unwrap());
+        let msg = encode_gossip_about(
+            &mut relay,
+            subject,
+            0, // Alive
+            2, // higher incarnation
+            &subject_tcp.to_string(),
+            "10.0.0.2:3301",
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = node.handle_message(&msg, relay_addr, &socket);
+
+        assert_eq!(
+            node.test_member_state(subject),
+            Some(crate::cluster::membership::NodeState::Alive),
+            "higher-incarnation Alive gossip must clear a Suspect",
+        );
+    }
+
+    // ── W3.2: suspect second-chance re-probe before Dead ────────────────
+
+    /// W3.2: when a probe times out and a node is suspected, the runner
+    /// must immediately issue a fresh direct re-probe of that suspect — a
+    /// real second chance — rather than waiting passively for the
+    /// suspicion timeout. Verifies a new `pending_probe` is armed for the
+    /// suspect after the timeout-driven suspicion path runs.
+    #[test]
+    fn suspect_arms_second_chance_reprobe() {
+        let self_addr: SocketAddr = "127.0.0.1:7104".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+
+        let suspect = NodeId(2);
+        let suspect_swim: SocketAddr = "10.0.0.2:3301".parse().unwrap();
+        let suspect_tcp: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        node.membership.lock().mark_alive(suspect, suspect_tcp, 1, true);
+        node.peer_addrs.lock().insert(suspect, suspect_tcp);
+        node.swim_peer_addrs.lock().insert(suspect, suspect_swim);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        // Drive the suspicion-on-probe-timeout transition directly.
+        node.declare_suspect_and_reprobe(suspect, &socket);
+
+        assert_eq!(
+            node.test_member_state(suspect),
+            Some(crate::cluster::membership::NodeState::Suspect),
+            "node must be Suspect after the timeout path",
+        );
+        assert_eq!(
+            node.test_pending_probe_target(),
+            Some(suspect),
+            "a fresh direct re-probe of the suspect must be armed as a second chance",
+        );
+    }
+
+    /// W3.2: a suspect that ACKs (refutes) within the confirm window is NOT
+    /// declared Dead. Models the second-chance re-probe receiving a direct
+    /// ACK, which clears the Suspect via the same-incarnation-direct path.
+    #[test]
+    fn suspect_that_acks_within_window_is_not_killed() {
+        let self_addr: SocketAddr = "127.0.0.1:7105".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+
+        let suspect = NodeId(2);
+        let suspect_swim: SocketAddr = "10.0.0.2:3302".parse().unwrap();
+        let suspect_tcp: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        node.membership.lock().mark_alive(suspect, suspect_tcp, 1, true);
+        node.peer_addrs.lock().insert(suspect, suspect_tcp);
+        node.swim_peer_addrs.lock().insert(suspect, suspect_swim);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        node.declare_suspect_and_reprobe(suspect, &socket);
+        assert_eq!(
+            node.test_member_state(suspect),
+            Some(crate::cluster::membership::NodeState::Suspect),
+        );
+
+        // The suspect answers the re-probe with a direct ACK.
+        let mut peer = test_runner_id(NodeId(2), suspect_swim, suspect_tcp);
+        let updates = peer.collect_member_updates_for_test();
+        let ack = peer.encode_message(MSG_ACK, &updates);
+        let _ = node.handle_message(&ack, suspect_swim, &socket);
+
+        assert_eq!(
+            node.test_member_state(suspect),
+            Some(crate::cluster::membership::NodeState::Alive),
+            "a direct ACK within the confirm window must clear the Suspect",
+        );
+        assert_eq!(
+            node.test_pending_probe_target(),
+            None,
+            "the ACK must clear the pending re-probe",
+        );
+    }
+
+    /// W3.2: a suspect that stays silent across the whole confirm window IS
+    /// declared Dead, bounded by `suspicion_timeout` measured from the
+    /// first suspicion. The bound is `suspicion_timeout` (+ up to one
+    /// probe_interval for the expire-check cadence in the real loop). Here
+    /// we use a tiny suspicion_timeout and assert `expire_suspects` kills
+    /// the node only after that timeout elapses from the first suspicion.
+    #[test]
+    fn silent_suspect_is_killed_within_bound() {
+        let self_addr: SocketAddr = "127.0.0.1:7106".parse().unwrap();
+        // Build a runner with a short suspicion timeout so the test is fast
+        // but still derives its bound from the config constant, not a sleep
+        // chosen for the test's convenience.
+        let suspicion_timeout = Duration::from_millis(40);
+        let cfg = SwimConfig {
+            self_id: NodeId(1),
+            self_addr,
+            bind_addr: self_addr,
+            swim_advertise_addr: None,
+            seed_nodes: vec![],
+            probe_interval: Duration::from_millis(10),
+            suspicion_timeout,
+            cluster_secret: None,
+            persisted_incarnation: 0,
+            committed_term: Arc::new(AtomicU64::new(0)),
+        };
+        let mut node = SwimRunner::new(cfg);
+
+        let suspect = NodeId(2);
+        let suspect_swim: SocketAddr = "10.0.0.2:3303".parse().unwrap();
+        let suspect_tcp: SocketAddr = "10.0.0.2:9000".parse().unwrap();
+        node.membership.lock().mark_alive(suspect, suspect_tcp, 1, true);
+        node.peer_addrs.lock().insert(suspect, suspect_tcp);
+        node.swim_peer_addrs.lock().insert(suspect, suspect_swim);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        node.declare_suspect_and_reprobe(suspect, &socket);
+
+        // Before the suspicion timeout elapses, the suspect must still be
+        // alive-or-suspect — never prematurely Dead.
+        let early = node.membership.lock().expire_suspects();
+        assert!(
+            early.is_empty(),
+            "suspect must not be declared Dead before suspicion_timeout elapses",
+        );
+        assert_eq!(
+            node.test_member_state(suspect),
+            Some(crate::cluster::membership::NodeState::Suspect),
+        );
+
+        // After the suspicion timeout (the second chance went unanswered),
+        // the suspect is declared Dead. Bound: suspicion_timeout from the
+        // first suspicion.
+        std::thread::sleep(suspicion_timeout + Duration::from_millis(10));
+        let events = node.membership.lock().expire_suspects();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                crate::cluster::membership::ClusterEvent::NodeLeft(NodeId(2))
+            )),
+            "a silent suspect must be declared Dead within suspicion_timeout, events: {events:?}",
+        );
+        assert_eq!(
+            node.test_member_state(suspect),
+            Some(crate::cluster::membership::NodeState::Dead),
         );
     }
 }
