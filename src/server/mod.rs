@@ -1158,7 +1158,10 @@ mod tests {
 
         // First sighting of each peer warns; immediate repeats are
         // suppressed (the per-peer interval has not elapsed).
-        assert!(should_warn_unauthenticated(a), "first frame from A must warn");
+        assert!(
+            should_warn_unauthenticated(a),
+            "first frame from A must warn"
+        );
         assert!(
             !should_warn_unauthenticated(a),
             "second frame from A within the interval must be suppressed"
@@ -1169,7 +1172,10 @@ mod tests {
         );
         // A distinct peer warns independently — one stuck peer does not mask
         // a different offender.
-        assert!(should_warn_unauthenticated(b), "first frame from B must warn");
+        assert!(
+            should_warn_unauthenticated(b),
+            "first frame from B must warn"
+        );
         assert!(!should_warn_unauthenticated(b), "B repeat suppressed");
 
         // A peer whose last-warn instant is older than the interval warns
@@ -1178,7 +1184,10 @@ mod tests {
         {
             let mut guard = UNAUTH_WARN_LAST_BY_PEER.lock();
             let map = guard.get_or_insert_with(HashMap::new);
-            map.insert(c, Instant::now() - UNAUTH_WARN_PER_PEER_INTERVAL - Duration::from_secs(1));
+            map.insert(
+                c,
+                Instant::now() - UNAUTH_WARN_PER_PEER_INTERVAL - Duration::from_secs(1),
+            );
         }
         assert!(
             should_warn_unauthenticated(Some(c)),

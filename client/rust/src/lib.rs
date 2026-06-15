@@ -1263,7 +1263,7 @@ impl Client {
 
     /// Upload large cold_data as a blob in chunks before CREATE.
     ///
-    /// Sends the data in [`BLOB_CHUNK_SIZE`] chunks via `OP_STREAM_CHUNK`,
+    /// Sends the data in `BLOB_CHUNK_SIZE` chunks via `OP_STREAM_CHUNK`,
     /// then finalizes with `OP_STREAM_END`. The chunks are routed to the
     /// shard master for the given txid (same node that will handle the CREATE).
     ///
@@ -1323,7 +1323,7 @@ impl Client {
     /// In cluster mode, items are automatically grouped by txid shard and
     /// sent to the correct nodes in parallel.
     ///
-    /// Items with `cold_data` larger than [`BLOB_UPLOAD_THRESHOLD`] (1 MiB)
+    /// Items with `cold_data` larger than `BLOB_UPLOAD_THRESHOLD` (1 MiB)
     /// are automatically uploaded via chunked blob streaming before the
     /// CREATE request. The wire item is sent with empty `cold_data` and the
     /// [`FLAG_EXTERNAL_BLOB`] flag set so the server knows to fetch from

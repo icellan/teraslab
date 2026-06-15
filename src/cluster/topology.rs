@@ -3203,8 +3203,7 @@ mod tests {
     fn debounce_max_wait_clamped_to_window() {
         // A max_wait below the window would defeat the debounce — it is
         // clamped up to the window.
-        let mut deb =
-            TopologyDebounce::new(Duration::from_millis(500), Duration::from_millis(10));
+        let mut deb = TopologyDebounce::new(Duration::from_millis(500), Duration::from_millis(10));
         let t0 = Instant::now();
         deb.observe(&members(&[1, 2]), t0);
         // At 10ms (the requested-but-clamped cap) it must NOT yet be due.

@@ -339,21 +339,14 @@ fn committed_topology_reactivation_metrics(
 /// EXCLUDED — those are legitimately in progress and the pull-based request
 /// loop already drives them, so they must not trigger spurious
 /// reactivation.
-fn stuck_subset_master_count(
-    table: &ShardTable,
-    mgr: &MigrationManager,
-    self_id: NodeId,
-) -> usize {
+fn stuck_subset_master_count(table: &ShardTable, mgr: &MigrationManager, self_id: NodeId) -> usize {
     let pending_inbound_shards: std::collections::HashSet<u16> = mgr
         .pending_inbound_entries()
         .into_iter()
         .map(|(shard, _)| shard)
         .collect();
-    let active_shards: std::collections::HashSet<u16> = mgr
-        .active_migrations()
-        .iter()
-        .map(|p| p.shard)
-        .collect();
+    let active_shards: std::collections::HashSet<u16> =
+        mgr.active_migrations().iter().map(|p| p.shard).collect();
     table.stuck_subset_shards_for(self_id, |shard| {
         pending_inbound_shards.contains(&shard) || active_shards.contains(&shard)
     })
@@ -1616,7 +1609,8 @@ impl ClusterCoordinator {
                             !mgr.active_migrations().iter().any(|p| {
                                 p.shard == t.shard
                                     && p.to_node == t.to_node
-                                    && p.state != crate::cluster::migration::MigrationState::Complete
+                                    && p.state
+                                        != crate::cluster::migration::MigrationState::Complete
                                     && p.state != crate::cluster::migration::MigrationState::Failed
                             })
                         });
@@ -3855,14 +3849,13 @@ fn run_migration_batch(
         let instant_count = ready_empty_tasks.len();
         if instant_count > 0 {
             tracing::info!(shards = instant_count, %addr, "cluster: empty shards committed instantly");
-            let delivered =
-                send_completion_only_handshakes(
-                    addr,
-                    &ready_empty_tasks,
-                    self_id,
-                    topology_epoch,
-                    auth_secret,
-                );
+            let delivered = send_completion_only_handshakes(
+                addr,
+                &ready_empty_tasks,
+                self_id,
+                topology_epoch,
+                auth_secret,
+            );
             for (task, delivered) in ready_empty_tasks.iter().zip(delivered) {
                 if delivered {
                     let should_commit_local_handoff = {
@@ -5085,7 +5078,9 @@ fn send_completion_only_handshakes(
                 }
                 // Error responses carry [code:2][msg_len:2][msg:N].
                 let code = if response.payload.len() >= 2 {
-                    Some(u16::from_le_bytes(response.payload[..2].try_into().unwrap()))
+                    Some(u16::from_le_bytes(
+                        response.payload[..2].try_into().unwrap(),
+                    ))
                 } else {
                     None
                 };
@@ -7019,8 +7014,7 @@ impl RunningCluster {
         let (version, target_in_transition, movers) = {
             let table = self.shard_table.read();
             let version = table.version;
-            let stamp_all =
-                version != self.node_pressure_stamped_version.load(Ordering::Relaxed);
+            let stamp_all = version != self.node_pressure_stamped_version.load(Ordering::Relaxed);
             (
                 version,
                 table.node_in_active_transition(target),
@@ -9875,19 +9869,13 @@ mod tests {
         );
         view.insert(NodeId(2), Vec::new());
         view.insert(NodeId(3), Vec::new());
-        apply_master_election(
-            &mut table,
-            &prev,
-            &view,
-            &std::collections::HashSet::new(),
-        );
+        apply_master_election(&mut table, &prev, &view, &std::collections::HashSet::new());
 
         // Sanity: the election actually deviated from round-robin,
         // otherwise this test would not exercise FIX C at all.
         let round_robin = ShardTable::compute_with_epoch(&members, rf, term);
-        let deviated = (0..NUM_SHARDS as u16).any(|s| {
-            table.target_assignment(s).master != round_robin.target_assignment(s).master
-        });
+        let deviated = (0..NUM_SHARDS as u16)
+            .any(|s| table.target_assignment(s).master != round_robin.target_assignment(s).master);
         assert!(
             deviated,
             "election with a one-node-holds-all view must deviate from round-robin"
@@ -9914,9 +9902,7 @@ mod tests {
         let new_table = ShardTable::compute_with_epoch(&new_members, rf, 2);
         let mut table = ShardTable::compute_with_epoch(&old_members, rf, 1);
         let moved_shard = (0..NUM_SHARDS as u16)
-            .find(|&s| {
-                table.target_assignment(s).master != new_table.target_assignment(s).master
-            })
+            .find(|&s| table.target_assignment(s).master != new_table.target_assignment(s).master)
             .expect("a shard must change master when a third node joins");
         table.begin_handoff_with(&new_table, |s| s == moved_shard);
 
@@ -9982,11 +9968,12 @@ mod tests {
                 let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
                 assert_eq!(request.op_code, OP_MIGRATION_BATCH_COMPLETE);
                 // The frame must carry the trailing topology epoch.
-                let count =
-                    u32::from_le_bytes(request.payload[..4].try_into().unwrap()) as usize;
+                let count = u32::from_le_bytes(request.payload[..4].try_into().unwrap()) as usize;
                 let epoch_off = 4 + count * 2 + 8;
                 let epoch = u64::from_le_bytes(
-                    request.payload[epoch_off..epoch_off + 8].try_into().unwrap(),
+                    request.payload[epoch_off..epoch_off + 8]
+                        .try_into()
+                        .unwrap(),
                 );
                 assert_eq!(epoch, 42, "sender must stamp the activation epoch");
                 let response = if attempt == 0 {
@@ -10109,16 +10096,19 @@ mod tests {
             .find(|&s| new_table.target_assignment(s).master == NodeId(3))
             .expect("node 3 must master another shard");
 
-        table.begin_handoff_with(&new_table, |s| {
-            s == master_shard || s == rolled_back_shard
-        });
+        table.begin_handoff_with(&new_table, |s| s == master_shard || s == rolled_back_shard);
         table.rollback_shard(rolled_back_shard);
 
         let (tasks, diverged) = split_transfer_request_tasks(
             &table,
             NodeId(1),
             NodeId(3),
-            &[master_shard, replica_shard, unrelated_shard, rolled_back_shard],
+            &[
+                master_shard,
+                replica_shard,
+                unrelated_shard,
+                rolled_back_shard,
+            ],
         );
         assert_eq!(diverged, 1, "the rolled-back shard must count as diverged");
         assert_eq!(tasks.len(), 2);
@@ -10199,7 +10189,11 @@ mod tests {
                 is_master: true,
             })
             .collect();
-        mgr_inflight.start_outbound(&inflight_tasks, NodeId(3), &std::collections::HashSet::new());
+        mgr_inflight.start_outbound(
+            &inflight_tasks,
+            NodeId(3),
+            &std::collections::HashSet::new(),
+        );
         assert!(mgr_inflight.inbound_count() > 1000, "test precondition");
         assert_eq!(
             stuck_subset_master_count(&table, &mgr_inflight, NodeId(3)),
@@ -10259,7 +10253,10 @@ mod tests {
         ));
         let state = authority.persisted_state(3, 1);
         persist_topology_state(&path, &state).expect("persist must create missing parent dirs");
-        assert!(path.exists(), "topology state file must exist after persist");
+        assert!(
+            path.exists(),
+            "topology state file must exist after persist"
+        );
 
         let loaded = load_topology_state(&path);
         assert_eq!(loaded.peak_cluster_size, 3);

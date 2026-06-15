@@ -1911,9 +1911,7 @@ pub(crate) fn build_replication_targets(
             }
         }
         for extra in &dual_write_extras {
-            if *extra == self_id
-                || *extra == current_master
-                || assignment.replicas.contains(extra)
+            if *extra == self_id || *extra == current_master || assignment.replicas.contains(extra)
             {
                 continue;
             }
@@ -2069,11 +2067,7 @@ fn replicate_all_ops_with_barrier(
     // admission before a legitimately-escalated (migration-pressured) target
     // could still ack.
     let target_addrs: Vec<SocketAddr> = by_addr.keys().copied().collect();
-    let max_ack_timeout = ack_timeouts
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(base_timeout);
+    let max_ack_timeout = ack_timeouts.values().copied().max().unwrap_or(base_timeout);
     let known_replica_addrs = cluster.alive_node_count().saturating_sub(1);
     let _fanout_permit = acquire_replication_fanout_permits(
         &target_addrs,
@@ -3764,8 +3758,7 @@ fn acquire_dispatch_visibility_guard(
     // Normal (non-migration) replica batches KEEP the exclusive guard: their
     // shards are NOT fenced, so a torn read of a partially-applied batch IS
     // client-observable. Only the migration flag downgrades the side.
-    let is_migration_replica_batch =
-        op == OP_REPLICA_BATCH && (flags & FLAG_MIGRATION_BATCH != 0);
+    let is_migration_replica_batch = op == OP_REPLICA_BATCH && (flags & FLAG_MIGRATION_BATCH != 0);
     if needs_exclusive_visibility_barrier(op) && !is_migration_replica_batch {
         Some(DispatchVisibilityGuard::Exclusive(Some(
             engine.acquire_mutation_visibility_guard(),
@@ -8804,22 +8797,16 @@ mod tests {
         assert_eq!(*saturated, Some(addr_a));
 
         // Addr B is NOT affected: admitted with a tiny wait budget.
-        let permit_b = acquire_replication_fanout_permits(
-            &[addr_b],
-            cap,
-            std::time::Duration::from_millis(1),
-        )
-        .expect("addr B must be admitted while addr A is saturated");
+        let permit_b =
+            acquire_replication_fanout_permits(&[addr_b], cap, std::time::Duration::from_millis(1))
+                .expect("addr B must be admitted while addr A is saturated");
         drop(permit_b);
         drop(held);
 
         // Once A's holders release, A is admitted again.
-        let permit_a = acquire_replication_fanout_permits(
-            &[addr_a],
-            cap,
-            std::time::Duration::from_millis(1),
-        )
-        .expect("addr A must be admitted again after its permits release");
+        let permit_a =
+            acquire_replication_fanout_permits(&[addr_a], cap, std::time::Duration::from_millis(1))
+                .expect("addr A must be admitted again after its permits release");
         drop(permit_a);
     }
 
@@ -8854,12 +8841,9 @@ mod tests {
         holding.wait();
 
         // All A-slots are wedged. B proceeds with a tiny wait budget.
-        let permit_b = acquire_replication_fanout_permits(
-            &[addr_b],
-            cap,
-            std::time::Duration::from_millis(1),
-        )
-        .expect("healthy addr B must be admitted while addr A is wedged");
+        let permit_b =
+            acquire_replication_fanout_permits(&[addr_b], cap, std::time::Duration::from_millis(1))
+                .expect("healthy addr B must be admitted while addr A is wedged");
         drop(permit_b);
 
         // A fails after the bound with the distinct error.
@@ -13845,14 +13829,19 @@ mod tests {
                 };
                 let mut conn_state = crate::server::ConnectionState::new();
                 let resp = handle_request(
-                    &req, engine.as_ref(), 8192, Some(&cluster), None, &mut conn_state, None,
+                    &req,
+                    engine.as_ref(),
+                    8192,
+                    Some(&cluster),
+                    None,
+                    &mut conn_state,
+                    None,
                 );
                 let results = crate::protocol::codec::decode_get_response(&resp.payload)
                     .expect("get_batch response decodes");
                 assert_eq!(results.len(), 1, "single key queried");
                 assert_eq!(
-                    results[0].status,
-                    ERR_MIGRATION_IN_PROGRESS as u8,
+                    results[0].status, ERR_MIGRATION_IN_PROGRESS as u8,
                     "GET_BATCH on an inbound-migrating shard must be fenced \
                      (ERR_MIGRATION_IN_PROGRESS), never observe intermediate apply state",
                 );
@@ -13865,9 +13854,8 @@ mod tests {
                     vout: 0,
                     utxo_hash: [0u8; 32],
                 };
-                let payload = crate::protocol::codec::encode_get_spend_batch(
-                    std::slice::from_ref(&item),
-                );
+                let payload =
+                    crate::protocol::codec::encode_get_spend_batch(std::slice::from_ref(&item));
                 let req = RequestFrame {
                     request_id: 1,
                     op_code: OP_GET_SPEND_BATCH,
@@ -13876,14 +13864,19 @@ mod tests {
                 };
                 let mut conn_state = crate::server::ConnectionState::new();
                 let resp = handle_request(
-                    &req, engine.as_ref(), 8192, Some(&cluster), None, &mut conn_state, None,
+                    &req,
+                    engine.as_ref(),
+                    8192,
+                    Some(&cluster),
+                    None,
+                    &mut conn_state,
+                    None,
                 );
                 let results = crate::protocol::codec::decode_get_spend_response(&resp.payload)
                     .expect("get_spend_batch response decodes");
                 assert_eq!(results.len(), 1, "single key queried");
                 assert_eq!(
-                    results[0].error_code,
-                    ERR_MIGRATION_IN_PROGRESS,
+                    results[0].error_code, ERR_MIGRATION_IN_PROGRESS,
                     "GET_SPEND_BATCH on an inbound-migrating shard must be fenced \
                      (ERR_MIGRATION_IN_PROGRESS), never observe intermediate apply state",
                 );
@@ -13947,9 +13940,8 @@ mod tests {
             matches!(second_migration, DispatchVisibilityGuard::Shared(_)),
             "a second concurrent migration apply also takes the SHARED guard",
         );
-        let concurrent_read =
-            acquire_dispatch_visibility_guard(engine.as_ref(), OP_GET_BATCH, 0)
-                .expect("read takes a visibility barrier");
+        let concurrent_read = acquire_dispatch_visibility_guard(engine.as_ref(), OP_GET_BATCH, 0)
+            .expect("read takes a visibility barrier");
         assert!(
             matches!(concurrent_read, DispatchVisibilityGuard::Shared(_)),
             "a client read runs concurrently with migration applies (no starvation)",
@@ -13961,9 +13953,8 @@ mod tests {
         // Negative control: a NORMAL OP_REPLICA_BATCH (no migration flag)
         // takes the exclusive side and therefore blocks a concurrent
         // exclusive acquire until it is released.
-        let normal_guard =
-            acquire_dispatch_visibility_guard(engine.as_ref(), OP_REPLICA_BATCH, 0)
-                .expect("normal OP_REPLICA_BATCH takes a visibility barrier");
+        let normal_guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_REPLICA_BATCH, 0)
+            .expect("normal OP_REPLICA_BATCH takes a visibility barrier");
         assert!(
             matches!(normal_guard, DispatchVisibilityGuard::Exclusive(_)),
             "a non-migration OP_REPLICA_BATCH must keep the EXCLUSIVE guard",
@@ -13975,9 +13966,8 @@ mod tests {
         let finished_t = Arc::clone(&finished);
         let blocked = std::thread::spawn(move || {
             entered_t.store(true, Ordering::SeqCst);
-            let _g =
-                acquire_dispatch_visibility_guard(blocked_engine.as_ref(), OP_SPEND_BATCH, 0)
-                    .expect("mutation takes a visibility barrier");
+            let _g = acquire_dispatch_visibility_guard(blocked_engine.as_ref(), OP_SPEND_BATCH, 0)
+                .expect("mutation takes a visibility barrier");
             finished_t.store(true, Ordering::SeqCst);
         });
         while !entered.load(Ordering::SeqCst) {

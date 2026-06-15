@@ -1243,10 +1243,7 @@ impl SwimRunner {
         // Mark the target Suspect using its current incarnation (our own
         // probe failure, so the incarnation is known and the guard passes).
         let mut mem = self.membership.lock();
-        let inc = mem
-            .member_info(&target)
-            .map(|i| i.incarnation)
-            .unwrap_or(0);
+        let inc = mem.member_info(&target).map(|i| i.incarnation).unwrap_or(0);
         let events = mem.mark_suspect(target, inc);
         drop(mem);
 
@@ -1488,10 +1485,7 @@ impl SwimRunner {
     }
 
     #[cfg(test)]
-    fn test_member_state(
-        &self,
-        id: NodeId,
-    ) -> Option<crate::cluster::membership::NodeState> {
+    fn test_member_state(&self, id: NodeId) -> Option<crate::cluster::membership::NodeState> {
         self.membership.lock().member_info(&id).map(|i| i.state)
     }
 }
@@ -2087,8 +2081,10 @@ mod tests {
             // Locally suspect it (our probe failed).
             let evts = mem.mark_suspect(subject, 1);
             assert!(
-                evts.iter()
-                    .any(|e| matches!(e, crate::cluster::membership::ClusterEvent::NodeSuspect(NodeId(2)))),
+                evts.iter().any(|e| matches!(
+                    e,
+                    crate::cluster::membership::ClusterEvent::NodeSuspect(NodeId(2))
+                )),
                 "precondition: subject must be Suspect",
             );
         }
@@ -2135,7 +2131,9 @@ mod tests {
         let suspect = NodeId(2);
         let suspect_swim: SocketAddr = "10.0.0.2:3301".parse().unwrap();
         let suspect_tcp: SocketAddr = "10.0.0.2:9000".parse().unwrap();
-        node.membership.lock().mark_alive(suspect, suspect_tcp, 1, true);
+        node.membership
+            .lock()
+            .mark_alive(suspect, suspect_tcp, 1, true);
         node.peer_addrs.lock().insert(suspect, suspect_tcp);
         node.swim_peer_addrs.lock().insert(suspect, suspect_swim);
 
@@ -2167,7 +2165,9 @@ mod tests {
         let suspect = NodeId(2);
         let suspect_swim: SocketAddr = "10.0.0.2:3302".parse().unwrap();
         let suspect_tcp: SocketAddr = "10.0.0.2:9000".parse().unwrap();
-        node.membership.lock().mark_alive(suspect, suspect_tcp, 1, true);
+        node.membership
+            .lock()
+            .mark_alive(suspect, suspect_tcp, 1, true);
         node.peer_addrs.lock().insert(suspect, suspect_tcp);
         node.swim_peer_addrs.lock().insert(suspect, suspect_swim);
 
@@ -2226,7 +2226,9 @@ mod tests {
         let suspect = NodeId(2);
         let suspect_swim: SocketAddr = "10.0.0.2:3303".parse().unwrap();
         let suspect_tcp: SocketAddr = "10.0.0.2:9000".parse().unwrap();
-        node.membership.lock().mark_alive(suspect, suspect_tcp, 1, true);
+        node.membership
+            .lock()
+            .mark_alive(suspect, suspect_tcp, 1, true);
         node.peer_addrs.lock().insert(suspect, suspect_tcp);
         node.swim_peer_addrs.lock().insert(suspect, suspect_swim);
 
