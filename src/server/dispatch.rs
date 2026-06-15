@@ -1872,8 +1872,49 @@ pub(crate) fn build_replication_targets(
                 None => {}
             }
         }
+        // P5 / R7b: include the shard's CURRENT master in the holder set
+        // whenever it is not this node.
+        //
+        // On the live client-write path the master IS this node (self), so
+        // this adds nothing — `self_id` is excluded below — and the regular
+        // replica/quorum set is unchanged.
+        //
+        // On the compensation re-drive path the topology may have changed
+        // since the failed write: the divergent replica R may have been
+        // PROMOTED to master of this shard. After promotion R is no longer in
+        // `assignment.replicas` (it is the master, and the demoted old master
+        // now sits in `replicas`), so the replica loop above would never reach
+        // R — leaving R serving a record the rest of the cluster compensated
+        // away (durable silent divergence). The current holder set for a shard
+        // is `{master} ∪ replicas`; resolving the compensation against that
+        // full set (minus self) closes the hole. The master is added to the
+        // per-key regular set so it participates in fan-out, ACK accounting
+        // and quorum exactly like a replica holder.
+        let current_master = assignment.master;
+        if current_master != self_id {
+            match cluster.node_addr(&current_master) {
+                Some(addr) => {
+                    if !this_key_regular.contains(&addr) {
+                        by_addr.entry(addr).or_default().extend(ops.clone());
+                        regular_addrs.insert(addr);
+                        addr_nodes.insert(addr, current_master);
+                        this_key_regular.push(addr);
+                    }
+                }
+                None if rf > 1 => {
+                    target_errors.push(format!(
+                        "shard {shard} master node {} has no resolved address",
+                        current_master.0,
+                    ));
+                }
+                None => {}
+            }
+        }
         for extra in &dual_write_extras {
-            if *extra == self_id || assignment.replicas.contains(extra) {
+            if *extra == self_id
+                || *extra == current_master
+                || assignment.replicas.contains(extra)
+            {
                 continue;
             }
             if let Some(addr) = cluster.node_addr(extra) {
@@ -13333,6 +13374,90 @@ mod tests {
             entry.1,
             vec![n2_addr],
             "per-key regular replica set must be exactly this shard's replica address",
+        );
+    }
+
+    /// P5 / R7b — compensation must reach a *re-mastered* divergent replica.
+    ///
+    /// Scenario (audit repro recipe 6): master M(n1) holds shard S with
+    /// replica R(n2); a client write to R failed, leaving a compensating
+    /// delete to re-drive. Before the intent is re-driven the topology
+    /// changes — R is promoted to MASTER of S (M demoted to replica). The
+    /// compensation re-drive runs `build_replication_targets` against the
+    /// CURRENT table. The compensating delete MUST reach R (the new master);
+    /// otherwise R serves a record the rest of the cluster compensated away —
+    /// durable silent divergence.
+    ///
+    /// Before the fix, `build_replication_targets` resolves fan-out solely
+    /// from `assignment.replicas`, which after promotion contains the OLD
+    /// master M and NOT R — so R's address is absent and this test fails.
+    #[test]
+    fn compensation_redrive_reaches_promoted_replica_master() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 311);
+        // Pick a shard mastered by n1 with n2 as a replica (n3 not a replica),
+        // so the promotion of n2→master is unambiguous.
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n1_addr: SocketAddr = "127.0.0.1:8931".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8932".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8933".parse().unwrap();
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        // Topology change between the failed write and the intent re-drive:
+        // R(n2) is promoted to master of S; M(n1) is demoted into replicas.
+        {
+            let table = cluster.shard_table();
+            let mut guard = table.write();
+            guard.set_master_for_shard(shard, n2);
+            assert_eq!(
+                guard.target_assignment(shard).master,
+                n2,
+                "promotion precondition: n2 must now be master of S",
+            );
+            assert!(
+                !guard.target_assignment(shard).replicas.contains(&n2),
+                "promotion precondition: n2 must no longer be in the replica list",
+            );
+            assert!(
+                guard.target_assignment(shard).replicas.contains(&n1),
+                "promotion precondition: demoted n1 must be in the replica list",
+            );
+        }
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 20),
+        };
+        // The compensating op for the failed write is a Delete of K.
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let plan = build_replication_targets(&cluster, &ops)
+            .expect("target resolution after promotion should succeed");
+
+        assert!(
+            plan.by_addr.contains_key(&n2_addr),
+            "compensating delete must reach R (n2), the NEW master of S, or R keeps the divergent record: {:?}",
+            plan.by_addr,
         );
     }
 
