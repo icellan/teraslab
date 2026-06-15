@@ -379,16 +379,27 @@ async fn run_scenario() -> Result<(), ClientError> {
             }
         }
 
-        // NOTE: This currently fails due to a known server replication bug —
-        // spend and setMined operations are not replicated to replica nodes.
-        // When the master (node2) dies, the promoted replica has stale state.
-        // This will be fixed in the replication subsystem.
-        if !mismatches.is_empty() {
-            eprintln!(
-                "WARNING Test 4.7: consistency check found {} mismatches (known replication bug)",
-                mismatches.len(),
-            );
-        }
+        // After a hard kill and replica promotion, spend/setMined state must be
+        // fully consistent: the promoted replica must carry every replicated
+        // mutation. Any mismatch is a real replication/promotion defect.
+        assert!(
+            mismatches.is_empty(),
+            "Test 4.7: consistency check found {} mismatch(es) after hard kill + promotion; \
+             first up to 10: {}",
+            mismatches.len(),
+            mismatches
+                .iter()
+                .take(10)
+                .map(|mm| format!(
+                    "{{txid={} field={} expected={} actual={}}}",
+                    txid_hex(&mm.txid),
+                    mm.field,
+                    mm.expected,
+                    mm.actual
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
     eprintln!("[4.7] OK -- full consistency check passed: zero mismatches");
     tlog!(t0, "test 4.7 done");

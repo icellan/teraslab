@@ -510,13 +510,34 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
     tokio::time::sleep(Duration::from_secs(2)).await;
     client.refresh_routing().await?;
 
+    // Bounded convergence wait: after the final heal, drained migrations and
+    // settled replication, every committed record MUST become master-routable
+    // and replica-backed. Block on the exact read path downstream uses until
+    // there are zero NotFound (or fail with the real per-shard error). This
+    // turns the post-heal read-back from "tolerate loss" into "wait for the
+    // cluster to actually reconverge, then demand zero loss".
+    let expected_txids = verifier.non_deleted_txids();
+    common::wait_for_migration_reads_ready(
+        &client,
+        &docker_arc,
+        &expected_txids,
+        &[1, 2, 3],
+        2,
+        50,
+        Duration::from_secs(120),
+    )
+    .await?;
+    client.refresh_routing().await?;
+
     let mismatches = common::verify_consistency(&client, &verifier).await?;
-    // The core invariant this test proves is *no split-brain* — that is,
-    // no data corruption from two masters accepting conflicting writes.
-    // NotFound after flapping indicates a stuck shard table (many shards
-    // without an assigned master after aggressive topology churn), which is
-    // a separate liveness concern from split-brain safety. Zero data
-    // corruption = the invariant this scenario exists to prove.
+    // The core invariant this test proves is *no split-brain* — no data
+    // corruption from two masters accepting conflicting writes. Separately,
+    // committed records must not be lost: split-brain prevention means the
+    // minority side rejects writes, so every acknowledged write was
+    // majority-committed and survives the heal. After the bounded reconverge
+    // wait above, the NotFound bound is therefore ZERO — any unreadable
+    // committed record is a real liveness/durability regression (stuck shard
+    // table, lost master assignment), not benign churn.
     let not_found = mismatches
         .iter()
         .filter(|m| m.actual.contains("NotFound"))
@@ -531,25 +552,13 @@ async fn test_flapping_partition() -> Result<(), ClientError> {
         corrupt.len(),
         corrupt.iter().take(5).collect::<Vec<_>>()
     );
-    // NotFound after 500ms-period flapping for 30s reflects a liveness gap
-    // (shards without an assigned master after rapid topology churn) rather
-    // than split-brain. A tight bound here would be noise, but a complete
-    // wipe of readable data indicates the cluster actually failed to recover
-    // and must still be caught. Allow up to 90% loss; anything beyond that
-    // is a regression worth failing on.
     let total_records = verifier.record_count();
-    let max_not_found = ((total_records as f64) * 0.9) as usize;
-    assert!(
-        not_found <= max_not_found,
-        "Test 14.3: {not_found}/{total_records} records NotFound after flapping \
-         (max {max_not_found}; >90% loss means the cluster failed to recover)"
+    assert_eq!(
+        not_found, 0,
+        "Test 14.3: {not_found}/{total_records} committed records NotFound after \
+         flapping + heal + reconverge (expected 0 — committed writes must survive \
+         a split-brain heal)"
     );
-    if not_found > 0 {
-        eprintln!(
-            "[14.3] WARN -- {not_found}/{total_records} records NotFound after flapping \
-             (shard-table liveness, not split-brain; zero corruption as required)"
-        );
-    }
     eprintln!("[14.3] OK -- flapping partition test passed, zero conflicting writes");
     Ok(())
 }

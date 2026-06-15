@@ -250,16 +250,26 @@ async fn run_scenario() -> Result<(), ClientError> {
                             bg_m.spends_ok.fetch_add(1, Ordering::Relaxed);
                             bg_verifier.record_spend(txid, 0);
                         } else {
+                            // The single item definitively failed. The
+                            // cluster-aware `spend_batch` already exhausts the
+                            // bounded transient/code-20 retry internally before
+                            // surfacing a Partial, so a failure here is terminal:
+                            // the spend was NOT acknowledged. Do NOT record it as
+                            // spent — recording a failed spend would inflate the
+                            // verifier's expected spent_utxos and mask real
+                            // spend-replication divergence at the final check.
                             bg_m.spends_err.fetch_add(1, Ordering::Relaxed);
-                            // Record as possibly spent: the server may have
-                            // applied locally before replication failed.
-                            bg_verifier.record_spend(txid, 0);
                         }
                     }
                     Err(_) => {
+                        // Transport/connection error. Spends run only while the
+                        // cluster is stable (the workload is paused across every
+                        // quiesce/stop/start/migration window), so this path is
+                        // not expected; if it does fire, the spend was not
+                        // acknowledged. Do NOT record it as spent — that keeps
+                        // the verifier's expected state aligned with confirmed
+                        // writes only.
                         bg_m.spends_err.fetch_add(1, Ordering::Relaxed);
-                        // Record as possibly spent for consistency tolerance.
-                        bg_verifier.record_spend(txid, 0);
                         let _ = bg_client.refresh_routing().await;
                     }
                 }
@@ -410,27 +420,19 @@ async fn run_scenario() -> Result<(), ClientError> {
     // Full consistency check — zero mismatches expected.
     eprintln!("[9.5] Running full consistency check");
     let mismatches = common::verify_consistency(&client, &verifier).await?;
-    // During rolling restart, a small number of partial-apply mismatches
-    // may occur: a spend is applied locally on one node but replication fails
-    // during the topology transition. When that node's shard migrates to
-    // another node, the spent state transfers but the verifier doesn't know.
-    // Tolerate up to 10 spent_utxos mismatches as a known limitation.
-    let non_spend_mismatches: Vec<_> = mismatches
-        .iter()
-        .filter(|m| m.field != "spent_utxos")
-        .collect();
+    // Strict: EVERY field, including spent_utxos, must match. The background
+    // workload only spends while the cluster is fully stable (it is paused
+    // across every quiesce/stop/start/migration window) and records a spend in
+    // the verifier only on a definitive client-acknowledged success, so after
+    // the final migration+replication settle there is no legitimate source of
+    // spend ambiguity. Any spent_utxos divergence here is real
+    // spend-replication loss and must fail the test.
     assert!(
-        non_spend_mismatches.is_empty(),
-        "9.5: {} non-spend consistency mismatches found after rolling restart: {:?}",
-        non_spend_mismatches.len(),
-        non_spend_mismatches.iter().take(10).collect::<Vec<_>>()
+        mismatches.is_empty(),
+        "9.5: {} consistency mismatch(es) found after rolling restart: {:?}",
+        mismatches.len(),
+        mismatches.iter().take(10).collect::<Vec<_>>()
     );
-    if !mismatches.is_empty() {
-        eprintln!(
-            "[9.5] WARNING: {} spent_utxos mismatches (partial-apply during topology transitions)",
-            mismatches.len()
-        );
-    }
     eprintln!("[9.5] Full consistency check passed: zero mismatches");
 
     // Report p99 latency per restart phase
