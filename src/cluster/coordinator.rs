@@ -32,6 +32,21 @@ const MIGRATION_TCP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 /// push (sources stream within ~1 s of activation) is never spammed.
 const TRANSFER_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 
+/// W5-followup — minimum spacing between consecutive reactivations while a node
+/// is *gracefully draining itself and making progress* (a `quiesce`, committed
+/// topology excludes `self`). See [`drain_reactivation_due`] for the full
+/// rationale, the `self_is_member` scoping, and the progress gate.
+///
+/// A drain batch finishes in ~5-6 s but settles its rolled-back (failed) tasks
+/// the instant the migration thread-scope joins, so the next batch can start
+/// almost immediately. This 2 s floor is *not* a settle delay — `active_count
+/// == 0` already guarantees the previous batch is done — it only stops a run of
+/// progressing batches from busy-spawning an activation on every 100 ms event
+/// tick. It is far below the 30 s same-term cooldown (which still governs member
+/// rebalances and the moment drain progress stalls), turning a 7-round drain
+/// from 7×30 s ≈ 210 s of idle waiting into back-to-back ~5 s rounds.
+const DRAIN_REACTIVATION_INTERVAL: Duration = Duration::from_secs(2);
+
 fn debug_shard_set() -> &'static std::collections::HashSet<u16> {
     static SET: std::sync::OnceLock<std::collections::HashSet<u16>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -915,6 +930,14 @@ impl ClusterCoordinator {
             // exchange on every 100 ms tick while the first exchange is in
             // flight; cleared implicitly by advancing as the term advances.
             let mut prompt_exchange_term: u64 = 0;
+            // W5-followup — progress tracker for the fast self-drain
+            // reactivation cadence. Holds `(term, work_remaining)` captured the
+            // last time the fast path fired. `None` (or a stale term) means the
+            // next fast round is the first for the current drain and is allowed
+            // unconditionally; subsequent fast rounds require the backlog to be
+            // strictly shrinking (see `drain_reactivation_due`). Cleared whenever
+            // a non-fast reactivation fires or the committed term moves.
+            let mut fast_reactivation_progress: Option<(u64, u32)> = None;
             // W3.3 — trailing-edge debounce: SWIM membership changes are
             // coalesced here and only fed to the propose path once the
             // membership has been stable for `topology_debounce_window`
@@ -1289,10 +1312,29 @@ impl ClusterCoordinator {
                 // topology change fully settle before retrying.
                 let startup_reactivation_due = startup_reactivation_event.load(Ordering::Acquire)
                     && last_activation_at.elapsed() >= Duration::from_secs(5);
-                let normal_reactivation_due = migration.lock().active_count() == 0
+                // Single lock acquisition shared by both the normal and drain
+                // reactivation gates below (the dispatch hot path contends on
+                // this Mutex, so avoid a second per-tick acquisition).
+                let no_active_migrations = migration.lock().active_count() == 0;
+                let normal_reactivation_due = no_active_migrations
                     && last_reactivation_at.elapsed() >= Duration::from_secs(15)
                     && last_activation_at.elapsed() >= Duration::from_secs(30);
-                if !activation_held && (startup_reactivation_due || normal_reactivation_due) {
+                // W5-followup — prompt self-drain re-drive. When THIS node is
+                // being gracefully drained (committed topology excludes `self`)
+                // its residual outbound handoffs must converge on the short
+                // `DRAIN_REACTIVATION_INTERVAL` cadence while progress holds,
+                // not the 30 s same-term cooldown. The `self_is_member` and
+                // progress gating is decided by `drain_reactivation_due` below,
+                // after the committed members and work metric are known; here we
+                // only ensure the block is entered once the short floor has
+                // elapsed and the previous batch has settled.
+                let drain_reactivation_possible = no_active_migrations
+                    && last_reactivation_at.elapsed() >= DRAIN_REACTIVATION_INTERVAL;
+                if !activation_held
+                    && (startup_reactivation_due
+                        || normal_reactivation_due
+                        || drain_reactivation_possible)
+                {
                     // Use the committed topology members, not SWIM live members.
                     // This avoids false mismatches during topology transitions.
                     let committed_members = topo_authority_event.committed_members();
@@ -1313,13 +1355,51 @@ impl ClusterCoordinator {
                             (mismatched, pending_handoffs, stuck_subset)
                         };
 
-                        if should_trigger_topology_reactivation(
-                            startup_reactivation_due,
-                            normal_reactivation_due,
-                            mismatched.saturating_add(stuck_subset as u32),
-                            pending_handoffs,
-                        ) {
+                        // W5-followup — self-drain fast path. Re-drive on the
+                        // short cadence only while `self` is being removed AND
+                        // the backlog is strictly shrinking; a plateau (or any
+                        // member rebalance) hands control back to the 30 s storm
+                        // guard (see `drain_reactivation_due`). The mismatched +
+                        // pending split is summed into one work metric so a round
+                        // that only clears pending handoffs still counts as
+                        // progress.
+                        let self_is_member = committed_members.contains(&self_id);
+                        let total_work = mismatched
+                            .saturating_add(stuck_subset as u32)
+                            .saturating_add(pending_handoffs as u32);
+                        // Compare only against the last fast round of THIS term;
+                        // a stale term's progress watermark must not block a new
+                        // drain.
+                        let prior_fast_work = match fast_reactivation_progress {
+                            Some((term, work)) if term == committed_term => Some(work),
+                            _ => None,
+                        };
+                        let drain_due = drain_reactivation_possible
+                            && drain_reactivation_due(
+                                self_is_member,
+                                true, // active_count == 0 already required above
+                                total_work,
+                                prior_fast_work,
+                                last_reactivation_at.elapsed(),
+                            );
+
+                        if drain_due
+                            || should_trigger_topology_reactivation(
+                                startup_reactivation_due,
+                                normal_reactivation_due,
+                                mismatched.saturating_add(stuck_subset as u32),
+                                pending_handoffs,
+                            )
+                        {
                             topology_epoch.store(committed_term, Ordering::Relaxed);
+                            // Update the progress watermark: record this round's
+                            // work iff it fired on the fast path, else clear it
+                            // (a normal/startup round resets the drain).
+                            if drain_due && !normal_reactivation_due && !startup_reactivation_due {
+                                fast_reactivation_progress = Some((committed_term, total_work));
+                            } else {
+                                fast_reactivation_progress = None;
+                            }
                             if startup_reactivation_due {
                                 startup_reactivation_event.store(false, Ordering::Release);
                                 tracing::info!(
@@ -1328,6 +1408,15 @@ impl ClusterCoordinator {
                                     mismatched,
                                     stuck_subset,
                                     "cluster: re-activating topology after restored outbound migration state",
+                                );
+                            } else if drain_due && !normal_reactivation_due {
+                                tracing::info!(
+                                    term = committed_term,
+                                    pending_handoffs,
+                                    mismatched,
+                                    stuck_subset,
+                                    total_work,
+                                    "cluster: re-driving self-drain handoffs (prompt cadence)",
                                 );
                             } else {
                                 tracing::info!(
@@ -3007,6 +3096,90 @@ fn should_promptly_activate_committed_term(
     committed_members_len: usize,
 ) -> bool {
     committed_members_len > 1 && committed_term > active_version
+}
+
+/// W5-followup — decide whether a node that is *gracefully draining itself*
+/// (an operator `quiesce`, whose committed topology EXCLUDES `self`) may re-drive
+/// its outbound handoffs on the short [`DRAIN_REACTIVATION_INTERVAL`] cadence
+/// instead of the 30 s same-term reactivation cooldown — as long as each round
+/// is making progress.
+///
+/// # Why this exists
+///
+/// `quiesce` commits term N+1 with `self` removed and leaves the shard plan to
+/// the event-loop activation. Each activation runs ONE batch of handoffs; under
+/// load roughly half lose their fence/handoff race and are *rolled back* (the
+/// shard stays mastered locally), so a batch only sheds a fraction of the
+/// masters and finishes with `failed > 0`. The only same-term retry was
+/// `normal_reactivation_due`, gated at 30 s to throttle repair storms — so a
+/// ~1365-shard drain took 7+ rounds × 30 s ≈ 3.5 min, idle for ~25 s of every
+/// 30 s window. Re-driving as soon as the previous batch settles collapses that
+/// to back-to-back ~5 s rounds (~0.5 s in practice).
+///
+/// # Why this is scoped to the self-drain (not member rebalances)
+///
+/// A self-drain is data-light: the shards leaving `self` are mostly already
+/// replicated on the surviving peers, so the handoffs are completion-only or
+/// tiny deltas. A *member* rebalance (a node rejoining, or absorbing a departed
+/// node's shards) instead streams full baselines of real data. Re-driving THAT
+/// on a 2 s cadence floods the receivers' bounded redo logs faster than the
+/// checkpointer can reclaim them (observed: `redo log full` → every subsequent
+/// baseline rejected), so member rebalances deliberately stay on the 30 s
+/// cadence that paces redo pressure. Hence the `self_is_member` short-circuit:
+/// the fast path applies ONLY while `self` is being removed.
+///
+/// # Why the 30 s cooldown still matters (and why progress-gating is safe)
+///
+/// The 30 s cooldown stops a *stuck* same-term mismatch from re-spawning batches
+/// forever (a storm). The signal distinguishing "still converging" from "stuck"
+/// is **progress**: if this round's `work_remaining` is strictly below the work
+/// outstanding at the last fast reactivation, the backlog is draining and we may
+/// re-drive immediately; once progress stalls (`work_remaining >= previous`),
+/// the fast path withdraws and the 30 s cooldown takes over. Self-limiting, with
+/// no per-batch result plumbing — the event loop already recomputes
+/// `work_remaining` (mismatched + stuck-subset, plus pending handoffs) each
+/// candidate round.
+///
+/// # Parameters
+/// * `self_is_member` — whether the committed topology still contains this node.
+///   `true` short-circuits to `false`: every member-rebalance case stays on the
+///   30 s cadence (see the redo-pressure rationale above).
+/// * `no_active_migrations` — the previous batch has fully settled
+///   (`active_count() == 0`); re-driving with work still in flight would only
+///   contend with it.
+/// * `work_remaining` — shards still needing a handoff this round (mismatched +
+///   stuck-subset masters, plus pending handoffs). Zero means drained — never
+///   re-fire.
+/// * `work_at_last_fast_reactivation` — `work_remaining` measured when the fast
+///   path last fired (`None` if the previous reactivation was NOT a fast one,
+///   e.g. the very first activation of this term). `None` permits the first
+///   fast round; afterwards a round fires only if `work_remaining` is strictly
+///   below it.
+/// * `since_last_reactivation` — elapsed since the last reactivation, floored at
+///   [`DRAIN_REACTIVATION_INTERVAL`] so a run of fast rounds cannot busy-spawn
+///   activations on every 100 ms tick.
+fn drain_reactivation_due(
+    self_is_member: bool,
+    no_active_migrations: bool,
+    work_remaining: u32,
+    work_at_last_fast_reactivation: Option<u32>,
+    since_last_reactivation: Duration,
+) -> bool {
+    if self_is_member
+        || !no_active_migrations
+        || work_remaining == 0
+        || since_last_reactivation < DRAIN_REACTIVATION_INTERVAL
+    {
+        return false;
+    }
+    match work_at_last_fast_reactivation {
+        // First fast round of this drain — nothing to compare, allow it.
+        None => true,
+        // Subsequent rounds: only stay on the fast cadence while the backlog is
+        // strictly shrinking. A plateau hands control back to the 30 s storm
+        // guard.
+        Some(prev) => work_remaining < prev,
+    }
 }
 
 fn migration_workers_can_be_preserved(current_table_epoch: u64, activation_epoch: u64) -> bool {
@@ -9818,6 +9991,76 @@ mod tests {
         );
         // No commit yet (term 0) → never fire.
         assert!(!should_promptly_activate_committed_term(0, 0, 3));
+    }
+
+    #[test]
+    fn self_drain_re_drives_on_short_cadence_while_making_progress() {
+        let floor = DRAIN_REACTIVATION_INTERVAL;
+        let below_floor = floor.checked_sub(Duration::from_millis(1)).unwrap();
+        // Arg order: (self_is_member, no_active_migrations, work_remaining,
+        //             work_at_last_fast_reactivation, since_last_reactivation)
+
+        // First fast round of a self-drain (self NOT a member, no prior fast
+        // watermark): the previous batch settled, work remains, the short floor
+        // elapsed → re-drive now instead of waiting out the 30 s cooldown.
+        assert!(
+            drain_reactivation_due(false, true, 485, None, floor),
+            "the first self-drain round must re-drive on the short cadence",
+        );
+
+        // Subsequent round that made progress (485 -> 254 < 485) → keep going.
+        assert!(
+            drain_reactivation_due(false, true, 254, Some(485), floor),
+            "a round that shrank the backlog must stay on the fast cadence",
+        );
+
+        // Scope guard: a node that is STILL a committed member (any member
+        // rebalance — rejoin, absorbing a departed node) must NEVER take the
+        // fast path; member rebalances stay on the 30 s cadence to pace redo
+        // pressure on the receivers (see `drain_reactivation_due` rationale).
+        assert!(
+            !drain_reactivation_due(true, true, 485, None, Duration::from_secs(120)),
+            "a node that remains a member must stay on the 30 s cadence",
+        );
+        assert!(!drain_reactivation_due(true, true, 254, Some(485), floor));
+
+        // Plateau / regression (254 >= 254): backlog stopped shrinking → fall
+        // back to the 30 s storm guard so a stuck drain can never busy-loop.
+        assert!(
+            !drain_reactivation_due(false, true, 254, Some(254), floor),
+            "a stalled backlog must fall back to the 30 s cooldown (storm guard)",
+        );
+        assert!(
+            !drain_reactivation_due(false, true, 300, Some(254), floor),
+            "a growing backlog must fall back to the 30 s cooldown (storm guard)",
+        );
+
+        // Zero work remaining → drained; must never re-fire.
+        assert!(
+            !drain_reactivation_due(false, true, 0, None, floor),
+            "a fully drained node must not re-fire",
+        );
+        assert!(!drain_reactivation_due(false, true, 0, Some(10), floor));
+
+        // Previous batch still in flight (active_count > 0) → would only contend.
+        assert!(
+            !drain_reactivation_due(false, false, 485, None, floor),
+            "must not re-drive while the previous batch is still active",
+        );
+
+        // Below the short floor → debounce so a run of fast rounds cannot
+        // busy-spawn an activation on every event-loop tick.
+        assert!(
+            !drain_reactivation_due(false, true, 485, None, below_floor),
+            "must respect the short re-drive floor to avoid per-tick respawn",
+        );
+        assert!(!drain_reactivation_due(
+            false,
+            true,
+            254,
+            Some(485),
+            below_floor
+        ));
     }
 
     #[test]

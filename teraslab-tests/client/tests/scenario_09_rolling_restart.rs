@@ -321,6 +321,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                 break;
             }
             if quiesce_start.elapsed() >= quiesce_timeout {
+                common::collect_failure_diagnostics(SID).await;
                 return Err(ClientError::Connection(format!(
                     "{node_name} still has {master_count} master shards after {quiesce_timeout:?}"
                 )));
@@ -363,10 +364,17 @@ async fn run_scenario() -> Result<(), ClientError> {
         eprintln!("[9.{node_num}] {node_name} started");
 
         // After restart, wait for rejoin
-        common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await?;
+        if let Err(e) = common::wait_cluster_ready(&docker, 3, Duration::from_secs(120)).await {
+            common::collect_failure_diagnostics(SID).await;
+            return Err(e);
+        }
         eprintln!("[9.{node_num}] Cluster back to 3 nodes");
 
-        common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await?;
+        if let Err(e) = common::wait_migrations_complete(&docker, 3, Duration::from_secs(120)).await
+        {
+            common::collect_failure_diagnostics(SID).await;
+            return Err(e);
+        }
         common::wait_replication_settled(&docker, 3, Duration::from_secs(60)).await?;
         eprintln!("[9.{node_num}] Migrations complete after restarting {node_name}");
 
