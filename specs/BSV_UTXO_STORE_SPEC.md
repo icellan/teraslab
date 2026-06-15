@@ -1376,6 +1376,43 @@ With RF=3, the master sends `ReplicaOp` to **both** replicas in parallel. Acknow
 - Expose `replication_lag_ops` = `master_sequence - last_ack_sequence`
 - Alert if lag exceeds configurable threshold
 
+### 8.7 `ERR_REPLICATION_FAILED` — ambiguous outcome, idempotent-retry-safe
+
+`ERR_REPLICATION_FAILED` (code `20`) is returned when the master could not
+confirm the durability contract (the required number of replica ACKs) for a
+mutation within the timeout. **It is an ambiguous outcome:** when a client
+receives code `20`, the write may have become durable on the master only, on
+one or more replicas only, on both, or on neither. The error reports a failure
+to *confirm* durability — not a definitive rollback — so the client must not
+assume either that the write took effect or that it did not.
+
+- **Convergence is the server's responsibility.** The master's compensation
+  machinery (see §9 cluster management and the dispatch/coordinator
+  compensation path) reconciles the divergent state asynchronously: a write
+  that landed on only a subset of the replica set is either driven forward to
+  the full set or compensated (deleted/unwound) so that, once replication
+  quiesces, every replica converges to a single consistent outcome for that
+  op. A record observed immediately after a code `20` may still be
+  compensation-deleted moments later; readers must let replication settle
+  before treating a post-error read as authoritative.
+
+- **The prescribed client recovery is an idempotent retry.** Because every
+  TeraSlab mutation is idempotent by txid/op semantics — re-spending an
+  already-spent output with the same spending data, re-mining an
+  already-mined transaction, re-creating an already-present record, etc., all
+  converge to the same state rather than double-applying — a client that
+  receives code `20` should re-issue the *identical* op. The retry is safe
+  regardless of which of the four durability outcomes actually occurred: if
+  the op had already taken effect the retry is a no-op against the converged
+  state; if it had not, the retry re-drives it. Clients retry with bounded
+  attempts and backoff (the reference client retries up to its transient
+  budget, refreshing routing between attempts).
+
+- **Classification.** Code `20` is therefore a *transient, same-target
+  retryable* code alongside `ERR_MIGRATION_IN_PROGRESS` (19) and
+  `ERR_STALE_EPOCH` (24) — distinct from `ERR_REDIRECT` (14), which instructs
+  the client to re-route to a different node rather than retry the same one.
+
 ---
 
 ## 9. Cluster Management

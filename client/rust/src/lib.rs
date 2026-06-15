@@ -237,10 +237,18 @@ impl Client {
             }
             STATUS_PARTIAL_ERROR => {
                 let errs = decode_sparse_errors(&resp.payload)?;
-                Err(ClientError::Partial(PartialError {
-                    successes: Vec::new(),
-                    errors: errs,
-                }))
+                // A PARTIAL_ERROR that decodes to zero per-item errors means
+                // nothing actually failed — treat it as success rather than
+                // surfacing an empty `Partial` (which callers must otherwise
+                // special-case as "0 failures = ok").
+                if errs.is_empty() {
+                    Ok(BatchResult { errors: Vec::new() })
+                } else {
+                    Err(ClientError::Partial(PartialError {
+                        successes: Vec::new(),
+                        errors: errs,
+                    }))
+                }
             }
             other => Err(ClientError::Protocol(format!("unknown status: {}", other))),
         }
@@ -380,8 +388,58 @@ impl Client {
         Self::handle_mutation_response(&resp)
     }
 
-    /// Cluster-aware version of send_txid_batch.
+    /// Cluster-aware version of send_txid_batch with bounded transient-retry.
+    ///
+    /// Wraps [`Self::send_txid_batch_cluster_once`] in the same bounded
+    /// same-target retry loop used by [`Self::send_item_batch_cluster`] so
+    /// txid-keyed mutations (set_mined, delete, mark_longest_chain, …)
+    /// behave consistently with the other cluster mutation paths. A retry
+    /// is taken only when the *entire* batch failed with a retryable
+    /// transient code — a global `ClientError::Server` whose code is
+    /// retryable, or a `Partial` where every item carries a retryable code
+    /// (notably `ERR_REPLICATION_FAILED` / code 20). These ops are
+    /// idempotent by txid/op semantics, so re-issuing the identical op is
+    /// safe; the server's compensation machinery reconciles any partial
+    /// durability behind the ambiguous error. A mixed `Partial` (some
+    /// successes, some errors) is returned as-is.
     async fn send_txid_batch_cluster<F>(
+        &self,
+        op_code: u16,
+        txids: &[TxID],
+        encode_payload: &F,
+    ) -> Result<BatchResult, ClientError>
+    where
+        F: Fn(&[TxID]) -> Vec<u8>,
+    {
+        for attempt in 0..=(TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() as u32) {
+            let result = self
+                .send_txid_batch_cluster_once(op_code, txids, encode_payload)
+                .await;
+            let retryable = (attempt as usize) < TRANSIENT_MUTATION_RETRY_DELAYS_MS.len()
+                && match &result {
+                    Err(ClientError::Server { code, .. }) => is_retryable_error_code(*code),
+                    Err(ClientError::Partial(pe)) => {
+                        pe.errors.len() == txids.len() && all_errors_are_retryable(&pe.errors)
+                    }
+                    _ => false,
+                };
+            if retryable {
+                tokio::time::sleep(Duration::from_millis(
+                    TRANSIENT_MUTATION_RETRY_DELAYS_MS[attempt as usize],
+                ))
+                .await;
+                let _ = self.refresh_routing().await;
+                continue;
+            }
+            return result;
+        }
+        unreachable!()
+    }
+
+    /// One attempt of a cluster-aware txid batch. The public
+    /// [`Self::send_txid_batch_cluster`] wraps this with bounded
+    /// transient-retry.
+    async fn send_txid_batch_cluster_once<F>(
         &self,
         op_code: u16,
         txids: &[TxID],
@@ -547,9 +605,54 @@ impl Client {
         Self::handle_signal_response(&resp, items.len())
     }
 
-    /// Cluster-aware spend batch: group items by target node, send in parallel,
-    /// merge results with index remapping.
+    /// Cluster-aware spend batch with bounded transient-retry.
+    ///
+    /// Wraps [`Self::spend_batch_cluster_once`] in the same bounded
+    /// same-target retry loop used by [`Self::send_item_batch_cluster`] so
+    /// spend behaves consistently with the other cluster mutation paths.
+    /// A retry is taken only when the *entire* batch failed with a
+    /// retryable transient code — either a global `ClientError::Server`
+    /// whose code is retryable, or a `Partial` where every item carries a
+    /// retryable code (notably `ERR_REPLICATION_FAILED` / code 20). Spends
+    /// are idempotent by txid+output semantics (re-spending an already-spent
+    /// output converges to the same state), so re-issuing the identical op
+    /// is safe; the server's compensation machinery reconciles any partial
+    /// durability behind the ambiguous error. A `Partial` with a mix of
+    /// successes and errors is returned as-is (we must not re-spend items
+    /// that already succeeded on this attempt).
     async fn spend_batch_cluster(
+        &self,
+        params: &SpendBatchParams,
+        items: &[SpendItem],
+    ) -> Result<SpendBatchResponse, ClientError> {
+        for attempt in 0..=(TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() as u32) {
+            let result = self.spend_batch_cluster_once(params, items).await;
+            let retryable = (attempt as usize) < TRANSIENT_MUTATION_RETRY_DELAYS_MS.len()
+                && match &result {
+                    Err(ClientError::Server { code, .. }) => is_retryable_error_code(*code),
+                    Err(ClientError::Partial(pe)) => {
+                        pe.errors.len() == items.len() && all_errors_are_retryable(&pe.errors)
+                    }
+                    _ => false,
+                };
+            if retryable {
+                tokio::time::sleep(Duration::from_millis(
+                    TRANSIENT_MUTATION_RETRY_DELAYS_MS[attempt as usize],
+                ))
+                .await;
+                let _ = self.refresh_routing().await;
+                continue;
+            }
+            return result;
+        }
+        unreachable!()
+    }
+
+    /// One attempt of a cluster-aware spend batch: group items by target
+    /// node, send in parallel, merge results with index remapping. The
+    /// public [`Self::spend_batch_cluster`] wraps this with bounded
+    /// transient-retry.
+    async fn spend_batch_cluster_once(
         &self,
         params: &SpendBatchParams,
         items: &[SpendItem],
@@ -843,8 +946,10 @@ impl Client {
 
         let encode_sub_arc = Arc::new(encode_sub);
 
-        // Retry once on transient errors (dead node / replication failure)
-        // after routing refresh.
+        // Bounded transient-retry on retryable errors (dead node, migration
+        // fence, stale epoch, or ambiguous ERR_REPLICATION_FAILED) after a
+        // routing refresh — up to TRANSIENT_MUTATION_RETRY_DELAYS_MS.len()
+        // attempts with backoff.
         for attempt in 0..=(TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() as u32) {
             let result = self
                 .send_item_batch_cluster_inner(op_code, items, &get_txid, &encode_sub_arc)
@@ -932,6 +1037,21 @@ impl Client {
                     continue;
                 }
                 Err(ClientError::Server { code, .. }) if attempt == 0 && code == 15 => {
+                    let _ = self.refresh_routing().await;
+                    continue;
+                }
+                // Global ERR_REPLICATION_FAILED: ambiguous, idempotent-retry-safe
+                // (see `is_retryable_error_code`). The op is idempotent by
+                // txid/op semantics, so re-issuing it is safe; the server's
+                // compensation machinery converges any partial durability.
+                Err(ClientError::Server { code, .. })
+                    if is_retryable_error_code(code)
+                        && (attempt as usize) < TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() =>
+                {
+                    tokio::time::sleep(Duration::from_millis(
+                        TRANSIENT_MUTATION_RETRY_DELAYS_MS[attempt as usize],
+                    ))
+                    .await;
                     let _ = self.refresh_routing().await;
                     continue;
                 }
@@ -2182,8 +2302,20 @@ fn all_errors_have_code(errors: &[BatchItemError], code: u16) -> bool {
 /// - [`ERR_STALE_EPOCH`] — the target's local cluster epoch differs
 ///   from the requester's view; same-target retry succeeds once both
 ///   sides observe the new committed term.
+/// - [`ERR_REPLICATION_FAILED`] — an *ambiguous, idempotent-retry-safe*
+///   outcome (see the spec's "ERR_REPLICATION_FAILED — ambiguous outcome"
+///   section). The write may now be durable on master, replicas, both, or
+///   neither; the server's compensation machinery converges the state, and
+///   the prescribed client recovery is to re-issue the identical idempotent
+///   op. Because all TeraSlab mutations are idempotent by txid/op semantics
+///   (re-spending an already-spent output, re-mining an already-mined tx,
+///   re-creating an existing record, etc. converge to the same state), a
+///   bounded same-target retry is safe and is the documented recovery path.
 pub(crate) fn is_retryable_error_code(code: u16) -> bool {
-    matches!(code, ERR_MIGRATION_IN_PROGRESS | ERR_STALE_EPOCH)
+    matches!(
+        code,
+        ERR_MIGRATION_IN_PROGRESS | ERR_STALE_EPOCH | ERR_REPLICATION_FAILED
+    )
 }
 
 /// Returns `true` when every per-item error in `errors` is one of the
@@ -2296,6 +2428,7 @@ mod tests {
             suspicion_timeout: Duration::from_secs(2),
             cluster_secret: None,
             max_migration_threads: 16,
+            topology_debounce: Duration::from_millis(100),
             topology_propose_timeout: Duration::from_millis(300),
             migration_pool_size: 4,
             migration_batch_size: 100,
@@ -2503,6 +2636,91 @@ mod tests {
         shutdown_node(&node1);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn set_mined_batch_retries_transient_until_fence_clears() {
+        // Exercises the bounded transient-retry loop wrapping
+        // `send_txid_batch_cluster` (set_mined / delete / mark_longest_chain
+        // path). The same loop now also recovers ERR_REPLICATION_FAILED
+        // (code 20) — see `replication_failed_is_retryable`. We drive a
+        // server-injectable transient (the migration fence) because a
+        // replication-ACK timeout cannot be forced in-process without the
+        // server compensation machinery owned by the P5 path. The wrapper
+        // logic (retry decision via `is_retryable_error_code`) is identical
+        // for code 19 and code 20.
+        let tcp1 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        let txid = txid_for_shard(777);
+        let shard = crate::cluster::shard_for_txid(&txid);
+
+        // Seed the record first (unfenced) so set_mined has something to mark.
+        let create_item = CreateItem {
+            txid,
+            utxo_hashes: vec![[0x77; 32]],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        client
+            .create_batch(&[create_item])
+            .await
+            .expect("seed create_batch should succeed before fencing");
+
+        // Now fence the shard so the first set_mined attempt is rejected with
+        // ERR_MIGRATION_IN_PROGRESS, and clear it shortly after.
+        node1.cluster.fenced_bitmap().set(shard);
+        let cluster = Arc::clone(&node1.cluster);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            cluster.fenced_bitmap().clear(shard);
+        });
+
+        let params = SetMinedBatchParams {
+            block_id: 1,
+            block_height: 10,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 10,
+            block_height_retention: 100,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.set_mined_batch(&params, &[txid]),
+        )
+        .await
+        .expect("set_mined_batch should not hang");
+
+        assert!(
+            result.is_ok(),
+            "set_mined_batch must retry the transient fence rejection until it \
+             clears (same loop that now recovers ERR_REPLICATION_FAILED): {result:?}"
+        );
+
+        client.close().await;
+        shutdown_node(&node1);
+    }
+
     #[tokio::test]
     async fn create_batch_retries_migration_in_progress_for_long_rebalance_window() {
         let tcp1 = reserve_tcp_port();
@@ -2676,6 +2894,43 @@ mod tests {
             is_retryable_error_code(ERR_STALE_EPOCH),
             "ERR_STALE_EPOCH must be classified as retryable so clients re-issue \
              the request once the local cluster_key catches up to the master's"
+        );
+    }
+
+    #[test]
+    fn replication_failed_is_retryable() {
+        // ERR_REPLICATION_FAILED (code 20) is the ambiguous,
+        // idempotent-retry-safe outcome: the write may be durable on
+        // master, replicas, both, or neither. The contract is that the
+        // client re-issues the identical idempotent op and the server's
+        // compensation machinery converges the state.
+        assert!(
+            is_retryable_error_code(ERR_REPLICATION_FAILED),
+            "ERR_REPLICATION_FAILED must be classified as retryable: it is an \
+             ambiguous, idempotent-retry-safe outcome and a client retry is \
+             the prescribed recovery"
+        );
+        assert_eq!(ERR_REPLICATION_FAILED, 20, "code under contract is 20");
+    }
+
+    #[test]
+    fn all_errors_are_retryable_accepts_replication_failed_batch() {
+        let errors = vec![
+            BatchItemError {
+                item_index: 0,
+                code: ERR_REPLICATION_FAILED,
+                data: vec![],
+            },
+            BatchItemError {
+                item_index: 1,
+                code: ERR_REPLICATION_FAILED,
+                data: vec![],
+            },
+        ];
+        assert!(
+            all_errors_are_retryable(&errors),
+            "a batch where every item failed with ERR_REPLICATION_FAILED must \
+             be retried as a whole"
         );
     }
 

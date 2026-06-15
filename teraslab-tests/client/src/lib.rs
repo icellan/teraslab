@@ -7,6 +7,7 @@
 // Test-specific modules
 pub mod helpers;
 pub mod reporter;
+pub mod retry;
 pub mod verifier;
 pub mod workload;
 
