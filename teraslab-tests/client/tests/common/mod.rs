@@ -1064,6 +1064,43 @@ pub async fn start_5node_cluster(scenario_id: u16) -> Result<(DockerHelpers, Cli
 /// Returns the list of txids created.
 type SeedMeta = ([u8; 32], Vec<[u8; 32]>);
 
+/// Settle interval between the two reconcile read-backs. A record observed
+/// present immediately after an ambiguous `ERR_REPLICATION_FAILED` (code 20)
+/// may still be compensation-deleted moments later (spec §8.7); we re-read
+/// after this delay and only treat a record as durably seeded if it is
+/// still present, so reconcile does not race in-flight compensation.
+const RECONCILE_SETTLE_INTERVAL: Duration = Duration::from_millis(750);
+
+/// Read back a set of txids for reconcile, retrying once after a routing
+/// refresh on connection error. Returns `None` if the read could not be
+/// completed (the caller then leaves the items in the retry set).
+async fn read_back_seed_records(
+    client: &Client,
+    txids: &[[u8; 32]],
+) -> Option<teraslab_test_client::client::GetBatchResult> {
+    match client.get_batch(FIELD_ALL_METADATA, txids).await {
+        Ok(results) => Some(results),
+        Err(_) => {
+            let _ = client.refresh_routing().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            client.get_batch(FIELD_ALL_METADATA, txids).await.ok()
+        }
+    }
+}
+
+/// For items that failed a create with an ambiguous outcome, check whether
+/// the record actually landed and converged — and, if so, drop it from the
+/// retry set so we do not re-create (which would surface `ERR_ALREADY_EXISTS`).
+///
+/// A record observed present immediately after an ambiguous code-20 outcome
+/// is NOT yet authoritative: the server's compensation machinery may delete
+/// it as it converges the partial-durability state (spec §8.7). To avoid
+/// racing in-flight compensation, a record is only counted reconciled if it
+/// is present on an initial read AND still present after
+/// [`RECONCILE_SETTLE_INTERVAL`] (a proxy for "replication has quiesced"
+/// that does not require Docker handles in scope). Records that disappear
+/// in the interval are left in the retry set and re-created on the next
+/// attempt — safe because create is idempotent by txid.
 async fn reconcile_existing_seed_records(
     client: &Client,
     remaining_items: &mut Vec<CreateItem>,
@@ -1075,16 +1112,16 @@ async fn reconcile_existing_seed_records(
     }
 
     let txids: Vec<[u8; 32]> = remaining_meta.iter().map(|(txid, _)| *txid).collect();
-    let results = match client.get_batch(FIELD_ALL_METADATA, &txids).await {
-        Ok(results) => results,
-        Err(_) => {
-            let _ = client.refresh_routing().await;
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            match client.get_batch(FIELD_ALL_METADATA, &txids).await {
-                Ok(results) => results,
-                Err(_) => return 0,
-            }
-        }
+    let Some(first) = read_back_seed_records(client, &txids).await else {
+        return 0;
+    };
+
+    // Re-read after a settle interval so a record that was transiently
+    // present (and is about to be compensation-deleted) is not mistaken for
+    // a durable seed.
+    tokio::time::sleep(RECONCILE_SETTLE_INTERVAL).await;
+    let Some(second) = read_back_seed_records(client, &txids).await else {
+        return 0;
     };
 
     let old_items = std::mem::take(remaining_items);
@@ -1092,7 +1129,9 @@ async fn reconcile_existing_seed_records(
     let mut reconciled = 0usize;
 
     for (idx, (item, meta)) in old_items.into_iter().zip(old_meta).enumerate() {
-        if idx < results.len() && results.found(idx) {
+        let durably_present =
+            idx < first.len() && first.found(idx) && idx < second.len() && second.found(idx);
+        if durably_present {
             succeeded_meta.push(meta);
             reconciled += 1;
         } else {
@@ -1156,13 +1195,15 @@ pub async fn seed_records(
         // Only record in verifier AFTER the create succeeds, to avoid
         // phantom records when the create fails (e.g., during degradation).
         // Retry on transient errors from SWIM instability, dead nodes,
-        // or cluster topology changes. Uses exponential backoff
-        // (500ms * 2^min(n,3), capped at 4s) with up to 16 attempts
-        // (~52s total backoff) to ride out post-topology-change settle.
+        // cluster topology changes, or ambiguous ERR_REPLICATION_FAILED
+        // (code 20). Backoff and the attempt budget come from the shared
+        // `retry` policy module (`retry::backoff_for_attempt` /
+        // `retry::MAX_TRANSIENT_ATTEMPTS`) so every mutation helper rides
+        // out the same post-topology-change settle window.
         //
         // On partial success, only retry the failed items (not items that
         // already succeeded — re-sending those would cause ERR_ALREADY_EXISTS).
-        const MAX_SEED_RETRIES: u32 = 16;
+        const MAX_SEED_RETRIES: u32 = teraslab_test_client::retry::MAX_TRANSIENT_ATTEMPTS;
         let mut remaining_items = items;
         let mut remaining_meta = batch_meta;
         let mut succeeded_meta: Vec<([u8; 32], Vec<[u8; 32]>)> = Vec::new();
@@ -1238,8 +1279,8 @@ pub async fn seed_records(
                             remaining_items.len()
                         );
                     }
-                    let delay = Duration::from_millis(500 * (1 << attempt.min(3)));
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(teraslab_test_client::retry::backoff_for_attempt(attempt))
+                        .await;
                     let _ = client.refresh_routing().await;
                 }
                 Err(e) => {

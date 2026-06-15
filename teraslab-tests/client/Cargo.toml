@@ -16,6 +16,10 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+# `tokio::test(start_paused = true)` for the unified transient-retry tests
+# (`retry::tests`) — lets backoff-driven retries advance virtual time
+# instantly instead of sleeping the real budget (~tens of seconds).
+tokio = { version = "1", features = ["test-util"] }
 # F-X-002 regression test (`helpers::tests::
 # rendered_node_config_passes_safe_defaults_under_fx002_default`)
 # round-trips the rendered docker-node TOML through `serde::Deserialize`
