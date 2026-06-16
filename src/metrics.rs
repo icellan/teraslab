@@ -1138,6 +1138,12 @@ pub struct MigrationMetrics {
     /// add/remove) raced an in-flight migration — the operator-visible
     /// signal that stale-epoch gating did its job.
     pub topology_epoch_mismatch: PaddedCounter,
+    /// Number of times a node DROPPED a phantom mastership on a failed outbound
+    /// handoff, relinquishing the shard to its committed master instead of
+    /// rolling back to self (Task #25). Non-zero is the operator-visible signal
+    /// that the convergence backstop fired — a drained/rejoined node shed a
+    /// shard a live peer had already taken over.
+    pub phantom_master_relinquished: PaddedCounter,
 }
 
 /// Number of {direction, role} buckets for migration byte counters.
@@ -1197,6 +1203,7 @@ impl MigrationMetrics {
             migration_phase_delta: AtomicU32::new(0),
             migration_phase_serving_new: AtomicU32::new(0),
             topology_epoch_mismatch: PaddedCounter::new(),
+            phantom_master_relinquished: PaddedCounter::new(),
         }
     }
 

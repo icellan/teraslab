@@ -1066,6 +1066,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_topology_epoch_mismatch_total",
             mm.topology_epoch_mismatch.get(),
         );
+        prom_counter(
+            &mut out,
+            "teraslab_phantom_master_relinquished_total",
+            mm.phantom_master_relinquished.get(),
+        );
     }
     if let Some(sw) = swim_metrics() {
         prom_counter(

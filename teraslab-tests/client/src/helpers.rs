@@ -1,7 +1,13 @@
 use crate::ClientError;
 use std::collections::HashMap;
 
-const DEFAULT_DOCKER_MIGRATION_POOL_SIZE: usize = 128;
+// Must stay BELOW the server's default `max_connections_per_ip` (64): a
+// migration burst opens up to `migration_pool_size` parallel connections to a
+// SINGLE target, so a pool >= the per-IP cap self-DoSes (the target resets the
+// overflow with "Connection reset by peer", baseline streaming fails, the
+// handoff rolls back, and rebalances never converge). 48 leaves headroom for
+// the node's other inter-node connections (SWIM, replication, status).
+const DEFAULT_DOCKER_MIGRATION_POOL_SIZE: usize = 48;
 const DEFAULT_DOCKER_MIGRATION_BATCH_SIZE: usize = 1000;
 const ENV_DOCKER_MIGRATION_POOL_SIZE: &str = "TERASLAB_DOCKER_MIGRATION_POOL_SIZE";
 const ENV_DOCKER_MIGRATION_BATCH_SIZE: &str = "TERASLAB_DOCKER_MIGRATION_BATCH_SIZE";

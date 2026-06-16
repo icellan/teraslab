@@ -119,6 +119,34 @@ fn migration_epoch_current(
     shard_table.read().version == topology_epoch
 }
 
+/// What [`fail_migration_task_current_epoch`] does to the shard table after
+/// marking the task failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedTaskTableAction {
+    /// Leave the table untouched (used for already-serving / replica-role
+    /// completion-handshake failures that were never table-committed).
+    None,
+    /// Revert the shard to `self` via `rollback_shard` — the historical
+    /// no-loss-safe outcome.
+    Rollback,
+    /// Drop `self`'s phantom mastership: commit the shard to its new
+    /// (committed round-robin) assignment via `commit_shard`. Task #25 —
+    /// only ever reached through [`fail_or_relinquish_outbound_task`] after a
+    /// [`failed_handoff_disposition`] check proved the rightful master holds
+    /// the data.
+    Relinquish,
+}
+
+impl From<bool> for FailedTaskTableAction {
+    fn from(rollback: bool) -> Self {
+        if rollback {
+            FailedTaskTableAction::Rollback
+        } else {
+            FailedTaskTableAction::None
+        }
+    }
+}
+
 fn fail_migration_task_current_epoch(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -126,8 +154,9 @@ fn fail_migration_task_current_epoch(
     migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
     task: &MigrationTask,
     topology_epoch: u64,
-    rollback: bool,
+    rollback: impl Into<FailedTaskTableAction>,
 ) -> bool {
+    let action: FailedTaskTableAction = rollback.into();
     if !migration_epoch_current(shard_table, topology_epoch) {
         if let Some(m) = crate::metrics::migration_metrics() {
             m.topology_epoch_mismatch.inc();
@@ -162,10 +191,96 @@ fn fail_migration_task_current_epoch(
         }
         migrating_bm.clear(task.shard);
     }
-    if rollback {
-        shard_table.write().rollback_shard(task.shard);
+    match action {
+        FailedTaskTableAction::None => {}
+        FailedTaskTableAction::Rollback => {
+            shard_table.write().rollback_shard(task.shard);
+        }
+        FailedTaskTableAction::Relinquish => {
+            // Drop the phantom mastership: commit the shard to its committed
+            // (round-robin) master, demoting `self` to the role the committed
+            // assignment gives it. No data is lost — the rightful master was
+            // proven to hold the authoritative copy before this action was
+            // selected (see `failed_handoff_disposition`).
+            shard_table.write().commit_shard(task.shard);
+            if let Some(m) = crate::metrics::migration_metrics() {
+                m.phantom_master_relinquished.inc();
+            }
+            tracing::info!(
+                shard = task.shard,
+                to_node = task.to_node.0,
+                "cluster: relinquished phantom mastership to committed master",
+            );
+        }
     }
     true
+}
+
+/// Context needed to decide, on an outbound master-handoff failure, whether to
+/// relinquish the shard to its committed master instead of rolling it back to
+/// `self` (Task #25). Built from the committed topology + live-member snapshot
+/// available at migration-spawn time.
+struct RelinquishContext {
+    committed_members: Vec<NodeId>,
+    rf: u8,
+    self_id: NodeId,
+    live_members: std::collections::HashSet<NodeId>,
+    /// Engine handle to check whether `self` holds any records for a shard
+    /// (only an EMPTY local shard is no-loss-safe to relinquish on failure).
+    engine: Arc<Engine>,
+}
+
+/// Fail an outbound migration task, relinquishing the shard to its committed
+/// master when [`failed_handoff_disposition`] proves that is no-loss-safe
+/// (an EMPTY local shard whose committed master is a live, different member);
+/// otherwise roll back to `self` exactly as before.
+///
+/// `ctx` is `None` when the caller has no committed-topology snapshot (legacy
+/// / test paths) — in that case this is identical to a `rollback = true` call.
+fn fail_or_relinquish_outbound_task(
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    task: &MigrationTask,
+    topology_epoch: u64,
+    ctx: Option<&RelinquishContext>,
+) -> bool {
+    let action = match ctx {
+        Some(ctx) => {
+            let has_pending_inbound = migration.lock().has_pending_inbound(task.shard);
+            let self_holds_records = ctx.engine.shard_record_count(task.shard) > 0;
+            let disposition = {
+                let table = shard_table.read();
+                failed_handoff_disposition(
+                    task,
+                    &table,
+                    &ctx.committed_members,
+                    ctx.rf,
+                    ctx.self_id,
+                    &ctx.live_members,
+                    has_pending_inbound,
+                    self_holds_records,
+                )
+            };
+            match disposition {
+                FailedHandoffDisposition::RelinquishToCommittedMaster => {
+                    FailedTaskTableAction::Relinquish
+                }
+                FailedHandoffDisposition::RollbackToSelf => FailedTaskTableAction::Rollback,
+            }
+        }
+        None => FailedTaskTableAction::Rollback,
+    };
+    fail_migration_task_current_epoch(
+        migration,
+        shard_table,
+        fenced_bm,
+        migrating_bm,
+        task,
+        topology_epoch,
+        action,
+    )
 }
 
 fn send_migration_abort_completion_best_effort(
@@ -415,6 +530,131 @@ fn phantom_master_shard_count(
                 && committed.target_assignment(shard).master != self_id
         })
         .count()
+}
+
+/// Result of a batched completion handshake (`send_completion_only_handshakes`),
+/// per shard. Distinguishes a delivered commit from the two failure flavours so
+/// the caller can choose between relinquish and rollback (Task #25).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandshakeOutcome {
+    /// The target acknowledged the commit (`STATUS_OK`).
+    Delivered,
+    /// The target answered with a hard, non-retryable rejection — it is alive
+    /// and processed the request against its own data.
+    HardReject,
+    /// The target could not be reached or never activated the epoch within the
+    /// retry budget. Nothing is known about its data.
+    Unconfirmed,
+}
+
+impl HandshakeOutcome {
+    fn delivered(self) -> bool {
+        matches!(self, HandshakeOutcome::Delivered)
+    }
+}
+
+/// Outcome of a failed outbound migration task: either revert ownership to
+/// `self` (the historical behaviour) or DROP `self`'s mastership and commit
+/// the shard to its committed (round-robin) master.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailedHandoffDisposition {
+    /// Restore `self` as master (`rollback_shard`) — the only no-loss-safe
+    /// outcome when the rightful master is not demonstrably holding the data.
+    RollbackToSelf,
+    /// Commit the shard to the new (committed) assignment, dropping `self` to
+    /// replica / non-holder. Safe only when the rightful master is a live,
+    /// committed member that demonstrably holds the authoritative copy.
+    RelinquishToCommittedMaster,
+}
+
+/// Task #25 — decide what to do when an outbound MASTER handoff for `shard`
+/// fails: roll back to `self` (default, no-loss-safe) or relinquish to the
+/// committed master.
+///
+/// # Why relinquish exists
+///
+/// A drained/rejoined node can re-assert stale mastership of shards a live peer
+/// took over while it was away. The phantom detector + empty-view reactivation
+/// schedules a handoff of those shards to their committed (round-robin) master,
+/// but the master is ALREADY serving the shard, so the push is a no-op the
+/// target rejects. The historical failure path then rolls the shard back to
+/// `self`, re-cementing the phantom mastership — the cluster never collapses to
+/// one master per shard (scenarios 05/07/09). Relinquishing instead lets `self`
+/// drop the phantom master so `master_shard_count` converges to `NUM_SHARDS`.
+///
+/// # No-loss invariant (UTXO store — paramount)
+///
+/// `self` may drop its copy ONLY when the rightful master DEMONSTRABLY holds the
+/// authoritative data. That is established by ALL of:
+///
+/// 1. The task is a master handoff (`task.is_master`) — replica-task failures
+///    never roll the master back, so they are irrelevant to the over-count.
+/// 2. The shard's committed round-robin master `R` is a DIFFERENT node
+///    (`R != self_id`) — relinquishing to self is meaningless.
+/// 3. `R` is a current committed member AND is currently LIVE.
+/// 4. The table's NEW (target) assignment for the shard already designates `R`
+///    as master — so `commit_shard` installs `R`, never a stale third node — and
+///    `self` is NOT pending-inbound for the shard (self is the source, not a
+///    half-migrated target).
+/// 5. `self` holds NO records for the shard locally (`self_holds_records ==
+///    false`). An empty phantom shard is trivially no-loss to drop — there is
+///    nothing to transfer or lose — AND it cannot strand the committed master in
+///    a half-served state (an empty shard needs no data to serve).
+///
+///    A NON-empty local copy is NEVER dropped on a failed handoff: a failed
+///    handoff cannot prove `R` holds a superset of `self`'s records (a hard
+///    reject only proves `R`'s data DIFFERS — possibly a subset), and a
+///    one-sided drop would also leave `R` in a subset-waiting state it can only
+///    exit via the very handoff that just failed (observed as a stranded read).
+///    So `self` keeps the data and rolls back — no-loss/correctness over
+///    convergence, exactly as the task mandates when peer-possession cannot be
+///    established.
+#[allow(clippy::too_many_arguments)]
+fn failed_handoff_disposition(
+    task: &MigrationTask,
+    table: &ShardTable,
+    committed_members: &[NodeId],
+    rf: u8,
+    self_id: NodeId,
+    live_members: &std::collections::HashSet<NodeId>,
+    has_pending_inbound: bool,
+    self_holds_records: bool,
+) -> FailedHandoffDisposition {
+    // Cond 1: only master handoffs cause the over-count.
+    if !task.is_master {
+        return FailedHandoffDisposition::RollbackToSelf;
+    }
+    // A single-member committed set cannot have a different rightful master.
+    if committed_members.len() <= 1 {
+        return FailedHandoffDisposition::RollbackToSelf;
+    }
+    // Cond 4: self must not be a half-migrated inbound target for this shard;
+    // if it is, its copy could be the authoritative one being assembled.
+    if has_pending_inbound {
+        return FailedHandoffDisposition::RollbackToSelf;
+    }
+    // Cond 5: NO-LOSS. Only an empty local copy is safe to drop on a failed
+    // handoff. A non-empty copy is kept (rollback) — see the doc comment.
+    if self_holds_records {
+        return FailedHandoffDisposition::RollbackToSelf;
+    }
+    // Cond 2 + 3: the deterministic committed master must be a DIFFERENT,
+    // live, committed member.
+    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0);
+    let rightful = committed.target_assignment(task.shard).master;
+    if rightful == self_id
+        || !committed_members.contains(&rightful)
+        || !live_members.contains(&rightful)
+    {
+        return FailedHandoffDisposition::RollbackToSelf;
+    }
+    // Cond 4 (cont): the table's NEW assignment must already hand off TO the
+    // rightful master, so committing installs `R` (not a stale node), and the
+    // handoff target the push went to is that same rightful master.
+    if table.target_assignment(task.shard).master != rightful || task.to_node != rightful {
+        return FailedHandoffDisposition::RollbackToSelf;
+    }
+    FailedHandoffDisposition::RelinquishToCommittedMaster
 }
 
 /// W1.1 residual fix (FIX 2) — self-heal backstop signal for the topology
@@ -1755,6 +1995,9 @@ impl ClusterCoordinator {
                             self_id,
                             throttle_ref,
                             secret_ref,
+                            // Replica resync backfill — never a master handoff,
+                            // so relinquish never applies here.
+                            None,
                         );
                     });
                 }
@@ -1830,6 +2073,25 @@ impl ClusterCoordinator {
                         let ib = inbound_bm_event.clone();
                         let throttle_ref = migration_throttle_event.clone();
                         let secret_ref = cluster_secret_event.clone();
+                        // Task #25 — relinquish context for the transfer-request
+                        // resend path: a peer is asking us to re-run an outbound
+                        // handoff. If the handoff hard-fails because that peer is
+                        // the committed master already serving the shard, drop
+                        // the phantom mastership instead of rolling back.
+                        let relinquish_ctx = {
+                            let committed_members = active_topology_members_event.read().clone();
+                            let rf = st.read().replication_factor();
+                            let mut live_members: std::collections::HashSet<NodeId> =
+                                node_addrs.read().keys().copied().collect();
+                            live_members.insert(self_id);
+                            Arc::new(RelinquishContext {
+                                committed_members,
+                                rf,
+                                self_id,
+                                live_members,
+                                engine: engine.clone(),
+                            })
+                        };
                         std::thread::spawn(move || {
                             Self::run_migration_tasks_with_global_limit(
                                 resend_tasks,
@@ -1849,6 +2111,7 @@ impl ClusterCoordinator {
                                 self_id,
                                 throttle_ref,
                                 secret_ref,
+                                Some(relinquish_ctx),
                             );
                         });
                     }
@@ -2080,6 +2343,24 @@ impl ClusterCoordinator {
                     let ib = inbound_bm.clone();
                     let throttle_ref = migration_throttle.clone();
                     let secret_ref = cluster_secret.clone();
+                    // Task #25 — relinquish context for the rejoin retry path,
+                    // built from the committed (active) topology members + RF
+                    // and the live-member snapshot (peers we have addresses for,
+                    // plus self).
+                    let relinquish_ctx = {
+                        let committed_members = active_topology_members.read().clone();
+                        let rf = st.read().replication_factor();
+                        let mut live_members: std::collections::HashSet<NodeId> =
+                            node_addrs.read().keys().copied().collect();
+                        live_members.insert(self_id);
+                        Arc::new(RelinquishContext {
+                            committed_members,
+                            rf,
+                            self_id,
+                            live_members,
+                            engine: engine.clone(),
+                        })
+                    };
                     std::thread::spawn(move || {
                         Self::run_migration_tasks_with_global_limit(
                             retry_tasks,
@@ -2099,6 +2380,7 @@ impl ClusterCoordinator {
                             self_id,
                             throttle_ref,
                             secret_ref,
+                            Some(relinquish_ctx),
                         );
                     });
                 }
@@ -2726,6 +3008,7 @@ impl ClusterCoordinator {
                 })
                 .cloned()
                 .collect();
+
             let inbound = all_tasks.iter().filter(|t| t.to_node == self_id).count();
             let master_out = outbound_tasks.iter().filter(|t| t.is_master).count();
             let replica_out = outbound_tasks.iter().filter(|t| !t.is_master).count();
@@ -2831,6 +3114,25 @@ impl ClusterCoordinator {
             let throttle_w = migration_throttle.clone();
             let secret_w = cluster_secret.clone();
 
+            // Task #25 — relinquish context: snapshot the committed member set,
+            // RF, and the currently-live members so a failed outbound master
+            // handoff can decide whether to drop a phantom mastership (the
+            // committed master is a live peer already serving the shard) instead
+            // of rolling the shard back to self. Live = peers we hold an address
+            // for, plus self (always live from its own POV).
+            let relinquish_ctx = {
+                let mut live_members: std::collections::HashSet<NodeId> =
+                    node_addrs.read().keys().copied().collect();
+                live_members.insert(self_id);
+                Arc::new(RelinquishContext {
+                    committed_members: members.to_vec(),
+                    rf,
+                    self_id,
+                    live_members,
+                    engine: engine.clone(),
+                })
+            };
+
             std::thread::spawn(move || {
                 let pre_swap_keys_by_shard = engine_w.keys_by_shard_filtered(&outbound_shard_set);
                 let pre_swap_keys: Vec<TxKey> = pre_swap_keys_by_shard
@@ -2856,6 +3158,7 @@ impl ClusterCoordinator {
                     self_id,
                     throttle_w,
                     secret_w,
+                    Some(relinquish_ctx),
                 );
             });
         }
@@ -2963,6 +3266,7 @@ impl ClusterCoordinator {
         self_id: NodeId,
         throttle: Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: Option<Arc<Vec<u8>>>,
+        relinquish_ctx: Option<Arc<RelinquishContext>>,
     ) {
         if tasks.is_empty() {
             return;
@@ -3036,6 +3340,7 @@ impl ClusterCoordinator {
                     let migrating_bm = migrating_bm.clone();
                     let inbound_bm = inbound_bm.clone();
                     let secret = cluster_secret.clone();
+                    let relinquish_ctx = relinquish_ctx.clone();
 
                     // Collect all keys for shards going to this target.
                     let mut target_keys: Vec<TxKey> = Vec::new();
@@ -3062,6 +3367,7 @@ impl ClusterCoordinator {
                             inbound_bm,
                             self_id,
                             secret,
+                            relinquish_ctx.as_deref(),
                         );
                     });
                 }
@@ -3823,6 +4129,7 @@ pub fn run_migration_chaos_test_batch(
         inbound_bm,
         task.from_node,
         None,
+        None,
     );
 
     let table = shard_table.read();
@@ -3949,6 +4256,7 @@ fn run_migration_batch(
     inbound_bm: Arc<crate::cluster::migration::AtomicShardBitmap>,
     self_id: NodeId,
     cluster_secret: Option<Arc<Vec<u8>>>,
+    relinquish_ctx: Option<&RelinquishContext>,
 ) {
     let auth_secret = cluster_secret.as_deref().map(Vec::as_slice);
     let addr = match target_addr {
@@ -4025,8 +4333,8 @@ fn run_migration_batch(
             topology_epoch,
             auth_secret,
         );
-        for (task, delivered) in skipped_tasks.iter().zip(delivered) {
-            if delivered {
+        for (task, outcome) in skipped_tasks.iter().zip(delivered) {
+            if outcome.delivered() {
                 if complete_migration_task_current_epoch(
                     migration,
                     shard_table,
@@ -4045,7 +4353,9 @@ fn run_migration_batch(
                 &migrating_bm,
                 task,
                 topology_epoch,
-                false,
+                // Already-serving (ServingNew) skip tasks were never
+                // table-committed by this batch; leave the table untouched.
+                FailedTaskTableAction::None,
             ) {
                 failed.fetch_add(1, Ordering::Relaxed);
             }
@@ -4121,8 +4431,8 @@ fn run_migration_batch(
                 topology_epoch,
                 auth_secret,
             );
-            for (task, delivered) in ready_empty_tasks.iter().zip(delivered) {
-                if delivered {
+            for (task, outcome) in ready_empty_tasks.iter().zip(delivered) {
+                if outcome.delivered() {
                     let should_commit_local_handoff = {
                         let table = shard_table.read();
                         let target_assignment = table.target_assignment(task.shard);
@@ -4149,14 +4459,16 @@ fn run_migration_batch(
                             topology_epoch,
                         );
                     }
-                } else if fail_migration_task_current_epoch(
+                } else if fail_or_relinquish_outbound_task(
                     migration,
                     shard_table,
                     &fenced_bm,
                     &migrating_bm,
                     task,
                     topology_epoch,
-                    true,
+                    // Empty shard: relinquish is trivially no-loss (nothing to
+                    // lose); the wrapper confirms the committed master anyway.
+                    relinquish_ctx,
                 ) {
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -4427,14 +4739,21 @@ fn run_migration_batch(
                                 "baseline streaming failed",
                                 auth_secret,
                             );
-                            if fail_migration_task_current_epoch(
+                            // Task #25 — baseline streaming failures are
+                            // typically the target's per-IP connection cap
+                            // resetting the migration burst (the dominant
+                            // scale-down/rejoin failure). Relinquish only when a
+                            // verify-only probe confirms the committed master
+                            // already holds a superset of self's records
+                            // (no-loss-safe); otherwise roll back to self.
+                            if fail_or_relinquish_outbound_task(
                                 &migration,
                                 shard_table,
                                 &fenced_bm,
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                relinquish_ctx,
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -4600,14 +4919,20 @@ fn run_migration_batch(
                                 "manifest verification failed",
                                 auth_secret,
                             );
-                            if fail_migration_task_current_epoch(
+                            // Task #25 — the completion was rejected (the target
+                            // already serves the shard / manifest mismatch). If a
+                            // verify-only probe confirms the committed master
+                            // holds a superset of self's records, relinquish
+                            // rather than re-cement the phantom.
+                            let _ = &e;
+                            if fail_or_relinquish_outbound_task(
                                 &migration,
                                 shard_table,
                                 &fenced_bm,
                                 &migrating_bm,
                                 task,
                                 topology_epoch,
-                                true,
+                                relinquish_ctx,
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -4627,8 +4952,8 @@ fn run_migration_batch(
                                 topology_epoch,
                                 auth_secret,
                             );
-                        for (task, delivered) in verified_tasks.iter().zip(delivered) {
-                            if !delivered {
+                        for (task, outcome) in verified_tasks.iter().zip(delivered) {
+                            if !outcome.delivered() {
                                 tracing::warn!(
                                     shard = task.shard,
                                     "cluster: batched verified completion failed",
@@ -4639,14 +4964,19 @@ fn run_migration_batch(
                                     "completion commit failed",
                                     auth_secret,
                                 );
-                                if fail_migration_task_current_epoch(
+                                // Task #25 — commit handshake failed. Relinquish
+                                // only if a verify-only probe confirms the
+                                // committed master holds a superset of self's
+                                // records; otherwise keep rollback-to-self.
+                                let _ = outcome;
+                                if fail_or_relinquish_outbound_task(
                                     &migration,
                                     shard_table,
                                     &fenced_bm,
                                     &migrating_bm,
                                     task,
                                     topology_epoch,
-                                    true,
+                                    relinquish_ctx,
                                 ) {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -5280,7 +5610,7 @@ fn send_completion_only_handshakes(
     from_node: NodeId,
     topology_epoch: u64,
     auth_secret: Option<&[u8]>,
-) -> Vec<bool> {
+) -> Vec<HandshakeOutcome> {
     if tasks.is_empty() {
         return Vec::new();
     }
@@ -5339,7 +5669,7 @@ fn send_completion_only_handshakes(
         match exchange_frame(&mut stream, &request, auth_secret) {
             Ok(response) => {
                 if response.status == STATUS_OK {
-                    return vec![true; tasks.len()];
+                    return vec![HandshakeOutcome::Delivered; tasks.len()];
                 }
                 // Error responses carry [code:2][msg_len:2][msg:N].
                 let code = if response.payload.len() >= 2 {
@@ -5373,7 +5703,7 @@ fn send_completion_only_handshakes(
                     shards = tasks.len(),
                     "cluster: batch-complete rejected by target",
                 );
-                return vec![false; tasks.len()];
+                return vec![HandshakeOutcome::HardReject; tasks.len()];
             }
             Err(e) => {
                 tracing::warn!(
@@ -5393,7 +5723,7 @@ fn send_completion_only_handshakes(
         shards = tasks.len(),
         "cluster: batch-complete exhausted retries",
     );
-    vec![false; tasks.len()]
+    vec![HandshakeOutcome::Unconfirmed; tasks.len()]
 }
 
 /// Convert a redo log entry to a ReplicaOp if it belongs to the given shard.
@@ -8374,6 +8704,255 @@ mod tests {
         assert!(!migrating_bm.test(shard));
     }
 
+    // ---- Task #25: no-loss-safe relinquish on failed outbound handoff ----
+
+    /// Build a (self_is_phantom_master) handoff table for one shard plus the
+    /// committed-member context, returning the shard, the rightful committed
+    /// master, and the master MigrationTask self would push.
+    fn phantom_handoff_fixture() -> (ShardTable, u16, NodeId, NodeId, Vec<NodeId>, MigrationTask) {
+        // Committed cluster {1,2,3}, RF=2. Pick a shard whose round-robin
+        // master is NOT node 1 — that is the shard node 1 would be a phantom
+        // master of after re-asserting stale ownership.
+        let self_id = NodeId(1);
+        let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let committed = ShardTable::compute_with_epoch(&committed_members, 2, 9);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let m = committed.target_assignment(s).master;
+                m != self_id && committed.target_assignment(s).replicas.contains(&self_id)
+            })
+            .expect("a shard mastered by a peer with node-1 as replica must exist");
+        let rightful = committed.target_assignment(shard).master;
+
+        // Old table: node 1 is the (stale) master, rightful peer is a replica.
+        // New table == committed round-robin (rightful is master). begin_handoff
+        // then puts `shard` into Copying with node 1 as old master, `rightful`
+        // as the new/target master — exactly the phantom-handoff state.
+        let mut old_table = committed.clone();
+        old_table.set_master_for_shard(shard, self_id);
+        let mut table = old_table;
+        table.begin_handoff_with(&committed, |s| s == shard);
+
+        let task = MigrationTask {
+            shard,
+            from_node: self_id,
+            to_node: rightful,
+            is_master: true,
+        };
+        (table, shard, self_id, rightful, committed_members, task)
+    }
+
+    #[test]
+    fn empty_local_shard_relinquishes_to_live_committed_master() {
+        // self holds NO records for the shard and the committed master is a
+        // different, live member → trivially no-loss to drop.
+        let (table, shard, self_id, rightful, committed_members, task) = phantom_handoff_fixture();
+        // Sanity: before the decision, self IS the effective (serving) master,
+        // and the table hands off to the rightful committed master.
+        assert_eq!(table.effective_assignment(shard).master, self_id);
+        assert_eq!(table.target_assignment(shard).master, rightful);
+        let live_members: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+
+        let disposition = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ false,
+        );
+        assert_eq!(
+            disposition,
+            FailedHandoffDisposition::RelinquishToCommittedMaster,
+            "an empty local shard to a live committed master is no-loss to drop",
+        );
+    }
+
+    #[test]
+    fn relinquish_action_drops_self_and_converges_to_single_master() {
+        // End-to-end through fail_migration_task_current_epoch: a Relinquish
+        // action must COMMIT the shard to the committed master (single master),
+        // whereas Rollback (the fail-before behaviour) keeps self → two masters.
+        let (table, shard, self_id, rightful, _committed_members, task) = phantom_handoff_fixture();
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        {
+            let mut mgr = migration.lock();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                self_id,
+                &std::collections::HashSet::from([shard]),
+            );
+            mgr.mark_fenced(&task, 5);
+        }
+        fenced_bm.set(shard);
+        migrating_bm.set(shard);
+
+        assert!(fail_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &task,
+            epoch,
+            FailedTaskTableAction::Relinquish,
+        ));
+
+        let t = shard_table.read();
+        // Self dropped: the shard now serves from the committed assignment with
+        // `rightful` as the single master, and self is no longer master.
+        assert_eq!(
+            t.effective_assignment(shard).master,
+            rightful,
+            "relinquish must commit the shard to the committed master",
+        );
+        assert_ne!(t.effective_assignment(shard).master, self_id);
+    }
+
+    #[test]
+    fn rollback_action_keeps_self_as_master_fail_before() {
+        // Documents the fail-before behaviour the bug exhibited: Rollback
+        // restores self as master, so the phantom over-count persists.
+        let (table, shard, self_id, rightful, _committed_members, task) = phantom_handoff_fixture();
+        let epoch = table.version;
+        let shard_table = Arc::new(ShardTableLock::new(table));
+
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        {
+            let mut mgr = migration.lock();
+            mgr.start_outbound(
+                std::slice::from_ref(&task),
+                self_id,
+                &std::collections::HashSet::from([shard]),
+            );
+            mgr.mark_fenced(&task, 5);
+        }
+        fenced_bm.set(shard);
+        migrating_bm.set(shard);
+
+        assert!(fail_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            &task,
+            epoch,
+            FailedTaskTableAction::Rollback,
+        ));
+
+        let t = shard_table.read();
+        assert_eq!(
+            t.effective_assignment(shard).master,
+            self_id,
+            "rollback restores self — this is the non-converging fail-before path",
+        );
+        let _ = rightful;
+    }
+
+    #[test]
+    fn no_loss_guard_keeps_rollback_when_self_holds_records() {
+        // self holds records → a failed handoff cannot prove the rightful master
+        // has a superset, and a one-sided drop strands the read. MUST keep
+        // rollback-to-self. This is the case the 1/5000-read-loss regression
+        // exposed when relinquish was attempted for non-empty shards.
+        let (table, _shard, self_id, _rightful, committed_members, task) =
+            phantom_handoff_fixture();
+        let live_members: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+
+        let disposition = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ true,
+        );
+        assert_eq!(
+            disposition,
+            FailedHandoffDisposition::RollbackToSelf,
+            "a non-empty local copy must never be dropped on a failed handoff",
+        );
+    }
+
+    #[test]
+    fn no_loss_guard_keeps_rollback_when_rightful_master_dead() {
+        // Empty shard (would otherwise drop), but the committed master is NOT
+        // live → keep rollback.
+        let (table, _shard, self_id, rightful, committed_members, task) = phantom_handoff_fixture();
+        let mut live_members: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+        live_members.remove(&rightful); // rightful master crashed
+
+        let disposition = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ false,
+        );
+        assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
+    }
+
+    #[test]
+    fn no_loss_guard_keeps_rollback_when_self_pending_inbound() {
+        // Self is mid-inbound for the shard — its copy could be the one being
+        // assembled, so dropping is unsafe even when empty.
+        let (table, _shard, self_id, _rightful, committed_members, task) =
+            phantom_handoff_fixture();
+        let live_members: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+
+        let disposition = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ true,
+            /* self_holds_records */ false,
+        );
+        assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
+    }
+
+    #[test]
+    fn no_loss_guard_keeps_rollback_for_replica_task() {
+        // A replica-role handoff failure never causes the master over-count and
+        // must never relinquish.
+        let (table, _shard, self_id, _rightful, committed_members, mut task) =
+            phantom_handoff_fixture();
+        task.is_master = false;
+        let live_members: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+
+        let disposition = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ false,
+        );
+        assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
+    }
+
     #[test]
     fn running_cluster_reports_inbound_migration_pressure() {
         let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1);
@@ -9264,6 +9843,7 @@ mod tests {
             inbound_bm,
             old_master,
             None,
+            None,
         );
 
         let table = shard_table.read();
@@ -9377,6 +9957,7 @@ mod tests {
             migrating_bm,
             inbound_bm,
             old_master,
+            None,
             None,
         );
 
@@ -9572,6 +10153,7 @@ mod tests {
             migrating_bm.clone(),
             inbound_bm,
             old_master,
+            None,
             None,
         );
 
@@ -9770,6 +10352,7 @@ mod tests {
             inbound_bm,
             old_master,
             None,
+            None,
         );
 
         // Silent-drop variant of the pipelined failure contract. The
@@ -9956,6 +10539,7 @@ mod tests {
             inbound_bm,
             old_master,
             None,
+            None,
         );
 
         let mut seen = Vec::new();
@@ -10081,6 +10665,7 @@ mod tests {
             migrating_bm,
             inbound_bm,
             old_master,
+            None,
             None,
         );
 
@@ -10381,7 +10966,7 @@ mod tests {
         let delivered = send_completion_only_handshakes(target_addr, &tasks, NodeId(1), 42, None);
         assert_eq!(
             delivered,
-            vec![true],
+            vec![HandshakeOutcome::Delivered],
             "after the target activates the epoch, the retried handshake must succeed"
         );
         receiver.join().unwrap();
@@ -10436,7 +11021,7 @@ mod tests {
         let delivered = send_completion_only_handshakes(target_addr, &tasks, NodeId(1), 3, None);
         assert_eq!(
             delivered,
-            vec![false, false],
+            vec![HandshakeOutcome::HardReject, HandshakeOutcome::HardReject],
             "a hard rejection must never be reported as delivered"
         );
         receiver.join().unwrap();
