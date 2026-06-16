@@ -934,9 +934,20 @@ pub fn handle_replica_batch_with_tracker(
         0
     };
 
+    // Migration-baseline applies SKIP the per-op redo journal. The
+    // single 64 MiB redo log would otherwise fill during a large
+    // baseline stream (`redo log full`), stalling scale-down convergence
+    // and aborting rejoin-after-quiesce. Migrated baseline data is
+    // idempotently re-drivable from the source under the persisted
+    // inbound fence (the source does not commit the handoff until
+    // `OP_MIGRATION_COMPLETE`), so it needs no receiver redo entry for
+    // crash-safety. Out-of-band / compensation batches carry no
+    // `FLAG_MIGRATION_BATCH` (`is_migration == false`) and therefore keep
+    // journalling — they are normal replicated mutations.
+    let journal = !is_migration;
     let start_seq = batch.first_sequence + skip_count as u64;
     for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
-        if let Err(msg) = apply_op(engine, op) {
+        if let Err(msg) = apply_op_journal(engine, op, journal) {
             let ack = ReplicaAck::Error {
                 failed_sequence: seq,
                 message: msg,
@@ -1235,6 +1246,52 @@ fn record_apply_divergence(op_name: &'static str, tx_key: &TxKey, detail: &str) 
 /// not-found records), or `Err(message)` if the operation fails in a
 /// way that should abort the batch.
 pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), String> {
+    // Default: journal the post-apply redo entry. The journalling
+    // discriminator lives in `apply_op_journal`; normal-replication and
+    // out-of-band / compensation applies always journal so the replica
+    // can self-recover via its own redo log on crash.
+    apply_op_journal(engine, op, true)
+}
+
+/// Apply a `ReplicaOp` to the engine, optionally writing the post-apply
+/// redo entry.
+///
+/// `journal == true` (the [`apply_op`] default) preserves the R-034
+/// discipline: each apply also appends a post-apply redo entry so the
+/// replica can replay through its own crash recovery without a full
+/// resync of every surviving replica.
+///
+/// `journal == false` is used ONLY for `FLAG_MIGRATION_BATCH` baseline
+/// applies. Migrated baseline data is idempotently re-drivable from the
+/// source under the persisted inbound fence: the source never commits
+/// the handoff until `OP_MIGRATION_COMPLETE`, so a receiver that crashes
+/// mid-baseline re-acquires the fence and the source re-runs a fresh
+/// full baseline. Baseline records therefore do NOT need a receiver redo
+/// entry for crash-safety, and journalling them would fill the single
+/// 64 MiB redo log during a large migration (`redo log full`), which is
+/// the bug this skip fixes. Out-of-band / compensation ops are NORMAL
+/// replicated mutations (not re-drivable from a source the same way) and
+/// MUST always journal — callers pass `journal = true` for those.
+pub fn apply_op_journal(
+    engine: &Engine,
+    op: &ReplicaOp,
+    journal: bool,
+) -> std::result::Result<(), String> {
+    // When journalling is disabled (migration-baseline apply), suppress
+    // ALL engine-internal redo writes for the duration of this apply too —
+    // not just the post-apply replica redo entry below. A baseline Create
+    // also drives `engine.create` (unmined secondary insert) and
+    // `restore_migrated_lifecycle` (DAH/unmined secondary intents), each of
+    // which journals via the engine's redo log; without this guard those
+    // alone fill the single 64 MiB redo log during a large migration. The
+    // guard suppresses redo only — the data, secondary indexes, and primary
+    // cache are still updated. See `Engine::MigrationJournalGuard`.
+    let _journal_guard = if journal {
+        None
+    } else {
+        Some(crate::ops::engine::MigrationJournalGuard::enter())
+    };
+
     // Pre-apply generation guard: reject stale ops BEFORE mutating state.
     // An op is stale if the record's current generation is strictly ahead of
     // the master's generation under wrapping serial-number ordering. A target
@@ -1823,7 +1880,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
     // the master uses on its own write path. Failure to journal the entry
     // is a hard batch-level error: ACKing without the local log would
     // re-introduce the same divergence R-034 was opened to fix.
-    if let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
+    if journal && let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
         write_replica_redo_entry(engine, &redo_op)?;
     }
 

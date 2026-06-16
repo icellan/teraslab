@@ -2,7 +2,7 @@
 //!
 //! Drives a shard migration the way the production receiver does — streaming
 //! baseline `ReplicaOp::Create` records from an OLD master into a NEW master
-//! via the real [`apply_op`] apply path — then CRASHES the new master
+//! via the real apply path — then CRASHES the new master
 //! mid-stream (power loss with a volatile write cache, before the receiver's
 //! end-of-batch device fsync + redo flush, and before the migration is marked
 //! complete). It then RESTARTS the new master through the production recovery
@@ -26,10 +26,23 @@
 //! a deterministic kill without sleeps-as-synchronization. Per the F-3 task
 //! guidance, this test drives the migration APPLY + inbound-state PERSISTENCE
 //! state machine directly with an injected crash point. The apply path
-//! (`apply_op` → `engine.create`), the inbound-state persistence
-//! (`persist_inbound_state`, fsynced on every change), and the restore path
-//! (`load_inbound_state` → `restore_inbound`) are the exact production
-//! components; only the network transport is elided.
+//! (`apply_op_journal(.., journal=false)` → `engine.create`), the
+//! inbound-state persistence (`persist_inbound_state`, fsynced on every
+//! change), and the restore path (`load_inbound_state` → `restore_inbound`)
+//! are the exact production components; only the network transport is elided.
+//!
+//! ## No-journal baseline (redo-full fix)
+//!
+//! Production migration-baseline applies SKIP the per-op receiver redo write
+//! (`apply_op_journal(.., journal=false)`): the single 64 MiB redo log would
+//! otherwise fill during a large baseline stream. This is crash-safe because
+//! migrated baseline data is idempotently RE-DRIVABLE FROM THE SOURCE under
+//! the persisted inbound fence — the source never commits the handoff until
+//! `OP_MIGRATION_COMPLETE`, so a receiver that crashes mid-baseline
+//! re-acquires the fence and the source re-runs a fresh full baseline. The
+//! load-bearing safety check below is the committed-source boundary: the
+//! source never commits on a receiver crash, so no record is lost even though
+//! the receiver journalled nothing for the baseline.
 //!
 //! Requires the `fault-injection` feature flag (to match the migration test
 //! family; the test itself uses only stable APIs):
@@ -56,7 +69,7 @@ use teraslab::ops::engine::Engine;
 use teraslab::recovery::recover_all_with_allocator;
 use teraslab::redo::RedoLog;
 use teraslab::replication::protocol::ReplicaOp;
-use teraslab::replication::receiver::apply_op;
+use teraslab::replication::receiver::apply_op_journal;
 
 const DATA_SIZE: u64 = 32 * 1024 * 1024;
 const REDO_SIZE: u64 = 1024 * 1024;
@@ -300,7 +313,9 @@ fn crash_mid_migration_no_loss_no_dup_no_dual_master() {
     let crash_after = NUM_RECORDS / 2;
     for (i, k) in keys.iter().enumerate() {
         let op = build_migration_create_op(&old.engine, k);
-        apply_op(&new.engine, &op).expect("migration apply");
+        // Production migration-baseline path: journal = false. No receiver
+        // redo entry is written for migrated baseline records.
+        apply_op_journal(&new.engine, &op, false).expect("migration apply");
         if i + 1 == crash_after {
             break;
         }
@@ -418,11 +433,23 @@ fn clean_migration_completes_with_single_master() {
     assert!(new_mgr.mark_inbound_active(shard));
     persist_inbound_state(&inbound_path, &new_mgr);
 
-    // Stream ALL records, then complete.
+    // Stream ALL records, then complete. journal = false (production
+    // migration-baseline path: no receiver redo entries written).
     for k in &keys {
         let op = build_migration_create_op(&old.engine, k);
-        apply_op(&new.engine, &op).expect("migration apply");
+        apply_op_journal(&new.engine, &op, false).expect("migration apply");
     }
+
+    // No-journal invariant: the receiver wrote ZERO redo entries for the
+    // entire baseline stream. This is what keeps the single redo log from
+    // filling during a large migration. (The data itself is still durable;
+    // only the redo journalling is skipped.)
+    assert_eq!(
+        new.redo_log.lock().earliest_sequence().unwrap(),
+        None,
+        "migration-baseline applies must not write receiver redo entries",
+    );
+
     new.make_durable();
     // Proven completion: mark inbound complete + persist, and the source
     // commits the handoff away.
@@ -441,5 +468,210 @@ fn clean_migration_completes_with_single_master() {
     assert_eq!(
         new_set, original,
         "new master serves every record, none lost"
+    );
+}
+
+/// A node with a deliberately tiny redo log, used by the redo-capacity
+/// regression tests. The data device is large enough for hundreds of
+/// records; only the redo region is small so that journalling the baseline
+/// would overflow it.
+struct TinyRedoNode {
+    data_dev: Arc<MemoryDevice>,
+    #[allow(dead_code)]
+    redo_dev: Arc<MemoryDevice>,
+    redo_log: Arc<Mutex<RedoLog>>,
+    engine: Arc<Engine>,
+}
+
+impl TinyRedoNode {
+    fn new(redo_size: u64) -> Self {
+        let data_dev = Arc::new(MemoryDevice::new(DATA_SIZE, ALIGN).unwrap());
+        let redo_dev = Arc::new(MemoryDevice::new(redo_size, ALIGN).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+        let index = PrimaryBackend::new_in_memory(4096).unwrap();
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, redo_size).unwrap(),
+        ));
+        let engine = Arc::new(Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahBackend::new_in_memory(),
+            UnminedBackend::new_in_memory(),
+        ));
+        engine.set_redo_log(redo_log.clone());
+        Self {
+            data_dev,
+            redo_dev,
+            redo_log,
+            engine,
+        }
+    }
+}
+
+/// HEADLINE REGRESSION (fail-before / pass-after): a migration whose
+/// baseline op-count would exceed redo capacity COMPLETES without
+/// `LogFull` once baseline applies skip the receiver redo journal.
+///
+/// The test first proves the regression is real — journalling the SAME
+/// stream into the SAME tiny redo log hits `RedoError::LogFull` before the
+/// stream completes (fail-before). It then streams with `journal = false`
+/// and asserts the full baseline applies with the redo log staying empty
+/// and every record present (pass-after).
+#[test]
+fn large_migration_baseline_completes_without_log_full() {
+    // Header block is one ALIGN-sized block; two blocks is the minimum
+    // region. With ~4 KiB usable, a CreateV2 redo entry (>100 bytes) lets
+    // only a few dozen entries fit — far fewer than NUM.
+    let redo_size = 2 * ALIGN as u64; // 8 KiB
+    const NUM: usize = 400;
+
+    let source = TinyRedoNode::new(8 * 1024 * 1024); // ample redo for source
+    let keys: Vec<TxKey> = (0..NUM).map(key).collect();
+    for n in 0..NUM {
+        let hashes = [slot_hash(n, 0)];
+        source.engine.create(&create_req(n, &hashes)).unwrap();
+    }
+    source.data_dev.sync().unwrap();
+
+    // --- fail-before: journalling the baseline overflows the tiny redo. ---
+    {
+        let journalled = TinyRedoNode::new(redo_size);
+        let mut hit_log_full = false;
+        for k in &keys {
+            let op = build_migration_create_op(&source.engine, k);
+            // journal = true is the OLD (pre-fix) migration behaviour.
+            match apply_op_journal(&journalled.engine, &op, true) {
+                Ok(()) => {}
+                Err(e) => {
+                    assert!(
+                        e.contains("redo log full"),
+                        "the only expected failure is redo log full, got: {e}",
+                    );
+                    hit_log_full = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            hit_log_full,
+            "fail-before: journalling {NUM} baseline ops into an 8 KiB redo \
+             MUST hit LogFull — if it does not, the regression setup is wrong",
+        );
+    }
+
+    // --- pass-after: no-journal baseline completes, redo stays empty. ---
+    let receiver = TinyRedoNode::new(redo_size);
+    for k in &keys {
+        let op = build_migration_create_op(&source.engine, k);
+        apply_op_journal(&receiver.engine, &op, false)
+            .expect("no-journal migration baseline must apply without LogFull");
+    }
+    receiver.data_dev.sync().unwrap();
+
+    // Receiver redo usage stayed bounded: ZERO entries written.
+    assert_eq!(
+        receiver.redo_log.lock().earliest_sequence().unwrap(),
+        None,
+        "no-journal baseline must leave the receiver redo log empty",
+    );
+    assert_eq!(
+        receiver.redo_log.lock().current_sequence(),
+        1,
+        "a fresh log starts at next_sequence == 1; a no-journal baseline must \
+         not consume any sequence numbers (it stays at 1)",
+    );
+
+    // Every record is durably applied on the receiver.
+    for k in &keys {
+        assert!(
+            receiver.engine.lookup(k).is_some(),
+            "every migrated record must be present after no-journal baseline",
+        );
+        // Structurally intact (not torn).
+        let meta = receiver.engine.read_metadata(k).unwrap();
+        let utxo_count = { meta.utxo_count };
+        for v in 0..utxo_count {
+            receiver.engine.read_slot(k, v).unwrap();
+        }
+    }
+}
+
+/// Receiver crash mid no-journal baseline still recovers via the inbound
+/// fence + source re-drive. Because the baseline wrote NO receiver redo,
+/// recovery cannot (and must not need to) replay it; the fence keeps the
+/// receiver from serving the partial shard, and the source — which never
+/// committed the handoff — re-runs a fresh full baseline. We assert the
+/// re-driven baseline then completes cleanly with all records present.
+#[test]
+fn receiver_crash_mid_no_journal_baseline_recovers_via_fence_and_redrive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inbound_path = tmp.path().join("inbound.state");
+
+    // Durable source holding the full shard.
+    let old = Node::new(false);
+    let keys: Vec<TxKey> = (0..NUM_RECORDS).map(key).collect();
+    for n in 0..NUM_RECORDS {
+        let hashes = [slot_hash(n, 0), slot_hash(n, 1)];
+        old.engine.create(&create_req(n, &hashes)).unwrap();
+    }
+    old.make_durable();
+    let shard = ShardTable::shard_for_key(&keys[0]);
+    let original: BTreeSet<[u8; 32]> = keys.iter().map(|k| k.txid).collect();
+
+    // Receiver begins inbound migration; persist the fence (fsync).
+    let new = Node::new(true);
+    let mut new_mgr = MigrationManager::new();
+    assert!(new_mgr.mark_inbound_active(shard));
+    persist_inbound_state(&inbound_path, &new_mgr);
+
+    // Apply HALF the no-journal baseline, then power-loss before completion.
+    for (i, k) in keys.iter().enumerate() {
+        let op = build_migration_create_op(&old.engine, k);
+        apply_op_journal(&new.engine, &op, false).expect("migration apply");
+        if i + 1 == NUM_RECORDS / 2 {
+            break;
+        }
+    }
+    assert!(new.data_dev.simulate_power_loss());
+    assert!(new.redo_dev.simulate_power_loss());
+
+    // Restart through real recovery. The no-journal baseline left no redo,
+    // so recovery replays nothing for it — and that is correct.
+    let _new_recovered = new.recover();
+    let mut restored_mgr = MigrationManager::new();
+    restored_mgr.restore_inbound(&load_inbound_state(&inbound_path));
+
+    // FENCE intact: the receiver still refuses to serve the shard, so the
+    // source remains the sole master (committed-source boundary held).
+    assert!(
+        restored_mgr.has_pending_inbound(shard),
+        "after crash mid no-journal baseline, the receiver must still be \
+         fenced (pending-inbound) so the source stays sole master",
+    );
+    let old_set = master_record_set(&old.engine, &keys, &new_mgr_source(), shard, true);
+    assert_eq!(
+        old_set, original,
+        "source never committed the handoff: it still serves the full shard",
+    );
+
+    // SOURCE RE-DRIVE: the source re-runs a FRESH full baseline into a clean
+    // receiver engine (modeling the post-crash retry). With the fence still
+    // pending, this re-applies every record idempotently and completes.
+    let redriven = Node::new(false);
+    let mut redrive_mgr = MigrationManager::new();
+    assert!(redrive_mgr.mark_inbound_active(shard));
+    for k in &keys {
+        let op = build_migration_create_op(&old.engine, k);
+        apply_op_journal(&redriven.engine, &op, false).expect("re-drive apply");
+    }
+    redriven.make_durable();
+    redrive_mgr.mark_inbound_complete(shard);
+
+    let redriven_set = master_record_set(&redriven.engine, &keys, &redrive_mgr, shard, true);
+    assert_eq!(
+        redriven_set, original,
+        "source re-drive recovers the full shard with no loss",
     );
 }

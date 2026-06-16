@@ -37,6 +37,26 @@ use teraslab::server::startup::{
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
+/// Classify a flattened (`String`) error from the replication
+/// intent-recovery path as transient redo backpressure.
+///
+/// `recover_pending_replication_intents` returns `Result<(), String>`, so
+/// the typed [`teraslab::redo::RedoError::LogFull`] variant has already
+/// been flattened by the time the startup barrier sees it. A full redo log
+/// on rejoin is transient self-healing backpressure — the inbound
+/// migration applies that fill it are idempotently re-drivable from their
+/// source under the persisted inbound fence, and the checkpointer/catch-up
+/// will free space. It must therefore route to the retry path, never to
+/// the terminal `process::exit(1)` arm (which would leave the cluster
+/// permanently stuck at 0/N ready, scenario_09). Genuine device/IO faults
+/// (`Poisoned`, I/O errors) do NOT match here and stay terminal.
+///
+/// The match is against [`teraslab::redo::LOG_FULL_MESSAGE_PREFIX`] so the
+/// `Display` format and this discriminator cannot drift apart.
+fn is_redo_pressure(err: &str) -> bool {
+    err.contains(teraslab::redo::LOG_FULL_MESSAGE_PREFIX)
+}
+
 /// Walk local interfaces via `getifaddrs(3)` and return the first
 /// non-loopback IPv4 address. Used as a best-effort fallback when
 /// `listen_addr = 0.0.0.0` and the operator did not configure
@@ -1115,6 +1135,24 @@ fn main() {
                     &engine,
                 ) {
                     Ok(()) => break,
+                    // Redo-pressure (`RedoError::LogFull`) on rejoin is
+                    // transient self-healing backpressure, NOT a terminal
+                    // fault: the inbound migration applies that are filling
+                    // the redo log are idempotently re-drivable from their
+                    // source under the persisted inbound fence, so the
+                    // checkpointer/catch-up will drain the log and free space.
+                    // Aborting here would leave the cluster permanently stuck
+                    // at 0/N ready (rejoin-after-quiesce, scenario_09). Keep
+                    // retrying past the 60s window — only the marker re-drive
+                    // is deferred, no client is served yet.
+                    Err(e) if is_redo_pressure(&e) => {
+                        tracing::warn!(
+                            err = %e,
+                            "replication intent recovery deferred by redo backpressure; \
+                             retrying (transient, re-drivable from source)",
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
                     Err(e) if start.elapsed() < std::time::Duration::from_secs(60) => {
                         tracing::warn!(
                             err = %e,
@@ -1682,3 +1720,60 @@ fn init_tracing_subscriber_fallback() {
 // invariant ("recovery completes before any listener accepts") lives in
 // `tests/g10_lifecycle.rs`, where a slow-recovery fault-injection point
 // proves no TCP/HTTP socket can answer during the recovery window.
+
+#[cfg(test)]
+mod tests {
+    use super::is_redo_pressure;
+    use teraslab::redo::RedoError;
+
+    /// The intent-recovery startup barrier downgrades `RedoError::LogFull`
+    /// (transient redo backpressure, re-drivable from source) to the retry
+    /// path. The discriminator must recognise the flattened `Display`
+    /// string of the `LogFull` variant.
+    #[test]
+    fn log_full_is_redo_pressure_routes_to_retry() {
+        // The recovery path flattens RedoError -> String, so feed the
+        // canonical Display the same way the barrier would observe it.
+        let log_full = RedoError::LogFull {
+            used: 64 * 1024 * 1024,
+            capacity: 64 * 1024 * 1024,
+        }
+        .to_string();
+        assert!(
+            is_redo_pressure(&log_full),
+            "LogFull must route to the retry path, not terminal exit; got {log_full:?}",
+        );
+
+        // A wrapped form (intent-recovery sometimes prefixes context) must
+        // still be detected via substring.
+        let wrapped = format!("replication intent re-replication: {log_full}");
+        assert!(
+            is_redo_pressure(&wrapped),
+            "wrapped LogFull must still route to retry; got {wrapped:?}",
+        );
+    }
+
+    /// Genuine device/IO faults must NOT be downgraded — they stay on the
+    /// terminal abort arm so a real fault is not retried forever.
+    #[test]
+    fn device_and_poison_faults_stay_terminal() {
+        let poisoned = RedoError::Poisoned.to_string();
+        assert!(
+            !is_redo_pressure(&poisoned),
+            "Poisoned is a terminal fault, must not route to retry; got {poisoned:?}",
+        );
+
+        let checksum = RedoError::ChecksumMismatch { offset: 4096 }.to_string();
+        assert!(
+            !is_redo_pressure(&checksum),
+            "checksum mismatch is terminal, must not route to retry; got {checksum:?}",
+        );
+
+        // A bare device I/O message (no "redo log full" substring) is terminal.
+        let io = "read redo for pending replication intent failed".to_string();
+        assert!(
+            !is_redo_pressure(&io),
+            "device I/O failure is terminal, must not route to retry; got {io:?}",
+        );
+    }
+}

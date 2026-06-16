@@ -48,6 +48,17 @@ use thiserror::Error;
 // Error
 // ---------------------------------------------------------------------------
 
+/// Stable prefix of the [`RedoError::LogFull`] `Display` string.
+///
+/// Some call paths flatten `RedoError` into a `String` (e.g. the
+/// replication intent-recovery path returns `Result<(), String>`).
+/// Callers that must discriminate transient redo backpressure from
+/// terminal device faults match against this prefix instead of
+/// hard-coding the literal, so the `Display` format and the discriminator
+/// cannot drift apart. The full `Display` is
+/// `"redo log full: {used}/{capacity} bytes used"`.
+pub const LOG_FULL_MESSAGE_PREFIX: &str = "redo log full";
+
 /// Errors from redo log operations.
 #[derive(Error, Debug)]
 pub enum RedoError {
@@ -2569,6 +2580,26 @@ mod tests {
     use super::*;
     use crate::device::{DeviceError, MemoryDevice};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `LOG_FULL_MESSAGE_PREFIX` must remain a prefix of the actual
+    /// `RedoError::LogFull` `Display` string. Callers that flatten the
+    /// error into a `String` (e.g. the replication intent-recovery startup
+    /// barrier) discriminate transient redo backpressure from terminal
+    /// device faults by matching this prefix; if the `#[error(...)]`
+    /// format and the prefix ever drift apart, that discrimination breaks
+    /// silently and rejoin-after-quiesce regresses to a terminal abort.
+    #[test]
+    fn log_full_message_prefix_matches_display() {
+        let rendered = RedoError::LogFull {
+            used: 10,
+            capacity: 20,
+        }
+        .to_string();
+        assert!(
+            rendered.starts_with(LOG_FULL_MESSAGE_PREFIX),
+            "LOG_FULL_MESSAGE_PREFIX {LOG_FULL_MESSAGE_PREFIX:?} is not a prefix of {rendered:?}",
+        );
+    }
 
     struct ReadFailingDevice {
         inner: Arc<MemoryDevice>,

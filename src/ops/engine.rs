@@ -23,6 +23,63 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+thread_local! {
+    /// Per-thread depth of active [`MigrationJournalGuard`]s.
+    ///
+    /// While non-zero, [`Engine::redo_log_handle`] returns `None`, so every
+    /// engine-internal redo journal write performed on this thread is
+    /// suppressed. Migration-baseline applies run on the receiver's
+    /// per-connection handler thread and wrap each baseline op in a guard;
+    /// see [`MigrationJournalGuard`] for the crash-safety argument. A depth
+    /// counter (rather than a bool) keeps the guard correct under any nested
+    /// use within a single apply.
+    static MIGRATION_JOURNAL_SUPPRESS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True when redo journalling is suppressed on the current thread because a
+/// [`MigrationJournalGuard`] is active.
+fn migration_journal_suppressed() -> bool {
+    MIGRATION_JOURNAL_SUPPRESS_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII guard that suppresses ALL engine-internal redo journalling on the
+/// current thread for its lifetime.
+///
+/// Used to wrap migration-baseline applies on the receiver. Migrated
+/// baseline data is idempotently RE-DRIVABLE FROM THE SOURCE under the
+/// persisted inbound fence: the source never commits the handoff until
+/// `OP_MIGRATION_COMPLETE`, so a receiver that crashes mid-baseline
+/// re-acquires the fence and the source re-runs a fresh full baseline.
+/// Baseline records therefore need NO receiver redo entries for
+/// crash-safety, and journalling them (create's unmined-index insert,
+/// `restore_migrated_lifecycle`'s secondary-index intents, the post-apply
+/// replica redo entry) would fill the single 64 MiB redo log during a large
+/// migration (`redo log full`). The guard suppresses only the redo writes —
+/// device, in-memory/redb secondary indexes, and the primary cache are all
+/// still updated, so the migrated data is fully durable and queryable.
+///
+/// Out-of-band / compensation ops do NOT use this guard: they are normal
+/// replicated mutations and must keep journalling.
+#[must_use = "the guard suppresses redo journalling only while it is alive"]
+pub struct MigrationJournalGuard {
+    _private: (),
+}
+
+impl MigrationJournalGuard {
+    /// Enter migration-baseline journal suppression on the current thread.
+    /// Journalling resumes when the returned guard is dropped.
+    pub fn enter() -> Self {
+        MIGRATION_JOURNAL_SUPPRESS_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Self { _private: () }
+    }
+}
+
+impl Drop for MigrationJournalGuard {
+    fn drop(&mut self) {
+        MIGRATION_JOURNAL_SUPPRESS_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Thread-safe store engine for UTXO operations.
 ///
 /// All mutation operations acquire a per-transaction stripe lock, ensuring
@@ -255,8 +312,25 @@ impl Engine {
     }
 
     /// Clone the engine's redo log handle for use as an `Option<&Mutex<_>>`
-    /// in secondary index calls.
+    /// in secondary index calls / two-phase durable mutation journalling.
+    ///
+    /// Returns `None` while a [`MigrationJournalGuard`] is active on the
+    /// current thread, which suppresses ALL engine-internal redo
+    /// journalling (secondary-index intents, create's unmined insert,
+    /// etc.) for the duration of a migration-baseline apply. Migrated
+    /// baseline data is idempotently re-drivable from the source under the
+    /// persisted inbound fence (the source never commits the handoff until
+    /// `OP_MIGRATION_COMPLETE`), so a receiver that crashes mid-baseline
+    /// re-acquires the fence and the source re-runs a fresh full baseline.
+    /// Baseline records therefore need NO receiver redo entries for
+    /// crash-safety, and journalling them would fill the single 64 MiB redo
+    /// log during a large migration (`redo log full`). The data writes
+    /// themselves (device footer, in-memory/redb secondary indexes,
+    /// primary cache) are NOT suppressed — only the redo journalling is.
     fn redo_log_handle(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
+        if migration_journal_suppressed() {
+            return None;
+        }
         self.redo_log.get().cloned()
     }
 
@@ -268,10 +342,15 @@ impl Engine {
     /// resync of every replica because replica recovery would have no
     /// log to replay.
     ///
+    /// Unlike [`Self::redo_log_handle`], this accessor is NOT affected by
+    /// migration-baseline journal suppression: callers use it to inspect
+    /// or attach the log itself, not to decide whether to journal a
+    /// mutation.
+    ///
     /// Returns `None` when no redo log has been attached (test paths,
     /// unconfigured deployments).
     pub fn redo_log(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
-        self.redo_log_handle()
+        self.redo_log.get().cloned()
     }
 
     /// Acquire the SHARED (read-side) dispatch visibility barrier — used
