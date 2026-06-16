@@ -114,6 +114,24 @@ pub enum ReplayCause {
     /// means the device is misbehaving and continuing would silently
     /// register an index entry pointing at incomplete record bytes.
     MissingRecordBytes,
+    /// A legacy (payload-less) `RedoOp::Create` referenced an on-device
+    /// record that is not durable on THIS node — `read_metadata` at the
+    /// entry's `record_offset` failed (the record bytes were never synced
+    /// before the node stopped, or the offset was later reclaimed).
+    ///
+    /// Unlike [`MissingRecordBytes`] (a `CreateV2` short device I/O, which
+    /// signals a misbehaving device), a legacy `Create` carries NO captured
+    /// bytes and is only ever written by the replication / migration
+    /// receiver (`replication::receiver`) for a SECONDARY copy whose
+    /// authoritative record lives on the master. The receiver's documented
+    /// durability contract (fsync data device, then flush redo, then ACK)
+    /// allows a stop between the two flushes to leave a redo `Create` whose
+    /// record bytes are absent; the master re-replicates / resyncs the key
+    /// on rejoin. Aborting startup here would strand the whole node (it can
+    /// never boot → cluster wedged at 0/N ready, scenario_09). Therefore
+    /// TOLERABLE up to a cap: the index registration is skipped (no entry
+    /// pointing at unreadable bytes) and the node boots and resyncs.
+    ReplicaRecordAbsent,
 }
 
 /// Statistics from a recovery run.
@@ -141,6 +159,11 @@ pub struct RecoveryStats {
     /// Gap #2: `CreateV2` replay could not write the full record bytes
     /// the entry carried (short device read/write). NOT tolerable.
     pub failed_missing_record_bytes: u64,
+    /// Legacy `RedoOp::Create` (replica/migration-received copy) whose
+    /// on-device record bytes are not durable on this node. TOLERABLE up
+    /// to a cap — the master re-replicates the key on rejoin. See
+    /// [`ReplayCause::ReplicaRecordAbsent`].
+    pub failed_replica_record_absent: u64,
 }
 
 /// B-7: how recovery reconciles the DAH / unmined secondary indexes
@@ -180,6 +203,7 @@ impl RecoveryStats {
             ReplayCause::CorruptEntry => self.failed_corrupt += 1,
             ReplayCause::LogicError => self.failed_logic += 1,
             ReplayCause::MissingRecordBytes => self.failed_missing_record_bytes += 1,
+            ReplayCause::ReplicaRecordAbsent => self.failed_replica_record_absent += 1,
         }
     }
 }
@@ -188,13 +212,19 @@ impl RecoveryStats {
 ///
 /// `MissingPrimary` is benign during idempotent replay (the record was
 /// deleted later in the log, or by a later snapshot) so the loop keeps
-/// going. Any other cause indicates the device or on-disk data is
-/// misbehaving; continuing the replay risks landing later entries on
-/// top of an already-broken intermediate state that
-/// `check_replay_tolerance` cannot roll back.
+/// going. `ReplicaRecordAbsent` is the analogous benign case for a legacy
+/// replica/migration `Create` whose secondary copy was never durable on
+/// this node — the master re-replicates it on rejoin, so the loop keeps
+/// going rather than stranding the node. Any other cause indicates the
+/// device or on-disk data is misbehaving; continuing the replay risks
+/// landing later entries on top of an already-broken intermediate state
+/// that `check_replay_tolerance` cannot roll back.
 #[inline]
 fn is_fatal_replay_cause(cause: ReplayCause) -> bool {
-    !matches!(cause, ReplayCause::MissingPrimary)
+    !matches!(
+        cause,
+        ReplayCause::MissingPrimary | ReplayCause::ReplicaRecordAbsent
+    )
 }
 
 /// B-6: append a recovery-progress marker, treating a full redo log as a
@@ -1794,14 +1824,20 @@ fn replay_create(
         return ReplayResult::Skipped;
     }
 
-    // Read the on-device metadata header. A read error here means the
-    // record bytes are missing or corrupt; fail closed rather than
-    // registering an index entry pointing at unreadable data. This
-    // mirrors `replay_create_v2` (which performs the same read after
-    // pwriting the captured record bytes).
+    // Read the on-device metadata header. A read error here means this
+    // node has no durable record bytes at `record_offset`. A legacy
+    // `Create` carries NO captured payload and is only written by the
+    // replication / migration receiver for a SECONDARY copy whose
+    // authoritative record lives on the master, so the bytes being absent
+    // is a recoverable replica condition (the master resyncs the key on
+    // rejoin), NOT the device-fault that `replay_create_v2`'s identical
+    // read-back guards against. We still fail-closed for THIS entry (skip
+    // the index registration so no entry points at unreadable bytes), but
+    // classify it as the tolerable `ReplicaRecordAbsent` so the node boots
+    // instead of crash-looping (scenario_09: 0/N ready forever).
     let meta = match crate::io::read_metadata(device, record_offset) {
         Ok(m) => m,
-        Err(_) => return ReplayResult::Failed(ReplayCause::MissingRecordBytes),
+        Err(_) => return ReplayResult::Failed(ReplayCause::ReplicaRecordAbsent),
     };
 
     // The redo entry's `utxo_count` MUST match the on-device metadata's
@@ -4033,6 +4069,12 @@ mod tests {
     /// pointing at unreadable bytes. Pre-fix the function silently
     /// registered the index entry, then the engine's fast-path read
     /// would return junk on first access.
+    ///
+    /// scenario_09 follow-up: the failure is classified as the TOLERABLE
+    /// [`ReplayCause::ReplicaRecordAbsent`] (not the fatal
+    /// `MissingRecordBytes`) — a legacy `Create` is a replica/migration
+    /// SECONDARY copy whose master re-replicates on rejoin, so the node
+    /// must still boot. The index entry is NOT registered either way.
     #[test]
     fn legacy_replay_create_fails_closed_on_missing_record_bytes() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -4063,13 +4105,54 @@ mod tests {
         let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
         assert_eq!(stats.entries_replayed, 0);
         assert_eq!(
-            stats.failed_missing_record_bytes, 1,
-            "legacy Create with no on-device record must fail closed (MissingRecordBytes)",
+            stats.failed_replica_record_absent, 1,
+            "legacy Create with no on-device record must fail closed as the \
+             tolerable ReplicaRecordAbsent (master re-replicates on rejoin)",
+        );
+        assert_eq!(
+            stats.failed_missing_record_bytes, 0,
+            "the legacy read-back path must NOT be classified as the fatal \
+             CreateV2 short-I/O cause",
         );
         assert!(
             index.lookup(&key).is_none(),
             "no index entry must be registered when the record bytes are missing",
         );
+    }
+
+    /// scenario_09 root cause: a legacy replica `Create` whose on-device
+    /// record bytes are not durable on this node must NOT abort startup.
+    /// `check_replay_tolerance` must accept the `ReplicaRecordAbsent`
+    /// failure so the node boots and resyncs from the master, instead of
+    /// crash-looping and wedging the cluster at 0/N ready.
+    #[test]
+    fn replica_record_absent_is_tolerable_at_startup() {
+        use crate::server::startup::check_replay_tolerance;
+
+        let mut stats = RecoveryStats::default();
+        stats.record_failure(ReplayCause::ReplicaRecordAbsent);
+        stats.record_failure(ReplayCause::ReplicaRecordAbsent);
+        assert_eq!(stats.failed_replica_record_absent, 2);
+        assert!(
+            check_replay_tolerance(&stats).is_ok(),
+            "a handful of absent replica records must not abort startup",
+        );
+
+        // The recovery loop must KEEP GOING past this cause (not break on
+        // the first one) so later durable entries still replay.
+        assert!(
+            !is_fatal_replay_cause(ReplayCause::ReplicaRecordAbsent),
+            "ReplicaRecordAbsent must be a non-fatal (continue) replay cause",
+        );
+
+        // The genuine CreateV2 device-fault class stays fatal.
+        let mut fatal = RecoveryStats::default();
+        fatal.record_failure(ReplayCause::MissingRecordBytes);
+        assert!(
+            check_replay_tolerance(&fatal).is_err(),
+            "a CreateV2 short-I/O (MissingRecordBytes) must still abort startup",
+        );
+        assert!(is_fatal_replay_cause(ReplayCause::MissingRecordBytes));
     }
 
     #[test]

@@ -162,6 +162,22 @@ pub struct SecondaryLoadOutcome {
 /// immediately, a high cap on the benign class is safe.
 pub const MAX_TOLERATED_MISSING_PRIMARY: u64 = 65_536;
 
+/// Cap on the number of tolerable [`ReplayCause::ReplicaRecordAbsent`]
+/// failures during startup replay.
+///
+/// `ReplicaRecordAbsent` is a legacy (payload-less) `RedoOp::Create` for a
+/// replica / migration-received SECONDARY copy whose on-device record bytes
+/// were never durable on this node — the receiver's documented contract
+/// (fsync data device, then flush redo, then ACK) allows a stop between the
+/// two flushes to leave a redo `Create` ahead of its record bytes. The
+/// authoritative record lives on the master and is re-replicated on rejoin,
+/// so aborting startup would only strand the whole node (scenario_09:
+/// cluster wedged at 0/N ready). Tolerated up to the same generous cap as
+/// `MissingPrimary`; an unbounded count still aborts because it would
+/// signal a mismatched device / wrong redo log rather than a routine
+/// stop-between-flushes window.
+pub const MAX_TOLERATED_REPLICA_RECORD_ABSENT: u64 = 65_536;
+
 /// Apply the per-cause replay tolerance policy and produce a
 /// human-readable error string when startup must abort.
 ///
@@ -238,6 +254,18 @@ pub fn check_replay_tolerance_with_cap(
             cause = replay_cause_label(ReplayCause::MissingPrimary),
         ));
     }
+    if stats.failed_replica_record_absent > MAX_TOLERATED_REPLICA_RECORD_ABSENT {
+        return Err(format!(
+            "recovery: {n} replica-record-absent replay failure(s) exceed cap \
+             ({cap}) — far more legacy replica `Create` entries reference \
+             record bytes missing from this device than a stop-between-flushes \
+             window can plausibly explain; verify device / path and \
+             investigate before restarting [cause={cause}]",
+            n = stats.failed_replica_record_absent,
+            cap = MAX_TOLERATED_REPLICA_RECORD_ABSENT,
+            cause = replay_cause_label(ReplayCause::ReplicaRecordAbsent),
+        ));
+    }
     Ok(())
 }
 
@@ -256,6 +284,7 @@ pub(crate) fn replay_cause_label(cause: ReplayCause) -> &'static str {
         ReplayCause::CorruptEntry => "corrupt-entry",
         ReplayCause::LogicError => "logic-error",
         ReplayCause::MissingRecordBytes => "missing-record-bytes",
+        ReplayCause::ReplicaRecordAbsent => "replica-record-absent",
     }
 }
 
@@ -691,6 +720,50 @@ mod tests {
         let err = check_replay_tolerance_with_cap(&stats, 10)
             .expect_err("configured cap should reject over-threshold count");
         assert!(err.contains("(10)"), "msg: {err}");
+    }
+
+    #[test]
+    fn replay_tolerance_accepts_replica_record_absent_below_cap() {
+        // scenario_09: a legacy replica `Create` whose record bytes are not
+        // durable on this node is tolerable (the master re-replicates) so
+        // the node boots instead of crash-looping.
+        let stats = RecoveryStats {
+            failed_replica_record_absent: MAX_TOLERATED_REPLICA_RECORD_ABSENT,
+            entries_failed: MAX_TOLERATED_REPLICA_RECORD_ABSENT,
+            ..RecoveryStats::default()
+        };
+        check_replay_tolerance(&stats)
+            .expect("replica-record-absent at the cap must still be tolerated");
+    }
+
+    #[test]
+    fn replay_tolerance_rejects_replica_record_absent_above_cap() {
+        let n = MAX_TOLERATED_REPLICA_RECORD_ABSENT + 1;
+        let stats = RecoveryStats {
+            failed_replica_record_absent: n,
+            entries_failed: n,
+            ..RecoveryStats::default()
+        };
+        let err = check_replay_tolerance(&stats)
+            .expect_err("replica-record-absent over cap must fail closed");
+        assert!(err.contains("replica-record-absent"), "msg: {err}");
+        assert!(err.contains("cap"), "msg: {err}");
+    }
+
+    #[test]
+    fn replay_tolerance_rejects_one_missing_record_bytes() {
+        // The CreateV2 short-I/O class stays fatal regardless of count —
+        // it signals a misbehaving device, distinct from the tolerable
+        // legacy replica-record-absent class.
+        let stats = RecoveryStats {
+            failed_missing_record_bytes: 1,
+            entries_failed: 1,
+            ..RecoveryStats::default()
+        };
+        let err =
+            check_replay_tolerance(&stats).expect_err("missing-record-bytes must fail closed");
+        assert!(err.contains("record bytes"), "msg: {err}");
+        assert!(err.contains("non-tolerable"), "msg: {err}");
     }
 
     #[test]
