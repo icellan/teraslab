@@ -996,7 +996,80 @@ pub(crate) fn handle_request(
                 );
             }
 
-            if let Some(entries) = source_entries.as_ref()
+            // DATA-LOSS GATE (task #29). The exact-entry manifest reconciliation
+            // below deletes every local key for this shard that the source's
+            // manifest omits. That is only correct when the manifest is the
+            // COMPLETE, AUTHORITATIVE set for the shard. The residual data-loss bug
+            // (the `holders=[N,N,N]` stranding in scenario_05 / scenario_07) came
+            // from a SHORT manifest whose source was NOT the authoritative holder
+            // of the shard's complete contents: a still-catching-up rejoining node,
+            // or a completion from a stale/superseded migration plan. Such a
+            // manifest under-reports the shard, so pruning the target down to it
+            // deletes GOOD records the live topology still expects — and when every
+            // holder receives the same short manifest, the last copy is lost.
+            //
+            // We therefore prune ONLY when BOTH hold:
+            //
+            //   1. EPOCH-CURRENT. The completion is stamped with an epoch (>0) that
+            //      equals this node's currently-activated shard-table version. This
+            //      mirrors `migration_epoch_current` in coordinator.rs, which makes
+            //      a mismatched-epoch completion get "ignored as stale" — such a
+            //      completion (e.g. an epoch-N scale-up completion arriving after
+            //      the cluster activated epoch N+1) must never drive a destructive
+            //      prune. A legacy no-epoch frame (epoch == 0) cannot be proven
+            //      current and is treated as untrusted.
+            //
+            //   2. SOURCE IS THE AUTHORITATIVE HOLDER. The completion source
+            //      (`from_node`) is the node that legitimately holds the complete
+            //      authoritative copy of the shard at this epoch: the committed
+            //      (target) master, OR the effective/old master that is still
+            //      authoritative mid-handoff (`effective_assignment`, which returns
+            //      the pre-handoff owner until the shard commits — this is the
+            //      node streaming the data out in a normal handoff, including a
+            //      draining node in scale-down). A source that is neither — a peer
+            //      that merely holds a partial copy, or a rejoining node still
+            //      assembling its set — is NOT authoritative; its omission of a key
+            //      is not evidence the key is stale, so the key is retained.
+            //
+            // Within a single current-epoch migration the authoritative source
+            // builds its manifest from the same consistent snapshot it streams (see
+            // the manifest fold in `stream_shard_to_target`), so a current-epoch
+            // manifest from the authoritative holder is a faithful, complete
+            // account — pruning the target down to it correctly removes
+            // genuinely-stale residue (e.g. a record the authoritative path
+            // deleted/spent), preserving the prune's legitimate anti-resurrection
+            // purpose.
+            //
+            // When the source is NOT authoritative-complete, the extra local keys
+            // are RETAINED. The subsequent exact count check (`actual ==
+            // expected_records`) then fails with the retryable
+            // `ERR_MIGRATION_IN_PROGRESS`, which leaves the shard's inbound state
+            // pending — i.e. the shard is NOT committed/unfenced on this node, so a
+            // retained record cannot be served to a client as a possibly-stale
+            // (spent) UTXO. The authoritative current-epoch migration, or the
+            // committed-handoff-gated orphan cleanup (task #28), reconciles any
+            // genuinely-stale residue. Bias: never delete the last copy on a
+            // stale/untrusted manifest.
+            let source_is_authoritative_complete = if let Some(cluster) = cluster {
+                let shard_table = cluster.shard_table();
+                let table = shard_table.read();
+                let epoch_current = migration_epoch > 0 && migration_epoch == table.version;
+                epoch_current
+                    && completion_from_node.is_some_and(|src| {
+                        // Authoritative holder = committed (target) master, or the
+                        // effective/old master still authoritative mid-handoff.
+                        table.target_assignment(shard).master == src
+                            || table.effective_assignment(shard).master == src
+                    })
+            } else {
+                // No cluster context (single-node / unit harness without a shard
+                // table): there is no committed epoch or owner to verify against,
+                // so the completion cannot be proven authoritative. Retain.
+                false
+            };
+
+            if source_is_authoritative_complete
+                && let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
             {
@@ -14175,6 +14248,12 @@ mod tests {
         );
     }
 
+    /// Task #29 (no-resurrection / preserve-the-prune): an AUTHORITATIVE-complete
+    /// completion — stamped with the CURRENT committed epoch and sent by the
+    /// shard's committed MASTER — that omits a key the target still holds DOES
+    /// prune that genuinely-stale extra record. This proves the data-loss gate
+    /// did not break the prune's legitimate purpose (removing a stale copy of a
+    /// record the authoritative master correctly deleted/spent).
     #[test]
     fn migration_complete_exact_entries_prune_extra_local_records() {
         let h = DispatchTestHarness::new();
@@ -14188,8 +14267,11 @@ mod tests {
         let meta_a = h.engine.read_metadata(&key_a).unwrap();
         let entries = vec![(key_a, meta_a.generation)];
 
+        // Single-node table at epoch 49: NodeId(1) is the committed master of
+        // every shard, and the activated table version is 49.
+        let epoch = 49u64;
         let members = vec![crate::cluster::shards::NodeId(1)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 49);
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch);
         let cluster = crate::cluster::coordinator::new_test_running_cluster(
             crate::cluster::shards::NodeId(1),
             table,
@@ -14204,13 +14286,15 @@ mod tests {
             1,
         );
 
+        // Authoritative-complete: from the committed master (NodeId(1)) at the
+        // current committed epoch (49).
         let payload = build_migration_complete_payload(
             1,
             0,
-            0,
+            epoch,
             None,
             Some(&entries),
-            Some(crate::cluster::shards::NodeId(2)),
+            Some(crate::cluster::shards::NodeId(1)),
         );
         let req = RequestFrame {
             request_id: shard as u64,
@@ -14238,6 +14322,347 @@ mod tests {
         assert_eq!(h.engine.shard_record_count(shard), 1);
         assert!(h.engine.read_metadata(&key_a).is_ok());
         assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
+    }
+
+    /// Task #29 (no-loss): a SHORT manifest stamped with a SUPERSEDED epoch
+    /// must NOT prune the extra local record, even when the completion source is
+    /// a legitimate cluster member. This reproduces the scenario_05 / scenario_07
+    /// stranding sequence directly: a migration plan from an older epoch (e.g. an
+    /// epoch-N scale-up) sends a completion AFTER the cluster has already
+    /// activated epoch N+1 (scale-down); its manifest lags the live topology, so
+    /// pruning the target down to it would delete good records that the current
+    /// epoch still expects (`holders=[N,N,N]`).
+    ///
+    /// B is RETAINED, the completion is rejected as retryable
+    /// (`ERR_MIGRATION_IN_PROGRESS`), and the shard's inbound state stays pending
+    /// — so the shard is not committed/unfenced and the retained record cannot be
+    /// served as a possibly-stale UTXO until the authoritative current-epoch
+    /// migration reconciles it.
+    ///
+    /// Fail-before: B was deleted by the unconditional prune. Pass-after: B is
+    /// retained.
+    #[test]
+    fn migration_complete_short_manifest_from_stale_epoch_source_retains_records() {
+        let h = DispatchTestHarness::new();
+        let shard = 39u16;
+        let txid_a = txid_for_shard(shard, 11);
+        let txid_b = txid_for_shard(shard, 12);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        // SHORT manifest: omits B even though the target legitimately holds it.
+        let entries = vec![(key_a, meta_a.generation)];
+
+        // Current committed epoch is 52; the completion is stamped with epoch 50
+        // (a superseded migration plan). It is within the 2-epoch reject slack so
+        // the staleness guard does not bounce it outright, but it is NOT
+        // epoch-current, so it must not drive a destructive prune.
+        let current_epoch = 52u64;
+        let stale_epoch = 50u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let table =
+            crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, current_epoch);
+        let source = crate::cluster::shards::NodeId(2);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4711".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.register_test_inbound_from_source(shard, source);
+        assert_eq!(cluster.inbound_pending_count(), 1);
+
+        let payload =
+            build_migration_complete_payload(1, 0, stale_epoch, None, Some(&entries), Some(source));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        // No-loss: B retained.
+        assert!(
+            h.engine.read_metadata(&key_b).is_ok(),
+            "short manifest from a stale-epoch source must NOT prune B"
+        );
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+        assert_eq!(h.engine.shard_record_count(shard), 2);
+
+        // No-resurrection: the completion is rejected as retryable and inbound
+        // stays pending, so the shard is not committed/unfenced on this node.
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "a stale-epoch short manifest must leave inbound pending (shard stays fenced)"
+        );
+    }
+
+    /// Task #29 (no-loss): a SHORT manifest stamped with a SUPERSEDED epoch from
+    /// the shard's committed master must ALSO be retained — being the master does
+    /// not rescue a stale-epoch snapshot, which can lag the live topology just as
+    /// any other stale plan can. Pins that the gate keys off epoch currency, not
+    /// ownership.
+    #[test]
+    fn migration_complete_short_manifest_from_stale_epoch_master_retains_records() {
+        let h = DispatchTestHarness::new();
+        let shard = 40u16;
+        let txid_a = txid_for_shard(shard, 13);
+        let txid_b = txid_for_shard(shard, 14);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+
+        // Self is the committed master at epoch 60; the completion is stamped
+        // with epoch 59 (one behind, still within the 2-epoch reject slack so
+        // it is not bounced by the staleness guard, but NOT epoch-current so it
+        // is not authoritative-complete for a prune).
+        let current_epoch = 60u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table =
+            crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, current_epoch);
+        let master = table.target_assignment(shard).master;
+        assert_eq!(master, crate::cluster::shards::NodeId(1));
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4712".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            current_epoch - 1,
+            None,
+            Some(&entries),
+            Some(master),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert!(
+            h.engine.read_metadata(&key_b).is_ok(),
+            "stale-epoch master snapshot must NOT prune B"
+        );
+        assert_eq!(h.engine.shard_record_count(shard), 2);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
+        assert_eq!(cluster.inbound_pending_count(), 1);
+    }
+
+    /// Task #29 (no-loss, same-epoch case): an EPOCH-CURRENT completion whose
+    /// source is NOT the authoritative holder of the shard (neither the committed
+    /// master nor the effective/old master mid-handoff) must NOT prune, even
+    /// though its epoch is current. This is the scenario_05 failure mode: a
+    /// rejoining node still assembling its set sends a SHORT manifest at the live
+    /// epoch; pruning every holder down to it strands the records
+    /// (`holders=[N,N,N]`). A current epoch is necessary but not sufficient —
+    /// the source must also be the authoritative holder. B is RETAINED.
+    ///
+    /// Fail-before (epoch-only gate): B deleted. Pass-after: B retained.
+    #[test]
+    fn migration_complete_epoch_current_non_authoritative_source_retains_record() {
+        let h = DispatchTestHarness::new();
+        let shard = 41u16;
+        let txid_a = txid_for_shard(shard, 15);
+        let txid_b = txid_for_shard(shard, 16);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        // SHORT manifest: omits B.
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let epoch = 70u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, epoch);
+        // No handoff state, so effective_assignment == target_assignment. The
+        // master and its replicas are the authoritative holders; pick a source
+        // that is NONE of them.
+        let assignment = table.target_assignment(shard);
+        let non_holder_source = members
+            .iter()
+            .copied()
+            .find(|n| *n != assignment.master && !assignment.replicas.contains(n))
+            .expect("with RF=2 of 3 members, one member is neither master nor replica");
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4713".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.register_test_inbound_from_source(shard, non_holder_source);
+
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            epoch,
+            None,
+            Some(&entries),
+            Some(non_holder_source),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        // No-loss: B retained because the source is not the authoritative holder.
+        assert!(
+            h.engine.read_metadata(&key_b).is_ok(),
+            "epoch-current but non-authoritative source must NOT prune B"
+        );
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+        assert_eq!(h.engine.shard_record_count(shard), 2);
+
+        // No-resurrection: rejected as retryable, inbound stays pending.
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
+    }
+
+    /// Task #29 (preserve-the-prune): an EPOCH-CURRENT completion from the shard's
+    /// committed master DOES prune the genuinely-stale extra record. Proves the
+    /// authoritative-holder gate did not break the prune's legitimate
+    /// anti-resurrection purpose for the common (no-handoff) case.
+    #[test]
+    fn migration_complete_epoch_current_master_source_prunes_extra_record() {
+        let h = DispatchTestHarness::new();
+        let shard = 42u16;
+        let txid_a = txid_for_shard(shard, 17);
+        let txid_b = txid_for_shard(shard, 18);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let epoch = 71u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+            crate::cluster::shards::NodeId(3),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, epoch);
+        let master = table.target_assignment(shard).master;
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4714".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        cluster.register_test_inbound_from_source(shard, master);
+
+        let payload =
+            build_migration_complete_payload(1, 0, epoch, None, Some(&entries), Some(master));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_OK);
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+        assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
+        assert_eq!(h.engine.shard_record_count(shard), 1);
+        assert_eq!(cluster.inbound_pending_count(), 0);
     }
 
     #[test]

@@ -5510,6 +5510,29 @@ fn stream_shard_baseline(
         let response = exchange_frame(stream, &request, auth_secret)?;
 
         use crate::replication::protocol::ReplicaAck;
+        // Check the frame status BEFORE attempting to parse the payload as a
+        // ReplicaAck. A STATUS_ERROR response carries an error payload
+        // ([code:2][msg_len:2][msg]), not a ReplicaAck; e.g. an
+        // ERR_STALE_EPOCH(24) first byte would otherwise be misread as a
+        // ReplicaAck op type and logged as "unknown op type: 24".
+        if response.status != STATUS_OK {
+            let detail = if response.payload.len() >= 4 {
+                let code = u16::from_le_bytes(response.payload[..2].try_into().unwrap());
+                let msg_len =
+                    u16::from_le_bytes(response.payload[2..4].try_into().unwrap()) as usize;
+                let msg = std::str::from_utf8(
+                    &response.payload[4..4 + msg_len.min(response.payload.len() - 4)],
+                )
+                .unwrap_or("(non-utf8)");
+                format!(" (code={code}: {msg})")
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "migration batch failed with status {}{detail}",
+                response.status
+            ));
+        }
         if !response.payload.is_empty() {
             match ReplicaAck::deserialize(&response.payload) {
                 Ok(ReplicaAck::Error {
@@ -5536,12 +5559,6 @@ fn stream_shard_baseline(
                     return Err(format!("migration batch: failed to parse replica ack: {e}"));
                 }
             }
-        }
-        if response.status != STATUS_OK {
-            return Err(format!(
-                "migration batch failed with status {}",
-                response.status
-            ));
         }
     }
 
