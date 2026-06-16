@@ -336,6 +336,87 @@ fn committed_topology_reactivation_metrics(
     (mismatched, table.pending_handoff_count())
 }
 
+/// Task #22 — detect runtime master over-ownership the steady-state
+/// reactivation metric is blind to.
+///
+/// # The bug
+///
+/// After a member rebalance the cluster can settle with every node on the
+/// SAME committed term yet the per-node `master_shard_count` summing to far
+/// more than `NUM_SHARDS` (observed 4671/4096): the same shard is mastered by
+/// two nodes at runtime, and it never self-corrects — `handoffs == 0`,
+/// `active_migrations == 0`, `inbound == 0`, and the topology term is settled.
+///
+/// # Root cause
+///
+/// `apply_master_election` (Phase F) refines each freshly-computed
+/// round-robin table using that node's LOCAL `partition_view` (the
+/// exchange-phase result) and its LOCAL `prev_table` stickiness. Both inputs
+/// differ per node — the exchange returns partial/divergent views, and each
+/// node's previous table differs — so the election can promote a DIFFERENT
+/// node to master for the same shard on different nodes. Each node's table is
+/// internally self-consistent (`target_assignment == intended_master`, and the
+/// elected master is always inside the shard's candidate set), so
+/// `committed_topology_reactivation_metrics` reads `mismatched == 0` on every
+/// node. Election is a per-node local optimization with NO cluster-wide
+/// agreement, so it cannot preserve the single-master-per-shard invariant.
+///
+/// # The convergence invariant
+///
+/// The only function that is deterministic and identical on every node is the
+/// round-robin `compute_with_epoch(committed_members)`: each node derives the
+/// exact same master per shard from the same member SET. A same-term
+/// reactivation runs `activate_topology` with an EMPTY partition view, which
+/// makes `apply_master_election` a no-op and installs precisely that
+/// round-robin table — so once reactivation fires on every divergent node the
+/// cluster collapses to a single master per shard (sum == `NUM_SHARDS`) and
+/// STAYS there (the round-robin table is a fixed point of this detector).
+///
+/// This detector therefore counts shards where `self` is the local master but
+/// the round-robin master for that shard under `committed_members` is a
+/// DIFFERENT node — i.e. exactly the election-deviated (or stale) shards a
+/// same-term empty-view reactivation will reassign. A node only knows its own
+/// table, so the check is purely local; every divergent node independently
+/// fires reactivation and relinquishes its deviant masters.
+///
+/// # No-loss
+///
+/// Reactivation does not drop data: `activate_topology` recomputes the table,
+/// `begin_handoff_with` keeps the current master serving until the round-robin
+/// master has the data, and `build_plan_from_partition_view` / `migration_plan`
+/// schedule the transfer (commit-before-unfence). The deviant shard is handed
+/// off to its round-robin master, never discarded.
+///
+/// # Cost
+///
+/// A correctly elected (data-aware) deviation is also reassigned to the
+/// round-robin master, which may trigger one extra migration. That is the
+/// deliberate price of a cluster-wide single-master invariant: election as
+/// implemented is unsafe (no cross-node consensus), so convergence-correctness
+/// takes precedence over the placement optimization.
+fn phantom_master_shard_count(
+    table: &ShardTable,
+    committed_members: &[NodeId],
+    rf: u8,
+    self_id: NodeId,
+) -> usize {
+    // A single-member committed set cannot over-own (every shard is self's
+    // by definition); skip the recompute.
+    if committed_members.len() <= 1 {
+        return 0;
+    }
+    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0);
+    (0..crate::cluster::shards::NUM_SHARDS as u16)
+        .filter(|&shard| {
+            // This node locally masters the shard, but the deterministic
+            // round-robin master for the committed members is a different
+            // node — the exact shard an empty-view reactivation reassigns.
+            table.target_assignment(shard).master == self_id
+                && committed.target_assignment(shard).master != self_id
+        })
+        .count()
+}
+
 /// W1.1 residual fix (FIX 2) — self-heal backstop signal for the topology
 /// reactivation loop.
 ///
@@ -1340,7 +1421,7 @@ impl ClusterCoordinator {
                     let committed_members = topo_authority_event.committed_members();
                     if committed_members.len() > 1 {
                         let committed_term = topo_authority_event.committed_term();
-                        let (mismatched, pending_handoffs, stuck_subset) = {
+                        let (mismatched, pending_handoffs, stuck_subset, phantom_masters) = {
                             let mgr = migration.lock();
                             let table = shard_table.read();
                             let (mismatched, pending_handoffs) =
@@ -1352,7 +1433,13 @@ impl ClusterCoordinator {
                                 );
                             // W1.1 residual fix (FIX 2) — self-heal backstop.
                             let stuck_subset = stuck_subset_master_count(&table, &mgr, self_id);
-                            (mismatched, pending_handoffs, stuck_subset)
+                            // Task #22 — detect phantom master over-ownership the
+                            // intent-only mismatch metric is blind to (a stale
+                            // local table stamped with the committed term that
+                            // still masters reassigned shards).
+                            let phantom_masters =
+                                phantom_master_shard_count(&table, &committed_members, rf, self_id);
+                            (mismatched, pending_handoffs, stuck_subset, phantom_masters)
                         };
 
                         // W5-followup — self-drain fast path. Re-drive on the
@@ -1366,6 +1453,7 @@ impl ClusterCoordinator {
                         let self_is_member = committed_members.contains(&self_id);
                         let total_work = mismatched
                             .saturating_add(stuck_subset as u32)
+                            .saturating_add(phantom_masters as u32)
                             .saturating_add(pending_handoffs as u32);
                         // Compare only against the last fast round of THIS term;
                         // a stale term's progress watermark must not block a new
@@ -1387,7 +1475,9 @@ impl ClusterCoordinator {
                             || should_trigger_topology_reactivation(
                                 startup_reactivation_due,
                                 normal_reactivation_due,
-                                mismatched.saturating_add(stuck_subset as u32),
+                                mismatched
+                                    .saturating_add(stuck_subset as u32)
+                                    .saturating_add(phantom_masters as u32),
                                 pending_handoffs,
                             )
                         {
@@ -1407,6 +1497,7 @@ impl ClusterCoordinator {
                                     pending_handoffs,
                                     mismatched,
                                     stuck_subset,
+                                    phantom_masters,
                                     "cluster: re-activating topology after restored outbound migration state",
                                 );
                             } else if drain_due && !normal_reactivation_due {
@@ -1424,6 +1515,7 @@ impl ClusterCoordinator {
                                     pending_handoffs,
                                     mismatched,
                                     stuck_subset,
+                                    phantom_masters,
                                     "cluster: re-activating topology",
                                 );
                             }
@@ -6179,15 +6271,46 @@ fn split_transfer_request_tasks(
 ///
 /// Run [`elect_master`] over the candidates and, when the elected master
 /// differs from the current round-robin pick, swap it into place via
-/// [`ShardTable::set_master_for_shard`]. Empty partition views (no
-/// information available) leave the round-robin pick unchanged so the
-/// behaviour reduces to the pre-Phase-F path.
+/// [`ShardTable::set_master_for_shard`].
+///
+/// # Empty partition views must be a true no-op (Task #22)
+///
+/// When `partition_view` is empty the round-robin pick is left COMPLETELY
+/// unchanged — the function returns before touching any shard. This is
+/// load-bearing for cluster convergence, not just an optimization:
+/// `elect_master` ranks candidates by `(data_score, was_previous_master,
+/// Reverse(node_id))`, and with an empty view every candidate scores equal on
+/// data, so the `was_previous_master` stickiness tiebreaker decides. That
+/// tiebreaker reads each node's OWN `prev_table`, which differs per node — so
+/// running election on an empty view produces a DIFFERENT master per node for
+/// the same shard, breaking the single-master-per-shard invariant. The
+/// same-term reactivation path (`activate_topology`, the convergence
+/// mechanism) always passes an empty view precisely so it installs the
+/// deterministic round-robin table identically on every node; election on an
+/// empty view would defeat that and leave the cluster permanently
+/// over-mastered (the 4626/4096 dual-master state). The previous code
+/// proceeded through the loop for `view_empty`, applying stickiness — that was
+/// the convergence bug.
 pub fn apply_master_election(
     table: &mut ShardTable,
     prev_table: &ShardTable,
     partition_view: &std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>>,
     evicted: &std::collections::HashSet<NodeId>,
 ) {
+    let view_empty = partition_view.is_empty();
+    // Task #22 — an empty view carries no ownership signal. Returning here
+    // (rather than running the stickiness tiebreaker) keeps the round-robin
+    // assignment fully deterministic across nodes, which the same-term
+    // reactivation relies on to converge to one master per shard. Eviction is
+    // the one cross-node-deterministic reason to mutate the table without a
+    // view (remove a known-dead node), so only short-circuit when there is
+    // also nothing to evict. In production the reactivation path passes an
+    // empty view AND an empty eviction set, so it takes this fast return and
+    // installs pure round-robin.
+    if view_empty && evicted.is_empty() {
+        return;
+    }
+
     // (node, shard) -> last_applied_seq, used to decide is_subset.
     let mut seq_by_node_shard: std::collections::HashMap<(NodeId, u16), u64> =
         std::collections::HashMap::new();
@@ -6199,8 +6322,6 @@ pub fn apply_master_election(
             seq_by_node_shard.insert((*node, e.shard), e.last_applied_seq);
         }
     }
-
-    let view_empty = partition_view.is_empty();
 
     for shard in 0..NUM_SHARDS as u16 {
         let assignment = table.target_assignment(shard);
@@ -6214,14 +6335,31 @@ pub fn apply_master_election(
             }
         }
 
-        // A-2b: if the partition view is non-empty but no candidate
-        // reports any data for this shard (every `last_applied_seq`
-        // is 0 — e.g. a fresh scale-up where every node is empty),
-        // the view carries no signal about ownership. `elect_master`'s
-        // `was_previous_master` stickiness tiebreaker would default to
-        // the prev master, silently un-doing the round-robin assignment
-        // to a newcomer. Treat all-zero as "no information" and
-        // preserve the round-robin pick — same shape as `view_empty`.
+        // Task #22 — determinism gate. Election may only DEVIATE the master
+        // from the round-robin pick when the view is complete enough that every
+        // node computes the identical result; otherwise per-node divergence
+        // re-creates the dual-master state on every committed term (worst under
+        // load, when the bounded exchange times out and returns partial views).
+        // Require every candidate for this shard to have REPORTED in the view:
+        // a candidate absent from the view did not respond (it is down or
+        // unreachable), and a down node is absent from EVERY node's view, so
+        // skipping deviation here is a consistent decision cluster-wide. With a
+        // partial view (some candidate missing) preserve the deterministic
+        // round-robin master. (The eviction-only empty-view path bypasses this:
+        // it has no responders by construction.)
+        let all_candidates_reported = view_empty
+            || candidate_nodes
+                .iter()
+                .all(|node_id| nodes_with_view.contains(node_id));
+        if !all_candidates_reported {
+            continue;
+        }
+
+        // Skip shards where no candidate reports data (all `last_applied_seq
+        // == 0`, e.g. a fresh scale-up): the view carries no ownership signal
+        // and `elect_master`'s `was_previous_master` stickiness would silently
+        // un-do the round-robin assignment to a newcomer. The eviction-only
+        // empty-view path treats every candidate as full and must not skip.
         let any_candidate_has_data = candidate_nodes.iter().any(|&node_id| {
             seq_by_node_shard
                 .get(&(node_id, shard))
@@ -6236,21 +6374,16 @@ pub fn apply_master_election(
         let candidates: Vec<MasterCandidate> = candidate_nodes
             .iter()
             .map(|&node_id| {
-                // A node is treated as "full" when:
-                //   (a) the partition view is empty (no info — fall back
-                //       to the pre-Phase-F path; round-robin pick stays);
-                //   (b) the partition view is non-empty AND this node
-                //       reports a non-zero last_applied_seq for the shard.
-                // Otherwise it is "subset".
-                let has_data = if view_empty {
-                    true
-                } else {
-                    seq_by_node_shard
+                // Eviction-only path (empty view): treat every candidate as
+                // full so election runs solely to skip the evicted node. With
+                // a real view, a node is "full" iff it reports a non-zero
+                // last_applied_seq for the shard, else "subset".
+                let has_data = view_empty
+                    || seq_by_node_shard
                         .get(&(node_id, shard))
                         .copied()
                         .unwrap_or(0)
-                        > 0
-                };
+                        > 0;
                 MasterCandidate {
                     node_id,
                     was_previous_master: node_id == prev_master,
@@ -10476,6 +10609,199 @@ mod tests {
         );
     }
 
+    /// Task #22 — post-rebalance dual-master non-convergence.
+    ///
+    /// A node can settle on a local shard table that is stamped with the
+    /// current committed term (`version == committed_term`) and is
+    /// internally self-consistent (`target_assignment == intended_master`
+    /// for every shard) yet still masters shards the committed-members term
+    /// does NOT assign to it. Across the cluster the per-node master counts
+    /// then sum to more than `NUM_SHARDS` — the same shard is mastered by
+    /// two nodes at runtime — and it never self-corrects: the steady-state
+    /// `committed_topology_reactivation_metrics` reads `mismatched == 0`
+    /// (it only compares the table against its OWN recorded intent, never
+    /// against the committed-members assignment), `pending_handoffs == 0`,
+    /// and `stuck_subset == 0`, so the reactivation trigger never fires.
+    ///
+    /// `phantom_master_shard_count` is the missing local detector: a shard
+    /// this node locally masters whose deterministic round-robin master under
+    /// `committed_members` is a DIFFERENT node is over-ownership that a
+    /// same-term empty-view reactivation will hand back. Folding the count
+    /// into the trigger must re-fire reactivation, which recomputes the
+    /// round-robin table (election is a no-op with an empty view) and hands
+    /// the shard off to its rightful master, collapsing the cluster to a
+    /// single master per shard.
+    #[test]
+    fn phantom_master_count_re_fires_reactivation_on_over_ownership() {
+        let rf = 2;
+        // Committed cluster is the 3-member term-2 set.
+        let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let committed_term = 2u64;
+        let committed_table = ShardTable::compute_with_epoch(&committed, rf, committed_term);
+
+        // This node's LOCAL table was computed from the stale 2-member set
+        // {1,2} but stamped with the current committed term — exactly the
+        // post-rebalance phantom: node 2 still masters every shard the
+        // 2-member round-robin gave it, including shards the 3-member
+        // committed term reassigned to node 3.
+        let stale_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, committed_term);
+        let self_id = NodeId(2);
+
+        // The local table is at the committed term and target == intended
+        // for every shard, so the steady-state metric reads zero — the bug.
+        let (mismatched, pending_handoffs) =
+            committed_topology_reactivation_metrics(&stale_table, &committed, rf, committed_term);
+        assert_eq!(
+            mismatched, 0,
+            "stale-but-same-term table reads mismatched==0 (the blind spot)"
+        );
+        assert_eq!(pending_handoffs, 0);
+
+        // There must genuinely be over-ownership: node 2 locally masters
+        // shards whose round-robin (committed-members) master is node 3.
+        let over_owned = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                stale_table.target_assignment(s).master == self_id
+                    && committed_table.target_assignment(s).master != self_id
+            })
+            .count();
+        assert!(
+            over_owned > 0,
+            "test precondition: node 2's stale table must over-own committed-node-3 shards",
+        );
+
+        // Pre-fix: the trigger does not fire on mismatched + stuck alone.
+        assert!(
+            !should_trigger_topology_reactivation(false, true, mismatched, pending_handoffs),
+            "pre-fix: reactivation never fires — the dual-master deadlock",
+        );
+
+        // The new detector flags exactly the phantom-mastered shards.
+        let phantom = phantom_master_shard_count(&stale_table, &committed, rf, self_id);
+        assert_eq!(
+            phantom, over_owned,
+            "phantom_master_shard_count must flag every committed-non-owned local master",
+        );
+        assert!(
+            phantom > 0,
+            "phantom count must be positive in the over-owned state"
+        );
+
+        // Post-fix: folding the phantom count into the trigger re-fires
+        // reactivation, which recomputes from committed members.
+        assert!(
+            should_trigger_topology_reactivation(
+                false,
+                true,
+                mismatched.saturating_add(phantom as u32),
+                pending_handoffs,
+            ),
+            "post-fix: phantom masters re-fire reactivation",
+        );
+    }
+
+    /// Task #22 — convergence: once the committed-members topology is
+    /// installed, `phantom_master_shard_count` must read zero and the
+    /// per-node master counts must sum to exactly `NUM_SHARDS` with each
+    /// shard single-mastered. This guards against the fix oscillating: a
+    /// correctly-activated committed table is a fixed point of the detector.
+    #[test]
+    fn phantom_master_count_zero_and_single_mastered_after_convergence() {
+        let rf = 2;
+        let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let term = 2u64;
+        let table = ShardTable::compute_with_epoch(&committed, rf, term);
+
+        // Every node's correctly-activated committed table reports zero
+        // phantom masters.
+        for &node in &committed {
+            assert_eq!(
+                phantom_master_shard_count(&table, &committed, rf, node),
+                0,
+                "a node activated on the committed term must report no phantom masters",
+            );
+        }
+
+        // Cluster-wide, each shard has exactly one master and the per-node
+        // master counts sum to NUM_SHARDS (no double-ownership).
+        let counts = table.shard_counts();
+        let total: usize = counts.values().sum();
+        assert_eq!(
+            total, NUM_SHARDS,
+            "master ownership must sum to exactly the shard count",
+        );
+        for shard in 0..NUM_SHARDS as u16 {
+            let m = table.target_assignment(shard).master;
+            assert!(
+                committed.contains(&m),
+                "shard {shard} master {m:?} must be a committed member",
+            );
+        }
+    }
+
+    /// Task #22 — the phantom detector must flag *election-deviated* masters,
+    /// because `apply_master_election` runs against each node's LOCAL view and
+    /// reaches NO cluster-wide agreement: two nodes can each elect themselves
+    /// master for the same shard at the same committed term (the real
+    /// 4671/4096 dual-master state). The only cluster-wide deterministic
+    /// assignment is round-robin, which a same-term empty-view reactivation
+    /// installs; so a self-master that differs from the round-robin master is
+    /// exactly what must be relinquished for the cluster to converge. The
+    /// detector must therefore count those shards (a settled election
+    /// deviation is NOT a fixed point — it is reverted to round-robin).
+    #[test]
+    fn phantom_master_count_flags_election_deviation_from_round_robin() {
+        let rf = 2;
+        let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let term = 5u64;
+        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 4);
+        let mut table = ShardTable::compute_with_epoch(&committed, rf, term);
+
+        // Drive election so node 1 (which reports all data) wins every shard
+        // where it is a candidate — deviating from round-robin. On a single
+        // node this looks "legitimate", but nothing guarantees the OTHER
+        // nodes elected node 1 too: each ran election against its own view,
+        // so the same shard can end up self-mastered on two nodes. Round-robin
+        // is the only assignment all nodes agree on.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            NodeId(1),
+            (0..NUM_SHARDS as u16)
+                .map(|shard| PartitionVersionEntry {
+                    shard,
+                    flags: 0,
+                    replica_count: 1,
+                    last_applied_seq: 9,
+                })
+                .collect(),
+        );
+        view.insert(NodeId(2), Vec::new());
+        view.insert(NodeId(3), Vec::new());
+        apply_master_election(&mut table, &prev, &view, &std::collections::HashSet::new());
+
+        // Election must have deviated from round-robin (otherwise the test
+        // does not exercise the convergence path).
+        let round_robin = ShardTable::compute_with_epoch(&committed, rf, term);
+        let deviated: usize = (0..NUM_SHARDS as u16)
+            .filter(|&s| {
+                table.target_assignment(s).master == NodeId(1)
+                    && round_robin.target_assignment(s).master != NodeId(1)
+            })
+            .count();
+        assert!(deviated > 0, "election must deviate to exercise this path");
+
+        // The detector flags exactly node 1's deviated masters — the shards a
+        // same-term empty-view reactivation will hand back to their
+        // round-robin masters, collapsing the cluster to single-mastership.
+        assert_eq!(
+            phantom_master_shard_count(&table, &committed, rf, NodeId(1)),
+            deviated,
+            "election-deviated self-masters must be flagged for reconciliation",
+        );
+    }
+
     /// W1.1 FIX D — persisting topology state must succeed even when the
     /// parent directory does not exist yet (persist racing data-dir
     /// creation at boot produced `No such file or directory`, failing the
@@ -11967,6 +12293,58 @@ mod tests {
                 .replicas
                 .contains(&NodeId(1)),
             "the previously-elected master must remain in the replica set",
+        );
+    }
+
+    /// Task #22 — determinism gate: when the partition view is PARTIAL (a
+    /// candidate for the shard did not report — e.g. unreachable during a
+    /// load-induced exchange timeout), election must NOT deviate the master.
+    /// Deviating on a partial view produces a different master per node (each
+    /// sees a different subset of responders), which re-creates the dual-master
+    /// state on every committed term. The round-robin pick must be preserved.
+    #[test]
+    fn apply_master_election_keeps_round_robin_when_candidate_missing_from_view() {
+        let members = [NodeId(1), NodeId(2), NodeId(3)];
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2);
+
+        // A shard whose round-robin candidate set spans two nodes; report data
+        // for a replica (which would otherwise win) but OMIT the round-robin
+        // master from the view entirely (it did not respond).
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| !table.target_assignment(s).replicas.is_empty())
+            .expect("some shard has a replica");
+        let rr_master = table.target_assignment(shard).master;
+        let replica = table.target_assignment(shard).replicas[0];
+        let baseline = table.target_assignment(shard).clone();
+
+        // View contains ONLY the replica (full data) — the master is absent.
+        let mut view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
+            std::collections::HashMap::new();
+        view.insert(
+            replica,
+            vec![PartitionVersionEntry {
+                shard,
+                flags: 0,
+                replica_count: 1,
+                last_applied_seq: 9_999,
+            }],
+        );
+        apply_master_election(
+            &mut table,
+            &prev_table,
+            &view,
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(
+            table.target_assignment(shard).master,
+            rr_master,
+            "a partial view (round-robin master {rr_master:?} absent) must NOT deviate the master",
+        );
+        assert_eq!(
+            table.target_assignment(shard),
+            &baseline,
+            "the full round-robin assignment must be preserved under a partial view",
         );
     }
 
