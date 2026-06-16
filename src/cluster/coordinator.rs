@@ -402,6 +402,17 @@ fn complete_migration_task_current_epoch_with_midpoint(
     {
         let mut mgr = migration.lock();
         mgr.mark_complete(task);
+        if commit {
+            // Data-loss guard (task #28): the master move was just committed
+            // to the shard table, so the new owner is now authoritative and
+            // (for data shards) has passed the count+manifest handshake. Record
+            // positive committed-handoff evidence so — and only so — orphan
+            // cleanup is later allowed to reclaim this node's stale copy. A
+            // completion that did NOT commit (replica-only fan-out that does not
+            // transfer the master, or a stale-epoch discard that returned early
+            // above) leaves no such evidence, so the last copy is retained.
+            mgr.record_committed_handoff(task.shard, topology_epoch);
+        }
         if !mgr.is_shard_fenced(task.shard) {
             fenced_bm.clear(task.shard);
         }
@@ -5117,6 +5128,13 @@ fn run_migration_batch(
 /// Safety guards:
 /// - Skips if other migrations are still active (`active_count > 0`).
 /// - Checks the topology epoch before each shard — aborts if it changed.
+/// - Data-loss guard (task #28): deletes a non-owned shard ONLY if this node
+///   has positive committed-handoff evidence for it
+///   (`MigrationManager::has_committed_handoff`). The current table saying
+///   "I don't own this" is INSUFFICIENT — the table can advance past an
+///   incomplete handoff, so without a committed handoff this node may be the
+///   last holder. Retain-until-verified: genuinely orphaned bytes may linger
+///   until a real handoff completes, but the last durable copy is never dropped.
 /// - `TxNotFound` during delete is non-fatal (concurrent ops may delete first).
 /// - Idempotent: running twice is safe.
 fn run_orphan_cleanup(
@@ -5146,22 +5164,44 @@ fn run_orphan_cleanup(
     let mut orphaned_shards: Vec<u16> = Vec::new();
     {
         let table = shard_table.read();
+        let mgr = migration.lock();
         for shard in 0..NUM_SHARDS as u16 {
             let assignment = table.effective_assignment(shard);
             let owned = assignment.master == self_id || assignment.replicas.contains(&self_id);
-            if !owned && engine.shard_record_count(shard) > 0 {
+            if owned || engine.shard_record_count(shard) == 0 {
+                continue;
+            }
+            // Data-loss guard (task #28): NEVER delete a non-owned shard's
+            // last local copy on the strength of the current table alone — the
+            // table can advance past an incomplete handoff (the source's
+            // completion discarded as stale while the new owner's re-home is
+            // still streaming), leaving this node holding the ONLY surviving
+            // copy. Delete only with positive evidence the data is safe
+            // elsewhere: a committed handoff of this shard from this node.
+            if !mgr.has_committed_handoff(shard, topology_epoch) {
                 debug_shard_log(
                     shard,
                     format!(
-                        "orphan_cleanup candidate self={} master={} replicas={:?} records={}",
+                        "orphan_cleanup RETAIN (no committed handoff) self={} master={} replicas={:?} records={}",
                         self_id.0,
                         assignment.master.0,
                         assignment.replicas.iter().map(|n| n.0).collect::<Vec<_>>(),
                         engine.shard_record_count(shard),
                     ),
                 );
-                orphaned_shards.push(shard);
+                continue;
             }
+            debug_shard_log(
+                shard,
+                format!(
+                    "orphan_cleanup candidate self={} master={} replicas={:?} records={}",
+                    self_id.0,
+                    assignment.master.0,
+                    assignment.replicas.iter().map(|n| n.0).collect::<Vec<_>>(),
+                    engine.shard_record_count(shard),
+                ),
+            );
+            orphaned_shards.push(shard);
         }
     }
 
@@ -5218,6 +5258,12 @@ fn run_orphan_cleanup(
 /// here. This keeps "migration complete" from leaving a transient third RF=2
 /// holder that strict direct-local checks can observe before the broad cleanup
 /// sweep runs.
+///
+/// Data-loss guard (task #28): like [`run_orphan_cleanup`], deletes ONLY when
+/// this node has positive committed-handoff evidence for the shard
+/// (`MigrationManager::has_committed_handoff`). On the success path that calls
+/// this, the completion that just committed has already recorded that evidence;
+/// a non-owned shard reached without a committed handoff is retained.
 fn cleanup_orphaned_shard_if_settled(
     self_id: NodeId,
     engine: &Arc<Engine>,
@@ -5246,6 +5292,14 @@ fn cleanup_orphaned_shard_if_settled(
             p.shard == shard && p.state == crate::cluster::migration::MigrationState::Failed
         });
         if shard_still_active || shard_failed {
+            return;
+        }
+        // Data-loss guard (task #28): only reclaim with positive evidence the
+        // data is durably installed on the new owner — a committed handoff of
+        // this shard from this node AT THE CURRENT EPOCH. Without it, this node
+        // may hold the last copy (table advanced past an incomplete handoff, or
+        // a stale prior-epoch handoff whose target since died); retain it.
+        if !mgr.has_committed_handoff(shard, topology_epoch) {
             return;
         }
     }
@@ -9557,6 +9611,12 @@ mod tests {
 
         let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        // Data-loss guard (task #28): reclamation requires positive
+        // committed-handoff evidence. Record it so this models a genuinely
+        // completed handoff whose stale source copy is now safe to drop.
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
 
         cleanup_orphaned_shard_if_settled(
             NodeId(1),
@@ -9568,6 +9628,363 @@ mod tests {
         );
 
         assert_eq!(engine.shard_record_count(shard), 0);
+    }
+
+    /// Data-loss guard (task #28), per-shard path: a non-owned shard whose
+    /// handoff was NOT committed from this node (the stale-discard case —
+    /// the table advanced past an in-flight handoff) MUST be retained, not
+    /// deleted. Fail-before: deleted; pass-after: retained.
+    #[test]
+    fn per_shard_orphan_cleanup_retains_unowned_shard_without_committed_handoff() {
+        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                old.master == NodeId(1) || old.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold at least one shard before removal");
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 47);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        // No committed handoff recorded: this node never positively handed
+        // off the shard; it may be the last holder.
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+
+        cleanup_orphaned_shard_if_settled(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            shard,
+            new_table.version,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "non-owned shard without committed handoff must be retained",
+        );
+    }
+
+    /// Data-loss guard (task #28), broad sweep: the table assigns shard S to
+    /// node B; THIS node (node1) holds S's records, is `!owned`, and has NOT
+    /// committed a handoff of S (the stale-discard case). `run_orphan_cleanup`
+    /// MUST NOT delete S. This is the direct fail-before / pass-after pin for
+    /// the data-loss bug — fail-before: it deletes the last copy; pass-after:
+    /// it retains it.
+    #[test]
+    fn run_orphan_cleanup_retains_unowned_shard_without_committed_handoff() {
+        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 48);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        // No committed handoff recorded for `shard`.
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "run_orphan_cleanup must retain a non-owned shard with no committed handoff",
+        );
+    }
+
+    /// Mirror of the above: once a committed handoff of S has been recorded,
+    /// `run_orphan_cleanup` MAY reclaim the stale source copy. Confirms the
+    /// guard does not break genuine orphan reclamation.
+    #[test]
+    fn run_orphan_cleanup_reclaims_unowned_shard_after_committed_handoff() {
+        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let old = old_table.target_assignment(s);
+                let new = new_table.target_assignment(s);
+                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
+                    && new.master != NodeId(1)
+                    && !new.replicas.contains(&NodeId(1))
+            })
+            .expect("node1 should hold a shard it no longer owns after removal");
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 49);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration
+            .lock()
+            .record_committed_handoff(shard, new_table.version);
+
+        run_orphan_cleanup(
+            NodeId(1),
+            &engine,
+            &shard_table,
+            &migration,
+            new_table.version,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "run_orphan_cleanup must reclaim a non-owned shard after a committed handoff",
+        );
+    }
+
+    /// Integration-style reproduction of the task #28 data-loss bug, driving
+    /// the REAL completion + REAL orphan-cleanup paths.
+    ///
+    /// Scenario: under epoch N this node (node2) is the handoff source for a
+    /// shard whose only copy it holds. The topology bumps to N+1 before the
+    /// completion is processed, so the completion is DISCARDED AS STALE
+    /// (`complete_migration_task_current_epoch` returns false at the epoch
+    /// guard — no `commit_shard`, no committed-handoff record). The epoch-(N+1)
+    /// re-home is still in flight, so node2 is the last holder. `run_orphan_cleanup`
+    /// then runs on node2 at epoch N+1. It MUST NOT delete the record.
+    ///
+    /// Fail-before: cleanup deleted node2's only copy → the record is stranded
+    /// (holders=[N,N,N]). Pass-after: cleanup retains it; the record stays
+    /// readable on node2 until a real handoff completes.
+    #[test]
+    fn stale_discarded_handoff_does_not_strand_last_copy_under_orphan_cleanup() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+
+        // Epoch N: node1, node2, node3. Find a shard node2 holds (master or
+        // replica) so it has a real local copy to lose.
+        let table_n = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 3);
+        // Epoch N+1: a different membership/term that strips node2 of the shard.
+        let table_n1 = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3)], 2, 4);
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table_n.target_assignment(s);
+                let b = table_n1.target_assignment(s);
+                (a.master == NodeId(2) || a.replicas.contains(&NodeId(2)))
+                    && b.master != NodeId(2)
+                    && !b.replicas.contains(&NodeId(2))
+            })
+            .expect("node2 must hold a shard at N that it loses at N+1");
+
+        let engine = Arc::new(test_engine());
+        let key = tx_key_for_shard(shard, 77);
+        create_test_record(&engine, key);
+        assert_eq!(engine.shard_record_count(shard), 1);
+
+        // node2's live shard table starts at epoch N with the handoff fenced.
+        let shard_table = Arc::new(ShardTableLock::new(table_n.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // Epoch-N outbound handoff source → node3, fenced and streaming.
+        let task_n = MigrationTask {
+            shard,
+            from_node: NodeId(2),
+            to_node: NodeId(3),
+            is_master: true,
+        };
+        {
+            let mut mgr = migration.lock();
+            mgr.start_outbound(
+                std::slice::from_ref(&task_n),
+                NodeId(2),
+                &std::collections::HashSet::from([shard]),
+            );
+            mgr.mark_fenced(&task_n, 0);
+        }
+        fenced.set(shard);
+        migrating.set(shard);
+
+        // Topology bumps to N+1 BEFORE the completion is processed.
+        *shard_table.write() = table_n1.clone();
+
+        // The epoch-N completion now arrives: discarded as stale (epoch guard).
+        let accepted = complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task_n,
+            /* task_epoch */ table_n.version,
+            /* commit */ true,
+        );
+        assert!(
+            !accepted,
+            "epoch-N completion must be discarded as stale once N+1 is active",
+        );
+        assert!(
+            !migration
+                .lock()
+                .has_committed_handoff(shard, table_n1.version),
+            "a stale-discarded completion must NOT record committed-handoff evidence",
+        );
+
+        // The epoch-(N+1) re-home is still in flight; node2 is the last holder.
+        // Mirror production activation, which marks the stale epoch-N task
+        // failed then `cleanup_completed`s it away — leaving active_count and
+        // failed_count at 0 (exactly the bug's observed state). This proves the
+        // committed-handoff gate, NOT the active/failed guards, is what now
+        // protects the data. `cleanup_completed` does not touch the
+        // committed-handoff record.
+        {
+            let mut mgr = migration.lock();
+            mgr.mark_failed(&task_n);
+            mgr.cleanup_completed();
+        }
+        assert_eq!(migration.lock().active_count(), 0);
+        assert_eq!(migration.lock().failed_count(), 0);
+
+        // Orphan cleanup runs on node2 at epoch N+1.
+        run_orphan_cleanup(
+            NodeId(2),
+            &engine,
+            &shard_table,
+            &migration,
+            table_n1.version,
+        );
+
+        assert_eq!(
+            engine.shard_record_count(shard),
+            1,
+            "orphan cleanup must NOT strand the last copy of a stale-discarded handoff",
+        );
+        // And the record is still readable on node2.
+        assert!(
+            engine.read_metadata(&key).is_ok(),
+            "the retained record must remain readable on the source",
+        );
+    }
+
+    /// The completion path records committed-handoff evidence only when it
+    /// actually commits the master move (`commit == true`). A non-committing
+    /// completion (e.g. replica-only fan-out) leaves no evidence, so a later
+    /// orphan sweep cannot delete the shard. Pins the wiring between
+    /// `complete_migration_task_current_epoch` and the cleanup gate.
+    #[test]
+    fn committed_handoff_recorded_only_when_master_move_commits() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        // commit == false: no evidence recorded.
+        let task_no_commit = make_outbound_master_task(200, NodeId(1), NodeId(2));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task_no_commit),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task_no_commit,
+            10,
+            false,
+        ));
+        assert!(
+            !migration.lock().has_committed_handoff(200, 10),
+            "non-committing completion must NOT record committed-handoff evidence",
+        );
+
+        // commit == true: evidence recorded.
+        let task_commit = make_outbound_master_task(201, NodeId(1), NodeId(2));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task_commit),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+        assert!(complete_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task_commit,
+            10,
+            true,
+        ));
+        assert!(
+            migration.lock().has_committed_handoff(201, 10),
+            "committing completion must record committed-handoff evidence",
+        );
+    }
+
+    /// Re-acquiring a shard as an inbound target clears any prior committed-
+    /// handoff record, so a stale entry cannot authorize deleting freshly
+    /// re-homed data after a later un-assignment that lacks its own handoff.
+    #[test]
+    fn committed_handoff_cleared_on_reacquisition() {
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().record_committed_handoff(300, 10);
+        assert!(migration.lock().has_committed_handoff(300, 10));
+
+        let inbound = MigrationTask {
+            shard: 300,
+            from_node: NodeId(2),
+            to_node: NodeId(1),
+            is_master: true,
+        };
+        migration.lock().start_outbound(
+            std::slice::from_ref(&inbound),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        assert!(
+            !migration.lock().has_committed_handoff(300, 10),
+            "re-acquiring the shard as inbound target must clear committed-handoff evidence",
+        );
+    }
+
+    /// Epoch-exact validity (multi-hop guard): a handoff committed at epoch N
+    /// authorizes deletion ONLY while the table is still at epoch N. Once the
+    /// topology advances to N+1, the entry is stale — the new owner may be a
+    /// different node this source never verified — so cleanup must retain.
+    #[test]
+    fn committed_handoff_is_stale_after_epoch_bump() {
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().record_committed_handoff(400, 10);
+        assert!(
+            migration.lock().has_committed_handoff(400, 10),
+            "evidence is valid at the epoch it was recorded",
+        );
+        assert!(
+            !migration.lock().has_committed_handoff(400, 11),
+            "evidence must be stale once the topology epoch advances",
+        );
+        assert!(
+            !migration.lock().has_committed_handoff(400, 9),
+            "evidence must not apply to an earlier epoch either",
+        );
     }
 
     #[test]

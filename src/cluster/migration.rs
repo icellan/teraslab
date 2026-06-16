@@ -480,6 +480,19 @@ pub struct MigrationManager {
     /// new replicas) that must also receive replica batches while the
     /// migration is in flight. Cleared on `mark_complete` / `mark_failed`.
     dual_write_targets: std::collections::HashMap<u16, Vec<NodeId>>,
+    /// Data-loss guard (task #28): shards this node has POSITIVELY,
+    /// COMMITTED-ly handed off as the outbound source, mapped to the
+    /// topology epoch at which the master move was committed to the
+    /// shard table. Orphan cleanup may delete a non-owned shard's local
+    /// records ONLY if it appears here — i.e. there is positive evidence
+    /// the data is durably installed on the new owner.
+    ///
+    /// A shard that became non-owned WITHOUT a committed handoff from
+    /// this node (e.g. the topology advanced while an in-flight handoff
+    /// was discarded as stale) is deliberately ABSENT, so cleanup
+    /// retains its last copy rather than stranding it. Cleared when this
+    /// node re-acquires the shard as an inbound migration target.
+    committed_handoffs: std::collections::HashMap<u16, u64>,
 }
 
 impl MigrationManager {
@@ -491,7 +504,47 @@ impl MigrationManager {
             inbound_bitmap: ShardBitmap::new(),
             fenced_shards: ShardBitmap::new(),
             dual_write_targets: std::collections::HashMap::new(),
+            committed_handoffs: std::collections::HashMap::new(),
         }
+    }
+
+    /// Record that this node has COMMITTED-ly handed off `shard` as the
+    /// outbound source at topology `epoch` (the master move was written to
+    /// the shard table). This is the positive evidence orphan cleanup
+    /// requires before deleting the shard's local records.
+    ///
+    /// Called from the migration-completion path only after `commit_shard`
+    /// has transferred ownership to the new master.
+    pub fn record_committed_handoff(&mut self, shard: u16, epoch: u64) {
+        self.committed_handoffs.insert(shard, epoch);
+    }
+
+    /// Whether this node has positive committed-handoff evidence for `shard`
+    /// that is STILL VALID at `current_epoch`. Orphan cleanup deletes a
+    /// non-owned shard ONLY when this returns true.
+    ///
+    /// The match is epoch-EXACT: a handoff verified at epoch N authorizes
+    /// deletion only while the table is still at epoch N — the epoch where
+    /// this node positively confirmed the then-current owner durably held
+    /// the data (count+manifest handshake). Once the topology advances, that
+    /// evidence is stale: the new owner may be a DIFFERENT node this node
+    /// never verified (the multi-hop churn case — e.g. the original target was
+    /// killed and a fresh re-home from this node is the only way to restore
+    /// the data). Honoring a stale entry across an epoch bump would let this
+    /// node delete the last copy while the re-home is still in flight, which
+    /// is exactly the data-loss bug. Stale entries cause retain-until-verified:
+    /// the bytes linger until a fresh same-epoch handoff completes (or this
+    /// node re-acquires the shard, which clears the entry).
+    pub fn has_committed_handoff(&self, shard: u16, current_epoch: u64) -> bool {
+        self.committed_handoffs.get(&shard) == Some(&current_epoch)
+    }
+
+    /// Drop any committed-handoff record for `shard`. Called when this
+    /// node re-acquires the shard (becomes an inbound target again), so a
+    /// stale record cannot authorize deleting freshly re-homed data after
+    /// a subsequent un-assignment that lacks its own committed handoff.
+    pub fn clear_committed_handoff(&mut self, shard: u16) {
+        self.committed_handoffs.remove(&shard);
     }
 
     /// Phase E: NodeIds (new master + new replicas) that must additionally
@@ -548,6 +601,10 @@ impl MigrationManager {
                 }
             }
             if task.to_node == self_id {
+                // Re-acquiring this shard: drop any prior committed-handoff
+                // record so a stale entry cannot later authorize deleting the
+                // data we are now receiving back (task #28).
+                self.committed_handoffs.remove(&task.shard);
                 if let Some(existing) = self
                     .inbound_migrations
                     .iter_mut()
