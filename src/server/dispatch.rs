@@ -832,6 +832,38 @@ pub(crate) fn handle_request(
             }
             let shard = request.request_id as u16;
 
+            // ABORT (FLAG_MIGRATION_ABORT). The source could not finish the
+            // outbound transfer (baseline/late-key/delta/manifest/commit
+            // failure) and is telling us to abandon the in-flight inbound for
+            // this shard. An abort is precisely the case where the partial copy
+            // will NOT match any record count, so it MUST bypass the
+            // manifest-evidence + count + prune machinery below — otherwise it
+            // is rejected as a "record count mismatch" and the shard stays
+            // inbound-pending / fenced forever (the stuck-inbound outcome).
+            //
+            // We clear the inbound-pending fence so the shard converges, retain
+            // any partial records (harmless residue — the source stays the
+            // authoritative master+holder of an aborted, NON-committed handoff,
+            // and the task-#28 orphan cleanup only reclaims after a recorded
+            // committed handoff, never on an abort), and never commit the shard
+            // to ourselves (the handoff did not complete). Idempotent: a shard
+            // with no matching pending inbound entry is a no-op.
+            if request.flags & FLAG_MIGRATION_ABORT != 0 {
+                if let Some(cluster) = cluster {
+                    let cleared = cluster.abort_inbound_migration(shard);
+                    tracing::info!(
+                        shard,
+                        cleared,
+                        "OP_MIGRATION_COMPLETE: abort — cleared inbound-pending, source stays authoritative",
+                    );
+                }
+                return ResponseFrame {
+                    request_id: request.request_id,
+                    status: STATUS_OK,
+                    payload: Vec::new(),
+                };
+            }
+
             let expected_records = le_u64_at(&request.payload, 0).unwrap_or(0);
             let _fence_sequence = le_u64_at(&request.payload, 8).unwrap_or(0);
             let migration_epoch = le_u64_at(&request.payload, 16).unwrap_or(0);
@@ -14122,6 +14154,146 @@ mod tests {
             cluster.inbound_pending_count(),
             1,
             "rejected completion must not clear pending inbound"
+        );
+    }
+
+    /// Task #31 (data-loss / stuck-inbound): an ABORT completion (record_count=0,
+    /// no manifest, FLAG_MIGRATION_ABORT) sent to a target that ALREADY holds K
+    /// migrated records from a partial transfer must be ACCEPTED — it clears the
+    /// inbound-pending fence so the shard converges (does NOT get stuck), and it
+    /// must NOT delete the target's partial records (no strand). This is the
+    /// exact frame `send_migration_abort_completion_best_effort` emits.
+    ///
+    /// Contrast with `migration_complete_rejects_non_empty_without_manifest`:
+    /// the identical zero-count/no-manifest payload WITHOUT the abort flag is
+    /// (correctly) rejected as a count mismatch and leaves inbound pending.
+    #[test]
+    fn migration_complete_abort_clears_inbound_without_count_check() {
+        let h = DispatchTestHarness::new();
+        let shard = 33u16;
+        // Target already holds K=2 partial-transfer records for the shard.
+        let txid_a = txid_for_shard(shard, 5);
+        let txid_b = txid_for_shard(shard, 6);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            2,
+            "test precondition: target holds K=2 partial records"
+        );
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 45);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4704".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "test precondition: 1 shard pending inbound before abort"
+        );
+
+        // The abort frame: record_count=0, no manifest, FLAG_MIGRATION_ABORT.
+        let payload = build_migration_complete_payload(0, 0, 0, None, None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: crate::protocol::opcodes::FLAG_MIGRATION_ABORT,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "abort must be ACCEPTED (not rejected as count mismatch)"
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "abort must clear inbound-pending so the shard is not stuck"
+        );
+        // The partial records must survive — abort never strands/deletes them.
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            2,
+            "abort must NOT delete the target's partial records"
+        );
+    }
+
+    /// Task #31: an abort for a shard with NO pending inbound is an idempotent
+    /// no-op (a duplicate/retried abort, or one racing a topology change that
+    /// already cleared the entry) — still accepted, no error, no record damage.
+    #[test]
+    fn migration_complete_abort_is_idempotent_noop() {
+        let h = DispatchTestHarness::new();
+        let shard = 34u16;
+        let txid = txid_for_shard(shard, 9);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 46);
+        // No inbound shards registered — nothing pending.
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4705".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        assert_eq!(cluster.inbound_pending_count(), 0);
+
+        let payload = build_migration_complete_payload(0, 0, 0, None, None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: crate::protocol::opcodes::FLAG_MIGRATION_ABORT,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "idempotent abort must still succeed"
+        );
+        assert_eq!(cluster.inbound_pending_count(), 0);
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            1,
+            "no-op abort must not touch records"
         );
     }
 

@@ -283,26 +283,51 @@ fn fail_or_relinquish_outbound_task(
     )
 }
 
+/// Tell the migration target to ABORT the in-flight inbound transfer for a
+/// shard (FLAG_MIGRATION_ABORT). The source could not finish streaming the
+/// shard's data, so the handoff did NOT complete: the source stays the
+/// authoritative master+holder and the target must abandon (not commit) its
+/// partial inbound, clearing the inbound-pending fence so the shard is not
+/// stranded forever.
+///
+/// This is distinct from a count-verified completion: it carries no manifest
+/// and `record_count = 0`, but the abort flag tells the target to accept it as
+/// an explicit "discard this in-flight inbound" signal and clear its fence
+/// WITHOUT a count/manifest check (which would otherwise reject it as a
+/// "record count mismatch: expected 0, got K" and leave the shard stuck).
 fn send_migration_abort_completion_best_effort(
     target_addr: SocketAddr,
     task: &MigrationTask,
     reason: &'static str,
     auth_secret: Option<&[u8]>,
 ) {
-    let empty_manifest = compute_manifest_for_entries(&[]);
-    if let Err(err) = send_migration_complete(
-        target_addr,
-        task.shard,
-        task.from_node,
-        0,
-        0,
-        0,
-        None,
-        &empty_manifest,
-        &[],
-        false,
-        auth_secret,
-    ) {
+    // Frame layout matches OP_MIGRATION_COMPLETE's prefix; the receiver only
+    // reads `shard` (request_id) on the abort path, but we keep the minimal
+    // [record_count:8][fence:8][epoch:8] prefix for wire compatibility.
+    let mut payload = Vec::with_capacity(24);
+    payload.extend_from_slice(&0u64.to_le_bytes()); // record_count = 0
+    payload.extend_from_slice(&0u64.to_le_bytes()); // fence_sequence
+    payload.extend_from_slice(&0u64.to_le_bytes()); // topology_epoch
+    let request = RequestFrame {
+        request_id: task.shard as u64,
+        op_code: OP_MIGRATION_COMPLETE,
+        flags: FLAG_MIGRATION_ABORT,
+        payload: payload.into(),
+    };
+    let send = (|| -> std::result::Result<(), String> {
+        let mut stream = TcpStream::connect_timeout(&target_addr, Duration::from_secs(3))
+            .map_err(|e| format!("connect: {e}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| format!("set read timeout: {e}"))?;
+        crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
+        let response = exchange_frame(&mut stream, &request, auth_secret)?;
+        if response.status != STATUS_OK {
+            return Err(format!("target rejected abort: status {}", response.status));
+        }
+        Ok(())
+    })();
+    if let Err(err) = send {
         tracing::warn!(
             shard = task.shard,
             %target_addr,
@@ -7287,6 +7312,38 @@ impl RunningCluster {
         }
     }
 
+    /// Abort an in-flight inbound migration for `shard` (FLAG_MIGRATION_ABORT).
+    ///
+    /// The source could not finish streaming the shard's data and is telling
+    /// this target to abandon the transfer. Unlike a real completion this does
+    /// NOT verify a record count or manifest (an abort is precisely when the
+    /// partial copy won't match) and does NOT prune or commit the shard: it
+    /// simply clears the inbound-pending fence so the shard is not stranded
+    /// "awaiting data" forever. The source remains the authoritative
+    /// master+holder, so this node must not commit the shard to itself.
+    ///
+    /// The target's partial copy (if any) is RETAINED: it is harmless residue
+    /// while the source stays master, and the data-loss-safe orphan cleanup
+    /// (task #28) will only reclaim it once a real committed handoff is
+    /// recorded — never on an abort. Idempotent: a shard with no matching
+    /// pending inbound entry is a no-op (returns `false`).
+    ///
+    /// Returns `true` if a pending inbound entry was cleared.
+    pub fn abort_inbound_migration(&self, shard: u16) -> bool {
+        let mgr = &mut self.migration.lock();
+        let shards = std::collections::HashSet::from([shard]);
+        let removed = mgr.clear_pending_inbound_for_shards(&shards);
+        if removed > 0 {
+            self.inbound_atomic.load_from(mgr.inbound_bitmap());
+            if let Some(ref path) = self.inbound_state_path {
+                crate::cluster::migration::persist_inbound_state(path, mgr);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn register_test_inbound_from_source(&self, shard: u16, from_node: NodeId) {
         let mgr = &mut self.migration.lock();
@@ -9952,6 +10009,101 @@ mod tests {
         assert!(
             migration.lock().has_committed_handoff(201, 10),
             "committing completion must record committed-handoff evidence",
+        );
+    }
+
+    /// Task #31: an ABORTED outbound handoff (the failure path that sends a
+    /// `send_migration_abort_completion_best_effort`) must NOT record a
+    /// committed handoff — an abort means the handoff did NOT complete, so the
+    /// source stays authoritative and the #25/#28 gates (relinquish /
+    /// orphan-cleanup), which both key off `has_committed_handoff`, must NOT
+    /// be allowed to let the source drop the shard.
+    #[test]
+    fn aborted_handoff_does_not_record_committed_handoff() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let task = make_outbound_master_task(205, NodeId(1), NodeId(2));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            NodeId(1),
+            &std::collections::HashSet::new(),
+        );
+
+        // The abort path: fail the task (rollback to self), exactly as the
+        // streaming/manifest/commit failure branches do after emitting the
+        // abort frame. This MUST NOT record committed-handoff evidence.
+        assert!(fail_migration_task_current_epoch(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            10,
+            FailedTaskTableAction::Rollback,
+        ));
+        assert!(
+            !migration.lock().has_committed_handoff(205, 10),
+            "an aborted handoff must NOT record committed-handoff evidence",
+        );
+    }
+
+    /// Task #31: the relinquish disposition that drops `self`'s mastership is
+    /// reachable ONLY when `self` holds NO records (Cond 5). On an abort where
+    /// the source still holds the shard's records, the disposition is
+    /// RollbackToSelf — the source stays the authoritative master+holder, so an
+    /// aborted handoff can never hand a non-empty shard away and lose it.
+    #[test]
+    fn aborted_handoff_with_records_stays_authoritative_rollback() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        // Find a shard whose committed master is NodeId(2) so the only thing
+        // blocking a relinquish is the self-holds-records guard.
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(2))
+            .expect("some shard masters to NodeId(2) in a 2-member table");
+        let task = make_outbound_master_task(shard, NodeId(1), NodeId(2));
+        let live: std::collections::HashSet<NodeId> = [NodeId(1), NodeId(2)].into_iter().collect();
+
+        // self holds records → must roll back, never relinquish.
+        let disposition_with_records = failed_handoff_disposition(
+            &task,
+            &table,
+            &members,
+            1,
+            NodeId(1),
+            &live,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ true,
+        );
+        assert_eq!(
+            disposition_with_records,
+            FailedHandoffDisposition::RollbackToSelf,
+            "an aborted handoff of a NON-empty shard must keep the source authoritative",
+        );
+
+        // Sanity: an EMPTY shard with the same topology IS relinquish-eligible,
+        // proving the records guard (not some other condition) is what blocks it.
+        let disposition_empty = failed_handoff_disposition(
+            &task,
+            &table,
+            &members,
+            1,
+            NodeId(1),
+            &live,
+            false,
+            /* self_holds_records */ false,
+        );
+        assert_eq!(
+            disposition_empty,
+            FailedHandoffDisposition::RelinquishToCommittedMaster,
+            "an empty phantom shard is the only no-loss-safe relinquish case",
         );
     }
 

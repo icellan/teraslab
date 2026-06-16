@@ -479,6 +479,19 @@ pub const FLAG_MIGRATION_BATCH: u16 = 0x0002;
 /// verification without forcing one durable inbound-state write per shard.
 pub const FLAG_MIGRATION_VERIFY_ONLY: u16 = 0x0004;
 
+/// Request flag on `OP_MIGRATION_COMPLETE`: this is an ABORT signal, not a
+/// real completion. The source could not finish streaming the shard's data
+/// (baseline/late-key/delta/manifest/commit-handshake failure) and is telling
+/// the target to abandon the in-flight inbound transfer: clear the
+/// inbound-pending fence so the shard is not stranded forever, WITHOUT a
+/// record-count or manifest check (an abort is precisely the case where the
+/// target's partial copy will not match any count) and WITHOUT pruning. The
+/// source remains the authoritative master+holder of the shard — the handoff
+/// did NOT complete, so the target must not commit the shard to itself and the
+/// source must not record a committed handoff. Idempotent: a target with no
+/// matching inbound entry treats it as a no-op.
+pub const FLAG_MIGRATION_ABORT: u16 = 0x0008;
+
 /// Maximum frame payload size (16 MiB) for normal client/server traffic.
 ///
 /// BSV mainnet has transactions exceeding 300 MB, but those payloads are

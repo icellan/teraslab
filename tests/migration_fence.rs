@@ -57,6 +57,7 @@ const TEST_CLUSTER_ID: ClusterId = ClusterId([0xA5; 16]);
 struct TestNode {
     server: Arc<Server>,
     cluster: Arc<RunningCluster>,
+    engine: Arc<Engine>,
     tcp_port: u16,
     swim_port: u16,
 }
@@ -143,7 +144,7 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], rf: u8) -> TestNode {
         strict_auth: false,
         ..Default::default()
     };
-    let server = Arc::new(Server::new(engine, config).with_cluster(running.clone()));
+    let server = Arc::new(Server::new(engine.clone(), config).with_cluster(running.clone()));
     let server_clone = server.clone();
     std::thread::spawn(move || {
         let _ = server_clone.run();
@@ -167,6 +168,7 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], rf: u8) -> TestNode {
     TestNode {
         server,
         cluster: running,
+        engine,
         tcp_port,
         swim_port,
     }
@@ -601,6 +603,187 @@ fn write_racing_completion_window_is_never_acked_then_lost() {
     assert_eq!(
         results[0].spending_data, spending_data,
         "retried spend must be durably visible"
+    );
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+}
+
+/// Task #31 (rolling-restart migration ABORT convergence + no data loss).
+///
+/// The source (node1, the authoritative master of the shard) could not finish
+/// a partial handoff to the target (node2), so it sends an ABORT completion
+/// (`OP_MIGRATION_COMPLETE` with `FLAG_MIGRATION_ABORT`, record_count=0, no
+/// manifest) over the real wire — exactly what
+/// `send_migration_abort_completion_best_effort` emits.
+///
+/// Fail-before (the bug): the abort frame (zero count, no manifest) was
+/// rejected by the target as `record count mismatch: expected 0, got K` /
+/// `ERR_MIGRATION_MANIFEST_REQUIRED`, so node2's inbound-pending fence was
+/// NEVER cleared — the shard stayed fenced forever ("awaiting data" that never
+/// arrives), and reads of node2's partial copy stayed blocked (the stuck
+/// outcome). Pass-after: the abort is ACCEPTED; the shard converges (node2
+/// inbound cleared, partial copy RETAINED + readable, source node1 still
+/// authoritative + serving) — no stuck inbound, no lost record.
+#[test]
+fn migration_abort_converges_source_authoritative_target_cleared_no_loss() {
+    let node1 = create_node(445, &[], 1);
+    let node2 = create_node(446, &[node1.swim_port], 1);
+
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(20),
+    )
+    .expect("2-node topology should commit on both nodes");
+
+    // A key node1 masters (the authoritative source of the would-be handoff).
+    let mut key_txid = None;
+    for i in 0..8192u32 {
+        let txid = make_txid(960_000 + i);
+        if matches!(
+            node1.cluster.is_master(&TxKey { txid }),
+            MasterQueryResult::Yes
+        ) {
+            key_txid = Some(txid);
+            break;
+        }
+    }
+    let txid = key_txid.expect("node1 should master at least one of 8192 candidate keys");
+    let utxo_hash = make_txid(970_001);
+    let key = TxKey { txid };
+    let shard = ShardTable::shard_for_key(&key);
+
+    // Source (node1) holds the authoritative copy.
+    let mut s1 = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
+    s1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let create_payload = encode_create_payload(&txid, &utxo_hash);
+    let resp = send_request(
+        &mut s1,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: create_payload.into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "source seed CREATE must succeed");
+
+    // Target (node2) holds a PARTIAL inbound copy and is registered as
+    // actively receiving the shard (inbound-pending / fenced) — the exact
+    // state a half-finished transfer leaves behind.
+    let create_req = teraslab::ops::create::CreateRequest {
+        tx_id: txid,
+        tx_version: 2,
+        locktime: 0,
+        fee: 1000,
+        size_in_bytes: 250,
+        extended_size: 0,
+        is_coinbase: false,
+        spending_height: 0,
+        utxo_hashes: std::slice::from_ref(&utxo_hash),
+        inputs: None,
+        outputs: None,
+        inpoints: None,
+        is_external: false,
+        created_at: 1_700_000_000_000,
+        block_height: 0,
+        mined_block_infos: &[],
+        frozen: false,
+        conflicting: false,
+        locked: false,
+        external_ref: None,
+        parent_txids: &[],
+    };
+    node2
+        .engine
+        .create(&create_req)
+        .expect("seed partial inbound copy on target");
+    assert_eq!(
+        node2.engine.shard_record_count(shard),
+        1,
+        "precondition: target holds K=1 partial record"
+    );
+    node2.cluster.mark_inbound_active(shard);
+    assert_eq!(
+        node2.cluster.inbound_pending_count(),
+        1,
+        "precondition: target shard is inbound-pending (fenced)"
+    );
+
+    // Send the ABORT frame over the real wire to the target (node2), exactly
+    // as the source's migration worker does on a failed handoff.
+    let mut s2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
+    s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut abort_payload = Vec::with_capacity(24);
+    abort_payload.extend_from_slice(&0u64.to_le_bytes()); // record_count
+    abort_payload.extend_from_slice(&0u64.to_le_bytes()); // fence_sequence
+    abort_payload.extend_from_slice(&0u64.to_le_bytes()); // topology_epoch
+    let resp = send_request(
+        &mut s2,
+        &RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_ABORT,
+            payload: abort_payload.into(),
+        },
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "abort must be ACCEPTED over the wire (not rejected as count mismatch)"
+    );
+
+    // Convergence: target inbound-pending cleared (no stuck inbound).
+    assert!(
+        wait_until(
+            || node2.cluster.inbound_pending_count() == 0,
+            Duration::from_secs(5),
+        )
+        .is_ok(),
+        "abort must clear target inbound-pending — shard must not be stuck",
+    );
+    // No loss: the target's partial copy is RETAINED (never stranded/deleted).
+    assert_eq!(
+        node2.engine.shard_record_count(shard),
+        1,
+        "abort must NOT delete the target's partial record",
+    );
+    assert!(
+        node2.engine.read_metadata(&key).is_ok(),
+        "the retained partial record must remain readable on the target",
+    );
+
+    // Source stays authoritative + serving: node1 still masters and serves it.
+    assert!(
+        matches!(node1.cluster.is_master(&key), MasterQueryResult::Yes),
+        "an aborted (non-committed) handoff must leave the source authoritative",
+    );
+    let query = encode_get_spend_batch(&[WireGetSpendItem {
+        txid,
+        vout: 0,
+        utxo_hash,
+    }]);
+    let resp = send_request(
+        &mut s1,
+        &RequestFrame {
+            request_id: 9,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: query.into(),
+        },
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "source must still serve the record after the abort"
+    );
+    let results = decode_get_spend_response(&resp.payload)
+        .expect("source get_spend response must decode after abort");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0].status, 0,
+        "the record must still be found on the authoritative source — no data loss"
     );
 
     shutdown_node(&node1);
