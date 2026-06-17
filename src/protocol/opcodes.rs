@@ -492,6 +492,32 @@ pub const FLAG_MIGRATION_VERIFY_ONLY: u16 = 0x0004;
 /// matching inbound entry treats it as a no-op.
 pub const FLAG_MIGRATION_ABORT: u16 = 0x0008;
 
+/// Request flag on `OP_MIGRATION_COMPLETE` (only meaningful together with
+/// `FLAG_MIGRATION_VERIFY_ONLY` and an exact-entry manifest): a SUPERSET
+/// verification probe, not an exact-count completion.
+///
+/// # Why it exists (sc09/sc05 drain convergence)
+///
+/// A gracefully-draining node that re-asserted stale mastership of a NON-empty
+/// shard a live peer already took over streams its (older) copy to the rightful
+/// master `R`, then sends a normal completion carrying its own record count
+/// `K`. But `R` already holds the shard and has accepted writes the draining
+/// node never saw, so `R`'s actual count is `> K`: the exact-count completion is
+/// rejected as `record count mismatch: expected K, got actual`. The draining
+/// node then rolls the shard back to itself (its copy is non-empty, so the
+/// no-loss guard forbids dropping it on a failed handoff) — and the handoff
+/// NEVER completes, leaving ~5 phantom master shards that stall the drain.
+///
+/// This flag breaks that deadlock the no-loss way. After streaming, the source
+/// probes `R`: "do you hold EVERY (txid, generation) in my exact manifest?".
+/// The target verifies superset containment (every source entry present locally
+/// with the matching generation) and ignores the exact-count equality — `R`
+/// legitimately holds MORE. A `STATUS_OK` proves the source's data is safe in
+/// `R`, so the source may relinquish the phantom mastership (transfer-then-
+/// relinquish). The probe NEVER mutates target state (it is verify-only: no
+/// prune, no commit, no inbound clear), so a mismatch is harmless.
+pub const FLAG_MIGRATION_SUPERSET_OK: u16 = 0x0010;
+
 /// Maximum frame payload size (16 MiB) for normal client/server traffic.
 ///
 /// BSV mainnet has transactions exceeding 300 MB, but those payloads are

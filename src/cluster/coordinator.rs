@@ -241,6 +241,15 @@ struct RelinquishContext {
 ///
 /// `ctx` is `None` when the caller has no committed-topology snapshot (legacy
 /// / test paths) — in that case this is identical to a `rollback = true` call.
+///
+/// `superset_probe`, when present, is a verify-only network probe of the
+/// rightful master that returns `true` iff that master provably holds a
+/// SUPERSET of `self`'s shard records (`confirm_target_holds_superset`). It is
+/// invoked LAZILY and only when `self` still holds records for the shard — the
+/// single case where the proof is needed to relinquish a NON-empty phantom
+/// (transfer-then-relinquish). A `None` probe (or one returning `false`) keeps
+/// the historical no-loss behaviour: a non-empty copy rolls back to self.
+#[allow(clippy::too_many_arguments)]
 fn fail_or_relinquish_outbound_task(
     migration: &Arc<Mutex<MigrationManager>>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -249,11 +258,23 @@ fn fail_or_relinquish_outbound_task(
     task: &MigrationTask,
     topology_epoch: u64,
     ctx: Option<&RelinquishContext>,
+    superset_probe: Option<&dyn Fn() -> bool>,
 ) -> bool {
     let action = match ctx {
         Some(ctx) => {
             let has_pending_inbound = migration.lock().has_pending_inbound(task.shard);
             let self_holds_records = ctx.engine.shard_record_count(task.shard) > 0;
+            // Probe the rightful master for superset containment only when
+            // self holds records (otherwise the empty-shard path already
+            // relinquishes no-loss) AND a probe was supplied. The probe is a
+            // network round-trip, so it is gated to the exact case that needs
+            // it — the non-empty phantom whose rightful master already holds
+            // the data.
+            let target_holds_superset = if self_holds_records {
+                superset_probe.map(|p| p()).unwrap_or(false)
+            } else {
+                false
+            };
             let disposition = {
                 let table = shard_table.read();
                 failed_handoff_disposition(
@@ -265,6 +286,7 @@ fn fail_or_relinquish_outbound_task(
                     &ctx.live_members,
                     has_pending_inbound,
                     self_holds_records,
+                    target_holds_superset,
                     ctx.placement_version,
                 )
             };
@@ -649,14 +671,20 @@ enum FailedHandoffDisposition {
 ///    nothing to transfer or lose — AND it cannot strand the committed master in
 ///    a half-served state (an empty shard needs no data to serve).
 ///
-///    A NON-empty local copy is NEVER dropped on a failed handoff: a failed
-///    handoff cannot prove `R` holds a superset of `self`'s records (a hard
-///    reject only proves `R`'s data DIFFERS — possibly a subset), and a
-///    one-sided drop would also leave `R` in a subset-waiting state it can only
-///    exit via the very handoff that just failed (observed as a stranded read).
-///    So `self` keeps the data and rolls back — no-loss/correctness over
-///    convergence, exactly as the task mandates when peer-possession cannot be
-///    established.
+///    A NON-empty local copy is dropped on a failed handoff ONLY when the
+///    rightful master `R` has been PROVEN to hold a superset of `self`'s records
+///    (`target_holds_superset == true`). That proof comes from a verify-only
+///    superset probe (`confirm_target_holds_superset`): after `self` streams its
+///    copy to `R`, `R` confirms it holds EVERY one of `self`'s
+///    `(txid, generation)` records. This is the no-loss way to drop a non-empty
+///    phantom — transfer first, then relinquish — and it is exactly the case
+///    sc09/sc05 hit: `R` already took the shard over and accepted newer writes,
+///    so `R`'s count is a strict superset of `self`'s and the exact-count
+///    completion is rejected even though `R` provably holds all of `self`'s
+///    data. Without the proof (`target_holds_superset == false`) a non-empty
+///    copy is NEVER dropped: a bare reject only proves `R`'s data DIFFERS
+///    (possibly a subset), and a one-sided drop would strand a record — so
+///    `self` keeps the data and rolls back (no-loss over convergence).
 #[allow(clippy::too_many_arguments)]
 fn failed_handoff_disposition(
     task: &MigrationTask,
@@ -667,6 +695,7 @@ fn failed_handoff_disposition(
     live_members: &std::collections::HashSet<NodeId>,
     has_pending_inbound: bool,
     self_holds_records: bool,
+    target_holds_superset: bool,
     placement_version: u16,
 ) -> FailedHandoffDisposition {
     // Cond 1: only master handoffs cause the over-count.
@@ -682,9 +711,11 @@ fn failed_handoff_disposition(
     if has_pending_inbound {
         return FailedHandoffDisposition::RollbackToSelf;
     }
-    // Cond 5: NO-LOSS. Only an empty local copy is safe to drop on a failed
-    // handoff. A non-empty copy is kept (rollback) — see the doc comment.
-    if self_holds_records {
+    // Cond 5: NO-LOSS. An empty local copy is trivially safe to drop. A
+    // NON-empty copy is safe to drop ONLY when the rightful master has been
+    // PROVEN to hold a superset of self's records (transfer-then-relinquish);
+    // otherwise it is kept (rollback) — see the doc comment.
+    if self_holds_records && !target_holds_superset {
         return FailedHandoffDisposition::RollbackToSelf;
     }
     // Cond 2 + 3: the deterministic committed master must be a DIFFERENT,
@@ -4621,7 +4652,9 @@ fn run_migration_batch(
                     topology_epoch,
                     // Empty shard: relinquish is trivially no-loss (nothing to
                     // lose); the wrapper confirms the committed master anyway.
+                    // No superset probe needed — emptiness already proves it.
                     relinquish_ctx,
+                    None,
                 ) {
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -4892,13 +4925,39 @@ fn run_migration_batch(
                                 "baseline streaming failed",
                                 auth_secret,
                             );
-                            // Task #25 — baseline streaming failures are
-                            // typically the target's per-IP connection cap
-                            // resetting the migration burst (the dominant
-                            // scale-down/rejoin failure). Relinquish only when a
-                            // verify-only probe confirms the committed master
-                            // already holds a superset of self's records
-                            // (no-loss-safe); otherwise roll back to self.
+                            // sc09/sc05 drain convergence — the baseline apply
+                            // was REJECTED by the target. The dominant cause on a
+                            // rejoin (sc09) is a GENERATION REGRESSION: the target
+                            // already took the shard over and holds each record at
+                            // a HIGHER generation (it saw spends this stale source
+                            // missed), so applying this source's older baseline
+                            // would regress the record and the target refuses the
+                            // batch. That is precisely the no-loss relinquish case
+                            // — the target holds a SUPERSET (newer-or-equal) of
+                            // this source's records. Probe the target with this
+                            // source's CURRENT manifest; if it confirms it holds
+                            // every record at generation >= ours, relinquish the
+                            // phantom. If the probe is inconclusive (target behind,
+                            // missing a record, or unreachable) the non-empty copy
+                            // rolls back to self (no-loss) and the next re-drive
+                            // retries.
+                            let probe_keys = engine.keys_for_shard(task.shard);
+                            let probe_manifest =
+                                collect_manifest_entries(&engine, task.shard, &probe_keys)
+                                    .unwrap_or_default();
+                            let probe = || {
+                                if probe_manifest.is_empty() {
+                                    return false;
+                                }
+                                confirm_target_holds_superset(
+                                    addr,
+                                    task.shard,
+                                    task.from_node,
+                                    topology_epoch,
+                                    &probe_manifest,
+                                    auth_secret,
+                                )
+                            };
                             if fail_or_relinquish_outbound_task(
                                 &migration,
                                 shard_table,
@@ -4907,6 +4966,7 @@ fn run_migration_batch(
                                 task,
                                 topology_epoch,
                                 relinquish_ctx,
+                                Some(&probe),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -5072,12 +5132,30 @@ fn run_migration_batch(
                                 "manifest verification failed",
                                 auth_secret,
                             );
-                            // Task #25 — the completion was rejected (the target
-                            // already serves the shard / manifest mismatch). If a
-                            // verify-only probe confirms the committed master
-                            // holds a superset of self's records, relinquish
-                            // rather than re-cement the phantom.
+                            // sc09/sc05 drain convergence — the completion was
+                            // rejected (the rightful master already serves the
+                            // shard and holds MORE records, so the exact-count
+                            // completion mismatches). We just streamed our full
+                            // manifest to that master, and the abort above only
+                            // cleared the target's inbound fence — it RETAINS the
+                            // streamed records. So a verify-only superset probe
+                            // can now prove the rightful master holds every one
+                            // of our records; if it does, relinquish the phantom
+                            // (transfer-then-relinquish, no-loss). If the probe
+                            // fails or is inconclusive, the non-empty copy rolls
+                            // back to self exactly as before.
                             let _ = &e;
+                            let manifest_for_probe = manifest_entries.clone();
+                            let probe = || {
+                                confirm_target_holds_superset(
+                                    addr,
+                                    task.shard,
+                                    task.from_node,
+                                    topology_epoch,
+                                    &manifest_for_probe,
+                                    auth_secret,
+                                )
+                            };
                             if fail_or_relinquish_outbound_task(
                                 &migration,
                                 shard_table,
@@ -5086,6 +5164,7 @@ fn run_migration_batch(
                                 task,
                                 topology_epoch,
                                 relinquish_ctx,
+                                Some(&probe),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -5117,10 +5196,13 @@ fn run_migration_batch(
                                     "completion commit failed",
                                     auth_secret,
                                 );
-                                // Task #25 — commit handshake failed. Relinquish
-                                // only if a verify-only probe confirms the
-                                // committed master holds a superset of self's
-                                // records; otherwise keep rollback-to-self.
+                                // Task #25 — the batched commit handshake failed
+                                // after the per-shard verify already succeeded.
+                                // Relinquish only on the empty-shard path; a
+                                // non-empty copy rolls back to self (no manifest
+                                // is retained here to drive a superset probe).
+                                // The next drain re-drive re-streams and the
+                                // manifest-reject path performs the probe.
                                 let _ = outcome;
                                 if fail_or_relinquish_outbound_task(
                                     &migration,
@@ -5130,6 +5212,7 @@ fn run_migration_batch(
                                     task,
                                     topology_epoch,
                                     relinquish_ctx,
+                                    None,
                                 ) {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                 }
@@ -5802,6 +5885,107 @@ fn send_migration_complete(
         ));
     }
     Ok(())
+}
+
+/// Probe the rightful master to confirm it holds a SUPERSET of `self`'s shard
+/// records (sc09/sc05 drain convergence — transfer-then-relinquish).
+///
+/// Sends a verify-only `OP_MIGRATION_COMPLETE` carrying `self`'s exact manifest
+/// (`(txid, generation)` per record) with `FLAG_MIGRATION_SUPERSET_OK`. The
+/// target answers superset containment — "do I hold EVERY entry in this
+/// manifest with a matching generation?" — and IGNORES the exact-count equality
+/// (the rightful master legitimately holds MORE records). A `STATUS_OK` proves
+/// every one of `self`'s records is safely present on the target, so `self` may
+/// drop its (non-empty) phantom copy without losing data.
+///
+/// Returns `true` ONLY on a confirmed superset (`STATUS_OK`). Any error,
+/// rejection, or connection failure returns `false` — the caller then keeps the
+/// data and rolls back to self (no-loss). The probe NEVER mutates target state:
+/// it is verify-only with the superset flag, so the target performs no prune, no
+/// commit, and no inbound-state change.
+///
+/// `manifest_entries` MUST be `self`'s complete current manifest for the shard
+/// (the same set just streamed to the target). An empty manifest is rejected by
+/// the target and reported here as `false`.
+fn confirm_target_holds_superset(
+    target_addr: SocketAddr,
+    shard: u16,
+    from_node: NodeId,
+    topology_epoch: u64,
+    manifest_entries: &[(TxKey, u32)],
+    auth_secret: Option<&[u8]>,
+) -> bool {
+    if manifest_entries.is_empty() {
+        return false;
+    }
+    // Wire layout matches `send_migration_complete`'s verify-only frame; the
+    // SUPERSET flag selects the containment check on the receiver.
+    let manifest_hash = compute_manifest_for_entries(manifest_entries);
+    let mut payload = Vec::with_capacity(68 + manifest_entries.len() * 36);
+    payload.extend_from_slice(&(manifest_entries.len() as u64).to_le_bytes()); // record_count
+    payload.extend_from_slice(&0u64.to_le_bytes()); // fence_sequence (unused by probe)
+    payload.extend_from_slice(&topology_epoch.to_le_bytes());
+    payload.extend_from_slice(&manifest_hash);
+    payload.extend_from_slice(&(manifest_entries.len() as u32).to_le_bytes());
+    for (key, generation) in manifest_entries {
+        payload.extend_from_slice(&key.txid);
+        payload.extend_from_slice(&generation.to_le_bytes());
+    }
+    payload.extend_from_slice(&from_node.0.to_le_bytes());
+
+    let request = RequestFrame {
+        request_id: shard as u64,
+        op_code: OP_MIGRATION_COMPLETE,
+        flags: FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK,
+        payload: payload.into(),
+    };
+
+    // One probe round-trip. `Ok(Some(b))` is a definitive answer from the
+    // target (confirmed superset or a logical reject); `Ok(None)` /  `Err`
+    // is a TRANSIENT connection failure (the target's per-IP connection cap
+    // resetting the migration burst), which is retried below.
+    let attempt = || -> std::result::Result<Option<bool>, String> {
+        let mut stream = TcpStream::connect_timeout(&target_addr, Duration::from_secs(3))
+            .map_err(|e| format!("connect: {e}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| format!("set read timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| format!("set write timeout: {e}"))?;
+        crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
+        let response = exchange_frame(&mut stream, &request, auth_secret)?;
+        Ok(Some(response.status == STATUS_OK))
+    };
+
+    // The probe competes with the migration pool (up to `migration_pool_size`
+    // connections) for the target's per-IP connection cap, so the first few
+    // attempts are frequently reset ("connection reset" / "failed to fill whole
+    // buffer"). These are BACKPRESSURE, not a logical "no": retry with backoff
+    // so the probe lands in a gap between bursts and the legitimate relinquish
+    // can complete (sc09/sc05 convergence). A definitive STATUS answer (Ok) is
+    // returned immediately — only transient connection errors are retried. The
+    // total budget is bounded (~3.1s of backoff plus per-attempt I/O timeouts),
+    // and on exhaustion we conservatively return `false` (keep data, roll back).
+    const RETRY_DELAYS_MS: [u64; 6] = [25, 75, 150, 300, 600, 1200];
+    let mut last_err = String::new();
+    for (i, &delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
+        match attempt() {
+            Ok(Some(confirmed)) => return confirmed,
+            Ok(None) => {}
+            Err(err) => last_err = err,
+        }
+        if i + 1 < RETRY_DELAYS_MS.len() {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+    tracing::warn!(
+        shard,
+        %target_addr,
+        err = %last_err,
+        "cluster: superset probe failed after retries — keeping data, rolling back",
+    );
+    false
 }
 
 /// Send batched migration-complete handshakes for multiple shards in a
@@ -7589,6 +7773,25 @@ impl RunningCluster {
             .find_map(|(id, a)| if a == addr { Some(*id) } else { None })
     }
 
+    /// Is `ip` the address of a known cluster peer (or self)?
+    ///
+    /// Used by the server accept loop to EXEMPT trusted cluster peers from the
+    /// per-IP connection cap. That cap is a DoS guard against untrusted CLIENT
+    /// IPs; a cluster peer driving a shard migration legitimately fans out up to
+    /// `migration_pool_size` connections PLUS completion handshakes and superset
+    /// probes, which together exceed the client cap and get reset. Those resets
+    /// stall handoff/relinquish convergence under a rolling restart (sc09/sc05):
+    /// a draining node's probe to its rightful master keeps getting refused, so
+    /// the no-loss relinquish never completes. Peers are identified by the
+    /// committed member addresses the coordinator already tracks; an unknown IP
+    /// is still subject to the cap.
+    pub fn is_known_peer_ip(&self, ip: std::net::IpAddr) -> bool {
+        if self.self_addr.ip() == ip {
+            return true;
+        }
+        self.node_addrs.read().values().any(|a| a.ip() == ip)
+    }
+
     /// Get the current shard table version.
     ///
     /// Returns the committed topology term (globally agreed) rather than
@@ -9028,6 +9231,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ false,
+            /* target_holds_superset */ false,
             1,
         );
         assert_eq!(
@@ -9144,6 +9348,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ true,
+            /* target_holds_superset */ false,
             1,
         );
         assert_eq!(
@@ -9171,6 +9376,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ false,
+            /* target_holds_superset */ false,
             1,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
@@ -9194,6 +9400,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ true,
             /* self_holds_records */ false,
+            /* target_holds_superset */ false,
             1,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
@@ -9218,6 +9425,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ false,
+            /* target_holds_superset */ false,
             1,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
@@ -9247,6 +9455,33 @@ mod tests {
             cluster.replication_timeout_during_migration(),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn is_known_peer_ip_exempts_members_and_self_only() {
+        // Self and committed peers use distinct IPs so the per-IP cap exemption
+        // (sc09/sc05 convergence) can be verified independently of port.
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
+        let self_addr: SocketAddr = "10.0.0.1:3300".parse().unwrap();
+        let peer_addr: SocketAddr = "10.0.0.2:3300".parse().unwrap();
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &[(NodeId(1), self_addr), (NodeId(2), peer_addr)],
+            &[NodeId(1), NodeId(2)],
+            &[],
+            &[],
+            &[],
+            2,
+        );
+
+        // Self is always exempt.
+        assert!(cluster.is_known_peer_ip("10.0.0.1".parse().unwrap()));
+        // A committed peer is exempt.
+        assert!(cluster.is_known_peer_ip("10.0.0.2".parse().unwrap()));
+        // An unknown (client) IP is NOT exempt — the cap still applies.
+        assert!(!cluster.is_known_peer_ip("10.0.0.99".parse().unwrap()));
+        assert!(!cluster.is_known_peer_ip("127.0.0.1".parse().unwrap()));
     }
 
     #[test]
@@ -10228,6 +10463,7 @@ mod tests {
             &live,
             /* has_pending_inbound */ false,
             /* self_holds_records */ true,
+            /* target_holds_superset */ false,
             1,
         );
         assert_eq!(
@@ -10247,12 +10483,99 @@ mod tests {
             &live,
             false,
             /* self_holds_records */ false,
+            /* target_holds_superset */ false,
             1,
         );
         assert_eq!(
             disposition_empty,
             FailedHandoffDisposition::RelinquishToCommittedMaster,
             "an empty phantom shard is the only no-loss-safe relinquish case",
+        );
+    }
+
+    /// sc09/sc05 drain convergence (transfer-then-relinquish). A NON-empty
+    /// phantom master whose rightful master is a live committed peer that has
+    /// been PROVEN to hold a superset of self's records MUST relinquish — the
+    /// data is safe in the rightful master, so dropping the phantom copy is
+    /// no-loss and lets the drain reach zero. This is the case the bare
+    /// no-loss guard left stuck forever (rollback-to-self).
+    #[test]
+    fn nonempty_phantom_relinquishes_when_target_holds_superset() {
+        let (table, shard, self_id, rightful, committed_members, task) = phantom_handoff_fixture();
+        assert_eq!(table.effective_assignment(shard).master, self_id);
+        assert_eq!(table.target_assignment(shard).master, rightful);
+        let live_members: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+
+        // FAIL-BEFORE: without the superset proof, a non-empty copy rolls back
+        // to self — the non-converging stall this fix targets.
+        let stuck = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ true,
+            /* target_holds_superset */ false,
+            1,
+        );
+        assert_eq!(
+            stuck,
+            FailedHandoffDisposition::RollbackToSelf,
+            "without superset proof, a non-empty copy must roll back (no-loss)",
+        );
+
+        // PASS-AFTER: the verify-only superset probe confirmed the rightful
+        // master holds every one of self's records → relinquish, converging to
+        // a single master without losing data.
+        let converged = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ true,
+            /* target_holds_superset */ true,
+            1,
+        );
+        assert_eq!(
+            converged,
+            FailedHandoffDisposition::RelinquishToCommittedMaster,
+            "a superset-proven rightful master makes the non-empty drop no-loss",
+        );
+    }
+
+    /// The superset proof relaxes ONLY the records guard — every OTHER no-loss
+    /// condition must still hold. A superset-proven handoff whose rightful
+    /// master is DEAD must still roll back (cannot relinquish to a master that
+    /// cannot serve).
+    #[test]
+    fn superset_proof_does_not_override_dead_rightful_master() {
+        let (table, _shard, self_id, rightful, committed_members, task) = phantom_handoff_fixture();
+        let mut live_members: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+        live_members.remove(&rightful); // rightful master crashed
+
+        let disposition = failed_handoff_disposition(
+            &task,
+            &table,
+            &committed_members,
+            2,
+            self_id,
+            &live_members,
+            /* has_pending_inbound */ false,
+            /* self_holds_records */ true,
+            /* target_holds_superset */ true,
+            1,
+        );
+        assert_eq!(
+            disposition,
+            FailedHandoffDisposition::RollbackToSelf,
+            "superset proof never overrides the live-rightful-master requirement",
         );
     }
 

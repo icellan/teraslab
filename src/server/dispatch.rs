@@ -1011,6 +1011,102 @@ pub(crate) fn handle_request(
 
             let verify_only = request.flags & FLAG_MIGRATION_VERIFY_ONLY != 0;
 
+            // SUPERSET probe (sc09/sc05 drain convergence — transfer-then-
+            // relinquish). A gracefully-draining node that re-asserted stale
+            // mastership of a NON-empty shard a live peer already took over
+            // streams its (older) copy to the rightful master, then asks: "do
+            // you now hold EVERY (txid, generation) in my exact manifest?".
+            // Because the rightful master already holds the shard AND has
+            // accepted writes the draining node never saw, its actual count is
+            // a strict SUPERSET of the source's — the normal exact-count
+            // completion is rejected as a count mismatch and the source rolls
+            // the non-empty shard back to itself forever (the ~5-shard drain
+            // stall). This probe answers superset containment instead of count
+            // equality: it confirms every source entry is present locally with
+            // the matching generation and returns STATUS_OK regardless of
+            // EXTRA local records. A STATUS_OK proves the source's data is safe
+            // here, so the source may relinquish the phantom mastership.
+            //
+            // Strictly verify-only and non-mutating: it requires the
+            // VERIFY_ONLY flag and an exact-entry manifest, performs NO prune,
+            // NO commit, and NO inbound-state change. A mismatch is reported as
+            // a retryable error and changes nothing, so the source keeps the
+            // data and rolls back (no-loss). It deliberately runs BEFORE the
+            // count/prune machinery so the rightful master's legitimate extra
+            // records never trip the exact-count reject.
+            if request.flags & FLAG_MIGRATION_SUPERSET_OK != 0 {
+                if !verify_only {
+                    return error_response(
+                        request.request_id,
+                        ERR_INVARIANT_VIOLATION,
+                        &format!(
+                            "shard {shard} superset probe requires FLAG_MIGRATION_VERIFY_ONLY",
+                        ),
+                    );
+                }
+                let entries = match source_entries.as_ref() {
+                    Some(e) if !e.is_empty() => e,
+                    _ => {
+                        return error_response(
+                            request.request_id,
+                            ERR_MIGRATION_MANIFEST_REQUIRED,
+                            &format!(
+                                "shard {shard} superset probe requires a non-empty exact-entry manifest",
+                            ),
+                        );
+                    }
+                };
+                for (key, expected_generation) in entries {
+                    let meta = match engine.read_metadata(key) {
+                        Ok(meta) => meta,
+                        Err(_) => {
+                            // The target does NOT hold this source record:
+                            // superset containment fails. Retryable — the
+                            // source keeps the data and rolls back.
+                            return error_response(
+                                request.request_id,
+                                ERR_MIGRATION_IN_PROGRESS,
+                                &format!(
+                                    "shard {shard} superset probe: target missing key {:?}",
+                                    key,
+                                ),
+                            );
+                        }
+                    };
+                    // Copy out of the packed-struct field before referencing
+                    // it (an unaligned reference to a packed field is UB).
+                    let actual_generation = meta.generation;
+                    // Generation is a monotonic per-record mutation counter: a
+                    // HIGHER local generation means the target applied STRICTLY
+                    // MORE mutations to this record than the source ever saw
+                    // (e.g. spends the draining/stale source missed). The
+                    // source's state is then a prefix of the target's — still a
+                    // superset for the source, so dropping it is no-loss. A
+                    // LOWER local generation means the target is BEHIND the
+                    // source on this record (the source holds a mutation the
+                    // target lacks); that is NOT a superset, so reject and let
+                    // the source keep the data.
+                    if actual_generation < *expected_generation {
+                        return error_response(
+                            request.request_id,
+                            ERR_MIGRATION_IN_PROGRESS,
+                            &format!(
+                                "shard {shard} superset probe: target behind for {:?}: source generation {}, target {}",
+                                key, expected_generation, actual_generation,
+                            ),
+                        );
+                    }
+                }
+                // Every source entry is present locally at a generation >= the
+                // source's: the target holds a superset (equal or newer). No
+                // mutation.
+                return ResponseFrame {
+                    request_id: request.request_id,
+                    status: STATUS_OK,
+                    payload: Vec::new(),
+                };
+            }
+
             // Safety requirement (R-219): every completion, including an
             // empty shard (`record_count == 0`), MUST send cryptographic
             // manifest evidence. The prior zero-count/no-manifest fast path
@@ -15207,6 +15303,278 @@ mod tests {
             1,
             "verify-only completion must not clear pending inbound until the batched durable completion arrives"
         );
+    }
+
+    /// sc09/sc05 drain convergence (transfer-then-relinquish) — the SUPERSET
+    /// probe. A draining node sends its exact manifest with
+    /// FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK. The rightful
+    /// master, which holds the source's records PLUS extra newer ones, must
+    /// answer STATUS_OK (superset containment, ignoring the exact-count
+    /// equality) WITHOUT mutating any state — proving the source's data is safe
+    /// so the source may relinquish its phantom copy.
+    #[test]
+    fn migration_complete_superset_probe_confirms_when_target_is_superset() {
+        let h = DispatchTestHarness::new();
+        let shard = 51u16;
+        // Source holds A; the rightful master here holds A AND B (a superset:
+        // it already took the shard over and accepted the newer write B).
+        let txid_a = txid_for_shard(shard, 21);
+        let txid_b = txid_for_shard(shard, 22);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        // Source's manifest: ONLY A (the source never saw B).
+        let entries = vec![(key_a, meta_a.generation)];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 60, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4720".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        // FAIL-BEFORE (the stall): a plain exact-count completion is rejected
+        // because the target's count (2) exceeds the source's expected (1) —
+        // the source would then roll back to self forever.
+        let plain = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let plain_req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY,
+            payload: plain.into(),
+        };
+        let mut cs0 = crate::server::ConnectionState::new();
+        let plain_resp = handle_request(
+            &plain_req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut cs0,
+            None,
+        );
+        assert_eq!(
+            plain_resp.status, STATUS_ERROR,
+            "exact-count completion must reject when target holds MORE (the stall)"
+        );
+        let (plain_code, _) = decode_error_payload(&plain_resp.payload).unwrap();
+        assert_eq!(plain_code, ERR_MIGRATION_IN_PROGRESS);
+
+        // PASS-AFTER: the SUPERSET probe accepts — the target holds every source
+        // record (A) regardless of the extra B.
+        let probe = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let probe_req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK,
+            payload: probe.into(),
+        };
+        let mut cs1 = crate::server::ConnectionState::new();
+        let probe_resp = handle_request(
+            &probe_req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut cs1,
+            None,
+        );
+        assert_eq!(
+            probe_resp.status, STATUS_OK,
+            "superset probe must confirm when the target holds every source record"
+        );
+        // No mutation: BOTH records still present (the probe never prunes B).
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+        assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_ok());
+        assert_eq!(h.engine.shard_record_count(shard), 2);
+    }
+
+    /// The superset probe must REJECT when the target is missing a source
+    /// record — superset containment fails, so the source keeps the data and
+    /// rolls back (no-loss). It never mutates target state.
+    #[test]
+    fn migration_complete_superset_probe_rejects_when_target_missing_record() {
+        let h = DispatchTestHarness::new();
+        let shard = 52u16;
+        // Source claims A and B; the target holds ONLY A (missing B).
+        let txid_a = txid_for_shard(shard, 23);
+        let txid_b = txid_for_shard(shard, 24);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        // Manifest lists B with an arbitrary generation; the target lacks it.
+        let entries = vec![(key_a, meta_a.generation), (key_b, 1u32)];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 61, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4721".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        let probe = build_migration_complete_payload(
+            2,
+            0,
+            0,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK,
+            payload: probe.into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "superset probe must reject when the target lacks a source record"
+        );
+        let (code, _) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
+        // No mutation: A is untouched.
+        assert!(h.engine.read_metadata(&key_a).is_ok());
+        assert_eq!(h.engine.shard_record_count(shard), 1);
+    }
+
+    /// sc09 generation-regression convergence. On a rejoin, the rightful master
+    /// holds each record at a HIGHER generation than the stale source (it saw
+    /// spends the source missed). The superset probe must ACCEPT when the
+    /// target's generation is >= the source's (target is newer-or-equal → the
+    /// source's state is a prefix, no-loss to drop) and REJECT when the target
+    /// is BEHIND the source's generation (the source holds a mutation the target
+    /// lacks → not a superset, keep the data).
+    #[test]
+    fn migration_complete_superset_probe_generation_semantics() {
+        let h = DispatchTestHarness::new();
+        let shard = 53u16;
+        let txid = txid_for_shard(shard, 25);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+        let target_gen = h.engine.read_metadata(&key).unwrap().generation;
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 62, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4722".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        // ACCEPT: source generation strictly LESS than the target's (target is
+        // newer). Use a source generation of target_gen - 1 if possible; if the
+        // record is at generation 0 there is no lower value, so use equality.
+        let lower = target_gen.saturating_sub(1);
+        let accept_entries = vec![(key, lower)];
+        let accept_payload = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&accept_entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let accept_req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK,
+            payload: accept_payload.into(),
+        };
+        let mut cs_a = crate::server::ConnectionState::new();
+        let accept_resp = handle_request(
+            &accept_req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut cs_a,
+            None,
+        );
+        assert_eq!(
+            accept_resp.status, STATUS_OK,
+            "target newer-or-equal generation must confirm superset"
+        );
+
+        // REJECT: source generation strictly GREATER than the target's (target
+        // is behind — the source holds a mutation the target lacks).
+        let higher = target_gen + 1;
+        let reject_entries = vec![(key, higher)];
+        let reject_payload = build_migration_complete_payload(
+            1,
+            0,
+            0,
+            None,
+            Some(&reject_entries),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        let reject_req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: FLAG_MIGRATION_VERIFY_ONLY | FLAG_MIGRATION_SUPERSET_OK,
+            payload: reject_payload.into(),
+        };
+        let mut cs_r = crate::server::ConnectionState::new();
+        let reject_resp = handle_request(
+            &reject_req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut cs_r,
+            None,
+        );
+        assert_eq!(
+            reject_resp.status, STATUS_ERROR,
+            "target behind the source's generation is NOT a superset — must reject"
+        );
+        let (code, _) = decode_error_payload(&reject_resp.payload).unwrap();
+        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
+        // No mutation either way.
+        assert_eq!(h.engine.shard_record_count(shard), 1);
     }
 
     #[test]

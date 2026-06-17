@@ -565,7 +565,23 @@ impl Server {
                         // `max_connections_per_ip == 0` disables the
                         // cap (operators behind a single egress NAT may
                         // legitimately need this).
-                        let per_ip_guard = if self.config.max_connections_per_ip > 0 {
+                        //
+                        // Known cluster PEERS are exempt: the cap is a DoS guard
+                        // against untrusted CLIENT IPs, but a peer driving a
+                        // shard migration legitimately opens up to
+                        // `migration_pool_size` connections plus completion
+                        // handshakes and superset probes — together far above
+                        // the client cap. Counting peer traffic against the cap
+                        // resets those connections and stalls handoff/relinquish
+                        // convergence under a rolling restart (sc09/sc05). Peer
+                        // traffic is already authenticated by `cluster_secret` on
+                        // every inter-node frame, so it needs no per-IP throttle.
+                        let peer_exempt = self
+                            .cluster
+                            .as_ref()
+                            .is_some_and(|c| c.is_known_peer_ip(addr.ip()));
+                        let per_ip_guard = if self.config.max_connections_per_ip > 0 && !peer_exempt
+                        {
                             let peer_ip = addr.ip();
                             let mut map = self.connections_per_ip.lock();
                             let count = map.entry(peer_ip).or_insert(0);
