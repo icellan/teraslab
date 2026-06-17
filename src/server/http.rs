@@ -3434,8 +3434,8 @@ mod tests {
     fn shard_counts_report_serving_master_during_handoff() {
         let old_members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 10);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 11);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master == NodeId(4)

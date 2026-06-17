@@ -24,6 +24,11 @@ pub struct RoutingInfo {
     /// commits with the correct digest. Empty if not present in the wire
     /// format (backward compatibility with older servers).
     pub committed_members: Vec<NodeId>,
+    /// W6 — placement version of the committed term (`1` = round-robin,
+    /// `2` = HRW). A node that adopts a routing snapshot recomputes its
+    /// shard table at THIS version so it matches the rest of the cluster.
+    /// Defaults to `1` when absent (pre-W6 wire format).
+    pub placement_version: u16,
 }
 
 /// Information about a single cluster node.
@@ -53,6 +58,7 @@ impl RoutingInfo {
             nodes,
             shard_assignments: assignments,
             committed_members: Vec::new(),
+            placement_version: 1,
         }
     }
 
@@ -150,11 +156,19 @@ impl RoutingInfo {
             }
         }
 
+        // W6 — optional 2-byte placement_version trailer (pre-W6 ⇒ v1).
+        let placement_version = if pos + 2 <= data.len() {
+            u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap_or([1, 0]))
+        } else {
+            1
+        };
+
         Some(Self {
             shard_table_version: version,
             nodes,
             shard_assignments: assignments,
             committed_members,
+            placement_version,
         })
     }
 }
@@ -314,7 +328,7 @@ mod tests {
     #[test]
     fn decoded_routing_info_covers_all_shards() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 5);
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 5, 1);
         let assignments: Vec<(u16, NodeId)> = (0..NUM_SHARDS as u16)
             .map(|s| (s, table.target_assignment(s).master))
             .collect();

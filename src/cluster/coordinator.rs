@@ -223,6 +223,10 @@ fn fail_migration_task_current_epoch(
 struct RelinquishContext {
     committed_members: Vec<NodeId>,
     rf: u8,
+    /// W6 — placement version of the committed term, so the relinquish oracle
+    /// recomputes the rightful master with the SAME algorithm the cluster
+    /// agreed on (round-robin vs HRW).
+    placement_version: u16,
     self_id: NodeId,
     live_members: std::collections::HashSet<NodeId>,
     /// Engine handle to check whether `self` holds any records for a shard
@@ -261,6 +265,7 @@ fn fail_or_relinquish_outbound_task(
                     &ctx.live_members,
                     has_pending_inbound,
                     self_holds_records,
+                    ctx.placement_version,
                 )
             };
             match disposition {
@@ -468,16 +473,17 @@ fn committed_topology_reactivation_metrics(
     committed_members: &[NodeId],
     rf: u8,
     committed_term: u64,
+    placement_version: u16,
 ) -> (u32, usize) {
     let mismatched = if table.version != committed_term {
-        let expected = ShardTable::compute_with_epoch(committed_members, rf, 0);
+        let expected = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
         let count = (0..crate::cluster::shards::NUM_SHARDS as u16)
             .filter(|&shard| {
                 table.target_assignment(shard).master != expected.target_assignment(shard).master
             })
             .count() as u32;
         // The stale version alone mandates reactivation even if every
-        // master coincidentally matches the round-robin expectation.
+        // master coincidentally matches the committed-version expectation.
         count.max(1)
     } else {
         (0..crate::cluster::shards::NUM_SHARDS as u16)
@@ -550,18 +556,24 @@ fn phantom_master_shard_count(
     committed_members: &[NodeId],
     rf: u8,
     self_id: NodeId,
+    placement_version: u16,
 ) -> usize {
     // A single-member committed set cannot over-own (every shard is self's
     // by definition); skip the recompute.
     if committed_members.len() <= 1 {
         return 0;
     }
-    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0);
+    // W6: recompute at the committed term's placement_version (round-robin
+    // for v1, HRW for v2) so a settled v2 cluster is compared against the
+    // SAME algorithm it serves — comparing a v2 table to a v1 baseline would
+    // flag almost every shard as a phantom and trigger a reshuffle storm.
+    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
     (0..crate::cluster::shards::NUM_SHARDS as u16)
         .filter(|&shard| {
             // This node locally masters the shard, but the deterministic
-            // round-robin master for the committed members is a different
-            // node — the exact shard an empty-view reactivation reassigns.
+            // committed-version master for the committed members is a
+            // different node — the exact shard an empty-view reactivation
+            // reassigns.
             table.target_assignment(shard).master == self_id
                 && committed.target_assignment(shard).master != self_id
         })
@@ -655,6 +667,7 @@ fn failed_handoff_disposition(
     live_members: &std::collections::HashSet<NodeId>,
     has_pending_inbound: bool,
     self_holds_records: bool,
+    placement_version: u16,
 ) -> FailedHandoffDisposition {
     // Cond 1: only master handoffs cause the over-count.
     if !task.is_master {
@@ -676,7 +689,7 @@ fn failed_handoff_disposition(
     }
     // Cond 2 + 3: the deterministic committed master must be a DIFFERENT,
     // live, committed member.
-    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0);
+    let committed = ShardTable::compute_with_epoch(committed_members, rf, 0, placement_version);
     let rightful = committed.target_assignment(task.shard).master;
     if rightful == self_id
         || !committed_members.contains(&rightful)
@@ -741,8 +754,12 @@ fn install_active_routing_snapshot(
         return false;
     }
 
-    let snapshot =
-        ShardTable::compute_with_epoch(&routing.committed_members, rf, routing.shard_table_version);
+    let snapshot = ShardTable::compute_with_epoch(
+        &routing.committed_members,
+        rf,
+        routing.shard_table_version,
+        routing.placement_version,
+    );
     *shard_table.write() = snapshot;
     *active_topology_members.write() = routing.committed_members.clone();
 
@@ -1072,7 +1089,10 @@ impl ClusterCoordinator {
         members.sort();
         // Bootstrap with the initial topology term so partition maps served
         // before the first membership event still use term-based versioning.
-        let initial_table = ShardTable::compute_with_epoch(&members, config.replication_factor, 1);
+        // Bootstrap is always v1 (round-robin): the cluster only upgrades to
+        // HRW after a unanimous v2 commit, never at single-node startup.
+        let initial_table =
+            ShardTable::compute_with_epoch(&members, config.replication_factor, 1, 1);
 
         let topology_authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
             config.self_id,
@@ -1396,6 +1416,8 @@ impl ClusterCoordinator {
                                 voter: self_id,
                                 accepted: true,
                                 voter_current_term: topo_authority_event.committed_term(),
+                                voter_placement_support:
+                                    crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                             };
                             if let Some(commit) = topo_authority_event.handle_vote(&self_vote) {
                                 let active_members = active_topology_members_event.read().clone();
@@ -1417,6 +1439,7 @@ impl ClusterCoordinator {
                                     Self::activate_topology(
                                         &commit.members,
                                         commit.term,
+                                        commit.placement_version,
                                         self_id,
                                         rf,
                                         &shard_table,
@@ -1460,6 +1483,67 @@ impl ClusterCoordinator {
                                     );
                                 });
                             }
+                        }
+
+                        // W6 (INVARIANT ii) — placement-version upgrade trigger.
+                        // Once every committed member is known (via their votes)
+                        // to support a higher placement version than is currently
+                        // committed, the deterministic proposer issues an upgrade
+                        // term for the SAME membership. This is the only path that
+                        // drives a settled v1 cluster to v2 (the membership-change
+                        // proposers all early-return on an unchanged member set).
+                        //
+                        // SETTLE GATE: only fire once the cluster has been quiet
+                        // for a LONG window — no in-flight migrations and no
+                        // (re)activation for a full minute. The upgrade triggers
+                        // a near-total one-time reshuffle (round-robin → HRW);
+                        // firing it while the cluster is forming, mid-migration,
+                        // or doing rolling restarts both churns placement AND
+                        // maximizes the pending-replication-intent surface a
+                        // concurrently-restarting node must recover (the
+                        // rejoin-after-quiesce path is sensitive to a peer being
+                        // briefly unreachable). A deliberately long quiescence
+                        // window keeps the reshuffle to a genuinely idle cluster
+                        // and prevents it from racing operational scenarios
+                        // (rolling restart, scale up/down) where activations keep
+                        // `last_activation_at` fresh.
+                        const PLACEMENT_UPGRADE_SETTLE: Duration = Duration::from_secs(60);
+                        let upgrade_settled = migration.lock().active_count() == 0
+                            && last_activation_at.elapsed() >= PLACEMENT_UPGRADE_SETTLE;
+                        let pending_upgrade = if upgrade_settled {
+                            topo_authority_event.upgrade_proposal()
+                        } else {
+                            None
+                        };
+                        if let Some(upgrade_proposal) = pending_upgrade {
+                            if let Some(ref path) = topo_state_path_event {
+                                let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                                let inc = swim_incarnation_event.load(Ordering::Relaxed);
+                                let _ = persist_topology_state(
+                                    path,
+                                    &topo_authority_event.persisted_state(peak, inc),
+                                );
+                            }
+                            let ta = topo_authority_event.clone();
+                            let na = node_addrs_for_topo.clone();
+                            let tx = topology_commit_tx_event.clone();
+                            let tp = topo_state_path_event.clone();
+                            let ps = peak_size_event.clone();
+                            let si = swim_incarnation_event.clone();
+                            let secret = cluster_secret_event.clone();
+                            std::thread::spawn(move || {
+                                run_topology_proposer(
+                                    upgrade_proposal,
+                                    ta,
+                                    na,
+                                    self_id,
+                                    tx,
+                                    tp,
+                                    ps,
+                                    si,
+                                    secret,
+                                );
+                            });
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1697,6 +1781,11 @@ impl ClusterCoordinator {
                     let committed_members = topo_authority_event.committed_members();
                     if committed_members.len() > 1 {
                         let committed_term = topo_authority_event.committed_term();
+                        // W6 — the oracles must recompute placement at the
+                        // committed term's version (NOT hardcoded round-robin),
+                        // else a settled v2 cluster false-fires the phantom
+                        // detector against a v1 baseline.
+                        let committed_pv = topo_authority_event.committed_placement_version();
                         let (mismatched, pending_handoffs, stuck_subset, phantom_masters) = {
                             let mgr = migration.lock();
                             let table = shard_table.read();
@@ -1706,6 +1795,7 @@ impl ClusterCoordinator {
                                     &committed_members,
                                     rf,
                                     committed_term,
+                                    committed_pv,
                                 );
                             // W1.1 residual fix (FIX 2) — self-heal backstop.
                             let stuck_subset = stuck_subset_master_count(&table, &mgr, self_id);
@@ -1713,8 +1803,13 @@ impl ClusterCoordinator {
                             // intent-only mismatch metric is blind to (a stale
                             // local table stamped with the committed term that
                             // still masters reassigned shards).
-                            let phantom_masters =
-                                phantom_master_shard_count(&table, &committed_members, rf, self_id);
+                            let phantom_masters = phantom_master_shard_count(
+                                &table,
+                                &committed_members,
+                                rf,
+                                self_id,
+                                committed_pv,
+                            );
                             (mismatched, pending_handoffs, stuck_subset, phantom_masters)
                         };
 
@@ -1800,6 +1895,7 @@ impl ClusterCoordinator {
                             Self::activate_topology(
                                 &committed_members,
                                 committed_term,
+                                committed_pv,
                                 self_id,
                                 rf,
                                 &shard_table,
@@ -1886,6 +1982,7 @@ impl ClusterCoordinator {
                     Self::activate_topology(
                         &members,
                         term,
+                        topo_authority_event.committed_placement_version(),
                         self_id,
                         rf,
                         &shard_table,
@@ -1946,6 +2043,7 @@ impl ClusterCoordinator {
                     Self::activate_topology_with_view(
                         &members,
                         term,
+                        topo_authority_event.committed_placement_version(),
                         self_id,
                         rf,
                         &shard_table,
@@ -2116,13 +2214,17 @@ impl ClusterCoordinator {
                         // the phantom mastership instead of rolling back.
                         let relinquish_ctx = {
                             let committed_members = active_topology_members_event.read().clone();
-                            let rf = st.read().replication_factor();
+                            let (rf, placement_version) = {
+                                let t = st.read();
+                                (t.replication_factor(), t.placement_version())
+                            };
                             let mut live_members: std::collections::HashSet<NodeId> =
                                 node_addrs.read().keys().copied().collect();
                             live_members.insert(self_id);
                             Arc::new(RelinquishContext {
                                 committed_members,
                                 rf,
+                                placement_version,
                                 self_id,
                                 live_members,
                                 engine: engine.clone(),
@@ -2166,6 +2268,7 @@ impl ClusterCoordinator {
                             Self::activate_topology(
                                 &committed_members,
                                 committed_term,
+                                topo_authority_event.committed_placement_version(),
                                 self_id,
                                 rf,
                                 &shard_table,
@@ -2385,13 +2488,17 @@ impl ClusterCoordinator {
                     // plus self).
                     let relinquish_ctx = {
                         let committed_members = active_topology_members.read().clone();
-                        let rf = st.read().replication_factor();
+                        let (rf, placement_version) = {
+                            let t = st.read();
+                            (t.replication_factor(), t.placement_version())
+                        };
                         let mut live_members: std::collections::HashSet<NodeId> =
                             node_addrs.read().keys().copied().collect();
                         live_members.insert(self_id);
                         Arc::new(RelinquishContext {
                             committed_members,
                             rf,
+                            placement_version,
                             self_id,
                             live_members,
                             engine: engine.clone(),
@@ -2458,6 +2565,8 @@ impl ClusterCoordinator {
                         voter: self_id,
                         accepted: true,
                         voter_current_term: topology_authority.committed_term(),
+                        voter_placement_support:
+                            crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                     };
                     if let Some(commit) = topology_authority.handle_vote(&self_vote) {
                         // Single-node: quorum met immediately. Activate directly.
@@ -2470,6 +2579,7 @@ impl ClusterCoordinator {
                         Self::activate_topology(
                             &commit.members,
                             commit.term,
+                            commit.placement_version,
                             self_id,
                             rf,
                             shard_table,
@@ -2705,6 +2815,8 @@ impl ClusterCoordinator {
                                     voter: self_id,
                                     accepted: true,
                                     voter_current_term: topology_authority.committed_term(),
+                                    voter_placement_support:
+                                        crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                                 };
                                 if let Some(commit) = topology_authority.handle_vote(&self_vote) {
                                     // Single-node quorum: signal the event loop to activate.
@@ -2751,6 +2863,7 @@ impl ClusterCoordinator {
     fn activate_topology(
         members: &[NodeId],
         epoch: u64,
+        placement_version: u16,
         self_id: NodeId,
         rf: u8,
         shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -2773,6 +2886,7 @@ impl ClusterCoordinator {
         Self::activate_topology_with_view(
             members,
             epoch,
+            placement_version,
             self_id,
             rf,
             shard_table,
@@ -2806,6 +2920,7 @@ impl ClusterCoordinator {
     fn activate_topology_with_view(
         members: &[NodeId],
         epoch: u64,
+        placement_version: u16,
         self_id: NodeId,
         rf: u8,
         shard_table: &Arc<ShardTableLock<ShardTable>>,
@@ -2845,7 +2960,8 @@ impl ClusterCoordinator {
             drop(old_table);
 
             if engine.index_len() == 0 && is_single_node_bootstrap {
-                let new_table = ShardTable::compute_with_epoch(members, rf, epoch);
+                let new_table =
+                    ShardTable::compute_with_epoch(members, rf, epoch, placement_version);
                 tracing::info!(
                     epoch,
                     members = members.len(),
@@ -2867,7 +2983,7 @@ impl ClusterCoordinator {
         // migrations can be preserved (same source, target, and type).
         let old_table_snap = shard_table.read().clone();
         let old_epoch = old_table_snap.version;
-        let mut new_table = ShardTable::compute_with_epoch(members, rf, epoch);
+        let mut new_table = ShardTable::compute_with_epoch(members, rf, epoch, placement_version);
         // Phase F: refine the round-robin master picks using the partition
         // view + previous topology so a peer that already holds the full
         // data is preferred over an empty (subset) candidate, and so an
@@ -3163,6 +3279,7 @@ impl ClusterCoordinator {
                 Arc::new(RelinquishContext {
                     committed_members: members.to_vec(),
                     rf,
+                    placement_version,
                     self_id,
                     live_members,
                     engine: engine.clone(),
@@ -6429,6 +6546,7 @@ pub fn load_topology_state(
             voted_term: 0,
             incarnation: 0,
             committed_voter_ever_seen: Vec::new(),
+            committed_placement_version: 1,
         },
     };
     if let Some(marker_peak) = load_topology_multi_node_marker_peak(path) {
@@ -7539,6 +7657,12 @@ impl RunningCluster {
             buf.extend_from_slice(&m.0.to_le_bytes());
         }
 
+        // W6 — placement version trailer so a follower that adopts this
+        // routing snapshot recomputes its shard table at the SAME version
+        // (round-robin vs HRW). Use the table's own version: the shard
+        // assignments above were produced by it, so they are self-consistent.
+        buf.extend_from_slice(&table.placement_version().to_le_bytes());
+
         buf
     }
 
@@ -7551,15 +7675,18 @@ impl RunningCluster {
         }
         members.sort();
         let cluster_id = self.topology_authority.cluster_id();
+        let placement_version = self.topology_authority.committed_placement_version();
         crate::cluster::topology::TopologyCommit {
             term,
             proposer: members[0],
             members: members.clone(),
             cluster_id,
+            placement_version,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 term,
                 &cluster_id,
                 &members,
+                placement_version,
             ),
             voters: {
                 let voters = self.topology_authority.committed_voters();
@@ -7885,15 +8012,20 @@ impl RunningCluster {
         let new_term = committed + 1;
         let new_members = members_for_new_table.clone();
         let cluster_id = self.topology_authority.cluster_id();
+        // W6 — preserve the committed placement version across a graceful
+        // departure (a membership change is not a placement downgrade).
+        let placement_version = self.topology_authority.committed_placement_version();
         let commit = crate::cluster::topology::TopologyCommit {
             term: new_term,
             proposer: new_members[0],
             members: new_members.clone(),
             cluster_id,
+            placement_version,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 new_term,
                 &cluster_id,
                 &new_members,
+                placement_version,
             ),
             // E-4 — THREAT-MODEL DECISION (trust authenticated peers by design):
             //
@@ -8213,6 +8345,7 @@ impl RunningCluster {
             nodes: Vec::new(),
             shard_assignments: Vec::new(),
             committed_members: members.to_vec(),
+            placement_version: self.topology_authority.committed_placement_version(),
         };
         let rf = self.shard_table.read().replication_factor();
         install_active_routing_snapshot(
@@ -8369,15 +8502,18 @@ pub(crate) fn new_test_running_cluster(
     }));
     if !committed_members.is_empty() {
         let cluster_id = topology_authority.cluster_id();
+        let placement_version = table.placement_version();
         let commit = crate::cluster::topology::TopologyCommit {
             term: table.version,
             proposer: self_id,
             members: committed_members.to_vec(),
             cluster_id,
+            placement_version,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 table.version,
                 &cluster_id,
                 committed_members,
+                placement_version,
             ),
             voters: committed_members.to_vec(),
         };
@@ -8739,8 +8875,8 @@ mod tests {
         // A real membership change (node 3 replaces node 1) is needed to move
         // shards: compute_with_epoch sorts members internally (F-01), so a
         // mere permutation of the same set yields an identical table.
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -8793,6 +8929,7 @@ mod tests {
             &[NodeId(1), NodeId(2)],
             2,
             3,
+            1,
         )));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -8843,7 +8980,7 @@ mod tests {
         // master of after re-asserting stale ownership.
         let self_id = NodeId(1);
         let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let committed = ShardTable::compute_with_epoch(&committed_members, 2, 9);
+        let committed = ShardTable::compute_with_epoch(&committed_members, 2, 9, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let m = committed.target_assignment(s).master;
@@ -8891,6 +9028,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ false,
+            1,
         );
         assert_eq!(
             disposition,
@@ -9006,6 +9144,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ true,
+            1,
         );
         assert_eq!(
             disposition,
@@ -9032,6 +9171,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ false,
+            1,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -9054,6 +9194,7 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ true,
             /* self_holds_records */ false,
+            1,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
@@ -9077,13 +9218,14 @@ mod tests {
             &live_members,
             /* has_pending_inbound */ false,
             /* self_holds_records */ false,
+            1,
         );
         assert_eq!(disposition, FailedHandoffDisposition::RollbackToSelf);
     }
 
     #[test]
     fn running_cluster_reports_inbound_migration_pressure() {
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
         let addr: SocketAddr = "127.0.0.1:3300".parse().unwrap();
         let cluster = new_test_running_cluster(
             NodeId(1),
@@ -9111,7 +9253,7 @@ mod tests {
     fn running_cluster_batch_inbound_completion_persists_remaining_state() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("inbound.state");
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1, 1);
         let mut cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -9151,7 +9293,7 @@ mod tests {
 
     #[test]
     fn running_cluster_keeps_migration_pressure_grace_after_local_clear() {
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 1, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -9189,7 +9331,7 @@ mod tests {
     /// Returns (cluster, moved_shard).
     fn uninvolved_sender_with_remote_handoff() -> (RunningCluster, u16) {
         let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-        let old = ShardTable::compute_with_epoch(&members, 2, 1);
+        let old = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let a = old.target_assignment(s);
@@ -9278,7 +9420,7 @@ mod tests {
         // on every query while the transition is still active, extending
         // the grace window past long migrations.
         let members = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
-        let old = ShardTable::compute_with_epoch(&members, 2, 1);
+        let old = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let a = old.target_assignment(s);
@@ -9372,7 +9514,7 @@ mod tests {
     #[test]
     fn already_serving_skip_is_task_local_not_shard_wide() {
         let shard = 7u16;
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 9);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 9, 1);
         let master_task = MigrationTask {
             shard,
             from_node: NodeId(1),
@@ -9570,7 +9712,7 @@ mod tests {
 
     #[test]
     fn topology_activation_tasks_include_local_holder_backfill() {
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = 42u16;
         let populated = std::collections::HashSet::from([shard]);
         let target = new_table.target_assignment(shard);
@@ -9613,7 +9755,7 @@ mod tests {
 
     #[test]
     fn local_holder_backfill_tasks_stream_to_all_target_holders() {
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = 42u16;
         let populated = std::collections::HashSet::from([shard]);
         let mut tasks = Vec::new();
@@ -9646,7 +9788,8 @@ mod tests {
 
     #[test]
     fn local_holder_backfill_tasks_repair_other_holder_when_still_owned_locally() {
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 11);
+        let new_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let target = new_table.target_assignment(s);
@@ -9670,8 +9813,9 @@ mod tests {
 
     #[test]
     fn per_shard_orphan_cleanup_deletes_settled_unowned_shard() {
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let old = old_table.target_assignment(s);
@@ -9710,8 +9854,9 @@ mod tests {
     /// deleted. Fail-before: deleted; pass-after: retained.
     #[test]
     fn per_shard_orphan_cleanup_retains_unowned_shard_without_committed_handoff() {
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let old = old_table.target_assignment(s);
@@ -9752,8 +9897,9 @@ mod tests {
     /// it retains it.
     #[test]
     fn run_orphan_cleanup_retains_unowned_shard_without_committed_handoff() {
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let old = old_table.target_assignment(s);
@@ -9792,8 +9938,9 @@ mod tests {
     /// guard does not break genuine orphan reclamation.
     #[test]
     fn run_orphan_cleanup_reclaims_unowned_shard_after_committed_handoff() {
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let old = old_table.target_assignment(s);
@@ -9850,9 +9997,9 @@ mod tests {
 
         // Epoch N: node1, node2, node3. Find a shard node2 holds (master or
         // replica) so it has a real local copy to lose.
-        let table_n = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 3);
+        let table_n = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 3, 1);
         // Epoch N+1: a different membership/term that strips node2 of the shard.
-        let table_n1 = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3)], 2, 4);
+        let table_n1 = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3)], 2, 4, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let a = table_n.target_assignment(s);
@@ -9963,7 +10110,7 @@ mod tests {
         let _guard = migration_metrics_test_guard();
         let _metrics = install_test_migration_metrics();
         let members = vec![NodeId(1), NodeId(2)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let table = ShardTable::compute_with_epoch(&members, 1, 10, 1);
         let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -10023,7 +10170,7 @@ mod tests {
         let _guard = migration_metrics_test_guard();
         let _metrics = install_test_migration_metrics();
         let members = vec![NodeId(1), NodeId(2)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let table = ShardTable::compute_with_epoch(&members, 1, 10, 1);
         let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
@@ -10062,7 +10209,7 @@ mod tests {
     #[test]
     fn aborted_handoff_with_records_stays_authoritative_rollback() {
         let members = vec![NodeId(1), NodeId(2)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let table = ShardTable::compute_with_epoch(&members, 1, 10, 1);
         // Find a shard whose committed master is NodeId(2) so the only thing
         // blocking a relinquish is the self-holds-records guard.
         let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
@@ -10081,6 +10228,7 @@ mod tests {
             &live,
             /* has_pending_inbound */ false,
             /* self_holds_records */ true,
+            1,
         );
         assert_eq!(
             disposition_with_records,
@@ -10099,6 +10247,7 @@ mod tests {
             &live,
             false,
             /* self_holds_records */ false,
+            1,
         );
         assert_eq!(
             disposition_empty,
@@ -10158,8 +10307,9 @@ mod tests {
 
     #[test]
     fn per_shard_orphan_cleanup_waits_for_active_same_shard_task() {
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let old = old_table.target_assignment(s);
@@ -10198,8 +10348,9 @@ mod tests {
 
     #[test]
     fn per_shard_orphan_cleanup_waits_for_any_active_epoch_work() {
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11);
+        let old_table =
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let old = old_table.target_assignment(s);
@@ -10242,7 +10393,7 @@ mod tests {
     #[test]
     fn quiesce_signals_topology_activation_without_pre_mutating_local_state() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let table = ShardTable::compute_with_epoch(&members, 2, 7);
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
         let live_nodes = [
             (NodeId(1), "127.0.0.1:11001".parse().unwrap()),
             (NodeId(2), "127.0.0.1:11002".parse().unwrap()),
@@ -10305,7 +10456,7 @@ mod tests {
     #[test]
     fn quiesce_fabricated_commit_is_accepted_and_preserves_peak_floor() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let table = ShardTable::compute_with_epoch(&members, 2, 4);
+        let table = ShardTable::compute_with_epoch(&members, 2, 4, 1);
         let live_nodes = [
             (NodeId(1), "127.0.0.1:12001".parse().unwrap()),
             (NodeId(2), "127.0.0.1:12002".parse().unwrap()),
@@ -10364,8 +10515,8 @@ mod tests {
     fn empty_shard_completion_failure_rolls_back_master_handoff() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -10444,8 +10595,8 @@ mod tests {
     fn empty_shard_completion_retries_until_target_is_ready() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -10572,8 +10723,8 @@ mod tests {
     fn failed_data_migration_marks_task_failed_in_pipelined_flow() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -10792,8 +10943,8 @@ mod tests {
     fn pipelined_migration_marks_failed_when_target_never_acks() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -10978,8 +11129,8 @@ mod tests {
     fn data_migration_verifies_manifest_before_batched_completion() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -11154,8 +11305,8 @@ mod tests {
     fn already_serving_completion_retries_until_target_is_ready() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -11372,10 +11523,10 @@ mod tests {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let rf = 2;
         let committed_term = 4;
-        let table = ShardTable::compute_with_epoch(&members, rf, committed_term);
+        let table = ShardTable::compute_with_epoch(&members, rf, committed_term, 1);
 
         let (mismatched, pending_handoffs) =
-            committed_topology_reactivation_metrics(&table, &members, rf, committed_term);
+            committed_topology_reactivation_metrics(&table, &members, rf, committed_term, 1);
 
         assert_eq!(
             mismatched, 0,
@@ -11395,8 +11546,8 @@ mod tests {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let rf = 2;
         let term = 7;
-        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 6);
-        let mut table = ShardTable::compute_with_epoch(&members, rf, term);
+        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 6, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, rf, term, 1);
 
         // Node 1 reports full data for every shard; the other candidates
         // report nothing — the election prefers node 1 wherever it is in
@@ -11420,7 +11571,7 @@ mod tests {
 
         // Sanity: the election actually deviated from round-robin,
         // otherwise this test would not exercise FIX C at all.
-        let round_robin = ShardTable::compute_with_epoch(&members, rf, term);
+        let round_robin = ShardTable::compute_with_epoch(&members, rf, term, 1);
         let deviated = (0..NUM_SHARDS as u16)
             .any(|s| table.target_assignment(s).master != round_robin.target_assignment(s).master);
         assert!(
@@ -11429,7 +11580,7 @@ mod tests {
         );
 
         let (mismatched, pending_handoffs) =
-            committed_topology_reactivation_metrics(&table, &members, rf, term);
+            committed_topology_reactivation_metrics(&table, &members, rf, term, 1);
         assert_eq!(
             mismatched, 0,
             "an election-refined settled table must never trigger reactivation"
@@ -11446,8 +11597,8 @@ mod tests {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         let rf = 2;
-        let new_table = ShardTable::compute_with_epoch(&new_members, rf, 2);
-        let mut table = ShardTable::compute_with_epoch(&old_members, rf, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, rf, 2, 1);
+        let mut table = ShardTable::compute_with_epoch(&old_members, rf, 1, 1);
         let moved_shard = (0..NUM_SHARDS as u16)
             .find(|&s| table.target_assignment(s).master != new_table.target_assignment(s).master)
             .expect("a shard must change master when a third node joins");
@@ -11462,7 +11613,7 @@ mod tests {
         );
 
         let (mismatched, _pending) =
-            committed_topology_reactivation_metrics(&table, &new_members, rf, 2);
+            committed_topology_reactivation_metrics(&table, &new_members, rf, 2, 1);
         assert!(
             mismatched >= 1,
             "a rolled-back handoff must keep triggering reactivation (got {mismatched})"
@@ -11478,9 +11629,9 @@ mod tests {
         let rf = 2;
         let committed_members = vec![NodeId(1), NodeId(2), NodeId(3)];
         // Active table is the stale 2-member term-1 table.
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1, 1);
         let (mismatched, _pending) =
-            committed_topology_reactivation_metrics(&table, &committed_members, rf, 2);
+            committed_topology_reactivation_metrics(&table, &committed_members, rf, 2, 1);
         assert!(
             mismatched >= 1,
             "a table behind the committed term must trigger reactivation"
@@ -11621,8 +11772,8 @@ mod tests {
     fn split_transfer_request_tasks_classifies_shards() {
         let rf = 2;
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let new_table = ShardTable::compute_with_epoch(&new_members, rf, 2);
-        let mut table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, rf, 2, 1);
+        let mut table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1, 1);
 
         let master_shard = (0..NUM_SHARDS as u16)
             .find(|&s| new_table.target_assignment(s).master == NodeId(3))
@@ -11689,13 +11840,13 @@ mod tests {
         let rf = 2;
         let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
         let committed_term = 2u64;
-        let new_table = ShardTable::compute_with_epoch(&committed, rf, committed_term);
+        let new_table = ShardTable::compute_with_epoch(&committed, rf, committed_term, 1);
 
         // Build node 3's table exactly as a late reactivation does: handoff
         // from the 2-member term-1 table to the 3-member term-2 table, with
         // one shard data-carrying so the handoff stays active and the
         // master_subset flags persist for every shard node 3 now masters.
-        let mut table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1);
+        let mut table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 1, 1);
         let any_n3 = (0..NUM_SHARDS as u16)
             .find(|&s| new_table.target_assignment(s).master == NodeId(3))
             .expect("node 3 must master some shard");
@@ -11711,7 +11862,7 @@ mod tests {
         // and target == intended for node 3's shards, so the steady-state
         // mismatch metric is zero — reactivation would never fire on it.
         let (mismatched, pending_handoffs) =
-            committed_topology_reactivation_metrics(&table, &committed, rf, committed_term);
+            committed_topology_reactivation_metrics(&table, &committed, rf, committed_term, 1);
         assert_eq!(
             mismatched, 0,
             "post-activation mismatch must be zero (the bug: nothing re-fires)"
@@ -11808,7 +11959,7 @@ mod tests {
         // Committed cluster is the 3-member term-2 set.
         let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
         let committed_term = 2u64;
-        let committed_table = ShardTable::compute_with_epoch(&committed, rf, committed_term);
+        let committed_table = ShardTable::compute_with_epoch(&committed, rf, committed_term, 1);
 
         // This node's LOCAL table was computed from the stale 2-member set
         // {1,2} but stamped with the current committed term — exactly the
@@ -11816,13 +11967,18 @@ mod tests {
         // 2-member round-robin gave it, including shards the 3-member
         // committed term reassigned to node 3.
         let stale_table =
-            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, committed_term);
+            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, committed_term, 1);
         let self_id = NodeId(2);
 
         // The local table is at the committed term and target == intended
         // for every shard, so the steady-state metric reads zero — the bug.
-        let (mismatched, pending_handoffs) =
-            committed_topology_reactivation_metrics(&stale_table, &committed, rf, committed_term);
+        let (mismatched, pending_handoffs) = committed_topology_reactivation_metrics(
+            &stale_table,
+            &committed,
+            rf,
+            committed_term,
+            1,
+        );
         assert_eq!(
             mismatched, 0,
             "stale-but-same-term table reads mismatched==0 (the blind spot)"
@@ -11849,7 +12005,7 @@ mod tests {
         );
 
         // The new detector flags exactly the phantom-mastered shards.
-        let phantom = phantom_master_shard_count(&stale_table, &committed, rf, self_id);
+        let phantom = phantom_master_shard_count(&stale_table, &committed, rf, self_id, 1);
         assert_eq!(
             phantom, over_owned,
             "phantom_master_shard_count must flag every committed-non-owned local master",
@@ -11882,13 +12038,13 @@ mod tests {
         let rf = 2;
         let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
         let term = 2u64;
-        let table = ShardTable::compute_with_epoch(&committed, rf, term);
+        let table = ShardTable::compute_with_epoch(&committed, rf, term, 1);
 
         // Every node's correctly-activated committed table reports zero
         // phantom masters.
         for &node in &committed {
             assert_eq!(
-                phantom_master_shard_count(&table, &committed, rf, node),
+                phantom_master_shard_count(&table, &committed, rf, node, 1),
                 0,
                 "a node activated on the committed term must report no phantom masters",
             );
@@ -11926,8 +12082,8 @@ mod tests {
         let rf = 2;
         let committed = vec![NodeId(1), NodeId(2), NodeId(3)];
         let term = 5u64;
-        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 4);
-        let mut table = ShardTable::compute_with_epoch(&committed, rf, term);
+        let prev = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], rf, 4, 1);
+        let mut table = ShardTable::compute_with_epoch(&committed, rf, term, 1);
 
         // Drive election so node 1 (which reports all data) wins every shard
         // where it is a candidate — deviating from round-robin. On a single
@@ -11954,7 +12110,7 @@ mod tests {
 
         // Election must have deviated from round-robin (otherwise the test
         // does not exercise the convergence path).
-        let round_robin = ShardTable::compute_with_epoch(&committed, rf, term);
+        let round_robin = ShardTable::compute_with_epoch(&committed, rf, term, 1);
         let deviated: usize = (0..NUM_SHARDS as u16)
             .filter(|&s| {
                 table.target_assignment(s).master == NodeId(1)
@@ -11967,7 +12123,7 @@ mod tests {
         // same-term empty-view reactivation will hand back to their
         // round-robin masters, collapsing the cluster to single-mastership.
         assert_eq!(
-            phantom_master_shard_count(&table, &committed, rf, NodeId(1)),
+            phantom_master_shard_count(&table, &committed, rf, NodeId(1), 1),
             deviated,
             "election-deviated self-masters must be flagged for reconciliation",
         );
@@ -12183,8 +12339,8 @@ mod tests {
     fn route_prefers_effective_master_while_old_master_is_alive() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -12226,8 +12382,8 @@ mod tests {
     fn route_falls_back_to_target_when_old_master_is_dead() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -12267,8 +12423,8 @@ mod tests {
     fn partition_map_prefers_effective_master_while_old_master_is_alive() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -12306,8 +12462,8 @@ mod tests {
     fn partition_map_falls_back_to_target_when_old_master_is_dead() {
         let old_members = vec![NodeId(1), NodeId(2)];
         let new_members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master
@@ -12348,7 +12504,7 @@ mod tests {
     #[test]
     fn partition_map_includes_self_when_node_addrs_omits_self() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let table = ShardTable::compute_with_epoch(&members, 2, 9);
+        let table = ShardTable::compute_with_epoch(&members, 2, 9, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -12372,7 +12528,7 @@ mod tests {
     #[test]
     fn partition_map_committed_members_match_active_table_version() {
         let active_members = vec![NodeId(1), NodeId(3)];
-        let active_table = ShardTable::compute_with_epoch(&active_members, 2, 3);
+        let active_table = ShardTable::compute_with_epoch(&active_members, 2, 3, 1);
         let cluster = new_test_running_cluster(
             NodeId(3),
             active_table,
@@ -12400,7 +12556,13 @@ mod tests {
             proposer: NodeId(1),
             members: next_members.clone(),
             cluster_id: cid,
-            digest: crate::cluster::topology::TopologyTerm::compute_digest(4, &cid, &next_members),
+            placement_version: 1,
+            digest: crate::cluster::topology::TopologyTerm::compute_digest(
+                4,
+                &cid,
+                &next_members,
+                1,
+            ),
             voters: next_members.clone(),
         };
         assert_eq!(
@@ -12423,6 +12585,7 @@ mod tests {
             nodes: Vec::new(),
             shard_assignments: Vec::new(),
             committed_members: committed_members.clone(),
+            placement_version: 1,
         };
         let authority =
             crate::cluster::topology::TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
@@ -12446,10 +12609,12 @@ mod tests {
             proposer: NodeId(1),
             members: committed_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            placement_version: 1,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 routing.shard_table_version,
                 &crate::cluster::topology::ClusterId::UNSET,
                 &committed_members,
+                1,
             ),
             voters: vec![NodeId(1), NodeId(2)],
         };
@@ -12463,7 +12628,7 @@ mod tests {
     #[test]
     fn committed_topology_encoding_tracks_latest_committed_term() {
         let active_members = vec![NodeId(1), NodeId(3)];
-        let active_table = ShardTable::compute_with_epoch(&active_members, 2, 3);
+        let active_table = ShardTable::compute_with_epoch(&active_members, 2, 3, 1);
         let cluster = new_test_running_cluster(
             NodeId(3),
             active_table,
@@ -12492,10 +12657,12 @@ mod tests {
             proposer: NodeId(1),
             members: committed_members.clone(),
             cluster_id: cid,
+            placement_version: 1,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 4,
                 &cid,
                 &committed_members,
+                1,
             ),
             voters: committed_members.clone(),
         };
@@ -12512,14 +12679,14 @@ mod tests {
         assert_eq!(decoded.members, committed_members);
         assert_eq!(
             decoded.digest,
-            crate::cluster::topology::TopologyTerm::compute_digest(4, &cid, &committed_members),
+            crate::cluster::topology::TopologyTerm::compute_digest(4, &cid, &committed_members, 1),
         );
     }
 
     #[test]
     fn alive_node_count_only_counts_live_committed_members() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let table = ShardTable::compute_with_epoch(&members, 2, 7);
+        let table = ShardTable::compute_with_epoch(&members, 2, 7, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -12547,7 +12714,7 @@ mod tests {
     #[test]
     fn alive_node_count_includes_self_when_not_in_node_addrs() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-        let table = ShardTable::compute_with_epoch(&members, 2, 9);
+        let table = ShardTable::compute_with_epoch(&members, 2, 9, 1);
         // Production-shape harness: only the surviving peer is in
         // node_addrs; self (NodeId(1)) is NOT — exactly the case the
         // audit calls out.
@@ -12619,7 +12786,7 @@ mod tests {
         let metrics = install_test_migration_metrics();
         // Live shard table is at epoch 10; the migration task carries epoch 9.
         let members = vec![NodeId(1), NodeId(2)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let table = ShardTable::compute_with_epoch(&members, 1, 10, 1);
         let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let task = make_outbound_master_task(123, NodeId(1), NodeId(2));
@@ -12667,7 +12834,7 @@ mod tests {
         let _guard = migration_metrics_test_guard();
         let metrics = install_test_migration_metrics();
         let members = vec![NodeId(1), NodeId(2)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 10);
+        let table = ShardTable::compute_with_epoch(&members, 1, 10, 1);
         let shard_table: Arc<ShardTableLock<ShardTable>> = Arc::new(ShardTableLock::new(table));
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
         let task = make_outbound_master_task(124, NodeId(1), NodeId(2));
@@ -12716,8 +12883,8 @@ mod tests {
     fn completion_commits_ownership_before_lifting_fence() {
         // Old topology: node1 masters everything. New topology at the
         // same epoch: node2 masters half the shards. Handoff in flight.
-        let old_table = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 10);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 1, 10);
+        let old_table = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 10, 1);
+        let new_table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 1, 10, 1);
         let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
             .find(|&s| new_table.target_assignment(s).master == NodeId(2))
             .expect("two-member table must assign some shard to node2");
@@ -12866,7 +13033,7 @@ mod tests {
 
         let members = vec![NodeId(1)];
         // Build a shard table at epoch 42 so cluster.local_cluster_key() == 42.
-        let table = ShardTable::compute_with_epoch(&members, 1, 42);
+        let table = ShardTable::compute_with_epoch(&members, 1, 42, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -12947,7 +13114,7 @@ mod tests {
         // Mirror `spawn_auto_ack_replica`: a replica thread that recv's,
         // ACKs `Ok { through_sequence }`, and returns the captured batches.
         let members = vec![NodeId(1), NodeId(2)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 99);
+        let table = ShardTable::compute_with_epoch(&members, 1, 99, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -13021,7 +13188,7 @@ mod tests {
     /// (single-node committed term == shard table version, no epoch gap).
     fn single_node_cluster_for_master_query_tests() -> RunningCluster {
         let members = vec![NodeId(1)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 7);
+        let table = ShardTable::compute_with_epoch(&members, 1, 7, 1);
         new_test_running_cluster(
             NodeId(1),
             table,
@@ -13047,7 +13214,7 @@ mod tests {
     #[test]
     fn is_master_returns_no_when_remote_master() {
         let members = vec![NodeId(1), NodeId(2)];
-        let table = ShardTable::compute_with_epoch(&members, 2, 5);
+        let table = ShardTable::compute_with_epoch(&members, 2, 5, 1);
         // Find a shard whose target master is NodeId(2), then run as NodeId(1).
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| table.target_assignment(s).master == NodeId(2))
@@ -13078,7 +13245,7 @@ mod tests {
         // (simulating a membership change that has been proposed/observed
         // locally but has not yet quorum-committed).
         let members = vec![NodeId(1)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 5);
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -13126,7 +13293,7 @@ mod tests {
         let members = vec![NodeId(1)];
         // Shard table version 7 → handle_commit(term=7) inside the helper
         // sets committed_term to 7.
-        let table = ShardTable::compute_with_epoch(&members, 1, 7);
+        let table = ShardTable::compute_with_epoch(&members, 1, 7, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -13172,7 +13339,7 @@ mod tests {
     fn committed_cluster_key_advances_on_topology_commit() {
         // Start with no committed term (fresh node, before any quorum).
         let members = vec![NodeId(1)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 1);
+        let table = ShardTable::compute_with_epoch(&members, 1, 1, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -13198,10 +13365,12 @@ mod tests {
             proposer: NodeId(1),
             members: commit_members.clone(),
             cluster_id: crate::cluster::topology::ClusterId::UNSET,
+            placement_version: 1,
             digest: crate::cluster::topology::TopologyTerm::compute_digest(
                 5,
                 &crate::cluster::topology::ClusterId::UNSET,
                 &commit_members,
+                1,
             ),
             voters: commit_members.clone(),
         };
@@ -13228,7 +13397,7 @@ mod tests {
     #[test]
     fn election_skips_subset_master() {
         let members = vec![NodeId(1)];
-        let table = ShardTable::compute_with_epoch(&members, 1, 5);
+        let table = ShardTable::compute_with_epoch(&members, 1, 5, 1);
         let shard = 0u16;
         let key = key_for_shard(shard);
         let cluster = new_test_running_cluster(
@@ -13416,8 +13585,8 @@ mod tests {
         // apply_master_election must swap so N2 becomes master.
         let prev_members = [NodeId(1), NodeId(2)];
         let new_members = [NodeId(1), NodeId(2)];
-        let prev_table = ShardTable::compute_with_epoch(&prev_members, 2, 1);
-        let mut new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let prev_table = ShardTable::compute_with_epoch(&prev_members, 2, 1, 1);
+        let mut new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
 
         // Pick a shard where round-robin assigned N1 as the new master.
         let shard = (0..NUM_SHARDS as u16)
@@ -13476,8 +13645,8 @@ mod tests {
     #[test]
     fn apply_master_election_keeps_round_robin_when_candidate_missing_from_view() {
         let members = [NodeId(1), NodeId(2), NodeId(3)];
-        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 2);
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
 
         // A shard whose round-robin candidate set spans two nodes; report data
         // for a replica (which would otherwise win) but OMIT the round-robin
@@ -13522,8 +13691,8 @@ mod tests {
     #[test]
     fn apply_master_election_keeps_round_robin_when_view_is_empty() {
         let members = [NodeId(1), NodeId(2), NodeId(3)];
-        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 2);
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
         let baseline_assignment = table.target_assignment(7).clone();
         let view: std::collections::HashMap<NodeId, Vec<PartitionVersionEntry>> =
             std::collections::HashMap::new();
@@ -13543,8 +13712,8 @@ mod tests {
     #[test]
     fn apply_master_election_skips_evicted_master_pick() {
         let members = [NodeId(1), NodeId(2), NodeId(3)];
-        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 2);
+        let prev_table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 2, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| table.target_assignment(s).master == NodeId(1))
             .unwrap();
@@ -13596,7 +13765,7 @@ mod tests {
     fn cluster_health_is_joining_until_first_commit() {
         // Build a test cluster with committed_members EMPTY → no commit
         // applied → state must be Joining.
-        let table = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 1);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 1, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -13622,7 +13791,7 @@ mod tests {
     fn cluster_health_is_alive_after_commit() {
         // committed_members non-empty → handle_commit ran in the test
         // builder → state must be Alive.
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 5);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 5, 1);
         let cluster = new_test_running_cluster(
             NodeId(1),
             table,
@@ -13651,7 +13820,7 @@ mod tests {
             node_id: 2,
             shards: vec![42, 7, 42], // duplicate must be deduped
         };
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 5);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 5, 1);
         let tasks = synthesize_resync_migration_tasks(&req, NodeId(1), &table);
         assert_eq!(
             tasks.len(),
@@ -13678,7 +13847,7 @@ mod tests {
             node_id: 2,
             shards: Vec::new(),
         };
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 5);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 5, 1);
         let expected: std::collections::HashSet<u16> = table.shards_owned_by(NodeId(2));
         let tasks = synthesize_resync_migration_tasks(&req, NodeId(1), &table);
         let observed: std::collections::HashSet<u16> = tasks.iter().map(|t| t.shard).collect();
@@ -13701,7 +13870,7 @@ mod tests {
             node_id: 1,
             shards: vec![1, 2, 3],
         };
-        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 5);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 2, 5, 1);
         let tasks = synthesize_resync_migration_tasks(&req, NodeId(1), &table);
         assert!(tasks.is_empty());
     }
@@ -13828,8 +13997,8 @@ mod tests {
         use std::collections::HashMap;
         let members_a = vec![NodeId(1), NodeId(2)];
         let members_b = vec![NodeId(2), NodeId(3)];
-        let old_table = ShardTable::compute_with_epoch(&members_a, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&members_b, 2, 2);
+        let old_table = ShardTable::compute_with_epoch(&members_a, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&members_b, 2, 2, 1);
         let changed_shard = (0..4096u16)
             .find(|&s| {
                 old_table.target_assignment(s).master != new_table.target_assignment(s).master

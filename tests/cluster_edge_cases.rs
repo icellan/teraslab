@@ -29,7 +29,7 @@ fn invariant_shard_coverage_and_no_self_replica() {
     for n in 1..=20u64 {
         let members: Vec<NodeId> = (1..=n).map(NodeId).collect();
         for rf in 1..=std::cmp::min(n, 4) as u8 {
-            let table = ShardTable::compute_with_epoch(&members, rf, 1);
+            let table = ShardTable::compute_with_epoch(&members, rf, 1, 1);
             let total: usize = table.shard_counts().values().sum();
             assert_eq!(
                 total, NUM_SHARDS,
@@ -65,10 +65,10 @@ fn invariant_shard_coverage_and_no_self_replica() {
 #[test]
 fn invariant_shard_table_path_independent() {
     // Path A: start with 3 → add 4 → remove 2
-    let t_a = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(4)], 2, 1);
+    let t_a = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(4)], 2, 1, 1);
 
     // Path B: start with 5 → remove 2 → remove 5
-    let t_b = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(4)], 2, 1);
+    let t_b = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3), NodeId(4)], 2, 1, 1);
 
     for shard in 0..NUM_SHARDS {
         assert_eq!(
@@ -344,8 +344,8 @@ fn shard_table_deterministic_across_100_configurations() {
     for n in 1..=20u64 {
         let members: Vec<NodeId> = (1..=n).map(NodeId).collect();
         for rf in 1..=std::cmp::min(n, 4) as u8 {
-            let t1 = ShardTable::compute_with_epoch(&members, rf, 1);
-            let t2 = ShardTable::compute_with_epoch(&members, rf, 1);
+            let t1 = ShardTable::compute_with_epoch(&members, rf, 1, 1);
+            let t2 = ShardTable::compute_with_epoch(&members, rf, 1, 1);
 
             for shard in 0..NUM_SHARDS {
                 assert_eq!(
@@ -370,8 +370,9 @@ fn shard_table_deterministic_across_100_configurations() {
 #[test]
 fn migration_plan_minimal_moves() {
     // Adding one node to a 3-node cluster should move ~25% of shards.
-    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1);
-    let new = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)], 2, 2);
+    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1, 1);
+    let new =
+        ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3), NodeId(4)], 2, 2, 1);
 
     let plan = ShardTable::migration_plan(&old, &new);
 
@@ -493,6 +494,7 @@ fn topology_quorum_sizes() {
                     voter,
                     accepted: true,
                     voter_current_term: 0,
+                    voter_placement_support: 1,
                 };
                 commit = auth.handle_vote(&vote);
                 if commit.is_some() {
@@ -591,6 +593,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         vec![NodeId(1), NodeId(2), NodeId(3)],
         NodeId(2),
         ClusterId::UNSET,
+        1,
     );
     let vote = auth.handle_propose(&propose);
     assert!(vote.accepted);
@@ -603,13 +606,20 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         members: mems.clone(),
         voters: mems.clone(),
         cluster_id: ClusterId::UNSET,
-        digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems),
+        placement_version: 1,
+        digest: TopologyTerm::compute_digest(10, &ClusterId::UNSET, &mems, 1),
     };
     assert_eq!(auth.handle_commit(&commit), Some(10));
 
     // Now a stale proposal for term 5 (between old voted_term=3 and new committed=10)
     // must be rejected: term 5 is not > committed_term 10.
-    let stale = TopologyTerm::new(5, vec![NodeId(1), NodeId(2)], NodeId(2), ClusterId::UNSET);
+    let stale = TopologyTerm::new(
+        5,
+        vec![NodeId(1), NodeId(2)],
+        NodeId(2),
+        ClusterId::UNSET,
+        1,
+    );
     let v = auth.handle_propose(&stale);
     assert!(
         !v.accepted,
@@ -622,6 +632,7 @@ fn topology_catchup_does_not_leave_voted_term_gap() {
         vec![NodeId(1), NodeId(2), NodeId(3)],
         NodeId(2),
         ClusterId::UNSET,
+        1,
     );
     let v2 = auth.handle_propose(&fresh);
     assert!(v2.accepted, "proposal for term 11 should be accepted");
@@ -645,7 +656,8 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         members: old_mems.clone(),
         voters: old_mems.clone(),
         cluster_id: ClusterId::UNSET,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &old_mems),
+        placement_version: 1,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &old_mems, 1),
     };
     auth.handle_commit(&old_commit);
 
@@ -684,6 +696,7 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         voter: NodeId(1),
         accepted: true,
         voter_current_term: 1,
+        voter_placement_support: 1,
     };
     let commit = auth.handle_vote(&vote_for_t1);
     assert!(
@@ -698,6 +711,7 @@ fn topology_fallback_proposer_superseded_by_second_timeout() {
         voter: NodeId(1),
         accepted: true,
         voter_current_term: 1,
+        voter_placement_support: 1,
     };
     let commit = auth.handle_vote(&vote_for_t2);
     assert!(
@@ -726,7 +740,8 @@ fn topology_cluster_formation_three_simultaneous_starts() {
             members: mems.clone(),
             voters: mems.clone(),
             cluster_id: ClusterId::UNSET,
-            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems),
+            placement_version: 1,
+            digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
         };
         auth.handle_commit(&commit);
         assert_eq!(auth.committed_term(), 1);
@@ -782,7 +797,8 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         members: mems.clone(),
         voters: mems.clone(),
         cluster_id: ClusterId::UNSET,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems),
+        placement_version: 1,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &mems, 1),
     };
     auth.handle_commit(&commit);
 
@@ -795,7 +811,13 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
     auth.set_committed_voter_ever_seen(&[NodeId(1), NodeId(2), NodeId(3)]);
 
     // Vote for term 2 via a different proposal (outstanding vote).
-    let proposal_2 = TopologyTerm::new(2, vec![NodeId(1), NodeId(2)], NodeId(1), ClusterId::UNSET);
+    let proposal_2 = TopologyTerm::new(
+        2,
+        vec![NodeId(1), NodeId(2)],
+        NodeId(1),
+        ClusterId::UNSET,
+        1,
+    );
     let v = auth.handle_propose(&proposal_2);
     assert!(v.accepted);
 
@@ -806,6 +828,7 @@ fn topology_formation_recovery_blocked_by_outstanding_vote() {
         vec![NodeId(1), NodeId(2), NodeId(3)],
         NodeId(1),
         ClusterId::UNSET,
+        1,
     );
     let v2 = auth.handle_propose(&recovery_proposal);
     assert!(
@@ -827,8 +850,8 @@ fn shard_table_double_handoff_preserves_routing() {
     let members_v2 = vec![NodeId(1), NodeId(2), NodeId(3)];
     let members_v3 = vec![NodeId(1), NodeId(3)]; // node 2 leaves
 
-    let mut table = ShardTable::compute_with_epoch(&members_v1, 2, 1);
-    let new_v2 = ShardTable::compute_with_epoch(&members_v2, 2, 2);
+    let mut table = ShardTable::compute_with_epoch(&members_v1, 2, 1, 1);
+    let new_v2 = ShardTable::compute_with_epoch(&members_v2, 2, 2, 1);
 
     // First handoff: v1 → v2 (all shards have data)
     table.begin_handoff_with(&new_v2, |_| true);
@@ -842,7 +865,7 @@ fn shard_table_double_handoff_preserves_routing() {
     assert!(copying_count > 0, "should have some shards in Copying");
 
     // Before v2 handoff completes, v3 topology arrives (node 2 leaves).
-    let new_v3 = ShardTable::compute_with_epoch(&members_v3, 2, 3);
+    let new_v3 = ShardTable::compute_with_epoch(&members_v3, 2, 3, 1);
     table.begin_handoff_with(&new_v3, |_| true);
 
     // Every shard must have a valid effective_assignment.
@@ -879,8 +902,8 @@ fn shard_table_rollback_then_new_handoff() {
     let v1 = vec![NodeId(1), NodeId(2), NodeId(3)];
     let v2 = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
 
-    let mut table = ShardTable::compute_with_epoch(&v1, 2, 1);
-    let new_table = ShardTable::compute_with_epoch(&v2, 2, 2);
+    let mut table = ShardTable::compute_with_epoch(&v1, 2, 1, 1);
+    let new_table = ShardTable::compute_with_epoch(&v2, 2, 2, 1);
 
     table.begin_handoff(&new_table);
 
@@ -896,7 +919,7 @@ fn shard_table_rollback_then_new_handoff() {
         assert_eq!(table.target_assignment(shard).master, old_master);
 
         // Now a new handoff (same v2 table) should re-enter Copying for this shard.
-        let new_table_2 = ShardTable::compute_with_epoch(&v2, 2, 3);
+        let new_table_2 = ShardTable::compute_with_epoch(&v2, 2, 3, 1);
         table.begin_handoff_with(&new_table_2, |_| true);
 
         // The rolled-back shard should be in Copying again if its master changed.
@@ -1255,6 +1278,7 @@ fn topology_restore_then_vote_safety() {
         voted_term: 12,
         incarnation: 0,
         committed_voter_ever_seen: vec![NodeId(1), NodeId(2), NodeId(3)],
+        committed_placement_version: 1,
     };
 
     let auth = TopologyAuthority::new(NodeId(2), Duration::from_secs(1));
@@ -1266,6 +1290,7 @@ fn topology_restore_then_vote_safety() {
         vec![NodeId(1), NodeId(2), NodeId(3)],
         NodeId(1),
         ClusterId::UNSET,
+        1,
     );
     let v1 = auth.handle_propose(&p1);
     assert!(
@@ -1279,6 +1304,7 @@ fn topology_restore_then_vote_safety() {
         vec![NodeId(1), NodeId(2), NodeId(3)],
         NodeId(1),
         ClusterId::UNSET,
+        1,
     );
     let v2 = auth.handle_propose(&p2);
     assert!(v2.accepted, "term 13 should be accepted");
@@ -1432,8 +1458,8 @@ fn replication_lag_zero_when_caught_up() {
 #[test]
 fn shard_table_handoff_identical_tables() {
     let members = vec![NodeId(1), NodeId(2), NodeId(3)];
-    let mut table = ShardTable::compute_with_epoch(&members, 2, 1);
-    let same = ShardTable::compute_with_epoch(&members, 2, 2);
+    let mut table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+    let same = ShardTable::compute_with_epoch(&members, 2, 2, 1);
 
     table.begin_handoff(&same);
     assert_eq!(
@@ -1456,8 +1482,8 @@ fn shard_table_handoff_identical_tables() {
 fn shard_table_mark_commit_ready_on_serving_new_is_noop() {
     let v1 = vec![NodeId(1), NodeId(2)];
     let v2 = vec![NodeId(1), NodeId(2), NodeId(3)];
-    let mut table = ShardTable::compute_with_epoch(&v1, 2, 1);
-    let new_table = ShardTable::compute_with_epoch(&v2, 2, 2);
+    let mut table = ShardTable::compute_with_epoch(&v1, 2, 1, 1);
+    let new_table = ShardTable::compute_with_epoch(&v2, 2, 2, 1);
 
     table.begin_handoff_with(&new_table, |_| true);
 
@@ -1486,8 +1512,8 @@ fn shard_table_mark_commit_ready_on_serving_new_is_noop() {
 #[test]
 fn migration_plan_dead_master_no_surviving_replica() {
     // RF=1: only master, no replicas. If master dies, data is lost.
-    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 1, 1);
-    let new = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 2);
+    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2)], 1, 1, 1);
+    let new = ShardTable::compute_with_epoch(&[NodeId(1)], 1, 2, 1);
 
     let plan = ShardTable::migration_plan(&old, &new);
 
@@ -1513,8 +1539,8 @@ fn migration_plan_dead_master_no_surviving_replica() {
 /// the old replica (data already in place → no migration task needed).
 #[test]
 fn migration_plan_dead_master_replica_has_data() {
-    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1);
-    let new = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3)], 2, 2);
+    let old = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 1, 1);
+    let new = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(3)], 2, 2, 1);
 
     let plan = ShardTable::migration_plan(&old, &new);
 
@@ -1608,6 +1634,7 @@ fn topology_full_5_node_quorum_cycle() {
         members: commit.members.clone(),
         voters: commit.voters.clone(),
         cluster_id: ClusterId::UNSET,
+        placement_version: 1,
         digest: commit.digest,
     };
     for node in &nodes {
@@ -1651,6 +1678,7 @@ fn topology_rejected_votes_dont_count() {
             voter,
             accepted: false,
             voter_current_term: 0,
+            voter_placement_support: 1,
         };
         let commit = auth.handle_vote(&vote);
         assert!(commit.is_none(), "rejected votes should not produce commit");
@@ -1663,6 +1691,7 @@ fn topology_rejected_votes_dont_count() {
         voter: NodeId(5),
         accepted: true,
         voter_current_term: 0,
+        voter_placement_support: 1,
     };
     let commit = auth.handle_vote(&vote);
     assert!(commit.is_none(), "2 accepts out of 5 is not quorum");
@@ -1686,6 +1715,7 @@ fn topology_duplicate_votes_not_inflated() {
         voter: NodeId(2),
         accepted: true,
         voter_current_term: 0,
+        voter_placement_support: 1,
     };
 
     let commit1 = auth.handle_vote(&vote);
@@ -1705,6 +1735,7 @@ fn topology_duplicate_votes_not_inflated() {
         voter: NodeId(2),
         accepted: true,
         voter_current_term: 0,
+        voter_placement_support: 1,
     };
     auth2.handle_vote(&vote2); // count: self(1) + node2(1) = 2
     auth2.handle_vote(&vote2); // duplicate: still 2
@@ -1721,6 +1752,7 @@ fn topology_duplicate_votes_not_inflated() {
         voter: NodeId(3),
         accepted: true,
         voter_current_term: 0,
+        voter_placement_support: 1,
     };
     let commit3 = auth2.handle_vote(&vote3);
     assert!(commit3.is_some(), "genuine third vote should reach quorum");
@@ -1764,7 +1796,8 @@ fn split_brain_heal_detects_independent_clusters() {
         members: a_members.clone(),
         voters: a_members.clone(),
         cluster_id: ClusterId::UNSET,
-        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members),
+        placement_version: 1,
+        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members, 1),
     });
     assert_eq!(a_proposer.committed_term(), 5);
     assert_eq!(a_proposer.committed_members(), a_members);
@@ -1778,7 +1811,8 @@ fn split_brain_heal_detects_independent_clusters() {
         members: b_members.clone(),
         voters: b_members.clone(),
         cluster_id: ClusterId::UNSET,
-        digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &b_members),
+        placement_version: 1,
+        digest: TopologyTerm::compute_digest(7, &ClusterId::UNSET, &b_members, 1),
     });
     assert_eq!(b_proposer.committed_term(), 7);
     assert_eq!(b_proposer.committed_members(), b_members);
@@ -1882,7 +1916,8 @@ fn split_brain_heal_detects_independent_clusters() {
         members: a_members.clone(),
         voters: a_members.clone(),
         cluster_id: ClusterId::UNSET,
-        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members),
+        placement_version: 1,
+        digest: TopologyTerm::compute_digest(5, &ClusterId::UNSET, &a_members, 1),
     });
 
     // -- Final verification: the regression test would FAIL without R-042

@@ -2087,7 +2087,8 @@ fn tcp_strict_replication_failure_returns_replication_failed() {
         members: members.clone(),
         voters: members.clone(),
         cluster_id: ClusterId::UNSET,
-        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &members),
+        placement_version: 1,
+        digest: TopologyTerm::compute_digest(1, &ClusterId::UNSET, &members, 1),
     };
     let resp = send_request(
         &mut stream,

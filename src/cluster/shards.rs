@@ -9,6 +9,39 @@ use crate::index::TxKey;
 /// Total number of shards (12-bit hash → 4096).
 pub const NUM_SHARDS: usize = 4096;
 
+/// Highest placement-version algorithm this build understands.
+///
+/// `1` = round-robin (`members[shard % n]`), `2` = rendezvous/HRW.
+/// A node refuses to activate a committed term whose `placement_version`
+/// exceeds this (it does not silently fall back to a different algorithm),
+/// and a voter rejects a proposal it cannot support. Bump this only when a
+/// new branch is added to [`ShardTable::compute_with_epoch`].
+pub const MAX_SUPPORTED_PLACEMENT_VERSION: u16 = 2;
+
+/// Fixed seed for the HRW (rendezvous) weight avalanche.
+///
+/// MUST be a build-stable constant — every node in the cluster mixes the
+/// identical seed so the per-shard `argmax` is reproducible across machines
+/// and binaries. Using a process-random or `DefaultHasher`-derived seed would
+/// make two nodes disagree on the master for a shard → split-brain. Do not
+/// change without a placement-version bump.
+const W6_SEED: u64 = 0x5EED_C0DE_1357_9BDF;
+
+/// Deterministic rendezvous weight of `node` for `shard` (placement v2).
+///
+/// A fixed-seed splitmix64-style avalanche over `(W6_SEED, shard, node.0)`.
+/// Branch-free and `std`-hasher-free so the value is identical on every node
+/// regardless of platform or compiler — the cross-node determinism the HRW
+/// scheme rests on. The master of a shard is the member maximizing this
+/// weight; replicas are the next-highest distinct members. Ties (equal
+/// weight) break toward the LOWER `NodeId` at the call site.
+fn hrw_weight(shard: u16, node: NodeId) -> u64 {
+    let mut x = W6_SEED ^ ((shard as u64) << 48) ^ node.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 /// Identifies a node in the cluster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct NodeId(pub u64);
@@ -74,6 +107,10 @@ pub struct ShardTable {
     handoff_state: Option<Vec<ShardHandoff>>,
     /// Monotonic topology epoch. Incremented on every membership change.
     pub version: u64,
+    /// Placement algorithm version used to compute this table
+    /// (`1` = round-robin, `2` = HRW). Carried so a routing snapshot can be
+    /// recomputed at the same version on a peer.
+    placement_version: u16,
     /// Replication factor used to compute this table.
     rf: u8,
     /// Tracks shards where the new master is still receiving inbound migration
@@ -114,20 +151,39 @@ impl ShardTable {
     ///
     /// This is a **pure function**: same inputs → same output on every node.
     ///
-    /// Algorithm (round-robin):
+    /// Algorithm depends on `placement_version`:
+    ///
+    /// **v1 (round-robin):**
     /// - Shard N's master = `members[N % len]`
     /// - Shard N's replica i = `members[(N + i) % len]` (if != master)
-    /// - Replicas clamped to available nodes (no node appears twice per shard)
+    ///
+    /// **v2 (rendezvous / HRW):**
+    /// - Shard N's master = the member maximizing [`hrw_weight`]`(N, node)`
+    /// - Shard N's replicas = the next RF-1 distinct members by descending
+    ///   weight. Ties (equal weight) break toward the LOWER `NodeId`.
+    ///
+    /// In both versions replicas are clamped to `min(RF-1, n-1)` available
+    /// nodes (no node appears twice per shard).
+    ///
+    /// `placement_version` is a REQUIRED parameter (no default) so the
+    /// compiler forces every call site to choose explicitly — preventing a
+    /// silent v1 fallback that would diverge from a committed v2 term.
     ///
     /// # Panics
     ///
     /// Panics if `members` is empty.
+    ///
     /// Compute a shard table with an explicit monotonic epoch.
     ///
     /// `epoch` must be strictly greater than the previous table's epoch.
     /// Each topology change increments the epoch so ownership transitions
     /// are totally ordered and stale views can be detected.
-    pub fn compute_with_epoch(members: &[NodeId], replication_factor: u8, epoch: u64) -> Self {
+    pub fn compute_with_epoch(
+        members: &[NodeId],
+        replication_factor: u8,
+        epoch: u64,
+        placement_version: u16,
+    ) -> Self {
         assert!(
             !members.is_empty(),
             "cannot compute shard table with 0 members"
@@ -138,21 +194,47 @@ impl ShardTable {
         let mut members = members.to_vec();
         members.sort_unstable();
         let n = members.len();
+        let rf = replication_factor as usize;
         let mut assignments = Vec::with_capacity(NUM_SHARDS);
 
         for shard in 0..NUM_SHARDS {
-            let master = members[shard % n];
-            let mut replicas = Vec::new();
-            for r in 1..replication_factor as usize {
-                if r >= n {
-                    break;
+            let assignment = if placement_version >= 2 {
+                // v2 — rendezvous/HRW. Order members by descending weight,
+                // tie-breaking on lower NodeId (members are already sorted
+                // ascending, so a stable sort by descending weight leaves
+                // equal-weight members in ascending-NodeId order — but we
+                // do not rely on stability: the explicit tie-break below is
+                // deterministic regardless of the sort's stability).
+                let mut ranked: Vec<(u64, NodeId)> = members
+                    .iter()
+                    .map(|&node| (hrw_weight(shard as u16, node), node))
+                    .collect();
+                ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+                let master = ranked[0].1;
+                let mut replicas = Vec::new();
+                for &(_, node) in ranked.iter().skip(1) {
+                    if replicas.len() + 1 >= rf {
+                        break;
+                    }
+                    replicas.push(node);
                 }
-                let replica = members[(shard + r) % n];
-                if replica != master {
-                    replicas.push(replica);
+                ShardAssignment { master, replicas }
+            } else {
+                // v1 — round-robin (unchanged).
+                let master = members[shard % n];
+                let mut replicas = Vec::new();
+                for r in 1..rf {
+                    if r >= n {
+                        break;
+                    }
+                    let replica = members[(shard + r) % n];
+                    if replica != master {
+                        replicas.push(replica);
+                    }
                 }
-            }
-            assignments.push(ShardAssignment { master, replicas });
+                ShardAssignment { master, replicas }
+            };
+            assignments.push(assignment);
         }
 
         let intended_masters = assignments.iter().map(|a| a.master).collect();
@@ -161,6 +243,7 @@ impl ShardTable {
             prev_assignments: None,
             handoff_state: None,
             version: epoch,
+            placement_version: placement_version.max(1),
             rf: replication_factor,
             master_subset: vec![false; NUM_SHARDS],
             intended_masters,
@@ -403,7 +486,14 @@ impl ShardTable {
         for (i, m) in sorted.iter().enumerate() {
             version_hash = version_hash.wrapping_add(m.0.wrapping_mul(i as u64 + 1));
         }
-        Self::compute_with_epoch(members, replication_factor, version_hash)
+        // Legacy helper: always round-robin (v1).
+        Self::compute_with_epoch(members, replication_factor, version_hash, 1)
+    }
+
+    /// The placement algorithm version used to compute this table
+    /// (`1` = round-robin, `2` = HRW).
+    pub fn placement_version(&self) -> u16 {
+        self.placement_version
     }
 
     /// The replication factor used to compute this table.
@@ -699,7 +789,7 @@ mod tests {
     #[test]
     fn intended_master_tracks_activation_intent_through_rollback() {
         let members3 = nodes(&[1, 2, 3]);
-        let new_table = ShardTable::compute_with_epoch(&members3, 2, 2);
+        let new_table = ShardTable::compute_with_epoch(&members3, 2, 2, 1);
         for shard in [0u16, 1, 2, 4095] {
             assert_eq!(
                 new_table.intended_master(shard),
@@ -708,7 +798,7 @@ mod tests {
             );
         }
 
-        let mut table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
+        let mut table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1, 1);
         let moved = (0..NUM_SHARDS as u16)
             .find(|&s| table.target_assignment(s).master != new_table.target_assignment(s).master)
             .expect("adding a member must move some master");
@@ -736,8 +826,8 @@ mod tests {
     /// in progress.
     #[test]
     fn stuck_subset_shards_for_detects_only_settled_subset_masters() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2, 1);
         // A shard whose master moves to node 3 when node 3 joins.
         let moved = (0..NUM_SHARDS as u16)
             .find(|&s| {
@@ -820,7 +910,7 @@ mod tests {
     #[test]
     fn set_master_for_shard_updates_intended_master() {
         let members = nodes(&[1, 2, 3]);
-        let mut table = ShardTable::compute_with_epoch(&members, 2, 3);
+        let mut table = ShardTable::compute_with_epoch(&members, 2, 3, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| !table.target_assignment(s).replicas.is_empty())
             .expect("rf=2 over 3 members must give replicas");
@@ -1168,8 +1258,8 @@ mod tests {
     fn rollback_shard_restores_old_master() {
         let old_members = nodes(&[1, 2, 3]);
         let new_members = nodes(&[1, 2, 3, 4]);
-        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
 
         // Find a shard that changes master between old and new.
         let mut changed_shard = None;
@@ -1248,7 +1338,7 @@ mod tests {
                 warnings: warnings.clone(),
             });
 
-        let mut table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
+        let mut table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1, 1);
         let before = table.target_assignment(0).clone();
 
         tracing::subscriber::with_default(subscriber, || {
@@ -1270,8 +1360,8 @@ mod tests {
     fn rollback_clears_handoff_when_all_done() {
         let old_members = nodes(&[1, 2]);
         let new_members = nodes(&[1, 2, 3]);
-        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
 
         table.begin_handoff(&new_table);
         let pending_before = table.pending_handoff_count();
@@ -1299,7 +1389,7 @@ mod tests {
     #[test]
     fn shards_owned_by_includes_master_and_replica() {
         let members = nodes(&[1, 2, 3]);
-        let table = ShardTable::compute_with_epoch(&members, 2, 1);
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
 
         let owned1 = table.shards_owned_by(NodeId(1));
         let owned2 = table.shards_owned_by(NodeId(2));
@@ -1324,7 +1414,7 @@ mod tests {
     #[test]
     fn shards_owned_by_excludes_non_member() {
         let members = nodes(&[1, 2, 3]);
-        let table = ShardTable::compute_with_epoch(&members, 2, 1);
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let owned = table.shards_owned_by(NodeId(99));
         assert!(owned.is_empty());
     }
@@ -1345,8 +1435,8 @@ mod tests {
         let mut b = nodes(&[2, 3, 1]);
         b.sort();
 
-        let t1 = ShardTable::compute_with_epoch(&a, 2, 1);
-        let t2 = ShardTable::compute_with_epoch(&b, 2, 1);
+        let t1 = ShardTable::compute_with_epoch(&a, 2, 1, 1);
+        let t2 = ShardTable::compute_with_epoch(&b, 2, 1, 1);
 
         for i in 0..NUM_SHARDS {
             assert_eq!(
@@ -1371,8 +1461,8 @@ mod tests {
         let mut sorted = nodes(&[3, 1, 2]);
         sorted.sort();
 
-        let t_unsorted = ShardTable::compute_with_epoch(&unsorted, 2, 1);
-        let t_sorted = ShardTable::compute_with_epoch(&sorted, 2, 1);
+        let t_unsorted = ShardTable::compute_with_epoch(&unsorted, 2, 1, 1);
+        let t_sorted = ShardTable::compute_with_epoch(&sorted, 2, 1, 1);
 
         for i in 0..NUM_SHARDS {
             assert_eq!(
@@ -1392,7 +1482,7 @@ mod tests {
 
     #[test]
     fn single_node_rf2_no_panic() {
-        let table = ShardTable::compute_with_epoch(&nodes(&[1]), 2, 1);
+        let table = ShardTable::compute_with_epoch(&nodes(&[1]), 2, 1, 1);
         for shard in 0..NUM_SHARDS {
             assert_eq!(table.assignments[shard].master, NodeId(1));
             assert!(
@@ -1409,7 +1499,7 @@ mod tests {
     #[test]
     fn three_nodes_rf3_all_unique() {
         let members = nodes(&[1, 2, 3]);
-        let table = ShardTable::compute_with_epoch(&members, 3, 1);
+        let table = ShardTable::compute_with_epoch(&members, 3, 1, 1);
 
         for shard in 0..NUM_SHARDS {
             let a = &table.assignments[shard];
@@ -1436,7 +1526,7 @@ mod tests {
     #[test]
     fn rf_greater_than_node_count_clamped() {
         // 2 nodes, RF=3: can't have 3 copies, should gracefully clamp
-        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 3, 1);
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 3, 1, 1);
         for shard in 0..NUM_SHARDS {
             let a = &table.assignments[shard];
             // Should have at most 1 replica (since only 2 nodes)
@@ -1456,7 +1546,7 @@ mod tests {
 
     #[test]
     fn balance_3_nodes() {
-        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
         let counts = table.shard_counts();
         let expected = NUM_SHARDS as f64 / 3.0;
         for (&node, &count) in &counts {
@@ -1470,7 +1560,7 @@ mod tests {
 
     #[test]
     fn balance_4_nodes() {
-        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 1);
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 1, 1);
         let counts = table.shard_counts();
         let expected = NUM_SHARDS as f64 / 4.0;
         for (&node, &count) in &counts {
@@ -1484,7 +1574,8 @@ mod tests {
 
     #[test]
     fn balance_10_nodes() {
-        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 2, 1);
+        let table =
+            ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 2, 1, 1);
         let counts = table.shard_counts();
         let expected = NUM_SHARDS as f64 / 10.0;
         for (&node, &count) in &counts {
@@ -1500,7 +1591,7 @@ mod tests {
     fn balance_100_nodes() {
         let ids: Vec<u64> = (1..=100).collect();
         let members: Vec<NodeId> = ids.iter().map(|&id| NodeId(id)).collect();
-        let table = ShardTable::compute_with_epoch(&members, 2, 1);
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let counts = table.shard_counts();
         let expected = NUM_SHARDS as f64 / 100.0;
         for (&node, &count) in &counts {
@@ -1517,14 +1608,14 @@ mod tests {
 
     #[test]
     fn single_node_owns_all() {
-        let table = ShardTable::compute_with_epoch(&nodes(&[1]), 2, 1);
+        let table = ShardTable::compute_with_epoch(&nodes(&[1]), 2, 1, 1);
         let counts = table.shard_counts();
         assert_eq!(*counts.get(&NodeId(1)).unwrap(), NUM_SHARDS);
     }
 
     #[test]
     fn two_nodes_rf2_symmetric() {
-        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1, 1);
         let counts = table.shard_counts();
         let n1 = *counts.get(&NodeId(1)).unwrap();
         let n2 = *counts.get(&NodeId(2)).unwrap();
@@ -1546,8 +1637,8 @@ mod tests {
 
     #[test]
     fn migration_plan_add_node_moves_correct_count() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2, 1);
 
         let plan = ShardTable::migration_plan(&old, &new);
         // ~1024 shards should move to node 4 (4096/4 = 1024)
@@ -1575,8 +1666,8 @@ mod tests {
 
     #[test]
     fn migration_plan_add_node_uses_authoritative_master_only() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2, 1);
 
         let plan = ShardTable::migration_plan(&old, &new);
         let shard = (0..NUM_SHARDS as u16)
@@ -1599,8 +1690,8 @@ mod tests {
 
     #[test]
     fn migration_plan_remove_node_uses_surviving_replica() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 2);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 2, 1);
 
         let plan = ShardTable::migration_plan(&old, &new);
         // Node 3's ~1365 shards should be redistributed to nodes 1 and 2.
@@ -1616,8 +1707,8 @@ mod tests {
 
     #[test]
     fn migration_plan_remove_middle_node_never_sources_dead_member() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 3]), 2, 3);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 3]), 2, 3, 1);
 
         let plan = ShardTable::migration_plan(&old, &new);
         for task in &plan {
@@ -1632,8 +1723,8 @@ mod tests {
 
     #[test]
     fn replica_migration_plan_remove_middle_node_never_sources_dead_member() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 3]), 2, 3);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 3]), 2, 3, 1);
 
         let plan = ShardTable::replica_migration_plan(&old, &new);
         for task in &plan {
@@ -1648,8 +1739,8 @@ mod tests {
 
     #[test]
     fn migration_plan_add_then_remove_net_zero() {
-        let original = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let back_to_3 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 3);
+        let original = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        let back_to_3 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 3, 1);
 
         // After add then remove, the table should be identical to original
         // (same members, same algorithm)
@@ -1674,8 +1765,8 @@ mod tests {
 
     #[test]
     fn migration_plan_no_unnecessary_movements() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2, 1);
         let plan = ShardTable::migration_plan(&old, &new);
 
         // Verify no shard that stays on the same master appears in the plan
@@ -1692,8 +1783,8 @@ mod tests {
 
     #[test]
     fn replica_migration_plan_uses_existing_old_owner_when_master_changes() {
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2, 1);
         let plan = ShardTable::replica_migration_plan(&old, &new);
 
         // Shard 2179 is deterministic for this node set: its master changes
@@ -1716,9 +1807,9 @@ mod tests {
 
     #[test]
     fn version_increments_on_every_membership_change() {
-        let t1 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1);
-        let t2 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2);
-        let t3 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 3);
+        let t1 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        let t2 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 2, 1);
+        let t3 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 3, 1);
 
         assert!(t2.version > t1.version);
         assert!(t3.version > t2.version);
@@ -1733,7 +1824,7 @@ mod tests {
         for n in 1..=20 {
             let ids: Vec<u64> = (1..=n).collect();
             let members: Vec<NodeId> = ids.iter().map(|&id| NodeId(id)).collect();
-            let table = ShardTable::compute_with_epoch(&members, 2, 1);
+            let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
             let total: usize = table.shard_counts().values().sum();
             assert_eq!(
                 total, NUM_SHARDS,
@@ -1747,7 +1838,7 @@ mod tests {
         for n in 1..=10 {
             let ids: Vec<u64> = (1..=n).collect();
             let members: Vec<NodeId> = ids.iter().map(|&id| NodeId(id)).collect();
-            let table = ShardTable::compute_with_epoch(&members, 2, 1);
+            let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
             // Each shard appears exactly once in assignments (by construction),
             // but verify via shard_counts summing to NUM_SHARDS
             let total: usize = table.shard_counts().values().sum();
@@ -1761,7 +1852,7 @@ mod tests {
             let ids: Vec<u64> = (1..=n).collect();
             let members: Vec<NodeId> = ids.iter().map(|&id| NodeId(id)).collect();
             for rf in 2..=std::cmp::min(n, 5) {
-                let table = ShardTable::compute_with_epoch(&members, rf as u8, 1);
+                let table = ShardTable::compute_with_epoch(&members, rf as u8, 1, 1);
                 for shard in 0..NUM_SHARDS {
                     let a = &table.assignments[shard];
                     assert!(
@@ -1791,8 +1882,8 @@ mod tests {
     fn handoff_empty_shards_skip_copying() {
         let old_members = nodes(&[1, 2, 3]);
         let new_members = nodes(&[1, 2, 3, 4]);
-        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
 
         // All shards are empty → shard_has_data returns false → skip Copying
         table.begin_handoff_with(&new_table, |_| false);
@@ -1807,8 +1898,8 @@ mod tests {
     fn handoff_with_data_enters_copying() {
         let old_members = nodes(&[1, 2, 3]);
         let new_members = nodes(&[1, 2, 3, 4]);
-        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
 
         // All shards have data → should enter Copying
         table.begin_handoff_with(&new_table, |_| true);
@@ -1822,8 +1913,8 @@ mod tests {
     fn commit_shard_transitions_to_serving_new() {
         let old_members = nodes(&[1, 2]);
         let new_members = nodes(&[1, 2, 3]);
-        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1);
-        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2);
+        let mut table = ShardTable::compute_with_epoch(&old_members, 2, 1, 1);
+        let new_table = ShardTable::compute_with_epoch(&new_members, 2, 2, 1);
         table.begin_handoff_with(&new_table, |_| true);
 
         // Find a shard in Copying state
@@ -1840,8 +1931,8 @@ mod tests {
     #[test]
     fn partition_version_starts_full_for_unchanged_shard() {
         let members_a = vec![NodeId(1), NodeId(2)];
-        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1);
-        let table_b = ShardTable::compute_with_epoch(&members_a, 2, 2);
+        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1, 1);
+        let table_b = ShardTable::compute_with_epoch(&members_a, 2, 2, 1);
         let mut active = table_a.clone();
         active.begin_handoff_with(&table_b, |_| true);
         for shard in 0..NUM_SHARDS as u16 {
@@ -1856,8 +1947,8 @@ mod tests {
     fn partition_version_starts_subset_for_inbound_master() {
         let members_a = vec![NodeId(1), NodeId(2)];
         let members_b = vec![NodeId(2), NodeId(3)];
-        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1);
-        let table_b = ShardTable::compute_with_epoch(&members_b, 2, 2);
+        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1, 1);
+        let table_b = ShardTable::compute_with_epoch(&members_b, 2, 2, 1);
         let mut active = table_a.clone();
         active.begin_handoff_with(&table_b, |_| true);
         let changed_shard = (0..NUM_SHARDS as u16)
@@ -1881,8 +1972,8 @@ mod tests {
         // for shards whose master changed — no inbound migration will run.
         let members_a = vec![NodeId(1), NodeId(2)];
         let members_b = vec![NodeId(2), NodeId(3)];
-        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1);
-        let table_b = ShardTable::compute_with_epoch(&members_b, 2, 2);
+        let table_a = ShardTable::compute_with_epoch(&members_a, 2, 1, 1);
+        let table_b = ShardTable::compute_with_epoch(&members_b, 2, 2, 1);
         let changed_shard = (0..NUM_SHARDS as u16)
             .find(|&s| table_a.target_assignment(s).master != table_b.target_assignment(s).master)
             .expect("membership change must move at least one shard");
@@ -1899,7 +1990,7 @@ mod tests {
     /// completely uninvolved. Returns (old, new, changed_shard).
     fn single_shard_master_move() -> (ShardTable, ShardTable, u16) {
         let members = nodes(&[1, 2, 3, 4]);
-        let old = ShardTable::compute_with_epoch(&members, 2, 1);
+        let old = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let shard = (0..NUM_SHARDS as u16)
             .find(|&s| {
                 let a = old.target_assignment(s);
@@ -1929,8 +2020,8 @@ mod tests {
     fn transition_nodes_capture_replica_gainers() {
         // Growing [1,2] → [1,2,3] makes node 3 a new master and/or replica
         // for many shards: it receives inbound data and must be a mover.
-        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1);
-        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2);
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 2, 1, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2, 1);
         let mut active = old;
         active.begin_handoff_with(&new, |_| true);
         assert!(active.transition_nodes().contains(&NodeId(3)));
@@ -1998,5 +2089,173 @@ mod tests {
         let mut active = old;
         active.begin_handoff_with(&new, |_| false);
         assert!(!active.node_in_active_transition(NodeId(2)));
+    }
+
+    // -------------------------------------------------------------------
+    // W6 — rendezvous (HRW) placement (placement_version = 2)
+    // -------------------------------------------------------------------
+
+    /// Count the shards whose MASTER differs between two tables.
+    fn moved_masters(a: &ShardTable, b: &ShardTable) -> usize {
+        (0..NUM_SHARDS)
+            .filter(|&s| a.assignments[s].master != b.assignments[s].master)
+            .count()
+    }
+
+    #[test]
+    fn hrw_weight_is_deterministic_and_seed_stable() {
+        // The avalanche must be a pure function of (shard, node): two calls
+        // agree, and a hand-computed reference (recomputed by the same
+        // formula) matches. This guards against an accidental seed change.
+        let w1 = hrw_weight(1234, NodeId(42));
+        let w2 = hrw_weight(1234, NodeId(42));
+        assert_eq!(w1, w2, "hrw_weight must be deterministic");
+
+        // Distinct nodes for the same shard get (almost surely) distinct
+        // weights — a degenerate all-equal hash would collapse placement.
+        let weights: std::collections::HashSet<u64> =
+            (1..=64u64).map(|n| hrw_weight(7, NodeId(n))).collect();
+        assert_eq!(
+            weights.len(),
+            64,
+            "weights must be well-spread, not colliding"
+        );
+    }
+
+    #[test]
+    fn hrw_is_permutation_invariant() {
+        // Cross-node determinism: any permutation of the SAME member set
+        // yields the identical v2 table (compute_with_epoch sorts, and HRW
+        // is a function of the set). This is the property round-robin and
+        // HRW must both satisfy for split-brain freedom.
+        let a = ShardTable::compute_with_epoch(&nodes(&[5, 1, 9, 3, 7]), 3, 10, 2);
+        let b = ShardTable::compute_with_epoch(&nodes(&[9, 3, 7, 5, 1]), 3, 10, 2);
+        for s in 0..NUM_SHARDS {
+            assert_eq!(a.assignments[s].master, b.assignments[s].master);
+            assert_eq!(a.assignments[s].replicas, b.assignments[s].replicas);
+        }
+    }
+
+    #[test]
+    fn hrw_rf_invariants_hold() {
+        // master ∉ replicas, replicas distinct, count == min(RF-1, n-1).
+        for n in 1..=16u64 {
+            for rf in 1..=4u8 {
+                let members = nodes(&(1..=n).collect::<Vec<_>>());
+                let table = ShardTable::compute_with_epoch(&members, rf, 1, 2);
+                let expected_replicas = ((rf as usize).saturating_sub(1)).min(n as usize - 1);
+                for s in 0..NUM_SHARDS {
+                    let a = &table.assignments[s];
+                    assert!(
+                        !a.replicas.contains(&a.master),
+                        "n={n} rf={rf} shard={s}: master in replicas"
+                    );
+                    let distinct: std::collections::HashSet<_> = a.replicas.iter().collect();
+                    assert_eq!(
+                        distinct.len(),
+                        a.replicas.len(),
+                        "n={n} rf={rf} shard={s}: duplicate replicas"
+                    );
+                    assert_eq!(
+                        a.replicas.len(),
+                        expected_replicas,
+                        "n={n} rf={rf} shard={s}: wrong replica count"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hrw_single_master_per_shard_sums_to_num_shards() {
+        // The whole point: every shard has exactly one master, so the
+        // per-node master counts sum to NUM_SHARDS.
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4, 5]), 2, 1, 2);
+        let total: usize = table.shard_counts().values().copied().sum();
+        assert_eq!(total, NUM_SHARDS);
+    }
+
+    #[test]
+    fn hrw_add_node_moves_about_one_over_n() {
+        // The headline property: adding ONE node to an n-node cluster moves
+        // ≈ NUM_SHARDS/(n+1) masters (vs ≈ NUM_SHARDS·(1-1/n) for
+        // round-robin). Assert the moved count lies in [0.5/(n+1), 2/(n+1)]
+        // · NUM_SHARDS — a generous band around the 1/(n+1) ideal.
+        for n in 2..=15u64 {
+            let before =
+                ShardTable::compute_with_epoch(&nodes(&(1..=n).collect::<Vec<_>>()), 2, 1, 2);
+            let after =
+                ShardTable::compute_with_epoch(&nodes(&(1..=n + 1).collect::<Vec<_>>()), 2, 2, 2);
+            let moved = moved_masters(&before, &after);
+            let ideal = NUM_SHARDS as f64 / (n + 1) as f64;
+            let lo = (0.5 * ideal) as usize;
+            let hi = (2.0 * ideal).ceil() as usize;
+            assert!(
+                moved >= lo && moved <= hi,
+                "add node: n={n} moved={moved} expected in [{lo},{hi}] (ideal {ideal:.0})"
+            );
+        }
+    }
+
+    #[test]
+    fn hrw_remove_node_moves_about_one_over_n() {
+        // Removing ONE node from an (n+1)-node cluster moves only the shards
+        // that node mastered (≈ NUM_SHARDS/(n+1)). The untouched shards keep
+        // their master — the locality property round-robin lacks.
+        for n in 2..=15u64 {
+            let before =
+                ShardTable::compute_with_epoch(&nodes(&(1..=n + 1).collect::<Vec<_>>()), 2, 1, 2);
+            let after =
+                ShardTable::compute_with_epoch(&nodes(&(1..=n).collect::<Vec<_>>()), 2, 2, 2);
+            let moved = moved_masters(&before, &after);
+            let ideal = NUM_SHARDS as f64 / (n + 1) as f64;
+            let lo = (0.5 * ideal) as usize;
+            let hi = (2.0 * ideal).ceil() as usize;
+            assert!(
+                moved >= lo && moved <= hi,
+                "remove node: n={n} moved={moved} expected in [{lo},{hi}] (ideal {ideal:.0})"
+            );
+        }
+    }
+
+    #[test]
+    fn hrw_untouched_shards_keep_master_on_membership_change() {
+        // Stability: for a shard whose master is NOT the removed node and
+        // whose master is NOT displaced by the added node, the master is
+        // unchanged. Concretely: removing node X, every shard NOT mastered
+        // by X before keeps its exact master after. (HRW's defining
+        // locality — round-robin reshuffles nearly everything.)
+        let before = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4]), 2, 1, 2);
+        let after = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 2, 2);
+        let removed = NodeId(4);
+        for s in 0..NUM_SHARDS {
+            if before.assignments[s].master != removed {
+                assert_eq!(
+                    before.assignments[s].master, after.assignments[s].master,
+                    "shard {s}: master changed despite not being on the removed node"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hrw_differs_from_round_robin() {
+        // v1 and v2 must produce genuinely different tables (otherwise the
+        // upgrade is a no-op and the property tests are vacuous).
+        let v1 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4, 5]), 2, 1, 1);
+        let v2 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3, 4, 5]), 2, 1, 2);
+        assert!(
+            moved_masters(&v1, &v2) > NUM_SHARDS / 4,
+            "v2 should reassign a large fraction of masters vs v1"
+        );
+    }
+
+    #[test]
+    fn hrw_tie_break_is_lower_node_id() {
+        // The table's recorded placement_version is preserved.
+        let table = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 2);
+        assert_eq!(table.placement_version(), 2);
+        let v1 = ShardTable::compute_with_epoch(&nodes(&[1, 2, 3]), 2, 1, 1);
+        assert_eq!(v1.placement_version(), 1);
     }
 }

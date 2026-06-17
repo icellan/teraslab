@@ -2512,7 +2512,7 @@ mod tests {
         // real master is 2 or 3 get the *other* (still real, still reachable)
         // remote node as their stale master. That is exactly the misroute this
         // test needs: node1's map points the shard at the wrong remote peer.
-        let stale_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 999);
+        let stale_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 999, 1);
         let (shard, actual_master, stale_master) = (0..teraslab::cluster::shards::NUM_SHARDS
             as u16)
             .find_map(|shard| {
