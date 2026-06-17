@@ -4912,6 +4912,37 @@ fn run_migration_batch(
                         }
                     }
 
+                    // Determine which shards' key SET may have churned between the
+                    // key snapshot and the fence. For those the pre-migration key
+                    // snapshot is unsafe (a balanced delete+create leaves the
+                    // count equal while membership changes), so the manifest /
+                    // late-key set must be rebuilt from the live index. Rescan
+                    // ALL changed shards in this sub-batch with ONE filtered
+                    // index pass instead of an O(index) `keys_for_shard` per
+                    // shard — keeping the fast path's bounded cost while
+                    // restoring correctness.
+                    //
+                    let changed_shards: std::collections::HashSet<u16> = sub_batch
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| streamed[*i])
+                        .filter(|(i, task)| {
+                            shard_membership_changed_in_window(
+                                redo_log,
+                                snapshot_seqs[*i],
+                                fence_seq,
+                                task.shard,
+                            )
+                            .unwrap_or(true)
+                        })
+                        .map(|(_, task)| task.shard)
+                        .collect();
+                    let rescanned_keys_by_shard = if changed_shards.is_empty() {
+                        std::collections::HashMap::new()
+                    } else {
+                        engine.keys_by_shard_filtered(&changed_shards)
+                    };
+
                     // Phase 3: Verify each shard manifest, then clear inbound
                     // migration state in one durable batch. Verification stays
                     // per shard so a single corrupt/missing shard is isolated,
@@ -4972,15 +5003,22 @@ fn run_migration_batch(
                             }
                             continue;
                         }
-                        // Get current keys for manifest (use count fast-path).
+                        // Get current keys for manifest. The pre-migration key
+                        // snapshot is only safe to reuse when the shard's key SET
+                        // is provably unchanged between snapshot and fence (no
+                        // same-shard Create/Delete in the redo window). When it
+                        // may have churned the shard is in `changed_shards` and
+                        // its true current keys were rebuilt above by the single
+                        // `keys_by_shard_filtered` pass; an absent entry there
+                        // means the shard is now empty.
                         let shard_keys_snapshot = keys_ref.get(&task.shard).unwrap_or(&empty_keys);
-                        let fenced_keys: Vec<TxKey> = {
-                            let count = engine.shard_record_count(task.shard) as usize;
-                            if count == shard_keys_snapshot.len() {
-                                shard_keys_snapshot.iter().map(|k| **k).collect()
-                            } else {
-                                engine.keys_for_shard(task.shard)
-                            }
+                        let fenced_keys: Vec<TxKey> = if changed_shards.contains(&task.shard) {
+                            rescanned_keys_by_shard
+                                .get(&task.shard)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            shard_keys_snapshot.iter().map(|k| **k).collect()
                         };
                         // Close the window between Phase 1 snapshot and Phase 2
                         // fence: any key present after fence but NOT streamed
@@ -6512,6 +6550,74 @@ fn collect_migration_delta_ops(
         .filter(|e| e.sequence < fence_seq)
         .filter_map(|e| redo_entry_to_replica_op(e, shard, engine))
         .collect())
+}
+
+/// Decide whether a shard's key SET may have changed between the baseline
+/// snapshot and the fence, so the manifest/late-key derivation knows when the
+/// O(1) `shard_record_count`-equality fast-path over the pre-migration key
+/// snapshot is unsafe.
+///
+/// The fast-path in the batched migration loop reuses the pre-migration key
+/// snapshot whenever `shard_record_count` equals the snapshot length. Count
+/// equality does NOT imply set equality: a balanced delete-of-one +
+/// create-of-another in the snapshot→fence window leaves the count unchanged
+/// while the membership churns. Under that race the snapshot omits the newly
+/// created key (so its record is never streamed and the source retains the
+/// shard, blocking convergence) and lists the deleted key (manifest/target
+/// drift). The redo window is the authority on membership change: only
+/// `Create` and `Delete` add or remove keys, so if neither appears for this
+/// shard in `[snapshot_seq, fence_seq)` the snapshot set is provably exact.
+///
+/// Returns `Ok(true)` when a `Create`/`Delete` for `shard` exists in the
+/// window OR there is no evidence to prove the set is unchanged (no redo log,
+/// or no anchoring `snapshot_seq`) — the caller must rescan the live index.
+/// Returns `Ok(false)` only when the set is provably unchanged (the fence did
+/// not advance past the snapshot, or no same-shard create/delete landed in the
+/// window) so the fast-path is exact. Returns `Err` when the redo log is
+/// unreadable or has been truncated past `snapshot_seq`; callers treat that as
+/// "may have changed" and fall back to the safe full scan, never to the stale
+/// snapshot.
+fn shard_membership_changed_in_window(
+    redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
+    snapshot_seq: u64,
+    fence_seq: u64,
+    shard: u16,
+) -> std::result::Result<bool, String> {
+    use crate::redo::RedoOp;
+
+    // A real, non-empty window requires a redo log and a fence sequence that
+    // advanced strictly past the snapshot. When the fence did NOT advance
+    // (`fence_seq <= snapshot_seq` with a captured snapshot) no mutation could
+    // have landed, so the set is provably unchanged. But when there is no
+    // snapshot sequence to anchor against (`snapshot_seq == 0`, e.g. no redo
+    // log) we have no evidence either way — report "changed" so the caller
+    // falls back to the safe live scan rather than trusting a stale snapshot.
+    let Some(rl) = redo_log else {
+        return Ok(true);
+    };
+    if snapshot_seq == 0 {
+        return Ok(true);
+    }
+    if fence_seq <= snapshot_seq {
+        return Ok(false);
+    }
+
+    let entries = rl
+        .lock()
+        .read_from_sequence(snapshot_seq)
+        .map_err(|e| format!("read redo from seq {snapshot_seq}: {e}"))?;
+    let first_entry_seq = entries.first().map(|e| e.sequence);
+    crate::replication::durable::check_redo_truncation(first_entry_seq, snapshot_seq)?;
+
+    Ok(entries
+        .iter()
+        .filter(|e| e.sequence < fence_seq)
+        .any(|e| match &e.op {
+            RedoOp::Create { tx_key, .. }
+            | RedoOp::CreateV2 { tx_key, .. }
+            | RedoOp::Delete { tx_key, .. } => ShardTable::shard_for_key(tx_key) == shard,
+            _ => false,
+        }))
 }
 
 /// Send delta ReplicaOps to the target on an existing stream and validate ACK.
@@ -9821,6 +9927,113 @@ mod tests {
             }
             other => panic!("expected SetLocked delta, got {other:?}"),
         }
+    }
+
+    /// #35 regression: the manifest/late-key fast-path must treat a shard
+    /// whose key SET churned in the snapshot→fence window as "changed" so the
+    /// caller rescans the live index. The pre-fix `shard_record_count`-equality
+    /// fast-path was unsound under a balanced delete-one + create-another
+    /// (count unchanged, membership changed): the stale snapshot omitted the
+    /// newly created key, so the manifest under-counted and the COMPLETE
+    /// handshake was rejected for a record-count mismatch (sc09 saw
+    /// "expected N, got N+1") — the handoff never converged.
+    #[test]
+    fn shard_membership_change_detected_for_windowed_create_or_delete() {
+        let shard = 81u16;
+        let created = tx_key_for_shard(shard, 1);
+        let deleted = tx_key_for_shard(shard, 2);
+        let other_shard_key = tx_key_for_shard(shard + 1, 3);
+        let redo_dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(ParkingMutex::new(
+            RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
+        ));
+
+        // Window: a balanced delete-one + create-another on the target shard
+        // (count nets to unchanged) plus a same-shard mutation and an
+        // unrelated-shard create. Only Create/Delete for THIS shard must flip
+        // the membership flag.
+        let snapshot_seq = redo.lock().current_sequence();
+        redo.lock()
+            .append_and_flush(crate::redo::RedoOp::Delete {
+                tx_key: deleted,
+                record_offset: 0,
+                record_size: 0,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(crate::redo::RedoOp::Create {
+                tx_key: created,
+                record_offset: 0,
+                utxo_count: 1,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(crate::redo::RedoOp::SetLocked {
+                tx_key: created,
+                value: true,
+            })
+            .unwrap();
+        let fence_seq = redo.lock().current_sequence();
+        let redo_log = Some(redo);
+
+        assert!(
+            shard_membership_changed_in_window(&redo_log, snapshot_seq, fence_seq, shard).unwrap(),
+            "a windowed create/delete on the shard must flag the membership as changed",
+        );
+
+        // A window with ONLY a same-shard mutation (no create/delete) must not
+        // flip the flag — the snapshot key set is provably exact and the
+        // fast-path stays valid.
+        let mutate_dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mutate_redo = Arc::new(ParkingMutex::new(
+            RedoLog::open(mutate_dev, 0, 1024 * 1024).unwrap(),
+        ));
+        let mutate_snapshot = mutate_redo.lock().current_sequence();
+        mutate_redo
+            .lock()
+            .append_and_flush(crate::redo::RedoOp::SetLocked {
+                tx_key: created,
+                value: false,
+            })
+            .unwrap();
+        // An unrelated-shard create in the window must also be ignored.
+        mutate_redo
+            .lock()
+            .append_and_flush(crate::redo::RedoOp::Create {
+                tx_key: other_shard_key,
+                record_offset: 0,
+                utxo_count: 1,
+            })
+            .unwrap();
+        let mutate_fence = mutate_redo.lock().current_sequence();
+        let mutate_log = Some(mutate_redo);
+
+        assert!(
+            !shard_membership_changed_in_window(&mutate_log, mutate_snapshot, mutate_fence, shard)
+                .unwrap(),
+            "a window with no same-shard create/delete must keep the fast-path valid",
+        );
+
+        // No window (snapshot == fence) means nothing could have changed.
+        assert!(
+            !shard_membership_changed_in_window(&mutate_log, mutate_fence, mutate_fence, shard)
+                .unwrap(),
+            "an empty window must report no membership change",
+        );
+
+        // No evidence (absent redo log, or no anchoring snapshot sequence)
+        // must conservatively report "changed" so the caller rescans the live
+        // index instead of trusting a possibly-stale snapshot.
+        assert!(
+            shard_membership_changed_in_window(&None, 10, 20, shard).unwrap(),
+            "an absent redo log must conservatively report a membership change",
+        );
+        assert!(
+            shard_membership_changed_in_window(&mutate_log, 0, 20, shard).unwrap(),
+            "a zero snapshot sequence must conservatively report a membership change",
+        );
     }
 
     #[test]
