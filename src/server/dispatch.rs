@@ -1959,6 +1959,25 @@ pub(crate) fn build_replication_targets(
         // destination once the address is known.
         let dual_write_extras = cluster.dual_write_targets_for_shard(shard);
         for replica_id in &assignment.replicas {
+            // A node never makes a NETWORK replication connection to its own
+            // address. When the shard's replica set names THIS node (which
+            // happens on rejoin / intent recovery, where the node holds the
+            // shard as a replica and re-drives its own pending intents, and
+            // on any topology where self is a replica rather than the
+            // master), self's copy is satisfied LOCALLY: the redo-log fsync
+            // and engine apply that produced this op already landed on this
+            // node's own device before fan-out. A TCP connect to self:port
+            // would fail during startup (the listener isn't up yet) and is
+            // always a no-op round-trip otherwise — so self is excluded from
+            // the network target set entirely. The local copy still counts
+            // toward quorum: `required_replica_acks` models the local copy as
+            // the implicit +1 (replication_factor = replica_targets + 1), so
+            // omitting self from `this_key_regular` shrinks the OTHER-holder
+            // count by one and credits this node's durable local copy without
+            // requiring a self-ACK. See `classify_per_key_replication`.
+            if *replica_id == self_id {
+                continue;
+            }
             match cluster.node_addr(replica_id) {
                 Some(addr) => {
                     by_addr.entry(addr).or_default().extend(ops.clone());
@@ -1981,8 +2000,9 @@ pub(crate) fn build_replication_targets(
         // whenever it is not this node.
         //
         // On the live client-write path the master IS this node (self), so
-        // this adds nothing — `self_id` is excluded below — and the regular
-        // replica/quorum set is unchanged.
+        // this adds nothing — the `current_master != self_id` guard below
+        // skips self, exactly as the replica loop above does — and the
+        // regular replica/quorum set is unchanged.
         //
         // On the compensation re-drive path the topology may have changed
         // since the failed write: the divergent replica R may have been
@@ -13550,6 +13570,150 @@ mod tests {
         );
     }
 
+    /// sc09 rejoin self-connect — `build_replication_targets` must never name
+    /// THIS node's own address as a NETWORK replication target.
+    ///
+    /// Scenario (scenario_09 rolling restart): a node rejoins and re-drives a
+    /// pending replication intent for a shard it holds as a REPLICA (not the
+    /// master). The shard's holder set is `{master, ..., self, ...}`. Before
+    /// the fix, `build_replication_targets` resolved `self` via
+    /// `node_addr(self_id) = Some(self_addr)` and inserted `self_addr` into
+    /// the fan-out set, so the recovering node attempted a TCP connect to
+    /// itself (`connect to <self>:3300: Connection refused`, the listener is
+    /// not up yet during startup), the per-key quorum failed, intent recovery
+    /// returned Err, and startup aborted — the cluster never returned to full
+    /// membership.
+    ///
+    /// After the fix: `self_addr` is NOT a network target; the OTHER holder
+    /// (the new master) IS; and the per-key regular set excludes self so the
+    /// local copy is the implicit +1 toward quorum.
+    #[test]
+    fn build_replication_targets_excludes_self_when_self_is_a_replica() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let n3 = crate::cluster::shards::NodeId(3);
+        let members = vec![n1, n2, n3];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 419, 1);
+        // Shard mastered by n1 with n2 as replica (n3 not a replica).
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n1 && a.replicas.contains(&n2) && !a.replicas.contains(&n3)
+            })
+            .expect("expected shard mastered by n1 with n2 (not n3) as replica");
+
+        let n1_addr: SocketAddr = "127.0.0.1:8941".parse().unwrap();
+        let n2_addr: SocketAddr = "127.0.0.1:8942".parse().unwrap();
+        let n3_addr: SocketAddr = "127.0.0.1:8943".parse().unwrap();
+        // self_id = n1.
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr), (n3, n3_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+
+        // Promote n2 to master of S; this DEMOTES n1 (self) into the replica
+        // list — now self holds S as a replica, exactly the rejoin condition.
+        {
+            let table = cluster.shard_table();
+            let mut guard = table.write();
+            guard.set_master_for_shard(shard, n2);
+            assert_eq!(
+                guard.target_assignment(shard).master,
+                n2,
+                "precondition: n2 must now be master of S",
+            );
+            assert!(
+                guard.target_assignment(shard).replicas.contains(&n1),
+                "precondition: demoted self (n1) must be in the replica list",
+            );
+        }
+
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 21),
+        };
+        let ops = vec![(
+            tx_key,
+            vec![crate::replication::protocol::ReplicaOp::Delete { tx_key }],
+        )];
+
+        let plan = build_replication_targets(&cluster, &ops)
+            .expect("target resolution must succeed when self is a replica holder");
+
+        // Self's own address is NEVER a network target.
+        assert!(
+            !plan.by_addr.contains_key(&n1_addr),
+            "self_addr must NOT be a network replication target (self holds the data locally): {:?}",
+            plan.by_addr,
+        );
+        // The OTHER holder (the new master n2) IS a network target.
+        assert!(
+            plan.by_addr.contains_key(&n2_addr),
+            "the other holder (n2, new master) must be a network target: {:?}",
+            plan.by_addr,
+        );
+
+        // Per-key quorum accounting credits the local copy: the regular set
+        // contains exactly the OTHER holder, NOT self. `required_replica_acks`
+        // models self's local durable copy as the implicit +1.
+        let entry = plan
+            .key_targets
+            .iter()
+            .find(|(k, _)| *k == tx_key)
+            .expect("key must appear in key_targets");
+        assert_eq!(
+            entry.1,
+            vec![n2_addr],
+            "per-key regular set must be exactly the OTHER holder; self is credited locally, not network-ACKed",
+        );
+    }
+
+    /// Companion to the above: a successful ACK from the single OTHER holder
+    /// satisfies WriteMajority because the local copy is the implicit +1.
+    /// With one other target and the local copy, RF=2; WriteMajority needs
+    /// `required_replica_acks(1, WriteMajority) = 1` ACK from the other holder.
+    /// This pins that excluding self does not silently weaken the quorum: the
+    /// remaining other-holder ACK still has to land.
+    #[test]
+    fn self_excluded_quorum_credits_local_copy_but_still_requires_other_holder_ack() {
+        use crate::replication::manager::AckPolicy;
+        let n2_addr: SocketAddr = "127.0.0.1:8952".parse().unwrap();
+        let targets = vec![n2_addr];
+
+        // No ACK from the other holder → WriteMajority fails (the local copy
+        // alone is not durable enough; one other copy is required).
+        let no_acks: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+        let verdict =
+            classify_per_key_replication(&targets, &no_acks, Some(AckPolicy::WriteMajority), false);
+        assert!(
+            matches!(
+                verdict,
+                KeyReplicationVerdict::Failed {
+                    required: 1,
+                    acked: 0,
+                    targets: 1
+                }
+            ),
+            "missing the other-holder ACK must FAIL quorum, not be masked by the local copy: {verdict:?}",
+        );
+
+        // ACK from the other holder → durable (local copy + 1 other = majority
+        // of RF=2).
+        let mut acked = std::collections::HashSet::new();
+        acked.insert(n2_addr);
+        let verdict =
+            classify_per_key_replication(&targets, &acked, Some(AckPolicy::WriteMajority), false);
+        assert!(
+            matches!(verdict, KeyReplicationVerdict::Durable),
+            "other-holder ACK + local copy must satisfy WriteMajority for RF=2: {verdict:?}",
+        );
+    }
+
     // -----------------------------------------------------------------------
     // C-1 + D-6 — integration over a real cluster + controlled TCP receivers.
     //
@@ -13741,6 +13905,99 @@ mod tests {
         let outcome = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
             .expect("key reached its own replica — batch must succeed");
         assert_eq!(outcome, ReplicationOutcome::Full);
+    }
+
+    /// sc09 rejoin — intent recovery for a shard THIS node holds as a replica
+    /// must NOT attempt a self-connect and must NOT abort startup.
+    ///
+    /// End-to-end repro of the scenario_09 wedge: node n1 rejoins and replays a
+    /// pending replication intent for a shard whose holder set is `{n2(master),
+    /// n1(self, replica)}`. n1's OWN address (`n1_addr`) is an unbound port —
+    /// any TCP connect to it is refused, exactly as during startup before the
+    /// listener is up. n2 is a controlled receiver that ACKs.
+    ///
+    /// Before the fix, `build_replication_targets` named `n1_addr` as a network
+    /// target, the recovery send hit "connection refused", the per-key quorum
+    /// failed, `recover_pending_replication_intents_from_tracker` returned Err,
+    /// and the startup barrier aborted the process. After the fix self is never
+    /// a network target — only n2 is contacted — recovery succeeds and the
+    /// intent is committed (cleared from the tracker).
+    #[test]
+    fn intent_recovery_for_self_held_shard_does_not_self_connect_or_abort() {
+        let n1 = crate::cluster::shards::NodeId(1);
+        let n2 = crate::cluster::shards::NodeId(2);
+        let members = vec![n1, n2];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, 53, 1);
+        // Shard mastered by n2 with n1 (self) as a replica — the rejoin holder
+        // condition: self holds the shard as a replica, not the master.
+        let shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                let a = table.target_assignment(s);
+                a.master == n2 && a.replicas.contains(&n1)
+            })
+            .expect("a shard mastered by n2 with n1(self) as replica");
+
+        // n1's own address: an unbound 127.0.0.1 port. A connect here is
+        // refused — proving the code never dials self. n2 is a live ACK
+        // receiver (the only legitimate network target).
+        let n1_addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let n2_addr = spawn_replica_receiver(ReplicaBehaviour::Ack);
+        let mut cluster = crate::cluster::coordinator::new_test_running_cluster(
+            n1,
+            table,
+            &[(n1, n1_addr), (n2, n2_addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        // WriteAll so that EVERY network target must ACK: before the fix this
+        // includes self (`n1_addr`, unbound → refused), so recovery fails and
+        // aborts; after the fix self is not a target and the sole network
+        // holder (n2) ACKing is sufficient.
+        cluster.set_replication_policy_for_test(Some(AckPolicy::WriteAll), false);
+
+        // A pending intent over a redo range carrying a Delete for a key that
+        // hashes into the self-held shard.
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(shard, 88),
+        };
+        let range = write_redo_ops(
+            Some(&redo_log),
+            &[RedoOp::Delete {
+                tx_key,
+                record_offset: 4096,
+                record_size: 256,
+            }],
+        )
+        .expect("redo write succeeds");
+        tracker.begin(range.0, range.1).unwrap();
+
+        let h = DispatchTestHarness::new();
+        // Drive the EXACT body of `recover_pending_replication_intents`: the
+        // production `replicate_all_ops` fan-out against the live cluster.
+        let result = recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &h.engine,
+            |ops, r| replicate_all_ops(Some(&cluster), ops, r, &[]).map(|_| ()),
+        );
+
+        result.expect(
+            "intent recovery for a self-held shard must succeed (contact n2 only, never self) — \
+             a self-connect here is the sc09 startup abort",
+        );
+        assert!(
+            tracker.pending().is_empty(),
+            "the recovered intent must be committed/cleared after successful fan-out to the OTHER holder",
+        );
     }
 
     #[test]
