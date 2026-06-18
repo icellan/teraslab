@@ -450,6 +450,7 @@ struct TxMetadataRaw {
     _tx_id: [u8; 32],
     _tx_version: u32,
     _locktime: u32,
+    _identity_crc: u32,
     _fee: u64,
     _size_in_bytes: u64,
     _extended_size: u64,
@@ -503,6 +504,21 @@ pub struct TxMetadata {
     pub tx_version: u32,
     /// Transaction locktime.
     pub locktime: u32,
+
+    /// CRC32 over the immutable identity prefix `[0..IDENTITY_PREFIX_LEN)` —
+    /// `magic`, `schema_version`, `record_size`, `utxo_count`, `tx_id`,
+    /// `tx_version`, `locktime`. All of these are write-once at create and
+    /// never mutated, so this CRC is computed once by [`TxMetadata::to_bytes`]
+    /// and is stable for the life of the record.
+    ///
+    /// It exists so the `get_spend` hot path can read+validate just the first
+    /// cache line of the header (60 bytes via
+    /// [`TxMetadata::read_identity_from`]) instead of the full
+    /// `METADATA_SIZE`-byte header guarded by [`Self::crc32`]. Reading one
+    /// cache line instead of five roughly halves read latency on cold
+    /// records. Callers must never write this field directly.
+    pub identity_crc: u32,
+
     /// Transaction fee in satoshis (signed to match Go's int64).
     pub fee: u64,
     /// Serialized transaction size in bytes.
@@ -590,6 +606,7 @@ impl TxMetadata {
             tx_id: [0u8; 32],
             tx_version: 0,
             locktime: 0,
+            identity_crc: 0,
             fee: 0,
             size_in_bytes: 0,
             extended_size: 0,
@@ -647,6 +664,14 @@ impl TxMetadata {
             std::slice::from_raw_parts((self as *const Self).cast::<u8>(), METADATA_SIZE)
         };
         dst[..METADATA_SIZE].copy_from_slice(src);
+
+        // Stamp the immutable identity-prefix CRC first, so it is part of the
+        // bytes covered by the full-header CRC below. The prefix CRC covers
+        // `[0..IDENTITY_PREFIX_LEN)` (which does NOT include the prefix-CRC
+        // slot itself at `IDENTITY_CRC_OFFSET`), so no zeroing is required.
+        let id_crc = crc32fast::hash(&dst[..IDENTITY_PREFIX_LEN]);
+        dst[IDENTITY_CRC_OFFSET..IDENTITY_CRC_OFFSET + 4].copy_from_slice(&id_crc.to_le_bytes());
+
         // Zero the CRC slot, compute CRC over the full METADATA_SIZE bytes,
         // then stamp the result into the CRC slot.
         let crc_off = CRC32_OFFSET;
@@ -729,7 +754,96 @@ impl TxMetadata {
 /// the four CRC bytes for zeroing/stamping during checksum computation.
 pub const CRC32_OFFSET: usize = std::mem::offset_of!(TxMetadata, crc32);
 
+/// Byte offset of the identity-prefix CRC32 slot within a serialized header.
+pub const IDENTITY_CRC_OFFSET: usize = std::mem::offset_of!(TxMetadata, identity_crc);
+
+/// Number of leading header bytes covered by [`TxMetadata::identity_crc`].
+///
+/// These bytes are all write-once at create (`magic`, `schema_version`,
+/// `record_size`, `utxo_count`, `tx_id`, `tx_version`, `locktime`) and end
+/// exactly where the identity-CRC slot begins.
+pub const IDENTITY_PREFIX_LEN: usize = IDENTITY_CRC_OFFSET;
+
+/// Number of leading header bytes a reader must copy to validate and parse
+/// the identity prefix: the covered region plus the 4-byte CRC slot.
+pub const IDENTITY_READ_LEN: usize = IDENTITY_CRC_OFFSET + 4;
+
+// The identity prefix (read + its CRC) must fit within a single 64-byte
+// cache line — that is the entire point of the layout (one cache-line read
+// on the get_spend hot path instead of the full five-line header).
+const _: () = assert!(IDENTITY_READ_LEN <= 64);
+// `locktime` is the last covered field and must butt up against the CRC slot.
+const _: () = assert!(std::mem::offset_of!(TxMetadata, locktime) + 4 == IDENTITY_CRC_OFFSET);
+// The identity fields must sit inside the covered prefix.
+const _: () = assert!(std::mem::offset_of!(TxMetadata, utxo_count) + 4 <= IDENTITY_PREFIX_LEN);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, tx_id) + 32 <= IDENTITY_PREFIX_LEN);
+
+/// The immutable identity of a record, extractable from just its first
+/// cache line via [`TxMetadata::read_identity_from`].
+///
+/// Used by the `get_spend` hot path: every field here is write-once at
+/// create, so reading the cache-line-sized prefix is sufficient to (a)
+/// confirm the record at an offset still belongs to the requested
+/// `tx_id` (F-G2-001 aliasing defense), (b) re-derive the authoritative
+/// `utxo_count` bound, and (c) obtain `locktime` — without paying for the
+/// full `METADATA_SIZE`-byte header read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxIdentity {
+    /// Transaction hash (write-once).
+    pub tx_id: [u8; 32],
+    /// Number of UTXO slots allocated in this record (write-once).
+    pub utxo_count: u32,
+    /// Transaction locktime (write-once).
+    pub locktime: u32,
+}
+
 impl TxMetadata {
+    /// Parse and validate the immutable identity prefix from the first
+    /// [`IDENTITY_READ_LEN`] bytes of a serialized header.
+    ///
+    /// `src` must be at least [`IDENTITY_READ_LEN`] bytes. Returns
+    /// [`RecordError::CrcMismatch`] if the stored identity CRC disagrees with
+    /// a freshly-computed CRC over `[0..IDENTITY_PREFIX_LEN)`.
+    ///
+    /// A `CrcMismatch` here means one of: (a) on-disk corruption of the
+    /// identity bytes, or (b) the header has been overwritten by a
+    /// `DeletedRecordMarker` or another record's bytes (offset reuse) — i.e.
+    /// the record no longer carries a valid live identity. Callers on the
+    /// lock-free read path treat this the same way they treat a `tx_id`
+    /// mismatch: the requested transaction is not present at this offset.
+    ///
+    /// Note: this validates *only* the identity prefix, not the full header.
+    /// It is exclusively for hot read paths that need `tx_id` / `utxo_count`
+    /// / `locktime`; any path needing other fields must use
+    /// [`TxMetadata::from_bytes`].
+    #[inline]
+    pub fn read_identity_from(src: &[u8]) -> Result<TxIdentity, RecordError> {
+        debug_assert!(src.len() >= IDENTITY_READ_LEN);
+        let mut stored = [0u8; 4];
+        stored.copy_from_slice(&src[IDENTITY_CRC_OFFSET..IDENTITY_CRC_OFFSET + 4]);
+        let expected = u32::from_le_bytes(stored);
+        let actual = crc32fast::hash(&src[..IDENTITY_PREFIX_LEN]);
+        if actual != expected {
+            return Err(RecordError::CrcMismatch { expected, actual });
+        }
+
+        let uc_off = std::mem::offset_of!(TxMetadata, utxo_count);
+        let id_off = std::mem::offset_of!(TxMetadata, tx_id);
+        let lt_off = std::mem::offset_of!(TxMetadata, locktime);
+        let mut utxo_count = [0u8; 4];
+        utxo_count.copy_from_slice(&src[uc_off..uc_off + 4]);
+        let mut locktime = [0u8; 4];
+        locktime.copy_from_slice(&src[lt_off..lt_off + 4]);
+        let mut tx_id = [0u8; 32];
+        tx_id.copy_from_slice(&src[id_off..id_off + 32]);
+
+        Ok(TxIdentity {
+            tx_id,
+            utxo_count: u32::from_le_bytes(utxo_count),
+            locktime: u32::from_le_bytes(locktime),
+        })
+    }
+
     /// Compute the CRC32 over this metadata header with the CRC slot zeroed.
     ///
     /// Used by the targeted-write helpers in [`crate::io`] that mutate only
@@ -743,6 +857,15 @@ impl TxMetadata {
             std::slice::from_raw_parts((self as *const Self).cast::<u8>(), METADATA_SIZE)
         };
         buf.copy_from_slice(src);
+        // Re-derive the identity-prefix CRC from the (immutable) prefix fields,
+        // exactly as `to_bytes` does, so the full CRC this returns matches the
+        // on-disk bytes regardless of the in-memory `identity_crc` field. The
+        // targeted-write restamp path never rewrites the identity slot on
+        // device, so this keeps `compute_crc` consistent with `to_bytes`
+        // without depending on the caller having round-tripped through
+        // `from_bytes`.
+        let id_crc = crc32fast::hash(&buf[..IDENTITY_PREFIX_LEN]);
+        buf[IDENTITY_CRC_OFFSET..IDENTITY_CRC_OFFSET + 4].copy_from_slice(&id_crc.to_le_bytes());
         buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
         crc32fast::hash(&buf)
     }
@@ -1459,6 +1582,75 @@ mod tests {
         // The inline bytes still survive the round-trip (raw memcpy), but they
         // are logically meaningless because count is 0.
         assert_eq!(meta, restored);
+    }
+
+    #[test]
+    fn identity_prefix_roundtrips() {
+        let mut m = TxMetadata::new(7);
+        m.tx_id = [0xAB; 32];
+        m.locktime = 0xCAFE;
+        let mut buf = vec![0u8; METADATA_SIZE];
+        m.to_bytes(&mut buf);
+
+        let id = TxMetadata::read_identity_from(&buf).expect("valid identity CRC");
+        assert_eq!(id.tx_id, [0xAB; 32]);
+        assert_eq!(id.utxo_count, 7);
+        assert_eq!(id.locktime, 0xCAFE);
+    }
+
+    #[test]
+    fn identity_prefix_detects_corruption_in_covered_bytes() {
+        let mut m = TxMetadata::new(3);
+        m.tx_id = [0x11; 32];
+        m.locktime = 5;
+        let mut buf = vec![0u8; METADATA_SIZE];
+        m.to_bytes(&mut buf);
+
+        // Flip a byte inside the covered prefix (within tx_id at offset 16).
+        buf[16] ^= 0xFF;
+        assert!(matches!(
+            TxMetadata::read_identity_from(&buf),
+            Err(RecordError::CrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_prefix_rejects_deleted_marker_header() {
+        // A deleted record's header is a DeletedRecordMarker, not a live
+        // identity prefix — read_identity_from must reject it so the
+        // get_spend hot path treats a tombstoned offset as "not present".
+        let mut buf = vec![0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(TxMetadata::record_size_for(5)).to_bytes(&mut buf);
+        assert!(TxMetadata::read_identity_from(&buf).is_err());
+    }
+
+    #[test]
+    fn identity_crc_is_independent_of_mutable_fields() {
+        // The identity prefix CRC must depend ONLY on write-once fields. A
+        // mutation to a field outside the prefix (generation, spent_utxos)
+        // followed by a full re-serialize must leave the identity bytes — and
+        // their CRC — byte-for-byte unchanged. This is what lets mutation
+        // restamps skip the identity slot entirely.
+        let mut m = TxMetadata::new(4);
+        m.tx_id = [0x22; 32];
+        m.locktime = 9;
+        let mut a = vec![0u8; METADATA_SIZE];
+        m.to_bytes(&mut a);
+        let id_a = TxMetadata::read_identity_from(&a).expect("valid");
+
+        m.generation = 999;
+        m.spent_utxos = 2;
+        m.updated_at = 123_456;
+        let mut b = vec![0u8; METADATA_SIZE];
+        m.to_bytes(&mut b);
+        let id_b = TxMetadata::read_identity_from(&b).expect("valid");
+
+        assert_eq!(id_a, id_b);
+        assert_eq!(
+            a[IDENTITY_CRC_OFFSET..IDENTITY_CRC_OFFSET + 4],
+            b[IDENTITY_CRC_OFFSET..IDENTITY_CRC_OFFSET + 4],
+            "identity CRC must not change when mutable fields change"
+        );
     }
 
     #[test]

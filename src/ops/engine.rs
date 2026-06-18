@@ -1414,6 +1414,38 @@ impl Engine {
         Ok(meta)
     }
 
+    /// Read just the immutable identity prefix of a record from device.
+    ///
+    /// Hot-path counterpart to [`Self::read_metadata_fast`]: copies and
+    /// validates only the first cache line of the header
+    /// ([`crate::record::IDENTITY_READ_LEN`] bytes) and returns the record's
+    /// `tx_id`, `utxo_count`, and `locktime` — all write-once fields. Used by
+    /// `get_spend`, which needs nothing else from the header. A CRC failure
+    /// here (corruption, or the header overwritten by a delete marker / a
+    /// reused offset) surfaces as a `StorageError`, matching the behavior of
+    /// `read_metadata_fast` on a non-`TxMetadata` header.
+    #[inline(always)]
+    fn read_identity_fast(
+        &self,
+        record_offset: u64,
+    ) -> std::result::Result<crate::record::TxIdentity, SpendError> {
+        if !self.device_ptr.is_null() {
+            // SAFETY: identical contract to `read_metadata_fast` —
+            // `device_ptr` is the live device base and `record_offset` is an
+            // allocator-issued, in-bounds offset. `read_identity_direct`
+            // takes the per-offset `io_locks()` read side internally.
+            unsafe { io::read_identity_direct(self.device_ptr, record_offset) }.map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("{e}"),
+                }
+            })
+        } else {
+            io::read_identity(&*self.device, record_offset).map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })
+        }
+    }
+
     /// Write metadata to device, using direct memory access when available.
     #[inline(always)]
     fn write_metadata_fast(
@@ -6052,8 +6084,11 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let ro = entry.record_offset;
 
-        let meta = self.read_metadata_for_key(&req.tx_key, ro)?;
-        if req.offset >= { meta.utxo_count } {
+        // Pre-slot bound from the cached index `utxo_count` (no device read).
+        // This only bounds the upcoming slot read into the offset's allocated
+        // extent; the *authoritative* bound is re-checked against the
+        // on-device identity below (which also closes the aliasing race).
+        if req.offset >= entry.utxo_count {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
 
@@ -6062,16 +6097,33 @@ impl Engine {
             return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
 
-        // F-G2-001 (re-verify): re-read metadata after the slot read so a
-        // `delete + create_at_offset` race that landed between the
-        // earlier `read_metadata_for_key` and this `read_slot_fast`
-        // surfaces as `TxNotFound` instead of returning a different
-        // transaction's slot data under `key`. The `slot.hash` check
-        // above catches the *type* of aliasing where utxo_hash differs;
-        // this catches the case where another transaction happens to
-        // share a slot hash by accident (small but not zero given
-        // 32-byte preimage-controllable hashes from upstream).
-        let _meta_check = self.read_metadata_for_key(&req.tx_key, ro)?;
+        // F-G2-001 (re-verify) + locktime, in ONE cache-line read.
+        //
+        // Read the immutable identity prefix AFTER the slot read so a
+        // `delete + create_at_offset` race that landed between the index
+        // lookup and `read_slot_fast` is caught here rather than returning
+        // another transaction's data under `key`. The prefix lives in the
+        // record *header*, which a delete overwrites with a `DeletedRecordMarker`
+        // and a create-at-offset overwrites with the new owner's identity —
+        // so it always reflects the CURRENT owner of the offset. (A per-slot
+        // identity cannot do this: a shrinking offset-reuse leaves lingering,
+        // CRC-valid slots carrying the OLD tx_id.)
+        //
+        // Two checks make the read sound:
+        //   1. `id.tx_id != key.txid` ⇒ the offset was reused (or the header
+        //      was tombstoned, failing the prefix CRC → StorageError) ⇒
+        //      `TxNotFound`. This subsumes the old per-accident slot-hash
+        //      collision concern.
+        //   2. `req.offset >= id.utxo_count` ⇒ the (possibly same-key)
+        //      record was re-created smaller and `req.offset` now addresses a
+        //      lingering slot beyond the live record ⇒ `UtxoNotFound`.
+        let id = self.read_identity_fast(ro)?;
+        if id.tx_id != req.tx_key.txid {
+            return Err(SpendError::TxNotFound);
+        }
+        if req.offset >= id.utxo_count {
+            return Err(SpendError::UtxoNotFound { offset: req.offset });
+        }
 
         let spending_data = match slot.status {
             UTXO_UNSPENT => None,
@@ -6083,7 +6135,7 @@ impl Engine {
         Ok(GetSpendResponse {
             status: slot.status,
             spending_data,
-            locktime: { meta.locktime },
+            locktime: id.locktime,
         })
     }
 
@@ -14479,6 +14531,127 @@ mod tests {
             Err(SpendError::UtxoNotFound { offset: 99 }) => {}
             other => panic!("expected UtxoNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn get_spend_locktime_survives_mutation() {
+        // get_spend sources locktime from the immutable identity prefix. A
+        // mutation (spend) bumps generation and restamps the FULL header CRC;
+        // it must not disturb the identity prefix or its CRC, so a subsequent
+        // get_spend still returns the original locktime.
+        let engine = create_engine();
+        let (_, mut req) = make_create_req(136, 5);
+        req.locktime = 7_777;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let mut sd = [0u8; 36];
+        sd[0] = 0x5A;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: req.utxo_hashes[0],
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+
+        // Read a different, still-unspent slot: locktime must be intact.
+        let resp = engine
+            .get_spend(&GetSpendRequest {
+                tx_key: key,
+                offset: 1,
+                utxo_hash: req.utxo_hashes[1],
+            })
+            .unwrap();
+        assert_eq!(resp.status, UTXO_UNSPENT);
+        assert_eq!(resp.locktime, 7_777, "locktime must survive a mutation");
+    }
+
+    #[test]
+    fn get_spend_offset_reuse_does_not_alias_shrunk_record() {
+        // Lingering-slot / F-G2-001 defense: deleting a record and creating a
+        // SMALLER one at the same offset must never let a get_spend addressing
+        // a slot that existed only in the old record surface the old record's
+        // (possibly spent) lingering slot data. The authoritative bound and
+        // identity come from the header, which the new owner overwrites.
+        let engine = create_engine();
+
+        // key1: 5 slots, spend slot 3 with distinctive data.
+        let (_, mut req1) = make_create_req(140, 5);
+        req1.locktime = 111;
+        let key1 = req1.tx_key();
+        engine.create(&req1).unwrap();
+        let mut sd1 = [0u8; 36];
+        sd1[0] = 0xD1;
+        engine
+            .spend(&SpendRequest {
+                tx_key: key1,
+                offset: 3,
+                utxo_hash: req1.utxo_hashes[3],
+                spending_data: sd1,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        let off1 = engine.lookup_cached(&key1).unwrap().record_offset;
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key1,
+                due_guard: None,
+            })
+            .unwrap();
+
+        // key2: only 2 slots — must reuse the freed offset for this test to
+        // exercise the aliasing condition.
+        let (_, mut req2) = make_create_req(141, 2);
+        req2.locktime = 222;
+        let key2 = req2.tx_key();
+        engine.create(&req2).unwrap();
+        let off2 = engine.lookup_cached(&key2).unwrap().record_offset;
+        assert_eq!(
+            off1, off2,
+            "test requires the allocator to reuse the freed offset"
+        );
+
+        // Slot 3 existed only in key1. Under key2 it is out of range; it must
+        // not surface key1's lingering spent slot.
+        match engine.get_spend(&GetSpendRequest {
+            tx_key: key2,
+            offset: 3,
+            utxo_hash: req1.utxo_hashes[3],
+        }) {
+            Err(SpendError::UtxoNotFound { offset: 3 }) => {}
+            other => panic!("expected UtxoNotFound for reused-shrunk offset, got {other:?}"),
+        }
+
+        // key1 is gone: any lookup is TxNotFound, never key2's data.
+        match engine.get_spend(&GetSpendRequest {
+            tx_key: key1,
+            offset: 0,
+            utxo_hash: req1.utxo_hashes[0],
+        }) {
+            Err(SpendError::TxNotFound) => {}
+            other => panic!("expected TxNotFound for deleted key1, got {other:?}"),
+        }
+
+        // key2's own slot reads correctly, with key2's locktime.
+        let resp = engine
+            .get_spend(&GetSpendRequest {
+                tx_key: key2,
+                offset: 0,
+                utxo_hash: req2.utxo_hashes[0],
+            })
+            .unwrap();
+        assert_eq!(resp.status, UTXO_UNSPENT);
+        assert_eq!(resp.locktime, 222);
     }
 
     #[test]

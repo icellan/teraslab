@@ -14,7 +14,8 @@
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::locks::StripedRwLocks;
 use crate::record::{
-    BLOCK_ENTRY_SIZE, BlockEntry, CRC32_OFFSET, METADATA_SIZE, TxMetadata, UTXO_SLOT_SIZE, UtxoSlot,
+    BLOCK_ENTRY_SIZE, BlockEntry, CRC32_OFFSET, IDENTITY_READ_LEN, METADATA_SIZE, TxIdentity,
+    TxMetadata, UTXO_SLOT_SIZE, UtxoSlot,
 };
 
 /// Result type for I/O helper operations.
@@ -244,24 +245,27 @@ unsafe fn atomic_store_from(dst: *mut u8, src: &[u8]) {
 // TxMetadata byte-offset constants (repr(C, packed), 256 bytes)
 // ===========================================================================
 
+// NOTE: these offsets all shifted +4 when the immutable `identity_crc` slot
+// was inserted after `locktime` (offset 56). The `offset_of!` asserts below
+// are the source of truth — if a field moves, the compile fails here.
 /// Byte offset of `flags` (u8) within TxMetadata.
-pub const META_OFF_FLAGS: usize = 80;
+pub const META_OFF_FLAGS: usize = 84;
 /// Byte offset of `spent_utxos` (u32 LE) within TxMetadata.
-pub const META_OFF_SPENT_UTXOS: usize = 93;
+pub const META_OFF_SPENT_UTXOS: usize = 97;
 /// Byte offset of `generation` (u32 LE) within TxMetadata.
-pub const META_OFF_GENERATION: usize = 101;
+pub const META_OFF_GENERATION: usize = 105;
 /// Byte offset of `updated_at` (u64 LE) within TxMetadata.
-pub const META_OFF_UPDATED_AT: usize = 105;
+pub const META_OFF_UPDATED_AT: usize = 109;
 /// Byte offset of `block_entry_count` (u8) within TxMetadata.
-pub const META_OFF_BLOCK_ENTRY_COUNT: usize = 113;
+pub const META_OFF_BLOCK_ENTRY_COUNT: usize = 117;
 /// Byte offset of `block_entries_inline` ([BlockEntry; 3]) within TxMetadata.
-pub const META_OFF_BLOCK_ENTRIES: usize = 114;
+pub const META_OFF_BLOCK_ENTRIES: usize = 118;
 /// Byte offset of `unmined_since` (u32 LE) within TxMetadata.
-pub const META_OFF_UNMINED_SINCE: usize = 167;
+pub const META_OFF_UNMINED_SINCE: usize = 171;
 /// Byte offset of `delete_at_height` (u32 LE) within TxMetadata.
-pub const META_OFF_DELETE_AT_HEIGHT: usize = 171;
+pub const META_OFF_DELETE_AT_HEIGHT: usize = 175;
 /// Byte offset of `preserve_until` (u32 LE) within TxMetadata.
-pub const META_OFF_PRESERVE_UNTIL: usize = 175;
+pub const META_OFF_PRESERVE_UNTIL: usize = 179;
 
 // Compile-time verification of offsets against the actual struct layout.
 const _: () = assert!(std::mem::offset_of!(TxMetadata, flags) == META_OFF_FLAGS);
@@ -781,6 +785,57 @@ pub unsafe fn read_metadata_direct(base_ptr: *const u8, record_offset: u64) -> R
     }
 }
 
+/// Read and validate just the immutable identity prefix of a record from a
+/// memory-mapped device region.
+///
+/// This copies only the first [`IDENTITY_READ_LEN`] bytes (one cache line)
+/// of the header and validates them against [`TxMetadata::identity_crc`],
+/// returning [`TxIdentity`] (`tx_id`, `utxo_count`, `locktime`). It is the
+/// hot-path counterpart to [`read_metadata_direct`] for `get_spend`, which
+/// needs only those three fields and pays for one cache-line fetch instead
+/// of five.
+///
+/// # Safety
+///
+/// `base_ptr` must be valid for at least `record_offset + IDENTITY_READ_LEN`
+/// bytes (always true: every record is at least `METADATA_SIZE` bytes).
+///
+/// # Concurrency contract (F-X-007 / BC-02)
+///
+/// Acquires the process-wide `StripedRwLocks` read guard keyed by
+/// `record_offset`, exactly like [`read_metadata_direct`] — the identity
+/// bytes are written by the bulk `write_metadata_direct` path via atomic
+/// chunked stores, so the read must go through `atomic_load_into` under the
+/// guard to avoid a torn read. The identity fields are immutable after
+/// create, so a concurrent full rewrite restamps identical values; the
+/// guard + CRC still guarantee a non-torn, valid-or-rejected result.
+#[inline]
+pub unsafe fn read_identity_direct(base_ptr: *const u8, record_offset: u64) -> Result<TxIdentity> {
+    let _r = io_locks().read(record_offset);
+    unsafe {
+        let src = base_ptr.add(off_to_usize(record_offset));
+        let mut buf = [0u8; IDENTITY_READ_LEN];
+        atomic_load_into(src, &mut buf);
+        Ok(TxMetadata::read_identity_from(&buf)?)
+    }
+}
+
+/// Block-device fallback for [`read_identity_direct`].
+///
+/// Reads the leading [`IDENTITY_READ_LEN`] bytes of the record (rounded up to
+/// device alignment) and validates the identity prefix.
+pub fn read_identity(device: &dyn BlockDevice, record_offset: u64) -> Result<TxIdentity> {
+    let align = device.alignment();
+    let aligned_base = record_offset / align as u64 * align as u64;
+    let intra_offset = (record_offset - aligned_base) as usize;
+    let total_read = align_up(intra_offset + IDENTITY_READ_LEN, align);
+    let mut read_buf = AlignedBuf::new(total_read, align);
+    device.pread_exact_at(&mut read_buf, aligned_base)?;
+    Ok(TxMetadata::read_identity_from(
+        &read_buf[intra_offset..intra_offset + IDENTITY_READ_LEN],
+    )?)
+}
+
 /// Write [`TxMetadata`] directly to a memory-mapped device region.
 ///
 /// Zero-copy serialization: writes the metadata bytes directly to the
@@ -1198,6 +1253,28 @@ mod tests {
         assert_eq!(read_meta, meta);
         assert_eq!({ read_meta.utxo_count }, 10);
         assert_eq!({ read_meta.fee }, 5000);
+    }
+
+    #[test]
+    fn read_identity_block_and_direct_agree() {
+        // The identity prefix must round-trip through BOTH the block-device
+        // fallback (`read_identity`) and the mmap fast path
+        // (`read_identity_direct`), at a non-zero (aligned) record offset.
+        let dev = test_device();
+        let off = 4096u64;
+        create_test_record(&*dev, off, 10);
+
+        let id_block = read_identity(&*dev, off).expect("block-path identity");
+        assert_eq!(id_block.utxo_count, 10);
+        assert_eq!(id_block.locktime, 700_000);
+        assert_eq!(id_block.tx_id[0], 0xAA);
+        assert_eq!(id_block.tx_id[31], 0xBB);
+
+        let base = dev.as_raw_ptr().expect("memory device exposes raw_ptr");
+        // SAFETY: `base` is the live device base; `off` is an aligned,
+        // in-bounds record offset written above.
+        let id_direct = unsafe { read_identity_direct(base, off) }.expect("direct-path identity");
+        assert_eq!(id_block, id_direct);
     }
 
     #[test]
