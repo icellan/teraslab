@@ -905,7 +905,18 @@ impl SwimRunner {
                         // higher-incarnation `dominated` path in
                         // `Membership::mark_alive`.
                         if (state == 1 || state == 2) && inc >= self.incarnation {
-                            self.incarnation = inc + 1;
+                            // SECURITY: `inc` is attacker-controlled (a
+                            // piggybacked self-Suspect/Dead update, unauthenticated
+                            // when `cluster_secret` is unset). `inc + 1` at
+                            // `inc == u64::MAX` would panic the SWIM thread in
+                            // debug (it has no catch_unwind → node stops gossiping
+                            // → declared Dead = membership DoS) and wrap to 0 in
+                            // release (refutation permanently wedged — the node
+                            // can no longer out-incarnate a Suspect/Dead claim).
+                            // Saturate: at the u64 ceiling refutation is already
+                            // impossible, so staying at MAX (rather than wrapping)
+                            // is the safe, non-regressing behaviour.
+                            self.incarnation = inc.saturating_add(1);
                             tracing::debug!(
                                 self_id = self.config.self_id.0,
                                 refuted_incarnation = inc,
@@ -2001,6 +2012,38 @@ mod tests {
             parse_first_entry_incarnation(&updates),
             start_inc + 1,
             "refutation must ride the next gossip as Alive(self, bumped incarnation)",
+        );
+    }
+
+    /// SECURITY: a crafted self-Suspect gossip at `incarnation = u64::MAX` must
+    /// NOT panic (debug overflow on `inc + 1` → SWIM thread death → membership
+    /// DoS) and must NOT wrap to 0 (release → refutation permanently wedged). It
+    /// saturates at u64::MAX.
+    #[test]
+    fn self_suspect_gossip_at_incarnation_ceiling_saturates_no_panic() {
+        let self_addr: SocketAddr = "127.0.0.1:7140".parse().unwrap();
+        let mut node = test_runner_id(NodeId(1), self_addr, self_addr);
+
+        let peer_addr: SocketAddr = "10.0.0.2:5140".parse().unwrap();
+        let mut peer = test_runner_id(NodeId(2), peer_addr, "10.0.0.2:9040".parse().unwrap());
+        let msg = encode_gossip_about(
+            &mut peer,
+            NodeId(1),
+            1, // Suspect
+            u64::MAX,
+            &self_addr.to_string(),
+            &self_addr.to_string(),
+        );
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Pre-fix: this panics in debug (inc + 1 overflow). Post-fix: clean.
+        let _ = node.handle_message(&msg, peer_addr, &socket);
+
+        let inc = node.test_incarnation();
+        assert_eq!(
+            inc,
+            u64::MAX,
+            "self-suspicion at u64::MAX must saturate (not wrap to 0, not panic)",
         );
     }
 
