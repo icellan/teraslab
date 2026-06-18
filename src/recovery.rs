@@ -2294,7 +2294,19 @@ fn replay_create(
     }
 }
 
-fn write_zeroed_metadata_header(device: &dyn BlockDevice, record_offset: u64) -> ReplayResult {
+/// Tombstone a record's metadata header during redo replay of a delete.
+///
+/// Writes the same length-bearing [`DeletedRecordMarker`] the live delete path
+/// writes (carrying `record_size`) into the first bytes of the header and
+/// zeroes the rest of the `METADATA_SIZE` window. This keeps a replayed delete
+/// indistinguishable on disk from a live-path delete, so a device-scan rebuild
+/// after a second crash mid-replay still skips the WHOLE deleted record rather
+/// than boot-looping on a multi-block body.
+fn write_zeroed_metadata_header(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+    record_size: u64,
+) -> ReplayResult {
     let align = device.alignment();
     let aligned_base = record_offset / align as u64 * align as u64;
     let intra_offset = (record_offset - aligned_base) as usize;
@@ -2306,7 +2318,9 @@ fn write_zeroed_metadata_header(device: &dyn BlockDevice, record_offset: u64) ->
     {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
-    buf[intra_offset..intra_offset + METADATA_SIZE].fill(0);
+    let mut header = [0u8; METADATA_SIZE];
+    DeletedRecordMarker::new(record_size).to_bytes(&mut header);
+    buf[intra_offset..intra_offset + METADATA_SIZE].copy_from_slice(&header);
     if device.pwrite_all_at(&buf, aligned_base).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
@@ -2325,7 +2339,7 @@ fn replay_delete(
 ) -> ReplayResult {
     let mut applied = false;
     if record_offset != 0 && record_size != 0 {
-        match write_zeroed_metadata_header(device, record_offset) {
+        match write_zeroed_metadata_header(device, record_offset, record_size) {
             ReplayResult::Applied => applied = true,
             ReplayResult::Skipped => {}
             failed @ ReplayResult::Failed(_) => return failed,

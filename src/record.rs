@@ -797,6 +797,153 @@ const _: () = assert!(std::mem::size_of::<TxMetadata>() == METADATA_SIZE);
 const _: () = assert!(CRC32_OFFSET + 4 <= METADATA_SIZE);
 
 // ---------------------------------------------------------------------------
+// DeletedRecordMarker
+// ---------------------------------------------------------------------------
+
+/// Magic number identifying a deleted-record tombstone marker ("DELD" in
+/// ASCII). Distinct from [`METADATA_MAGIC`] ("SLAB") so a device scan can
+/// tell a deleted record apart from a live one, and non-zero so it is also
+/// distinct from the legacy all-zero deleted-header convention.
+pub const DELETED_RECORD_MAGIC: u32 = 0x444C_4544;
+
+/// Length-bearing on-device marker written in place of a record's metadata
+/// header when the record is deleted (`Engine::delete`).
+///
+/// # Why this exists
+///
+/// The delete path zeroes the record's metadata header as a crash-recovery
+/// skip-guard, but leaves the record body (UTXO slots / cold data) intact.
+/// A device-scan index rebuild that runs after a delete-then-crash (before
+/// the next allocator checkpoint frees the region in the persisted freelist)
+/// must skip the *whole* deleted record. With a bare all-zero header it can
+/// only advance one alignment block — for any record larger than one block
+/// the next read lands on the deleted record's still-non-zero body, fails
+/// the magic/CRC check, and aborts the rebuild → boot loop.
+///
+/// This marker is written into the first [`METADATA_SIZE`] bytes of the
+/// record (the rest of the header window is zeroed, so old transaction bytes
+/// do not remain readable). It carries the freed `record_size`, letting the
+/// rebuild skip `align_up(record_size)` — exactly as it does for a live
+/// record — instead of a single block.
+///
+/// It is CRC-protected so a torn write of the marker cannot be mistaken for a
+/// valid skip instruction (a torn marker fails the CRC check and is rejected
+/// as corruption, never silently advancing the scan by a garbage length).
+///
+/// Crash-safety: the marker is written and fsynced in the *same* delete
+/// fsync that the old zeroing used — it adds no extra device writes.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct DeletedRecordMarker {
+    /// Magic number — must be [`DELETED_RECORD_MAGIC`]. Sits at byte offset 0,
+    /// the same position as [`TxMetadata::magic`], so a scan can read four
+    /// bytes at the record start and classify the header in one read.
+    pub magic: u32,
+    /// Total size in bytes of the deleted record (metadata + slots + cold
+    /// data), i.e. the value of [`TxMetadata::record_size`] at delete time.
+    /// The rebuild advances `align_up(record_size)` past this marker.
+    pub record_size: u64,
+    /// CRC32 over these marker bytes with the `crc32` slot zeroed. Guards
+    /// against a torn write being read back as a valid length-skip.
+    pub crc32: u32,
+}
+
+/// Number of leading bytes of a record header occupied by a serialized
+/// [`DeletedRecordMarker`]. The remaining header bytes up to [`METADATA_SIZE`]
+/// are zeroed on delete.
+pub const DELETED_RECORD_MARKER_SIZE: usize = std::mem::size_of::<DeletedRecordMarker>();
+
+/// Byte offset of the CRC32 field within a serialized [`DeletedRecordMarker`].
+pub const DELETED_RECORD_MARKER_CRC_OFFSET: usize =
+    std::mem::offset_of!(DeletedRecordMarker, crc32);
+
+impl DeletedRecordMarker {
+    /// Construct a marker for a deleted record of `record_size` bytes.
+    pub fn new(record_size: u64) -> Self {
+        Self {
+            magic: DELETED_RECORD_MAGIC,
+            record_size,
+            crc32: 0,
+        }
+    }
+
+    /// Serialize the marker into the first [`DELETED_RECORD_MARKER_SIZE`]
+    /// bytes of `dst`, stamping the CRC32 over the marker bytes (with the CRC
+    /// slot zeroed during computation). `dst` must be at least
+    /// [`DELETED_RECORD_MARKER_SIZE`] bytes.
+    pub fn to_bytes(&self, dst: &mut [u8]) {
+        debug_assert!(dst.len() >= DELETED_RECORD_MARKER_SIZE);
+        // Safety: DeletedRecordMarker is repr(C, packed); transmute to bytes.
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                (self as *const Self).cast::<u8>(),
+                DELETED_RECORD_MARKER_SIZE,
+            )
+        };
+        dst[..DELETED_RECORD_MARKER_SIZE].copy_from_slice(src);
+        let crc_off = DELETED_RECORD_MARKER_CRC_OFFSET;
+        dst[crc_off..crc_off + 4].copy_from_slice(&[0u8; 4]);
+        let crc = crc32fast::hash(&dst[..DELETED_RECORD_MARKER_SIZE]);
+        dst[crc_off..crc_off + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    /// Parse a deleted-record marker from the start of `src`, returning it
+    /// only if the magic matches [`DELETED_RECORD_MAGIC`] AND the CRC32
+    /// validates.
+    ///
+    /// Returns `None` when the bytes are not a (valid) marker — i.e. a live
+    /// record header, an all-zero legacy/reservation header, or a torn marker
+    /// write. `None` deliberately does NOT distinguish these: the caller has
+    /// already separated the all-zero and live-magic cases, so any remaining
+    /// `None` from a non-zero, non-live header is genuine corruption.
+    pub fn try_parse(src: &[u8]) -> Option<Self> {
+        if src.len() < DELETED_RECORD_MARKER_SIZE {
+            return None;
+        }
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&src[0..4]);
+        if u32::from_le_bytes(magic) != DELETED_RECORD_MAGIC {
+            return None;
+        }
+        let crc_off = DELETED_RECORD_MARKER_CRC_OFFSET;
+        let mut expected = [0u8; 4];
+        expected.copy_from_slice(&src[crc_off..crc_off + 4]);
+        let expected = u32::from_le_bytes(expected);
+
+        let mut buf = [0u8; DELETED_RECORD_MARKER_SIZE];
+        buf.copy_from_slice(&src[..DELETED_RECORD_MARKER_SIZE]);
+        buf[crc_off..crc_off + 4].copy_from_slice(&[0u8; 4]);
+        let actual = crc32fast::hash(&buf);
+        if actual != expected {
+            return None;
+        }
+
+        let mut marker = std::mem::MaybeUninit::<Self>::uninit();
+        // Safety: DeletedRecordMarker is repr(C, packed) and Copy; copy
+        // exactly DELETED_RECORD_MARKER_SIZE bytes in.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                marker.as_mut_ptr().cast::<u8>(),
+                DELETED_RECORD_MARKER_SIZE,
+            );
+            Some(marker.assume_init())
+        }
+    }
+}
+
+// The marker must fit inside the header window it overwrites, and its magic
+// must share byte offset 0 with `TxMetadata::magic` so a scan can classify a
+// header by reading four bytes at the record start.
+const _: () = assert!(DELETED_RECORD_MARKER_SIZE <= METADATA_SIZE);
+const _: () = assert!(std::mem::offset_of!(DeletedRecordMarker, magic) == 0);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, magic) == 0);
+const _: () = assert!(DELETED_RECORD_MARKER_CRC_OFFSET + 4 <= DELETED_RECORD_MARKER_SIZE);
+// Distinct from the live-record magic so the two never collide.
+const _: () = assert!(DELETED_RECORD_MAGIC != METADATA_MAGIC);
+const _: () = assert!(DELETED_RECORD_MAGIC != 0);
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -882,6 +1029,57 @@ mod tests {
         assert_eq!(UTXO_SLOT_CRC32_OFFSET, 69);
         assert_eq!(UTXO_SLOT_SIZE, 73);
     }
+
+    #[test]
+    fn deleted_marker_roundtrip() {
+        let record_size = TxMetadata::record_size_for(80);
+        let mut buf = [0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(record_size).to_bytes(&mut buf);
+
+        let parsed = DeletedRecordMarker::try_parse(&buf).expect("must parse");
+        let parsed_size = { parsed.record_size };
+        let parsed_magic = { parsed.magic };
+        assert_eq!(parsed_size, record_size);
+        assert_eq!(parsed_magic, DELETED_RECORD_MAGIC);
+    }
+
+    #[test]
+    fn deleted_marker_magic_distinct_from_live() {
+        // A live record header must NOT be parsed as a deleted marker.
+        let meta = TxMetadata::new(5);
+        let mut buf = [0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+        assert!(
+            DeletedRecordMarker::try_parse(&buf).is_none(),
+            "live header must not parse as a deleted marker"
+        );
+        assert_ne!(DELETED_RECORD_MAGIC, METADATA_MAGIC);
+    }
+
+    #[test]
+    fn deleted_marker_rejects_torn_write() {
+        let mut buf = [0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(4096).to_bytes(&mut buf);
+        // Flip a byte inside the marker payload (not the magic): CRC must
+        // reject it so a torn write is never read back as a valid skip.
+        buf[4] ^= 0xFF;
+        assert!(
+            DeletedRecordMarker::try_parse(&buf).is_none(),
+            "torn marker must fail CRC and parse as None"
+        );
+    }
+
+    #[test]
+    fn deleted_marker_rejects_all_zero() {
+        // An all-zero header (legacy delete / reservation) is NOT a marker.
+        let buf = [0u8; METADATA_SIZE];
+        assert!(DeletedRecordMarker::try_parse(&buf).is_none());
+    }
+
+    // NOTE: the marker-fits-header and magic-at-offset-0 invariants are
+    // enforced at COMPILE time by `const _: () = assert!(...)` next to the
+    // `DeletedRecordMarker` definition, so there is no runtime test for them
+    // (a runtime assert over two consts is vacuous and clippy-rejected).
 
     #[test]
     fn block_entry_size() {

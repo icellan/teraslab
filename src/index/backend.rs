@@ -561,16 +561,19 @@ impl PrimaryBackend {
             let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
 
-            // Skip fully-zeroed metadata headers: a deleted-record tombstone
-            // or a never-written reservation, NOT corruption. See the matching
-            // comment in `crate::index::mod`'s in-memory rebuild — a crash
-            // after a delete but before the next allocator-header checkpoint
-            // leaves a zeroed region in the recovered high-water range whose
-            // `FreeRegion` redo entry has not yet been replayed; aborting here
-            // would boot-loop the node. A torn/garbage (non-zero) header is
-            // still rejected below.
-            if buf[..crate::record::METADATA_SIZE].iter().all(|&b| b == 0) {
-                offset += align as u64;
+            // A deleted-record tombstone or never-written reservation, NOT
+            // corruption. `classify_scan_header` skips the WHOLE record for a
+            // length-bearing deleted marker (multi-block boot-loop fix) and
+            // one block for a legacy all-zero header, bounded by `end`. A live
+            // record yields `None`. See the matching comment in
+            // `crate::index::mod`'s in-memory rebuild.
+            if let Some(next) = crate::index::classify_scan_header(
+                &buf[..crate::record::METADATA_SIZE],
+                offset,
+                align as u64,
+                end,
+            )? {
+                offset = next;
                 continue;
             }
 
@@ -678,16 +681,19 @@ impl PrimaryBackend {
             let mut buf = crate::device::AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
 
-            // Skip fully-zeroed metadata headers: a deleted-record tombstone
-            // or a never-written reservation, NOT corruption. See the matching
-            // comment in `crate::index::mod`'s in-memory rebuild — a crash
-            // after a delete but before the next allocator-header checkpoint
-            // leaves a zeroed region in the recovered high-water range whose
-            // `FreeRegion` redo entry has not yet been replayed; aborting here
-            // would boot-loop the node. A torn/garbage (non-zero) header is
-            // still rejected below.
-            if buf[..crate::record::METADATA_SIZE].iter().all(|&b| b == 0) {
-                offset += align as u64;
+            // A deleted-record tombstone or never-written reservation, NOT
+            // corruption. `classify_scan_header` skips the WHOLE record for a
+            // length-bearing deleted marker (multi-block boot-loop fix) and
+            // one block for a legacy all-zero header, bounded by `end`. A live
+            // record yields `None`. See the matching comment in
+            // `crate::index::mod`'s in-memory rebuild.
+            if let Some(next) = crate::index::classify_scan_header(
+                &buf[..crate::record::METADATA_SIZE],
+                offset,
+                align as u64,
+                end,
+            )? {
+                offset = next;
                 continue;
             }
 

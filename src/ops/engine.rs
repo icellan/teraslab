@@ -1439,23 +1439,49 @@ impl Engine {
         }
     }
 
+    /// Tombstone a deleted record's metadata header with a length-bearing
+    /// deleted marker.
+    ///
+    /// The first [`DELETED_RECORD_MARKER_SIZE`] bytes of the header become a
+    /// CRC-protected [`DeletedRecordMarker`] carrying `record_size`; the rest
+    /// of the `METADATA_SIZE`-byte header window is zeroed so the old
+    /// transaction's metadata does not remain readable in freed space.
+    ///
+    /// A device-scan index rebuild that runs after a delete-then-crash (before
+    /// the next allocator checkpoint frees the region in the persisted
+    /// freelist) reads this marker and skips the *whole* deleted record —
+    /// `align_up(record_size)` — instead of a single alignment block. Without
+    /// the length, a multi-block deleted record would leave the scan landing
+    /// on its still-non-zero body, failing the magic/CRC check and aborting
+    /// the rebuild (boot loop).
+    ///
+    /// `record_size` is the record's [`TxMetadata::record_size`] read under
+    /// the same stripe lock the caller already holds. The marker is published
+    /// in the same fsync the caller issues after this returns, so it adds no
+    /// extra device writes versus the old bare-zeroing.
     fn write_zeroed_metadata_header(
         &self,
         record_offset: u64,
+        record_size: u64,
     ) -> std::result::Result<(), SpendError> {
+        // Build the header image: marker prefix + zeroed remainder.
+        let mut header = [0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(record_size).to_bytes(&mut header);
+
         if !self.device_ptr.is_null() {
             // SAFETY: `device_ptr` is non-null (checked above) and points to
             // this engine's owned device region; `record_offset` is an
             // allocator-aligned, in-bounds record offset, so
             // `device_ptr.add(record_offset)` is in-bounds and writing
-            // `METADATA_SIZE` zero bytes from it stays within the record. The
-            // caller holds the record's stripe lock for this tombstone write
-            // (delete path), and the following `Release` fence publishes the
-            // zeroing to other threads.
+            // `METADATA_SIZE` bytes from it stays within the record (the
+            // record is at least `METADATA_SIZE` bytes). The caller holds the
+            // record's stripe lock for this tombstone write (delete path),
+            // and the following `Release` fence publishes the marker to other
+            // threads.
             unsafe {
-                std::ptr::write_bytes(
+                std::ptr::copy_nonoverlapping(
+                    header.as_ptr(),
                     self.device_ptr.add(record_offset as usize),
-                    0,
                     METADATA_SIZE,
                 );
             }
@@ -1475,7 +1501,7 @@ impl Engine {
                         detail: format!("{e}"),
                     })?;
             }
-            buf[intra_offset..intra_offset + METADATA_SIZE].fill(0);
+            buf[intra_offset..intra_offset + METADATA_SIZE].copy_from_slice(&header);
             self.device
                 .pwrite_all_at(&buf, aligned_base)
                 .map_err(|e| SpendError::StorageError {
@@ -5453,10 +5479,12 @@ impl Engine {
 
         // Step 2: Tombstone the metadata before freeing the region so crash-time
         // index rebuilds cannot resurrect this record from stale bytes in freed
-        // space. Zero the full header, not just magic/record_size: freed
-        // regions can be reallocated later, and old tx metadata must not
-        // remain readable.
-        self.write_zeroed_metadata_header(entry.record_offset)?;
+        // space. The marker overwrites the full header (zeroing all but its own
+        // prefix), so freed regions can be reallocated later without old tx
+        // metadata remaining readable. It also carries `record_size` so a
+        // post-crash device-scan rebuild skips the WHOLE deleted record, not
+        // just its first alignment block (multi-block boot-loop fix).
+        self.write_zeroed_metadata_header(entry.record_offset, record_size)?;
         // Step 3: Sync so the zeroed header is durable before any reuse.
         self.device.sync().map_err(|e| SpendError::StorageError {
             detail: format!("delete tombstone sync failed: {e}"),
@@ -14298,9 +14326,32 @@ mod tests {
             .device
             .pread_exact_at(&mut buf, created.record_offset)
             .unwrap();
+
+        // The header now holds a length-bearing deleted marker (multi-block
+        // boot-loop fix): the marker carries the freed record_size so a
+        // post-crash device scan skips the WHOLE record. The live magic must
+        // be gone (no resurrection), and the rest of the header window past
+        // the marker must be zeroed so the old tx metadata is not readable in
+        // freed space.
+        let marker =
+            DeletedRecordMarker::try_parse(&buf[..METADATA_SIZE]).expect("marker must be present");
+        let marker_size = { marker.record_size };
+        assert_eq!(
+            marker_size,
+            TxMetadata::record_size_for(5),
+            "marker must carry the freed record_size"
+        );
         assert!(
-            buf[..METADATA_SIZE].iter().all(|b| *b == 0),
-            "delete tombstone must zero the full metadata header"
+            TxMetadata::from_bytes(&buf[..METADATA_SIZE]).is_err() || {
+                TxMetadata::from_bytes(&buf[..METADATA_SIZE]).unwrap().magic
+            } != METADATA_MAGIC,
+            "deleted header must not read back as a live record"
+        );
+        assert!(
+            buf[DELETED_RECORD_MARKER_SIZE..METADATA_SIZE]
+                .iter()
+                .all(|b| *b == 0),
+            "header bytes past the marker must be zeroed (no stale tx metadata)"
         );
     }
 

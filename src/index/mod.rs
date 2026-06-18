@@ -25,7 +25,7 @@ pub use unmined_index::{UnminedIndex, UnminedRedoEntry};
 
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::record::{METADATA_MAGIC, METADATA_SIZE, TxMetadata};
+use crate::record::{DeletedRecordMarker, METADATA_MAGIC, METADATA_SIZE, TxMetadata};
 use hashtable::HashTable;
 use thiserror::Error;
 
@@ -131,6 +131,74 @@ pub struct RestoreFlags {
 pub struct Index {
     table: HashTable,
     resize_threshold: f64,
+}
+
+/// Classify a record header read during a device-scan rebuild and, for a
+/// non-live header, return how far the scan should advance from `offset`.
+///
+/// Shared by every device-scan rebuild path (primary in-memory / on-disk /
+/// file-backed, and the secondary-index scan) so the deleted-record handling
+/// stays identical everywhere.
+///
+/// Returns:
+/// - `Ok(Some(next_offset))` — the header is NOT a live record, so the scan
+///   jumps to `next_offset`. Two cases: a length-bearing
+///   [`DeletedRecordMarker`] (CRC-valid) skips the whole deleted record
+///   (`offset + align_up(record_size)`); a legacy all-zero deleted/reservation
+///   header skips one alignment block (`offset + align`, back-compat with
+///   records deleted by code that pre-dates the marker). The returned offset
+///   is clamped so it always makes forward progress and never exceeds `end`
+///   (the allocator high-water mark), keeping the scan bounded.
+/// - `Ok(None)` — the header is (or claims to be) a live record; the caller
+///   parses it with [`TxMetadata::from_bytes`] and validates magic/CRC.
+/// - `Err(IndexError::FormatError)` — a deleted marker whose declared
+///   `record_size` is zero or would run past `end`: genuine corruption, fail
+///   the rebuild rather than advance by a garbage length.
+///
+/// `buf` must hold at least `METADATA_SIZE` bytes. `align` is the device
+/// alignment and `end` the exclusive high-water mark.
+pub(crate) fn classify_scan_header(
+    buf: &[u8],
+    offset: u64,
+    align: u64,
+    end: u64,
+) -> Result<Option<u64>> {
+    // Legacy all-zero header: a record deleted by pre-marker code, or a
+    // never-written reservation. Advance one alignment block; the subsequent
+    // redo replay re-applies the free. (For a multi-block legacy-deleted
+    // record the body is still intact, but that is the pre-existing behavior
+    // we preserve for back-compat — the new marker is what fixes it going
+    // forward.)
+    if buf[..METADATA_SIZE].iter().all(|&b| b == 0) {
+        return Ok(Some(offset + align));
+    }
+
+    // Length-bearing deleted marker (CRC-validated): skip the whole record.
+    if let Some(marker) = DeletedRecordMarker::try_parse(buf) {
+        let record_size = { marker.record_size };
+        if record_size == 0 {
+            return Err(IndexError::FormatError {
+                detail: format!(
+                    "deleted marker with zero record_size at allocated offset {offset}"
+                ),
+            });
+        }
+        let record_aligned = record_size.div_ceil(align) * align;
+        let next = offset.saturating_add(record_aligned);
+        if next > end {
+            return Err(IndexError::FormatError {
+                detail: format!(
+                    "deleted marker at allocated offset {offset} declares \
+                     record_size {record_size} extending past allocator high-water mark"
+                ),
+            });
+        }
+        // Guard against a degenerate marker that fails to make progress.
+        return Ok(Some(next.max(offset + align)));
+    }
+
+    // Live record (or genuine corruption) — caller validates magic/CRC.
+    Ok(None)
 }
 
 impl Index {
@@ -453,21 +521,21 @@ impl Index {
             let mut buf = AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
 
-            // A fully-zeroed metadata header is a deleted-record tombstone
-            // (`Engine::delete` zeroes `METADATA_SIZE` bytes and syncs) or a
-            // never-written reservation — NOT corruption. `delete` frees the
-            // region and journals a `FreeRegion` redo entry, but the persisted
-            // allocator header is only refreshed at the next checkpoint, so a
-            // crash after a delete but before that checkpoint leaves a zeroed
+            // A deleted-record tombstone (`Engine::delete`) or a never-written
+            // reservation is NOT corruption. `delete` frees the region and
+            // journals a `FreeRegion` redo entry, but the persisted allocator
+            // header is only refreshed at the next checkpoint, so a crash
+            // after a delete but before that checkpoint leaves a tombstoned
             // region inside the recovered high-water range with no freelist
             // entry to skip it (the `FreeRegion` replay runs AFTER this device
-            // scan). Treating it as corruption would abort startup
-            // (boot-loop) for a benign, WAL-covered state. Skip it: advance
-            // one alignment block; the subsequent redo replay re-applies the
-            // free. A genuinely torn/garbage header (non-zero, CRC-failing) is
-            // still rejected below.
-            if buf[..METADATA_SIZE].iter().all(|&b| b == 0) {
-                offset += align as u64;
+            // scan). `classify_scan_header` recognizes both the length-bearing
+            // deleted marker (skip the WHOLE record — the multi-block
+            // boot-loop fix) and the legacy all-zero header (skip one block),
+            // and bounds the advance by `end`. A live record yields `None`.
+            if let Some(next) =
+                classify_scan_header(&buf[..METADATA_SIZE], offset, align as u64, end)?
+            {
+                offset = next;
                 continue;
             }
 
@@ -564,21 +632,15 @@ impl Index {
             let mut buf = AlignedBuf::new(aligned_read, align);
             device.pread_exact_at(&mut buf, offset)?;
 
-            // A fully-zeroed metadata header is a deleted-record tombstone
-            // (`Engine::delete` zeroes `METADATA_SIZE` bytes and syncs) or a
-            // never-written reservation — NOT corruption. `delete` frees the
-            // region and journals a `FreeRegion` redo entry, but the persisted
-            // allocator header is only refreshed at the next checkpoint, so a
-            // crash after a delete but before that checkpoint leaves a zeroed
-            // region inside the recovered high-water range with no freelist
-            // entry to skip it (the `FreeRegion` replay runs AFTER this device
-            // scan). Treating it as corruption would abort startup
-            // (boot-loop) for a benign, WAL-covered state. Skip it: advance
-            // one alignment block; the subsequent redo replay re-applies the
-            // free. A genuinely torn/garbage header (non-zero, CRC-failing) is
-            // still rejected below.
-            if buf[..METADATA_SIZE].iter().all(|&b| b == 0) {
-                offset += align as u64;
+            // Deleted-record tombstone or never-written reservation — NOT
+            // corruption. Same classification as `Index::rebuild`: skip the
+            // whole record for a length-bearing deleted marker, one block for
+            // a legacy all-zero header, bounded by `end`. A live record
+            // yields `None`. See `classify_scan_header`.
+            if let Some(next) =
+                classify_scan_header(&buf[..METADATA_SIZE], offset, align as u64, end)?
+            {
+                offset = next;
                 continue;
             }
 
@@ -960,7 +1022,10 @@ mod tests {
     use super::*;
     use crate::device::MemoryDevice;
     use crate::io::write_full_record;
-    use crate::record::{CRC32_OFFSET, TxMetadata, UtxoSlot};
+    use crate::record::{
+        CRC32_OFFSET, DELETED_RECORD_MARKER_SIZE, DeletedRecordMarker, METADATA_MAGIC, TxMetadata,
+        UtxoSlot,
+    };
     use std::sync::Arc;
 
     /// Corrupt the first 4 bytes of an allocated record's metadata header
@@ -1678,6 +1743,281 @@ mod tests {
         let rebuilt = Index::rebuild(&*dev, &alloc).unwrap();
         assert_eq!(rebuilt.len(), 9);
         assert!(rebuilt.lookup(&records[3].0).is_none());
+    }
+
+    /// Build a device of `record_count` contiguous records, each with the
+    /// utxo count supplied by `utxo_count_for(i)`. Returns the device, an
+    /// allocator whose high-water mark covers all records, and the list of
+    /// `(key, offset, utxo_count)` in scan order.
+    ///
+    /// Records are placed by the real allocator so offsets are alignment-valid
+    /// and contiguous — exactly the layout a device scan walks.
+    fn setup_device_with_varied_records(
+        record_count: usize,
+        utxo_count_for: impl Fn(usize) -> u32,
+    ) -> (Arc<MemoryDevice>, SlotAllocator, Vec<(TxKey, u64, u32)>) {
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut records = Vec::new();
+
+        for i in 0..record_count {
+            let utxo_count = utxo_count_for(i);
+            let mut meta = TxMetadata::new(utxo_count);
+            let key = make_key(i as u64);
+            meta.tx_id = key.txid;
+
+            let record_size = TxMetadata::record_size_for(utxo_count);
+            let offset = alloc.allocate(record_size).unwrap();
+
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|s| {
+                    let mut h = [0u8; 32];
+                    h[0..4].copy_from_slice(&s.to_le_bytes());
+                    h[4] = i as u8;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+
+            write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            records.push((key, offset, utxo_count));
+        }
+
+        (dev, alloc, records)
+    }
+
+    /// Replicate `Engine::write_zeroed_metadata_header`'s on-disk bytes: a
+    /// length-bearing `DeletedRecordMarker` in the first marker bytes, the
+    /// rest of the `METADATA_SIZE` header window zeroed. Does NOT free the
+    /// region (mimics a crash after the delete fsync but before the next
+    /// allocator checkpoint, so the freed region is absent from the freelist).
+    fn tombstone_record_with_marker(dev: &dyn BlockDevice, offset: u64, record_size: u64) {
+        let align = dev.alignment();
+        // Read the first block so we only modify the header window.
+        let read_len = align.max(METADATA_SIZE).div_ceil(align) * align;
+        let mut buf = AlignedBuf::new(read_len, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+
+        let mut header = [0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(record_size).to_bytes(&mut header);
+        buf[..METADATA_SIZE].copy_from_slice(&header);
+        dev.pwrite_all_at(&buf, offset).unwrap();
+    }
+
+    /// THE headline regression test: a deleted MULTI-BLOCK record whose freed
+    /// region is NOT yet in the freelist (crash before checkpoint) must be
+    /// skipped whole by the device-scan rebuild — not boot-loop.
+    ///
+    /// Pre-fix, the all-zero header advanced exactly one alignment block, the
+    /// next read landed on the deleted record's still-non-zero second block,
+    /// the magic/CRC check failed, and `rebuild` returned `FormatError`
+    /// (boot loop). The length-bearing marker skips `align_up(record_size)`.
+    #[test]
+    fn rebuild_skips_deleted_multiblock_record_not_in_freelist() {
+        let align = 4096u64;
+        // Record index 3 has 80 UTXOs: record_size_for(80) = 320 + 80*73 =
+        // 6160 bytes > 4096, so it spans two alignment blocks.
+        let big = 3usize;
+        let big_utxos = 80u32;
+        assert!(
+            TxMetadata::record_size_for(big_utxos) > align,
+            "test record must span >1 alignment block"
+        );
+        let n = 7usize;
+        let (dev, alloc, records) =
+            setup_device_with_varied_records(n, |i| if i == big { big_utxos } else { 5 });
+
+        // Delete record 3 by writing the real marker bytes; do NOT free it.
+        let (big_key, big_offset, _) = records[big];
+        let big_size = TxMetadata::record_size_for(big_utxos);
+        tombstone_record_with_marker(&*dev, big_offset, big_size);
+        assert!(
+            alloc.free_region_containing(big_offset).is_none(),
+            "freed region must be absent from the freelist for this case to bite"
+        );
+
+        let rebuilt = Index::rebuild(&*dev, &alloc).unwrap();
+
+        // The deleted record is gone; every other record is present + correct.
+        assert_eq!(rebuilt.len(), n - 1, "exactly one record removed");
+        assert!(
+            rebuilt.lookup(&big_key).is_none(),
+            "deleted multi-block record must be absent"
+        );
+        for (i, (key, offset, utxo_count)) in records.iter().enumerate() {
+            if i == big {
+                continue;
+            }
+            let e = rebuilt
+                .lookup(key)
+                .unwrap_or_else(|| panic!("live record {i} must be indexed"));
+            assert_eq!(e.record_offset, *offset, "record {i} offset");
+            assert_eq!(e.utxo_count, *utxo_count, "record {i} utxo_count");
+        }
+    }
+
+    /// Back-compat: a record deleted by pre-marker code leaves a bare all-zero
+    /// single-block header. The rebuild must still skip it (advance one block)
+    /// and not boot-loop. (For a small record the body fits in one block, so
+    /// the legacy one-block skip is sufficient — this preserves the existing
+    /// behavior exactly.)
+    #[test]
+    fn rebuild_skips_legacy_all_zero_deleted_header() {
+        let (dev, alloc, records) = setup_device_with_records(6);
+
+        // Zero the FULL header window of record 2 (legacy delete shape) — its
+        // body (5 UTXOs) fits within one 4096-byte block, so one-block skip
+        // lands on the next live record.
+        let offset = records[2].1;
+        let align = dev.alignment();
+        let mut buf = AlignedBuf::new(align.max(METADATA_SIZE).div_ceil(align) * align, align);
+        dev.pread_exact_at(&mut buf, offset).unwrap();
+        buf[..METADATA_SIZE].fill(0);
+        dev.pwrite_all_at(&buf, offset).unwrap();
+
+        let rebuilt = Index::rebuild(&*dev, &alloc).unwrap();
+        assert_eq!(rebuilt.len(), 5);
+        assert!(rebuilt.lookup(&records[2].0).is_none());
+        // All other records still present.
+        for (i, (key, _)) in records.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            assert!(rebuilt.lookup(key).is_some(), "record {i} must survive");
+        }
+    }
+
+    /// A LIVE multi-block record must NOT be mis-skipped: the marker magic
+    /// differs from the live `METADATA_MAGIC`, so a live record is parsed and
+    /// indexed, and the scan advances by its real `record_size`.
+    #[test]
+    fn rebuild_does_not_misskip_live_multiblock_record() {
+        let big = 2usize;
+        let big_utxos = 80u32;
+        let n = 5usize;
+        let (dev, alloc, records) =
+            setup_device_with_varied_records(n, |i| if i == big { big_utxos } else { 5 });
+
+        let rebuilt = Index::rebuild(&*dev, &alloc).unwrap();
+        assert_eq!(rebuilt.len(), n, "no record skipped");
+        for (i, (key, offset, utxo_count)) in records.iter().enumerate() {
+            let e = rebuilt
+                .lookup(key)
+                .unwrap_or_else(|| panic!("record {i} must be indexed"));
+            assert_eq!(e.record_offset, *offset);
+            assert_eq!(e.utxo_count, *utxo_count);
+        }
+    }
+
+    /// Scan bounds: a deleted multi-block record at the END of the data region
+    /// must not read past the allocator high-water mark. The marker skip is
+    /// clamped to `end`, so the scan terminates cleanly.
+    #[test]
+    fn rebuild_deleted_record_at_end_stays_bounded() {
+        let big = 3usize; // last record
+        let big_utxos = 80u32;
+        let n = 4usize;
+        let (dev, alloc, records) =
+            setup_device_with_varied_records(n, |i| if i == big { big_utxos } else { 5 });
+
+        let (big_key, big_offset, _) = records[big];
+        let big_size = TxMetadata::record_size_for(big_utxos);
+        tombstone_record_with_marker(&*dev, big_offset, big_size);
+
+        let rebuilt = Index::rebuild(&*dev, &alloc).unwrap();
+        assert_eq!(rebuilt.len(), n - 1);
+        assert!(rebuilt.lookup(&big_key).is_none());
+        // Every earlier live record survived.
+        for (key, _, _) in records.iter().take(big) {
+            assert!(rebuilt.lookup(key).is_some());
+        }
+    }
+
+    /// OPTION A round-trip: `DeletedRecordMarker` write → `try_parse`
+    /// recognizes it → `classify_scan_header` returns the exact aligned skip;
+    /// the size assertion holds and the marker magic is distinct from a live
+    /// header.
+    #[test]
+    fn deleted_marker_roundtrips_and_skips_exact_size() {
+        let align = 4096u64;
+        let record_size = TxMetadata::record_size_for(80); // 6160, spans 2 blocks
+
+        let mut header = [0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(record_size).to_bytes(&mut header);
+
+        // try_parse recognizes a well-formed marker and carries record_size.
+        let parsed = DeletedRecordMarker::try_parse(&header).expect("marker must parse");
+        let parsed_size = { parsed.record_size };
+        assert_eq!(parsed_size, record_size);
+        let parsed_magic = { parsed.magic };
+        assert_ne!(
+            parsed_magic, METADATA_MAGIC,
+            "marker magic must differ from live"
+        );
+
+        // classify_scan_header returns the exact aligned skip from a base.
+        let base = 100 * align;
+        let end = base + record_size + align; // room beyond the record
+        let next = super::classify_scan_header(&header, base, align, end)
+            .expect("classify must not error")
+            .expect("deleted marker must yield a skip");
+        let expected = base + record_size.div_ceil(align) * align;
+        assert_eq!(next, expected, "must skip exactly align_up(record_size)");
+
+        // (The marker-fits-header size invariant is a compile-time
+        // `const _: () = assert!(DELETED_RECORD_MARKER_SIZE <= METADATA_SIZE)`
+        // in `record.rs` — checked by the build, not re-asserted here.)
+
+        // A torn marker (CRC corrupted) is NOT mistaken for a valid skip:
+        // classify treats it as a live/corrupt header (None), so the caller's
+        // magic/CRC gate rejects it rather than advancing by a garbage length.
+        let mut torn = header;
+        torn[DELETED_RECORD_MARKER_SIZE - 1] ^= 0xFF; // flip a CRC byte
+        let classified =
+            super::classify_scan_header(&torn, base, align, end).expect("classify must not error");
+        assert!(
+            classified.is_none(),
+            "a torn marker must not be read back as a valid length-skip"
+        );
+    }
+
+    /// A deleted marker whose declared `record_size` runs past the high-water
+    /// mark is genuine corruption: the rebuild fails rather than advancing by
+    /// a garbage length.
+    #[test]
+    fn classify_rejects_marker_past_high_water() {
+        let align = 4096u64;
+        let record_size = 10 * align;
+        let mut header = [0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(record_size).to_bytes(&mut header);
+
+        let base = 0u64;
+        let end = 2 * align; // record_size declares way past end
+        let err = super::classify_scan_header(&header, base, align, end).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("past allocator high-water mark"),
+                    "expected high-water detail, got: {detail}"
+                );
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
+    }
+
+    /// A deleted marker with a zero `record_size` is corruption (a valid
+    /// marker always carries the real record size).
+    #[test]
+    fn classify_rejects_marker_with_zero_record_size() {
+        let align = 4096u64;
+        let mut header = [0u8; METADATA_SIZE];
+        DeletedRecordMarker::new(0).to_bytes(&mut header);
+        let err = super::classify_scan_header(&header, 0, align, 100 * align).unwrap_err();
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(detail.contains("zero record_size"), "got: {detail}");
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
     }
 
     #[test]
