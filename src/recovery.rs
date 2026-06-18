@@ -365,6 +365,33 @@ pub struct TombstoneRecoveryStats {
 /// KEPT — the tombstone only authorizes dropping the version it recorded or an
 /// older one.
 ///
+/// ## Index/allocator inconsistency the R2 purge must tolerate
+///
+/// The record R2 finds "live" is one this node resurrected from its OWN durable
+/// state (redo replay + on-device record load) for a key the cluster
+/// authoritatively deleted. That resurrection can leave the primary index and
+/// the allocator's recovered free-list DISAGREEING about the record's region:
+/// the index entry points at `record_offset`, but the allocator's recovered
+/// free-list ALREADY considers `[record_offset, record_offset + record_size)`
+/// free (the deletion freed it pre-crash and that free was journaled, while the
+/// stale index entry was re-derived from an older redo/record image). The two
+/// recovered structures are rebuilt from independent durable sources, so this
+/// skew is expected, not corruption.
+///
+/// Consequently R2's removal cannot blindly free the region: the allocator's
+/// free-list is AUTHORITATIVE that the region is dead, and a second `free` of an
+/// already-free range is (correctly) rejected as a double-free. R2's actual
+/// goal is narrower — drop the stale primary-index entry so the resurrected key
+/// is gone. [`crate::ops::engine::Engine::delete_for_purge`] therefore tolerates
+/// an already-free region: it removes the index entry (durably, via the redb
+/// primary index `commit`, so the key cannot reappear on the next restart — no
+/// per-restart purge loop) and SKIPS the redundant free when the region is fully
+/// contained in an existing free region. A PARTIAL overlap (the record range
+/// extending past the free region into possibly-live space) is NOT tolerated and
+/// still surfaces as an error. This makes the already-free case a SUCCESSFUL
+/// purge (counted, no warning), because the record is gone from the index (R2's
+/// goal) and the region is correctly free.
+///
 /// ## Idempotency
 ///
 /// Re-running yields the same state: `rebuild_from` is a deterministic
@@ -2937,6 +2964,19 @@ mod tests {
             let mut ie = self.index.lookup(key).unwrap();
             ie.generation = generation;
             self.index.register(*key, ie).unwrap();
+        }
+
+        /// Free a record's region in the ALLOCATOR only, leaving the
+        /// primary-index entry and the on-device bytes in place. This stages
+        /// the exact index/allocator inconsistency recovery can produce: the
+        /// index still resurrects the key at `record_offset`, but the
+        /// allocator's free-list already considers that region dead. Returns
+        /// `(record_offset, record_size)` of the now-already-free region.
+        fn free_region_in_allocator_only(&mut self, key: &TxKey, utxo_count: u32) -> (u64, u64) {
+            let ie = self.index.lookup(key).unwrap();
+            let record_size = TxMetadata::record_size_for(utxo_count);
+            self.alloc.free(ie.record_offset, record_size).unwrap();
+            (ie.record_offset, record_size)
         }
 
         /// Write `delete_at_height` / `unmined_since` into a record's
@@ -5804,6 +5844,171 @@ mod tests {
         assert!(engine.lookup(&newer).is_some());
         assert!(engine.lookup(&kept_no_ts).is_some());
         assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn r2_purges_resurrected_key_whose_region_allocator_already_freed() {
+        // The bug: recovery resurrects a primary-index entry at an offset the
+        // allocator's recovered free-list ALREADY freed. R2's delete must NOT
+        // double-free that region; it must drop the stale index entry and count
+        // the purge as a SUCCESS (no spurious "self-purge failed" warning).
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 2;
+        let key = h.create_record(0xE1, utxo_count);
+
+        // Stage the index/allocator inconsistency: free the region in the
+        // allocator only, leaving the index entry + device bytes in place.
+        let (offset, _size) = h.free_region_in_allocator_only(&key, utxo_count);
+        // Sanity: the allocator now considers the region free (the precondition
+        // that makes delete_inner's step-5 free a double-free).
+        assert!(
+            !h.alloc
+                .is_allocated_range(offset, TxMetadata::record_size_for(utxo_count)),
+            "precondition: allocator must already consider the region free",
+        );
+
+        let engine = engine_from_harness(h);
+        // The index still resurrects the key.
+        assert!(
+            engine.lookup(&key).is_some(),
+            "precondition: key resurrected"
+        );
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        seed_tombstone(&mut log, &key, 0, 150);
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(
+            stats.records_self_purged, 1,
+            "an already-free region must count as a SUCCESSFUL purge, not a failure",
+        );
+        assert_eq!(stats.kept_newer_generation, 0);
+        assert!(
+            engine.lookup(&key).is_none(),
+            "the resurrected stale index entry must be removed (R2's goal)",
+        );
+        // The tombstone survives for later use.
+        assert!(idx.is_tombstoned(&key));
+    }
+
+    #[test]
+    fn r2_already_free_purge_is_idempotent_no_loop() {
+        // Running R2 twice on an already-free resurrected key yields the same
+        // state: the key stays gone (the redb-backed primary-index removal is
+        // durable, so there is no per-restart re-purge loop) and the second run
+        // finds nothing to purge.
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 1;
+        let key = h.create_record(0xE2, utxo_count);
+        let _ = h.free_region_in_allocator_only(&key, utxo_count);
+        let engine = engine_from_harness(h);
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        seed_tombstone(&mut log, &key, 0, 150);
+
+        let s1 = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(s1.records_self_purged, 1);
+        assert!(engine.lookup(&key).is_none());
+
+        // Second run: the key is already absent, so nothing is purged again
+        // and no double-free is attempted.
+        let s2 = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(
+            s2.records_self_purged, 0,
+            "key already purged + durably removed → no re-purge, no loop",
+        );
+        assert!(engine.lookup(&key).is_none());
+        assert_eq!(idx.len(), 1, "tombstone count is stable across reruns");
+    }
+
+    #[test]
+    fn r2_partial_overlap_free_is_not_tolerated() {
+        // SAFETY boundary: the already-free tolerance is restricted to a record
+        // region FULLY CONTAINED in an existing free region. A PARTIAL overlap
+        // (the record range extends past the free region into still-allocated
+        // space) is real corruption and must NOT be silently tolerated — the
+        // allocator's DoubleFree error must surface so the purge is NOT counted.
+        let mut h = RecoveryTestHarness::new();
+        // A record spanning two 4096 blocks (256 + 100*64 = 6656 → 8192 aligned).
+        let utxo_count = 100;
+        let key = h.create_record(0xE4, utxo_count);
+        let ie = h.index.lookup(&key).unwrap();
+        let offset = ie.record_offset;
+        let full_size = TxMetadata::record_size_for(utxo_count); // > 4096
+        assert!(
+            full_size > 4096,
+            "record must span >1 block for a partial overlap"
+        );
+        // Free ONLY the first 4096 of the record's region, leaving the rest
+        // still allocated. The record's [offset, offset+full_size) now only
+        // PARTIALLY overlaps the free region [offset, offset+4096).
+        h.alloc.free(offset, 4096).unwrap();
+        // Precondition: not fully allocated (overlaps the free block), and the
+        // containing free region does NOT cover the whole record.
+        assert!(!h.alloc.is_allocated_range(offset, full_size));
+        let (free_off, free_size) = h.alloc.free_region_containing(offset).unwrap();
+        assert_eq!(free_off, offset);
+        assert!(
+            offset + full_size > free_off + free_size,
+            "must be a partial overlap"
+        );
+
+        let engine = engine_from_harness(h);
+        assert!(engine.lookup(&key).is_some());
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        seed_tombstone(&mut log, &key, 0, 150);
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(
+            stats.records_self_purged, 0,
+            "a partial-overlap free is corruption and must NOT count as a purge",
+        );
+    }
+
+    #[test]
+    fn r2_genuine_delete_error_is_not_counted_as_purged() {
+        // A GENUINE failure (not the benign already-free case) must keep the
+        // existing warn+retry behavior: the purge is NOT counted, and the
+        // record is left for the next restart. We force a real failure by
+        // making the on-device metadata header unreadable for the resurrected
+        // key, so `delete_inner`'s `read_metadata_for_key` (step pre-1) errors
+        // out BEFORE any index removal — i.e. a transient backend error, not an
+        // already-free region.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xE3, 2);
+        // Corrupt the metadata header so reading it back fails (CRC mismatch),
+        // turning the delete into a genuine StorageError. The region is still
+        // ALLOCATED (we do NOT free it), so this is unambiguously NOT the
+        // already-free path.
+        let ie = h.index.lookup(&key).unwrap();
+        let offset = ie.record_offset;
+        let align = h.data_dev.alignment();
+        let aligned = offset / align as u64 * align as u64;
+        let mut buf = crate::device::AlignedBuf::new(align, align);
+        h.data_dev.pread_exact_at(&mut buf, aligned).unwrap();
+        // Flip the magic bytes so metadata read rejects it.
+        buf[(offset - aligned) as usize] ^= 0xFF;
+        h.data_dev.pwrite_all_at(&buf, aligned).unwrap();
+        h.data_dev.sync().unwrap();
+
+        let engine = engine_from_harness(h);
+        assert!(engine.lookup(&key).is_some());
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        seed_tombstone(&mut log, &key, 0, 150);
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(
+            stats.records_self_purged, 0,
+            "a genuine delete error must NOT be counted as a successful purge",
+        );
+        // The record is still present (the delete failed before index removal),
+        // so the next restart will retry — idempotent recovery.
+        assert!(
+            engine.lookup(&key).is_some(),
+            "a genuinely-failed purge must leave the record for retry",
+        );
     }
 
     #[test]

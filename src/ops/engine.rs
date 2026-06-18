@@ -5276,9 +5276,11 @@ impl Engine {
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         // Public deletes write a tombstone when the feature is active. The
-        // recovery R2 self-purge uses `delete_inner(.., false)` instead so it
-        // never re-tombstones a key whose tombstone already exists.
-        self.delete_inner(req, self.tombstone_write_active())
+        // recovery R2 self-purge uses `delete_inner(.., false, true)` instead
+        // so it never re-tombstones a key whose tombstone already exists and
+        // tolerates an already-free region. The hot path passes
+        // `tolerate_already_free = false`: a double-free here is a real bug.
+        self.delete_inner(req, self.tombstone_write_active(), false)
             .map(|_| ())
     }
 
@@ -5300,7 +5302,7 @@ impl Engine {
         &self,
         req: &DeleteRequest,
     ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
-        self.delete_inner(req, self.tombstone_write_active())
+        self.delete_inner(req, self.tombstone_write_active(), false)
     }
 
     /// Internal delete with explicit tombstone control.
@@ -5333,6 +5335,7 @@ impl Engine {
         &self,
         req: &DeleteRequest,
         write_tombstone: bool,
+        tolerate_already_free: bool,
     ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
@@ -5438,12 +5441,68 @@ impl Engine {
         // the offset can be handed out to a future `create`/`create_at_offset`.
         // Because step 4 already removed the primary-index entry, no
         // reader can reach this offset via `lookup(req.tx_key)` any longer.
-        self.allocator
-            .lock()
-            .free(entry.record_offset, record_size)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        //
+        // `tolerate_already_free` is set ONLY by the recovery R2 self-purge
+        // path ([`Self::delete_for_purge`]). Recovery can encounter an
+        // index/allocator inconsistency where the primary index resurrected a
+        // record at an offset the allocator's recovered free-list already
+        // freed (see `recover_tombstones`). For that path a region that the
+        // allocator already considers fully free is BENIGN — the free-list is
+        // authoritative that the region is dead, and R2's job is only to drop
+        // the stale index entry (step 4, already done above). Freeing it again
+        // would (correctly) raise `DoubleFree`, so we skip the free instead.
+        //
+        // CRITICAL SAFETY: this tolerance is restricted to the case where the
+        // record's `[offset, offset + record_size)` is FULLY CONTAINED in a
+        // single already-free region. A PARTIAL overlap (the record range
+        // extends past the free region into space that may be allocated/live)
+        // is real corruption and is NOT tolerated even on the purge path — the
+        // `free` error is propagated so it keeps surfacing. The normal
+        // spend/delete hot path (`tolerate_already_free == false`) ALWAYS
+        // propagates any allocator error: a double-free there is a genuine bug
+        // that must never be hidden.
+        {
+            let mut alloc = self.allocator.lock();
+            if tolerate_already_free && !alloc.is_allocated_range(entry.record_offset, record_size)
+            {
+                // Region is not fully allocated. Only tolerate the fully
+                // contained case; anything else is a partial overlap (or an
+                // out-of-bounds range) and must error.
+                let contained = alloc
+                    .free_region_containing(entry.record_offset)
+                    .is_some_and(|(free_offset, free_size)| {
+                        let region_end = entry.record_offset.saturating_add(record_size);
+                        let free_end = free_offset.saturating_add(free_size);
+                        entry.record_offset >= free_offset && region_end <= free_end
+                    });
+                if contained {
+                    // Benign: the region is already, correctly, free. The stale
+                    // index entry has been removed (step 4). Nothing more to do.
+                    tracing::debug!(
+                        offset = entry.record_offset,
+                        size = record_size,
+                        "delete_for_purge: region already free (resurrected \
+                         index/allocator inconsistency); index entry removed, \
+                         skipping redundant free",
+                    );
+                } else {
+                    // Partial overlap or out-of-bounds — real corruption.
+                    // Attempt the free so the allocator produces its precise
+                    // `DoubleFree`/`InvalidFree` error, then propagate it.
+                    alloc.free(entry.record_offset, record_size).map_err(|e| {
+                        SpendError::StorageError {
+                            detail: format!("{e}"),
+                        }
+                    })?;
+                }
+            } else {
+                alloc.free(entry.record_offset, record_size).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("{e}"),
+                    }
+                })?;
+            }
+        }
 
         // Step 6: Insert the derived redb tombstone row (not fsynced — the
         // log is the durable source of truth; recovery `rebuild_from`
@@ -5499,8 +5558,27 @@ impl Engine {
     /// All other delete semantics (header zero, fsync, primary-index removal,
     /// region free, secondary cleanup) are identical to [`Self::delete`], so
     /// re-running recovery is idempotent.
+    ///
+    /// # Already-free tolerance (resurrected index/allocator inconsistency)
+    ///
+    /// This path passes `tolerate_already_free = true` to [`Self::delete_inner`].
+    /// Recovery can resurrect a primary-index entry pointing at a `record_offset`
+    /// the allocator's recovered free-list ALREADY freed (an index/allocator
+    /// inconsistency — see [`crate::recovery::recover_tombstones`]). For such a
+    /// key the index-entry removal is the only work R2 needs: the allocator
+    /// free-list is already authoritative that the region is dead, so the
+    /// otherwise-correct `free` of step 5 would raise [`DoubleFree`] and wrongly
+    /// fail an operation that, in fact, completed. When the region is fully
+    /// contained in an existing free region the free is skipped (benign) and
+    /// this returns `Ok(())`; a PARTIAL overlap is still surfaced as a
+    /// [`SpendError::StorageError`] (real corruption — never silently tolerated).
+    ///
+    /// The normal client/sweep delete path keeps the strict behavior
+    /// (`tolerate_already_free = false`): a double-free there is a genuine bug.
+    ///
+    /// [`DoubleFree`]: crate::allocator::AllocatorError::DoubleFree
     pub(crate) fn delete_for_purge(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, false).map(|_| ())
+        self.delete_inner(req, false, true).map(|_| ())
     }
 
     /// Discard ALL local records for `shard` WITHOUT writing tombstones, for
