@@ -1571,6 +1571,102 @@ pub(crate) fn handle_request(
                 payload: Vec::new(),
             }
         }
+        OP_SHARD_RECONCILE_REQUEST => {
+            // #36 — reverse manifest reconciliation (receiver side). A stale,
+            // non-authoritative holder `N` of `shard` (a rejoined node that
+            // rebuilt its FULL pre-shutdown index, including records the cluster
+            // authoritatively DELETED while `N` was down) asks us — the
+            // shard's committed master `R` — for our AUTHORITATIVE keyset so it
+            // can reconcile its local set DOWN to ours (delete `local − R`).
+            //
+            // We answer with our full manifest ONLY when we can PROVE we are
+            // authoritative-and-complete for the shard at the requested epoch.
+            // If we cannot, we reply `ERR_NOT_AUTHORITATIVE_COMPLETE` and `N`
+            // RETAINS everything (no-loss, retries later) — never "delete all".
+            //
+            // Wire format (request, 16 bytes):
+            //   [topology_epoch:8][requester_node:8]
+            // `request_id` low 16 bits = shard (upper 48 bits MUST be zero).
+            let cluster = match cluster {
+                Some(c) => c,
+                None => {
+                    return error_response(request.request_id, ERR_NOT_CLUSTERED, "not clustered");
+                }
+            };
+            // F-G5-004 parity — request_id overloads shard identity; reject any
+            // caller that sets the upper 48 bits so a typo cannot silently
+            // target an unintended shard.
+            if request.request_id >> 16 != 0 {
+                return error_response(
+                    request.request_id,
+                    ERR_INVARIANT_VIOLATION,
+                    "OP_SHARD_RECONCILE_REQUEST: request_id must encode shard in low 16 bits",
+                );
+            }
+            let shard = request.request_id as u16;
+            let (Some(reconcile_epoch), Some(_requester_id)) = (
+                le_u64_at(&request.payload, 0),
+                le_u64_at(&request.payload, 8),
+            ) else {
+                return error_response(
+                    request.request_id,
+                    ERR_PAYLOAD_MALFORMED,
+                    "reconcile-request: truncated header",
+                );
+            };
+            // Completeness proof. ALL of: epoch-current, we are the
+            // effective/target master, and we have no pending inbound for the
+            // shard (we are not mid-catch-up). Without it the keyset we hold is
+            // not a trustworthy authoritative account — reply retryable and let
+            // `N` retain everything.
+            if !cluster.is_authoritative_complete_for_shard(shard, reconcile_epoch) {
+                return error_response(
+                    request.request_id,
+                    ERR_NOT_AUTHORITATIVE_COMPLETE,
+                    &format!(
+                        "shard {shard} reconcile: not authoritative-complete at epoch {reconcile_epoch}"
+                    ),
+                );
+            }
+            // Proven authoritative — build our COMPLETE current keyset for the
+            // shard from a consistent snapshot and reply with the exact-entry
+            // manifest. An empty keyset is a valid proven answer (entry_count
+            // == 0): it means we authoritatively hold NOTHING for the shard, so
+            // `N` deletes its entire stale copy.
+            let keys = engine.keys_for_shard(shard);
+            let mut entries: Vec<(TxKey, u32)> = Vec::with_capacity(keys.len());
+            for key in &keys {
+                match engine.read_metadata(key) {
+                    Ok(meta) => entries.push((*key, meta.generation)),
+                    // A key that vanished between the keyset scan and the
+                    // metadata read was concurrently deleted — it is simply not
+                    // in our authoritative set, so omit it (the same skip the
+                    // source-side `collect_manifest_entries` performs).
+                    Err(crate::ops::error::SpendError::TxNotFound) => {}
+                    Err(e) => {
+                        return error_response(
+                            request.request_id,
+                            ERR_STORAGE_IO,
+                            &format!(
+                                "shard {shard} reconcile: read_metadata failed for {:?}: {e:?}",
+                                key
+                            ),
+                        );
+                    }
+                }
+            }
+            let mut payload = Vec::with_capacity(4 + entries.len() * 36);
+            payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for (key, generation) in &entries {
+                payload.extend_from_slice(&key.txid);
+                payload.extend_from_slice(&generation.to_le_bytes());
+            }
+            ResponseFrame {
+                request_id: request.request_id,
+                status: STATUS_OK,
+                payload,
+            }
+        }
         OP_TOPOLOGY_PROPOSE => {
             // Topology authority: another node is proposing a new term.
             //
@@ -15575,6 +15671,232 @@ mod tests {
         assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
         // No mutation either way.
         assert_eq!(h.engine.shard_record_count(shard), 1);
+    }
+
+    /// #36 — build an `OP_SHARD_RECONCILE_REQUEST` payload: `[epoch:8][node:8]`.
+    fn build_reconcile_request_payload(
+        epoch: u64,
+        requester: crate::cluster::shards::NodeId,
+    ) -> Vec<u8> {
+        let mut p = Vec::with_capacity(16);
+        p.extend_from_slice(&epoch.to_le_bytes());
+        p.extend_from_slice(&requester.0.to_le_bytes());
+        p
+    }
+
+    /// #36 — decode a reconcile reply manifest:
+    /// `[count:4][ (txid:32)(gen:4) × count ]`.
+    fn decode_reconcile_manifest(payload: &[u8]) -> Vec<(TxKey, u32)> {
+        let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(count);
+        let mut pos = 4;
+        for _ in 0..count {
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&payload[pos..pos + 32]);
+            pos += 32;
+            let generation = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            out.push((TxKey { txid }, generation));
+        }
+        out
+    }
+
+    /// #36 — the receiver R, when PROVEN authoritative-complete (epoch-current,
+    /// serving master, no pending inbound), replies STATUS_OK with its COMPLETE
+    /// exact-entry keyset for the shard. Wire round-trip: the requester decodes
+    /// exactly the keys+generations R holds. (Tests proof-TRUE + wire frame.)
+    #[test]
+    fn shard_reconcile_request_returns_authoritative_manifest_when_proven() {
+        let h = DispatchTestHarness::new();
+        let shard = 81u16;
+        let txid_a = txid_for_shard(shard, 41);
+        let txid_b = txid_for_shard(shard, 42);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+        let key_a = TxKey { txid: txid_a };
+        let key_b = TxKey { txid: txid_b };
+        let gen_a = h.engine.read_metadata(&key_a).unwrap().generation;
+        let gen_b = h.engine.read_metadata(&key_b).unwrap().generation;
+
+        // R (node 1) is the committed master of every shard (single member),
+        // epoch 70, no pending inbound → authoritative-complete.
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 70, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4730".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_SHARD_RECONCILE_REQUEST,
+            flags: 0,
+            payload: build_reconcile_request_payload(70, crate::cluster::shards::NodeId(2)).into(),
+        };
+        let mut cs = crate::server::ConnectionState::new();
+        let resp = handle_request(&req, &h.engine, 8192, Some(&cluster), None, &mut cs, None);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "proven master must return its manifest"
+        );
+
+        let mut got = decode_reconcile_manifest(&resp.payload);
+        got.sort_by_key(|e| e.0.txid);
+        let mut want = vec![(key_a, gen_a), (key_b, gen_b)];
+        want.sort_by_key(|e| e.0.txid);
+        assert_eq!(
+            got, want,
+            "reconcile manifest must be R's exact keyset+generations"
+        );
+        // Verify-only: R did NOT mutate its own state.
+        assert_eq!(h.engine.shard_record_count(shard), 2);
+    }
+
+    /// #36 NO-LOSS — R replies ERR_NOT_AUTHORITATIVE_COMPLETE (never a manifest)
+    /// when it cannot prove completeness. Three falsifying cases:
+    ///   (a) mid-inbound for the shard,
+    ///   (b) wrong epoch,
+    ///   (c) not the master/target for the shard.
+    #[test]
+    fn shard_reconcile_request_rejects_when_not_authoritative_complete() {
+        let h = DispatchTestHarness::new();
+        let shard = 82u16;
+        let txid = txid_for_shard(shard, 43);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let addr = "127.0.0.1:4731".parse().unwrap();
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 71, 1);
+
+        // (a) mid-inbound for the shard → not complete.
+        let cluster_inbound = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table.clone(),
+            &[(crate::cluster::shards::NodeId(1), addr)],
+            &members,
+            &[shard], // pending inbound
+            &[],
+            &[],
+            1,
+        );
+        let req_a = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_SHARD_RECONCILE_REQUEST,
+            flags: 0,
+            payload: build_reconcile_request_payload(71, crate::cluster::shards::NodeId(2)).into(),
+        };
+        let mut cs_a = crate::server::ConnectionState::new();
+        let resp_a = handle_request(
+            &req_a,
+            &h.engine,
+            8192,
+            Some(&cluster_inbound),
+            None,
+            &mut cs_a,
+            None,
+        );
+        assert_eq!(resp_a.status, STATUS_ERROR);
+        assert_eq!(
+            decode_error_payload(&resp_a.payload).unwrap().0,
+            ERR_NOT_AUTHORITATIVE_COMPLETE,
+            "a mid-inbound master must reject the reconcile (no-loss)"
+        );
+
+        // (b) wrong epoch: serving master but the requester reconciles at an
+        // epoch R has not activated.
+        let cluster_ok = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table.clone(),
+            &[(crate::cluster::shards::NodeId(1), addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let req_b = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_SHARD_RECONCILE_REQUEST,
+            flags: 0,
+            payload: build_reconcile_request_payload(72, crate::cluster::shards::NodeId(2)).into(),
+        };
+        let mut cs_b = crate::server::ConnectionState::new();
+        let resp_b = handle_request(
+            &req_b,
+            &h.engine,
+            8192,
+            Some(&cluster_ok),
+            None,
+            &mut cs_b,
+            None,
+        );
+        assert_eq!(resp_b.status, STATUS_ERROR);
+        assert_eq!(
+            decode_error_payload(&resp_b.payload).unwrap().0,
+            ERR_NOT_AUTHORITATIVE_COMPLETE,
+            "an epoch the master has not activated must reject (no-loss)"
+        );
+
+        // (c) not master/target: ask for a shard mastered by node 2 in a
+        // two-member table, but R is node 1.
+        let members2 = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table2 = crate::cluster::shards::ShardTable::compute_with_epoch(&members2, 1, 73, 1);
+        let peer_shard = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|&s| {
+                table2.target_assignment(s).master == crate::cluster::shards::NodeId(2)
+                    && table2.effective_assignment(s).master == crate::cluster::shards::NodeId(2)
+            })
+            .expect("a shard mastered by node 2");
+        let cluster_peer = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table2,
+            &[
+                (crate::cluster::shards::NodeId(1), addr),
+                (
+                    crate::cluster::shards::NodeId(2),
+                    "127.0.0.1:4732".parse().unwrap(),
+                ),
+            ],
+            &members2,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        let req_c = RequestFrame {
+            request_id: peer_shard as u64,
+            op_code: OP_SHARD_RECONCILE_REQUEST,
+            flags: 0,
+            payload: build_reconcile_request_payload(73, crate::cluster::shards::NodeId(3)).into(),
+        };
+        let mut cs_c = crate::server::ConnectionState::new();
+        let resp_c = handle_request(
+            &req_c,
+            &h.engine,
+            8192,
+            Some(&cluster_peer),
+            None,
+            &mut cs_c,
+            None,
+        );
+        assert_eq!(resp_c.status, STATUS_ERROR);
+        assert_eq!(
+            decode_error_payload(&resp_c.payload).unwrap().0,
+            ERR_NOT_AUTHORITATIVE_COMPLETE,
+            "a non-master for the shard must reject (no-loss)"
+        );
     }
 
     #[test]

@@ -249,6 +249,20 @@ struct RelinquishContext {
 /// single case where the proof is needed to relinquish a NON-empty phantom
 /// (transfer-then-relinquish). A `None` probe (or one returning `false`) keeps
 /// the historical no-loss behaviour: a non-empty copy rolls back to self.
+///
+/// `reconcile_probe` (#36 — rejoin deletion-reconciliation), when present, is a
+/// REVERSE manifest reconciliation against the rightful master: it pulls the
+/// master's AUTHORITATIVE keyset (gated on the master's completeness proof) and
+/// deletes every local key the master omits (`local − R`), then returns `true`
+/// iff that succeeded (`self`'s keyset is now ⊆ `R`). It is invoked ONLY in the
+/// exact stranding case — `self` still holds records AND the forward superset
+/// probe FAILED — which is precisely the #36 phantom: `self` is a stale holder
+/// of records the cluster authoritatively DELETED while it was down, so `R`
+/// lacks them and the forward probe can never succeed. A successful reconcile
+/// converts the disposition from `RollbackToSelf` (strand the stale records,
+/// stay phantom master) to `RelinquishToCommittedMaster` (drop the now-⊆-R
+/// keyset). An unproven / failed reconcile (`None`, or returning `false`) keeps
+/// the historical no-loss rollback — never a one-sided delete.
 #[allow(clippy::too_many_arguments)]
 fn fail_or_relinquish_outbound_task(
     migration: &Arc<Mutex<MigrationManager>>,
@@ -259,22 +273,44 @@ fn fail_or_relinquish_outbound_task(
     topology_epoch: u64,
     ctx: Option<&RelinquishContext>,
     superset_probe: Option<&dyn Fn() -> bool>,
+    reconcile_probe: Option<&dyn Fn() -> bool>,
 ) -> bool {
     let action = match ctx {
         Some(ctx) => {
             let has_pending_inbound = migration.lock().has_pending_inbound(task.shard);
-            let self_holds_records = ctx.engine.shard_record_count(task.shard) > 0;
+            let mut self_holds_records = ctx.engine.shard_record_count(task.shard) > 0;
             // Probe the rightful master for superset containment only when
             // self holds records (otherwise the empty-shard path already
             // relinquishes no-loss) AND a probe was supplied. The probe is a
             // network round-trip, so it is gated to the exact case that needs
             // it — the non-empty phantom whose rightful master already holds
             // the data.
-            let target_holds_superset = if self_holds_records {
+            let mut target_holds_superset = if self_holds_records {
                 superset_probe.map(|p| p()).unwrap_or(false)
             } else {
                 false
             };
+            // #36 — reverse deletion-reconciliation. When `self` still holds
+            // records and the forward superset probe FAILED, this is the exact
+            // stranding case: `self` is a stale holder of keys the cluster
+            // authoritatively DELETED while it was down, so `R` lacks them and
+            // the forward probe can NEVER succeed — the historical path would
+            // strand those stale records and keep `self` their phantom master
+            // (the #36 over-count + resurrection bug). Attempt to pull `R`'s
+            // authoritative keyset (gated on `R`'s completeness proof) and
+            // delete `local − R`. On success `self`'s keyset is now ⊆ `R`, so a
+            // re-probe would pass — set `target_holds_superset` and re-read the
+            // (possibly now-empty) local count so the disposition relinquishes.
+            // On failure (unproven / unreachable `R`) nothing is deleted and the
+            // historical no-loss rollback stands.
+            if self_holds_records
+                && !target_holds_superset
+                && let Some(reconcile) = reconcile_probe
+                && reconcile()
+            {
+                target_holds_superset = true;
+                self_holds_records = ctx.engine.shard_record_count(task.shard) > 0;
+            }
             let disposition = {
                 let table = shard_table.read();
                 failed_handoff_disposition(
@@ -4653,7 +4689,10 @@ fn run_migration_batch(
                     // Empty shard: relinquish is trivially no-loss (nothing to
                     // lose); the wrapper confirms the committed master anyway.
                     // No superset probe needed — emptiness already proves it.
+                    // No reverse reconcile needed either — there is nothing to
+                    // reconcile away.
                     relinquish_ctx,
+                    None,
                     None,
                 ) {
                     failed.fetch_add(1, Ordering::Relaxed);
@@ -4989,6 +5028,24 @@ fn run_migration_batch(
                                     auth_secret,
                                 )
                             };
+                            // #36 — when the forward superset probe FAILS because
+                            // the target lacks keys the cluster authoritatively
+                            // DELETED while this (rejoined, stale) source was down,
+                            // reverse-reconcile: pull the target's authoritative
+                            // keyset (gated on its completeness proof) and delete
+                            // `local − target` so this source's set becomes ⊆ the
+                            // target's, then relinquish the phantom. Unproven /
+                            // unreachable target ⇒ retain (no-loss rollback).
+                            let reconcile = || {
+                                reconcile_down_to_authoritative_master(
+                                    addr,
+                                    task.shard,
+                                    task.from_node,
+                                    topology_epoch,
+                                    &engine,
+                                    auth_secret,
+                                )
+                            };
                             if fail_or_relinquish_outbound_task(
                                 &migration,
                                 shard_table,
@@ -4998,6 +5055,7 @@ fn run_migration_batch(
                                 topology_epoch,
                                 relinquish_ctx,
                                 Some(&probe),
+                                Some(&reconcile),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -5194,6 +5252,21 @@ fn run_migration_batch(
                                     auth_secret,
                                 )
                             };
+                            // #36 — if the forward superset probe fails because
+                            // the master lacks keys the cluster authoritatively
+                            // DELETED while this stale source was down, reverse-
+                            // reconcile down to the master's authoritative keyset
+                            // (gated on its completeness proof), then relinquish.
+                            let reconcile = || {
+                                reconcile_down_to_authoritative_master(
+                                    addr,
+                                    task.shard,
+                                    task.from_node,
+                                    topology_epoch,
+                                    &engine,
+                                    auth_secret,
+                                )
+                            };
                             if fail_or_relinquish_outbound_task(
                                 &migration,
                                 shard_table,
@@ -5203,6 +5276,7 @@ fn run_migration_batch(
                                 topology_epoch,
                                 relinquish_ctx,
                                 Some(&probe),
+                                Some(&reconcile),
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -5240,7 +5314,9 @@ fn run_migration_batch(
                                 // non-empty copy rolls back to self (no manifest
                                 // is retained here to drive a superset probe).
                                 // The next drain re-drive re-streams and the
-                                // manifest-reject path performs the probe.
+                                // manifest-reject path performs the probe AND the
+                                // #36 reverse reconcile, so neither is supplied
+                                // here.
                                 let _ = outcome;
                                 if fail_or_relinquish_outbound_task(
                                     &migration,
@@ -5250,6 +5326,7 @@ fn run_migration_batch(
                                     task,
                                     topology_epoch,
                                     relinquish_ctx,
+                                    None,
                                     None,
                                 ) {
                                     failed.fetch_add(1, Ordering::Relaxed);
@@ -6024,6 +6101,226 @@ fn confirm_target_holds_superset(
         "cluster: superset probe failed after retries — keeping data, rolling back",
     );
     false
+}
+
+/// #36 — reverse manifest reconciliation (sender / stale-holder side).
+///
+/// `self` (`N`) is a stale, non-authoritative holder of `shard`: it rebuilt
+/// its FULL pre-shutdown local index — including records the cluster
+/// authoritatively DELETED while `N` was down — and re-asserted phantom
+/// mastership. The committed master `R` (`target_addr` / `to_node`) rejected
+/// `N`'s push (and a forward superset probe failed) precisely because `R`
+/// lacks the keys the cluster deleted, so `N` would otherwise STRAND those
+/// stale records and stay their phantom master (the #36 over-count +
+/// resurrection bug).
+///
+/// This pulls `R`'s AUTHORITATIVE keyset for the shard (`OP_SHARD_RECONCILE_
+/// REQUEST`) and reconciles `N`'s local keyset DOWN to it: every key `N` holds
+/// that `R`'s authoritative manifest omits is deleted (`local − R`). Under
+/// `R`'s completeness proof each such key is EITHER (a) a record the cluster
+/// authoritatively deleted, OR (b) a write `N` took as master but never reached
+/// quorum (never ACKed to a client, safe to drop per the quorum contract).
+/// BOTH are safe to delete. Keys present in BOTH are KEPT.
+///
+/// # Safety — deletion is gated on `R`'s COMPLETENESS PROOF
+///
+/// `R` only returns a manifest (`STATUS_OK`) when it can PROVE it is
+/// authoritative-and-complete for the shard at `topology_epoch` (epoch-current,
+/// effective/target master, no pending inbound — see
+/// `is_authoritative_complete_for_shard`). Without that proof `R` replies
+/// `ERR_NOT_AUTHORITATIVE_COMPLETE` (or the round-trip fails), and this
+/// function RETAINS everything and returns `false` — a lagging / mid-inbound /
+/// wrong-epoch `R` could lack genuinely-unique LIVE records, so reconciling
+/// down to it would be the exact data-loss trap fixes #28/#29/#31 prevent.
+/// The proof is therefore mandatory and conservative: no proof ⇒ no deletion.
+///
+/// # Scope — PRESENCE only
+///
+/// This reconciles PRESENCE only (deletes `local − R`). It deliberately does
+/// NOT touch generation/spent-state for keys present in BOTH: if `R` holds a
+/// key at a higher generation, normal master→replica replication converges it.
+/// Generation-divergence reconciliation is out of scope for #36.
+///
+/// Returns `true` iff `R`'s manifest was proven and the `local − R` difference
+/// was fully deleted (so `self`'s keyset is now ⊆ `R` and a re-issued superset
+/// probe will succeed). Returns `false` (retain everything) on an unproven /
+/// failed reply, so the caller keeps the historical no-loss rollback.
+fn reconcile_down_to_authoritative_master(
+    target_addr: SocketAddr,
+    shard: u16,
+    requester_node: NodeId,
+    topology_epoch: u64,
+    engine: &Engine,
+    auth_secret: Option<&[u8]>,
+) -> bool {
+    // Request R's authoritative manifest for the shard at our committed epoch.
+    let mut payload = Vec::with_capacity(16);
+    payload.extend_from_slice(&topology_epoch.to_le_bytes());
+    payload.extend_from_slice(&requester_node.0.to_le_bytes());
+    let request = RequestFrame {
+        request_id: shard as u64,
+        op_code: OP_SHARD_RECONCILE_REQUEST,
+        flags: 0,
+        payload: payload.into(),
+    };
+
+    // One round-trip, with bounded backoff retries for TRANSIENT connection
+    // failures only (the probe competes with the migration pool for R's
+    // per-IP connection cap, exactly like `confirm_target_holds_superset`). A
+    // definitive STATUS answer is acted on immediately; only connection errors
+    // are retried. On exhaustion we conservatively RETAIN (return false).
+    let attempt = || -> std::result::Result<Option<Vec<(TxKey, u32)>>, String> {
+        let mut stream = TcpStream::connect_timeout(&target_addr, Duration::from_secs(3))
+            .map_err(|e| format!("connect: {e}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| format!("set read timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| format!("set write timeout: {e}"))?;
+        crate::replication::tcp_transport::configure_tcp_keepalive(&stream);
+        let response = exchange_frame(&mut stream, &request, auth_secret)?;
+        if response.status != STATUS_OK {
+            // A logical "not authoritative-complete" (or any other STATUS_ERROR)
+            // is a DEFINITIVE "retain everything, retry later" — NOT a transient
+            // connection failure, so do not retry it here. Surface it as an
+            // empty-but-present answer the caller maps to retain.
+            let code = crate::protocol::codec::decode_error_payload(&response.payload)
+                .map(|(c, _)| c)
+                .unwrap_or(ERR_INTERNAL);
+            return Err(format!(
+                "reconcile rejected: status {} code {code}",
+                response.status
+            ));
+        }
+        // Decode the exact-entry manifest: [count:4][ (txid:32)(gen:4) × count ].
+        if response.payload.len() < 4 {
+            return Err("reconcile reply: truncated entry count".to_string());
+        }
+        let entry_count = u32::from_le_bytes(match response.payload[0..4].try_into() {
+            Ok(b) => b,
+            Err(_) => return Err("reconcile reply: truncated entry count".to_string()),
+        }) as usize;
+        let needed = match 36usize
+            .checked_mul(entry_count)
+            .and_then(|n| n.checked_add(4))
+        {
+            Some(n) => n,
+            None => {
+                return Err(format!(
+                    "reconcile reply: entry_count overflow ({entry_count})"
+                ));
+            }
+        };
+        if response.payload.len() < needed {
+            return Err(format!(
+                "reconcile reply: need {needed} bytes, got {}",
+                response.payload.len()
+            ));
+        }
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut pos = 4;
+        for _ in 0..entry_count {
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&response.payload[pos..pos + 32]);
+            pos += 32;
+            let generation = u32::from_le_bytes(match response.payload[pos..pos + 4].try_into() {
+                Ok(b) => b,
+                Err(_) => return Err("reconcile reply: malformed generation".to_string()),
+            });
+            pos += 4;
+            entries.push((TxKey { txid }, generation));
+        }
+        Ok(Some(entries))
+    };
+
+    const RETRY_DELAYS_MS: [u64; 6] = [25, 75, 150, 300, 600, 1200];
+    let mut last_err = String::new();
+    let mut authoritative: Option<Vec<(TxKey, u32)>> = None;
+    for (i, &delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
+        match attempt() {
+            Ok(Some(entries)) => {
+                authoritative = Some(entries);
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // Distinguish a definitive logical reject (retain, do NOT retry)
+                // from a transient connection failure (retry). The logical
+                // reject message is prefixed "reconcile rejected:".
+                if err.starts_with("reconcile rejected:") {
+                    tracing::info!(
+                        shard,
+                        %target_addr,
+                        err = %err,
+                        "cluster: reverse reconcile not authoritative — retaining, retry later",
+                    );
+                    return false;
+                }
+                last_err = err;
+            }
+        }
+        if i + 1 < RETRY_DELAYS_MS.len() {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+    }
+    let authoritative = match authoritative {
+        Some(a) => a,
+        None => {
+            tracing::warn!(
+                shard,
+                %target_addr,
+                err = %last_err,
+                "cluster: reverse reconcile manifest pull failed — retaining, rolling back",
+            );
+            return false;
+        }
+    };
+
+    // R PROVED completeness and returned its authoritative keyset. Delete every
+    // local key for the shard that R's manifest omits (local − R). Keys present
+    // in R (regardless of generation) are KEPT — presence-only reconciliation.
+    let authoritative_keys: std::collections::HashSet<TxKey> =
+        authoritative.iter().map(|(key, _)| *key).collect();
+    let mut deleted = 0usize;
+    for key in engine.keys_for_shard(shard) {
+        if authoritative_keys.contains(&key) {
+            continue;
+        }
+        // Admin-style unconditional delete (`due_guard: None`), the same path
+        // the forward prune uses in dispatch.rs.
+        match engine.delete(&crate::ops::remaining::DeleteRequest {
+            tx_key: key,
+            due_guard: None,
+        }) {
+            Ok(()) => deleted += 1,
+            // Already gone (a concurrent delete) — fine, the goal is "not held".
+            Err(crate::ops::error::SpendError::TxNotFound) => {}
+            Err(e) => {
+                // A storage error mid-reconcile leaves the keyset only partially
+                // reduced. RETAIN (return false): the caller rolls back to self,
+                // and the next cycle re-attempts the full reconcile. Never report
+                // success on a partial deletion — that could relinquish the shard
+                // while a stale key is still held.
+                tracing::warn!(
+                    shard,
+                    %target_addr,
+                    key = ?key,
+                    err = ?e,
+                    "cluster: reverse reconcile delete failed — retaining, rolling back",
+                );
+                return false;
+            }
+        }
+    }
+    tracing::info!(
+        shard,
+        %target_addr,
+        deleted,
+        authoritative_count = authoritative_keys.len(),
+        "cluster: reverse reconcile complete — local keyset reduced to authoritative master",
+    );
+    true
 }
 
 /// Send batched migration-complete handshakes for multiple shards in a
@@ -7662,6 +7959,37 @@ impl RunningCluster {
     /// Check if this node is still expecting inbound migration data for a shard.
     pub fn has_pending_inbound_shard(&self, shard: u16) -> bool {
         self.inbound_atomic.test(shard)
+    }
+
+    /// #36 — reverse manifest reconciliation (receiver side). Prove this node
+    /// (`R`) is the AUTHORITATIVE-AND-COMPLETE holder of `shard` at the epoch
+    /// `reconcile_epoch` a stale holder (`N`) is reconciling at, so the keyset
+    /// `R` returns may be reconciled DOWN to (delete `local − R` on `N`).
+    ///
+    /// Returns `true` only when ALL hold (see
+    /// [`crate::cluster::migration::MigrationManager::is_authoritative_complete_for_shard`]):
+    ///
+    ///   - epoch-current: `reconcile_epoch > 0` and equals `R`'s committed
+    ///     shard-table version;
+    ///   - `R` is the effective OR target master for `shard` in the committed
+    ///     table;
+    ///   - `R` is serving `shard` with NO pending inbound migration for it.
+    ///
+    /// Lock-light: reads the shard table under its visibility lock and the
+    /// inbound bitmap lock-free (`inbound_atomic`, kept in sync with the
+    /// migration manager's `has_pending_inbound`). Takes NO migration mutex, so
+    /// it cannot deadlock against the migration-completion path that holds it.
+    pub fn is_authoritative_complete_for_shard(&self, shard: u16, reconcile_epoch: u64) -> bool {
+        let table = self.shard_table();
+        let table = table.read();
+        let epoch_current = reconcile_epoch > 0 && reconcile_epoch == table.version;
+        let self_id = self.self_id();
+        let is_master_or_target = table.effective_assignment(shard).master == self_id
+            || table.target_assignment(shard).master == self_id;
+        // Condition (iii) — serving with no in-flight inbound for the shard —
+        // is the inbound-bitmap test, the lock-free mirror of the migration
+        // manager's `has_pending_inbound`.
+        epoch_current && is_master_or_target && !self.inbound_atomic.test(shard)
     }
 
     /// Check if writes are fenced for the given key's shard.
@@ -10789,6 +11117,428 @@ mod tests {
             disposition,
             FailedHandoffDisposition::RollbackToSelf,
             "superset proof never overrides the live-rightful-master requirement",
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // #36 — reverse manifest reconciliation (rejoin deletion-reconciliation)
+    // ----------------------------------------------------------------------
+
+    /// Spawn a one-shot fake master `R` on `addr` that answers a single
+    /// `OP_SHARD_RECONCILE_REQUEST` with the given response and returns the
+    /// op_code it observed. `response` is built from the decoded request so a
+    /// test can return either a proven manifest (`STATUS_OK` + entries) or a
+    /// `STATUS_ERROR` (`ERR_NOT_AUTHORITATIVE_COMPLETE`).
+    fn spawn_reconcile_responder(
+        addr: SocketAddr,
+        response: ResponseFrame,
+    ) -> std::thread::JoinHandle<u16> {
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind(addr).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut rest = vec![0u8; payload_len];
+            stream.read_exact(&mut rest).unwrap();
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&rest);
+            let (request, _) = RequestFrame::decode(&frame_bytes).unwrap();
+            stream.write_all(&response.encode()).unwrap();
+            request.op_code
+        })
+    }
+
+    /// Encode a proven reconcile manifest reply: `STATUS_OK` +
+    /// `[count:4][ (txid:32)(gen:4) × count ]`.
+    fn reconcile_ok_payload(shard: u16, entries: &[(TxKey, u32)]) -> ResponseFrame {
+        let mut payload = Vec::with_capacity(4 + entries.len() * 36);
+        payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (key, generation) in entries {
+            payload.extend_from_slice(&key.txid);
+            payload.extend_from_slice(&generation.to_le_bytes());
+        }
+        ResponseFrame {
+            request_id: shard as u64,
+            status: STATUS_OK,
+            payload,
+        }
+    }
+
+    /// #36 selective delete — N holds {a, b, c-deleted}; the authoritative
+    /// master R returns {a, b}. After reconcile N holds exactly {a, b} (c is
+    /// the cluster-deleted record, gone). Keys present in R are KEPT.
+    #[test]
+    fn reverse_reconcile_deletes_only_keys_master_lacks() {
+        let shard = 77u16;
+        let engine = test_engine();
+        let key_a = tx_key_for_shard(shard, 1);
+        let key_b = tx_key_for_shard(shard, 2);
+        let key_c = tx_key_for_shard(shard, 3); // cluster-deleted while N was down
+        create_test_record(&engine, key_a);
+        create_test_record(&engine, key_b);
+        create_test_record(&engine, key_c);
+        assert_eq!(engine.shard_record_count(shard), 3);
+
+        let gen_a = engine.read_metadata(&key_a).unwrap().generation;
+        let gen_b = engine.read_metadata(&key_b).unwrap().generation;
+        // R's authoritative manifest: {a, b} — it authoritatively DELETED c.
+        let authoritative = vec![(key_a, gen_a), (key_b, gen_b)];
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = spawn_reconcile_responder(addr, reconcile_ok_payload(shard, &authoritative));
+
+        let reconciled =
+            reconcile_down_to_authoritative_master(addr, shard, NodeId(1), 9, &engine, None);
+        let op = server.join().unwrap();
+        assert_eq!(op, OP_SHARD_RECONCILE_REQUEST);
+        assert!(
+            reconciled,
+            "a proven master manifest must reconcile successfully"
+        );
+
+        // c deleted; a and b retained (present in R).
+        assert_eq!(engine.shard_record_count(shard), 2);
+        assert!(engine.read_metadata(&key_a).is_ok());
+        assert!(engine.read_metadata(&key_b).is_ok());
+        assert!(matches!(
+            engine.read_metadata(&key_c),
+            Err(crate::ops::error::SpendError::TxNotFound)
+        ));
+    }
+
+    /// #36 — a fully-shared keyset (N holds {a, b, d}, R holds {a, b, d}; `d`
+    /// was replicated to N as a live record) deletes NOTHING: every local key
+    /// is present in R's authoritative manifest, so the selective difference is
+    /// empty. This proves the reconcile is presence-selective, not whole-shard.
+    #[test]
+    fn reverse_reconcile_keeps_keys_present_in_master() {
+        let shard = 78u16;
+        let engine = test_engine();
+        let key_a = tx_key_for_shard(shard, 1);
+        let key_b = tx_key_for_shard(shard, 2);
+        let key_d = tx_key_for_shard(shard, 4); // unique-but-live, replicated to R
+        create_test_record(&engine, key_a);
+        create_test_record(&engine, key_b);
+        create_test_record(&engine, key_d);
+
+        let g = |k: &TxKey| engine.read_metadata(k).unwrap().generation;
+        let authoritative = vec![(key_a, g(&key_a)), (key_b, g(&key_b)), (key_d, g(&key_d))];
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = spawn_reconcile_responder(addr, reconcile_ok_payload(shard, &authoritative));
+
+        let reconciled =
+            reconcile_down_to_authoritative_master(addr, shard, NodeId(1), 9, &engine, None);
+        server.join().unwrap();
+        assert!(reconciled);
+        assert_eq!(
+            engine.shard_record_count(shard),
+            3,
+            "every key present in R's manifest must be kept (presence-selective, not whole-shard)"
+        );
+        assert!(engine.read_metadata(&key_d).is_ok());
+    }
+
+    /// #36 NO-LOSS — when R replies `ERR_NOT_AUTHORITATIVE_COMPLETE` (it could
+    /// not prove completeness), N RETAINS its entire local copy and the
+    /// function returns `false` (retryable). NOTHING is deleted.
+    #[test]
+    fn reverse_reconcile_retains_all_when_master_not_authoritative() {
+        let shard = 79u16;
+        let engine = test_engine();
+        let key_a = tx_key_for_shard(shard, 1);
+        let key_b = tx_key_for_shard(shard, 2);
+        create_test_record(&engine, key_a);
+        create_test_record(&engine, key_b);
+        assert_eq!(engine.shard_record_count(shard), 2);
+
+        let reject = ResponseFrame {
+            request_id: shard as u64,
+            status: STATUS_ERROR,
+            payload: crate::protocol::codec::encode_error_payload(
+                ERR_NOT_AUTHORITATIVE_COMPLETE,
+                "not authoritative-complete",
+            ),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = spawn_reconcile_responder(addr, reject);
+
+        let reconciled =
+            reconcile_down_to_authoritative_master(addr, shard, NodeId(1), 9, &engine, None);
+        server.join().unwrap();
+        assert!(
+            !reconciled,
+            "an unproven master must yield a retryable retain, never a reconcile"
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            2,
+            "no key may be deleted when the master cannot prove completeness (no-loss)"
+        );
+    }
+
+    /// #36 empty authoritative manifest — R proves completeness but holds
+    /// NOTHING for the shard (it authoritatively deleted every record while N
+    /// was down). N then deletes its ENTIRE stale copy. This is a valid proven
+    /// answer (entry_count == 0), distinct from the unproven retain above.
+    #[test]
+    fn reverse_reconcile_empty_master_manifest_deletes_entire_stale_copy() {
+        let shard = 80u16;
+        let engine = test_engine();
+        let key_a = tx_key_for_shard(shard, 1);
+        let key_b = tx_key_for_shard(shard, 2);
+        create_test_record(&engine, key_a);
+        create_test_record(&engine, key_b);
+        assert_eq!(engine.shard_record_count(shard), 2);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = spawn_reconcile_responder(addr, reconcile_ok_payload(shard, &[]));
+
+        let reconciled =
+            reconcile_down_to_authoritative_master(addr, shard, NodeId(1), 9, &engine, None);
+        server.join().unwrap();
+        assert!(reconciled);
+        assert_eq!(
+            engine.shard_record_count(shard),
+            0,
+            "a proven-but-empty master manifest deletes the whole stale local copy"
+        );
+    }
+
+    /// #36 integration — `fail_or_relinquish_outbound_task` converts the
+    /// stranding `RollbackToSelf` into `RelinquishToCommittedMaster` once the
+    /// reverse reconcile succeeds. PRE: the forward superset probe fails (R
+    /// lacks the cluster-deleted key c) → without #36 this rolls back to self
+    /// and N stays phantom master. POST: the reconcile deletes c, N's keyset
+    /// becomes ⊆ R, and the shard is committed to R (relinquish).
+    #[test]
+    fn failed_handoff_reconciles_then_relinquishes() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+        let (table, shard, self_id, rightful, committed_members, task) = phantom_handoff_fixture();
+
+        let engine = Arc::new(test_engine());
+        // N holds {a, b} that R also holds, plus c that the cluster deleted.
+        let key_a = tx_key_for_shard(shard, 1);
+        let key_b = tx_key_for_shard(shard, 2);
+        let key_c = tx_key_for_shard(shard, 3);
+        create_test_record(&engine, key_a);
+        create_test_record(&engine, key_b);
+        create_test_record(&engine, key_c);
+        let g = |k: &TxKey| engine.read_metadata(k).unwrap().generation;
+        let authoritative = vec![(key_a, g(&key_a)), (key_b, g(&key_b))];
+
+        let shard_table: Arc<ShardTableLock<ShardTable>> =
+            Arc::new(ShardTableLock::new(table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            self_id,
+            &std::collections::HashSet::new(),
+        );
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let mut live: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+        live.insert(self_id);
+        let ctx = RelinquishContext {
+            committed_members: committed_members.clone(),
+            rf: 2,
+            placement_version: 1,
+            self_id,
+            live_members: live,
+            engine: engine.clone(),
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = spawn_reconcile_responder(addr, reconcile_ok_payload(shard, &authoritative));
+
+        // Forward superset probe FAILS (R lacks c). Reverse reconcile succeeds.
+        let superset_probe = || false;
+        let reconcile =
+            || reconcile_down_to_authoritative_master(addr, shard, self_id, 9, &engine, None);
+        let failed = fail_or_relinquish_outbound_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            9,
+            Some(&ctx),
+            Some(&superset_probe),
+            Some(&reconcile),
+        );
+        let op = server.join().unwrap();
+        assert_eq!(op, OP_SHARD_RECONCILE_REQUEST);
+        assert!(failed, "the task must be marked failed");
+
+        // c deleted; the shard committed to the rightful master (relinquished).
+        assert!(matches!(
+            engine.read_metadata(&key_c),
+            Err(crate::ops::error::SpendError::TxNotFound)
+        ));
+        assert_eq!(engine.shard_record_count(shard), 2);
+        assert_eq!(
+            shard_table.read().effective_assignment(shard).master,
+            rightful,
+            "after reconcile the phantom master relinquishes the shard to R",
+        );
+    }
+
+    /// #36 NO-LOSS integration — when the reverse reconcile CANNOT complete (R
+    /// not authoritative), `fail_or_relinquish_outbound_task` keeps the
+    /// historical `RollbackToSelf`: N RETAINS every record (including the one R
+    /// lacks) and stays master. No deletion, no relinquish.
+    #[test]
+    fn failed_handoff_retains_and_rolls_back_when_reconcile_unproven() {
+        let _guard = migration_metrics_test_guard();
+        let _metrics = install_test_migration_metrics();
+        let (table, shard, self_id, _rightful, committed_members, task) = phantom_handoff_fixture();
+
+        let engine = Arc::new(test_engine());
+        let key_a = tx_key_for_shard(shard, 1);
+        let key_unique = tx_key_for_shard(shard, 9); // genuinely-unique live record
+        create_test_record(&engine, key_a);
+        create_test_record(&engine, key_unique);
+
+        let shard_table: Arc<ShardTableLock<ShardTable>> =
+            Arc::new(ShardTableLock::new(table.clone()));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        migration.lock().start_outbound(
+            std::slice::from_ref(&task),
+            self_id,
+            &std::collections::HashSet::new(),
+        );
+        let fenced = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+
+        let mut live: std::collections::HashSet<NodeId> =
+            committed_members.iter().copied().collect();
+        live.insert(self_id);
+        let ctx = RelinquishContext {
+            committed_members: committed_members.clone(),
+            rf: 2,
+            placement_version: 1,
+            self_id,
+            live_members: live,
+            engine: engine.clone(),
+        };
+
+        // R rejects: not authoritative-complete.
+        let reject = ResponseFrame {
+            request_id: shard as u64,
+            status: STATUS_ERROR,
+            payload: crate::protocol::codec::encode_error_payload(
+                ERR_NOT_AUTHORITATIVE_COMPLETE,
+                "not authoritative-complete",
+            ),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = spawn_reconcile_responder(addr, reject);
+
+        let superset_probe = || false;
+        let reconcile =
+            || reconcile_down_to_authoritative_master(addr, shard, self_id, 9, &engine, None);
+        let failed = fail_or_relinquish_outbound_task(
+            &migration,
+            &shard_table,
+            &fenced,
+            &migrating,
+            &task,
+            9,
+            Some(&ctx),
+            Some(&superset_probe),
+            Some(&reconcile),
+        );
+        server.join().unwrap();
+        assert!(failed);
+
+        // No deletion (no-loss); the unique live record survives.
+        assert_eq!(engine.shard_record_count(shard), 2);
+        assert!(engine.read_metadata(&key_unique).is_ok());
+        // Rolled back to self — N stays master, no relinquish.
+        assert_eq!(
+            shard_table.read().effective_assignment(shard).master,
+            self_id,
+            "an unproven reconcile keeps the no-loss rollback (N stays master)",
+        );
+    }
+
+    /// #36 — the `RunningCluster` completeness proof. The committed master that
+    /// is serving the shard with no pending inbound at the current epoch is
+    /// proven; flipping any one input breaks the proof.
+    #[test]
+    fn running_cluster_authoritative_complete_proof() {
+        let members = vec![NodeId(1), NodeId(2)];
+        let table = ShardTable::compute_with_epoch(&members, 1, 70, 1);
+        // A shard mastered by node 1 (self) in the committed table.
+        let shard = (0..NUM_SHARDS as u16)
+            .find(|&s| table.target_assignment(s).master == NodeId(1))
+            .expect("some shard masters to node 1");
+        let addr = "127.0.0.1:4799".parse().unwrap();
+
+        // PROVEN: epoch-current (70), self is master, no pending inbound.
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table.clone(),
+            &[(NodeId(1), addr)],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        assert!(
+            cluster.is_authoritative_complete_for_shard(shard, 70),
+            "serving master at current epoch with no pending inbound is authoritative-complete"
+        );
+        // FALSE — wrong epoch.
+        assert!(!cluster.is_authoritative_complete_for_shard(shard, 71));
+        // FALSE — epoch 0 can never be current.
+        assert!(!cluster.is_authoritative_complete_for_shard(shard, 0));
+
+        // FALSE — mid-inbound for the shard (still catching up).
+        let cluster_inbound = new_test_running_cluster(
+            NodeId(1),
+            table.clone(),
+            &[(NodeId(1), addr)],
+            &members,
+            &[shard], // pending inbound for the shard
+            &[],
+            &[],
+            1,
+        );
+        assert!(
+            !cluster_inbound.is_authoritative_complete_for_shard(shard, 70),
+            "a node mid-inbound for the shard is NOT complete"
+        );
+
+        // FALSE — not the master/target for the shard. Pick a shard mastered by
+        // node 2 and ask node 1's cluster.
+        let peer_shard = (0..NUM_SHARDS as u16)
+            .find(|&s| {
+                table.target_assignment(s).master == NodeId(2)
+                    && table.effective_assignment(s).master == NodeId(2)
+            })
+            .expect("some shard masters to node 2");
+        assert!(
+            !cluster.is_authoritative_complete_for_shard(peer_shard, 70),
+            "a non-master for the shard is NOT authoritative"
         );
     }
 

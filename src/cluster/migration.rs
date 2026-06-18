@@ -739,6 +739,49 @@ impl MigrationManager {
         self.inbound_bitmap.test(shard)
     }
 
+    /// #36 — reverse manifest reconciliation: prove this node (`R`) is the
+    /// AUTHORITATIVE-AND-COMPLETE holder of `shard`, so the keyset it returns
+    /// in an `OP_SHARD_RECONCILE_REQUEST` reply is a faithful, complete account
+    /// the requester (`N`) may reconcile DOWN to (delete `local − R`).
+    ///
+    /// The proof is the AND of three facts, all of which the CALLER computes
+    /// from the committed shard table and passes in, EXCEPT the third which is
+    /// this manager's own inbound state:
+    ///
+    ///   - `epoch_current`: the requested reconciliation epoch equals `R`'s
+    ///     committed shard-table version. A mismatched epoch means `R`'s view
+    ///     of ownership is stale (it has not activated the epoch `N` is
+    ///     reconciling at, or it has moved past it) — its keyset is not a
+    ///     trustworthy account of the shard at `N`'s epoch.
+    ///   - `is_master_or_target`: `R` is the EFFECTIVE master OR the TARGET
+    ///     master for `shard` in the committed table (the authoritative holder
+    ///     — the same test as the #29 `source_is_authoritative_complete` gate
+    ///     in `dispatch.rs`). A node that merely holds a partial replica copy
+    ///     is NOT authoritative; its omission of a key is not evidence the key
+    ///     is stale.
+    ///   - `!self.has_pending_inbound(shard)`: `R` has FULLY ASSEMBLED and is
+    ///     SERVING the shard — it is NOT itself mid-catch-up with an in-flight
+    ///     inbound migration for `shard`. A mid-inbound `R` may legitimately
+    ///     lack records that are still streaming to it, so reconciling down to
+    ///     its partial keyset would delete genuinely-live data on `N`.
+    ///
+    /// Returns `true` only when ALL THREE hold. Any one missing → `false`, and
+    /// the reconcile reply is `ERR_NOT_AUTHORITATIVE_COMPLETE` (the requester
+    /// RETAINS everything and retries — no-loss, identical bias to #29).
+    ///
+    /// This is a SIBLING of [`Self::has_committed_handoff`] (the source-side
+    /// deletion-authority gate): both establish "this node demonstrably holds
+    /// the authoritative copy" before any cross-node deletion is allowed, just
+    /// from opposite ends of the handoff.
+    pub fn is_authoritative_complete_for_shard(
+        &self,
+        shard: u16,
+        epoch_current: bool,
+        is_master_or_target: bool,
+    ) -> bool {
+        epoch_current && is_master_or_target && !self.has_pending_inbound(shard)
+    }
+
     /// Fence a shard on the source node — writes for this shard will be
     /// rejected with ERR_MIGRATION_IN_PROGRESS. Reads continue locally.
     pub fn fence_shard(&mut self, shard: u16) {
@@ -1711,6 +1754,37 @@ mod tests {
 
         mgr.mark_inbound_complete(42);
         assert!(!mgr.has_pending_inbound(42));
+    }
+
+    /// #36 — the authoritative-complete predicate is the AND of all three
+    /// facts: serving (no pending inbound) + epoch-current + master-or-target.
+    /// Dropping ANY one falsifies it.
+    #[test]
+    fn is_authoritative_complete_requires_all_three_conditions() {
+        let shard = 88u16;
+        let mut mgr = MigrationManager::new();
+
+        // All true → proven. (no pending inbound, epoch_current, master/target)
+        assert!(mgr.is_authoritative_complete_for_shard(shard, true, true));
+
+        // Drop epoch-current → false.
+        assert!(!mgr.is_authoritative_complete_for_shard(shard, false, true));
+        // Drop master-or-target → false.
+        assert!(!mgr.is_authoritative_complete_for_shard(shard, true, false));
+
+        // Drop "serving" by registering a pending inbound for the shard → false,
+        // even with epoch-current and master/target both true.
+        assert!(mgr.mark_inbound_active(shard));
+        assert!(mgr.has_pending_inbound(shard));
+        assert!(
+            !mgr.is_authoritative_complete_for_shard(shard, true, true),
+            "a node mid-inbound for the shard is NOT complete"
+        );
+
+        // Once the inbound completes, the proof holds again.
+        mgr.mark_inbound_complete(shard);
+        assert!(!mgr.has_pending_inbound(shard));
+        assert!(mgr.is_authoritative_complete_for_shard(shard, true, true));
     }
 
     #[test]
