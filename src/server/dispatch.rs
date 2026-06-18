@@ -3398,11 +3398,14 @@ fn compensate_replication_failure(
                         record_size: 0,
                     });
                 }
-                ReplicaOp::Delete { .. } => {
+                ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. } => {
                     // Delete compensation is handled directly in
                     // handle_delete_batch using pre-captured record snapshots.
                     // If this path is reached from another handler, the record
                     // is already destroyed and cannot be restored here.
+                    // `DeleteV2` behaves identically to `Delete` for rollback —
+                    // the extra tombstone fields don't change that the record
+                    // cannot be reconstructed at this point.
                 }
                 ReplicaOp::MarkLongestChain {
                     on_longest_chain,
@@ -6543,6 +6546,30 @@ pub(crate) fn build_delete_compensation_ops(key: &TxKey, snap: &DeleteSnapshot) 
     ops
 }
 
+/// Choose the master→replica delete op (deletion-tombstone §6).
+///
+/// When the master's own delete wrote a tombstone (`info` is `Some`), emit
+/// `DeleteV2` carrying those exact `deletion_height` / `generation` / `cause`
+/// values so the replica records a matching tombstone and self-purges on its
+/// own restart. When no tombstone was written (`info` is `None` — tombstones
+/// disabled or no log attached), fall back to the V1 `Delete`, keeping the
+/// `tombstones_enabled = false` behavior byte-identical to the pre-tombstone
+/// path.
+fn delete_replica_op_for(
+    key: TxKey,
+    info: Option<crate::ops::engine::DeleteTombstoneInfo>,
+) -> ReplicaOp {
+    match info {
+        Some(info) => ReplicaOp::DeleteV2 {
+            tx_key: key,
+            deletion_height: info.deletion_height,
+            generation: info.generation,
+            cause: info.cause.as_u8(),
+        },
+        None => ReplicaOp::Delete { tx_key: key },
+    }
+}
+
 fn handle_delete_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -6833,18 +6860,27 @@ fn handle_delete_batch(
         if item_failed {
             continue;
         }
-        match engine.delete(&DeleteRequest {
+        match engine.delete_returning_tombstone(&DeleteRequest {
             tx_key: v.key,
             due_guard: sweep_due_height,
         }) {
-            Ok(()) => {
+            Ok(tombstone_info) => {
                 repl_ops_by_key.extend(item_prune_ops);
                 before_images_by_key.extend(item_prune_before);
+                // Deletion-tombstone §6: emit `DeleteV2` carrying the SAME
+                // tombstone fields the master's own delete recorded, so the
+                // replica writes a matching tombstone and self-purges on its
+                // own restart. `tombstone_info` is `Some` exactly when a
+                // tombstone was written (feature on AND log attached); when
+                // it is `None` (tombstones disabled / no log) we emit the V1
+                // `Delete`, keeping that fallback byte-identical to the
+                // pre-tombstone behavior.
+                let delete_op = delete_replica_op_for(v.key, tombstone_info);
                 push_repl_with_before_image(
                     &mut repl_ops_by_key,
                     &mut before_images_by_key,
                     v.key,
-                    ReplicaOp::Delete { tx_key: v.key },
+                    delete_op,
                     BeforeImage::None,
                 );
             }
@@ -6977,16 +7013,24 @@ fn handle_delete_batch(
                 tracing::error!(cause = %cause, "delete compensation aborted; node is in degraded state");
                 return error_response(req.request_id, ERR_INTERNAL, &cause);
             }
-            // Also compensate any non-delete ops in the same batch.
+            // Also compensate any non-delete ops in the same batch. `DeleteV2`
+            // counts as a delete here (it is the tombstone-carrying form this
+            // handler now emits) so it is NOT re-compensated as a "non-delete".
             let non_delete: Vec<_> = repl_ops_by_key
                 .iter()
-                .filter(|(_, ops)| !ops.iter().any(|o| matches!(o, ReplicaOp::Delete { .. })))
+                .filter(|(_, ops)| {
+                    !ops.iter()
+                        .any(|o| matches!(o, ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. }))
+                })
                 .cloned()
                 .collect();
             let non_delete_before: Vec<_> = repl_ops_by_key
                 .iter()
                 .zip(before_images_by_key.iter())
-                .filter(|((_, ops), _)| !ops.iter().any(|o| matches!(o, ReplicaOp::Delete { .. })))
+                .filter(|((_, ops), _)| {
+                    !ops.iter()
+                        .any(|o| matches!(o, ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. }))
+                })
                 .map(|(_, before)| before.clone())
                 .collect();
             if !non_delete.is_empty() {
@@ -17542,6 +17586,74 @@ mod tests {
     }
 
     /// Delete items should tick deletes_succeeded / deletes_failed per item.
+    #[test]
+    fn master_emit_delete_v2_when_tombstone_written() {
+        // Deletion-tombstone §6 master emit gating: a written tombstone →
+        // DeleteV2 carrying the exact fields; no tombstone → V1 Delete.
+        let k = TxKey { txid: [0x44; 32] };
+
+        let v2 = delete_replica_op_for(
+            k,
+            Some(crate::ops::engine::DeleteTombstoneInfo {
+                deletion_height: 700_222,
+                generation: 13,
+                cause: crate::tombstone::TombstoneCause::SpentDah,
+            }),
+        );
+        match v2 {
+            ReplicaOp::DeleteV2 {
+                tx_key,
+                deletion_height,
+                generation,
+                cause,
+            } => {
+                assert_eq!(tx_key, k);
+                assert_eq!(deletion_height, 700_222);
+                assert_eq!(generation, 13);
+                assert_eq!(cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
+            }
+            other => panic!("expected DeleteV2, got {other:?}"),
+        }
+
+        // tombstones disabled / no log → V1 Delete fallback.
+        let v1 = delete_replica_op_for(k, None);
+        assert_eq!(v1, ReplicaOp::Delete { tx_key: k });
+    }
+
+    #[test]
+    fn master_delete_writes_tombstone_end_to_end() {
+        // The full master delete-batch dispatch writes a tombstone when the
+        // feature is active — the precondition that makes the emit a DeleteV2.
+        let h = DispatchTestHarness::new();
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let log = crate::tombstone::TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
+        let log = Arc::new(Mutex::new(log));
+        let dir = TempDir::new().unwrap();
+        let idx = crate::index::redb_tombstone::RedbTombstoneIndex::open(
+            &dir.path().join("tombstone.redb"),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        let idx = Arc::new(Mutex::new(idx));
+        h.engine.set_tombstone_log(log.clone());
+        h.engine.set_tombstone_index(idx.clone());
+
+        let txid = DispatchTestHarness::make_txid(95);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let payload = encode_txid_batch(&[txid], &[]);
+        let resp = h.request(OP_DELETE_BATCH, payload);
+        assert_eq!(resp.status, STATUS_OK);
+
+        let k = TxKey { txid };
+        assert!(h.engine.lookup(&k).is_none(), "record removed");
+        assert!(
+            idx.lock().is_tombstoned(&k),
+            "master delete wrote a tombstone (DeleteV2 precondition)",
+        );
+        assert_eq!(log.lock().scan().unwrap().len(), 1);
+    }
+
     #[test]
     fn handle_delete_batch_ticks_outcome_counters() {
         let m = test_metrics();

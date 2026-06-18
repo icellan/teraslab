@@ -99,6 +99,28 @@ const OP_DELETE: u8 = 12;
 const OP_PRUNE_SLOT: u8 = 13;
 const OP_MARK_LONGEST_CHAIN: u8 = 14;
 const OP_PRUNE_SLOT_IF_SPENT_BY: u8 = 15;
+/// Deletion-tombstone §6: a delete that carries the tombstone fields so the
+/// replica records the tombstone alongside the record removal. The legacy
+/// [`OP_DELETE`] (tag 12) stays decodable for back-compat (an old peer or an
+/// old redo/receive replay) and is emitted unchanged when tombstones are
+/// disabled. Mirrors the `CreateV2`/`SpendV2` versioning precedent: new tag,
+/// old tag retained.
+const OP_DELETE_V2: u8 = 16;
+
+/// Fixed wire payload of a [`ReplicaOp::DeleteV2`] op, AFTER the 1-byte
+/// [`OP_DELETE_V2`] tag. `#[repr(C, packed)]` pins the on-wire byte order to
+/// declaration order with no compiler padding, matching the manual
+/// little-endian encode/decode below. All multi-byte fields are stored
+/// little-endian; the compile-time assertion guards the 41-byte size.
+#[repr(C, packed)]
+struct DeleteV2Wire {
+    txid: [u8; 32],
+    deletion_height: u32,
+    generation: u32,
+    cause: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<DeleteV2Wire>() == 41);
 
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
@@ -190,6 +212,28 @@ pub enum ReplicaOp {
     Delete {
         tx_key: TxKey,
     },
+    /// Delete carrying the tombstone fields (deletion-tombstone §6).
+    ///
+    /// Applied by the receiver as: remove the record (same as [`Self::Delete`])
+    /// AND write a tombstone via the engine's existing tombstone-write path,
+    /// so the replica's own restart self-purges (§5.2) and its redb tombstone
+    /// index is updated. The master emits this (instead of [`Self::Delete`])
+    /// when `tombstones_enabled`, carrying the same `deletion_height` /
+    /// `generation` / `cause` the master's own tombstone recorded. `cause` is
+    /// the [`crate::tombstone::TombstoneCause`] discriminant byte.
+    ///
+    /// Like [`Self::Delete`], this carries no `master_generation` idempotency
+    /// token — it is an idempotent remove keyed on `tx_key`. The `generation`
+    /// here is the *tombstone's* generation (the record's generation at
+    /// deletion), a first-class tombstone field, not the replication ordering
+    /// token. `master_generation()` therefore returns `None` for this op,
+    /// exactly as for [`Self::Delete`].
+    DeleteV2 {
+        tx_key: TxKey,
+        deletion_height: u32,
+        generation: u32,
+        cause: u8,
+    },
     PruneSlot {
         tx_key: TxKey,
         offset: u32,
@@ -232,6 +276,7 @@ impl ReplicaOp {
             | Self::PreserveUntil { tx_key, .. }
             | Self::Create { tx_key, .. }
             | Self::Delete { tx_key, .. }
+            | Self::DeleteV2 { tx_key, .. }
             | Self::PruneSlot { tx_key, .. }
             | Self::PruneSlotIfSpentBy { tx_key, .. }
             | Self::MarkLongestChain { tx_key, .. } => *tx_key,
@@ -279,7 +324,14 @@ impl ReplicaOp {
                 master_generation, ..
             } => Some(*master_generation),
             Self::Create { metadata_bytes, .. } => create_embedded_generation(metadata_bytes),
-            Self::Delete { .. } | Self::PruneSlot { .. } | Self::PruneSlotIfSpentBy { .. } => None,
+            // DeleteV2's `generation` is the tombstone's own field, NOT the
+            // replication ordering token — it is an idempotent remove keyed on
+            // `tx_key`, exactly like `Delete`. So it carries no
+            // `master_generation`.
+            Self::Delete { .. }
+            | Self::DeleteV2 { .. }
+            | Self::PruneSlot { .. }
+            | Self::PruneSlotIfSpentBy { .. } => None,
         }
     }
 }
@@ -463,6 +515,20 @@ impl ReplicaOp {
             ReplicaOp::Delete { tx_key } => {
                 buf.push(OP_DELETE);
                 buf.extend_from_slice(&tx_key.txid);
+            }
+            ReplicaOp::DeleteV2 {
+                tx_key,
+                deletion_height,
+                generation,
+                cause,
+            } => {
+                // Layout mirrors `DeleteV2Wire` (txid | dh | gen | cause), all
+                // little-endian, 41 payload bytes after the tag.
+                buf.push(OP_DELETE_V2);
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&deletion_height.to_le_bytes());
+                buf.extend_from_slice(&generation.to_le_bytes());
+                buf.push(*cause);
             }
             ReplicaOp::PruneSlot { tx_key, offset } => {
                 buf.push(OP_PRUNE_SLOT);
@@ -709,6 +775,19 @@ impl ReplicaOp {
                         tx_key: read_key(rest),
                     },
                     33,
+                ))
+            }
+            OP_DELETE_V2 => {
+                // 32(txid) + 4(deletion_height) + 4(generation) + 1(cause) = 41.
+                need(rest, 41)?;
+                Ok((
+                    ReplicaOp::DeleteV2 {
+                        tx_key: read_key(rest),
+                        deletion_height: r_u32(rest, 32),
+                        generation: r_u32(rest, 36),
+                        cause: rest[40],
+                    },
+                    42,
                 ))
             }
             OP_PRUNE_SLOT => {
@@ -1145,6 +1224,81 @@ mod tests {
     }
 
     #[test]
+    fn delete_v2_round_trip_all_fields() {
+        // Deletion-tombstone §6: DeleteV2 carries the tombstone fields. Cover
+        // a non-zero deletion_height + generation + each cause discriminant.
+        for cause in [
+            crate::tombstone::TombstoneCause::SpentDah,
+            crate::tombstone::TombstoneCause::Admin,
+            crate::tombstone::TombstoneCause::MigrationPrune,
+        ] {
+            let op = ReplicaOp::DeleteV2 {
+                tx_key: key(7),
+                deletion_height: 0x0123_4567,
+                generation: 0x89AB_CDEF,
+                cause: cause.as_u8(),
+            };
+            let bytes = op.serialize();
+            // 1 (tag) + 32 (txid) + 4 (dh) + 4 (gen) + 1 (cause) = 42 bytes.
+            assert_eq!(bytes.len(), 42, "DeleteV2 wire size");
+            assert_eq!(bytes[0], OP_DELETE_V2, "DeleteV2 op tag is 16");
+            let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+            assert_eq!(decoded, op, "DeleteV2 round-trip failed for {cause:?}");
+            assert_eq!(consumed, bytes.len());
+            // Verify the decoded fields explicitly (packed → local copies).
+            match decoded {
+                ReplicaOp::DeleteV2 {
+                    tx_key,
+                    deletion_height,
+                    generation,
+                    cause: got_cause,
+                } => {
+                    assert_eq!(tx_key, key(7));
+                    assert_eq!(deletion_height, 0x0123_4567);
+                    assert_eq!(generation, 0x89AB_CDEF);
+                    assert_eq!(got_cause, cause.as_u8());
+                }
+                other => panic!("expected DeleteV2, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn delete_v2_wire_struct_is_41_bytes() {
+        // Guards the fixed payload size the manual encode/decode mirrors.
+        assert_eq!(core::mem::size_of::<DeleteV2Wire>(), 41);
+    }
+
+    #[test]
+    fn delete_v2_does_not_carry_master_generation() {
+        // Like V1 Delete, DeleteV2 is an idempotent remove keyed on tx_key —
+        // its `generation` is the tombstone field, NOT the replication
+        // ordering token, so `master_generation()` must be None.
+        let op = ReplicaOp::DeleteV2 {
+            tx_key: key(3),
+            deletion_height: 10,
+            generation: 99,
+            cause: crate::tombstone::TombstoneCause::Admin.as_u8(),
+        };
+        assert_eq!(op.master_generation(), None);
+        assert_eq!(op.tx_key(), key(3));
+    }
+
+    #[test]
+    fn v1_delete_still_decodes_unchanged() {
+        // Back-compat: the V1 Delete op (tag 12, 33 bytes) must still encode
+        // and decode exactly as before DeleteV2 was added.
+        let op = ReplicaOp::Delete { tx_key: key(5) };
+        let bytes = op.serialize();
+        assert_eq!(bytes.len(), 33, "V1 Delete wire size unchanged");
+        assert_eq!(bytes[0], OP_DELETE, "V1 Delete tag is 12");
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, op);
+        assert_eq!(consumed, 33);
+        assert_eq!(decoded.master_generation(), None);
+    }
+
+    #[test]
     fn all_variants_round_trip() {
         let ops = vec![
             ReplicaOp::Spend {
@@ -1223,6 +1377,12 @@ mod tests {
                 is_external: false,
             },
             ReplicaOp::Delete { tx_key: key(12) },
+            ReplicaOp::DeleteV2 {
+                tx_key: key(16),
+                deletion_height: 812_345,
+                generation: 9,
+                cause: crate::tombstone::TombstoneCause::SpentDah.as_u8(),
+            },
             ReplicaOp::PruneSlot {
                 tx_key: key(13),
                 offset: 99,

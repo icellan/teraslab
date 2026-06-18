@@ -6484,6 +6484,20 @@ pub fn redo_entry_to_replica_op(
             // A delete after the baseline snapshot must be forwarded so the
             // target removes the record. Without this, deleted records would
             // be resurrected on the target.
+            //
+            // Deletion-tombstone §6 scope note: this converter stays on the V1
+            // `ReplicaOp::Delete`. It feeds the migration-baseline catch-up
+            // (which must remain V1/unchanged this phase) AND the
+            // replication-intent crash-recovery re-emit. The live foreground
+            // delete path emits `DeleteV2` (carrying tombstone fields) directly
+            // in `handle_delete_batch`; only a master crash BETWEEN the redo
+            // commit and the fan-out falls back here, re-emitting V1 Delete.
+            // The replica then removes the record but records no pre-arm
+            // tombstone — strictly no worse than the pre-tombstone behavior and
+            // never a resurrection of the deleted record itself. Closing this
+            // gap requires a `RedoOp::DeleteV2` carrying the fields (touches the
+            // redo wire format + this shared converter for both callers), which
+            // is deferred to keep this phase surgical.
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
             }

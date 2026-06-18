@@ -136,6 +136,24 @@ impl Drop for MigrationJournalGuard {
 /// replication compensation) MUST either already hold the appropriate
 /// stripe lock or accept that the snapshot may be staler than the
 /// committed engine state by the time their follow-up mutation runs.
+///
+/// The exact tombstone fields written by a public delete (deletion-tombstone
+/// §6). Returned by [`Engine::delete_returning_tombstone`] so the master
+/// replication path can emit a `DeleteV2` carrying the *same* values the
+/// master's own tombstone recorded (matching generation / deletion_height /
+/// cause), instead of re-deriving them on the replica. `None` is returned by
+/// that method when no tombstone was written (feature off or no log attached).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteTombstoneInfo {
+    /// Block height recorded in the tombstone (sweep height for a DAH delete,
+    /// observed tip for an admin delete).
+    pub deletion_height: u32,
+    /// The record's generation counter at deletion time.
+    pub generation: u32,
+    /// Why the record was deleted.
+    pub cause: crate::tombstone::TombstoneCause,
+}
+
 pub struct Engine {
     device: Arc<dyn BlockDevice>,
     /// Raw pointer to device memory for zero-copy I/O on the hot path.
@@ -5049,6 +5067,28 @@ impl Engine {
         // recovery R2 self-purge uses `delete_inner(.., false)` instead so it
         // never re-tombstones a key whose tombstone already exists.
         self.delete_inner(req, self.tombstone_write_active())
+            .map(|_| ())
+    }
+
+    /// Like [`Self::delete`] but returns the exact tombstone fields written
+    /// (deletion-tombstone §6).
+    ///
+    /// Returns `Ok(Some(info))` when a tombstone was written (the feature is
+    /// active and a log is attached), carrying the `deletion_height`,
+    /// `generation`, and `cause` recorded — so the master replication path can
+    /// emit a `DeleteV2` carrying those same values to replicas. Returns
+    /// `Ok(None)` when no tombstone was written (feature off or no log
+    /// attached); the caller then falls back to emitting a V1 `Delete`, keeping
+    /// the `tombstones_enabled = false` behavior byte-identical.
+    ///
+    /// # Errors
+    /// Same as [`Self::delete`]: [`SpendError::TxNotFound`] if the key is
+    /// absent, or [`SpendError::StorageError`] on a device/index failure.
+    pub fn delete_returning_tombstone(
+        &self,
+        req: &DeleteRequest,
+    ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
+        self.delete_inner(req, self.tombstone_write_active())
     }
 
     /// Internal delete with explicit tombstone control.
@@ -5077,7 +5117,11 @@ impl Engine {
     /// 6. (tombstone path only) insert the derived redb tombstone row. Not
     ///    fsynced here; a crash after the log append but before this insert
     ///    is re-derived by recovery's `rebuild_from`.
-    fn delete_inner(&self, req: &DeleteRequest, write_tombstone: bool) -> Result<(), SpendError> {
+    fn delete_inner(
+        &self,
+        req: &DeleteRequest,
+        write_tombstone: bool,
+    ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
@@ -5130,6 +5174,22 @@ impl Engine {
         } else {
             None
         };
+
+        // Capture the exact fields written so the master replication path can
+        // emit a `DeleteV2` carrying them (deletion-tombstone §6). `cause` came
+        // from a known [`crate::tombstone::TombstoneCause`] inside
+        // `append_delete_tombstone`, so `from_u8` here never fails; on the
+        // impossible corruption case we treat it as "no info" and the caller
+        // falls back to a V1 `Delete`.
+        let tombstone_info = tombstone_to_index.as_ref().and_then(|(_, v)| {
+            crate::tombstone::TombstoneCause::from_u8(v.cause)
+                .ok()
+                .map(|cause| DeleteTombstoneInfo {
+                    deletion_height: v.deletion_height,
+                    generation: v.generation,
+                    cause,
+                })
+        });
 
         // Step 2: Tombstone the metadata before freeing the region so crash-time
         // index rebuilds cannot resurrect this record from stale bytes in freed
@@ -5216,7 +5276,7 @@ impl Engine {
             self.update_unmined_index(&req.tx_key, old_unmined, 0)?;
         }
 
-        Ok(())
+        Ok(tombstone_info)
     }
 
     /// Delete a record WITHOUT writing a new deletion tombstone.
@@ -5228,7 +5288,7 @@ impl Engine {
     /// region free, secondary cleanup) are identical to [`Self::delete`], so
     /// re-running recovery is idempotent.
     pub(crate) fn delete_for_purge(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, false)
+        self.delete_inner(req, false).map(|_| ())
     }
 
     /// Build the [`crate::tombstone::Tombstone`] for this delete, append it
@@ -5297,6 +5357,104 @@ impl Engine {
             cause: cause.as_u8(),
         };
         Ok(Some((req.tx_key, value)))
+    }
+
+    /// Record a tombstone replicated from the master with *exact* carried
+    /// fields (deletion-tombstone §6, replica `DeleteV2` apply).
+    ///
+    /// Unlike [`Self::append_delete_tombstone`] — which derives the fields from
+    /// the local record at delete time — this writes the master's
+    /// `deletion_height` / `generation` / `cause` verbatim, so the replica's
+    /// tombstone matches the master's. The receiver calls it AFTER removing the
+    /// record (record-removal-then-tombstone ordering, §6); a crash in between
+    /// leaves "record gone, tombstone pending," which recovery R2 re-derives
+    /// harmlessly.
+    ///
+    /// The key need NOT exist locally: a replica that never held the key still
+    /// records the tombstone (the §6 "pre-arm" benefit, cheap at 56 B) so a
+    /// later resurrecting source self-purges.
+    ///
+    /// Idempotent: if the redb index already carries a row for `tx_key`, this
+    /// is a no-op — it does NOT append a duplicate to the durable log
+    /// (re-applying a `DeleteV2` in a re-sent batch costs no extra SSD wear).
+    /// The `shard` is derived from `tx_key`, matching the master.
+    ///
+    /// Inert (returns `Ok(())` doing nothing) when no tombstone log is
+    /// attached, so the `tombstones_enabled = false` / no-log fallback path
+    /// behaves exactly as before.
+    ///
+    /// # Errors
+    /// [`SpendError::StorageError`] if the durable log append / sync fails. A
+    /// redb-index insert failure is logged but NOT fatal: the durable log
+    /// carries the tombstone and recovery `rebuild_from` re-derives the row.
+    pub fn apply_replicated_tombstone(
+        &self,
+        tx_key: &TxKey,
+        deletion_height: u32,
+        generation: u32,
+        cause: u8,
+    ) -> Result<(), SpendError> {
+        let Some(log) = self.tombstone_log.get() else {
+            return Ok(());
+        };
+
+        // Validate the cause byte up front so a corrupt op can never decode to
+        // a wrong variant on disk (mirrors `TombstoneCause::from_u8`).
+        let cause_enum = crate::tombstone::TombstoneCause::from_u8(cause).map_err(|e| {
+            SpendError::StorageError {
+                detail: format!("replicated tombstone has unknown cause byte: {e}"),
+            }
+        })?;
+
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(tx_key);
+
+        // Idempotency: if the redb index already carries this key, the
+        // tombstone is already durable (the log carries it, the index derives
+        // from it). Skip re-appending to avoid duplicate log entries on a
+        // re-sent batch. The index is the derived view, but it is the cheapest
+        // membership probe; on a crash that lost the index row the log is
+        // re-scanned at recovery, and a re-sent `DeleteV2` then re-appends —
+        // harmless (last-writer-wins on key in `rebuild_from`).
+        if let Some(idx) = self.tombstone_index.get()
+            && idx.lock().is_tombstoned(tx_key)
+        {
+            return Ok(());
+        }
+
+        let tombstone = crate::tombstone::Tombstone::new(
+            tx_key.txid,
+            shard,
+            deletion_height,
+            generation,
+            cause_enum,
+            0,
+        );
+
+        {
+            let mut guard = log.lock();
+            guard
+                .append_synced(&tombstone)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("replicated tombstone log append failed: {e}"),
+                })?;
+        }
+
+        // Insert the derived redb row. Non-fatal on failure: the durable log
+        // already carries the tombstone and recovery `rebuild_from` re-derives
+        // the row.
+        if let Some(idx) = self.tombstone_index.get()
+            && let Err(e) = idx
+                .lock()
+                .insert(*tx_key, deletion_height, generation, shard, cause)
+        {
+            tracing::warn!(
+                err = %e,
+                "apply_replicated_tombstone: redb-index insert failed; log carries the \
+                 tombstone and recovery will re-derive the index row",
+            );
+        }
+
+        Ok(())
     }
 
     /// Best-effort observed tip height for admin-delete tombstones.
@@ -13200,6 +13358,140 @@ mod tests {
         assert_eq!(t_shard, expected_shard);
         assert_eq!(t_gen, gen_before_delete);
         assert_eq!(t.cause().unwrap(), crate::tombstone::TombstoneCause::Admin);
+    }
+
+    #[test]
+    fn delete_returning_tombstone_reports_written_fields() {
+        // Deletion-tombstone §6 master emit: the foreground delete returns the
+        // exact fields it wrote so the master can emit a matching `DeleteV2`.
+        let engine = create_engine();
+        let (_log, idx, _dir) = wire_tombstones(&engine);
+
+        let (_, req) = make_create_req(140, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        let gen_before = engine.lookup(&key).unwrap().generation;
+
+        // Admin delete (due_guard None): no sweep predicate, so it is
+        // unconditional. Cause = Admin, deletion_height = observed tip (0).
+        let info = engine
+            .delete_returning_tombstone(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap()
+            .expect("tombstone written → Some(info)");
+
+        assert_eq!(info.deletion_height, 0, "admin delete tip is 0 here");
+        assert_eq!(info.generation, gen_before);
+        assert_eq!(info.cause, crate::tombstone::TombstoneCause::Admin);
+        // And the fields match what landed in the index.
+        let v = idx.lock().get(&key).unwrap();
+        assert_eq!(v.deletion_height, info.deletion_height);
+        assert_eq!(v.generation, info.generation);
+        assert_eq!(v.cause, info.cause.as_u8());
+    }
+
+    #[test]
+    fn delete_returning_tombstone_is_none_when_disabled() {
+        // Fallback: with the feature off the master must emit V1 Delete, so
+        // `delete_returning_tombstone` returns None and writes no tombstone.
+        let engine = create_engine();
+        let (log, idx, _dir) = wire_tombstones(&engine);
+        engine.set_tombstones_enabled(false);
+
+        let (_, req) = make_create_req(141, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let info = engine
+            .delete_returning_tombstone(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+        assert!(info.is_none(), "disabled → None (V1 fallback)");
+        assert!(engine.lookup(&key).is_none(), "record still removed");
+        assert!(!idx.lock().is_tombstoned(&key));
+        assert!(log.lock().scan().unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_replicated_tombstone_writes_exact_fields_for_absent_key() {
+        // Deletion-tombstone §6 pre-arm: a replica that never held the key
+        // still records the tombstone with the master's EXACT carried fields.
+        let engine = create_engine();
+        let (log, idx, _dir) = wire_tombstones(&engine);
+
+        let k = TxKey { txid: [0x77; 32] };
+        assert!(engine.lookup(&k).is_none(), "key absent (pre-arm)");
+
+        engine
+            .apply_replicated_tombstone(
+                &k,
+                812_345,
+                42,
+                crate::tombstone::TombstoneCause::SpentDah.as_u8(),
+            )
+            .unwrap();
+
+        assert!(idx.lock().is_tombstoned(&k));
+        let v = idx.lock().get(&k).unwrap();
+        assert_eq!(v.deletion_height, 812_345);
+        assert_eq!(v.generation, 42);
+        assert_eq!(v.cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
+        assert_eq!(
+            v.shard,
+            crate::cluster::shards::ShardTable::shard_for_key(&k),
+            "shard derived from key, matching the master",
+        );
+        assert_eq!(log.lock().scan().unwrap().len(), 1, "one log entry");
+    }
+
+    #[test]
+    fn apply_replicated_tombstone_is_idempotent() {
+        // Re-applying the same DeleteV2 (re-sent batch) must be a no-op: one
+        // row, one durable log entry, no error, no duplicate append.
+        let engine = create_engine();
+        let (log, idx, _dir) = wire_tombstones(&engine);
+
+        let k = TxKey { txid: [0x55; 32] };
+        let cause = crate::tombstone::TombstoneCause::Admin.as_u8();
+        engine
+            .apply_replicated_tombstone(&k, 100, 7, cause)
+            .unwrap();
+        engine
+            .apply_replicated_tombstone(&k, 100, 7, cause)
+            .unwrap();
+
+        assert_eq!(idx.lock().len(), 1);
+        assert_eq!(
+            log.lock().scan().unwrap().len(),
+            1,
+            "idempotent: no duplicate log append on re-apply",
+        );
+    }
+
+    #[test]
+    fn apply_replicated_tombstone_rejects_unknown_cause() {
+        // A corrupt cause byte must be rejected, not silently decoded.
+        let engine = create_engine();
+        let (_log, _idx, _dir) = wire_tombstones(&engine);
+        let k = TxKey { txid: [0x33; 32] };
+        match engine.apply_replicated_tombstone(&k, 1, 1, 99) {
+            Err(SpendError::StorageError { .. }) => {}
+            other => panic!("expected StorageError for unknown cause, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_replicated_tombstone_inert_without_log() {
+        // No log attached → no-op success (the disabled / no-log fallback).
+        let engine = create_engine();
+        let k = TxKey { txid: [0x22; 32] };
+        engine
+            .apply_replicated_tombstone(&k, 5, 5, crate::tombstone::TombstoneCause::Admin.as_u8())
+            .unwrap();
     }
 
     #[test]
