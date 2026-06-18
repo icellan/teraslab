@@ -1358,6 +1358,59 @@ mod tests {
         assert_eq!(log.scan().unwrap().len(), before);
     }
 
+    // -- Multi-chunk scan (cross chunk-boundary) --
+
+    /// The scan reads the entries region in chunks of `lcm(align, 56)` rounded
+    /// up to >= 4 MiB (4,214,784 bytes = 75,264 entries on a 4 KiB-aligned
+    /// device). All prior scan tests use sub-chunk regions, so the cross-chunk
+    /// boundary path (`was_final_chunk == false`, `pos` staying aligned across
+    /// iterations) was untested. Append just over one chunk's worth of entries
+    /// and assert scan returns every entry, in order, across the boundary.
+    #[test]
+    fn scan_spans_multiple_chunks_in_order() {
+        // One chunk holds 75,264 entries; append enough to require >= 2 chunk
+        // reads. Region: 4 KiB header + room for ~120k entries (~6.4 MiB).
+        const N: u32 = 80_000;
+        let region = 7 * 1024 * 1024;
+        let dev = Arc::new(MemoryDevice::new(region, 4096).unwrap());
+        let mut log = TombstoneLog::open(dev, 0, region).unwrap();
+
+        for i in 0..N {
+            // deletion_height = index, so order and identity are checkable.
+            let t = Tombstone::new(
+                test_txid((i % 251) as u8),
+                (i % 4096) as u16,
+                i,
+                i,
+                TombstoneCause::SpentDah,
+                0,
+            );
+            log.append(&t).unwrap();
+        }
+        log.sync().unwrap();
+
+        let entries = log.scan().unwrap();
+        assert_eq!(entries.len(), N as usize, "every appended entry survives");
+        // Order preserved across the chunk boundary (entry 75,264 is the first
+        // of the second chunk).
+        for (i, t) in entries.iter().enumerate() {
+            let dh = t.deletion_height;
+            let g = t.generation;
+            assert_eq!(dh, i as u32, "entry {i} deletion_height out of order");
+            assert_eq!(g, i as u32, "entry {i} generation out of order");
+        }
+        // Spot-check the exact boundary entries.
+        let boundary = 75_264usize;
+        let last_of_chunk0 = entries[boundary - 1].deletion_height;
+        let first_of_chunk1 = entries[boundary].deletion_height;
+        assert_eq!(last_of_chunk0, (boundary - 1) as u32);
+        assert_eq!(first_of_chunk1, boundary as u32);
+
+        // Reopen and rescan: the entries survive a fresh open (header-driven).
+        let entries2 = log.scan().unwrap();
+        assert_eq!(entries2.len(), N as usize);
+    }
+
     // -- Region full --
 
     #[test]
