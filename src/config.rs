@@ -492,6 +492,21 @@ pub struct ServerConfig {
     /// conservative fallback per deletion-tombstone design §11.5.
     pub tombstones_enabled: bool,
 
+    /// Whether tombstone-driven migration reconciliation is enabled
+    /// (deletion-tombstone Phase 8, design §7/§11.5).
+    ///
+    /// Default `false` — the conservative, soak-pending state. When `false`,
+    /// `OP_MIGRATION_COMPLETE`, the completion-frame builder, the superset
+    /// proof, and the failed-handoff disposition behave EXACTLY as on the
+    /// pre-Phase-8 path (Fix B superset-accept + #29 prune gate): no tombstone
+    /// frame section is emitted or decoded and no tombstone-driven drop occurs.
+    /// When `true`, a rejoinee classifies its migration over-count against the
+    /// source's tombstone manifest (§7) — dropping authoritatively-deleted keys
+    /// while transferring never-received keys up — and the superset proof
+    /// relaxes to the source's non-tombstoned keys. Enable only after CI soak
+    /// validates convergence + no-loss + no-resurrection (design §11.3).
+    pub tombstone_reconciliation_enabled: bool,
+
     /// Path for the index snapshot file.
     pub index_snapshot_path: PathBuf,
 
@@ -854,6 +869,7 @@ impl Default for ServerConfig {
             tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
             tombstone_log_path: None,
             tombstones_enabled: true,
+            tombstone_reconciliation_enabled: false,
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
             expected_records: 100_000,
             lock_stripes: 65536,

@@ -216,6 +216,22 @@ pub struct Engine {
     /// skips the R2 self-purge. Set from config via
     /// [`Self::set_tombstones_enabled`].
     tombstones_enabled: std::sync::atomic::AtomicBool,
+    /// Master switch for tombstone-driven migration RECONCILIATION
+    /// (deletion-tombstone Phase 8, design §7/§11.5).
+    ///
+    /// Defaults to `false` — the conservative, soak-pending state. When
+    /// `false`, the `OP_MIGRATION_COMPLETE` reconciliation, the completion-frame
+    /// builder, the superset proof, and `failed_handoff_disposition` behave
+    /// EXACTLY as on the pre-Phase-8 path (Fix B superset-accept + #29 prune
+    /// gate): no tombstone frame section is emitted or decoded, and no
+    /// tombstone-driven drop occurs. When `true`, the rejoinee classifies its
+    /// over-count against the source's tombstone manifest (§7) and the superset
+    /// proof relaxes to non-tombstoned keys (§7). Set from config via
+    /// [`Self::set_tombstone_reconciliation_enabled`]; independent of
+    /// [`Self::tombstones_enabled`] (reconciliation additionally requires the
+    /// tombstone WRITE path, but the gate is checked separately so the
+    /// off-default is byte-identical regardless of write-path state).
+    tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool,
     blob_store: Option<Arc<dyn BlobStore>>,
     /// In-flight external-blob pins (F-IJ-002).
     ///
@@ -333,6 +349,10 @@ impl Engine {
             // until a log + index are attached, so this is inert until the
             // server wires the storage in.
             tombstones_enabled: std::sync::atomic::AtomicBool::new(true),
+            // Default OFF (design §11.5, Phase 8). The enabled path awaits CI
+            // soak; until set true by config the migration reconciliation is
+            // byte-identical to the pre-Phase-8 Fix-B/#29 behavior.
+            tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool::new(false),
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
@@ -453,6 +473,24 @@ impl Engine {
     /// Whether the deletion-tombstone feature is enabled.
     pub fn tombstones_enabled(&self) -> bool {
         self.tombstones_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the tombstone-driven migration-reconciliation flag (Phase 8,
+    /// design §7/§11.5). Default `false`. Set once from config at startup.
+    ///
+    /// `true` activates the §7 reconciliation in `OP_MIGRATION_COMPLETE`, the
+    /// tombstone completion-frame section, and the relaxed superset proof;
+    /// `false` keeps every one of those paths byte-identical to the
+    /// pre-Phase-8 Fix-B/#29 behavior.
+    pub fn set_tombstone_reconciliation_enabled(&self, enabled: bool) {
+        self.tombstone_reconciliation_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether tombstone-driven migration reconciliation is enabled (Phase 8).
+    pub fn tombstone_reconciliation_enabled(&self) -> bool {
+        self.tombstone_reconciliation_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1503,6 +1541,24 @@ impl Engine {
                 }
             })
             .collect()
+    }
+
+    /// All tombstoned keys for `shard`, as `(TxKey, deletion-generation)` pairs.
+    ///
+    /// The source (master) side of tombstone-driven migration reconciliation
+    /// (deletion-tombstone Phase 8, design §7): the master builds the completion
+    /// frame's tombstone section from this — mirroring [`Self::keys_for_shard`]
+    /// for live keys. Returns an empty vec when no tombstone index is attached
+    /// (feature inert), so a caller observes the pre-tombstone empty set.
+    ///
+    /// The generation in each pair is the record's generation at deletion time,
+    /// which the §7 row-2/row-4 split compares against the rejoinee's local
+    /// generation (the create-after-delete defense, §8.4).
+    pub fn tombstones_for_shard(&self, shard: u16) -> Vec<(TxKey, u32)> {
+        match self.tombstone_index.get() {
+            Some(idx) => idx.lock().tombstones_for_shard(shard),
+            None => Vec::new(),
+        }
     }
 
     /// Group all keys by shard in a single index scan.

@@ -992,6 +992,142 @@ fn lcm(a: usize, b: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Migration reconciliation decision (deletion-tombstone Phase 8, design §7)
+// ---------------------------------------------------------------------------
+
+/// The action to take for a single local key during tombstone-driven migration
+/// reconciliation (`DELETION_TOMBSTONE_DESIGN.md` §7).
+///
+/// Produced by [`classify_reconcile`] against the authoritative source's
+/// live + tombstone manifest for the shard. The three outcomes partition the
+/// rejoinee's local over-count exactly:
+///
+/// * [`Keep`](Self::Keep) — the source holds the key live (normal superset), or
+///   the local copy is a *newer* re-creation than the source's tombstone
+///   (§8.4). Existing behavior; the generation is reconciled by the existing
+///   exact-entry path.
+/// * [`Drop`](Self::Drop) — the source has an authoritative tombstone for the
+///   key at a generation at-or-ahead of the local copy. Resurrection-safe
+///   removal of a deleted UTXO.
+/// * [`Transfer`](Self::Transfer) — the source has neither a live copy nor a
+///   tombstone: the key was *never received* by the source. It must be
+///   transferred up to the master (no-loss), never dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileAction {
+    /// Keep the local record (normal superset, or a newer local re-creation).
+    Keep,
+    /// Drop the local record — the source authoritatively deleted it.
+    Drop,
+    /// Transfer the local record up to the master — never-received, no-loss.
+    Transfer,
+}
+
+/// Classify one local key against a single authoritative source's manifest
+/// (`DELETION_TOMBSTONE_DESIGN.md` §7 — the 4-row table).
+///
+/// This is the PURE decision core of tombstone-driven migration reconciliation:
+/// no cluster, no engine, no I/O. It is exhaustively unit-testable in isolation
+/// (design §11.3). The multi-source UNION rule (§9.1 #1) is layered *on top* of
+/// this by [`classify_reconcile_union`]; this single-source form is the
+/// building block.
+///
+/// Inputs (all for the SAME key the rejoinee holds locally at `local_gen`):
+/// * `local_gen` — the generation of the rejoinee's local record.
+/// * `source_live_gen` — `Some(gen)` if the source holds the key LIVE at `gen`
+///   (its manifest lists it), else `None`.
+/// * `source_tombstone_gen` — `Some(gen)` if the source has a TOMBSTONE for the
+///   key at deletion-generation `gen`, else `None`.
+///
+/// The §7 table, in order:
+///
+/// | source-live | source-tombstone | result |
+/// |---|---|---|
+/// | present | — | [`Keep`](ReconcileAction::Keep) (normal superset; generation reconciled by the exact-entry path) |
+/// | absent | present, `tomb_gen >= local_gen` | [`Drop`](ReconcileAction::Drop) (authoritative deletion, resurrection-safe) |
+/// | absent | absent | [`Transfer`](ReconcileAction::Transfer) (never-received, no-loss) |
+/// | absent | present, `tomb_gen < local_gen` | [`Keep`](ReconcileAction::Keep) (newer re-creation, §8.4) |
+///
+/// `live` WINS over `tombstone`: if the source lists the key live it is Keep
+/// regardless of any tombstone it also carries (a re-creation supersedes an
+/// older deletion). The `>=` / `<` generation split uses the wrapping-aware
+/// [`crate::record::generation_at_or_ahead`] comparison so a generation wrap
+/// cannot flip a Drop into a Keep or vice versa (§8.4).
+///
+/// No-loss invariant: this returns [`Drop`](ReconcileAction::Drop) ONLY when a
+/// tombstone is present. A key the source merely omits (no live, no tombstone)
+/// is ALWAYS [`Transfer`](ReconcileAction::Transfer) — never dropped.
+pub fn classify_reconcile(
+    local_gen: u32,
+    source_live_gen: Option<u32>,
+    source_tombstone_gen: Option<u32>,
+) -> ReconcileAction {
+    // Row 1: source holds the key live → keep (live beats tombstone).
+    if source_live_gen.is_some() {
+        return ReconcileAction::Keep;
+    }
+    match source_tombstone_gen {
+        // Rows 2 & 4: not live, tombstone present. The tombstone authorizes a
+        // drop only when its generation is at-or-ahead of the local copy's
+        // (the deletion covers this version or a newer one). A tombstone for an
+        // OLDER generation (`tomb_gen < local_gen`) is for a version the
+        // rejoinee has since superseded with a newer re-creation → keep (§8.4).
+        Some(tomb_gen) => {
+            if crate::record::generation_at_or_ahead(tomb_gen, local_gen) {
+                ReconcileAction::Drop
+            } else {
+                ReconcileAction::Keep
+            }
+        }
+        // Row 3: not live, no tombstone → never-received → transfer (no-loss).
+        None => ReconcileAction::Transfer,
+    }
+}
+
+/// Classify one local key against the UNION of ALL pending sources' manifests
+/// (`DELETION_TOMBSTONE_DESIGN.md` §9.1 #1 — the multi-source union rule).
+///
+/// This is the load-bearing correctness point of multi-source migration. A
+/// single-source [`classify_reconcile`] is WRONG when several sources stream the
+/// same shard concurrently: source X may tombstone key `k` while source Y holds
+/// `k` LIVE. Dropping on X's tombstone alone would resurrect-then-lose a key Y
+/// still has live. The fix: evaluate the drop against the UNION.
+///
+/// Inputs (for the SAME local key at `local_gen`):
+/// * `union_live` — `true` iff ANY pending source holds the key live.
+/// * `union_tombstone_gen` — the tombstone generation to use for the drop test,
+///   i.e. `Some(gen)` iff SOME pending source tombstones the key; when several
+///   do, pass the MAXIMUM (newest) tombstone generation (the most permissive
+///   for a drop — if even the newest tombstone is older than the local copy,
+///   none authorize the drop). `None` iff no pending source tombstones it.
+///
+/// Decision (the union of §7 across sources):
+/// * key live on ANY source → [`Keep`](ReconcileAction::Keep) (a live holder
+///   anywhere wins; a key tombstoned by some source but live on another is
+///   kept).
+/// * not live anywhere, tombstoned by some source at `gen >= local_gen` →
+///   [`Drop`](ReconcileAction::Drop).
+/// * not live anywhere, tombstoned by some source at `gen < local_gen` →
+///   [`Keep`](ReconcileAction::Keep) (newer local re-creation, §8.4).
+/// * not live anywhere, tombstoned by NO source → [`Transfer`](ReconcileAction::Transfer)
+///   (never-received, no-loss).
+///
+/// This is exactly [`classify_reconcile`] evaluated with the union live flag
+/// folded into `source_live_gen` — it is expressed as a thin wrapper so the
+/// union semantics are explicit and independently testable.
+pub fn classify_reconcile_union(
+    local_gen: u32,
+    union_live: bool,
+    union_tombstone_gen: Option<u32>,
+) -> ReconcileAction {
+    // Fold the union-live flag into the single-source form. The generation
+    // carried in the `Some` is irrelevant for the live case (row 1 ignores it),
+    // so a sentinel `local_gen` is fine — `classify_reconcile` only inspects
+    // `is_some()` for the live arm.
+    let source_live_gen = if union_live { Some(local_gen) } else { None };
+    classify_reconcile(local_gen, source_live_gen, union_tombstone_gen)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1482,5 +1618,265 @@ mod tests {
         assert!(log.scan().unwrap().is_empty());
         assert_eq!(log.current_sequence(), 1);
         assert_eq!(log.compacted_through_height(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_reconcile — the §7 4-row decision (Phase 8). Exhaustive.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_row1_source_live_keeps_regardless_of_tombstone() {
+        // Row 1: source holds the key live → Keep, whether or not a tombstone
+        // is also present, and for any generation relationship.
+        assert_eq!(
+            classify_reconcile(5, Some(5), None),
+            ReconcileAction::Keep,
+            "live, no tombstone → keep"
+        );
+        assert_eq!(
+            classify_reconcile(5, Some(7), None),
+            ReconcileAction::Keep,
+            "live at newer gen → keep"
+        );
+        assert_eq!(
+            classify_reconcile(5, Some(3), None),
+            ReconcileAction::Keep,
+            "live at older gen → keep (live always wins)"
+        );
+        // Live WINS over a co-present tombstone (re-creation supersedes deletion).
+        assert_eq!(
+            classify_reconcile(5, Some(6), Some(5)),
+            ReconcileAction::Keep,
+            "live beats tombstone even when tombstone_gen >= local"
+        );
+        assert_eq!(
+            classify_reconcile(5, Some(6), Some(10)),
+            ReconcileAction::Keep,
+            "live beats tombstone even when tombstone_gen > local"
+        );
+    }
+
+    #[test]
+    fn classify_row2_drop_when_tombstone_at_or_ahead_of_local() {
+        // Row 2: not live, tombstone present at gen >= local → Drop. Cover the
+        // boundary (==) and strictly-greater.
+        assert_eq!(
+            classify_reconcile(5, None, Some(5)),
+            ReconcileAction::Drop,
+            "tombstone_gen == local_gen → drop (boundary)"
+        );
+        assert_eq!(
+            classify_reconcile(5, None, Some(6)),
+            ReconcileAction::Drop,
+            "tombstone_gen > local_gen → drop"
+        );
+        assert_eq!(
+            classify_reconcile(0, None, Some(0)),
+            ReconcileAction::Drop,
+            "both zero → drop (boundary)"
+        );
+    }
+
+    #[test]
+    fn classify_row3_transfer_when_no_live_and_no_tombstone() {
+        // Row 3: never-received → Transfer (no-loss). The ONLY way a never-
+        // received key behaves; it is NEVER dropped.
+        assert_eq!(
+            classify_reconcile(5, None, None),
+            ReconcileAction::Transfer,
+            "no live, no tombstone → transfer (no-loss)"
+        );
+        assert_eq!(
+            classify_reconcile(0, None, None),
+            ReconcileAction::Transfer,
+            "gen 0, never-received → transfer"
+        );
+        assert_eq!(
+            classify_reconcile(u32::MAX, None, None),
+            ReconcileAction::Transfer,
+            "gen MAX, never-received → transfer"
+        );
+    }
+
+    #[test]
+    fn classify_row4_keep_when_tombstone_older_than_local() {
+        // Row 4: not live, tombstone present at gen < local → Keep (the local
+        // copy is a newer re-creation; §8.4 generation defense).
+        assert_eq!(
+            classify_reconcile(6, None, Some(5)),
+            ReconcileAction::Keep,
+            "tombstone_gen < local_gen → keep (newer re-creation)"
+        );
+        assert_eq!(
+            classify_reconcile(10, None, Some(0)),
+            ReconcileAction::Keep,
+            "tombstone far older than local → keep"
+        );
+    }
+
+    #[test]
+    fn classify_generation_boundary_exhaustive() {
+        // The == boundary is the load-bearing line between Drop (row 2) and
+        // Keep (row 4). Walk it directly: at local_gen == tomb_gen we Drop;
+        // one below (tomb older) we Keep; one above (tomb newer) we Drop.
+        let local = 100u32;
+        assert_eq!(
+            classify_reconcile(local, None, Some(local)),
+            ReconcileAction::Drop,
+            "tomb == local → drop"
+        );
+        assert_eq!(
+            classify_reconcile(local, None, Some(local - 1)),
+            ReconcileAction::Keep,
+            "tomb == local-1 → keep"
+        );
+        assert_eq!(
+            classify_reconcile(local, None, Some(local + 1)),
+            ReconcileAction::Drop,
+            "tomb == local+1 → drop"
+        );
+    }
+
+    #[test]
+    fn classify_generation_wrapping_is_respected() {
+        // The split uses wrapping-aware `generation_at_or_ahead`, so a small
+        // forward delta across the u32 wrap boundary is "ahead" (Drop), while a
+        // small backward delta is "behind" (Keep). This guards §8.4 against a
+        // naive `tomb_gen >= local_gen` that would invert near wrap.
+        // local just below MAX, tombstone just past wrap (forward by 2) → drop.
+        assert_eq!(
+            classify_reconcile(u32::MAX - 1, None, Some(1)),
+            ReconcileAction::Drop,
+            "tombstone forward across wrap (ahead) → drop"
+        );
+        // local just past wrap, tombstone just below MAX (backward) → keep.
+        assert_eq!(
+            classify_reconcile(1, None, Some(u32::MAX - 1)),
+            ReconcileAction::Keep,
+            "tombstone backward across wrap (behind) → keep"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_reconcile_union — the §9.1 #1 multi-source union. Exhaustive
+    // over the {live / tombstone / omit} × {live / tombstone / omit} matrix.
+    // -----------------------------------------------------------------------
+
+    /// Fold two per-source manifest states into the union inputs for
+    /// [`classify_reconcile_union`]: union_live (live on ANY source) and the
+    /// MAX tombstone generation across sources that tombstone the key.
+    fn union_of(
+        x_live: Option<u32>,
+        x_tomb: Option<u32>,
+        y_live: Option<u32>,
+        y_tomb: Option<u32>,
+    ) -> (bool, Option<u32>) {
+        let union_live = x_live.is_some() || y_live.is_some();
+        let union_tomb = match (x_tomb, y_tomb) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        (union_live, union_tomb)
+    }
+
+    #[test]
+    fn union_live_on_any_source_keeps() {
+        let local = 5u32;
+        // X tombstones k, Y has k live → keep (live anywhere wins).
+        let (live, tomb) = union_of(None, Some(5), Some(5), None);
+        assert_eq!(
+            classify_reconcile_union(local, live, tomb),
+            ReconcileAction::Keep,
+            "X tombstones, Y live → keep"
+        );
+        // X live, Y tombstones → keep.
+        let (live, tomb) = union_of(Some(5), None, None, Some(9));
+        assert_eq!(
+            classify_reconcile_union(local, live, tomb),
+            ReconcileAction::Keep,
+            "X live, Y tombstones → keep"
+        );
+        // Both live → keep.
+        let (live, tomb) = union_of(Some(5), None, Some(7), None);
+        assert_eq!(
+            classify_reconcile_union(local, live, tomb),
+            ReconcileAction::Keep,
+            "both live → keep"
+        );
+    }
+
+    #[test]
+    fn union_tombstoned_by_some_live_by_none_drops() {
+        let local = 5u32;
+        // X tombstones k at gen >= local, Y omits k → drop (no source live).
+        let (live, tomb) = union_of(None, Some(5), None, None);
+        assert_eq!(
+            classify_reconcile_union(local, live, tomb),
+            ReconcileAction::Drop,
+            "X tombstones (>= local), Y omits → drop"
+        );
+        // X tombstones at older gen, Y tombstones at >= local → drop (max wins,
+        // and the newest authorizes the drop).
+        let (live, tomb) = union_of(None, Some(3), None, Some(6));
+        assert_eq!(
+            classify_reconcile_union(local, live, tomb),
+            ReconcileAction::Drop,
+            "max tombstone gen >= local → drop"
+        );
+    }
+
+    #[test]
+    fn union_omitted_by_all_transfers() {
+        let local = 5u32;
+        // Neither source has k live or tombstoned → never-received → transfer.
+        let (live, tomb) = union_of(None, None, None, None);
+        assert_eq!(
+            classify_reconcile_union(local, live, tomb),
+            ReconcileAction::Transfer,
+            "omitted by all → transfer (no-loss)"
+        );
+    }
+
+    #[test]
+    fn union_all_tombstones_older_than_local_keeps() {
+        let local = 10u32;
+        // Both sources tombstone k, but BOTH at gen < local → keep (newer
+        // local re-creation; even the max tombstone is older than local).
+        let (live, tomb) = union_of(None, Some(5), None, Some(8));
+        assert_eq!(
+            classify_reconcile_union(local, live, tomb),
+            ReconcileAction::Keep,
+            "all tombstones older than local → keep (§8.4)"
+        );
+    }
+
+    #[test]
+    fn union_full_matrix_3x3() {
+        // Exhaustive {live(L) / tombstone(T) / omit(O)} × {L / T / O}.
+        // Tombstone gens chosen >= local so a tombstone, when decisive, drops.
+        let local = 5u32;
+        let states: [(Option<u32>, Option<u32>, &str); 3] = [
+            (Some(5), None, "L"),
+            (None, Some(5), "T"),
+            (None, None, "O"),
+        ];
+        for (x_live, x_tomb, xn) in states {
+            for (y_live, y_tomb, yn) in states {
+                let (live, tomb) = union_of(x_live, x_tomb, y_live, y_tomb);
+                let got = classify_reconcile_union(local, live, tomb);
+                let expected = if x_live.is_some() || y_live.is_some() {
+                    // Any live → keep.
+                    ReconcileAction::Keep
+                } else if x_tomb.is_some() || y_tomb.is_some() {
+                    // No live, some tombstone (>= local) → drop.
+                    ReconcileAction::Drop
+                } else {
+                    // No live, no tombstone → transfer.
+                    ReconcileAction::Transfer
+                };
+                assert_eq!(got, expected, "matrix X={xn} Y={yn}");
+            }
+        }
     }
 }

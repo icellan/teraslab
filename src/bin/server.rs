@@ -966,6 +966,21 @@ fn main() {
     // partially-wired tombstone subsystem would silently drop the
     // deletion-evidence the cluster relies on.
     engine.set_tombstones_enabled(config.tombstones_enabled);
+    // Phase 8 (design §7/§11.5): tombstone-driven migration reconciliation.
+    // Default OFF; awaits CI soak. When OFF, OP_MIGRATION_COMPLETE / the
+    // completion-frame builder / the superset proof / the failed-handoff
+    // disposition are byte-identical to the pre-Phase-8 Fix-B/#29 path. The
+    // enabled path additionally needs the tombstone index attached (below) to
+    // observe a non-empty source tombstone set; with reconciliation on but
+    // tombstones off, the source presents an empty tombstone section and the
+    // path degrades to the never-received TRANSFER decision (no-loss).
+    engine.set_tombstone_reconciliation_enabled(config.tombstone_reconciliation_enabled);
+    if config.tombstone_reconciliation_enabled {
+        tracing::info!(
+            "tombstone-driven migration reconciliation ENABLED (Phase 8) — \
+             enabled path is NOT docker-validated; awaiting CI soak",
+        );
+    }
     if config.tombstones_enabled {
         let tombstone_path = config.resolved_tombstone_log_path();
         let (tombstone_device, tombstone_log) = match open_tombstone_log(

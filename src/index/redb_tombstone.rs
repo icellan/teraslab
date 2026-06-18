@@ -299,6 +299,66 @@ impl RedbTombstoneIndex {
         Ok(removed)
     }
 
+    /// All tombstoned keys for `shard`, as `(TxKey, generation)` pairs.
+    ///
+    /// Scans the tombstone table and filters by the stored `shard` field (the
+    /// shard recorded at insert time, computed from the txid via
+    /// [`crate::cluster::shards::ShardTable::shard_for_key`] — so it matches the
+    /// derived shard of each key). This is the source side of tombstone-driven
+    /// migration reconciliation (deletion-tombstone Phase 8, design §7): the
+    /// master builds the completion frame's tombstone section from this, mirroring
+    /// the engine's `keys_for_shard` for live keys.
+    ///
+    /// O(total tombstones). The full tombstone set is bounded by the GC horizon
+    /// (design §3.3), so this is acceptable for the per-shard handoff path.
+    /// Returns `(TxKey, deletion-generation)` pairs; the generation is the
+    /// record's generation at deletion time (what the §7 row-2/row-4 split
+    /// compares against the rejoinee's local generation).
+    ///
+    /// On a redb read error the scan returns whatever it accumulated before the
+    /// error and logs at `warn` — a partial tombstone section can only cause a
+    /// key to be *transferred* instead of *dropped* (a tombstone the source
+    /// failed to read is simply not presented), which is no-loss-safe; it can
+    /// never cause a spurious drop.
+    pub fn tombstones_for_shard(&self, shard: u16) -> Vec<(TxKey, u32)> {
+        let mut out = Vec::new();
+        let txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(err = %e, shard, "tombstones_for_shard: begin_read failed");
+                return out;
+            }
+        };
+        let table = match txn.open_table(TOMBSTONES) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(err = %e, shard, "tombstones_for_shard: open_table failed");
+                return out;
+            }
+        };
+        let iter = match table.iter() {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::warn!(err = %e, shard, "tombstones_for_shard: iter failed");
+                return out;
+            }
+        };
+        for row in iter {
+            let (k, v) = match row {
+                Ok(kv) => kv,
+                Err(e) => {
+                    tracing::warn!(err = %e, shard, "tombstones_for_shard: row read failed");
+                    return out;
+                }
+            };
+            let value = TombstoneIndexValue::decode(&v.value());
+            if value.shard == shard {
+                out.push((TxKey { txid: k.value() }, value.generation));
+            }
+        }
+        out
+    }
+
     /// Clear the index and bulk-insert from an iterator of [`Tombstone`]s.
     ///
     /// For the future recovery path: rebuild the redb index from the durable
@@ -454,6 +514,29 @@ mod tests {
         // height == threshold is kept (strictly-below semantics).
         assert!(idx.is_tombstoned(&key(3)));
         assert!(idx.is_tombstoned(&key(4)));
+    }
+
+    #[test]
+    fn tombstones_for_shard_filters_by_stored_shard() {
+        let (_dir, mut idx) = open_temp();
+        // Keys 1 and 3 in shard 7; key 2 in shard 9. The generation is the
+        // record's deletion-generation returned to the reconciliation path.
+        idx.insert(key(1), 100, 11, 7, TombstoneCause::SpentDah.as_u8())
+            .unwrap();
+        idx.insert(key(2), 100, 22, 9, TombstoneCause::SpentDah.as_u8())
+            .unwrap();
+        idx.insert(key(3), 100, 33, 7, TombstoneCause::Admin.as_u8())
+            .unwrap();
+
+        let mut s7 = idx.tombstones_for_shard(7);
+        s7.sort_by_key(|(k, _)| k.txid);
+        assert_eq!(s7, vec![(key(1), 11u32), (key(3), 33u32)]);
+
+        let s9 = idx.tombstones_for_shard(9);
+        assert_eq!(s9, vec![(key(2), 22u32)]);
+
+        // A shard with no tombstones returns empty.
+        assert!(idx.tombstones_for_shard(123).is_empty());
     }
 
     #[test]
