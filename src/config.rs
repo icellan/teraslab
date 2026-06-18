@@ -456,6 +456,16 @@ pub struct ServerConfig {
     /// path by appending `.redo`.
     pub redo_log_path: Option<PathBuf>,
 
+    /// Size of the on-device deletion-tombstone log region in bytes.
+    ///
+    /// The tombstone log ([`crate::tombstone::TombstoneLog`]) is append-only
+    /// and — unlike the redo log — is NOT reset on checkpoint; it is bounded
+    /// only by GC compaction below the safe-rejoin horizon (a later phase).
+    /// The region must hold roughly `deletion_rate × horizon_window × 56 B`
+    /// worth of tombstones; the default matches the redo region until the GC
+    /// horizon tuning (deletion-tombstone design §3.3/§4.5) lands.
+    pub tombstone_region_size: u64,
+
     /// Path for the index snapshot file.
     pub index_snapshot_path: PathBuf,
 
@@ -815,6 +825,7 @@ impl Default for ServerConfig {
             device_alignment: 4096,
             redo_log_size: 64 * 1024 * 1024, // 64 MiB
             redo_log_path: None,
+            tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
             expected_records: 100_000,
             lock_stripes: 65536,
@@ -1387,6 +1398,7 @@ impl ServerConfig {
         pow2("lock_stripes", self.lock_stripes)?;
         nonzero_u64("device_size", self.device_size)?;
         nonzero_u64("redo_log_size", self.redo_log_size)?;
+        nonzero_u64("tombstone_region_size", self.tombstone_region_size)?;
         nonzero_usize("expected_records", self.expected_records)?;
         nonzero_u32("max_batch_size", self.max_batch_size)?;
         nonzero_usize("max_connections", self.max_connections)?;

@@ -33,3 +33,4 @@ pub mod redo;
 pub mod replication;
 pub mod server;
 pub mod storage;
+pub mod tombstone;
