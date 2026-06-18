@@ -620,6 +620,64 @@ pub fn open_mandatory_redo_log(
     Ok((device, log))
 }
 
+/// Errors raised by [`open_tombstone_log`] when the deletion-tombstone log
+/// cannot be opened (deletion-tombstone Phase 3).
+#[derive(Debug, thiserror::Error)]
+pub enum TombstoneOpenError {
+    /// `DirectDevice::open` failed for the tombstone-log file.
+    #[error("tombstone log device open failed at {path}: {reason}")]
+    Device { path: String, reason: String },
+
+    /// The device opened but [`crate::tombstone::TombstoneLog::open`] returned
+    /// an error (region bounds, corrupt / incompatible header, etc.).
+    #[error("tombstone log open failed at {path}: {reason}")]
+    Log { path: String, reason: String },
+}
+
+/// Open or create the on-device deletion-tombstone log at `path`
+/// (deletion-tombstone Phase 3), mirroring [`open_mandatory_redo_log`].
+///
+/// The tombstone log lives in its own device file (a `.tombstone` sibling of
+/// the data device, exactly as the redo log is a `.redo` sibling) at region
+/// offset 0. Unlike the redo log it is append-only and NOT reset on
+/// checkpoint; it is the durable source of truth for deletion tombstones.
+///
+/// On success the caller receives the device handle (which must be kept alive
+/// for the lifetime of the process so the shared fd survives) and the open
+/// [`crate::tombstone::TombstoneLog`]. The caller wraps the log in
+/// `Arc<Mutex<_>>` for shared engine access.
+///
+/// # Errors
+/// * [`TombstoneOpenError::Device`] — `DirectDevice::open` failed.
+/// * [`TombstoneOpenError::Log`] — the device opened but the log could not be
+///   established (bounds / corrupt header / incompatible version).
+pub fn open_tombstone_log(
+    path: &Path,
+    size: u64,
+    alignment: usize,
+) -> Result<
+    (
+        std::sync::Arc<dyn crate::device::BlockDevice>,
+        crate::tombstone::TombstoneLog,
+    ),
+    TombstoneOpenError,
+> {
+    let device = crate::device::DirectDevice::open(path, size, alignment).map_err(|e| {
+        TombstoneOpenError::Device {
+            path: path.display().to_string(),
+            reason: format!("{e}"),
+        }
+    })?;
+    let device: std::sync::Arc<dyn crate::device::BlockDevice> = std::sync::Arc::new(device);
+    let log = crate::tombstone::TombstoneLog::open(device.clone(), 0, size).map_err(|e| {
+        TombstoneOpenError::Log {
+            path: path.display().to_string(),
+            reason: format!("{e}"),
+        }
+    })?;
+    Ok((device, log))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

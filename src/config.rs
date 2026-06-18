@@ -388,6 +388,15 @@ pub struct IndexConfig {
     /// Only used when `backend = "redb"`.
     pub redb_unmined_path: PathBuf,
 
+    /// Path for the redb deletion-tombstone lookup index database.
+    ///
+    /// Unlike the other redb paths this is used regardless of the primary
+    /// `backend` (tombstones are a cluster-correctness feature independent of
+    /// the primary-index storage mode). The on-device tombstone log is the
+    /// durable source of truth; this redb file is a derived index rebuilt
+    /// from the log on recovery.
+    pub redb_tombstone_path: PathBuf,
+
     /// redb page cache size in bytes. Default: 256 MiB.
     /// Only applies to the redb backend.
     pub redb_cache_size: usize,
@@ -404,6 +413,7 @@ impl Default for IndexConfig {
             redb_path: PathBuf::from("teraslab-index.redb"),
             redb_dah_path: PathBuf::from("teraslab-dah.redb"),
             redb_unmined_path: PathBuf::from("teraslab-unmined.redb"),
+            redb_tombstone_path: PathBuf::from("teraslab-tombstone.redb"),
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
             file_backed_path: PathBuf::from("teraslab-index.dat"),
         }
@@ -465,6 +475,22 @@ pub struct ServerConfig {
     /// worth of tombstones; the default matches the redo region until the GC
     /// horizon tuning (deletion-tombstone design §3.3/§4.5) lands.
     pub tombstone_region_size: u64,
+
+    /// Path for the on-device deletion-tombstone log file. If not set,
+    /// derived from the first device path by appending `.tombstone`. The
+    /// tombstone log lives in its own file (mirroring the redo log's
+    /// `.redo` sibling file) at region offset 0.
+    pub tombstone_log_path: Option<PathBuf>,
+
+    /// Whether the engine writes a durable deletion tombstone on every
+    /// physical record delete, and whether recovery reconstructs the
+    /// tombstone index and runs the R2 self-purge pass.
+    ///
+    /// Default `true`. When `false`, the delete path behaves exactly as it
+    /// did before tombstones existed (no tombstone append, no extra work),
+    /// and recovery skips the tombstone rebuild + self-purge — the
+    /// conservative fallback per deletion-tombstone design §11.5.
+    pub tombstones_enabled: bool,
 
     /// Path for the index snapshot file.
     pub index_snapshot_path: PathBuf,
@@ -826,6 +852,8 @@ impl Default for ServerConfig {
             redo_log_size: 64 * 1024 * 1024, // 64 MiB
             redo_log_path: None,
             tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
+            tombstone_log_path: None,
+            tombstones_enabled: true,
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
             expected_records: 100_000,
             lock_stripes: 65536,
@@ -989,6 +1017,29 @@ impl ServerConfig {
                     .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
                 let mut p = base.into_os_string();
                 p.push(".redo");
+                PathBuf::from(p)
+            }
+        }
+    }
+
+    /// Resolve the deletion-tombstone log file path. Uses
+    /// `tombstone_log_path` if explicitly set, otherwise derives it from the
+    /// first device path by appending `.tombstone`.
+    ///
+    /// Same fallback story as [`Self::resolved_redo_log_path`] when
+    /// `tombstone_log_path` is `None` and `device_paths` is empty —
+    /// `validate_safe_defaults` is the gate.
+    pub fn resolved_tombstone_log_path(&self) -> PathBuf {
+        match &self.tombstone_log_path {
+            Some(p) => p.clone(),
+            None => {
+                let base = self
+                    .device_paths
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
+                let mut p = base.into_os_string();
+                p.push(".tombstone");
                 PathBuf::from(p)
             }
         }

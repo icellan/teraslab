@@ -32,8 +32,8 @@ use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
     AllocatorOrigin, SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
     fallback_unmined_index, load_primary_index_file_backed, load_primary_index_in_memory,
-    load_primary_index_redb, open_mandatory_redo_log, rebuild_in_memory_secondaries,
-    recover_or_create_allocator, secondaries_from_pair,
+    load_primary_index_redb, open_mandatory_redo_log, open_tombstone_log,
+    rebuild_in_memory_secondaries, recover_or_create_allocator, secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -949,6 +949,85 @@ fn main() {
     engine.set_blob_store(blob_store.clone());
 
     let engine = Arc::new(engine);
+
+    // 4c. Deletion tombstones (deletion-tombstone Phase 3 + 7).
+    //
+    // Open the on-device tombstone log (its own `.tombstone` device file,
+    // mirroring the redo log's `.redo` sibling) and the redb tombstone
+    // lookup index, attach both to the engine, then run the tombstone
+    // recovery pass: R1 rebuilds the redb index from the durable log, R2
+    // self-purges any record this node resurrected for a key the cluster
+    // authoritatively deleted (design §5). All gated on `tombstones_enabled`
+    // (default true); when off, the delete path and recovery behave exactly
+    // as before tombstones existed (design §11.5).
+    //
+    // Kept alive for the process lifetime (like `_redo_log_device`) so the
+    // shared fd survives. A failure to open the log/index is fatal — a
+    // partially-wired tombstone subsystem would silently drop the
+    // deletion-evidence the cluster relies on.
+    engine.set_tombstones_enabled(config.tombstones_enabled);
+    if config.tombstones_enabled {
+        let tombstone_path = config.resolved_tombstone_log_path();
+        let (tombstone_device, tombstone_log) = match open_tombstone_log(
+            &tombstone_path,
+            config.tombstone_region_size,
+            config.device_alignment,
+        ) {
+            Ok(parts) => parts,
+            Err(e) => {
+                tracing::error!(
+                    path = %tombstone_path.display(),
+                    err = %e,
+                    "FATAL: deletion-tombstone log unavailable — cannot start with \
+                     tombstones enabled (set tombstones_enabled = false to fall back)",
+                );
+                std::process::exit(1);
+            }
+        };
+        let _tombstone_device: Arc<dyn BlockDevice> = tombstone_device;
+
+        let mut tombstone_index = match teraslab::index::redb_tombstone::RedbTombstoneIndex::open(
+            &config.index.redb_tombstone_path,
+            config.index.redb_cache_size,
+        ) {
+            Ok(idx) => idx,
+            Err(e) => {
+                tracing::error!(
+                    path = %config.index.redb_tombstone_path.display(),
+                    err = %e,
+                    "FATAL: deletion-tombstone redb index unavailable",
+                );
+                std::process::exit(1);
+            }
+        };
+
+        // R1 + R2: reconstruct the index from the log and self-purge.
+        match teraslab::recovery::recover_tombstones(&engine, &tombstone_log, &mut tombstone_index)
+        {
+            Ok(stats) => {
+                tracing::info!(
+                    reconstructed = stats.tombstones_reconstructed,
+                    self_purged = stats.records_self_purged,
+                    kept_newer_generation = stats.kept_newer_generation,
+                    "deletion-tombstone recovery complete (R1 reconstruct + R2 self-purge)",
+                );
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "FATAL: deletion-tombstone recovery failed");
+                std::process::exit(1);
+            }
+        }
+
+        engine.set_tombstone_log(Arc::new(Mutex::new(tombstone_log)));
+        engine.set_tombstone_index(Arc::new(Mutex::new(tombstone_index)));
+        tracing::info!(
+            path = %tombstone_path.display(),
+            size_mib = config.tombstone_region_size / (1024 * 1024),
+            "deletion-tombstone log + index attached (enabled)",
+        );
+    } else {
+        tracing::info!("deletion tombstones disabled (tombstones_enabled = false)");
+    }
 
     // 5. Start cluster if configured
     //

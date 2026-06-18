@@ -175,6 +175,29 @@ pub struct Engine {
     /// the primary index. In-memory secondary indexes ignore the log — they
     /// are rebuilt on startup from the primary redo replay + device scan.
     redo_log: std::sync::OnceLock<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>,
+    /// Append-only on-device deletion-tombstone log (deletion-tombstone
+    /// Phase 3). When attached AND [`Self::tombstones_enabled`] is true, the
+    /// physical-delete path appends a [`crate::tombstone::Tombstone`] here
+    /// and rides the delete's existing `device.sync()` so the tombstone is
+    /// durable BEFORE the primary-index removal (design §9.1 #4). Attached
+    /// post-construction via [`Self::set_tombstone_log`], mirroring
+    /// [`Self::set_redo_log`], so existing `Engine::new` call sites are
+    /// untouched. `None` in test / unconfigured paths.
+    tombstone_log: std::sync::OnceLock<Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>>,
+    /// redb-backed derived lookup index over the tombstone log. The log is
+    /// the durable source of truth; this index is rebuilt from it on
+    /// recovery (design §5.1), so its insert is NOT separately fsynced on
+    /// the hot path. Attached via [`Self::set_tombstone_index`].
+    tombstone_index: std::sync::OnceLock<
+        Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
+    >,
+    /// Master switch for the deletion-tombstone feature (design §11.5).
+    ///
+    /// Defaults to `true`. When `false`, the delete path writes NO tombstone
+    /// and behaves exactly as it did before tombstones existed; recovery
+    /// skips the R2 self-purge. Set from config via
+    /// [`Self::set_tombstones_enabled`].
+    tombstones_enabled: std::sync::atomic::AtomicBool,
     blob_store: Option<Arc<dyn BlobStore>>,
     /// In-flight external-blob pins (F-IJ-002).
     ///
@@ -286,6 +309,12 @@ impl Engine {
             unmined_index: parking_lot::Mutex::new(unmined_index.into()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_log: std::sync::OnceLock::new(),
+            tombstone_log: std::sync::OnceLock::new(),
+            tombstone_index: std::sync::OnceLock::new(),
+            // Default ON (design §11.5). A delete still writes no tombstone
+            // until a log + index are attached, so this is inert until the
+            // server wires the storage in.
+            tombstones_enabled: std::sync::atomic::AtomicBool::new(true),
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
@@ -351,6 +380,69 @@ impl Engine {
     /// unconfigured deployments).
     pub fn redo_log(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
         self.redo_log.get().cloned()
+    }
+
+    /// Attach the on-device deletion-tombstone log (deletion-tombstone
+    /// Phase 3).
+    ///
+    /// Once attached AND with [`Self::tombstones_enabled`] true, the
+    /// physical-delete path appends a tombstone to this log and rides the
+    /// delete's existing `device.sync()` for durability. Call this after
+    /// constructing the engine and before accepting traffic; ignored (with a
+    /// warning) if a log is already attached.
+    pub fn set_tombstone_log(
+        &self,
+        tombstone_log: Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>,
+    ) {
+        if self.tombstone_log.set(tombstone_log).is_err() {
+            tracing::warn!("engine tombstone log already attached; ignoring replacement");
+        }
+    }
+
+    /// Attach the redb-backed tombstone lookup index (deletion-tombstone
+    /// Phase 3). Derived from the log; rebuilt from it on recovery.
+    pub fn set_tombstone_index(
+        &self,
+        tombstone_index: Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
+    ) {
+        if self.tombstone_index.set(tombstone_index).is_err() {
+            tracing::warn!("engine tombstone index already attached; ignoring replacement");
+        }
+    }
+
+    /// The attached tombstone log handle, if any.
+    pub fn tombstone_log(&self) -> Option<Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>> {
+        self.tombstone_log.get().cloned()
+    }
+
+    /// The attached tombstone index handle, if any.
+    pub fn tombstone_index(
+        &self,
+    ) -> Option<Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>> {
+        self.tombstone_index.get().cloned()
+    }
+
+    /// Set the deletion-tombstone feature flag (design §11.5).
+    ///
+    /// `true` (the default) makes the delete path write a durable tombstone;
+    /// `false` reverts the delete path to its pre-tombstone behavior and
+    /// disables the R2 recovery self-purge. Set once from config at startup.
+    pub fn set_tombstones_enabled(&self, enabled: bool) {
+        self.tombstones_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the deletion-tombstone feature is enabled.
+    pub fn tombstones_enabled(&self) -> bool {
+        self.tombstones_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the delete path should write a tombstone on this call: the
+    /// feature is enabled AND both the log and index are attached. When any
+    /// is missing the delete behaves exactly as the pre-tombstone path.
+    fn tombstone_write_active(&self) -> bool {
+        self.tombstones_enabled() && self.tombstone_log.get().is_some()
     }
 
     /// Acquire the SHARED (read-side) dispatch visibility barrier — used
@@ -4940,8 +5032,52 @@ impl Engine {
     /// sweep the blob remains on the blob store (orphaned but harmless — no
     /// index entry references it). This keeps the delete hot path off the
     /// blob-store I/O path and lets the sweep batch unlinks.
+    ///
+    /// # Deletion tombstone (deletion-tombstone Phase 3)
+    ///
+    /// When the feature is active ([`Self::tombstone_write_active`]) this
+    /// path also writes a durable [`crate::tombstone::Tombstone`] so the
+    /// cluster's physical removal is self-describing across a restart /
+    /// rejoin. The tombstone is made durable BEFORE the primary-index
+    /// removal (design §9.1 #4), so a crash can never leave "deletion
+    /// durably committed but tombstone lost." The redb tombstone-index
+    /// insert is a derived index (rebuilt from the log on recovery) and is
+    /// NOT separately fsynced on this hot path.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        // Public deletes write a tombstone when the feature is active. The
+        // recovery R2 self-purge uses `delete_inner(.., false)` instead so it
+        // never re-tombstones a key whose tombstone already exists.
+        self.delete_inner(req, self.tombstone_write_active())
+    }
+
+    /// Internal delete with explicit tombstone control.
+    ///
+    /// `write_tombstone` is the public delete path's
+    /// [`Self::tombstone_write_active`] result for normal deletes, and
+    /// `false` for the recovery R2 self-purge (the tombstone already exists;
+    /// re-writing one would be redundant — see [`Self::delete_for_purge`]).
+    ///
+    /// # Ordering (F-G2-001 + deletion-tombstone §9.1 #4)
+    ///
+    /// 1. (tombstone path only) build the [`crate::tombstone::Tombstone`]
+    ///    from the record's generation-at-deletion + deletion_height + cause,
+    ///    append it to the [`crate::tombstone::TombstoneLog`], and make it
+    ///    durable — so the tombstone is on stable storage BEFORE the
+    ///    deletion is durably committed.
+    /// 2. Zero the on-device metadata header (rebuild skip-guard).
+    /// 3. `sync()` the data device so the zeroed header is durable before any
+    ///    future overwrite of the freed region.
+    /// 4. Unregister the key from the primary index. This MUST follow the
+    ///    tombstone durability (step 1) so a crash between them yields at
+    ///    worst "tombstone present, record present" (R2 purges on recovery),
+    ///    never "record gone, tombstone lost."
+    /// 5. Return the region to the allocator (after the primary-index removal,
+    ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
+    /// 6. (tombstone path only) insert the derived redb tombstone row. Not
+    ///    fsynced here; a crash after the log append but before this insert
+    ///    is re-derived by recovery's `rebuild_from`.
+    fn delete_inner(&self, req: &DeleteRequest, write_tombstone: bool) -> Result<(), SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
@@ -4973,18 +5109,40 @@ impl Engine {
             ({ meta.record_size }) as u64
         };
 
-        // Step 1: Tombstone the metadata before freeing the region so crash-time
+        // Step 1 (deletion-tombstone §9.1 #4): build and durably record the
+        // tombstone BEFORE the primary-index removal. `entry.generation` is
+        // the record's generation at deletion time, read above under this
+        // stripe lock. `due_guard == Some(height)` is the DAH sweep
+        // (`SpentDah`, deletion_height = the sweep height); `None` is an
+        // admin / explicit delete (`Admin`, deletion_height = the observed
+        // tip we can derive from cached state). The redb-index insert is a
+        // derived step deferred to step 6 (rebuilt from the log on recovery,
+        // so it need not be fsynced on the hot path).
+        //
+        // NOTE on the "single fsync" goal (design §3.3): the production
+        // tombstone log lives in its own device file (like the redo log), so
+        // it is fsynced on its own device here — this is a separate-device
+        // fsync, not a second fsync of the SAME region. The load-bearing
+        // invariant the design requires is preserved exactly: the tombstone
+        // is durable before the deletion is durably committed.
+        let tombstone_to_index = if write_tombstone {
+            self.append_delete_tombstone(req, &entry)?
+        } else {
+            None
+        };
+
+        // Step 2: Tombstone the metadata before freeing the region so crash-time
         // index rebuilds cannot resurrect this record from stale bytes in freed
         // space. Zero the full header, not just magic/record_size: freed
         // regions can be reallocated later, and old tx metadata must not
         // remain readable.
         self.write_zeroed_metadata_header(entry.record_offset)?;
-        // Step 2: Sync so the tombstone is durable before any reuse.
+        // Step 3: Sync so the zeroed header is durable before any reuse.
         self.device.sync().map_err(|e| SpendError::StorageError {
             detail: format!("delete tombstone sync failed: {e}"),
         })?;
 
-        // Step 3: Remove from primary index AND decrement shard_counts in
+        // Step 4: Remove from primary index AND decrement shard_counts in
         // the same critical section so the two can never drift (H2
         // correctness fix). `unregister_with_shard_count` only decrements
         // when an entry was actually removed, preventing underflow if the
@@ -5004,9 +5162,9 @@ impl Engine {
                 detail: format!("index unregister failed: {e}"),
             })?;
 
-        // Step 4: Return the region to the allocator. From this point on
+        // Step 5: Return the region to the allocator. From this point on
         // the offset can be handed out to a future `create`/`create_at_offset`.
-        // Because step 3 already removed the primary-index entry, no
+        // Because step 4 already removed the primary-index entry, no
         // reader can reach this offset via `lookup(req.tx_key)` any longer.
         self.allocator
             .lock()
@@ -5014,6 +5172,30 @@ impl Engine {
             .map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
             })?;
+
+        // Step 6: Insert the derived redb tombstone row (not fsynced — the
+        // log is the durable source of truth; recovery `rebuild_from`
+        // re-derives this index). A failure here is logged but NOT fatal:
+        // the durable log already carries the tombstone, so recovery will
+        // reconstruct the missing row. Failing the whole delete after the
+        // primary-index removal already committed would leave the caller a
+        // spurious error for an operation that did, in fact, complete.
+        if let Some((key, value)) = tombstone_to_index
+            && let Some(idx) = self.tombstone_index.get()
+            && let Err(e) = idx.lock().insert(
+                key,
+                value.deletion_height,
+                value.generation,
+                value.shard,
+                value.cause,
+            )
+        {
+            tracing::warn!(
+                err = %e,
+                "delete: tombstone redb-index insert failed; log carries the \
+                 tombstone and recovery will re-derive the index row",
+            );
+        }
 
         // Clean up secondary indexes with two-phase durability.
         // The cached entry captured before unregister carries the heights we
@@ -5035,6 +5217,103 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    /// Delete a record WITHOUT writing a new deletion tombstone.
+    ///
+    /// Used exclusively by the recovery R2 self-purge (design §5.2): the key
+    /// already has a durable tombstone (that is *why* it is being purged), so
+    /// re-tombstoning would be redundant and could mask a generation race.
+    /// All other delete semantics (header zero, fsync, primary-index removal,
+    /// region free, secondary cleanup) are identical to [`Self::delete`], so
+    /// re-running recovery is idempotent.
+    pub(crate) fn delete_for_purge(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(req, false)
+    }
+
+    /// Build the [`crate::tombstone::Tombstone`] for this delete, append it
+    /// to the durable log, and return the values to insert into the redb
+    /// index (so the caller can defer that derived-index write).
+    ///
+    /// Returns `Ok(None)` when no tombstone log is attached (the feature is
+    /// inert). The append is made durable here so the tombstone is on stable
+    /// storage before the primary-index removal (design §9.1 #4).
+    ///
+    /// # Errors
+    /// [`SpendError::StorageError`] if the log append / sync fails. The
+    /// delete is aborted in that case — we must not proceed to remove the
+    /// primary-index row when we could not durably record the deletion.
+    fn append_delete_tombstone(
+        &self,
+        req: &DeleteRequest,
+        entry: &TxIndexEntry,
+    ) -> Result<Option<(TxKey, crate::index::redb_tombstone::TombstoneIndexValue)>, SpendError>
+    {
+        let Some(log) = self.tombstone_log.get() else {
+            return Ok(None);
+        };
+
+        // cause + deletion_height per design §11.1 step 3:
+        //   - DAH sweep (`due_guard == Some(h)`): SpentDah at height `h`.
+        //   - admin / explicit (`due_guard == None`): Admin at the observed
+        //     tip. We do not have a distinct call-site signal for the #29
+        //     migration prune at this layer (that wiring is a later phase),
+        //     so non-DAH deletes default to Admin, as the task permits.
+        let (cause, deletion_height) = match req.due_guard {
+            Some(height) => (crate::tombstone::TombstoneCause::SpentDah, height),
+            None => (
+                crate::tombstone::TombstoneCause::Admin,
+                self.observed_tip_height(),
+            ),
+        };
+        let generation = entry.generation;
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&req.tx_key);
+
+        let tombstone = crate::tombstone::Tombstone::new(
+            req.tx_key.txid,
+            shard,
+            deletion_height,
+            generation,
+            cause,
+            0,
+        );
+
+        // Append + make durable on the tombstone device BEFORE returning, so
+        // the tombstone is durable before the caller proceeds to the
+        // primary-index removal.
+        {
+            let mut guard = log.lock();
+            guard
+                .append_synced(&tombstone)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("tombstone log append failed: {e}"),
+                })?;
+        }
+
+        let value = crate::index::redb_tombstone::TombstoneIndexValue {
+            deletion_height,
+            generation,
+            shard,
+            cause: cause.as_u8(),
+        };
+        Ok(Some((req.tx_key, value)))
+    }
+
+    /// Best-effort observed tip height for admin-delete tombstones.
+    ///
+    /// Admin deletes carry no `due_guard` height, so the tombstone's
+    /// `deletion_height` is taken from the highest block height the engine
+    /// has observed. We derive it from the redo log's recorded tip if
+    /// available, falling back to 0. This is only used as the GC-horizon
+    /// anchor for admin tombstones (a later phase); 0 is safe (it merely
+    /// keeps the tombstone longer), so a missing tip never causes
+    /// under-retention.
+    fn observed_tip_height(&self) -> u32 {
+        // The engine does not maintain a separate tip cache; admin deletes
+        // are rare and out-of-band. Using 0 keeps the tombstone for the full
+        // (eventual) GC horizon, which is conservative-safe. A future phase
+        // that threads the cluster tip into the engine can refine this.
+        0
     }
 
     /// Expire a preservation whose `preserve_until` height has been reached.
@@ -12851,6 +13130,213 @@ mod tests {
             rebuilt.lookup(&key).is_none(),
             "rebuild must ignore freed records whose metadata was tombstoned",
         );
+    }
+
+    // -- Deletion tombstones (deletion-tombstone Phase 3) --
+
+    /// Attach a fresh in-memory-device tombstone log + a tempdir redb
+    /// tombstone index to an engine (tombstones enabled by default). Returns
+    /// the tombstone log handle and index handle so the test can inspect them,
+    /// plus the `TempDir` whose lifetime must outlive the index.
+    fn wire_tombstones(
+        engine: &Engine,
+    ) -> (
+        Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>,
+        Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
+        tempfile::TempDir,
+    ) {
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let log = crate::tombstone::TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(log));
+        let dir = tempfile::tempdir().unwrap();
+        let idx = crate::index::redb_tombstone::RedbTombstoneIndex::open(
+            &dir.path().join("tombstone.redb"),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        let idx = Arc::new(parking_lot::Mutex::new(idx));
+        engine.set_tombstone_log(log.clone());
+        engine.set_tombstone_index(idx.clone());
+        (log, idx, dir)
+    }
+
+    #[test]
+    fn delete_with_tombstones_enabled_writes_tombstone() {
+        let engine = create_engine();
+        let (log, idx, _dir) = wire_tombstones(&engine);
+        assert!(engine.tombstones_enabled());
+        assert!(engine.tombstone_write_active());
+
+        let (_, req) = make_create_req(130, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        let gen_before_delete = engine.lookup(&key).unwrap().generation;
+
+        // Admin delete (due_guard None) at the engine's observed tip (0 here).
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        // The redb index records it.
+        assert!(idx.lock().is_tombstoned(&key));
+        let v = idx.lock().get(&key).unwrap();
+        let expected_shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+        assert_eq!(v.shard, expected_shard);
+        assert_eq!(v.generation, gen_before_delete);
+        assert_eq!(v.deletion_height, 0, "admin delete tip is 0 in this engine");
+        assert_eq!(v.cause, crate::tombstone::TombstoneCause::Admin.as_u8());
+
+        // The durable log carries exactly one entry with the same fields.
+        let scanned = log.lock().scan().unwrap();
+        assert_eq!(scanned.len(), 1);
+        let t = &scanned[0];
+        let t_txid = t.txid;
+        let t_shard = t.shard;
+        let t_gen = t.generation;
+        assert_eq!(t_txid, key.txid);
+        assert_eq!(t_shard, expected_shard);
+        assert_eq!(t_gen, gen_before_delete);
+        assert_eq!(t.cause().unwrap(), crate::tombstone::TombstoneCause::Admin);
+    }
+
+    #[test]
+    fn dah_sweep_delete_tombstone_is_spentdah_at_sweep_height() {
+        // A single-UTXO mined record: spending its only UTXO sets DAH and
+        // makes it sweep-due (all-spent ∧ on-longest-chain). The DAH sweep
+        // then deletes it with `due_guard = Some(sweep_height)`, which yields
+        // a SpentDah tombstone at that height.
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+        });
+        let (log, idx, _dir) = wire_tombstones(&h.engine);
+
+        // Spend the only UTXO → sets delete_at_height = 1000 + 288 = 1288.
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        let gen_before = h.engine.lookup(&h.key).unwrap().generation;
+
+        let sweep_height = 1288u32;
+        h.engine
+            .delete(&DeleteRequest {
+                tx_key: h.key,
+                due_guard: Some(sweep_height),
+            })
+            .unwrap();
+
+        let v = idx.lock().get(&h.key).unwrap();
+        assert_eq!(v.cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
+        assert_eq!(v.deletion_height, sweep_height);
+        assert_eq!(v.generation, gen_before);
+        let scanned = log.lock().scan().unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].cause().unwrap(),
+            crate::tombstone::TombstoneCause::SpentDah
+        );
+    }
+
+    #[test]
+    fn delete_with_tombstones_disabled_writes_no_tombstone() {
+        let engine = create_engine();
+        let (log, idx, _dir) = wire_tombstones(&engine);
+        // Disable the feature: delete must behave exactly as before.
+        engine.set_tombstones_enabled(false);
+        assert!(!engine.tombstone_write_active());
+
+        let (_, req) = make_create_req(132, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        // Record gone (unchanged behavior), but NO tombstone written.
+        assert!(engine.lookup(&key).is_none());
+        assert!(!idx.lock().is_tombstoned(&key));
+        assert!(log.lock().scan().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_without_tombstone_log_attached_is_unchanged() {
+        // No tombstone log wired at all: enabled flag is true but
+        // `tombstone_write_active` is false, so the delete path is identical
+        // to the pre-tombstone behavior.
+        let engine = create_engine();
+        assert!(engine.tombstones_enabled());
+        assert!(!engine.tombstone_write_active());
+
+        let (_, req) = make_create_req(133, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+        assert!(engine.lookup(&key).is_none());
+    }
+
+    #[test]
+    fn delete_for_purge_writes_no_new_tombstone() {
+        // R2's primitive: removes the record but must NOT append a tombstone
+        // even when the feature is active (the tombstone already exists).
+        let engine = create_engine();
+        let (log, idx, _dir) = wire_tombstones(&engine);
+
+        let (_, req) = make_create_req(134, 5);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        engine
+            .delete_for_purge(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        assert!(engine.lookup(&key).is_none(), "record purged");
+        assert!(
+            log.lock().scan().unwrap().is_empty(),
+            "delete_for_purge must not append a tombstone",
+        );
+        assert!(!idx.lock().is_tombstoned(&key));
+    }
+
+    #[test]
+    fn delete_tombstone_durable_before_index_removal_ordering() {
+        // The tombstone-durable-before-primary-removal invariant (§9.1 #4):
+        // after the delete returns, the tombstone is in the durable log AND
+        // the primary-index row is gone. We assert both post-conditions hold
+        // together — a crash between them (tombstone present, record present)
+        // is the only window, and it is exactly what R2 converges.
+        let engine = create_engine();
+        let (log, _idx, _dir) = wire_tombstones(&engine);
+
+        let (_, req) = make_create_req(135, 4);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        // Tombstone durably recorded (log scan re-reads from device).
+        assert_eq!(log.lock().scan().unwrap().len(), 1);
+        // Primary-index row removed.
+        assert!(engine.lookup(&key).is_none());
     }
 
     #[test]

@@ -76,6 +76,14 @@ pub enum RecoveryError {
     /// Index error.
     #[error("index error: {0}")]
     Index(#[from] crate::index::IndexError),
+
+    /// Deletion-tombstone log error (R1 reconstruct, design §5.1).
+    #[error("tombstone log error: {0}")]
+    Tombstone(#[from] crate::tombstone::TombstoneError),
+
+    /// Deletion-tombstone redb index error (R1 reconstruct).
+    #[error("tombstone index error: {0}")]
+    TombstoneIndex(#[from] crate::index::redb_tombstone::TombstoneIndexError),
 }
 
 /// Cause classification for a single entry that could not be replayed.
@@ -284,6 +292,157 @@ pub fn recover(
                 if is_fatal_replay_cause(cause) {
                     break;
                 }
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Statistics from the deletion-tombstone recovery pass
+/// ([`recover_tombstones`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TombstoneRecoveryStats {
+    /// R1: number of tombstone entries reconstructed into the redb index
+    /// from the on-device log (after CRC validation + torn-tail drop).
+    pub tombstones_reconstructed: usize,
+    /// R2: number of live primary-index records purged because an
+    /// authoritative tombstone (generation at-or-ahead of the live record)
+    /// existed for them.
+    pub records_self_purged: usize,
+    /// R2: number of tombstoned keys left in place because the live record
+    /// had a STRICTLY HIGHER generation than the tombstone (a legitimate
+    /// post-deletion re-creation — design §8.4). These are NOT over-purged.
+    pub kept_newer_generation: usize,
+}
+
+/// Reconstruct the deletion-tombstone index from the on-device log (R1) and
+/// run the R2 self-purge pass (deletion-tombstone design §5).
+///
+/// This runs once at boot, AFTER redo replay + primary-index load + the redb
+/// tombstone index has been opened, and AFTER the engine is constructed (R2
+/// routes record removal through the engine's delete primitive).
+///
+/// ## R1 — durability across restart (design §5.1)
+///
+/// Scans the durable, never-reset tombstone log and rebuilds the redb
+/// tombstone index from it via
+/// [`crate::index::redb_tombstone::RedbTombstoneIndex::rebuild_from`]. CRC
+/// validation and torn-tail dropping are handled by the log's
+/// [`crate::tombstone::TombstoneLog::scan`]; a half-written final entry is
+/// dropped exactly like a torn redo tail.
+///
+/// ## R2 — self-purge (design §5.2 — the critical correctness step)
+///
+/// For every tombstone key, if the primary index STILL holds that key AND the
+/// tombstone's generation is at-or-ahead of the live record's generation
+/// (wrapping comparison, [`crate::record::generation_at_or_ahead`]), the
+/// record is removed locally via [`crate::ops::engine::Engine::delete_for_purge`]
+/// (which does NOT write a new tombstone — the tombstone already exists). This
+/// collapses any record the node resurrected from its own redo/device load of
+/// a key the cluster authoritatively deleted, making the node safe even before
+/// it rejoins.
+///
+/// Generation guard (design §8.4): a record whose live generation is STRICTLY
+/// HIGHER than the tombstone's is a legitimate post-deletion re-creation and is
+/// KEPT — the tombstone only authorizes dropping the version it recorded or an
+/// older one.
+///
+/// ## Idempotency
+///
+/// Re-running yields the same state: `rebuild_from` is a deterministic
+/// clear-and-repopulate, and R2 only purges keys still live + tombstoned, so a
+/// second run finds the purged keys absent and does nothing.
+///
+/// Gated by the caller on `tombstones_enabled` — when the feature is off this
+/// is not called at all.
+///
+/// # Errors
+/// * [`RecoveryError::Tombstone`] if scanning the log fails (a torn TAIL is
+///   tolerated by the scan and is NOT an error; only a device read failure
+///   propagates).
+/// * [`RecoveryError::TombstoneIndex`] if the redb rebuild fails.
+///
+/// An R2 purge that fails for a single key is logged and counted but does NOT
+/// abort the pass — a transient per-key delete error must not wedge boot; the
+/// next restart re-derives the index and retries the purge (idempotent).
+pub fn recover_tombstones(
+    engine: &crate::ops::engine::Engine,
+    log: &crate::tombstone::TombstoneLog,
+    index: &mut crate::index::redb_tombstone::RedbTombstoneIndex,
+) -> Result<TombstoneRecoveryStats, RecoveryError> {
+    let mut stats = TombstoneRecoveryStats::default();
+
+    // R1: rebuild the redb tombstone index from the durable log.
+    let entries = log.scan()?;
+    stats.tombstones_reconstructed = entries.len();
+    index.rebuild_from(entries.iter().copied())?;
+
+    // R2: self-purge. Iterate the reconstructed tombstone entries (the log
+    // is the source of truth; the redb index we just rebuilt mirrors it).
+    // For a key that appears multiple times in the log, the LAST entry is
+    // authoritative — that matches `rebuild_from`'s last-writer-wins, so we
+    // also fold to the last generation seen per key to avoid an earlier,
+    // lower-generation entry wrongly purging a key the redb index now records
+    // at a higher generation.
+    let mut latest: std::collections::HashMap<[u8; 32], u32> = std::collections::HashMap::new();
+    for t in &entries {
+        let txid = t.txid;
+        let generation = t.generation;
+        latest
+            .entry(txid)
+            .and_modify(|g| {
+                // Keep the generation that is at-or-ahead under wrapping
+                // order (the authoritative latest tombstone for the key).
+                if crate::record::generation_at_or_ahead(generation, *g) {
+                    *g = generation;
+                }
+            })
+            .or_insert(generation);
+    }
+
+    for (txid, tombstone_gen) in latest {
+        let key = TxKey { txid };
+        // Read the live primary-index entry. A read error is surfaced (we
+        // must not collapse a backend error into "absent" and skip a purge
+        // that is actually needed).
+        let live = engine.lookup_checked(&key).map_err(RecoveryError::Index)?;
+        let Some(entry) = live else {
+            // Not resurrected — nothing to purge.
+            continue;
+        };
+        let live_gen = entry.generation;
+
+        // Generation guard (design §8.4): purge only when the tombstone is
+        // at-or-ahead of the live record. A strictly-higher live generation
+        // is a legitimate re-creation post-deletion — keep it.
+        if !crate::record::generation_at_or_ahead(tombstone_gen, live_gen) {
+            stats.kept_newer_generation += 1;
+            continue;
+        }
+
+        // The record was resurrected from this node's own durable state for a
+        // key the cluster authoritatively deleted. Purge it WITHOUT writing a
+        // new tombstone (the tombstone already exists). `due_guard: None` so
+        // the purge is unconditional — we are not re-validating a DAH
+        // predicate, we are enforcing an existing authoritative deletion.
+        let req = crate::ops::remaining::DeleteRequest {
+            tx_key: key,
+            due_guard: None,
+        };
+        match engine.delete_for_purge(&req) {
+            Ok(()) => stats.records_self_purged += 1,
+            Err(crate::ops::error::SpendError::TxNotFound) => {
+                // Raced away between the lookup and the delete (e.g. a
+                // concurrent op) — already gone, nothing to do.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    txid = ?&txid[..4],
+                    err = %e,
+                    "tombstone recovery: R2 self-purge failed for a key; will retry \
+                     on next restart (idempotent)",
+                );
             }
         }
     }
@@ -2746,6 +2905,15 @@ mod tests {
 
         fn redo_log(&self) -> RedoLog {
             RedoLog::open(self.redo_dev.clone(), 0, 1024 * 1024).unwrap()
+        }
+
+        /// Overwrite a record's primary-index `generation` (keeping its
+        /// offset and other fields), so a test can stage a live record whose
+        /// generation is higher than a tombstone's (the §8.4 keep case).
+        fn set_index_generation(&mut self, key: &TxKey, generation: u32) {
+            let mut ie = self.index.lookup(key).unwrap();
+            ie.generation = generation;
+            self.index.register(*key, ie).unwrap();
         }
 
         /// Write `delete_at_height` / `unmined_since` into a record's
@@ -5444,5 +5612,210 @@ mod tests {
         assert_eq!(stats.failed_io, 1);
         assert_eq!(stats.failed_corrupt, 1);
         assert_eq!(stats.failed_logic, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deletion-tombstone recovery (Phase 7: R1 reconstruct + R2 self-purge)
+    // -----------------------------------------------------------------------
+
+    use crate::index::redb_tombstone::RedbTombstoneIndex;
+    use crate::tombstone::{Tombstone, TombstoneCause, TombstoneLog};
+
+    /// Build a fresh in-memory-device tombstone log + tempdir redb index.
+    fn fresh_tombstone_storage() -> (TombstoneLog, RedbTombstoneIndex, tempfile::TempDir) {
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let log = TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let idx =
+            RedbTombstoneIndex::open(&dir.path().join("tombstone.redb"), 16 * 1024 * 1024).unwrap();
+        (log, idx, dir)
+    }
+
+    /// Consume the harness into an engine (so R2 can route record removal
+    /// through `delete_for_purge`).
+    fn engine_from_harness(h: RecoveryTestHarness) -> Arc<Engine> {
+        Arc::new(Engine::new(
+            h.data_dev.clone(),
+            h.index,
+            h.alloc,
+            StripedLocks::new(1024),
+            DahBackend::new_in_memory(),
+            UnminedBackend::new_in_memory(),
+        ))
+    }
+
+    fn seed_tombstone(log: &mut TombstoneLog, key: &TxKey, generation: u32, height: u32) {
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
+        let t = Tombstone::new(
+            key.txid,
+            shard,
+            height,
+            generation,
+            TombstoneCause::SpentDah,
+            0,
+        );
+        log.append_synced(&t).unwrap();
+    }
+
+    #[test]
+    fn r1_rebuild_reconstructs_all_entries() {
+        // N tombstone log entries → recover rebuilds the redb index with all N.
+        let h = RecoveryTestHarness::new();
+        let engine = engine_from_harness(h);
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+
+        let mut keys = Vec::new();
+        for n in 0..7u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = n;
+            txid[1] = n.wrapping_mul(3);
+            let key = TxKey { txid };
+            seed_tombstone(&mut log, &key, n as u32, 100 + n as u32);
+            keys.push(key);
+        }
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(stats.tombstones_reconstructed, 7);
+        // No records exist in the primary index, so nothing is purged.
+        assert_eq!(stats.records_self_purged, 0);
+        assert_eq!(idx.len(), 7);
+        for (n, key) in keys.iter().enumerate() {
+            let v = idx.get(key).unwrap();
+            assert_eq!(v.deletion_height, 100 + n as u32);
+            assert_eq!(v.generation, n as u32);
+        }
+    }
+
+    #[test]
+    fn r2_self_purges_resurrected_record_gen_equal() {
+        // Live record at gen 0 + tombstone at gen 0 (tombstone gen >= live
+        // gen) → recover purges the record.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xA1, 2);
+        let engine = engine_from_harness(h);
+        assert!(engine.lookup(&key).is_some());
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        seed_tombstone(&mut log, &key, 0, 150);
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(stats.records_self_purged, 1);
+        assert_eq!(stats.kept_newer_generation, 0);
+        assert!(
+            engine.lookup(&key).is_none(),
+            "R2 must purge a resurrected record whose tombstone gen >= live gen",
+        );
+        // The tombstone itself survives in the index (still needed later).
+        assert!(idx.is_tombstoned(&key));
+    }
+
+    #[test]
+    fn r2_keeps_record_with_strictly_higher_generation() {
+        // Live record re-created post-deletion at gen 6; tombstone is for the
+        // older gen 3 → recover KEEPS the live record (design §8.4).
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xB2, 1);
+        h.set_index_generation(&key, 6);
+        let engine = engine_from_harness(h);
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        seed_tombstone(&mut log, &key, 3, 150);
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(stats.records_self_purged, 0);
+        assert_eq!(stats.kept_newer_generation, 1);
+        assert!(
+            engine.lookup(&key).is_some(),
+            "R2 must NOT purge a record newer than its tombstone",
+        );
+    }
+
+    #[test]
+    fn r2_keeps_record_with_no_tombstone() {
+        // A live record with no tombstone at all is untouched.
+        let mut h = RecoveryTestHarness::new();
+        let kept = h.create_record(0xC3, 1);
+        let purged = h.create_record(0xC4, 1);
+        let engine = engine_from_harness(h);
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        // Only `purged` gets a tombstone.
+        seed_tombstone(&mut log, &purged, 0, 150);
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(stats.records_self_purged, 1);
+        assert!(engine.lookup(&purged).is_none());
+        assert!(
+            engine.lookup(&kept).is_some(),
+            "a record with no tombstone is never purged",
+        );
+    }
+
+    #[test]
+    fn r2_is_idempotent_across_two_recoveries() {
+        // Running recovery twice yields the same state.
+        let mut h = RecoveryTestHarness::new();
+        let purged = h.create_record(0xD5, 2);
+        let newer = h.create_record(0xD6, 1);
+        h.set_index_generation(&newer, 9);
+        let kept_no_ts = h.create_record(0xD7, 1);
+        let engine = engine_from_harness(h);
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        seed_tombstone(&mut log, &purged, 0, 150);
+        seed_tombstone(&mut log, &newer, 4, 150); // older than live gen 9
+
+        let s1 = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(s1.records_self_purged, 1);
+        assert_eq!(s1.kept_newer_generation, 1);
+        assert!(engine.lookup(&purged).is_none());
+        assert!(engine.lookup(&newer).is_some());
+        assert!(engine.lookup(&kept_no_ts).is_some());
+
+        // Second run: identical reconstruct count, nothing left to purge.
+        let s2 = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(s2.tombstones_reconstructed, s1.tombstones_reconstructed);
+        assert_eq!(s2.records_self_purged, 0, "nothing left to purge on rerun");
+        assert_eq!(s2.kept_newer_generation, 1);
+        assert!(engine.lookup(&purged).is_none());
+        assert!(engine.lookup(&newer).is_some());
+        assert!(engine.lookup(&kept_no_ts).is_some());
+        assert_eq!(idx.len(), 2);
+    }
+
+    #[test]
+    fn r1_drops_torn_tail_entry() {
+        // R1 relies on the log's torn-tail-drop scan: a corrupt final entry
+        // is not reconstructed, and is not an error.
+        let h = RecoveryTestHarness::new();
+        let engine = engine_from_harness(h);
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let mut log = TombstoneLog::create(dev.clone(), 0, 8 * 1024 * 1024).unwrap();
+        for n in 0..3u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = n;
+            seed_tombstone(&mut log, &TxKey { txid }, n as u32, 100 + n as u32);
+        }
+        // Corrupt the 3rd (final) entry on device: header block is 4096, then
+        // 56-byte entries; entry 2 starts at 4096 + 2*56.
+        let header = 4096u64;
+        let entry2_off = header + 2 * 56;
+        let aligned = entry2_off / 4096 * 4096;
+        let intra = (entry2_off - aligned) as usize;
+        let mut block = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut block, aligned).unwrap();
+        block[intra + 4] ^= 0xFF;
+        dev.pwrite_all_at(&block, aligned).unwrap();
+        dev.sync().unwrap();
+        let log = TombstoneLog::open(dev, 0, 8 * 1024 * 1024).unwrap();
+
+        let (_unused, mut idx, _dir) = fresh_tombstone_storage();
+        let _ = _unused;
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+        assert_eq!(
+            stats.tombstones_reconstructed, 2,
+            "torn final tombstone entry must be dropped, not reconstructed",
+        );
+        assert_eq!(idx.len(), 2);
     }
 }
