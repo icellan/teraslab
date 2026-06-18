@@ -2742,7 +2742,17 @@ impl ClusterCoordinator {
                         let swim_incarnation = &catch_up_si;
                         let cluster_secret = &catch_up_secret;
                         let committed_members = topology_authority.committed_members();
-                        let peers: Vec<SocketAddr> = {
+                        // BUG2: a non-empty committed membership is the
+                        // precondition for a SOUND tip estimate — the gate may
+                        // only take MAX over the *committed* peers. An empty
+                        // committed view means the tip would be estimated from an
+                        // arbitrary address set, which §4.3 forbids.
+                        let committed_view_trustworthy = !committed_members.is_empty();
+                        // Keep node ids alongside addresses so the rejoin gate can
+                        // map an answered height probe back to the peer's NodeId
+                        // (needed to gate the discard on the committed master being
+                        // reachable — BUG1 fix 2).
+                        let peer_nodes: Vec<(NodeId, SocketAddr)> = {
                             let addrs = node_addrs_for_topo.read();
                             addrs
                                 .iter()
@@ -2750,9 +2760,11 @@ impl ClusterCoordinator {
                                 .filter(|(id, _)| {
                                     committed_members.is_empty() || committed_members.contains(id)
                                 })
-                                .map(|(_, &addr)| addr)
+                                .map(|(&id, &addr)| (id, addr))
                                 .collect()
                         };
+                        let peers: Vec<SocketAddr> =
+                            peer_nodes.iter().map(|(_, addr)| *addr).collect();
 
                         // Phase 4 rejoin-eligibility gate (deletion-tombstone
                         // design §4.3). INERT unless `tombstone_gc_enabled`.
@@ -2767,16 +2779,34 @@ impl ClusterCoordinator {
                         // for the §4.3 soundness proof. Off-path
                         // (`tombstone_gc_enabled == false`) this whole block is
                         // a no-op and the catch-up below runs exactly as today.
+                        // BUG1: shards discarded by a RefuseFullResync must be
+                        // re-seeded as pending-inbound AFTER the routing snapshot
+                        // install wipes the migration manager, so the pull-based
+                        // re-push (`OP_MIGRATION_TRANSFER_REQUEST`) fires. Carried
+                        // out of the gate block to the post-install point below.
+                        let mut pending_reseed: Vec<(u16, NodeId)> = Vec::new();
                         if tombstone_gc_enabled {
                             let self_height = catch_up_engine.last_durable_height();
                             let secret_slice = cluster_secret.as_deref().map(Vec::as_slice);
-                            let tip_results: Vec<Option<u32>> = peers
+                            // Probe each (committed) peer's height. An answered
+                            // probe doubles as a reachability signal: a master
+                            // that answered is a confirmed live re-push source.
+                            let mut reachable_masters: std::collections::HashSet<NodeId> =
+                                std::collections::HashSet::new();
+                            let tip_results: Vec<Option<u32>> = peer_nodes
                                 .iter()
-                                .map(|addr| query_node_height(*addr, secret_slice))
+                                .map(|(id, addr)| {
+                                    let h = query_node_height(*addr, secret_slice);
+                                    if h.is_some() {
+                                        reachable_masters.insert(*id);
+                                    }
+                                    h
+                                })
                                 .collect();
                             let cluster_tip = max_tip_from_results(&tip_results);
-                            match rejoin_gate_decision(
+                            match rejoin_gate_decision_committed_view(
                                 true,
+                                committed_view_trustworthy,
                                 cluster_tip,
                                 self_height,
                                 rejoin_grace_blocks,
@@ -2793,47 +2823,68 @@ impl ClusterCoordinator {
                                     // tombstones (a local drop, not a cluster
                                     // delete).
                                     //
-                                    // NO-LOSS INVARIANT: only discard a shard
-                                    // when a LIVE PEER will re-push it — i.e.
-                                    // when the committed master is a peer (≠
-                                    // self). For those shards the peer master
-                                    // holds the authoritative copy durably and
-                                    // re-pushes the baseline once the routing
-                                    // snapshot installs, so the local drop is
-                                    // recoverable. A shard this node is itself
-                                    // the committed MASTER of is NEVER discarded:
-                                    // master→replica is the only push direction,
-                                    // so nothing would re-push it and the drop
-                                    // would be permanent data loss (replicas hold
-                                    // copies but never push to the master). A
-                                    // too-stale node should relinquish mastership
-                                    // of such shards (handled by the reactivation
-                                    // path), not destroy their only master copy
-                                    // here. `replica_only_shards_owned_by`
-                                    // returns exactly the owned-but-not-mastered
-                                    // shards (it already excludes self-mastered).
-                                    let owned: Vec<u16> = {
-                                        shard_table.read().replica_only_shards_owned_by(self_id)
+                                    // NO-LOSS INVARIANT (BUG1): only discard a
+                                    // shard when a CURRENTLY-REACHABLE committed
+                                    // master will re-push it. `plan_full_resync_
+                                    // discards` filters to replica-only shards
+                                    // (self-mastered excluded — master→replica is
+                                    // the only push direction, so a master's only
+                                    // copy is never destroyed) whose committed
+                                    // master answered the height probe. A shard
+                                    // whose master is unreachable/unknown is KEPT
+                                    // (stale-replica is safer than empty-replica-
+                                    // with-offline-master), and seeded for re-push
+                                    // only when its master is confirmed live.
+                                    let plan = {
+                                        let table = shard_table.read();
+                                        plan_full_resync_discards(
+                                            &table,
+                                            self_id,
+                                            &reachable_masters,
+                                        )
                                     };
+                                    // BUG1 fix 3 (crash ordering): persist the
+                                    // re-request intent for ALL target shards
+                                    // BEFORE discarding, so a crash mid-discard
+                                    // still leaves a durable re-request trigger
+                                    // (recovery's restore_inbound re-arms the
+                                    // requester loop). The install below wipes
+                                    // and re-persists, after which `pending_reseed`
+                                    // re-establishes the durable steady state.
+                                    if !plan.seed_inbound.is_empty() {
+                                        let mut mgr = migration.lock();
+                                        for (shard, master) in &plan.seed_inbound {
+                                            mgr.register_inbound_source(*shard, *master);
+                                        }
+                                        if let Some(path) = inbound_state_path.as_ref() {
+                                            crate::cluster::migration::persist_inbound_state(
+                                                path, &mgr,
+                                            );
+                                        }
+                                    }
                                     let mut discarded = 0usize;
-                                    for shard in &owned {
+                                    for (shard, _master) in &plan.seed_inbound {
                                         discarded += catch_up_engine.discard_shard_records(*shard);
                                     }
+                                    pending_reseed = plan.seed_inbound.clone();
                                     tracing::warn!(
                                         cluster_tip,
                                         self_height,
                                         rejoin_grace_blocks,
-                                        shards = owned.len(),
+                                        committed_view_trustworthy,
+                                        shards = plan.discard.len(),
                                         records_discarded = discarded,
                                         "cluster: Phase 4 rejoin gate REFUSED incremental rejoin \
                                          (too stale) — forced full resync: discarded local shard \
-                                         state, will re-receive fresh baselines (design §4.3)",
+                                         state for shards with a reachable master, seeded + \
+                                         persisted pending-inbound so masters re-push fresh \
+                                         baselines (design §4.3)",
                                     );
                                     // Fall through to the catch-up below: it
                                     // installs the active routing snapshot and
-                                    // resets migration state, after which the
-                                    // shards' masters push fresh baselines into
-                                    // the now-empty local store.
+                                    // resets migration state; `pending_reseed` is
+                                    // re-applied immediately after so the wipe
+                                    // does not clear the re-request triggers.
                                 }
                             }
                         }
@@ -2887,6 +2938,36 @@ impl ClusterCoordinator {
                                 }
                                 break;
                             }
+                        }
+
+                        // BUG1: re-seed the pending-inbound entries the rejoin
+                        // gate discarded. `install_active_routing_snapshot` does
+                        // `*mgr = MigrationManager::new()`, WIPING the markers
+                        // seeded before the discard, so without this re-seed the
+                        // requester loop sees an empty pending set and never pulls
+                        // the discarded shards → permanently half-empty replica.
+                        // Re-seeding here (after the install) and re-persisting
+                        // restores both the live requester trigger and the durable
+                        // restart trigger. Idempotent + no-op off-path
+                        // (`pending_reseed` is empty unless the gate refused).
+                        if !pending_reseed.is_empty() {
+                            let mut mgr = migration.lock();
+                            for (shard, master) in &pending_reseed {
+                                mgr.register_inbound_source(*shard, *master);
+                            }
+                            if let Some(path) = inbound_state_path.as_ref() {
+                                crate::cluster::migration::persist_inbound_state(path, &mgr);
+                            }
+                            // Sync the coordinator-level inbound bitmap from the
+                            // manager so the read/write path treats these shards
+                            // as still-receiving (the install above cleared it).
+                            inbound_bm.load_from(mgr.inbound_bitmap());
+                            tracing::info!(
+                                shards = pending_reseed.len(),
+                                "cluster: Phase 4 rejoin gate re-seeded pending-inbound after \
+                                 routing-snapshot install so masters re-push discarded shards \
+                                 (design §4.3; BUG1)",
+                            );
                         }
 
                         let local_term = topology_authority.committed_term();
@@ -4376,6 +4457,159 @@ pub fn rejoin_gate_decision(
     } else {
         RejoinGateDecision::Admit
     }
+}
+
+/// The Phase 4 rejoin gate decision, hardened against a node with an EMPTY or
+/// stale committed membership view (deletion-tombstone design §4.3; BUG2).
+///
+/// # The §4.3 assumption this guards
+///
+/// The §4.3 soundness proof requires that the GC-min and the gate-tip range
+/// over the **same agreed committed membership**. The GC horizon takes the MIN
+/// over committed members (conservative — `None` aborts the round on any
+/// unreachable member). The rejoin gate takes the MAX over reachable peers as a
+/// tip estimate. That MAX is only a sound tip when the peers it ranges over are
+/// the cluster's committed members. A freshly-restarted rejoinee with an EMPTY
+/// committed view does not know the committed set, so it would estimate the tip
+/// from WHATEVER addresses it happens to hold — a set that may exclude the high
+/// nodes the GC node treats as committed. Under a divergent-membership
+/// partition that lets a laggard compute a tip below the real min, get admitted
+/// incrementally, and resurrect a key whose tombstone was already GC'd.
+///
+/// **Load-bearing assumption (documented per the task):** a node may not
+/// advance the GC horizon using a committed set that excludes nodes some
+/// rejoinee still treats as committed, and a rejoinee may not estimate the gate
+/// tip from an arbitrary (non-committed) address set. GC-min and gate-tip MUST
+/// range over the same committed membership.
+///
+/// # The conservative rule
+///
+/// When `gc_enabled` AND the node has NO trustworthy committed view
+/// (`committed_view_trustworthy == false`, i.e. an empty/stale committed
+/// membership), we cannot establish a sound tip, so we DO NOT estimate one from
+/// an arbitrary address set. We instead return
+/// [`RejoinGateDecision::RefuseFullResync`] unconditionally — the conservative
+/// outcome that cannot admit on incomplete tip info. A full resync discards
+/// local state and re-receives fresh baselines, which is always safe (it can
+/// never carry a stale live key). The cost is an occasional unnecessary full
+/// resync for a node that was actually fresh; the alternative (admitting on
+/// incomplete info) can silently resurrect a deleted UTXO, which is
+/// unacceptable.
+///
+/// When `committed_view_trustworthy == true`, this delegates to
+/// [`rejoin_gate_decision`] (the tip estimate is sound because it ranges over
+/// the committed peers).
+///
+/// Off-path (`gc_enabled == false`) this ALWAYS returns
+/// [`RejoinGateDecision::Admit`] regardless of the committed view — byte-
+/// identical to pre-Phase-4 behavior, so existing rejoin/migration paths are
+/// unchanged.
+///
+/// # Parameters
+/// - `gc_enabled` — when `false` the gate is inert (always `Admit`).
+/// - `committed_view_trustworthy` — `true` iff this node holds a non-empty
+///   committed membership view that the tip-estimate peers were filtered to.
+/// - `cluster_tip` / `self_height` / `rejoin_grace_blocks` — as in
+///   [`rejoin_gate_decision`]. When the view is untrustworthy `cluster_tip` is
+///   reported (as `cluster_tip.unwrap_or(self_height)`) only for logging; the
+///   refusal does not depend on it.
+pub fn rejoin_gate_decision_committed_view(
+    gc_enabled: bool,
+    committed_view_trustworthy: bool,
+    cluster_tip: Option<u32>,
+    self_height: u32,
+    rejoin_grace_blocks: u32,
+) -> RejoinGateDecision {
+    if !gc_enabled {
+        return RejoinGateDecision::Admit;
+    }
+    if !committed_view_trustworthy {
+        // BUG2: no agreed committed set → the MAX tip estimate is not sound →
+        // refuse rather than risk admitting on incomplete info.
+        return RejoinGateDecision::RefuseFullResync {
+            cluster_tip: cluster_tip.unwrap_or(self_height),
+            self_height,
+        };
+    }
+    rejoin_gate_decision(gc_enabled, cluster_tip, self_height, rejoin_grace_blocks)
+}
+
+/// The full-resync discard plan for the Phase 4 rejoin gate
+/// (deletion-tombstone design §4.3; BUG1).
+///
+/// When the rejoin gate refuses an incremental rejoin, the node must discard
+/// its stale local copy of the shards it is about to re-receive — but a discard
+/// is only no-loss-safe if a LIVE source will re-push that shard. This computes
+/// exactly which replica-only shards to discard and, for each, the inbound
+/// entry to seed so the existing pull-based re-push
+/// (`OP_MIGRATION_TRANSFER_REQUEST`) actually fires.
+///
+/// # Inputs
+/// - `table` — the node's current shard table (committed assignments).
+/// - `self_id` — this node.
+/// - `reachable_masters` — the set of node ids this node has just confirmed are
+///   CURRENTLY REACHABLE (e.g. answered an `OP_GET_NODE_HEIGHT` probe). A shard
+///   whose committed master is NOT in this set is NOT discarded — there is no
+///   confirmed live source to re-push it, so keeping the (possibly stale) local
+///   copy is strictly safer than dropping it to an empty replica with an
+///   offline master (BUG1 fix 2).
+///
+/// # Output
+/// `(discard, seed_inbound)` where:
+/// - `discard` is the sorted list of shards to drop locally. Every shard in it
+///   is replica-only (this node is NOT its committed master —
+///   [`ShardTable::replica_only_shards_owned_by`] already excludes self-mastered
+///   shards, so a master's only copy is never destroyed) AND has a reachable
+///   committed master.
+/// - `seed_inbound` pairs each discarded shard with its committed master as the
+///   `from` source. The caller registers these as pending-inbound (with the
+///   concrete master, NOT the `NodeId(0)` sentinel) and persists them, so:
+///   (a) the requester loop pulls them (it filters `from != self && from !=
+///   NodeId(0)`), and (b) a restart mid-discard re-derives the re-request
+///   intent from the persisted marker. `seed_inbound` mirrors `discard`
+///   one-to-one and in the same order.
+///
+/// Off-path note: this is only ever invoked when `tombstone_gc_enabled` AND the
+/// gate refuses — with GC disabled it is never called, so the discard path is
+/// inert and existing rejoin/migration behavior is byte-identical.
+pub fn plan_full_resync_discards(
+    table: &ShardTable,
+    self_id: NodeId,
+    reachable_masters: &std::collections::HashSet<NodeId>,
+) -> FullResyncDiscardPlan {
+    let mut discard = Vec::new();
+    let mut seed_inbound = Vec::new();
+    for shard in table.replica_only_shards_owned_by(self_id) {
+        let master = table.target_assignment(shard).master;
+        // Defensive: replica_only_shards_owned_by already excludes self-mastered
+        // shards, but never discard a shard we somehow master — master→replica
+        // is the only push direction, so there would be no source to re-receive.
+        if master == self_id {
+            continue;
+        }
+        // BUG1 fix 2: only discard when the committed master is CURRENTLY
+        // reachable (a confirmed live re-push source). An unreachable /
+        // unknown master means no proven source → keep the local copy.
+        if !reachable_masters.contains(&master) {
+            continue;
+        }
+        discard.push(shard);
+        seed_inbound.push((shard, master));
+    }
+    FullResyncDiscardPlan {
+        discard,
+        seed_inbound,
+    }
+}
+
+/// The output of [`plan_full_resync_discards`] (BUG1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FullResyncDiscardPlan {
+    /// Shards to drop locally (replica-only, reachable master). Sorted.
+    pub discard: Vec<u16>,
+    /// `(shard, committed_master)` inbound entries to seed + persist so the
+    /// re-push is triggered. Parallel to `discard`.
+    pub seed_inbound: Vec<(u16, NodeId)>,
 }
 
 /// Phase D: build this node's `PartitionVersionEntry` list by reading the
@@ -9548,6 +9782,217 @@ mod tests {
             rejoin_gate_decision(true, Some(100), 500, 50),
             RejoinGateDecision::Admit
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG2 — conservative rejoin gate on an empty/stale committed view (§4.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejoin_gate_empty_view_with_gc_refuses_regardless_of_tip() {
+        let grace = 100_000u32;
+        // Untrustworthy committed view + GC enabled → REFUSE even though the
+        // node looks fresh by the (unsound) tip estimate. The MAX-tip cannot be
+        // trusted because it ranges over an arbitrary, non-committed address
+        // set, so admitting could resurrect a GC'd-tombstone key.
+        assert_eq!(
+            rejoin_gate_decision_committed_view(
+                true,  /* gc */
+                false, /* committed_view_trustworthy */
+                Some(800_000),
+                800_000, /* self_height == tip, would be Admit if trusted */
+                grace,
+            ),
+            RejoinGateDecision::RefuseFullResync {
+                cluster_tip: 800_000,
+                self_height: 800_000,
+            }
+        );
+
+        // No tip evidence at all + untrustworthy view → still REFUSE (reports
+        // self_height as the tip for logging; the refusal is unconditional).
+        assert_eq!(
+            rejoin_gate_decision_committed_view(true, false, None, 12_345, grace),
+            RejoinGateDecision::RefuseFullResync {
+                cluster_tip: 12_345,
+                self_height: 12_345,
+            }
+        );
+    }
+
+    #[test]
+    fn rejoin_gate_empty_view_with_gc_disabled_admits() {
+        // OFF-PATH: GC disabled → admit as today even with an empty committed
+        // view (byte-identical pre-Phase-4 behavior; existing rejoin path
+        // unchanged).
+        assert_eq!(
+            rejoin_gate_decision_committed_view(false, false, Some(u32::MAX), 0, 1),
+            RejoinGateDecision::Admit
+        );
+        assert_eq!(
+            rejoin_gate_decision_committed_view(false, false, None, 0, 1),
+            RejoinGateDecision::Admit
+        );
+    }
+
+    #[test]
+    fn rejoin_gate_trustworthy_view_delegates_to_base_decision() {
+        let grace = 100_000u32;
+        let tip = 800_000u32;
+        // Trustworthy view → identical to `rejoin_gate_decision`: within grace
+        // admits, beyond grace refuses.
+        assert_eq!(
+            rejoin_gate_decision_committed_view(true, true, Some(tip), tip - 1, grace),
+            RejoinGateDecision::Admit
+        );
+        assert_eq!(
+            rejoin_gate_decision_committed_view(true, true, Some(tip), tip - grace, grace),
+            RejoinGateDecision::RefuseFullResync {
+                cluster_tip: tip,
+                self_height: tip - grace,
+            }
+        );
+        // Trustworthy view, no tip evidence → admit (no staleness proof).
+        assert_eq!(
+            rejoin_gate_decision_committed_view(true, true, None, 500_000, grace),
+            RejoinGateDecision::Admit
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG1 — full-resync discard plan: re-push trigger + reachable-master gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_resync_plan_seeds_reachable_replica_shards_with_master_source() {
+        // 3 nodes, RF=2: self_id holds some shards as replica-only with a peer
+        // master and some as master. With ALL masters reachable, every
+        // replica-only shard is discarded AND seeded with its committed master
+        // as the inbound source; no self-mastered shard is touched.
+        let self_id = NodeId(2);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 7, 1);
+        let replica_only = table.replica_only_shards_owned_by(self_id);
+        assert!(
+            !replica_only.is_empty(),
+            "test precondition: self must hold replica-only shards"
+        );
+
+        let all_masters: std::collections::HashSet<NodeId> =
+            [NodeId(1), NodeId(3)].into_iter().collect();
+        let plan = plan_full_resync_discards(&table, self_id, &all_masters);
+
+        // Every replica-only shard is discarded (master reachable).
+        assert_eq!(plan.discard, replica_only);
+        // seed_inbound mirrors discard one-to-one, each with the committed
+        // master as the source (NEVER self, NEVER NodeId(0)).
+        assert_eq!(plan.seed_inbound.len(), plan.discard.len());
+        for (shard, master) in &plan.seed_inbound {
+            assert_eq!(*master, table.target_assignment(*shard).master);
+            assert_ne!(*master, self_id, "source must not be self");
+            assert_ne!(*master, NodeId(0), "source must be a concrete master");
+        }
+        // No self-mastered shard appears in the discard set.
+        for &shard in &plan.discard {
+            assert_ne!(table.target_assignment(shard).master, self_id);
+        }
+    }
+
+    #[test]
+    fn full_resync_plan_keeps_shard_when_master_unreachable() {
+        let self_id = NodeId(2);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 7, 1);
+        let replica_only = table.replica_only_shards_owned_by(self_id);
+
+        // Only NodeId(1) is reachable; shards mastered by NodeId(3) must be KEPT
+        // (no confirmed live source → keep the stale replica rather than empty
+        // it with an offline master).
+        let only_n1: std::collections::HashSet<NodeId> = [NodeId(1)].into_iter().collect();
+        let plan = plan_full_resync_discards(&table, self_id, &only_n1);
+
+        for &shard in &replica_only {
+            let master = table.target_assignment(shard).master;
+            if master == NodeId(1) {
+                assert!(
+                    plan.discard.contains(&shard),
+                    "shard {shard} with reachable master must be discarded"
+                );
+            } else {
+                assert!(
+                    !plan.discard.contains(&shard),
+                    "shard {shard} with unreachable master must be KEPT"
+                );
+            }
+        }
+        // Every discarded shard's master is reachable + seeded.
+        for (shard, master) in &plan.seed_inbound {
+            assert!(only_n1.contains(master));
+            assert_eq!(*master, table.target_assignment(*shard).master);
+        }
+    }
+
+    #[test]
+    fn full_resync_plan_empty_when_no_master_reachable() {
+        let self_id = NodeId(2);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 7, 1);
+        // No master reachable → discard nothing (every shard kept), seed
+        // nothing. The conservative no-loss outcome.
+        let none: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        let plan = plan_full_resync_discards(&table, self_id, &none);
+        assert!(plan.discard.is_empty());
+        assert!(plan.seed_inbound.is_empty());
+    }
+
+    #[test]
+    fn full_resync_plan_seed_drives_requester_loop() {
+        // End-to-end of the BUG1 seed contract: the seeded inbound entries are
+        // exactly what the pull-based requester loop consumes — concrete-source
+        // entries with `from != self && from != NodeId(0)`. Register them into a
+        // real MigrationManager and confirm `pending_inbound_entries` surfaces
+        // them with the master source, AND that they survive a
+        // serialize/restore round-trip (the durable restart trigger).
+        let self_id = NodeId(2);
+        let table = ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 7, 1);
+        let all_masters: std::collections::HashSet<NodeId> =
+            [NodeId(1), NodeId(3)].into_iter().collect();
+        let plan = plan_full_resync_discards(&table, self_id, &all_masters);
+        assert!(!plan.seed_inbound.is_empty());
+
+        let mut mgr = MigrationManager::new();
+        for (shard, master) in &plan.seed_inbound {
+            assert!(mgr.register_inbound_source(*shard, *master));
+        }
+        // Idempotent re-seed (mirrors the pre-discard + post-install double
+        // seed) adds nothing.
+        for (shard, master) in &plan.seed_inbound {
+            assert!(!mgr.register_inbound_source(*shard, *master));
+        }
+
+        let pending = mgr.pending_inbound_entries();
+        // The requester loop filters `from != self && from != NodeId(0)`; every
+        // seeded entry must pass that filter.
+        let requestable: Vec<(u16, NodeId)> = pending
+            .iter()
+            .copied()
+            .filter(|(_, from)| *from != self_id && *from != NodeId(0))
+            .collect();
+        let mut expected = plan.seed_inbound.clone();
+        let mut got = requestable.clone();
+        expected.sort();
+        got.sort();
+        assert_eq!(got, expected, "all seeded shards must be requestable");
+
+        // Durable restart trigger: serialize → fresh manager → restore must
+        // recover the same concrete-source pending entries.
+        let bytes = mgr.serialize_inbound();
+        let mut restored = MigrationManager::new();
+        restored.restore_inbound(&bytes);
+        let mut after: Vec<(u16, NodeId)> = restored
+            .pending_inbound_entries()
+            .into_iter()
+            .filter(|(_, from)| *from != self_id && *from != NodeId(0))
+            .collect();
+        after.sort();
+        assert_eq!(after, expected, "re-request intent must survive restart");
     }
 
     #[test]

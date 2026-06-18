@@ -781,6 +781,11 @@ fn main() {
     // allocator so freelist mutations between snapshots are not lost.
     let mut allocator = allocator;
     let mut pending_conflicting_children = Vec::new();
+    // Height subsystem (deletion-tombstone design §4; BUG3): the max block
+    // height the replayed redo entries prove this node has durably seen. Folded
+    // into the last-durable-height floor below so a lost/corrupt `.height` file
+    // cannot regress the node to height 0. Independent of `tombstones_enabled`.
+    let mut recovery_height_floor: u32 = 0;
     if let Some(ref mut redo) = redo_log {
         // B-7: only the redb backend has crash-durable secondaries that
         // already reflect committed state; when it loaded both cleanly,
@@ -804,6 +809,7 @@ fn main() {
         ) {
             Ok((stats, pending)) => {
                 pending_conflicting_children = pending;
+                recovery_height_floor = stats.max_observed_block_height;
                 tracing::info!(
                     replayed = stats.entries_replayed,
                     skipped = stats.entries_skipped,
@@ -1061,15 +1067,25 @@ fn main() {
     // additive — independent of `tombstones_enabled` / `tombstone_gc_enabled`.
     //
     // The restored value is `max(persisted_file, record_floor)`: the persisted
-    // file is the primary source (atomic + CRC), and the tombstone-derived
-    // floor (max deletion_height) is a free safety net that keeps the height
-    // from regressing below deletions the node has durably recorded even if
-    // the file is lost or corrupt. With tombstones disabled the floor is 0 and
-    // the value comes from the persisted file alone; persistence keeps it
-    // monotone across restarts.
+    // file is the primary source (atomic + CRC), and `record_floor` is a free
+    // safety net that keeps the height from regressing below what the node's own
+    // durable state proves it has seen even if the file is lost or corrupt.
+    //
+    // BUG3: `record_floor` is the MAX of two independent lower bounds, so it is
+    // correct even with tombstones DISABLED:
+    //   - the max tombstone `deletion_height` (only non-zero when tombstones are
+    //     enabled — a tombstone's height ≤ the tip the node saw when deleting);
+    //   - the max block height across replayed height-bearing redo entries
+    //     (`recovery_height_floor`, always-on, independent of tombstones). This
+    //     is what stops a tombstones-off node with a lost `.height` file from
+    //     reporting 0 (which would freeze the cluster GC horizon and force
+    //     unnecessary full resyncs — design §4 height subsystem).
+    // Persistence keeps the value monotone across restarts.
     let height_path = config.resolved_last_durable_height_path();
     let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
-    let record_floor = tombstone_height_floor.unwrap_or(0);
+    let record_floor = tombstone_height_floor
+        .unwrap_or(0)
+        .max(recovery_height_floor);
     engine.set_last_durable_height_path(height_path.clone());
     let restored_height = engine.restore_last_durable_height(persisted_height, record_floor);
     tracing::info!(

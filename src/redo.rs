@@ -864,6 +864,75 @@ impl RedoOp {
         }
     }
 
+    /// The block height this op observed when it was applied, if any (height
+    /// subsystem, deletion-tombstone design §4).
+    ///
+    /// Returns `Some(h)` for the height-bearing ops that carry the chain height
+    /// (or, for [`RedoOp::SetMined`], the mined block height) at the time the
+    /// engine applied them: spend / unspend (V2 — V1 predates the field),
+    /// set-mined, reassign, set-conflicting, preserve-until,
+    /// mark-on-longest-chain, and the unset-mined compensation. Returns `None`
+    /// for ops that carry no height (freeze, prune, raw create/delete, region
+    /// allocation, control entries).
+    ///
+    /// Folded by recovery into [`crate::recovery::RecoveryStats`] so a node
+    /// whose durable `.height` file was lost or corrupted still floors its
+    /// `last_durable_height` at the max height its own replayed records prove
+    /// it has seen — independent of whether deletion tombstones are enabled.
+    /// This keeps the GC horizon / rejoin gate from regressing to 0 (design
+    /// §4 height subsystem; BUG3).
+    pub fn observed_block_height(&self) -> Option<u32> {
+        match self {
+            RedoOp::SpendV2 {
+                current_block_height,
+                ..
+            }
+            | RedoOp::UnspendV2 {
+                current_block_height,
+                ..
+            }
+            | RedoOp::SetConflicting {
+                current_block_height,
+                ..
+            }
+            | RedoOp::MarkOnLongestChain {
+                current_block_height,
+                ..
+            } => Some(*current_block_height),
+            RedoOp::SetMined { block_height, .. }
+            | RedoOp::Reassign { block_height, .. }
+            | RedoOp::PreserveUntil { block_height, .. }
+            | RedoOp::CompensateUnsetMined { block_height, .. } => Some(*block_height),
+            // No height carried (or V1 ops predating the height field) — these
+            // contribute nothing to the floor.
+            RedoOp::Spend { .. }
+            | RedoOp::Unspend { .. }
+            | RedoOp::Freeze { .. }
+            | RedoOp::FreezeV2 { .. }
+            | RedoOp::Unfreeze { .. }
+            | RedoOp::UnfreezeV2 { .. }
+            | RedoOp::PruneSlot { .. }
+            | RedoOp::PruneSlotIfSpentBy { .. }
+            | RedoOp::Create { .. }
+            | RedoOp::CreateV2 { .. }
+            | RedoOp::Delete { .. }
+            | RedoOp::AppendConflictingChild { .. }
+            | RedoOp::AppendDeletedChild { .. }
+            | RedoOp::SetLocked { .. }
+            | RedoOp::SecondaryUnminedUpdate { .. }
+            | RedoOp::SecondaryDahUpdate { .. }
+            | RedoOp::CompensateReassign { .. }
+            | RedoOp::CompensatePrune { .. }
+            | RedoOp::CompensateSetLocked { .. }
+            | RedoOp::AllocateRegion { .. }
+            | RedoOp::FreeRegion { .. }
+            | RedoOp::HashtableResizeBegin { .. }
+            | RedoOp::HashtableResizeCommit { .. }
+            | RedoOp::RecoveryProgress { .. }
+            | RedoOp::Checkpoint => None,
+        }
+    }
+
     /// Serialize op-specific data (without type byte, sequence, or length).
     fn serialize_data(&self, buf: &mut Vec<u8>) {
         match self {

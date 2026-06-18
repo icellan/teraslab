@@ -581,10 +581,17 @@ impl Engine {
     ///   the file is missing or corrupt; a missing/corrupt file is NOT a hard
     ///   error, it just contributes nothing).
     /// - `record_floor` — a lower bound the node has DEMONSTRABLY committed:
-    ///   the max block height across loaded records. Even if persistence is
-    ///   lost entirely, the height cannot regress below what the node's own
-    ///   durable records prove it has seen, which is exactly what the GC
-    ///   horizon and rejoin gate require for soundness.
+    ///   the max block height across the node's own durable, height-bearing
+    ///   state. The caller (startup) computes it as the MAX of (a) the max
+    ///   height of replayed height-bearing redo entries — live-record heights
+    ///   from set-mined / spend / mark-on-longest-chain etc.
+    ///   ([`crate::redo::RedoOp::observed_block_height`]) — and (b) the max
+    ///   tombstone `deletion_height` when tombstones are enabled. Folding the
+    ///   live-record height (a) is what makes the floor correct even with
+    ///   tombstones DISABLED (BUG3): even if persistence is lost entirely, the
+    ///   height cannot regress below what the node's own durable records prove
+    ///   it has seen, which is exactly what the GC horizon and rejoin gate
+    ///   require for soundness.
     ///
     /// Because the result is a `fetch_max`, calling this is itself monotone
     /// and idempotent. Returns the value the height was set to.

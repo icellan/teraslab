@@ -172,6 +172,18 @@ pub struct RecoveryStats {
     /// to a cap — the master re-replicates the key on rejoin. See
     /// [`ReplayCause::ReplicaRecordAbsent`].
     pub failed_replica_record_absent: u64,
+    /// Height subsystem (deletion-tombstone design §4; BUG3): the maximum
+    /// block height observed across all replayed height-bearing redo entries
+    /// (via [`crate::redo::RedoOp::observed_block_height`]), regardless of
+    /// whether the entry applied/skipped — a skipped (already-applied) entry
+    /// still proves the node durably saw that height. `0` when the replayed
+    /// range carried no height-bearing op.
+    ///
+    /// Startup folds this into the node's `last_durable_height` floor so a
+    /// node whose durable `.height` file was lost still reports a height no
+    /// lower than its own records prove, keeping the GC horizon / rejoin gate
+    /// from regressing to 0. Independent of `tombstones_enabled`.
+    pub max_observed_block_height: u32,
 }
 
 /// B-7: how recovery reconciles the DAH / unmined secondary indexes
@@ -281,6 +293,11 @@ pub fn recover(
     let mut stats = RecoveryStats::default();
 
     for entry in &entries {
+        // Height subsystem (design §4; BUG3): fold the max block height across
+        // height-bearing entries, independent of replay outcome.
+        if let Some(h) = entry.op.observed_block_height() {
+            stats.max_observed_block_height = stats.max_observed_block_height.max(h);
+        }
         match replay_entry(device, index, entry) {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
@@ -708,6 +725,12 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         // can reconcile just these against the durable secondaries.
         if let Some(key) = entry.op.tx_key() {
             touched_keys.insert(*key);
+        }
+        // Height subsystem (design §4; BUG3): fold the max block height across
+        // height-bearing entries — BEFORE the replay outcome, since a skipped
+        // (already-applied) entry still proves the height was durably seen.
+        if let Some(h) = entry.op.observed_block_height() {
+            stats.max_observed_block_height = stats.max_observed_block_height.max(h);
         }
         let outcome = match &entry.op {
             RedoOp::SecondaryUnminedUpdate {
@@ -5817,5 +5840,99 @@ mod tests {
             "torn final tombstone entry must be dropped, not reconstructed",
         );
         assert_eq!(idx.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG3 — record-height floor from replayed live-record (height-bearing)
+    // redo entries, independent of tombstones (design §4 height subsystem).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recovery_folds_max_block_height_across_height_bearing_entries() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x70, 2);
+
+        // A height-bearing op (SetMined at height 800_123) and a NON-height op
+        // (Freeze) — only the former should contribute to the floor.
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SetMined {
+            tx_key: key,
+            block_id: 5,
+            block_height: 800_123,
+            subtree_idx: 0,
+            unset: false,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::Freeze {
+            tx_key: key,
+            offset: 0,
+        })
+        .unwrap();
+        // A lower height-bearing op must not lower the max.
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: [0xAA; 36],
+            new_spent_count: 1,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            target_generation: 1,
+            updated_at: 10,
+            utxo_hash: None,
+        })
+        .unwrap();
+        drop(redo);
+
+        let redo = h.redo_log();
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(
+            stats.max_observed_block_height, 800_123,
+            "floor must be the MAX height across height-bearing entries",
+        );
+    }
+
+    #[test]
+    fn recovery_height_floor_zero_when_no_height_bearing_entry() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x71, 1);
+        let mut redo = h.redo_log();
+        // Only non-height ops → floor stays 0.
+        redo.append_and_flush(RedoOp::Freeze {
+            tx_key: key,
+            offset: 0,
+        })
+        .unwrap();
+        drop(redo);
+        let redo = h.redo_log();
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.max_observed_block_height, 0);
+    }
+
+    #[test]
+    fn restore_last_durable_height_floors_at_record_height_without_tombstones() {
+        // BUG3 core: a node with a LOST `.height` file (persisted = None) and
+        // tombstones DISABLED (so the tombstone floor is 0) must still restore
+        // its height to the live-record floor H — NOT 0.
+        let h = RecoveryTestHarness::new();
+        let engine = engine_from_harness(h);
+
+        let big_h = 850_000u32;
+        // persisted=None (file lost), record_floor=H (from replayed records).
+        // No tombstones involved — the floor comes purely from the record
+        // height path, proving independence from `tombstones_enabled`.
+        let restored = engine.restore_last_durable_height(None, big_h);
+        assert_eq!(
+            restored, big_h,
+            "must floor at the live-record height, not 0"
+        );
+        assert_eq!(engine.last_durable_height(), big_h);
+
+        // Monotone: a later restore with a lower floor never regresses.
+        let restored2 = engine.restore_last_durable_height(None, 100);
+        assert_eq!(restored2, big_h);
+
+        // The persisted file, when present and higher, still wins.
+        let restored3 = engine.restore_last_durable_height(Some(900_000), 0);
+        assert_eq!(restored3, 900_000);
     }
 }

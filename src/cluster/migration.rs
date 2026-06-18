@@ -765,6 +765,43 @@ impl MigrationManager {
         true
     }
 
+    /// Register a pending inbound migration for `shard` from a CONCRETE source
+    /// (deletion-tombstone design §4.3; BUG1).
+    ///
+    /// Unlike [`Self::mark_inbound_active`] (which registers the `NodeId(0)`
+    /// sentinel when the source is unknown at dispatch time), this records the
+    /// committed master as the `from_node` so the pull-based repair loop —
+    /// which sends `OP_MIGRATION_TRANSFER_REQUEST` only for entries whose source
+    /// is a concrete peer (`from != self && from != NodeId(0)`) — will actually
+    /// request the shard. Used by the Phase 4 rejoin gate after a full-resync
+    /// discard: the discarded shard's master must re-push it, but the routing
+    /// snapshot install wipes the migration manager, so the gate seeds these
+    /// entries AFTER the install (and persists them via
+    /// [`persist_inbound_state`]) so both the live requester loop and a restart
+    /// re-trigger the re-push.
+    ///
+    /// Idempotent: if a non-completed entry for `(shard, from_node)` already
+    /// exists this is a no-op. Sets the inbound bitmap bit so the read/write
+    /// path treats the shard as still receiving until completion. Returns
+    /// `true` if a new entry was added, `false` if one already existed.
+    pub fn register_inbound_source(&mut self, shard: u16, from_node: NodeId) -> bool {
+        if self
+            .inbound_migrations
+            .iter()
+            .any(|m| m.shard == shard && m.from_node == from_node && !m.completed)
+        {
+            return false;
+        }
+        self.inbound_migrations.push(InboundMigration {
+            shard,
+            from_node,
+            completed: false,
+            transfer_requested_at: None,
+        });
+        self.inbound_bitmap.set(shard);
+        true
+    }
+
     /// Mark an inbound shard as received (data has arrived and been verified).
     ///
     /// Marks the first non-completed entry for this shard as completed.
@@ -1832,6 +1869,30 @@ mod tests {
 
         mgr.mark_inbound_complete(42);
         assert!(!mgr.has_pending_inbound(42));
+    }
+
+    #[test]
+    fn register_inbound_source_records_concrete_source() {
+        // BUG1: unlike mark_inbound_active (sentinel NodeId(0)),
+        // register_inbound_source records the concrete master so the
+        // pull-based requester loop (which filters out NodeId(0)) will
+        // actually request the shard.
+        let mut mgr = MigrationManager::new();
+        let master = NodeId(7);
+        assert!(mgr.register_inbound_source(9, master));
+        assert!(mgr.has_pending_inbound(9));
+        assert_eq!(mgr.pending_inbound_entries(), vec![(9, master)]);
+
+        // Idempotent for the same (shard, source).
+        assert!(!mgr.register_inbound_source(9, master));
+        assert_eq!(mgr.inbound_count(), 1);
+
+        // Survives a serialize/restore round-trip with the source intact (the
+        // durable restart trigger).
+        let bytes = mgr.serialize_inbound();
+        let mut restored = MigrationManager::new();
+        restored.restore_inbound(&bytes);
+        assert_eq!(restored.pending_inbound_entries(), vec![(9, master)]);
     }
 
     #[test]
