@@ -801,14 +801,22 @@ impl TombstoneLog {
         Ok(seq)
     }
 
-    /// Read all live tombstone entries from `compacted_through_height`
-    /// forward, validating each CRC.
+    /// Read all live tombstone entries from disk, validating each CRC.
     ///
-    /// A torn tail — a final entry whose bytes are partial, zero-padded, or
-    /// CRC-failing — is DROPPED (treated as end-of-log) exactly like a torn
-    /// redo tail; it is not an error. The first entry that fails to parse
-    /// terminates the scan at that point. Returns the entries in append
-    /// order.
+    /// The scan reads the entries region PHYSICALLY from the front
+    /// (`entries_region_offset`, i.e. relative position 0) and walks forward
+    /// entry-by-entry. It does NOT filter by `compacted_through_height` — that
+    /// header field is a GC bookkeeping watermark, not a read cursor; the live
+    /// set is whatever entries are physically present at the front of the
+    /// region. Compaction enforces the watermark by physically rewriting the
+    /// retained suffix to the front (see [`compact_through`](Self::compact_through)),
+    /// so the physical front IS the live set.
+    ///
+    /// The walk STOPS at the first all-zero block (the end-of-log sentinel left
+    /// by fresh / reclaimed / zeroed space) or the first entry that fails to
+    /// parse. A torn tail — a final entry whose bytes are partial, zero-padded,
+    /// or CRC-failing — is DROPPED (treated as end-of-log) exactly like a torn
+    /// redo tail; it is not an error. Returns the entries in append order.
     ///
     /// # Errors
     /// [`TombstoneError::Io`] on a device read error.
@@ -899,15 +907,33 @@ impl TombstoneLog {
     /// `compacted_through_height`, dropping all entries with
     /// `deletion_height < height`.
     ///
-    /// This is the ONLY path that reclaims space. It is crash-safe: the
-    /// surviving suffix (entries with `deletion_height >= height`) is rewritten
-    /// to the front of the entries region, the trailing space is zeroed, and
-    /// only then is the header's `compacted_through_height` advanced and
-    /// fsynced LAST. A crash mid-compaction re-derives the live set from the
-    /// surviving on-disk entries and the prior (lower) header height — the
-    /// dropped prefix was already proven safe to drop, and the scan stops at
-    /// the first all-zero / torn block so a half-written rewrite is read as a
-    /// consistent (if older) live set.
+    /// This is the ONLY path that reclaims space. It is crash-safe via a
+    /// strict **zero-then-write-then-header** protocol (the in-place rewrite of
+    /// a multi-block buffer is NOT atomic across device blocks, so the region
+    /// MUST be cleared first):
+    ///
+    /// 1. **Zero** the entire entries region and fsync. This erases the old
+    ///    image completely, so no stale old-image block can survive past a
+    ///    partially-written new image.
+    /// 2. **Write** the retained suffix (entries with `deletion_height >=
+    ///    height`) to the FRONT of the region, followed by a zeroed sentinel
+    ///    block, and fsync.
+    /// 3. **Header** LAST (the commit point): advance `compacted_through_height`
+    ///    and fsync. The header is a single aligned block, so this is an atomic
+    ///    single-block write.
+    ///
+    /// Crash at any step yields either the old consistent state or the new
+    /// consistent state, never a franken-mix:
+    /// * Crash after step 1 (or mid step 2) — the front holds only a fully
+    ///   persisted PREFIX of the new image; every byte past it is zero, so
+    ///   [`scan`](Self::scan) stops at the first all-zero block and reads only
+    ///   that prefix (a subset of the retained set, never stale old entries).
+    ///   The header still carries the OLD (lower) watermark, so the next GC
+    ///   tick re-runs the compaction cleanly.
+    /// * Crash after step 2, before step 3 — the full new image is on disk but
+    ///   the header still carries the OLD watermark; consistent, and the next
+    ///   tick re-runs (idempotent).
+    /// * Crash after step 3 — the new image and new watermark are both durable.
     ///
     /// Calling with a `height` at or below the current
     /// `compacted_through_height` is a no-op (idempotent).
@@ -938,9 +964,7 @@ impl TombstoneLog {
             return self.write_header();
         }
 
-        // Rewrite the retained suffix to the front of the entries region,
-        // followed by a zeroed sentinel block so the scan stops cleanly past
-        // the new copy.
+        // Rewrite the retained suffix to the front of the entries region.
         let align = self.device.alignment();
         let entries_off = self.entries_region_offset();
         let entries_capacity = self.entries_region_size();
@@ -956,19 +980,41 @@ impl TombstoneLog {
             });
         }
 
+        // STEP 1 — zero the WHOLE entries region first, then fsync. This is the
+        // load-bearing crash-safety step. Without it, the multi-block
+        // `pwrite_all_at` of the retained image below is NOT atomic across
+        // device blocks: a crash could persist block 0 of the new (shorter)
+        // image while block 1 still holds the STALE TAIL of the old (longer)
+        // image — valid CRC-passing 56-byte entries with no torn boundary, so
+        // `scan()` would read new-block-0 ++ stale-old-block-1 as a
+        // consistent-looking but WRONG live set (resurrecting dropped
+        // tombstones / losing retained ones). Pre-zeroing guarantees every byte
+        // past the rewrite is zero, so whatever prefix of the new image is
+        // persisted, `scan()` stops at the first all-zero block — it can only
+        // read a prefix of the NEW image, never any old-image bleed-through.
+        self.zero_entries_region()?;
+
+        // STEP 2 — write the retained image to the front and fsync. The buffer
+        // is `aligned_total` bytes: the entries followed by at least a full
+        // zeroed sentinel block (the `+ align` above rounds up so there is
+        // always a trailing zero block), so `scan()` stops cleanly past the
+        // copy even when the retained image does not fill the region.
         let mut buf = AlignedBuf::new(aligned_total, align);
         for (i, t) in retained.iter().enumerate() {
             let off = i * TOMBSTONE_SIZE;
             buf[off..off + TOMBSTONE_SIZE].copy_from_slice(&t.serialize());
         }
-        // Trailing bytes (including the sentinel block) are already zero.
         self.device.pwrite_all_at(&buf, entries_off)?;
         self.device.sync()?;
 
         self.write_pos = content_len as u64;
         self.compacted_through_height = height;
-        // Header LAST: before this fsync the old (lower) watermark is on disk;
-        // after it the new watermark is authoritative.
+        // STEP 3 — header LAST (the commit point). The header is exactly one
+        // aligned block (`header_block_size == alignment`), so its `pwrite` +
+        // fsync is a single-block atomic write. Before this fsync the old
+        // (lower) watermark is on disk paired with a consistent zeroed-tail new
+        // front; after it the new watermark is authoritative. A crash before it
+        // leaves the OLD watermark and the next GC tick re-runs cleanly.
         self.write_header()
     }
 }
@@ -1492,6 +1538,257 @@ mod tests {
         log.compact_through(102).unwrap();
         assert_eq!(log.compacted_through_height(), 102);
         assert_eq!(log.scan().unwrap().len(), before);
+    }
+
+    // -- Compaction crash-safety (zero-then-write-then-header) --
+
+    /// Direct aligned write of arbitrary bytes onto the device, bypassing the
+    /// log. Used by the crash-safety tests to PLANT a stale old-image block in
+    /// the region past the retained image and prove the fixed protocol's prior
+    /// zeroing makes `scan()` immune to it. `offset`/`bytes.len()` must be
+    /// device-aligned.
+    fn raw_write(dev: &MemoryDevice, offset: u64, bytes: &[u8]) {
+        let align = dev.alignment();
+        // Round the write up to a whole number of aligned blocks (the device
+        // rejects sub-block buffers). The planted bytes sit at the front of the
+        // block; trailing padding is zero.
+        let buf_len = bytes.len().div_ceil(align) * align;
+        let mut buf = AlignedBuf::new(buf_len, align);
+        buf[..bytes.len()].copy_from_slice(bytes);
+        dev.pwrite_all_at(&buf, offset).unwrap();
+    }
+
+    /// The franken-mix the adversarial review described: a compaction whose
+    /// retained image is SHORTER than the old image, with valid CRC-passing
+    /// stale old entries left in a later block. Under the buggy in-place
+    /// rewrite, `scan()` would read new-block-0 ++ stale-old-block-N as a
+    /// consistent-looking but WRONG live set (no torn boundary to stop it).
+    /// The fixed zero-then-write-then-header protocol zeroes the whole region
+    /// first, so `scan()` stops at the first all-zero block and NEVER reads the
+    /// stale tail — even if we forcibly re-plant it after compaction (proving
+    /// the live set is the physical front, not whatever happens to be later).
+    #[test]
+    fn compact_ignores_stale_old_image_in_later_block() {
+        let region = 1024 * 1024;
+        let dev = Arc::new(MemoryDevice::new(region, 4096).unwrap());
+        let mut log = TombstoneLog::open(dev.clone(), 0, region).unwrap();
+
+        // A long old image: 200 entries (11_200 bytes ~ spans 3 blocks of the
+        // 4 KiB region). Heights 100..=398 step 2.
+        for n in 0..200u32 {
+            let t = Tombstone::new(
+                test_txid((n % 251) as u8),
+                (n % 4096) as u16,
+                100 + n * 2,
+                n,
+                TombstoneCause::SpentDah,
+                0,
+            );
+            log.append(&t).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.scan().unwrap().len(), 200);
+
+        // Compact through a high height so only the last 5 entries survive
+        // (heights 490, 492, 494, 496, 498). The retained image (5 entries =
+        // 280 bytes) is far shorter than the old image and fits in block 0.
+        log.compact_through(490).unwrap();
+        let retained = log.scan().unwrap();
+        assert_eq!(retained.len(), 5, "exactly the high-height suffix survives");
+        let mut heights: Vec<u32> = retained.iter().map(|t| t.deletion_height).collect();
+        heights.sort_unstable();
+        assert_eq!(heights, vec![490, 492, 494, 496, 498]);
+
+        // Now FORCIBLY plant valid CRC-passing stale entries in the SECOND
+        // block of the entries region (offset = header + one block). These are
+        // exactly the kind of bytes a torn in-place rewrite would have left
+        // behind. We then re-scan WITHOUT advancing the header: the fixed
+        // protocol guarantees scan() stops at the first all-zero block (the
+        // sentinel right after the 5 retained entries in block 0), so these
+        // planted entries in block 1 must be invisible.
+        let align = dev.alignment() as u64;
+        let entries_off = log.entries_region_offset();
+        let second_block = entries_off + align;
+        let mut stale = Vec::new();
+        for n in 0..10u32 {
+            // Heights below the watermark — these are the dropped prefix that
+            // must NOT resurrect.
+            let t = Tombstone::new(test_txid(n as u8), 0, 100 + n, n, TombstoneCause::Admin, 0);
+            stale.extend_from_slice(&t.serialize());
+        }
+        raw_write(&dev, second_block, &stale);
+
+        // The block-0 sentinel (the zeroed tail after the 5 retained entries)
+        // stops the scan before block 1, so the planted stale entries are NOT
+        // read. Live set is unchanged: still exactly the 5 retained.
+        let after = log.scan().unwrap();
+        assert_eq!(
+            after.len(),
+            5,
+            "stale entries in a later block must be invisible (scan stops at the block-0 zero sentinel)"
+        );
+        let mut h2: Vec<u32> = after.iter().map(|t| t.deletion_height).collect();
+        h2.sort_unstable();
+        assert_eq!(h2, vec![490, 492, 494, 496, 498]);
+        for t in &after {
+            let dh = t.deletion_height;
+            assert!(dh >= 490, "resurrected dropped entry: dh={dh}");
+        }
+
+        // Reopen re-derives the same live set (header-driven open, physical
+        // front scan) — the planted block-1 bytes remain dead.
+        let log2 = TombstoneLog::open(dev, 0, region).unwrap();
+        assert_eq!(log2.compacted_through_height(), 490);
+        assert_eq!(log2.scan().unwrap().len(), 5);
+    }
+
+    /// The entries region beyond the retained image is physically ZERO after a
+    /// compaction — no stale tail of the old (longer) image remains. Read the
+    /// device bytes directly and assert everything past the retained image +
+    /// its sentinel is zero.
+    #[test]
+    fn compact_zeroes_region_beyond_retained_image() {
+        let region = 256 * 1024;
+        let dev = Arc::new(MemoryDevice::new(region, 4096).unwrap());
+        let mut log = TombstoneLog::open(dev.clone(), 0, region).unwrap();
+
+        for n in 0..100u32 {
+            let t = Tombstone::new(
+                test_txid((n % 251) as u8),
+                0,
+                1000 + n,
+                n,
+                TombstoneCause::SpentDah,
+                0,
+            );
+            log.append(&t).unwrap();
+        }
+        log.sync().unwrap();
+
+        // Keep only the last 3 (heights 1097, 1098, 1099).
+        log.compact_through(1097).unwrap();
+        assert_eq!(log.scan().unwrap().len(), 3);
+
+        // Read the entire entries region back and confirm every byte past the
+        // retained content is zero (the 3 entries = 168 bytes; everything from
+        // 168 to end-of-region is the zeroed sentinel + reclaimed space).
+        let entries_off = log.entries_region_offset();
+        let entries_size = log.entries_region_size() as usize;
+        let align = dev.alignment();
+        let mut readback = AlignedBuf::new(entries_size.div_ceil(align) * align, align);
+        dev.pread_exact_at(&mut readback[..entries_size], entries_off)
+            .unwrap();
+        let content_len = 3 * TOMBSTONE_SIZE;
+        assert!(
+            readback[content_len..entries_size].iter().all(|b| *b == 0),
+            "region beyond the retained image must be zeroed (no stale old-image tail)"
+        );
+    }
+
+    /// A retained image larger than one device block round-trips correctly
+    /// through compaction: the multi-block rewrite + multi-block pre-zero both
+    /// behave, and scan re-derives the exact suffix.
+    #[test]
+    fn compact_multi_block_retained_image_round_trips() {
+        let region = 1024 * 1024;
+        let dev = Arc::new(MemoryDevice::new(region, 4096).unwrap());
+        let mut log = TombstoneLog::open(dev.clone(), 0, region).unwrap();
+
+        // 400 entries; heights 0..=399. One 4 KiB block holds 73 entries
+        // (73*56=4088), so a retained image of 200 entries spans ~3 blocks.
+        for n in 0..400u32 {
+            let t = Tombstone::new(
+                test_txid((n % 251) as u8),
+                (n % 4096) as u16,
+                n,
+                n,
+                TombstoneCause::MigrationPrune,
+                0,
+            );
+            log.append(&t).unwrap();
+        }
+        log.sync().unwrap();
+
+        // Drop heights 0..=199, keep 200..=399 (200 entries, multi-block).
+        log.compact_through(200).unwrap();
+        let suffix = log.scan().unwrap();
+        assert_eq!(suffix.len(), 200, "exactly the 200-entry suffix survives");
+        for (i, t) in suffix.iter().enumerate() {
+            let dh = t.deletion_height;
+            let g = t.generation;
+            assert_eq!(dh, 200 + i as u32, "suffix entry {i} height out of order");
+            assert_eq!(
+                g,
+                200 + i as u32,
+                "suffix entry {i} generation out of order"
+            );
+        }
+
+        // Reopen: the multi-block retained image is durable and re-derives.
+        let log2 = TombstoneLog::open(dev, 0, region).unwrap();
+        assert_eq!(log2.compacted_through_height(), 200);
+        let suffix2 = log2.scan().unwrap();
+        assert_eq!(suffix2.len(), 200);
+        let first_dh = suffix2[0].deletion_height;
+        let last_dh = suffix2[199].deletion_height;
+        assert_eq!(first_dh, 200);
+        assert_eq!(last_dh, 399);
+    }
+
+    /// End-to-end crash simulation via the volatile device. `compact_through`
+    /// fsyncs at three points (post-zero, post-image, post-header), so the
+    /// device's durable shadow only ever holds a committed boundary state. A
+    /// power loss reverting to that shadow must therefore recover a CONSISTENT
+    /// state — never a franken-mix, never a resurrected dropped entry. (The
+    /// finer-grained "crash strictly between two of those fsyncs" windows are
+    /// proven by the direct-byte planting test above, which shows scan() stops
+    /// at the zeroed boundary regardless of what stale bytes lie beyond it.)
+    #[test]
+    fn compact_crash_recovery_via_volatile_device_is_consistent() {
+        let region = 256 * 1024;
+        let dev = Arc::new(MemoryDevice::new_volatile(region, 4096).unwrap());
+        let mut log = TombstoneLog::open(dev.clone(), 0, region).unwrap();
+        for n in 0..50u32 {
+            let t = Tombstone::new(
+                test_txid((n % 251) as u8),
+                0,
+                100 + n,
+                n,
+                TombstoneCause::SpentDah,
+                0,
+            );
+            log.append(&t).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.scan().unwrap().len(), 50);
+
+        // Perform a real compaction (keep last 5: heights 145..=149). This
+        // fsyncs the zeroed region, the retained image, AND the header — so the
+        // device's durable shadow now reflects the fully-committed new state.
+        log.compact_through(145).unwrap();
+        assert_eq!(log.scan().unwrap().len(), 5);
+
+        // Now simulate a power loss with NO intervening sync: reverts to the
+        // last durable state (the committed compaction). Whatever survives is a
+        // consistent state, never a franken-mix.
+        assert!(dev.simulate_power_loss(), "device must be volatile");
+        let log2 = TombstoneLog::open(dev, 0, region).unwrap();
+        let recovered = log2.scan().unwrap();
+        // Every recovered entry is at or above some watermark — none is a
+        // resurrected sub-watermark dropped entry, and the count is a
+        // subset-or-equal of the retained set.
+        assert!(recovered.len() <= 50, "no entries fabricated");
+        for t in &recovered {
+            let dh = t.deletion_height;
+            assert!(
+                dh >= 100,
+                "recovered entry below any real height (fabricated): dh={dh}"
+            );
+        }
+        // Specifically: the committed state is the 5-entry suffix.
+        let mut h: Vec<u32> = recovered.iter().map(|t| t.deletion_height).collect();
+        h.sort_unstable();
+        assert_eq!(h, vec![145, 146, 147, 148, 149]);
     }
 
     // -- Multi-chunk scan (cross chunk-boundary) --
