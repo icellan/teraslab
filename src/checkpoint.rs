@@ -392,6 +392,17 @@ where
         .persist_allocator()
         .map_err(|e| format!("persist_allocator: {e}"))?;
 
+    // 2b. Persist the node's last-durable height to its tiny durable file
+    //     (deletion-tombstone design §4, height subsystem). Always-on and
+    //     additive; a no-op when no height path is attached. A failure here
+    //     does NOT abort the checkpoint: the height is a monotone hint
+    //     recoverable from the record-derived floor, so unlike the index /
+    //     allocator it is non-fatal — log and continue so a transient height
+    //     write error never blocks redo reclamation.
+    if let Err(e) = engine.persist_last_durable_height() {
+        tracing::warn!(err = %e, "checkpoint: last-durable-height persist failed (non-fatal)");
+    }
+
     // 3. Durability barrier (B-1/G-1 audit fixes). Redo reclamation is
     //    only legal once every store the fenced entries cover is durable:
     //

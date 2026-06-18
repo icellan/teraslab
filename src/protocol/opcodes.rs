@@ -100,6 +100,28 @@ pub const OP_ADMIN_DIAGNOSE_KEY: u16 = 104;
 /// dependency on cluster state. Safe to spam on every reconnect.
 pub const OP_HELLO: u16 = 107;
 
+/// Inter-node query returning the responding node's `last_durable_height`
+/// (deletion-tombstone design §4, height subsystem).
+///
+/// Pull-based by design: this is NOT a SWIM/gossip wire change. A node that
+/// needs the cluster's finalized-height view queries each committed member
+/// with this op on demand (the GC horizon and the rejoin-eligibility gate),
+/// rather than piggybacking height on the membership payload.
+///
+/// Request payload: empty.
+///
+/// Response payload (`STATUS_OK`, fixed 4 bytes):
+/// ```text
+///   last_durable_height: u32 LE   (4 bytes)
+/// ```
+///
+/// HMAC-gated as an inter-node opcode (see [`is_inter_node_auth_opcode`]): the
+/// height exposes cluster-internal progress, mirroring `OP_GET_PARTITION_MAP`.
+pub const OP_GET_NODE_HEIGHT: u16 = 108;
+
+/// Encoded width of the `OP_GET_NODE_HEIGHT` response payload.
+pub const NODE_HEIGHT_PAYLOAD_SIZE: usize = 4;
+
 /// Maximum number of txids accepted in a single `OP_ADMIN_DIAGNOSE_KEY`
 /// request. The barrier in integration tests only ever inspects the
 /// first ~32 failing records, so 64 is comfortably above expected use
@@ -625,6 +647,7 @@ pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
             | OP_PARTITION_VERSION_REPORT
             | OP_ADMIN_DIAGNOSE_KEY
             | OP_ADMIN_CLUSTER_HEALTH
+            | OP_GET_NODE_HEIGHT
     )
 }
 

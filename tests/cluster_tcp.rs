@@ -167,6 +167,8 @@ fn create_node_full(
         migration_batch_size: 100,
         persisted_incarnation: 0,
         cluster_id,
+        tombstone_gc_enabled: false,
+        rejoin_grace_blocks: 100_000,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
@@ -346,6 +348,58 @@ fn partition_map_served_over_tcp() {
     eprintln!(
         "partition map: version={version}, nodes={node_count}, payload_size={}",
         resp.payload.len()
+    );
+
+    node.cluster.shutdown();
+    node.server.shutdown();
+}
+
+#[test]
+fn node_height_served_over_tcp() {
+    // Height subsystem (deletion-tombstone design §4): OP_GET_NODE_HEIGHT
+    // returns the node's last-durable height as a 4-byte LE payload.
+    let node = create_node(11, 13312, 13313, &[], 2);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Fresh node → height 0.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_NODE_HEIGHT,
+            flags: 0,
+            payload: vec![].into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    assert_eq!(resp.payload.len(), NODE_HEIGHT_PAYLOAD_SIZE);
+    assert_eq!(
+        u32::from_le_bytes(resp.payload[0..4].try_into().unwrap()),
+        0,
+        "fresh node should report height 0"
+    );
+
+    // Observe a height directly on the engine, then re-query: the wire value
+    // must reflect the new monotone max.
+    node.server.engine().observe_block_height(812_345);
+    let resp2 = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 2,
+            op_code: OP_GET_NODE_HEIGHT,
+            flags: 0,
+            payload: vec![].into(),
+        },
+    );
+    assert_eq!(resp2.status, STATUS_OK);
+    assert_eq!(
+        u32::from_le_bytes(resp2.payload[0..4].try_into().unwrap()),
+        812_345,
+        "node height should reflect the observed block height"
     );
 
     node.cluster.shutdown();

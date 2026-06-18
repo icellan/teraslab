@@ -1037,6 +1037,20 @@ pub struct ClusterConfig {
     /// pre-orchestrator deployments — those nodes fall back to the
     /// F-G8-001 ever-seen heuristic.
     pub cluster_id: crate::cluster::topology::ClusterId,
+    /// Whether tombstone GC + its load-bearing rejoin-eligibility gate are
+    /// active (deletion-tombstone design §4.3, Phase 4+5). Default `false`.
+    ///
+    /// When `false`, the rejoin gate in the topology catch-up path is INERT:
+    /// a catching-up node is admitted exactly as before (no staleness refusal,
+    /// no forced full resync). When `true`, a node more than
+    /// [`Self::rejoin_grace_blocks`] behind the estimated cluster tip is
+    /// refused incremental rejoin and forced into a full-baseline resync —
+    /// the §4.3 coupling that makes GC sound.
+    pub tombstone_gc_enabled: bool,
+    /// Maximum staleness (block heights) a rejoining node may carry before the
+    /// rejoin gate forces a full resync (deletion-tombstone design §4.2/§4.5).
+    /// Only consulted when [`Self::tombstone_gc_enabled`] is `true`.
+    pub rejoin_grace_blocks: u32,
 }
 
 /// Runtime replication policy passed to a started cluster coordinator.
@@ -1108,6 +1122,12 @@ pub struct ClusterCoordinator {
     /// changes before the event loop proposes a new topology term. Consumed
     /// when the event loop starts to build its [`TopologyDebounce`].
     topology_debounce: Duration,
+    /// Phase 4 rejoin-eligibility gate (deletion-tombstone design §4.3).
+    /// Shares the GC master switch; default `false` → gate inert.
+    tombstone_gc_enabled: bool,
+    /// Max staleness (block heights) before the rejoin gate forces a full
+    /// resync. Only consulted when `tombstone_gc_enabled` (design §4.2/§4.5).
+    rejoin_grace_blocks: u32,
 }
 
 impl ClusterCoordinator {
@@ -1191,6 +1211,8 @@ impl ClusterCoordinator {
             cluster_secret: config.cluster_secret.map(Arc::new),
             activation_hold: Arc::new(AtomicBool::new(false)),
             topology_debounce: config.topology_debounce,
+            tombstone_gc_enabled: config.tombstone_gc_enabled,
+            rejoin_grace_blocks: config.rejoin_grace_blocks,
         }
     }
 
@@ -1228,6 +1250,10 @@ impl ClusterCoordinator {
         let node_addrs = self.node_addrs.clone();
         let self_id = self.self_id;
         let rf = self.replication_factor;
+        // Phase 4 rejoin gate config (deletion-tombstone design §4.3),
+        // captured for the event loop / catch-up thread.
+        let tombstone_gc_enabled = self.tombstone_gc_enabled;
+        let rejoin_grace_blocks = self.rejoin_grace_blocks;
         let shutdown = self.shutdown.clone();
         let peak_size = Arc::new(std::sync::atomic::AtomicUsize::new(self.initial_peak));
         let peak_size_event = peak_size.clone();
@@ -1404,6 +1430,8 @@ impl ClusterCoordinator {
                                 &active_topology_members_event,
                                 &migration_throttle_event,
                                 &cluster_secret_event,
+                                tombstone_gc_enabled,
+                                rejoin_grace_blocks,
                             );
                             let activated_term = topology_epoch.load(Ordering::Relaxed);
                             if activated_term > last_activated_term {
@@ -1618,6 +1646,8 @@ impl ClusterCoordinator {
                         &active_topology_members_event,
                         &migration_throttle_event,
                         &cluster_secret_event,
+                        tombstone_gc_enabled,
+                        rejoin_grace_blocks,
                     );
                     let activated_term = topology_epoch.load(Ordering::Relaxed);
                     if activated_term > last_activated_term {
@@ -2484,6 +2514,9 @@ impl ClusterCoordinator {
         active_topology_members: &Arc<RwLock<Vec<NodeId>>>,
         migration_throttle: &Arc<crate::cluster::migration::MigrationThrottle>,
         cluster_secret: &Option<Arc<Vec<u8>>>,
+        // Phase 4 rejoin-eligibility gate (deletion-tombstone design §4.3).
+        tombstone_gc_enabled: bool,
+        rejoin_grace_blocks: u32,
     ) {
         match event {
             ClusterEvent::NodeJoined(node, addr) => {
@@ -2683,6 +2716,10 @@ impl ClusterCoordinator {
                     let catch_up_peak = peak_size.clone();
                     let catch_up_si = swim_incarnation.clone();
                     let catch_up_secret = cluster_secret.clone();
+                    // Phase 4 rejoin gate (design §4.3): capture self's engine
+                    // (for last_durable_height). `self_id` is Copy and moves in
+                    // directly; the gate config is in scope as Copy fn params.
+                    let catch_up_engine = engine.clone();
                     let remote_term = *remote_term;
                     std::thread::spawn(move || {
                         tracing::info!(
@@ -2717,6 +2754,76 @@ impl ClusterCoordinator {
                                 .map(|(_, &addr)| addr)
                                 .collect()
                         };
+
+                        // Phase 4 rejoin-eligibility gate (deletion-tombstone
+                        // design §4.3). INERT unless `tombstone_gc_enabled`.
+                        // When enabled: estimate the cluster tip (MAX over the
+                        // reachable seed/committed peers' OP_GET_NODE_HEIGHT)
+                        // and, if this node is more than `rejoin_grace_blocks`
+                        // behind, REFUSE the incremental rejoin and force a
+                        // full resync — discard the local copy of the shards
+                        // this node is about to (re-)receive, so it cannot
+                        // carry a stale live key whose tombstone the cluster
+                        // may already have GC'd. See `rejoin_gate_decision`
+                        // for the §4.3 soundness proof. Off-path
+                        // (`tombstone_gc_enabled == false`) this whole block is
+                        // a no-op and the catch-up below runs exactly as today.
+                        if tombstone_gc_enabled {
+                            let self_height = catch_up_engine.last_durable_height();
+                            let secret_slice = cluster_secret.as_deref().map(Vec::as_slice);
+                            let tip_results: Vec<Option<u32>> = peers
+                                .iter()
+                                .map(|addr| query_node_height(*addr, secret_slice))
+                                .collect();
+                            let cluster_tip = max_tip_from_results(&tip_results);
+                            match rejoin_gate_decision(
+                                true,
+                                cluster_tip,
+                                self_height,
+                                rejoin_grace_blocks,
+                            ) {
+                                RejoinGateDecision::Admit => {}
+                                RejoinGateDecision::RefuseFullResync {
+                                    cluster_tip,
+                                    self_height,
+                                } => {
+                                    // §4.3: too stale for incremental rejoin.
+                                    // Discard local records for every shard the
+                                    // committed topology says this node holds,
+                                    // so the subsequent baseline re-receive
+                                    // carries no stale extras. The discard does
+                                    // NOT write tombstones (a local drop, not a
+                                    // cluster delete).
+                                    let owned: Vec<u16> = {
+                                        let table = shard_table.read();
+                                        let mut s: Vec<u16> =
+                                            table.shards_owned_by(self_id).into_iter().collect();
+                                        s.sort_unstable();
+                                        s
+                                    };
+                                    let mut discarded = 0usize;
+                                    for shard in &owned {
+                                        discarded += catch_up_engine.discard_shard_records(*shard);
+                                    }
+                                    tracing::warn!(
+                                        cluster_tip,
+                                        self_height,
+                                        rejoin_grace_blocks,
+                                        shards = owned.len(),
+                                        records_discarded = discarded,
+                                        "cluster: Phase 4 rejoin gate REFUSED incremental rejoin \
+                                         (too stale) — forced full resync: discarded local shard \
+                                         state, will re-receive fresh baselines (design §4.3)",
+                                    );
+                                    // Fall through to the catch-up below: it
+                                    // installs the active routing snapshot and
+                                    // resets migration state, after which the
+                                    // shards' masters push fresh baselines into
+                                    // the now-empty local store.
+                                }
+                            }
+                        }
+
                         let local_active_version = { shard_table.read().version };
                         for peer_addr in &peers {
                             if let Ok(payload) = send_topology_frame(
@@ -4116,6 +4223,145 @@ fn send_topology_frame(
     };
     let response = exchange_frame(&mut stream, &request, auth_secret)?;
     Ok(response.payload)
+}
+
+/// Query a single peer for its `last_durable_height` via `OP_GET_NODE_HEIGHT`
+/// (deletion-tombstone design §4, height subsystem).
+///
+/// Returns `Some(height)` on a clean 4-byte response, `None` on any failure
+/// (connect/read/timeout/auth error or a malformed payload). The caller treats
+/// `None` conservatively (a missing member height blocks the GC horizon and
+/// the rejoin-tip estimate, never advances them).
+fn query_node_height(addr: SocketAddr, auth_secret: Option<&[u8]>) -> Option<u32> {
+    let payload = send_topology_frame(addr, OP_GET_NODE_HEIGHT, &[], auth_secret).ok()?;
+    parse_node_height_response(&payload)
+}
+
+/// Parse an `OP_GET_NODE_HEIGHT` response payload (exactly 4 LE bytes) into a
+/// height. Returns `None` for any other length so a malformed peer is treated
+/// as unreachable rather than reporting a bogus height.
+fn parse_node_height_response(payload: &[u8]) -> Option<u32> {
+    if payload.len() != crate::protocol::opcodes::NODE_HEIGHT_PAYLOAD_SIZE {
+        return None;
+    }
+    Some(u32::from_le_bytes(payload[0..4].try_into().ok()?))
+}
+
+/// Reduce per-member height query results to the cluster-wide MIN finalized
+/// height, CONSERVATIVELY (deletion-tombstone design §4.2/§4.6).
+///
+/// `results` is one entry per CURRENT COMMITTED member (self included), each
+/// `Some(height)` if that member answered or `None` if it was unreachable /
+/// errored / timed out / returned a malformed payload.
+///
+/// Returns:
+/// - `None` if `results` is empty OR **any** member is `None`. A missing
+///   member height is the load-bearing safety rule: an unreachable member
+///   might be a laggard whose tombstones must be retained, so the GC horizon
+///   must NOT advance this round. Never GC on incomplete information.
+/// - `Some(min)` only when **every** committed member answered, taking the
+///   minimum so the horizon advances no faster than the slowest live member.
+fn min_finalized_height_from_results(results: &[Option<u32>]) -> Option<u32> {
+    if results.is_empty() {
+        return None;
+    }
+    let mut min = u32::MAX;
+    for r in results {
+        match r {
+            Some(h) => min = min.min(*h),
+            // Conservative: any unknown member height aborts the round.
+            None => return None,
+        }
+    }
+    Some(min)
+}
+
+/// Reduce per-seed height query results to the MAX (the cluster-tip estimate)
+/// for the rejoin-eligibility gate (deletion-tombstone design §4.3).
+///
+/// Unlike the GC horizon (which needs the conservative MIN over ALL committed
+/// members), the rejoin gate estimates the cluster TIP from whatever seed /
+/// committed peers it can reach and takes the MAX: a higher tip can only make
+/// the gate MORE likely to refuse a stale rejoinee (force full resync), which
+/// is the safe direction. Returns `None` only if no peer answered at all, in
+/// which case the gate cannot establish a tip and admits as today (it has no
+/// evidence the node is stale).
+fn max_tip_from_results(results: &[Option<u32>]) -> Option<u32> {
+    results.iter().filter_map(|r| *r).max()
+}
+
+/// Outcome of the Phase 4 rejoin-eligibility gate (deletion-tombstone design
+/// §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejoinGateDecision {
+    /// Admit the incremental rejoin / topology catch-up as today. Returned
+    /// when GC is disabled (gate inert), when there is no cluster-tip evidence,
+    /// or when the node is within `rejoin_grace_blocks` of the tip.
+    Admit,
+    /// Refuse the incremental rejoin: the node is too stale and must perform a
+    /// full-baseline resync (discard local shard state and re-receive), so it
+    /// cannot carry a stale live copy of a key whose tombstone may already be
+    /// GC'd. Carries the staleness `(cluster_tip, self_height)` for logging.
+    RefuseFullResync { cluster_tip: u32, self_height: u32 },
+}
+
+/// The Phase 4 rejoin-eligibility decision (deletion-tombstone design §4.3).
+///
+/// # The §4.3 proof this gate enforces
+///
+/// A tombstone for key `k` (deleted at height `h`) is GC-eligible only once
+/// `min_member_finalized_height − h ≥ rejoin_grace_blocks`. Suppose such a
+/// tombstone has been GC'd and a laggard `N` rejoins still holding a stale live
+/// `k`. For `N`'s copy to be *stale* it never saw the deletion, so its last
+/// durable height `d_N < h`. This gate admits an INCREMENTAL rejoin only when
+/// `cluster_tip − d_N < rejoin_grace_blocks`, i.e.
+/// `d_N > cluster_tip − rejoin_grace_blocks ≥ min_member_finalized_height −
+/// rejoin_grace_blocks ≥ h`, so `d_N > h` — contradicting `d_N < h`. Therefore
+/// any node stale enough to still need a GC'd tombstone is refused incremental
+/// rejoin here and forced into a full resync (which discards its stale `k`).
+/// GC and this gate share the SAME `rejoin_grace_blocks` bound; that shared
+/// bound is the entire load-bearing coupling.
+///
+/// # Parameters
+/// - `gc_enabled` — when `false` the gate is INERT and always returns
+///   [`RejoinGateDecision::Admit`] (byte-identical pre-Phase-4 behavior).
+/// - `cluster_tip` — the estimated cluster tip height (MAX over reachable
+///   seed/committed peers, [`max_tip_from_results`]); `None` when no peer
+///   answered, in which case the gate has no staleness evidence and admits.
+/// - `self_height` — this node's `last_durable_height`.
+/// - `rejoin_grace_blocks` — the shared staleness bound.
+///
+/// Returns [`RejoinGateDecision::RefuseFullResync`] iff `gc_enabled` AND a tip
+/// is known AND `cluster_tip − self_height ≥ rejoin_grace_blocks` (saturating
+/// so a tip below self — clock/heuristic skew — yields 0 < grace → admit).
+pub fn rejoin_gate_decision(
+    gc_enabled: bool,
+    cluster_tip: Option<u32>,
+    self_height: u32,
+    rejoin_grace_blocks: u32,
+) -> RejoinGateDecision {
+    if !gc_enabled {
+        // §4.3 coupling: the gate is load-bearing ONLY when GC can drop
+        // tombstones. With GC off, nothing is GC'd, so the gate must not
+        // fire — admit exactly as today.
+        return RejoinGateDecision::Admit;
+    }
+    let Some(tip) = cluster_tip else {
+        // No tip evidence: the gate cannot prove the node is stale, so it
+        // admits. (Contrast the GC horizon, which is conservative on missing
+        // info; here a missing tip is the *absence* of a refusal reason, and
+        // refusing on no evidence would needlessly full-resync healthy nodes.)
+        return RejoinGateDecision::Admit;
+    };
+    let staleness = tip.saturating_sub(self_height);
+    if staleness >= rejoin_grace_blocks {
+        RejoinGateDecision::RefuseFullResync {
+            cluster_tip: tip,
+            self_height,
+        }
+    } else {
+        RejoinGateDecision::Admit
+    }
 }
 
 /// Phase D: build this node's `PartitionVersionEntry` list by reading the
@@ -8460,6 +8706,89 @@ impl RunningCluster {
         self.topology_authority.committed_members()
     }
 
+    /// The MIN `last_durable_height` across all CURRENT COMMITTED members
+    /// (self included), or `None` if any member is unreachable
+    /// (deletion-tombstone design §4.2/§4.6). This is the GC horizon's
+    /// finalized-height input.
+    ///
+    /// `self_height` is this node's own [`crate::ops::engine::Engine::last_durable_height`],
+    /// passed in because the coordinator does not hold the engine; it is used
+    /// directly for `self_id` (no self-loopback RPC). Every OTHER committed
+    /// member is queried over the wire via `OP_GET_NODE_HEIGHT`.
+    ///
+    /// CONSERVATIVE on failure: if ANY committed member cannot be resolved to
+    /// an address, is unreachable, errors, times out, or returns a malformed
+    /// payload, this returns `None` and the caller MUST NOT advance the GC
+    /// horizon. This is the load-bearing safety rule of §4.6 — a missing
+    /// height means "an unreachable member might be a laggard whose tombstones
+    /// must be retained", so we never GC on incomplete information. A member
+    /// that is genuinely DOWN (and therefore no longer in the committed view)
+    /// does not pin the horizon; a down member that later rejoins is governed
+    /// by the §4.3 rejoin gate, so dropping it from the committed set here is
+    /// safe.
+    ///
+    /// Returns `None` for an empty committed set (a not-yet-clustered node has
+    /// no horizon to compute).
+    pub fn min_member_finalized_height(&self, self_height: u32) -> Option<u32> {
+        let members = self.committed_topology_members();
+        if members.is_empty() {
+            return None;
+        }
+        let secret = self.cluster_secret.clone();
+        let addrs = self.node_addrs.read();
+        let mut results: Vec<Option<u32>> = Vec::with_capacity(members.len());
+        for member in &members {
+            if *member == self.self_id {
+                results.push(Some(self_height));
+                continue;
+            }
+            match addrs.get(member) {
+                Some(&addr) => {
+                    let h = query_node_height(addr, secret.as_deref().map(Vec::as_slice));
+                    if h.is_none() {
+                        tracing::debug!(
+                            member = member.0,
+                            %addr,
+                            "min_member_finalized_height: member height unavailable — \
+                             horizon will not advance this round (conservative §4.6)",
+                        );
+                    }
+                    results.push(h);
+                }
+                None => {
+                    // A committed member with no known address is treated as
+                    // unreachable (conservative): we cannot prove its height,
+                    // so the horizon must not advance.
+                    tracing::debug!(
+                        member = member.0,
+                        "min_member_finalized_height: committed member has no known address",
+                    );
+                    results.push(None);
+                }
+            }
+        }
+        drop(addrs);
+        min_finalized_height_from_results(&results)
+    }
+
+    /// Estimate the cluster TIP height for the rejoin-eligibility gate by
+    /// querying the given seed/committed `peers` and taking the MAX of the
+    /// heights that answer (deletion-tombstone design §4.3).
+    ///
+    /// Returns `None` only if NO peer answers — in which case the gate has no
+    /// tip evidence and admits the rejoinee as today. A higher tip can only
+    /// make the gate refuse a stale node more readily (the safe direction), so
+    /// MAX-over-reachable-peers is correct here (contrast the GC horizon, which
+    /// needs the conservative MIN over ALL committed members).
+    pub fn estimate_cluster_tip_height(&self, peers: &[SocketAddr]) -> Option<u32> {
+        let secret = self.cluster_secret.clone();
+        let results: Vec<Option<u32>> = peers
+            .iter()
+            .map(|addr| query_node_height(*addr, secret.as_deref().map(Vec::as_slice)))
+            .collect();
+        max_tip_from_results(&results)
+    }
+
     /// Trigger graceful shard drain (quiesce).
     ///
     /// Recomputes the shard table as if this node has left the cluster,
@@ -9079,6 +9408,140 @@ pub(crate) fn new_test_running_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Height subsystem helpers (deletion-tombstone design §4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn min_finalized_height_all_reachable_returns_min() {
+        // Every committed member answered → the minimum (slowest member).
+        let r = vec![Some(800_010), Some(800_000), Some(800_005)];
+        assert_eq!(min_finalized_height_from_results(&r), Some(800_000));
+
+        // Single member.
+        assert_eq!(min_finalized_height_from_results(&[Some(42)]), Some(42));
+    }
+
+    #[test]
+    fn min_finalized_height_any_unreachable_returns_none() {
+        // One member unreachable → None (conservative §4.6: never GC on
+        // incomplete info — an unreachable laggard may need its tombstones).
+        let r = vec![Some(800_000), None, Some(800_005)];
+        assert_eq!(min_finalized_height_from_results(&r), None);
+
+        // First member unreachable.
+        assert_eq!(min_finalized_height_from_results(&[None, Some(1)]), None);
+
+        // All unreachable.
+        assert_eq!(min_finalized_height_from_results(&[None, None]), None);
+    }
+
+    #[test]
+    fn min_finalized_height_empty_is_none() {
+        // An empty committed set has no horizon.
+        assert_eq!(min_finalized_height_from_results(&[]), None);
+    }
+
+    #[test]
+    fn max_tip_is_max_over_reachable_or_none() {
+        // MAX over the peers that answered (cluster-tip estimate).
+        let r = vec![Some(100), None, Some(250), Some(180)];
+        assert_eq!(max_tip_from_results(&r), Some(250));
+
+        // No peer answered → None (gate has no tip evidence, admits as today).
+        assert_eq!(max_tip_from_results(&[None, None]), None);
+        assert_eq!(max_tip_from_results(&[]), None);
+    }
+
+    #[test]
+    fn rejoin_gate_inert_when_gc_disabled() {
+        // GC disabled → ALWAYS admit, regardless of staleness (the gate is
+        // load-bearing only when GC can drop tombstones, §4.3).
+        assert_eq!(
+            rejoin_gate_decision(false, Some(1_000_000), 0, 100_000),
+            RejoinGateDecision::Admit
+        );
+        // Even an absurdly stale node is admitted when GC is off.
+        assert_eq!(
+            rejoin_gate_decision(false, Some(u32::MAX), 0, 1),
+            RejoinGateDecision::Admit
+        );
+    }
+
+    #[test]
+    fn rejoin_gate_admits_within_grace_refuses_beyond() {
+        let grace = 100_000u32;
+        let tip = 800_000u32;
+
+        // Within grace (staleness < grace) → admit.
+        assert_eq!(
+            rejoin_gate_decision(true, Some(tip), tip - (grace - 1), grace),
+            RejoinGateDecision::Admit
+        );
+
+        // Beyond grace (staleness > grace) → refuse + full resync.
+        assert_eq!(
+            rejoin_gate_decision(true, Some(tip), tip - (grace + 1), grace),
+            RejoinGateDecision::RefuseFullResync {
+                cluster_tip: tip,
+                self_height: tip - (grace + 1),
+            }
+        );
+    }
+
+    #[test]
+    fn rejoin_gate_boundary_is_refuse_at_exactly_grace() {
+        let grace = 100_000u32;
+        let tip = 800_000u32;
+
+        // Exactly AT the grace boundary (staleness == grace) → refuse
+        // (the horizon math is `>=`, so the boundary is on the refuse side;
+        // §4.3 requires the admitted set to be strictly < grace stale).
+        assert_eq!(
+            rejoin_gate_decision(true, Some(tip), tip - grace, grace),
+            RejoinGateDecision::RefuseFullResync {
+                cluster_tip: tip,
+                self_height: tip - grace,
+            }
+        );
+
+        // Just inside (staleness == grace - 1) → admit.
+        assert_eq!(
+            rejoin_gate_decision(true, Some(tip), tip - grace + 1, grace),
+            RejoinGateDecision::Admit
+        );
+    }
+
+    #[test]
+    fn rejoin_gate_admits_when_no_tip_or_tip_below_self() {
+        // No tip evidence (no peer answered) → admit (no staleness proof).
+        assert_eq!(
+            rejoin_gate_decision(true, None, 500_000, 100_000),
+            RejoinGateDecision::Admit
+        );
+
+        // Tip below self (skew) → saturating staleness 0 < grace → admit.
+        assert_eq!(
+            rejoin_gate_decision(true, Some(100), 500, 50),
+            RejoinGateDecision::Admit
+        );
+    }
+
+    #[test]
+    fn parse_node_height_response_validates_length() {
+        // Exactly 4 LE bytes → the height.
+        assert_eq!(
+            parse_node_height_response(&800_000u32.to_le_bytes()),
+            Some(800_000)
+        );
+        assert_eq!(parse_node_height_response(&0u32.to_le_bytes()), Some(0));
+
+        // Wrong lengths → None (malformed peer treated as unreachable).
+        assert_eq!(parse_node_height_response(&[]), None);
+        assert_eq!(parse_node_height_response(&[1, 2, 3]), None);
+        assert_eq!(parse_node_height_response(&[1, 2, 3, 4, 5]), None);
+    }
 
     /// Fix D: a `ReplicaAck::Error` payload on a STATUS_ERROR migration-batch
     /// response is decoded to its REAL message, not the bogus `code=1` the

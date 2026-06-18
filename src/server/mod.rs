@@ -376,6 +376,15 @@ impl Server {
         }
     }
 
+    /// Borrow the server's engine handle.
+    ///
+    /// Exposed for embedders and integration tests that need to observe or
+    /// seed engine state (e.g. the node's last-durable height) without going
+    /// through the TCP dispatch path.
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+
     /// Set the cluster coordinator for distributed mode.
     pub fn with_cluster(mut self, cluster: Arc<RunningCluster>) -> Self {
         self.cluster = Some(cluster);

@@ -299,6 +299,42 @@ impl RedbTombstoneIndex {
         Ok(removed)
     }
 
+    /// The maximum `deletion_height` across all live tombstone rows, or `None`
+    /// if the index is empty.
+    ///
+    /// Cheap: the `TOMBSTONES_BY_HEIGHT` table is keyed `height_be || txid`, so
+    /// the last key in iteration order carries the max height — a single
+    /// reverse range step, not a full scan.
+    ///
+    /// Used at recovery to derive a sound lower-bound floor for the node's
+    /// last-durable height (deletion-tombstone design §4, height subsystem): a
+    /// tombstone's `deletion_height` is, by construction, ≤ the
+    /// `current_block_height` the node observed when it applied that delete, so
+    /// it is a valid (free) floor that prevents the restored height from
+    /// regressing below deletions the node has durably recorded.
+    ///
+    /// # Errors
+    /// [`TombstoneIndexError::Redb`] on a redb read failure.
+    pub fn max_deletion_height(&self) -> Result<Option<u32>, TombstoneIndexError> {
+        let txn = self.db.begin_read().map_err(|e| redb_err("begin", e))?;
+        let by_height = txn
+            .open_table(TOMBSTONES_BY_HEIGHT)
+            .map_err(|e| redb_err("table", e))?;
+        let mut range = by_height
+            .range::<[u8; 36]>(..)
+            .map_err(|e| redb_err("range", e))?;
+        match range.next_back() {
+            Some(row) => {
+                let (k, _) = row.map_err(|e| redb_err("row", e))?;
+                let composite = k.value();
+                Ok(Some(u32::from_be_bytes(
+                    composite[0..4].try_into().unwrap(),
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// All tombstoned keys for `shard`, as `(TxKey, generation)` pairs.
     ///
     /// Scans the tombstone table and filters by the stored `shard` field (the
@@ -514,6 +550,24 @@ mod tests {
         // height == threshold is kept (strictly-below semantics).
         assert!(idx.is_tombstoned(&key(3)));
         assert!(idx.is_tombstoned(&key(4)));
+    }
+
+    #[test]
+    fn max_deletion_height_returns_highest_or_none() {
+        let (_dir, mut idx) = open_temp();
+        // Empty index → None.
+        assert_eq!(idx.max_deletion_height().unwrap(), None);
+
+        idx.insert(key(1), 100, 0, 0, 0).unwrap();
+        idx.insert(key(2), 250, 0, 0, 0).unwrap();
+        idx.insert(key(3), 150, 0, 0, 0).unwrap();
+        assert_eq!(idx.max_deletion_height().unwrap(), Some(250));
+
+        // Removing the max below a threshold lowers the reported max.
+        idx.range_delete_below_height(200).unwrap();
+        assert_eq!(idx.max_deletion_height().unwrap(), Some(250));
+        idx.range_delete_below_height(300).unwrap();
+        assert_eq!(idx.max_deletion_height().unwrap(), None);
     }
 
     #[test]

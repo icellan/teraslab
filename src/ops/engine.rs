@@ -232,6 +232,30 @@ pub struct Engine {
     /// tombstone WRITE path, but the gate is checked separately so the
     /// off-default is byte-identical regardless of write-path state).
     tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool,
+    /// Highest `current_block_height` this node has durably observed across
+    /// every height-bearing op it applied (spend / set_mined /
+    /// mark_longest_chain / unspend), monotonically maxed
+    /// (deletion-tombstone design §4, height subsystem).
+    ///
+    /// ALWAYS-ON and purely additive: it tracks a number and answers the
+    /// [`Self::last_durable_height`] query / `OP_GET_NODE_HEIGHT`, and is the
+    /// input to the GC horizon and the rejoin-eligibility gate. Nothing acts
+    /// on it unless `tombstone_gc_enabled` is set, so maintaining it changes
+    /// no existing behavior.
+    ///
+    /// Monotonicity: updated only via [`Self::observe_block_height`] (atomic
+    /// `fetch_max`), so it never decreases within a process. Across restarts
+    /// it is restored from the durable height file and then floored by the
+    /// max record block height (see [`Self::restore_last_durable_height`]), so
+    /// it cannot regress below what the node has durably committed.
+    last_durable_height: std::sync::atomic::AtomicU32,
+    /// Path to the tiny durable file backing [`Self::last_durable_height`].
+    /// Attached post-construction via [`Self::set_last_durable_height_path`]
+    /// (mirroring the redo / tombstone log attach pattern) so existing
+    /// `Engine::new` call sites are untouched. `None` in test / unconfigured
+    /// paths, in which case [`Self::persist_last_durable_height`] is a no-op
+    /// and the height is recovered from the record-derived floor alone.
+    last_durable_height_path: std::sync::OnceLock<std::path::PathBuf>,
     blob_store: Option<Arc<dyn BlobStore>>,
     /// In-flight external-blob pins (F-IJ-002).
     ///
@@ -353,6 +377,8 @@ impl Engine {
             // soak; until set true by config the migration reconciliation is
             // byte-identical to the pre-Phase-8 Fix-B/#29 behavior.
             tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool::new(false),
+            last_durable_height: std::sync::atomic::AtomicU32::new(0),
+            last_durable_height_path: std::sync::OnceLock::new(),
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
@@ -492,6 +518,112 @@ impl Engine {
     pub fn tombstone_reconciliation_enabled(&self) -> bool {
         self.tombstone_reconciliation_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // -----------------------------------------------------------------------
+    // Node last-durable-height tracking (deletion-tombstone design §4,
+    // height subsystem). ALWAYS-ON and purely additive.
+    // -----------------------------------------------------------------------
+
+    /// Observe a `current_block_height` carried by an applied height-bearing
+    /// op and fold it into [`Self::last_durable_height`] via an atomic
+    /// `fetch_max` (monotonic non-decreasing).
+    ///
+    /// Called at the top of every engine entrypoint whose request struct
+    /// carries `current_block_height` (spend / spend_multi / set_mined /
+    /// set_mined_batch / mark_longest_chain / unspend). Cheap: a single
+    /// relaxed atomic max with no allocation and no lock. A height of `0`
+    /// (the sentinel "unknown") is folded harmlessly — it never lowers the
+    /// running max.
+    ///
+    /// This update is unconditional (not gated by any tombstone flag): the
+    /// height is consumed by the GC horizon and the rejoin gate only when
+    /// `tombstone_gc_enabled`, but tracking it always is harmless and keeps
+    /// the value warm so enabling GC needs no warm-up window.
+    pub fn observe_block_height(&self, current_block_height: u32) {
+        // `fetch_max` returns the previous value; we ignore it. Relaxed is
+        // sufficient: there is no ordering dependency between this counter and
+        // other memory — readers (the height query / GC) only need the latest
+        // monotone value, not a happens-before with the op's data writes.
+        self.last_durable_height
+            .fetch_max(current_block_height, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The highest block height this node has durably observed (design §4).
+    ///
+    /// Served over the wire by `OP_GET_NODE_HEIGHT` and consumed by the GC
+    /// horizon ([`crate::cluster::coordinator::ClusterCoordinator::min_member_finalized_height`])
+    /// and the rejoin-eligibility gate. Monotone within a process; restored
+    /// (and floored) across restarts by [`Self::restore_last_durable_height`].
+    pub fn last_durable_height(&self) -> u32 {
+        self.last_durable_height
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Attach the path of the tiny durable height file (design §4, height
+    /// subsystem). Mirrors [`Self::set_redo_log`] / [`Self::set_tombstone_log`]
+    /// so existing `Engine::new` call sites are untouched. Call once at
+    /// startup, before [`Self::persist_last_durable_height`] is invoked by the
+    /// checkpoint task. When unset, persistence is a no-op and recovery relies
+    /// on the record-derived floor alone.
+    pub fn set_last_durable_height_path(&self, path: std::path::PathBuf) {
+        if self.last_durable_height_path.set(path).is_err() {
+            tracing::warn!("engine last-durable-height path already set; ignoring replacement");
+        }
+    }
+
+    /// Restore [`Self::last_durable_height`] at recovery (design §4, height
+    /// subsystem).
+    ///
+    /// The final value is `max(persisted, record_floor, current)`:
+    ///
+    /// - `persisted` — the value read from the durable height file (`None` if
+    ///   the file is missing or corrupt; a missing/corrupt file is NOT a hard
+    ///   error, it just contributes nothing).
+    /// - `record_floor` — a lower bound the node has DEMONSTRABLY committed:
+    ///   the max block height across loaded records. Even if persistence is
+    ///   lost entirely, the height cannot regress below what the node's own
+    ///   durable records prove it has seen, which is exactly what the GC
+    ///   horizon and rejoin gate require for soundness.
+    ///
+    /// Because the result is a `fetch_max`, calling this is itself monotone
+    /// and idempotent. Returns the value the height was set to.
+    pub fn restore_last_durable_height(&self, persisted: Option<u32>, record_floor: u32) -> u32 {
+        let restored = persisted.unwrap_or(0).max(record_floor);
+        self.last_durable_height
+            .fetch_max(restored, std::sync::atomic::Ordering::Relaxed);
+        self.last_durable_height()
+    }
+
+    /// Persist [`Self::last_durable_height`] to its durable file, atomically
+    /// (temp file + fsync + rename + parent-dir fsync) so a crash mid-write
+    /// never leaves a torn value (design §4, height subsystem).
+    ///
+    /// Called by the checkpoint task (sibling to allocator persist) and on
+    /// graceful shutdown. A no-op when no path is attached.
+    ///
+    /// File format: `magic(4) "TSHT" | version(2) = 1 | reserved(2) |
+    /// height(4 LE) | crc32(4)` over the preceding 12 bytes. A read that fails
+    /// any check yields `None` (recovery falls back to the record floor).
+    ///
+    /// # Errors
+    /// Returns [`std::io::Error`] on filesystem failure (write / fsync /
+    /// rename). The caller treats this like a failed allocator persist: the
+    /// height is simply not durable this round and is retried next checkpoint.
+    pub fn persist_last_durable_height(&self) -> std::io::Result<()> {
+        let Some(path) = self.last_durable_height_path.get() else {
+            return Ok(());
+        };
+        let height = self.last_durable_height();
+        let bytes = encode_durable_height(height);
+        let tmp_path = path.with_extension("height.tmp");
+        std::fs::write(&tmp_path, bytes)?;
+        let f = std::fs::File::open(&tmp_path)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, path)?;
+        fsync_parent_dir(path)?;
+        Ok(())
     }
 
     /// Whether the delete path should write a tombstone on this call: the
@@ -1608,6 +1740,9 @@ impl Engine {
     /// [`ValidatedSpend::apply`].
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn spend_multi(&self, req: &SpendMultiRequest) -> Result<SpendMultiResponse, SpendError> {
+        // Height subsystem (design §4): fold the request's chain tip into the
+        // node's monotone last-durable height. Always-on, additive.
+        self.observe_block_height(req.current_block_height);
         let validated = self.validate_spend_multi(req)?;
         validated.apply(self)
     }
@@ -1864,6 +1999,9 @@ impl Engine {
     /// Inlines the validate-and-apply logic for exactly one UTXO,
     /// avoiding the `Vec` and ordered-map allocations that `spend_multi` uses.
     pub fn spend(&self, req: &SpendRequest) -> Result<SpendResponse, SpendError> {
+        // Height subsystem (design §4): fold the request's chain tip into the
+        // node's monotone last-durable height. Always-on, additive.
+        self.observe_block_height(req.current_block_height);
         // F-G2-002: reject the all-`0xFF` reserved sentinel up front. That
         // byte pattern is the on-disk frozen marker; accepting it under
         // `status=UTXO_SPENT` would let any client permanently brick the
@@ -2088,6 +2226,9 @@ impl Engine {
     /// real caller's expected data is never the frozen marker, but preserved to
     /// mirror the Lua), counter corruption, and storage failures.
     pub fn unspend(&self, req: &UnspendRequest) -> Result<UnspendResponse, SpendError> {
+        // Height subsystem (design §4): fold the request's chain tip into the
+        // node's monotone last-durable height. Always-on, additive.
+        self.observe_block_height(req.current_block_height);
         let _guard = self.locks.lock(&req.tx_key);
 
         // 1. Index lookup
@@ -2248,6 +2389,11 @@ impl Engine {
         tx_key: &TxKey,
         req: &SetMinedSharedParams,
     ) -> Result<SetMinedResponse, SpendError> {
+        // Height subsystem (design §4): fold the request's chain tip into the
+        // node's monotone last-durable height. Shared by single set_mined and
+        // set_mined_batch (called once per key; the atomic max is idempotent).
+        // Always-on, additive.
+        self.observe_block_height(req.current_block_height);
         let _guard = self.locks.lock(tx_key);
 
         // 1. Index lookup
@@ -2635,6 +2781,9 @@ impl Engine {
         &self,
         req: &MarkOnLongestChainRequest,
     ) -> Result<MarkOnLongestChainResponse, SpendError> {
+        // Height subsystem (design §4): fold the request's chain tip into the
+        // node's monotone last-durable height. Always-on, additive.
+        self.observe_block_height(req.current_block_height);
         let _guard = self.locks.lock(&req.tx_key);
 
         let entry = self
@@ -5347,6 +5496,60 @@ impl Engine {
         self.delete_inner(req, false).map(|_| ())
     }
 
+    /// Discard ALL local records for `shard` WITHOUT writing tombstones, for
+    /// the Phase 4 full-resync path (deletion-tombstone design §4.3).
+    ///
+    /// When the rejoin gate refuses an incremental rejoin (the node is too
+    /// stale and may hold a stale live copy of a key whose tombstone is
+    /// already GC'd), the node must DISCARD its local copy of the shards it is
+    /// about to re-receive and pull fresh baselines. This is a LOCAL discard,
+    /// NOT a cluster delete: it must NOT write tombstones (a tombstone would
+    /// wrongly mark the key deleted cluster-wide), so it routes through
+    /// [`Self::delete_for_purge`] (`write_tombstone = false`), which otherwise
+    /// performs the identical, audited header-zero → fsync → primary-index
+    /// removal → region-free → secondary-cleanup sequence.
+    ///
+    /// The freshly-cleared shard is then repopulated by the normal inbound
+    /// migration baseline push from the shard's master after the catch-up
+    /// installs the active routing snapshot — so no stale extra survives the
+    /// resync, which is precisely what the §4.3 proof requires.
+    ///
+    /// Returns the number of records discarded. Per-key failures are logged
+    /// and skipped (best-effort): a record that fails to discard is simply
+    /// re-evaluated on the next baseline apply (idempotent), and the count
+    /// reflects only successful discards.
+    ///
+    /// # Warning
+    /// This is a destructive bulk-local operation reachable ONLY from the
+    /// Phase 4 full-resync path, which is gated behind `tombstone_gc_enabled`
+    /// (default OFF). It is not on any client path.
+    pub fn discard_shard_records(&self, shard: u16) -> usize {
+        let keys = self.keys_for_shard(shard);
+        let mut discarded = 0usize;
+        for key in keys {
+            let req = DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            };
+            match self.delete_for_purge(&req) {
+                Ok(()) => discarded += 1,
+                // TX_NOT_FOUND can occur if a concurrent op already removed the
+                // key — benign for a discard. Anything else is logged and the
+                // key is left for the next baseline apply to reconcile.
+                Err(SpendError::TxNotFound) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        shard,
+                        err = %e,
+                        "full-resync discard: failed to drop a local record; \
+                         baseline re-apply will reconcile it",
+                    );
+                }
+            }
+        }
+        discarded
+    }
+
     /// Build the [`crate::tombstone::Tombstone`] for this delete, append it
     /// to the durable log, and return the values to insert into the redb
     /// index (so the caller can defer that derived-index write).
@@ -6438,6 +6641,83 @@ fn sys_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Magic bytes for the durable node-height file (design §4, height subsystem).
+const DURABLE_HEIGHT_MAGIC: [u8; 4] = *b"TSHT";
+/// On-disk format version for the durable node-height file.
+const DURABLE_HEIGHT_VERSION: u16 = 1;
+/// Total serialized length: `magic(4) | version(2) | reserved(2) |
+/// height(4) | crc32(4)` = 16 bytes.
+const DURABLE_HEIGHT_LEN: usize = 4 + 2 + 2 + 4 + 4;
+
+/// Serialize a node height into the fixed 16-byte durable-file layout with a
+/// trailing CRC32 over the preceding 12 bytes.
+fn encode_durable_height(height: u32) -> [u8; DURABLE_HEIGHT_LEN] {
+    let mut buf = [0u8; DURABLE_HEIGHT_LEN];
+    buf[0..4].copy_from_slice(&DURABLE_HEIGHT_MAGIC);
+    buf[4..6].copy_from_slice(&DURABLE_HEIGHT_VERSION.to_le_bytes());
+    // buf[6..8] reserved = 0
+    buf[8..12].copy_from_slice(&height.to_le_bytes());
+    let crc = crc32fast::hash(&buf[0..12]);
+    buf[12..16].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// Parse a durable node-height file's bytes, returning the stored height or
+/// `None` if the bytes are the wrong length, carry a foreign magic / unknown
+/// version, or fail the CRC check.
+///
+/// A `None` is NOT an error from the caller's perspective: recovery treats a
+/// missing or corrupt height file as "no persisted value" and falls back to
+/// the record-derived floor (design §4, height subsystem). Exposed for the
+/// boot-time restore path in the server and for unit tests.
+pub fn decode_durable_height(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() != DURABLE_HEIGHT_LEN {
+        return None;
+    }
+    if bytes[0..4] != DURABLE_HEIGHT_MAGIC {
+        return None;
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if version != DURABLE_HEIGHT_VERSION {
+        return None;
+    }
+    let stored_crc = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let computed = crc32fast::hash(&bytes[0..12]);
+    if stored_crc != computed {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        bytes[8], bytes[9], bytes[10], bytes[11],
+    ]))
+}
+
+/// Read and decode a durable node-height file from disk, returning the stored
+/// height or `None` (file absent, unreadable, or corrupt). Used by the server
+/// boot path to seed [`Engine::restore_last_durable_height`].
+pub fn read_durable_height_file(path: &std::path::Path) -> Option<u32> {
+    let bytes = std::fs::read(path).ok()?;
+    decode_durable_height(&bytes)
+}
+
+/// fsync the parent directory of `path` so the rename of the durable-height
+/// file survives a crash. Mirrors the per-module helper used elsewhere
+/// (e.g. `replication::durable`); a no-op on non-unix where directory fsync
+/// is unsupported.
+#[cfg(unix)]
+fn fsync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let dir = std::fs::File::open(parent)?;
+    dir.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -15058,5 +15338,175 @@ mod tests {
             .create(&recovery_req)
             .expect("create should succeed after injector consumed");
         assert_counts_match_primary(&engine);
+    }
+
+    // -----------------------------------------------------------------------
+    // Height subsystem (deletion-tombstone design §4, height subsystem)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn observe_block_height_is_running_max_independent_of_order() {
+        let engine = create_engine();
+        assert_eq!(engine.last_durable_height(), 0);
+
+        engine.observe_block_height(100);
+        assert_eq!(engine.last_durable_height(), 100);
+
+        // A lower height never lowers the running max.
+        engine.observe_block_height(50);
+        assert_eq!(engine.last_durable_height(), 100);
+
+        // A higher height advances it.
+        engine.observe_block_height(150);
+        assert_eq!(engine.last_durable_height(), 150);
+
+        // Zero (the "unknown" sentinel) is harmless.
+        engine.observe_block_height(0);
+        assert_eq!(engine.last_durable_height(), 150);
+
+        // Re-observing the current max is idempotent.
+        engine.observe_block_height(150);
+        assert_eq!(engine.last_durable_height(), 150);
+    }
+
+    #[test]
+    fn real_height_bearing_ops_advance_last_durable_height() {
+        // A real spend carries current_block_height and must bump the height.
+        let h = TestHarness::new(10, TxFlags::empty());
+        assert_eq!(h.engine.last_durable_height(), 0);
+        let mut req = h.spend_req(0);
+        req.current_block_height = 800_000;
+        h.engine.spend(&req).expect("spend should succeed");
+        assert_eq!(h.engine.last_durable_height(), 800_000);
+
+        // A subsequent op at a LOWER height does not regress it.
+        let mut req2 = h.spend_req(1);
+        req2.current_block_height = 700_000;
+        // Spend of a second offset (idempotent error tolerated; the height
+        // observe happens before any validation).
+        let _ = h.engine.spend(&req2);
+        assert_eq!(h.engine.last_durable_height(), 800_000);
+    }
+
+    #[test]
+    fn restore_last_durable_height_takes_max_of_persisted_and_floor() {
+        // persisted > floor → persisted wins.
+        let e = create_engine();
+        assert_eq!(e.restore_last_durable_height(Some(500), 100), 500);
+        assert_eq!(e.last_durable_height(), 500);
+
+        // floor > persisted → floor wins (record-derived safety net).
+        let e = create_engine();
+        assert_eq!(e.restore_last_durable_height(Some(100), 500), 500);
+
+        // no persisted value → floor alone.
+        let e = create_engine();
+        assert_eq!(e.restore_last_durable_height(None, 321), 321);
+
+        // neither → 0.
+        let e = create_engine();
+        assert_eq!(e.restore_last_durable_height(None, 0), 0);
+
+        // restore is monotone: a later restore cannot lower a higher current.
+        let e = create_engine();
+        e.observe_block_height(900);
+        assert_eq!(e.restore_last_durable_height(Some(100), 50), 900);
+    }
+
+    #[test]
+    fn durable_height_codec_round_trips() {
+        for h in [0u32, 1, 288, 800_000, u32::MAX] {
+            let bytes = encode_durable_height(h);
+            assert_eq!(bytes.len(), DURABLE_HEIGHT_LEN);
+            assert_eq!(decode_durable_height(&bytes), Some(h));
+        }
+    }
+
+    #[test]
+    fn durable_height_codec_rejects_corruption() {
+        let mut bytes = encode_durable_height(12_345);
+        // Corrupt the height payload without fixing the CRC → rejected.
+        bytes[8] ^= 0xFF;
+        assert_eq!(decode_durable_height(&bytes), None);
+
+        // Wrong magic → rejected.
+        let mut b2 = encode_durable_height(7);
+        b2[0] = b'X';
+        assert_eq!(decode_durable_height(&b2), None);
+
+        // Wrong length → rejected.
+        assert_eq!(decode_durable_height(&[0u8; 4]), None);
+
+        // Wrong version → rejected.
+        let mut b3 = encode_durable_height(7);
+        b3[4] = 9; // version low byte
+        // Fix CRC so only the version mismatch trips it.
+        let crc = crc32fast::hash(&b3[0..12]);
+        b3[12..16].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(decode_durable_height(&b3), None);
+    }
+
+    #[test]
+    fn persist_then_read_height_round_trips_across_simulated_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.height");
+
+        // First "process": observe a height and persist it.
+        let e1 = create_engine();
+        e1.set_last_durable_height_path(path.clone());
+        e1.observe_block_height(654_321);
+        e1.persist_last_durable_height().expect("persist");
+
+        // Second "process": read the file and restore. With no record floor,
+        // the restored height equals the persisted value — no regression.
+        let persisted = read_durable_height_file(&path);
+        assert_eq!(persisted, Some(654_321));
+        let e2 = create_engine();
+        let restored = e2.restore_last_durable_height(persisted, 0);
+        assert_eq!(restored, 654_321);
+        assert_eq!(e2.last_durable_height(), 654_321);
+    }
+
+    #[test]
+    fn persist_last_durable_height_is_noop_without_path() {
+        // No path attached → persist returns Ok and writes nothing.
+        let e = create_engine();
+        e.observe_block_height(42);
+        e.persist_last_durable_height()
+            .expect("no-op persist must succeed");
+    }
+
+    #[test]
+    fn discard_shard_records_drops_local_copy_without_tombstone() {
+        // The full-resync local discard removes the shard's records and writes
+        // NO tombstone (it is a local drop, not a cluster delete).
+        let h = TestHarness::new(10, TxFlags::empty());
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
+
+        // Precondition: the seeded record is present in its shard.
+        assert_eq!(h.engine.keys_for_shard(shard).len(), 1);
+
+        let discarded = h.engine.discard_shard_records(shard);
+        assert_eq!(discarded, 1, "the one seeded record should be discarded");
+        assert!(
+            h.engine.keys_for_shard(shard).is_empty(),
+            "shard must be empty after discard"
+        );
+
+        // No tombstone attached in this harness, so nothing to assert there;
+        // the key being gone from the index is the local-discard outcome.
+        // Discarding an already-empty shard is a harmless no-op.
+        assert_eq!(h.engine.discard_shard_records(shard), 0);
+    }
+
+    #[test]
+    fn read_height_file_missing_or_corrupt_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.height");
+        assert_eq!(read_durable_height_file(&missing), None);
+
+        let corrupt = dir.path().join("corrupt.height");
+        std::fs::write(&corrupt, b"not a valid height file").unwrap();
+        assert_eq!(read_durable_height_file(&corrupt), None);
     }
 }

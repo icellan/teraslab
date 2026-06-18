@@ -981,6 +981,9 @@ fn main() {
              enabled path is NOT docker-validated; awaiting CI soak",
         );
     }
+    // Height floor for the height subsystem (design §4), populated from the
+    // tombstone index when tombstones are enabled; `None` otherwise.
+    let mut tombstone_height_floor: Option<u32> = None;
     if config.tombstones_enabled {
         let tombstone_path = config.resolved_tombstone_log_path();
         let (tombstone_device, tombstone_log) = match open_tombstone_log(
@@ -1033,6 +1036,15 @@ fn main() {
             }
         }
 
+        // Height-subsystem floor (design §4): the max tombstone deletion
+        // height is a sound, free lower bound for the node's last-durable
+        // height (a tombstone's deletion_height ≤ the chain tip the node saw
+        // when it applied that delete). Read it before the index is moved.
+        tombstone_height_floor = tombstone_index.max_deletion_height().unwrap_or_else(|e| {
+            tracing::warn!(err = %e, "could not read tombstone max deletion height for height floor");
+            None
+        });
+
         engine.set_tombstone_log(Arc::new(Mutex::new(tombstone_log)));
         engine.set_tombstone_index(Arc::new(Mutex::new(tombstone_index)));
         tracing::info!(
@@ -1043,6 +1055,30 @@ fn main() {
     } else {
         tracing::info!("deletion tombstones disabled (tombstones_enabled = false)");
     }
+
+    // Height subsystem (deletion-tombstone design §4): attach the durable
+    // height file and restore the node's last-durable height. ALWAYS-ON and
+    // additive — independent of `tombstones_enabled` / `tombstone_gc_enabled`.
+    //
+    // The restored value is `max(persisted_file, record_floor)`: the persisted
+    // file is the primary source (atomic + CRC), and the tombstone-derived
+    // floor (max deletion_height) is a free safety net that keeps the height
+    // from regressing below deletions the node has durably recorded even if
+    // the file is lost or corrupt. With tombstones disabled the floor is 0 and
+    // the value comes from the persisted file alone; persistence keeps it
+    // monotone across restarts.
+    let height_path = config.resolved_last_durable_height_path();
+    let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
+    let record_floor = tombstone_height_floor.unwrap_or(0);
+    engine.set_last_durable_height_path(height_path.clone());
+    let restored_height = engine.restore_last_durable_height(persisted_height, record_floor);
+    tracing::info!(
+        path = %height_path.display(),
+        persisted = ?persisted_height,
+        record_floor,
+        restored = restored_height,
+        "node last-durable height restored (height subsystem)",
+    );
 
     // 5. Start cluster if configured
     //
@@ -1156,6 +1192,10 @@ fn main() {
             migration_batch_size: config.migration_batch_size,
             persisted_incarnation: topo_state.incarnation,
             cluster_id: resolved_cluster_id,
+            // Phase 4 rejoin gate (deletion-tombstone design §4.3). Shares the
+            // GC master switch; default OFF → gate inert.
+            tombstone_gc_enabled: config.tombstone_gc_enabled,
+            rejoin_grace_blocks: config.rejoin_grace_blocks,
         };
         if initial_peak > 1 {
             tracing::info!(
@@ -1496,6 +1536,40 @@ fn main() {
         None
     };
 
+    // Phase 5 — spawn the tombstone-GC daemon (deletion-tombstone design §4.6),
+    // sibling to the checkpoint / blob-gc tasks. It is spawned only in
+    // clustered mode (it needs the committed-membership view to compute the
+    // min finalized height) and ticks on `tombstone_gc_poll_interval_ms`. The
+    // daemon is GATED INTERNALLY on `tombstone_gc_enabled` (default OFF): when
+    // disabled it wakes, sees the flag is off, and does nothing — no horizon
+    // query, no range-delete, no log compaction. With GC off, this is a
+    // dormant thread and behavior is byte-identical to before Phase 5.
+    let tombstone_gc_handle: Option<std::thread::JoinHandle<()>> = match &cluster {
+        Some(c) => {
+            let gc_cfg = teraslab::tombstone_gc::TombstoneGcConfig {
+                enabled: config.tombstone_gc_enabled,
+                rejoin_grace_blocks: config.rejoin_grace_blocks,
+                poll_interval: std::time::Duration::from_millis(
+                    config.tombstone_gc_poll_interval_ms,
+                ),
+            };
+            if config.tombstone_gc_enabled {
+                tracing::warn!(
+                    rejoin_grace_blocks = config.rejoin_grace_blocks,
+                    "tombstone GC ENABLED (Phase 4+5) — the enabled path is NOT \
+                     docker-validated; awaiting CI soak (design §11.5)",
+                );
+            }
+            Some(teraslab::tombstone_gc::spawn_tombstone_gc_task(
+                gc_cfg,
+                engine.clone(),
+                c.clone(),
+                shutdown_flag.clone(),
+            ))
+        }
+        None => None,
+    };
+
     // R-038 (D-01): spawn the replica-lag monitor when:
     //   (a) we are clustered (RF > 1, so `init_ack_tracker` has been
     //       called and the static is populated), AND
@@ -1594,6 +1668,7 @@ fn main() {
         checkpoint_handle: Mutex::new(checkpoint_handle),
         blob_gc_handle: Mutex::new(blob_gc_handle),
         lag_monitor_handle: Mutex::new(lag_monitor_handle),
+        tombstone_gc_handle: Mutex::new(tombstone_gc_handle),
     };
 
     // F-G10-001 + F-G10-002: install the SIGINT/SIGTERM handler now. The
@@ -1641,6 +1716,9 @@ struct ServerWithShutdown {
     blob_gc_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the replica-lag monitor thread. See F-G10-022.
     lag_monitor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Join handle for the Phase 5 tombstone-GC daemon thread (gated off by
+    /// default). See deletion-tombstone design §4.6.
+    tombstone_gc_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerWithShutdown {
@@ -1674,6 +1752,11 @@ impl ServerWithShutdown {
             self.lag_monitor_handle.lock().take(),
             std::time::Duration::from_secs(5),
         );
+        Self::join_with_timeout(
+            "tombstone_gc",
+            self.tombstone_gc_handle.lock().take(),
+            std::time::Duration::from_secs(5),
+        );
 
         // On shutdown: stop cluster, sync device
         if let Some(ref cluster) = self.cluster {
@@ -1693,6 +1776,16 @@ impl ServerWithShutdown {
         match self.engine.persist_allocator() {
             Ok(()) => tracing::info!("allocator state persisted"),
             Err(e) => tracing::warn!(err = %e, "allocator persist failed"),
+        }
+
+        // Persist the node's last-durable height (deletion-tombstone design
+        // §4, height subsystem). No-op when no path is attached.
+        match self.engine.persist_last_durable_height() {
+            Ok(()) => tracing::info!(
+                height = self.engine.last_durable_height(),
+                "last-durable height persisted"
+            ),
+            Err(e) => tracing::warn!(err = %e, "last-durable height persist failed"),
         }
 
         match teraslab::server::dispatch::flush_replication_intent_tracker() {

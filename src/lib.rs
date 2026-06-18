@@ -34,3 +34,4 @@ pub mod replication;
 pub mod server;
 pub mod storage;
 pub mod tombstone;
+pub mod tombstone_gc;

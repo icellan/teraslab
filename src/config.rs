@@ -482,6 +482,21 @@ pub struct ServerConfig {
     /// `.redo` sibling file) at region offset 0.
     pub tombstone_log_path: Option<PathBuf>,
 
+    /// Path for the tiny durable node-height file that persists the engine's
+    /// `last_durable_height` across restarts (deletion-tombstone design §4,
+    /// height subsystem). If not set, derived from the index snapshot path by
+    /// appending `.height`.
+    ///
+    /// The file holds a single fsynced, CRC-protected `u32` written
+    /// atomically (temp + rename) by the checkpoint task and on graceful
+    /// shutdown, sibling to the allocator persist. It is ALWAYS maintained
+    /// (independent of `tombstones_enabled` / `tombstone_gc_enabled`); on
+    /// recovery the value is restored and then bounded below by a
+    /// record-derived floor so the height can never regress (monotonicity).
+    /// A missing or corrupt file simply falls back to the record-derived
+    /// floor — never a hard failure.
+    pub last_durable_height_path: Option<PathBuf>,
+
     /// Whether the engine writes a durable deletion tombstone on every
     /// physical record delete, and whether recovery reconstructs the
     /// tombstone index and runs the R2 self-purge pass.
@@ -506,6 +521,62 @@ pub struct ServerConfig {
     /// relaxes to the source's non-tombstoned keys. Enable only after CI soak
     /// validates convergence + no-loss + no-resurrection (design §11.3).
     pub tombstone_reconciliation_enabled: bool,
+
+    /// Whether bounded-retention tombstone garbage collection (Phase 5) and
+    /// its load-bearing rejoin-eligibility gate (Phase 4) are active
+    /// (deletion-tombstone design §4).
+    ///
+    /// Default `false` — the conservative, soak-pending state. The Phase 4
+    /// rejoin gate and the Phase 5 GC daemon are the §4.3 coupled pair: the
+    /// gate is what makes GC sound (a node stale enough to need a GC'd
+    /// tombstone is refused incremental rejoin and full-resynced), so they
+    /// share this single switch. When `false`:
+    ///
+    /// - The rejoin-eligibility gate is INERT: a catching-up node is admitted
+    ///   exactly as it is today (no staleness refusal, no forced full resync).
+    /// - The GC daemon performs NO tombstone range-delete and NO log
+    ///   compaction — tombstones are retained unboundedly (bounded only by the
+    ///   operational outage length), byte-identical to the pre-Phase-4/5 path.
+    ///
+    /// The always-on node-height tracking ([`crate::ops::engine::Engine::last_durable_height`])
+    /// and the [`crate::protocol::opcodes::OP_GET_NODE_HEIGHT`] query are
+    /// purely additive and are NOT gated by this flag (they only track and
+    /// answer a number; nothing acts on it unless GC is enabled).
+    ///
+    /// Enable only after CI soak validates the cross-node min-finalized-height
+    /// horizon, GC firing, and a laggard rejoining right at the grace boundary
+    /// being full-resynced rather than incrementally admitted (design §11.3).
+    pub tombstone_gc_enabled: bool,
+
+    /// Maximum staleness (in block heights) a rejoining node may carry before
+    /// it is refused an incremental rejoin and forced into a full-baseline
+    /// resync (deletion-tombstone design §4.2/§4.5).
+    ///
+    /// This is the load-bearing coupling bound shared by the Phase 4 rejoin
+    /// gate and the Phase 5 GC horizon: a tombstone is GC-eligible once
+    /// `min_member_finalized_height − deletion_height ≥ rejoin_grace_blocks`,
+    /// and a node more than `rejoin_grace_blocks` behind the cluster tip is
+    /// refused incremental rejoin. Because both use the SAME bound, any node
+    /// stale enough to still need a GC'd tombstone is — by the §4.3 proof —
+    /// too stale to be admitted incrementally and is instead full-resynced
+    /// (which discards its stale copy).
+    ///
+    /// Default `100_000` — a finality-scale value (design §4.5: tie to
+    /// finality, not to a generous outage window). Only consulted when
+    /// [`Self::tombstone_gc_enabled`] is `true`.
+    pub rejoin_grace_blocks: u32,
+
+    /// Cadence in milliseconds at which the background tombstone-GC daemon
+    /// (Phase 5) evaluates the GC horizon (deletion-tombstone design §4.6).
+    ///
+    /// Each tick — only when [`Self::tombstone_gc_enabled`] is `true` — the
+    /// daemon computes the committed-member min finalized height, derives the
+    /// safe horizon, range-deletes redb tombstone rows below it, and compacts
+    /// the on-device log prefix. A missing member height makes the daemon skip
+    /// the round (conservative; never GC on incomplete info). Sized like the
+    /// checkpoint cadence; a slow cadence only delays reclamation, never
+    /// affects correctness. Default `60_000` (one minute).
+    pub tombstone_gc_poll_interval_ms: u64,
 
     /// Path for the index snapshot file.
     pub index_snapshot_path: PathBuf,
@@ -868,8 +939,17 @@ impl Default for ServerConfig {
             redo_log_path: None,
             tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
             tombstone_log_path: None,
+            last_durable_height_path: None,
             tombstones_enabled: true,
             tombstone_reconciliation_enabled: false,
+            // Phase 4+5 (rejoin gate + GC daemon) ship DISABLED. The enabled
+            // path awaits CI soak (design §11.5); until then there is no
+            // rejoin refusal and no tombstone GC — byte-identical behavior.
+            tombstone_gc_enabled: false,
+            // Finality-scale default (design §4.5). Only consulted when
+            // `tombstone_gc_enabled` is true.
+            rejoin_grace_blocks: 100_000,
+            tombstone_gc_poll_interval_ms: 60_000,
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
             expected_records: 100_000,
             lock_stripes: 65536,
@@ -1056,6 +1136,25 @@ impl ServerConfig {
                     .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
                 let mut p = base.into_os_string();
                 p.push(".tombstone");
+                PathBuf::from(p)
+            }
+        }
+    }
+
+    /// Resolve the durable node-height file path. Uses
+    /// `last_durable_height_path` if explicitly set, otherwise derives it from
+    /// the index snapshot path by appending `.height`.
+    ///
+    /// Deriving from the snapshot path (rather than a device path) co-locates
+    /// the height with the other engine-derived durable artifacts the
+    /// checkpoint task writes (index snapshot, allocator header) and works
+    /// even for in-memory device configurations used in tests.
+    pub fn resolved_last_durable_height_path(&self) -> PathBuf {
+        match &self.last_durable_height_path {
+            Some(p) => p.clone(),
+            None => {
+                let mut p = self.index_snapshot_path.clone().into_os_string();
+                p.push(".height");
                 PathBuf::from(p)
             }
         }
@@ -1494,6 +1593,13 @@ impl ServerConfig {
         nonzero_u64(
             "checkpoint_poll_interval_ms",
             self.checkpoint_poll_interval_ms,
+        )?;
+        // The tombstone-GC daemon polls on this cadence (Phase 5). A zero
+        // interval would busy-spin the daemon thread; require it non-zero
+        // even though the daemon only acts when `tombstone_gc_enabled`.
+        nonzero_u64(
+            "tombstone_gc_poll_interval_ms",
+            self.tombstone_gc_poll_interval_ms,
         )?;
 
         // device_size must be large enough to hold at least one record's

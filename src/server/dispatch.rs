@@ -855,6 +855,15 @@ pub(crate) fn handle_request(
         ),
         OP_GET_PARTITION_MAP => handle_get_partition_map(request, cluster),
         OP_GET_COMMITTED_TOPOLOGY => handle_get_committed_topology(request, cluster),
+        // Height subsystem (deletion-tombstone design §4): return this node's
+        // last-durable height as a 4-byte LE payload. Always-on and additive:
+        // it reads a number and never mutates state, so it is safe regardless
+        // of the tombstone / GC flags.
+        OP_GET_NODE_HEIGHT => ResponseFrame {
+            request_id: request.request_id,
+            status: STATUS_OK,
+            payload: engine.last_durable_height().to_le_bytes().to_vec(),
+        },
         OP_ADMIN_DIAGNOSE_KEY => handle_admin_diagnose_key(request, engine, cluster),
         OP_PARTITION_VERSION_REPORT => handle_partition_version_report(request, engine, cluster),
         OP_ADMIN_CLUSTER_HEALTH => handle_admin_cluster_health(request, cluster),
