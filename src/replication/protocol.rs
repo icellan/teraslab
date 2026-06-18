@@ -1015,7 +1015,18 @@ impl ReplicaBatch {
     /// length-prefixed op layout with a different header size.
     fn decode_ops(data: &[u8], header_size: usize, count: usize) -> Result<Vec<ReplicaOp>> {
         let mut pos = header_size;
-        let mut ops = Vec::with_capacity(count);
+        // SECURITY: `count` is an untrusted wire field independent of the
+        // payload length. Reserving `Vec::with_capacity(count)` directly lets a
+        // hostile ~53-byte OP_REPLICA_BATCH frame with `count = 0xFFFF_FFFF`
+        // request gigabytes in one allocation → allocator abort / OOM-kill
+        // (remote DoS, reachable on the inter-node port in the default
+        // trusted-overlay mode). Clamp the reservation to what the payload can
+        // possibly back: every op is at least a 4-byte length prefix + 1 op
+        // byte. The loop's per-op `need()` still surfaces a genuinely short
+        // payload as a clean `BufferTooShort` error.
+        const MIN_OP_WIRE_BYTES: usize = 5;
+        let max_possible_ops = data.len().saturating_sub(header_size) / MIN_OP_WIRE_BYTES;
+        let mut ops = Vec::with_capacity(count.min(max_possible_ops));
         for _ in 0..count {
             need(&data[pos..], 4)?;
             let op_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
@@ -1154,6 +1165,26 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0] = n;
         TxKey { txid }
+    }
+
+    /// SECURITY: a hostile V2 batch whose `count` field is huge but whose
+    /// payload carries no ops must return a clean error, NOT pre-allocate a
+    /// gigantic Vec (which aborts the process via the allocator). Pre-fix this
+    /// test aborts the test runner instead of failing — which IS the proof.
+    #[test]
+    fn replica_batch_huge_count_does_not_over_allocate() {
+        let mut p = vec![0u8; ReplicaBatch::HEADER_SIZE];
+        p[0] = BATCH_PROTOCOL_V2;
+        // count = 0xFFFF_FFFF at bytes [9..13]; no op bytes follow.
+        p[9..13].copy_from_slice(&u32::MAX.to_le_bytes());
+        let res = ReplicaBatch::deserialize(&p);
+        assert!(
+            res.is_err(),
+            "huge-count batch with empty op stream must error, not allocate"
+        );
+        // A count that the payload genuinely backs still decodes (regression
+        // guard that the clamp didn't break the happy path is covered by the
+        // existing round-trip tests).
     }
 
     #[test]
