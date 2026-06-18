@@ -632,6 +632,27 @@ impl ShardTable {
         owned
     }
 
+    /// Shards `node` holds as a REPLICA only — owned but NOT mastered by `node`.
+    ///
+    /// This is the no-loss-safe set to discard during a Phase-4 rejoin-gate
+    /// full resync: for each of these shards a live peer is the committed
+    /// master and durably holds the authoritative copy, so it will re-push the
+    /// baseline after the routing snapshot installs and the local drop is
+    /// recoverable. Shards `node` is the committed MASTER of are deliberately
+    /// excluded — master→replica is the only push direction, so discarding a
+    /// master's only copy would be permanent data loss with no source to
+    /// re-receive from.
+    pub fn replica_only_shards_owned_by(&self, node: NodeId) -> Vec<u16> {
+        let mut out: Vec<u16> = (0..NUM_SHARDS as u16)
+            .filter(|&shard| {
+                let a = &self.assignments[shard as usize];
+                a.master != node && a.replicas.contains(&node)
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Compute which shards need to migrate between an old and new table.
     ///
     /// Only master migrations are tracked (replica migrations follow).
@@ -1417,6 +1438,40 @@ mod tests {
         let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
         let owned = table.shards_owned_by(NodeId(99));
         assert!(owned.is_empty());
+    }
+
+    #[test]
+    fn replica_only_shards_owned_by_excludes_self_mastered() {
+        let members = nodes(&[1, 2, 3]);
+        let table = ShardTable::compute_with_epoch(&members, 2, 1, 1);
+        for node in [NodeId(1), NodeId(2), NodeId(3)] {
+            let owned = table.shards_owned_by(node);
+            let replica_only = table.replica_only_shards_owned_by(node);
+            let replica_set: std::collections::HashSet<u16> =
+                replica_only.iter().copied().collect();
+
+            // Replica-only is a strict subset of owned, and every shard in it is
+            // one the node does NOT master (so a live peer master re-pushes it).
+            for &shard in &replica_only {
+                assert!(owned.contains(&shard));
+                assert_ne!(
+                    table.assignment(shard).master,
+                    node,
+                    "shard {shard} is self-mastered and must NOT be in the discard set",
+                );
+            }
+            // The excluded shards (owned but not replica-only) are exactly the
+            // ones the node masters — discarding those would be data loss.
+            for &shard in owned.iter() {
+                if !replica_set.contains(&shard) {
+                    assert_eq!(table.assignment(shard).master, node);
+                }
+            }
+            // Sorted output.
+            let mut sorted = replica_only.clone();
+            sorted.sort_unstable();
+            assert_eq!(replica_only, sorted);
+        }
     }
 
     // -----------------------------------------------------------------------

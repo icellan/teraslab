@@ -2788,18 +2788,33 @@ impl ClusterCoordinator {
                                     self_height,
                                 } => {
                                     // §4.3: too stale for incremental rejoin.
-                                    // Discard local records for every shard the
-                                    // committed topology says this node holds,
-                                    // so the subsequent baseline re-receive
-                                    // carries no stale extras. The discard does
-                                    // NOT write tombstones (a local drop, not a
-                                    // cluster delete).
+                                    // Discard local stale records so the
+                                    // subsequent baseline re-receive carries no
+                                    // stale extras. The discard does NOT write
+                                    // tombstones (a local drop, not a cluster
+                                    // delete).
+                                    //
+                                    // NO-LOSS INVARIANT: only discard a shard
+                                    // when a LIVE PEER will re-push it — i.e.
+                                    // when the committed master is a peer (≠
+                                    // self). For those shards the peer master
+                                    // holds the authoritative copy durably and
+                                    // re-pushes the baseline once the routing
+                                    // snapshot installs, so the local drop is
+                                    // recoverable. A shard this node is itself
+                                    // the committed MASTER of is NEVER discarded:
+                                    // master→replica is the only push direction,
+                                    // so nothing would re-push it and the drop
+                                    // would be permanent data loss (replicas hold
+                                    // copies but never push to the master). A
+                                    // too-stale node should relinquish mastership
+                                    // of such shards (handled by the reactivation
+                                    // path), not destroy their only master copy
+                                    // here. `replica_only_shards_owned_by`
+                                    // returns exactly the owned-but-not-mastered
+                                    // shards (it already excludes self-mastered).
                                     let owned: Vec<u16> = {
-                                        let table = shard_table.read();
-                                        let mut s: Vec<u16> =
-                                            table.shards_owned_by(self_id).into_iter().collect();
-                                        s.sort_unstable();
-                                        s
+                                        shard_table.read().replica_only_shards_owned_by(self_id)
                                     };
                                     let mut discarded = 0usize;
                                     for shard in &owned {
