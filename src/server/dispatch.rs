@@ -166,16 +166,39 @@ fn apply_tombstone_reconciliation(
         return Ok(());
     }
 
+    // The committed/migration epoch this commit is happening at. Accumulated
+    // entries are stamped with the `migration_epoch` of the completion that
+    // produced them (BUG4 fix (a)); only entries stamped with THIS epoch may
+    // drive DROPS via their tombstones.
+    let current_epoch = cluster.shard_table().read().version;
+
     // Build the UNION across all pending sources (§9.1 #1):
-    //   * union_live: a key live on ANY source.
+    //   * union_live: a key live on ANY accumulated source. Contributed
+    //     UNCONDITIONALLY by every accumulated entry, regardless of its stamped
+    //     epoch — the no-loss invariant (Claim B) requires the union to see
+    //     EVERY pending source's live set so a key live anywhere is Kept
+    //     (BUG2). A within-slack (epoch == current-1) source's live keys must
+    //     never be Dropped just because that source is not epoch-current.
     //   * union_tomb: per key, the MAX (newest) tombstone generation across
     //     sources that tombstone it (the most permissive for a drop — if even
-    //     the newest is older than local, none authorize the drop).
+    //     the newest is older than local, none authorize the drop). A
+    //     tombstone is admitted into the union ONLY from an entry whose stamped
+    //     epoch equals `current_epoch` (BUG4 fix (a)): a STALE entry — one that
+    //     was epoch-current when accumulated but whose epoch the cluster has
+    //     since advanced past (a leaked entry, the case BUG4 (b) also guards) —
+    //     must NOT drive a Drop of a now-live key in this later epoch. Its live
+    //     set is still counted above (no-loss), only its drop-driving power is
+    //     dropped.
     let mut union_live: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
     let mut union_tomb: std::collections::HashMap<TxKey, u32> = std::collections::HashMap::new();
     for m in &manifests {
         for k in &m.live {
             union_live.insert(*k);
+        }
+        if m.epoch != current_epoch {
+            // Stale (or within-slack) entry: its tombstones are untrusted for
+            // driving a drop at this epoch. Live set already folded in above.
+            continue;
         }
         for (k, tgen) in &m.tombstones {
             union_tomb
@@ -1412,11 +1435,31 @@ pub(crate) fn handle_request(
                 false
             };
 
-            // Phase 8: when reconciliation is active, the destructive #29
+            // Phase 8: when reconciliation is ENABLED, the destructive #29
             // "prune the whole shard down to the manifest" is REPLACED by the
             // §7 "drop exactly the tombstoned keys" union applied at the commit
-            // gate. Skip the #29 prune in that case; keep it verbatim otherwise.
-            if !reconcile_active
+            // gate. Skip the #29 prune for the WHOLE shard whenever
+            // reconciliation is enabled — NOT merely per-frame `reconcile_active`
+            // (BUG3 fix).
+            //
+            // Why whole-shard, not per-frame: the union is PER-SHARD, but
+            // `reconcile_active` is PER-FRAME (it requires THIS frame's
+            // `source_tombstones.is_some()`). With heterogeneous sources, source
+            // X may carry tombstones (reconcile_active=true → #29 skipped, X
+            // accumulates) while source Y is authoritative-complete but ships NO
+            // tombstone section (reconcile_active=false → #29 prune would RUN for
+            // Y's frame, deleting a legit-extra LIVE key `j` via
+            // `engine.delete()`, which WRITES a tombstone → replicates →
+            // cluster-wide loss). Under reconciliation, ALL destructive removal
+            // must go EXCLUSIVELY through the commit-gate union
+            // (`apply_tombstone_reconciliation`), which is no-loss by
+            // construction (Claim B). So gate the #29 prune on
+            // `!tombstone_reconciliation_enabled()`.
+            //
+            // OFF path (reconciliation disabled): the condition is exactly
+            // `!false == true`, identical to the pre-Phase-8 `#29` guard, so the
+            // prune runs verbatim.
+            if !engine.tombstone_reconciliation_enabled()
                 && source_is_authoritative_complete
                 && let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
@@ -1561,12 +1604,26 @@ pub(crate) fn handle_request(
             //     the hash. A superset cannot be verified via hash, so this path
             //     KEEPS the strict `actual == expected_records` requirement.
             //
-            //   * anything not epoch-current: STRICT `actual == expected_records`
-            //     (preserves #29).
+            //   * reconcile_active && exact_entries_verified (BUG2): a
+            //     reconciliation source that proved its full live set is present
+            //     locally is accepted as a verified superset EVEN WHEN it is not
+            //     epoch-current (a within-slack source, migration_epoch ==
+            //     version-1). This is required so the within-slack source can
+            //     REACH the accumulate + mark-inbound-complete path below and
+            //     contribute its LIVE set to the union (Claim B no-loss): a key
+            //     live on the within-slack source must be Kept, not Dropped by a
+            //     concurrent source's tombstone. Its TOMBSTONES are NOT
+            //     accumulated (only epoch-current tombstones drive drops, §9.1
+            //     #2), and the commit-gate union + epoch-stamp (BUG4) keep this
+            //     no-loss / resurrection-proof. Gated on `reconcile_active`, so
+            //     the OFF path is unaffected.
+            //
+            //   * anything not epoch-current (and not reconcile_active): STRICT
+            //     `actual == expected_records` (preserves #29).
             let actual = engine.shard_record_count(shard);
             let count_ok = if expected_records == 0 && completion_epoch_current {
                 true
-            } else if exact_entries_verified && completion_epoch_current {
+            } else if exact_entries_verified && (completion_epoch_current || reconcile_active) {
                 actual >= expected_records
             } else {
                 actual == expected_records
@@ -1635,20 +1692,61 @@ pub(crate) fn handle_request(
 
             if let Some(cluster) = cluster {
                 // Phase 8 (§9.1 #1 + §9.1 #2): accumulate THIS source's live +
-                // tombstone manifest for the multi-source union, but ONLY for a
-                // current-epoch source (`completion_epoch_current`). A
-                // stale-epoch completion's tombstones are untrusted and never
-                // drive a drop — same treatment as today's stale manifest. The
-                // accumulator is unioned and applied at the commit gate below.
-                if reconcile_active && completion_epoch_current {
+                // tombstone manifest for the multi-source union.
+                //
+                // INVARIANT (design §7, Claim B no-loss): a key live on ANY
+                // pending source ⇒ Keep; the union must see every pending
+                // source's LIVE set regardless of epoch-currency. So the LIVE
+                // set is accumulated UNCONDITIONALLY for every reconcile-active
+                // pending source (BUG2 fix, option (a)). Otherwise a within-slack
+                // (migration_epoch == version-1) completion — which is admitted
+                // past the stale-epoch reject (2-epoch slack) but is NOT
+                // `completion_epoch_current` — would clear its inbound-pending
+                // bit (below) WITHOUT contributing its live keys, and a
+                // concurrent source that tombstones one of those keys would then
+                // wrongly Drop a key that is still LIVE on the within-slack
+                // source. Accumulating its live set keeps the union complete
+                // while still letting the source complete (liveness preserved).
+                //
+                // The TOMBSTONE set, by contrast, stays epoch-gated: a
+                // non-epoch-current source's tombstones are untrusted and must
+                // NEVER drive a drop (design §9.1 #2). So tombstones are included
+                // ONLY when `completion_epoch_current`; a within-slack source
+                // contributes live keys but zero drop-driving tombstones.
+                //
+                // The manifest is stamped with `migration_epoch` (BUG4 fix (a))
+                // so the commit gate can DISCARD any accumulator entry whose
+                // epoch is stale relative to the committed/migration epoch before
+                // computing the union — a superseded plan's stale {tomb k} must
+                // not drive a Drop of a now-live k in a later epoch.
+                //
+                // Accumulate ONLY when this node is the prospective TARGET MASTER
+                // for the shard (BUG4 fix (c)): a non-master/replica target never
+                // applies the union (the commit gate below requires master), so
+                // accumulating there would only leak entries.
+                let prospective_target_master = {
+                    let shard_table = cluster.shard_table();
+                    let table = shard_table.read();
+                    table.target_assignment(shard).master == cluster.self_id()
+                };
+                if reconcile_active && prospective_target_master {
                     let live = source_entries
                         .as_ref()
                         .map(|e| e.iter().map(|(k, _)| *k).collect::<Vec<_>>())
                         .unwrap_or_default();
-                    let tombstones = source_tombstones.clone().unwrap_or_default();
+                    // Only an epoch-current source's tombstones may drive drops.
+                    let tombstones = if completion_epoch_current {
+                        source_tombstones.clone().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     cluster.accumulate_reconcile_manifest(
                         shard,
-                        crate::cluster::coordinator::SourceReconcileManifest { live, tombstones },
+                        crate::cluster::coordinator::SourceReconcileManifest {
+                            live,
+                            tombstones,
+                            epoch: migration_epoch,
+                        },
                     );
                 }
 
@@ -16212,6 +16310,405 @@ mod tests {
         assert!(
             idx.lock().is_tombstoned(&key_k),
             "learned tombstone recorded for dropped K"
+        );
+    }
+
+    /// BUG2: a WITHIN-SLACK (migration_epoch == table.version - 1, admitted by
+    /// the 2-epoch slack but NOT epoch-current) source holding key K LIVE must
+    /// contribute K to the union so a concurrent CURRENT-epoch source that
+    /// tombstones K does NOT wrongly Drop it. Before the fix, the within-slack
+    /// source cleared its inbound bit WITHOUT being accumulated, so the union
+    /// saw only `{tomb K}` and Dropped a live K (loss + resurrection).
+    #[test]
+    fn migration_complete_reconcile_within_slack_live_source_keeps_key() {
+        let h = DispatchTestHarness::new();
+        let (_log, idx, _dir) = enable_tombstone_reconciliation(&h.engine);
+        let shard = 60u16;
+        let txid_k = txid_for_shard(shard, 1);
+        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
+        let key_k = TxKey { txid: txid_k };
+        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
+
+        // This node is the committed target master at table version = epoch.
+        let epoch = 70u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4720".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        // Two pending sources: X (current-epoch, tombstones K) and Y
+        // (within-slack epoch-1, holds K live).
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(1));
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+        let mut conn_state = crate::server::ConnectionState::new();
+
+        // Completion X (NodeId(1)) at the CURRENT epoch: tombstones K, no live.
+        let mut px = build_migration_complete_payload(
+            0,
+            0,
+            epoch,
+            None,
+            None,
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        append_test_tombstone_section(&mut px, &[(key_k, gen_k)]);
+        let rx = handle_request(
+            &RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: FLAG_MIGRATION_TOMBSTONES,
+                payload: px.into(),
+            },
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(rx.status, STATUS_OK);
+        assert!(cluster.has_pending_inbound_shard(shard), "Y still pending");
+
+        // Completion Y (NodeId(2)) at the WITHIN-SLACK epoch (epoch - 1): holds
+        // K live, no tombstones. Not epoch-current, but must still contribute
+        // its live set to the union.
+        let live_y = vec![(key_k, gen_k)];
+        let mut py = build_migration_complete_payload(
+            live_y.len() as u64,
+            0,
+            epoch - 1,
+            None,
+            Some(&live_y),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        append_test_tombstone_section(&mut py, &[]);
+        let ry = handle_request(
+            &RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: FLAG_MIGRATION_TOMBSTONES,
+                payload: py.into(),
+            },
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(ry.status, STATUS_OK);
+        assert_eq!(cluster.inbound_pending_count(), 0, "both done → committed");
+
+        // The union saw K live on the within-slack source → K KEPT, not Dropped.
+        assert!(
+            h.engine.read_metadata(&key_k).is_ok(),
+            "K kept — live on the within-slack source (no loss, no resurrection)"
+        );
+        assert!(
+            !idx.lock().is_tombstoned(&key_k),
+            "K not tombstoned on the rejoinee (it was kept)"
+        );
+    }
+
+    /// BUG3: with reconciliation ENABLED, an authoritative-complete source that
+    /// ships NO tombstone section (reconcile_active=false for ITS frame) must
+    /// NOT trigger the #29 whole-shard prune — a legit-extra LIVE key survives.
+    /// Before the fix, the prune was gated per-frame on `reconcile_active`, so
+    /// this frame ran #29 and deleted the extra (writing a tombstone →
+    /// cluster-wide loss). The whole-shard prune is now gated on
+    /// `!tombstone_reconciliation_enabled()`.
+    #[test]
+    fn migration_complete_reconcile_enabled_no_tombstone_section_does_not_prune_extra() {
+        let h = DispatchTestHarness::new();
+        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
+        let shard = 61u16;
+        let txid_a = txid_for_shard(shard, 1); // in the manifest
+        let txid_extra = txid_for_shard(shard, 2); // legit-extra, omitted
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_extra, 1).status, STATUS_OK);
+        let key_a = TxKey { txid: txid_a };
+        let key_extra = TxKey { txid: txid_extra };
+        let gen_a = h.engine.read_metadata(&key_a).unwrap().generation;
+
+        let epoch = 71u64;
+        let cluster = reconcile_test_cluster(shard, epoch);
+
+        // Authoritative-complete source: exact entries = {A}, NO tombstone
+        // section on the frame (so its frame is NOT reconcile_active).
+        let entries = vec![(key_a, gen_a)];
+        let payload = build_migration_complete_payload(
+            1,
+            0,
+            epoch,
+            None,
+            Some(&entries),
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        // NO append_test_tombstone_section, NO FLAG_MIGRATION_TOMBSTONES.
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: 0,
+                payload: payload.into(),
+            },
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        // The extra LIVE key SURVIVES — the #29 whole-shard prune was suppressed
+        // because reconciliation is enabled.
+        assert!(
+            h.engine.read_metadata(&key_a).is_ok(),
+            "manifest key A kept"
+        );
+        assert!(
+            h.engine.read_metadata(&key_extra).is_ok(),
+            "legit-extra LIVE key survives (no #29 prune under reconciliation)"
+        );
+    }
+
+    /// BUG4 (c): a NON-MASTER (replica) target must NOT accumulate reconcile
+    /// manifests — it never applies the union (the commit gate requires this
+    /// node be the target master), so accumulating there would only leak.
+    #[test]
+    fn migration_complete_reconcile_non_master_target_does_not_accumulate() {
+        let h = DispatchTestHarness::new();
+        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
+        // 2-node table; pick a shard whose TARGET MASTER is NodeId(2) so this
+        // node (NodeId(1)) is a non-master target for it.
+        let epoch = 72u64;
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let shard = (0u16..crate::cluster::shards::NUM_SHARDS as u16)
+            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(2))
+            .expect("some shard mastered by NodeId(2)");
+        let txid_k = txid_for_shard(shard, 1);
+        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
+        let key_k = TxKey { txid: txid_k };
+        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
+
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[
+                (
+                    crate::cluster::shards::NodeId(1),
+                    "127.0.0.1:4721".parse().unwrap(),
+                ),
+                (
+                    crate::cluster::shards::NodeId(2),
+                    "127.0.0.1:4722".parse().unwrap(),
+                ),
+            ],
+            &members,
+            &[],
+            &[],
+            &[],
+            2,
+        );
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+
+        // A current-epoch completion with a tombstone section arrives at this
+        // non-master target.
+        let mut payload = build_migration_complete_payload(
+            0,
+            0,
+            epoch,
+            None,
+            None,
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        append_test_tombstone_section(&mut payload, &[(key_k, gen_k)]);
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: FLAG_MIGRATION_TOMBSTONES,
+                payload: payload.into(),
+            },
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        // Non-master target: nothing accumulated (no leak), and no commit/drop.
+        assert_eq!(
+            cluster.reconcile_accumulator_len(shard),
+            0,
+            "non-master target does not accumulate (BUG4c)"
+        );
+        assert!(
+            h.engine.read_metadata(&key_k).is_ok(),
+            "non-master target never drops via the union"
+        );
+    }
+
+    /// BUG4 (a)+(b): a STALE-epoch accumulator entry's TOMBSTONES are discarded
+    /// at the commit gate (do not drive a drop), and the bulk inbound-clear
+    /// path drops accumulator entries (no leak). Here a current-epoch source
+    /// accumulates a tombstone for K; the cluster epoch then advances; at the
+    /// later-epoch commit the stale tombstone must NOT drop the now-live K.
+    #[test]
+    fn migration_complete_reconcile_stale_epoch_accumulator_entry_does_not_drop() {
+        use crate::tombstone::{ReconcileAction, classify_reconcile_union};
+        // Sanity: the union classifier keeps a key live on a source even with a
+        // tombstone present (defends the no-loss arm this test exercises).
+        assert_eq!(
+            classify_reconcile_union(5, true, Some(5)),
+            ReconcileAction::Keep
+        );
+
+        let h = DispatchTestHarness::new();
+        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
+        let shard = 62u16;
+        let txid_k = txid_for_shard(shard, 1);
+        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
+        let key_k = TxKey { txid: txid_k };
+        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
+
+        // Committed master at epoch E; two pending sources so the first
+        // completion accumulates but does NOT commit.
+        let epoch = 80u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4723".parse().unwrap(),
+            )],
+            &members,
+            &[],
+            &[],
+            &[],
+            1,
+        );
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(1));
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+        let mut conn_state = crate::server::ConnectionState::new();
+
+        // Source X at epoch E tombstones K (accumulated, epoch-stamped E).
+        let mut px = build_migration_complete_payload(
+            0,
+            0,
+            epoch,
+            None,
+            None,
+            Some(crate::cluster::shards::NodeId(1)),
+        );
+        append_test_tombstone_section(&mut px, &[(key_k, gen_k)]);
+        let rx = handle_request(
+            &RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: FLAG_MIGRATION_TOMBSTONES,
+                payload: px.into(),
+            },
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(rx.status, STATUS_OK);
+        assert_eq!(
+            cluster.reconcile_accumulator_len(shard),
+            1,
+            "X's manifest accumulated (epoch-stamped E)"
+        );
+
+        // The cluster epoch ADVANCES (a new committed table version). The
+        // accumulated X entry is now STALE relative to the committed epoch.
+        // (Bump only `version`; assignments are unchanged so this node remains
+        // the shard's target master.)
+        cluster.shard_table().write().version = epoch + 1;
+
+        // Source Y completes at the NEW epoch holding K live → both sources done
+        // → commit fires. The stale E entry's tombstone must NOT drop K.
+        let live_y = vec![(key_k, gen_k)];
+        let mut py = build_migration_complete_payload(
+            live_y.len() as u64,
+            0,
+            epoch + 1,
+            None,
+            Some(&live_y),
+            Some(crate::cluster::shards::NodeId(2)),
+        );
+        append_test_tombstone_section(&mut py, &[]);
+        let ry = handle_request(
+            &RequestFrame {
+                request_id: shard as u64,
+                op_code: OP_MIGRATION_COMPLETE,
+                flags: FLAG_MIGRATION_TOMBSTONES,
+                payload: py.into(),
+            },
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+        assert_eq!(ry.status, STATUS_OK);
+        assert_eq!(cluster.inbound_pending_count(), 0, "both done → committed");
+        assert!(
+            h.engine.read_metadata(&key_k).is_ok(),
+            "K kept — stale-epoch tombstone discarded at commit (BUG4a), and K live on Y"
+        );
+    }
+
+    /// BUG4 (b): a NON-ABORT bulk inbound-clear path drops accumulator entries
+    /// (no leak). `mark_inbound_complete_all` clears the inbound bit without
+    /// routing through the commit union, so its accumulator entry must go too.
+    #[test]
+    fn reconcile_accumulator_cleared_on_mark_inbound_complete_all() {
+        let epoch = 90u64;
+        let shard = 63u16;
+        let cluster = reconcile_test_cluster(shard, epoch);
+        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
+        let k = TxKey {
+            txid: txid_for_shard(shard, 1),
+        };
+        cluster.accumulate_reconcile_manifest(
+            shard,
+            crate::cluster::coordinator::SourceReconcileManifest {
+                live: vec![k],
+                tombstones: vec![],
+                epoch,
+            },
+        );
+        assert_eq!(cluster.reconcile_accumulator_len(shard), 1, "accumulated");
+        // A non-abort inbound-clear path.
+        cluster.mark_inbound_complete_all(shard);
+        assert_eq!(
+            cluster.reconcile_accumulator_len(shard),
+            0,
+            "accumulator cleared on mark_inbound_complete_all (no leak, BUG4b)"
         );
     }
 

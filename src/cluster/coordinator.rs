@@ -2446,7 +2446,6 @@ impl ClusterCoordinator {
         RunningCluster {
             self_id,
             self_addr: self.self_addr,
-            reconcile_accumulator: Arc::new(Mutex::new(std::collections::HashMap::new())),
             shard_table: self.shard_table.clone(),
             migration: self.migration.clone(),
             node_addrs: self.node_addrs.clone(),
@@ -4631,8 +4630,23 @@ fn collect_manifest_entries(
 /// target to hold a superset of EVERYTHING — only of self's non-tombstoned
 /// keys; self's tombstoned keys are allowed to be absent on the target (the
 /// target authoritatively deleted them). So this drops from `entries` any key
-/// that self's OWN tombstone index marks tombstoned: self must not demand the
-/// target still hold a key self itself knows is deleted.
+/// that self's OWN tombstone index marks tombstoned AT-OR-AHEAD of the live
+/// generation: self must not demand the target still hold a version self itself
+/// knows is deleted.
+///
+/// GENERATION-AWARE (the create-after-delete defense, design §8.4): a boolean
+/// `is_tombstoned` is WRONG here. After a key is deleted at gen `g` (tombstone
+/// written) and then re-created LIVE at gen `g+1` (the create path does NOT
+/// remove the stale tombstone row), `is_tombstoned` is still `true`. A boolean
+/// filter would EXCLUDE that live key from the probe, so a draining source
+/// uniquely holding `k@g+1` would never have the target checked for it, would
+/// wrongly relinquish, and would drop `k` → DATA LOSS (the never-received
+/// re-creation, the no-loss Transfer case). So a key is excluded ONLY when the
+/// tombstone's generation is at-or-ahead of the live entry's generation —
+/// mirroring [`classify_reconcile`]'s row-2/row-4 split
+/// ([`crate::record::generation_at_or_ahead`]). A tombstone for an OLDER
+/// generation than the live entry means the live entry is a newer re-creation
+/// and is KEPT in the demand.
 ///
 /// Gated on `engine.tombstone_reconciliation_enabled()`: when OFF this returns
 /// `entries` UNCHANGED (clone), so the disabled superset proof is byte-identical
@@ -4647,7 +4661,15 @@ fn relax_superset_manifest(engine: &Engine, entries: &[(TxKey, u32)]) -> Vec<(Tx
     let guard = idx.lock();
     entries
         .iter()
-        .filter(|(k, _)| !guard.is_tombstoned(k))
+        .filter(|(k, live_gen)| match guard.get(k) {
+            // Excluded (target need not hold it) ONLY when the tombstone covers
+            // this live version or a newer one. KEPT (demand it) when the local
+            // live generation is newer than the tombstone — a re-creation
+            // (§8.4) the target must still hold to be a valid superset.
+            Some(v) => !crate::record::generation_at_or_ahead(v.generation, *live_gen),
+            // No tombstone for this key → demand it (normal superset case).
+            None => true,
+        })
         .copied()
         .collect()
 }
@@ -7779,37 +7801,17 @@ pub enum MasterQueryResult {
     },
 }
 
-/// One source's per-shard reconciliation manifest, accumulated across
-/// `OP_MIGRATION_COMPLETE` arrivals for the multi-source UNION drop rule
-/// (deletion-tombstone Phase 8, design §9.1 #1).
+/// One source's per-shard reconciliation manifest for the multi-source UNION
+/// drop rule (deletion-tombstone Phase 8, design §9.1 #1).
 ///
-/// A rejoinee may receive completions from several concurrent sources for the
-/// same shard. The Drop decision (§7 row 2) must be evaluated against the UNION
-/// of ALL pending sources' live∪tombstone sets, NOT a single source — a key
-/// tombstoned by source X but live on source Y must be KEPT. So each completion
-/// stashes its `(live_keys, tombstones)` here and the actual drops are deferred
-/// to the commit gate (`!has_pending_inbound_shard`), where the union is
-/// computed. Touched ONLY on the `tombstone_reconciliation_enabled` path.
-#[derive(Debug, Clone, Default)]
-pub struct SourceReconcileManifest {
-    /// The source's LIVE keys for the shard (its exact-entry manifest).
-    pub live: Vec<TxKey>,
-    /// The source's TOMBSTONES for the shard: `(key, deletion-generation)`.
-    pub tombstones: Vec<(TxKey, u32)>,
-}
+/// Re-exported from [`crate::cluster::migration`], where it lives alongside the
+/// accumulator and inbound state so EVERY inbound-clear path drops its matching
+/// accumulated entries (BUG4 fix (b)).
+pub use crate::cluster::migration::SourceReconcileManifest;
 
 pub struct RunningCluster {
     self_id: NodeId,
     self_addr: SocketAddr,
-    /// Per-shard accumulation of each pending source's reconciliation manifest
-    /// (deletion-tombstone Phase 8, design §9.1 #1 — the multi-source union).
-    ///
-    /// Keyed by shard; each value is the list of per-source manifests collected
-    /// since the shard's inbound migration began. Drained when the shard
-    /// commits (`!has_pending_inbound_shard`) and the union drop is applied.
-    /// Empty and untouched unless `tombstone_reconciliation_enabled`, so the
-    /// off-path is byte-identical.
-    reconcile_accumulator: Arc<Mutex<std::collections::HashMap<u16, Vec<SourceReconcileManifest>>>>,
     shard_table: Arc<ShardTableLock<ShardTable>>,
     migration: Arc<Mutex<MigrationManager>>,
     node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
@@ -8132,11 +8134,9 @@ impl RunningCluster {
     /// [`Self::take_reconcile_accumulator`]. No-op semantics off-path: nothing
     /// else reads this map unless reconciliation is enabled.
     pub fn accumulate_reconcile_manifest(&self, shard: u16, manifest: SourceReconcileManifest) {
-        self.reconcile_accumulator
+        self.migration
             .lock()
-            .entry(shard)
-            .or_default()
-            .push(manifest);
+            .accumulate_reconcile_manifest(shard, manifest);
     }
 
     /// Remove and return all accumulated source manifests for `shard`.
@@ -8144,19 +8144,18 @@ impl RunningCluster {
     /// Called at the commit gate to compute the union (`live` / `tombstone`
     /// sets across every pending source) before applying the deferred drops.
     /// Returns an empty vec if nothing was accumulated (e.g. reconciliation
-    /// disabled, or a source sent no tombstone section).
+    /// disabled, or a source sent no tombstone section). Delegates to the
+    /// [`MigrationManager`], where the accumulator lives co-located with the
+    /// inbound state (BUG4 fix (b)).
     pub fn take_reconcile_accumulator(&self, shard: u16) -> Vec<SourceReconcileManifest> {
-        self.reconcile_accumulator
-            .lock()
-            .remove(&shard)
-            .unwrap_or_default()
+        self.migration.lock().take_reconcile_accumulator(shard)
     }
 
     /// Discard any accumulated source manifests for `shard` without applying
     /// them — used on abort so a non-committing handoff does not leak
     /// accumulator entries.
     pub fn clear_reconcile_accumulator(&self, shard: u16) {
-        self.reconcile_accumulator.lock().remove(&shard);
+        self.migration.lock().clear_reconcile_accumulator(shard);
     }
 
     pub fn mark_inbound_complete_many_from_source(&self, shards: &[u16], from_node: NodeId) {
@@ -8222,6 +8221,15 @@ impl RunningCluster {
             &std::collections::HashSet::new(),
         );
         self.inbound_atomic.load_from(mgr.inbound_bitmap());
+    }
+
+    /// Number of source manifests currently accumulated for `shard` (test-only
+    /// peek that does NOT drain, used to assert the BUG4 accumulate-lifecycle).
+    #[cfg(test)]
+    pub(crate) fn reconcile_accumulator_len(&self, shard: u16) -> usize {
+        self.migration
+            .lock()
+            .reconcile_accumulator_len_for_test(shard)
     }
 
     /// Register a shard as actively receiving inbound migration data.
@@ -9382,7 +9390,6 @@ pub(crate) fn new_test_running_cluster(
             .iter()
             .find_map(|(node, addr)| (*node == self_id).then_some(*addr))
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
-        reconcile_accumulator: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shard_table: Arc::new(ShardTableLock::new(table.clone())),
         migration,
         node_addrs: Arc::new(RwLock::new(node_addrs)),
@@ -15274,6 +15281,110 @@ mod tests {
         assert!(
             task_for_shard.is_none(),
             "must skip migration for shard {changed_shard} when new master already has data",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG1: relax_superset_manifest is generation-aware (deletion-tombstone
+    // Phase 8, design §8.4). A key tombstoned at gen `g` but live at gen `g+1`
+    // (re-created after delete; the create path leaves the stale tombstone row)
+    // must NOT be excluded from the relaxed superset manifest — else a draining
+    // source uniquely holding it would never have the target checked for it,
+    // would wrongly relinquish, and would lose the re-creation.
+    // -----------------------------------------------------------------------
+
+    /// Attach a real (in-memory device + temp redb) tombstone index to `engine`
+    /// and enable reconciliation, returning the index handle (+ TempDir keeping
+    /// the redb alive).
+    fn engine_with_tombstone_index(
+        engine: &Engine,
+    ) -> (
+        Arc<Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(Mutex::new(
+            crate::index::redb_tombstone::RedbTombstoneIndex::open(
+                &dir.path().join("tombstone.redb"),
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+        engine.set_tombstone_index(idx.clone());
+        engine.set_tombstone_reconciliation_enabled(true);
+        (idx, dir)
+    }
+
+    #[test]
+    fn relax_superset_manifest_off_path_is_unchanged_clone() {
+        // Reconciliation DISABLED (default): the manifest is returned UNCHANGED
+        // even with a tombstone index that would otherwise exclude a key.
+        let engine = test_engine();
+        let (idx, _dir) = {
+            let dir = tempfile::TempDir::new().unwrap();
+            let idx = Arc::new(Mutex::new(
+                crate::index::redb_tombstone::RedbTombstoneIndex::open(
+                    &dir.path().join("t.redb"),
+                    16 * 1024 * 1024,
+                )
+                .unwrap(),
+            ));
+            engine.set_tombstone_index(idx.clone());
+            // Do NOT enable reconciliation.
+            (idx, dir)
+        };
+        let shard = 7u16;
+        let k = tx_key_for_shard(shard, 1);
+        // Tombstone at a gen >= the live gen would normally exclude k.
+        idx.lock().insert(k, 100, 5, shard, 0).unwrap();
+        let entries = vec![(k, 5u32)];
+        let out = relax_superset_manifest(&engine, &entries);
+        assert_eq!(out, entries, "off-path returns entries unchanged");
+    }
+
+    #[test]
+    fn relax_superset_manifest_excludes_key_tombstoned_at_or_ahead() {
+        // Tombstone gen == live gen → EXCLUDED (the target authoritatively
+        // deleted this exact version; self must not demand it).
+        let engine = test_engine();
+        let (idx, _dir) = engine_with_tombstone_index(&engine);
+        let shard = 8u16;
+        let k_eq = tx_key_for_shard(shard, 1); // tombstone gen == live gen
+        let k_ahead = tx_key_for_shard(shard, 2); // tombstone gen > live gen
+        let k_clean = tx_key_for_shard(shard, 3); // no tombstone
+        idx.lock().insert(k_eq, 100, 4, shard, 0).unwrap();
+        idx.lock().insert(k_ahead, 100, 9, shard, 0).unwrap();
+        let entries = vec![(k_eq, 4u32), (k_ahead, 4u32), (k_clean, 4u32)];
+        let out = relax_superset_manifest(&engine, &entries);
+        // k_eq and k_ahead excluded; only the clean key remains demanded.
+        assert_eq!(
+            out,
+            vec![(k_clean, 4u32)],
+            "tombstone at-or-ahead of live gen excludes the key; clean key kept"
+        );
+    }
+
+    #[test]
+    fn relax_superset_manifest_keeps_key_live_newer_than_tombstone() {
+        // The §8.4 create-after-delete defense: tombstone at gen 5, the key is
+        // LIVE at gen 6 → the key must be KEPT in the demand (a boolean
+        // `is_tombstoned` would wrongly EXCLUDE it → DATA LOSS of the
+        // re-creation). This is the exact BUG1 no-loss case.
+        let engine = test_engine();
+        let (idx, _dir) = engine_with_tombstone_index(&engine);
+        let shard = 9u16;
+        let k = tx_key_for_shard(shard, 1);
+        // Stale tombstone from the gen-5 deletion; key re-created live at gen 6.
+        idx.lock().insert(k, 100, 5, shard, 0).unwrap();
+        assert!(
+            idx.lock().is_tombstoned(&k),
+            "boolean is_tombstoned is still true after re-creation (the trap)"
+        );
+        let entries = vec![(k, 6u32)];
+        let out = relax_superset_manifest(&engine, &entries);
+        assert_eq!(
+            out, entries,
+            "key live at a generation NEWER than the tombstone is KEPT (no-loss)"
         );
     }
 }
