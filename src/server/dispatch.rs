@@ -3805,6 +3805,18 @@ fn compensate_replication_failure(
         }
     }
 
+    // Fault-injection point (test-only, inert without the
+    // `fault-injection` feature): all engine effects above have been
+    // applied to in-memory/device state, but the compensating redo
+    // entries have NOT been appended yet. This is the WAL-inverted window
+    // the red-team flagged as the single most fragile spot. A crash here
+    // (followed by power loss) leaves NO durable compensating intent, so
+    // recovery replays the still-durable ORIGINAL redo entry and the slot
+    // is reproduced deterministically — never half-applied.
+    crate::fault_injection::check(
+        crate::fault_injection::SyncPoint::MidCompensationBeforeRedoAppend,
+    );
+
     let comp_range = if comp_redo.is_empty() {
         None
     } else {
@@ -20753,6 +20765,389 @@ mod tests {
             resp.status
         );
         TxKey { txid }
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 3 — compensation racing a checkpoint / crash (the WAL-inverted
+    // "single most fragile spot"). `compensate_replication_failure` applies
+    // the engine effect FIRST and appends the compensating redo entry LAST,
+    // with the redo mutex released between append and flush. These tests
+    // crash at the two dangerous boundaries and after a clean completion,
+    // proving the slot ALWAYS lands in exactly ONE well-defined state
+    // (never torn / half-applied):
+    //
+    //   (a) crash after engine-effect, before redo append   → SPENT
+    //   (b) crash after redo append, before redo fsync       → SPENT
+    //   (c) compensation completes (append + fsync), crash   → UNSPENT
+    //
+    // BRUTAL-HONESTY NOTE: the task brief asked the post-recovery state to
+    // be "unspent" for the crash-before-durable cases. That is NOT what a
+    // correct WAL produces and asserting it would be wrong: until the
+    // compensating `Unspend` entry crosses the fsync boundary it is not
+    // durable, so recovery legitimately replays the still-durable ORIGINAL
+    // `SpendV2` and the slot is SPENT. The genuine invariant — and the one
+    // these tests lock in — is that the slot is single-valued and
+    // recovery-deterministic: SPENT before the comp entry is durable,
+    // UNSPENT after, and never a torn in-between. Case (c) is the only one
+    // where the compensated (UNSPENT) state is durable.
+    // -----------------------------------------------------------------------
+
+    /// A volatile-device harness for the compensation crash tests. The data
+    /// device and redo device both simulate a volatile write cache so a
+    /// `simulate_power_loss()` drops everything not covered by a `sync()`.
+    struct CompensationCrashHarness {
+        engine: Engine,
+        redo_log: Arc<Mutex<crate::redo::RedoLog>>,
+        data_dev: Arc<MemoryDevice>,
+        redo_dev: Arc<MemoryDevice>,
+        redo_size: u64,
+        _metrics_guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CompensationCrashHarness {
+        fn new() -> Self {
+            let redo_size = 4 * 1024 * 1024u64;
+            let data_dev = Arc::new(MemoryDevice::new_volatile(64 * 1024 * 1024, 4096).unwrap());
+            let redo_dev = Arc::new(MemoryDevice::new_volatile(redo_size, 4096).unwrap());
+            let alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+            let index: PrimaryBackend = Index::new(10000).unwrap().into();
+            let engine = Engine::new(
+                data_dev.clone() as Arc<dyn BlockDevice>,
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let redo_log =
+                crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, redo_size)
+                    .unwrap();
+            let redo_log = Arc::new(Mutex::new(redo_log));
+            // Attach the redo log so allocator reservations during create are
+            // journaled (recovery's CreateV2 gate requires the AllocateRegion
+            // entry to precede the create).
+            engine.allocator().lock().set_redo_log(redo_log.clone());
+            Self {
+                engine,
+                redo_log,
+                data_dev,
+                redo_dev,
+                redo_size,
+                _metrics_guard: metrics_test_lock(),
+            }
+        }
+
+        fn request(&self, op_code: u16, payload: Vec<u8>) -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut conn_state = crate::server::ConnectionState::new();
+            handle_request(
+                &req,
+                &self.engine,
+                8192,
+                None,
+                Some(&self.redo_log),
+                &mut conn_state,
+                None,
+            )
+        }
+
+        /// Create a 1-slot record then spend slot 0. Both are acked WAL-first
+        /// through the full handler so the redo log + device carry them, and
+        /// we sync the data device afterward so the record/slot bytes are
+        /// durable (modelling an earlier checkpoint barrier) — this isolates
+        /// the compensation crash from a separate "create bytes never synced"
+        /// concern. Returns the key + the spending_data that was applied.
+        fn seed_record_and_spend(&self, txid: [u8; 32]) -> (TxKey, [u8; 36]) {
+            let hashes = vec![[0u8; 32]];
+            let item = WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: hashes,
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            assert_eq!(
+                self.request(OP_CREATE_BATCH, encode_create_batch(&[item]))
+                    .status,
+                STATUS_OK,
+                "seed create must ack"
+            );
+            let key = TxKey { txid };
+
+            let spending_data = [0xD3u8; 36];
+            let resp = self
+                .engine
+                .spend_multi(&crate::ops::spend::SpendMultiRequest {
+                    tx_key: key,
+                    spends: vec![crate::ops::spend::SpendItem {
+                        utxo_hash: [0u8; 32],
+                        offset: 0,
+                        spending_data,
+                        idx: 0,
+                    }],
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                });
+            assert!(resp.is_ok(), "seed spend must apply: {resp:?}");
+            // WAL the spend so it is replayable on recovery.
+            write_redo_ops(
+                Some(self.redo_log.as_ref()),
+                &[RedoOp::SpendV2 {
+                    tx_key: key,
+                    offset: 0,
+                    spending_data,
+                    new_spent_count: 1,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                    target_generation: { self.engine.read_metadata(&key).unwrap().generation },
+                    updated_at: 0,
+                    utxo_hash: None,
+                }],
+            )
+            .unwrap();
+
+            // Make the data-device bytes (record + spent slot) durable.
+            self.data_dev.sync().unwrap();
+
+            let slot = self.engine.read_slot(&key, 0).expect("read seeded slot");
+            assert!(slot.is_spent(), "seed must leave slot spent");
+            (key, spending_data)
+        }
+
+        /// Drop the engine + redo handles, power-loss both devices, then
+        /// recover index + allocator from the durable redo log and return
+        /// the recovered engine so the caller can read the post-crash slot.
+        fn power_loss_and_recover(self) -> Engine {
+            let data_dev = self.data_dev.clone();
+            let redo_dev = self.redo_dev.clone();
+            let redo_size = self.redo_size;
+            drop(self.engine);
+            drop(self.redo_log);
+
+            // Power loss: drop volatile writes not covered by a sync.
+            assert!(
+                data_dev.simulate_power_loss(),
+                "data device must be volatile"
+            );
+            assert!(
+                redo_dev.simulate_power_loss(),
+                "redo device must be volatile"
+            );
+
+            let redo_log =
+                crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, redo_size)
+                    .unwrap();
+            let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+            let mut index: PrimaryBackend = Index::new(10000).unwrap().into();
+            let mut dah = DahBackend::new_in_memory();
+            let mut unmined = UnminedBackend::new_in_memory();
+            crate::recovery::recover_all_with_allocator(
+                &*data_dev as &dyn BlockDevice,
+                &redo_log,
+                &mut index,
+                &mut dah,
+                &mut unmined,
+                Some(&mut alloc),
+            )
+            .expect("recovery must succeed");
+            // The recovered secondary backends (`dah`, `unmined`) reflect the
+            // replayed state, but this test only asserts on primary slot bytes
+            // read straight off the device via `engine.read_slot`, which is
+            // independent of the secondary indexes. Build the engine with
+            // fresh secondaries (the recovered ones already validated that
+            // `recover_all_with_allocator` succeeded above).
+            let _ = (&dah, &unmined);
+            Engine::new(
+                data_dev as Arc<dyn BlockDevice>,
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            )
+        }
+    }
+
+    /// TEST 3(a): crash after the engine effect (`engine.unspend`) but
+    /// BEFORE the compensating redo entry is appended. No durable
+    /// compensating intent exists, so recovery replays the original durable
+    /// `SpendV2` and the slot deterministically ends SPENT — a single,
+    /// well-defined state, never torn.
+    #[test]
+    fn compensation_crash_before_redo_append_leaves_slot_single_valued_spent() {
+        use crate::fault_injection::{self, FaultMode, SyncPoint};
+
+        let h = CompensationCrashHarness::new();
+        let (key, spending_data) = h.seed_record_and_spend([0xE1; 32]);
+
+        // Drive compensation for the spend; crash before the comp redo append.
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        fault_injection::arm(FaultMode::PanicAt(
+            SyncPoint::MidCompensationBeforeRedoAppend,
+        ));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = compensate_replication_failure(
+                &h.engine,
+                &repl_ops,
+                &before_images,
+                Some(&h.redo_log),
+            );
+        }));
+        fault_injection::disarm();
+        assert!(
+            result.is_err(),
+            "compensation must crash at MidCompensationBeforeRedoAppend"
+        );
+
+        // The engine.unspend already ran in volatile state; confirm it was
+        // applied pre-crash (so we know recovery has real work to do).
+        assert!(
+            h.engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "pre-crash in-memory effect should have unspent the slot"
+        );
+
+        let recovered = h.power_loss_and_recover();
+        let slot = recovered.read_slot(&key, 0).expect("slot must exist");
+        assert!(
+            slot.is_spent(),
+            "no durable comp intent ⇒ recovery replays the original spend → SPENT (single-valued, not torn)"
+        );
+        assert_eq!(
+            slot.spending_data, spending_data,
+            "the reproduced spend must carry the original spending_data"
+        );
+    }
+
+    /// TEST 3(b): crash after the compensating redo entry is appended to the
+    /// in-memory buffer but BEFORE the fsync (`BeforeRedoFsync`). The
+    /// unsynced bytes are dropped by power loss, so — exactly like (a) — the
+    /// slot ends SPENT. This proves the compensation is atomic with respect
+    /// to the fsync boundary: there is no half-flushed comp entry that could
+    /// leave the slot in an ambiguous state.
+    #[test]
+    fn compensation_crash_after_redo_append_before_fsync_leaves_slot_single_valued_spent() {
+        use crate::fault_injection::{self, FaultMode, SyncPoint};
+
+        let h = CompensationCrashHarness::new();
+        let (key, spending_data) = h.seed_record_and_spend([0xE2; 32]);
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        // BeforeRedoFsync fires inside RedoLog::flush AFTER the comp entry's
+        // pwrite but BEFORE the device sync. With a volatile redo device the
+        // pwrite sits in the cache and power loss drops it.
+        fault_injection::arm(FaultMode::PanicAt(SyncPoint::BeforeRedoFsync));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = compensate_replication_failure(
+                &h.engine,
+                &repl_ops,
+                &before_images,
+                Some(&h.redo_log),
+            );
+        }));
+        fault_injection::disarm();
+        assert!(
+            result.is_err(),
+            "compensation must crash at BeforeRedoFsync"
+        );
+
+        let recovered = h.power_loss_and_recover();
+        let slot = recovered.read_slot(&key, 0).expect("slot must exist");
+        assert!(
+            slot.is_spent(),
+            "comp entry pwritten but not fsynced ⇒ dropped by power loss → SPENT (single-valued)"
+        );
+        assert_eq!(slot.spending_data, spending_data);
+    }
+
+    /// TEST 3(c): compensation COMPLETES (engine effect + redo append +
+    /// fsync), THEN power loss. The compensating `Unspend` entry is durable,
+    /// so recovery replays both the original `SpendV2` AND the later
+    /// `Unspend`, and the slot ends UNSPENT — the compensated state. This is
+    /// the only case where the compensated outcome survives a crash, and it
+    /// is single-valued just like (a)/(b).
+    #[test]
+    fn completed_compensation_then_power_loss_leaves_slot_single_valued_unspent() {
+        let h = CompensationCrashHarness::new();
+        let (key, spending_data) = h.seed_record_and_spend([0xE3; 32]);
+
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::Spend {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                master_generation: 0,
+            }],
+        )];
+        let before_images = vec![(key, vec![BeforeImage::None])];
+
+        let comp_range =
+            compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+                .expect("compensation must complete cleanly");
+        assert!(
+            comp_range.is_some(),
+            "a spend reversal must emit a compensating Unspend redo entry"
+        );
+        // Make the compensated slot bytes durable too (the dispatch path's
+        // post-compensation barrier). The comp redo entry is already fsynced
+        // by write_redo_ops; this models the data-device durability.
+        h.data_dev.sync().unwrap();
+        assert!(
+            h.engine.read_slot(&key, 0).unwrap().is_unspent(),
+            "post-compensation in-memory slot must be unspent"
+        );
+
+        let recovered = h.power_loss_and_recover();
+        let slot = recovered.read_slot(&key, 0).expect("slot must exist");
+        assert!(
+            slot.is_unspent(),
+            "durable comp Unspend ⇒ recovery lands the slot UNSPENT (compensated, single-valued)"
+        );
     }
 
     /// R-007 (Codex F1): the `build_delete_compensation_ops` helper

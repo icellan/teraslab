@@ -138,6 +138,14 @@ pub enum AllocatorError {
     /// add an overflow-chain implementation) before space is leaked.
     #[error("freelist overflow: {entries} entries, max persistable is {max}")]
     FreelistOverflow { entries: usize, max: usize },
+
+    /// Test/fault-injection only: a `persist` call was deliberately failed
+    /// via [`SlotAllocator::arm_fail_next_persist`]. Never returned in
+    /// production builds (the variant and its trigger are compiled out
+    /// unless `cfg(test)` or the `fault-injection` feature is active).
+    #[cfg(any(test, feature = "fault-injection"))]
+    #[error("allocator persist fault-injected")]
+    PersistFaultInjected,
 }
 
 /// Result type for allocator operations.
@@ -245,6 +253,19 @@ pub struct SlotAllocator {
     /// future multi-device layout where each allocator tracks a distinct
     /// logical device so recovery can route redo entries correctly.
     redo_device_id: u8,
+    /// Test/fault-injection only: fail the next [`SlotAllocator::persist`]
+    /// call with [`AllocatorError::PersistFaultInjected`], then auto-clear.
+    ///
+    /// Used by the checkpoint crash tests to drive `persist_allocator` to
+    /// return `Err` AFTER the snapshot has already been renamed but BEFORE
+    /// the recovery-progress fence is written, exercising the
+    /// "no-fence ⇒ full redo replay re-derives the freelist" self-healing
+    /// invariant. `Cell` so it can be flipped through `&self` (`persist`
+    /// takes `&self`). Compiled out of production builds — only present
+    /// under `cfg(test)` or the `fault-injection` feature, so it never
+    /// affects release behaviour.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fail_next_persist: std::cell::Cell<bool>,
 }
 
 /// Hybrid freelist backend: Vec for small, BTree for large.
@@ -487,6 +508,8 @@ impl SlotAllocator {
             device_id,
             redo_log: None,
             redo_device_id: 0,
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_persist: std::cell::Cell::new(false),
         })
     }
 
@@ -1168,7 +1191,27 @@ impl SlotAllocator {
     /// Returns [`AllocatorError::FreelistOverflow`] if the freelist does
     /// not fit in the on-device header, or [`AllocatorError::Device`] if
     /// the header write or the sync fails.
+    /// Test/fault-injection only: arm the next [`SlotAllocator::persist`]
+    /// to fail once with [`AllocatorError::PersistFaultInjected`], then
+    /// auto-clear. Used by the checkpoint crash tests to fail
+    /// `persist_allocator` after the snapshot has been renamed but before
+    /// the recovery-progress fence is written. Compiled out of production
+    /// builds.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub fn arm_fail_next_persist(&self) {
+        self.fail_next_persist.set(true);
+    }
+
     pub fn persist(&self) -> Result<()> {
+        // Test/fault-injection only: fail-once hook to drive a checkpoint
+        // into the "snapshot renamed, allocator persist failed, no fence
+        // written" crash window. Auto-clears so a retry succeeds. Compiled
+        // out of production builds.
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.fail_next_persist.replace(false) {
+            return Err(AllocatorError::PersistFaultInjected);
+        }
+
         // F-G1-009: refuse to silently truncate a freelist that does not
         // fit in the on-device header. Pre-fix this branch was
         // `let count = self.freelist.len().min(MAX_PERSISTED_FREE_REGIONS);`
@@ -1355,6 +1398,8 @@ impl SlotAllocator {
             device_id,
             redo_log: None,
             redo_device_id: 0,
+            #[cfg(any(test, feature = "fault-injection"))]
+            fail_next_persist: std::cell::Cell::new(false),
         })
     }
 

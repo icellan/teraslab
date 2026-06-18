@@ -134,6 +134,31 @@ pub enum SyncPoint {
     /// Just after the redb secondary-index commit returns.
     /// See [`SyncPoint::BeforeSecondaryRedbCommit`].
     AfterSecondaryRedbCommit,
+
+    /// Inside the checkpoint, AFTER the snapshot rename + allocator
+    /// persist + data-device durability barrier + recovery-progress
+    /// fence, but BEFORE the redo-prefix compaction
+    /// (`compact_prefix_through`). Panicking here simulates a crash in
+    /// the narrow window where the durable snapshot already covers every
+    /// acked mutation but the redo prefix has NOT yet been reclaimed.
+    /// Post-recovery: no acked write may be lost — either the snapshot
+    /// alone or the still-intact redo prefix carries it. This is the
+    /// regression lock for the snapshot-durable-strictly-before-reclaim
+    /// ordering.
+    AfterSnapshotRenameBeforeReclaim,
+
+    /// Inside `compensate_replication_failure`, AFTER the engine effect
+    /// (e.g. `engine.unspend`) has been applied to in-memory/device
+    /// state but BEFORE the compensating redo entry has been appended to
+    /// the log. Panicking here simulates a crash in the WAL-inverted
+    /// window the red-team flagged as the single most fragile spot: the
+    /// engine effect exists only in volatile state, no durable redo
+    /// intent has been written yet. Post-recovery (after power loss):
+    /// the slot must end in a SINGLE consistent state — never
+    /// half-applied. Because no compensating intent was made durable,
+    /// the still-durable original redo entry replays and the slot is
+    /// reproduced deterministically.
+    MidCompensationBeforeRedoAppend,
 }
 
 /// Thread-local fault configuration.
@@ -251,6 +276,8 @@ mod tests {
         check(SyncPoint::BeforeCheckpointDataSync);
         check(SyncPoint::BeforeSecondaryRedbCommit);
         check(SyncPoint::AfterSecondaryRedbCommit);
+        check(SyncPoint::AfterSnapshotRenameBeforeReclaim);
+        check(SyncPoint::MidCompensationBeforeRedoAppend);
         assert_eq!(current(), FaultMode::None);
     }
 

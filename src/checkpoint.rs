@@ -432,6 +432,16 @@ where
     log.mark_recovery_progress(snapshot_fence_sequence)
         .map_err(|e| format!("redo checkpoint fence: {e}"))?;
 
+    // Fault-injection point (test-only, inert without the
+    // `fault-injection` feature): the snapshot is durable, the
+    // data/index barrier has run, and the recovery-progress fence is
+    // written, but the redo prefix has NOT yet been reclaimed. A crash
+    // here must lose no acked write — the snapshot and the still-intact
+    // redo prefix both cover them.
+    crate::fault_injection::check(
+        crate::fault_injection::SyncPoint::AfterSnapshotRenameBeforeReclaim,
+    );
+
     // 5. Reclaim only the covered prefix. Sequence numbers continue
     //    monotonically, and entries after the fence remain available.
     let reset_performed = if can_reset(snapshot_fence_sequence) {
@@ -980,6 +990,478 @@ mod tests {
         let slot0 = crate::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
         assert!(slot0.is_spent(), "acked spend must be reproduced by replay");
         assert_eq!(slot0.spending_data, spending_data);
+    }
+
+    // -- Crash-injection regression tests (snapshot/reclaim ordering,
+    //    allocator point-skew). These lock in the verified-correct
+    //    durability ordering against future regression. --
+
+    /// Restore the index + allocator from disk and replay the redo log
+    /// after a (simulated) power loss, then return the recovered primary
+    /// index so the caller can assert post-recovery state. Mirrors the
+    /// restart sequence the other crash tests use: allocator from its
+    /// header (or fresh on `NoPersistedState`), index from the snapshot
+    /// (or fresh in-memory when no snapshot is durable), then redo replay.
+    fn recover_after_crash(
+        data_dev: &Arc<MemoryDevice>,
+        redo_dev: &Arc<dyn BlockDevice>,
+        snap_path: &std::path::Path,
+        redo_capacity: u64,
+    ) -> (
+        crate::index::PrimaryBackend,
+        crate::allocator::SlotAllocator,
+        usize,
+    ) {
+        use crate::index::{DahBackend, PrimaryBackend, UnminedBackend};
+        use crate::recovery::recover_all_with_allocator;
+
+        let mut alloc = match SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>) {
+            Ok(a) => a,
+            Err(crate::allocator::AllocatorError::NoPersistedState) => {
+                SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap()
+            }
+            Err(e) => panic!("allocator recover failed unexpectedly: {e:?}"),
+        };
+
+        let (mut index, dah, unmined) = if snap_path.exists() {
+            let (idx, dah, unmined, _flags) =
+                PrimaryBackend::restore_all(snap_path).expect("snapshot must restore");
+            (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
+        } else {
+            (
+                PrimaryBackend::new_in_memory(128).unwrap(),
+                DahBackend::new_in_memory(),
+                UnminedBackend::new_in_memory(),
+            )
+        };
+        let mut dah_b = dah;
+        let mut unmined_b = unmined;
+
+        let log = RedoLog::open(redo_dev.clone(), 0, redo_capacity).unwrap();
+        let replayed = log.recover().unwrap().len();
+        recover_all_with_allocator(
+            &**data_dev,
+            &log,
+            &mut index,
+            &mut dah_b,
+            &mut unmined_b,
+            Some(&mut alloc),
+        )
+        .expect("recovery must succeed");
+        (index, alloc, replayed)
+    }
+
+    /// TEST 1 (regression lock — snapshot-durable-STRICTLY-before-reclaim).
+    ///
+    /// Crash inside the checkpoint at
+    /// [`SyncPoint::AfterSnapshotRenameBeforeReclaim`]: the snapshot is
+    /// renamed + parent-dir-fsynced, the durability barrier ran, and the
+    /// recovery-progress fence is written, but `compact_prefix_through`
+    /// (redo reclamation) NEVER runs. After power loss, EVERY acked
+    /// mutation must survive: the durable snapshot carries them and the
+    /// redo prefix is still intact too. The property: there is NO crash
+    /// point between snapshot and reclaim that loses an acked write.
+    #[test]
+    fn snapshot_durable_strictly_before_redo_reclaim_loses_no_acked_write() {
+        use crate::fault_injection::{self, FaultMode, SyncPoint};
+        use crate::index::{PrimaryBackend, TxIndexEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("snap-before-reclaim.snap");
+
+        let data_dev = Arc::new(MemoryDevice::new_volatile(16 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+
+        let (key, record_offset, spending_data) =
+            seed_acked_create_and_spend(&data_dev, &mut alloc, &mut log);
+
+        let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    utxo_count: 2,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 1,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo = Mutex::new(log);
+        let cfg = CheckpointConfig::new(snap_path.clone());
+
+        // Crash AFTER snapshot rename + barrier + fence, BEFORE reclaim.
+        fault_injection::arm(FaultMode::PanicAt(
+            SyncPoint::AfterSnapshotRenameBeforeReclaim,
+        ));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = perform_checkpoint(&cfg, &engine, &redo);
+        }));
+        fault_injection::disarm();
+        assert!(
+            result.is_err(),
+            "checkpoint must have crashed at the pre-reclaim sync point"
+        );
+        // The reclamation never ran, so the redo prefix is still on disk.
+        // (We must drop the engine/redo handles to simulate the crash; the
+        // Mutex<RedoLog> is consumed below by reopening from the device.)
+        drop(redo);
+        drop(engine);
+
+        // Power loss on top of the crash: only synced data survives.
+        assert!(data_dev.simulate_power_loss(), "device must be volatile");
+
+        // Recover. The snapshot exists (rename completed pre-crash) AND the
+        // redo prefix was never reclaimed — recovery from snapshot + replay
+        // must reproduce both acked mutations regardless of which data
+        // writes the volatile device dropped.
+        let (index2, _alloc2, _replayed) =
+            recover_after_crash(&data_dev, &redo_dev, &snap_path, 1024 * 1024);
+
+        let entry = index2
+            .lookup(&key)
+            .expect("record must survive snapshot + replay");
+        assert_eq!(entry.record_offset, record_offset);
+        let meta_after = crate::io::read_metadata(&*data_dev, record_offset)
+            .expect("record metadata must be durable");
+        assert_eq!({ meta_after.tx_id }, key.txid);
+        assert_eq!(
+            { meta_after.spent_utxos },
+            1,
+            "acked spend count must survive a crash between snapshot and reclaim"
+        );
+        let slot0 = crate::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
+        assert!(
+            slot0.is_spent(),
+            "acked spend must NOT silently revert when crashing before reclaim"
+        );
+        assert_eq!(slot0.spending_data, spending_data);
+        let slot1 = crate::io::read_utxo_slot(&*data_dev, record_offset, 1).unwrap();
+        assert!(slot1.is_unspent(), "untouched slot must stay unspent");
+    }
+
+    /// TEST 1 (variant — checkpoint COMPLETES, then power loss).
+    ///
+    /// The complementary half of the property: once the checkpoint runs to
+    /// completion (snapshot durable AND redo prefix reclaimed), the
+    /// snapshot ALONE must carry every acked mutation across a power loss —
+    /// the redo prefix it relied on is now gone. Together with the crash
+    /// variant above, this proves there is no crash point in the
+    /// snapshot→reclaim window that loses an acked write.
+    #[test]
+    fn completed_checkpoint_snapshot_alone_carries_acked_writes_after_power_loss() {
+        use crate::index::{PrimaryBackend, TxIndexEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("snap-complete.snap");
+
+        let data_dev = Arc::new(MemoryDevice::new_volatile(16 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+
+        let (key, record_offset, spending_data) =
+            seed_acked_create_and_spend(&data_dev, &mut alloc, &mut log);
+
+        let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    utxo_count: 2,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 1,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo = Mutex::new(log);
+        let cfg = CheckpointConfig::new(snap_path.clone());
+
+        let stats = perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
+        assert!(stats.reset_performed, "redo prefix must be reclaimed");
+        drop(redo);
+        drop(engine);
+
+        // Power loss: the reclaimed redo prefix is gone; only the durable
+        // snapshot + barriered data writes remain.
+        assert!(data_dev.simulate_power_loss(), "device must be volatile");
+
+        let (index2, _alloc2, replayed) =
+            recover_after_crash(&data_dev, &redo_dev, &snap_path, 1024 * 1024);
+        assert_eq!(
+            replayed, 0,
+            "the fence + reclaim must leave zero redo entries to replay"
+        );
+
+        let entry = index2
+            .lookup(&key)
+            .expect("snapshot alone must carry the record");
+        assert_eq!(entry.record_offset, record_offset);
+        let slot0 = crate::io::read_utxo_slot(&*data_dev, record_offset, 0).unwrap();
+        assert!(
+            slot0.is_spent(),
+            "snapshot alone must carry the acked spend after reclaim + power loss"
+        );
+        assert_eq!(slot0.spending_data, spending_data);
+        let meta_after = crate::io::read_metadata(&*data_dev, record_offset).unwrap();
+        assert_eq!({ meta_after.spent_utxos }, 1);
+    }
+
+    /// TEST 2 (snapshot/allocator point-skew — item #4).
+    ///
+    /// `persist_allocator` fails AFTER the snapshot has already been
+    /// renamed but BEFORE the recovery-progress fence is written, so the
+    /// checkpoint returns `Err` with no fence. After power loss, recovery
+    /// runs the full redo replay (no fence ⇒ nothing is skipped), which
+    /// must self-heal: re-derive the freelist from the `AllocateRegion`
+    /// redo entry and reproduce the acked CREATE + SPEND. Assert: (a) no
+    /// acked mutation is lost, and (b) the region the CREATE allocated is
+    /// NEITHER double-allocatable NOR aliased — the index entry's offset
+    /// and the recovered allocator's high-water mark agree, so a fresh
+    /// allocation can never hand back the live record's region.
+    #[test]
+    fn allocator_persist_skew_after_snapshot_self_heals_via_redo_replay() {
+        use crate::index::{PrimaryBackend, TxIndexEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("alloc-skew.snap");
+
+        let data_dev = Arc::new(MemoryDevice::new_volatile(16 * 1024 * 1024, 4096).unwrap());
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap(),
+        ));
+
+        let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        // Seed an acked CREATE + SPEND. We journal the redo stream in the
+        // SAME order production does — `AllocateRegion` FIRST (so recovery's
+        // `is_allocated_range` gate on `CreateV2` passes during replay),
+        // then `CreateV2`, then `SpendV2` — driving the log directly through
+        // a `&mut RedoLog` (matching the recovery harness's allocate-region
+        // tests). We deliberately do NOT attach the log to the allocator
+        // here: `alloc.allocate` would re-lock the same `Arc<Mutex<RedoLog>>`
+        // we already hold, deadlocking. The on-device record bytes are
+        // written to the volatile cache (no sync) so power loss drops them,
+        // forcing the redo replay to do the real reconstruction work.
+        let (key, region_r, record_size, spending_data) = {
+            use crate::record::{TxMetadata, UtxoSlot};
+            let mut log = redo.lock();
+
+            let mut txid = [0u8; 32];
+            txid[0] = 0xA2;
+            let key = crate::index::TxKey { txid };
+            let utxo_count = 2u32;
+            let record_size = TxMetadata::record_size_for(utxo_count);
+
+            // Reserve region R via the allocator (no redo attached → no
+            // journal here), then journal AllocateRegion ourselves first.
+            // The journaled size is the allocator's alignment-rounded size
+            // (4 KiB device alignment) so the replayed high-water mark
+            // covers the full reserved extent.
+            let region_r = alloc.allocate(record_size).unwrap();
+            let aligned_size = record_size.div_ceil(4096) * 4096;
+            log.append_and_flush(RedoOp::AllocateRegion {
+                offset: region_r,
+                size: aligned_size,
+                device_id: 0,
+            })
+            .unwrap();
+
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.record_size = record_size as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = i as u8 + 1;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+
+            let mut record_bytes = Vec::with_capacity(
+                crate::record::METADATA_SIZE + slots.len() * crate::record::UTXO_SLOT_SIZE,
+            );
+            let mut meta_bytes = [0u8; crate::record::METADATA_SIZE];
+            meta.to_bytes(&mut meta_bytes);
+            record_bytes.extend_from_slice(&meta_bytes);
+            for slot in &slots {
+                let mut sb = [0u8; crate::record::UTXO_SLOT_SIZE];
+                slot.to_bytes(&mut sb);
+                record_bytes.extend_from_slice(&sb);
+            }
+            log.append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                record_offset: region_r,
+                utxo_count,
+                is_conflicting: false,
+                record_bytes,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+            crate::io::write_full_record(&*data_dev, region_r, &meta, &slots).unwrap();
+
+            let mut spending_data = [0u8; 36];
+            spending_data[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+            log.append_and_flush(RedoOp::SpendV2 {
+                tx_key: key,
+                offset: 0,
+                spending_data,
+                new_spent_count: 1,
+                current_block_height: 0,
+                block_height_retention: 0,
+                target_generation: 1,
+                updated_at: 0,
+                utxo_hash: None,
+            })
+            .unwrap();
+            let spent = UtxoSlot::new_spent(slots[0].hash, spending_data);
+            crate::io::write_utxo_slot(&*data_dev, region_r, 0, &spent).unwrap();
+            meta.spent_utxos = 1;
+            crate::io::write_metadata(&*data_dev, region_r, &meta).unwrap();
+
+            (key, region_r, record_size, spending_data)
+        };
+        let record_offset = region_r;
+        assert!(region_r >= crate::allocator::DATA_REGION_OFFSET);
+
+        // Make the record's data-device bytes durable, modelling the
+        // realistic precondition that the acked CREATE+SPEND were already
+        // flushed to the data device by an EARLIER successful checkpoint
+        // (step-3 `device.sync()`). Without this the test would also be
+        // exercising "create record bytes never synced" — a different,
+        // WAL-replay concern — instead of isolating the allocator
+        // point-skew. The allocator HEADER is deliberately left non-durable
+        // (persist will fail below), so this sync isolates exactly the skew:
+        // record bytes durable, allocator header stale/absent.
+        data_dev.sync().unwrap();
+
+        let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+        index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset,
+                    utxo_count: 2,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 1,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // Arm the allocator to fail its next persist. The checkpoint will
+        // have already renamed the snapshot (step 1) before reaching
+        // persist_allocator (step 2), so the failure lands in the skew
+        // window: snapshot durable, NO fence written.
+        engine.allocator().lock().arm_fail_next_persist();
+        let cfg = CheckpointConfig::new(snap_path.clone());
+        let err = perform_checkpoint(&cfg, &engine, &redo)
+            .expect_err("checkpoint must abort when persist_allocator fails");
+        assert!(
+            err.contains("persist_allocator"),
+            "error must name the failing step, got: {err}"
+        );
+        // No fence was written: the full redo log must still be replayable.
+        {
+            let log = redo.lock();
+            assert!(
+                !log.recover().unwrap().is_empty(),
+                "aborted checkpoint must leave the redo log fully replayable"
+            );
+        }
+        // The snapshot was already renamed before the failure.
+        assert!(
+            snap_path.exists(),
+            "snapshot rename precedes persist_allocator — file must exist"
+        );
+
+        drop(engine);
+        drop(redo);
+
+        // Power loss: drop volatile data writes + the (failed) header.
+        assert!(data_dev.simulate_power_loss(), "device must be volatile");
+
+        // Recover. No durable allocator header survived the power loss
+        // (persist failed), so SlotAllocator::recover returns
+        // NoPersistedState and we start fresh; the full redo replay then
+        // re-derives the freelist/high-water from AllocateRegion AND
+        // reproduces the CREATE + SPEND.
+        let (index2, alloc2, replayed) =
+            recover_after_crash(&data_dev, &redo_dev, &snap_path, 1024 * 1024);
+        assert!(
+            replayed > 0,
+            "no fence ⇒ the full redo prefix must be replayed"
+        );
+
+        // (a) No acked mutation lost.
+        let entry = index2
+            .lookup(&key)
+            .expect("replay must re-register the record");
+        assert_eq!(entry.record_offset, region_r);
+        let slot0 = crate::io::read_utxo_slot(&*data_dev, region_r, 0).unwrap();
+        assert!(slot0.is_spent(), "acked spend must be reproduced by replay");
+        assert_eq!(slot0.spending_data, spending_data);
+
+        // (b) Region R is NEITHER double-allocatable NOR aliased: a fresh
+        // allocation after recovery must hand back an offset STRICTLY
+        // beyond R's extent (or carved from a freelist hole that does not
+        // overlap R). The allocator's high-water mark must cover R, so the
+        // next bump-allocation cannot return R again.
+        let mut alloc2 = alloc2;
+        let fresh = alloc2
+            .allocate(record_size)
+            .expect("post-recovery allocation must succeed");
+        let r_end = region_r + record_size;
+        let fresh_end = fresh + record_size;
+        assert!(
+            fresh + record_size <= region_r || fresh >= r_end,
+            "fresh allocation {fresh}..{fresh_end} must NOT overlap live region R {region_r}..{r_end} (no double-alloc / aliasing)"
+        );
     }
 
     // -- BC-01 background-task tests --

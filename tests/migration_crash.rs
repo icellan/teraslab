@@ -315,7 +315,7 @@ fn crash_mid_migration_no_loss_no_dup_no_dual_master() {
         let op = build_migration_create_op(&old.engine, k);
         // Production migration-baseline path: journal = false. No receiver
         // redo entry is written for migrated baseline records.
-        apply_op_journal(&new.engine, &op, false).expect("migration apply");
+        apply_op_journal(&new.engine, &op, false, true).expect("migration apply");
         if i + 1 == crash_after {
             break;
         }
@@ -437,7 +437,7 @@ fn clean_migration_completes_with_single_master() {
     // migration-baseline path: no receiver redo entries written).
     for k in &keys {
         let op = build_migration_create_op(&old.engine, k);
-        apply_op_journal(&new.engine, &op, false).expect("migration apply");
+        apply_op_journal(&new.engine, &op, false, true).expect("migration apply");
     }
 
     // No-journal invariant: the receiver wrote ZERO redo entries for the
@@ -542,7 +542,7 @@ fn large_migration_baseline_completes_without_log_full() {
         for k in &keys {
             let op = build_migration_create_op(&source.engine, k);
             // journal = true is the OLD (pre-fix) migration behaviour.
-            match apply_op_journal(&journalled.engine, &op, true) {
+            match apply_op_journal(&journalled.engine, &op, true, true) {
                 Ok(()) => {}
                 Err(e) => {
                     assert!(
@@ -565,7 +565,7 @@ fn large_migration_baseline_completes_without_log_full() {
     let receiver = TinyRedoNode::new(redo_size);
     for k in &keys {
         let op = build_migration_create_op(&source.engine, k);
-        apply_op_journal(&receiver.engine, &op, false)
+        apply_op_journal(&receiver.engine, &op, false, true)
             .expect("no-journal migration baseline must apply without LogFull");
     }
     receiver.data_dev.sync().unwrap();
@@ -629,7 +629,7 @@ fn receiver_crash_mid_no_journal_baseline_recovers_via_fence_and_redrive() {
     // Apply HALF the no-journal baseline, then power-loss before completion.
     for (i, k) in keys.iter().enumerate() {
         let op = build_migration_create_op(&old.engine, k);
-        apply_op_journal(&new.engine, &op, false).expect("migration apply");
+        apply_op_journal(&new.engine, &op, false, true).expect("migration apply");
         if i + 1 == NUM_RECORDS / 2 {
             break;
         }
@@ -664,7 +664,7 @@ fn receiver_crash_mid_no_journal_baseline_recovers_via_fence_and_redrive() {
     assert!(redrive_mgr.mark_inbound_active(shard));
     for k in &keys {
         let op = build_migration_create_op(&old.engine, k);
-        apply_op_journal(&redriven.engine, &op, false).expect("re-drive apply");
+        apply_op_journal(&redriven.engine, &op, false, true).expect("re-drive apply");
     }
     redriven.make_durable();
     redrive_mgr.mark_inbound_complete(shard);
