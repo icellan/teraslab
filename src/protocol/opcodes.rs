@@ -193,38 +193,6 @@ pub const OP_MIGRATION_BATCH_COMPLETE: u16 = 243;
 /// completion handshake) for the listed shards. Fully idempotent.
 pub const OP_MIGRATION_TRANSFER_REQUEST: u16 = 244;
 
-/// Reverse manifest reconciliation (#36 — rejoin deletion-reconciliation).
-///
-/// A stale, non-authoritative holder `N` of shard `S` (a rejoined node that
-/// rebuilt its FULL pre-shutdown index — including records the cluster
-/// authoritatively DELETED while `N` was down) sends this to the shard's
-/// committed master `R` to pull `R`'s authoritative keyset, so `N` can
-/// reconcile its local keyset DOWN to `R`'s (deleting `local − R`).
-///
-/// Request payload (16 bytes):
-/// ```text
-///   topology_epoch:  u64 LE   (8 bytes; the committed epoch N reconciles at)
-///   requester_node:  u64 LE   (8 bytes; N's own NodeId, for audit)
-/// ```
-/// `request_id` carries the shard in its low 16 bits (upper 48 bits MUST be
-/// zero — same overload guard as `OP_MIGRATION_COMPLETE`).
-///
-/// Response:
-///   - `STATUS_OK` + exact-entry manifest payload
-///     `[entry_count:4 LE][ (txid:32)(generation:4 LE) × entry_count ]` when
-///     `R` can PROVE it is authoritative-and-complete for `S` at the requested
-///     epoch (see
-///     [`crate::cluster::migration::MigrationManager::is_authoritative_complete_for_shard`]).
-///     The manifest is `R`'s complete current keyset for `S`. An empty keyset
-///     is a valid proven answer (`entry_count == 0`) — it means `R`
-///     authoritatively holds NOTHING for `S`, so `N` deletes its entire stale
-///     copy.
-///   - `ERR_NOT_AUTHORITATIVE_COMPLETE` when `R` cannot prove completeness
-///     (wrong epoch, not the master/target, or itself mid-inbound for `S`).
-///     `N` treats this as RETRYABLE: it RETAINS everything and retries on the
-///     next cycle. Never interpreted as "delete everything".
-pub const OP_SHARD_RECONCILE_REQUEST: u16 = 245;
-
 // Cluster (inter-node)
 pub const OP_HEARTBEAT: u16 = 250;
 
@@ -447,22 +415,6 @@ pub const ERR_NOT_DUE: u16 = 36;
 /// completed handoff.
 pub const ERR_MIGRATION_TARGET_NOT_READY: u16 = 37;
 
-/// #36 — reverse manifest reconciliation: the master `R` that received an
-/// `OP_SHARD_RECONCILE_REQUEST` CANNOT PROVE it is authoritative-and-complete
-/// for the requested shard at the requested epoch. The completeness proof
-/// requires ALL of: (i) the requested epoch equals `R`'s committed
-/// shard-table version; (ii) `R` is the effective OR target master for the
-/// shard in the committed table; (iii) `R` is serving the shard with NO
-/// pending inbound migration for it (it is not itself mid-catch-up).
-///
-/// The requester `N` MUST treat this as RETRYABLE and conservative: it
-/// RETAINS its entire local copy of the shard and retries on the next
-/// reconciliation cycle. It is NEVER interpreted as "delete everything" —
-/// without the proof, a lagging / mid-inbound / wrong-epoch `R` could lack
-/// genuinely-unique live records, so reconciling down to it would be the
-/// exact data-loss trap fixes #28/#29/#31 prevent.
-pub const ERR_NOT_AUTHORITATIVE_COMPLETE: u16 = 38;
-
 /// P3.10 / F-G5-017 — wire protocol revision.
 ///
 /// `1` is the historical implicit version: legacy clients and servers do
@@ -636,7 +588,6 @@ pub fn is_inter_node_auth_opcode(op_code: u16) -> bool {
             | OP_MIGRATION_COMPLETE
             | OP_MIGRATION_BATCH_COMPLETE
             | OP_MIGRATION_TRANSFER_REQUEST
-            | OP_SHARD_RECONCILE_REQUEST
             | OP_TOPOLOGY_PROPOSE
             | OP_TOPOLOGY_VOTE
             | OP_TOPOLOGY_COMMIT
