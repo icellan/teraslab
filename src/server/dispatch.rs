@@ -5550,6 +5550,92 @@ fn take_cold_data_section<'a>(cold_data: &'a [u8], pos: &mut usize) -> Option<&'
     Some(section)
 }
 
+/// Outcome of deciding what `cold_data` a create replica op should carry.
+///
+/// See [`create_repl_cold_data`] for the rationale behind each variant.
+enum CreateReplColdData {
+    /// Ship a `ReplicaOp::Create` whose `cold_data` field carries this value.
+    /// `None` means "no inline cold data" (non-external create with an empty
+    /// wire body); `Some(bytes)` carries the payload the replica must persist.
+    Ship(Option<Vec<u8>>),
+    /// Do NOT push a replica op for this item. Used only for the
+    /// should-never-happen case where an EXTERNAL record's blob cannot be read
+    /// back from the master's blob store at replica-op build time. The master's
+    /// own create already succeeded (record + blob + ExternalRef are durable
+    /// and pinned), so this is degraded under-replication, NOT a client-facing
+    /// failure: the caller logs and skips replication for this item only.
+    SkipReplicationBlobMissing,
+}
+
+/// Decide the `cold_data` a create's `ReplicaOp::Create` must carry.
+///
+/// # Why external blobs are read back here
+///
+/// When a client streams a large external blob to the master
+/// (`OP_STREAM_CHUNK`/`OP_STREAM_END` write it to the master's blob store
+/// only — never replicated) and then sends `OP_CREATE_BATCH` with
+/// `FLAG_EXTERNAL_BLOB` and an EMPTY inline `cold_data`, the wire body carries
+/// no bytes. Shipping the (empty) wire `cold_data` as `None` would create a
+/// live EXTERNAL record with a valid `ExternalRef` but NO blob on the replica,
+/// permanently losing the payload on promotion. To close that gap, for an
+/// external item we read the blob back from the master's blob store (the same
+/// read-back the delete-snapshot path performs) and ship it inline so the
+/// receiver's "failing to store cold data must fail the ACK" contract actually
+/// engages.
+///
+/// # Parameters
+///
+/// * `engine` — the master engine, used to reach `blob_store()` for read-back.
+/// * `txid` — the transaction id, also the blob key.
+/// * `is_external` — whether this create carries `FLAG_EXTERNAL_BLOB`.
+/// * `wire_cold_data` — the inline cold data from the create request.
+///
+/// # Behavior
+///
+/// * Non-external: preserves the historical rule — empty wire body → `Ship(None)`,
+///   otherwise `Ship(Some(clone))`.
+/// * External: reads `engine.blob_store().get(txid)`. Present → `Ship(Some(blob))`.
+///   Absent/error/no blob store → [`CreateReplColdData::SkipReplicationBlobMissing`]
+///   (a should-never-happen inconsistency: the digest check already verified the
+///   blob and it is pinned through registration). The caller must NOT ship a
+///   blob-less external Create — doing so re-opens the data-loss bug.
+///
+/// The blob is read back while the per-item blob pin is still held (it lives in
+/// `ValidCreate::_blob_pin` and is dropped only after this loop), so a
+/// concurrent periodic GC sweep cannot unlink it between the digest check and
+/// this read-back.
+fn create_repl_cold_data(
+    engine: &Engine,
+    txid: &[u8; 32],
+    is_external: bool,
+    wire_cold_data: &[u8],
+) -> CreateReplColdData {
+    if !is_external {
+        return if wire_cold_data.is_empty() {
+            CreateReplColdData::Ship(None)
+        } else {
+            CreateReplColdData::Ship(Some(wire_cold_data.to_vec()))
+        };
+    }
+
+    let key = TxKey { txid: *txid };
+    match engine.blob_store() {
+        Some(bs) => match bs.get(&key.txid) {
+            Ok(Some(blob)) => CreateReplColdData::Ship(Some(blob)),
+            Ok(None) => CreateReplColdData::SkipReplicationBlobMissing,
+            Err(e) => {
+                tracing::error!(
+                    txid = ?key.txid,
+                    err = %e,
+                    "external create replica-op build: blob read-back failed",
+                );
+                CreateReplColdData::SkipReplicationBlobMissing
+            }
+        },
+        None => CreateReplColdData::SkipReplicationBlobMissing,
+    }
+}
+
 fn handle_create_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -5930,18 +6016,41 @@ fn handle_create_batch(
                     meta_buf.extend_from_slice(&ext.outputs_offset.to_le_bytes());
                 }
 
+                let is_external = item.flags & FLAG_EXTERNAL_BLOB != 0;
+                // CRITICAL: for a streamed external blob the wire `cold_data`
+                // is empty (the bytes arrived via OP_STREAM_*). Shipping that
+                // empty body as `cold_data: None` would leave the replica with
+                // a live EXTERNAL record + ExternalRef but no blob — the
+                // payload is lost on promotion. Read the blob back from the
+                // master's (still-pinned) store so it is carried inline and the
+                // receiver's fail-the-ACK-on-put-failure contract engages.
+                let cold_data =
+                    match create_repl_cold_data(engine, &item.txid, is_external, &item.cold_data) {
+                        CreateReplColdData::Ship(cold_data) => cold_data,
+                        CreateReplColdData::SkipReplicationBlobMissing => {
+                            // Should never happen: the digest check verified the
+                            // blob and it is pinned through registration. The
+                            // master's own create+blob is durable, so this is NOT
+                            // a client-facing failure (do not push an error for
+                            // `item.idx`). It is degraded under-replication: skip
+                            // this item's replica op and log loudly.
+                            tracing::error!(
+                                txid = ?item.txid,
+                                "external create succeeded on master but its blob could not be \
+                                 read back for replication; skipping replica op for this item \
+                                 (record is under-replicated, not lost on master)",
+                            );
+                            continue;
+                        }
+                    };
                 repl_ops_by_key.push((
                     key,
                     vec![ReplicaOp::Create {
                         tx_key: key,
                         metadata_bytes: meta_buf,
                         utxo_hashes: item.utxo_hashes.clone(),
-                        cold_data: if item.cold_data.is_empty() {
-                            None
-                        } else {
-                            Some(item.cold_data.clone())
-                        },
-                        is_external: item.flags & FLAG_EXTERNAL_BLOB != 0,
+                        cold_data,
+                        is_external,
                     }],
                 ));
             }
@@ -11228,6 +11337,227 @@ mod tests {
             results[0].status, STATUS_OK,
             "delete must not remove the record when its external blob snapshot is missing"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Streamed external blob replication — close create-batch data loss
+    // -----------------------------------------------------------------------
+
+    /// Build the `ReplicaOp::Create` metadata_bytes for an EXTERNAL record the
+    /// way `handle_create_batch`'s Phase-3 loop does: 46-byte core header,
+    /// 24-byte lifecycle block, `block_height(4)` + `block_count(1)=0` +
+    /// `parent_count(2)=0`, then the 65-byte `ExternalRef` tail. The receiver
+    /// reconstructs the EXTERNAL record (and its `ExternalRef`) from exactly
+    /// this layout.
+    fn external_create_metadata_bytes(digest_sha256: [u8; 32], total_size: u64) -> Vec<u8> {
+        let mut m = Vec::with_capacity(140);
+        // Core 46 bytes.
+        m.extend_from_slice(&1u32.to_le_bytes()); // tx_version
+        m.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        m.extend_from_slice(&0u64.to_le_bytes()); // fee
+        m.extend_from_slice(&total_size.to_le_bytes()); // size_in_bytes
+        m.extend_from_slice(&total_size.to_le_bytes()); // extended_size
+        m.push(0); // is_coinbase
+        m.extend_from_slice(&0u32.to_le_bytes()); // spending_height
+        m.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        m.push(0); // wire flags
+        // Lifecycle 24 bytes.
+        m.extend_from_slice(&0u32.to_le_bytes()); // generation
+        m.extend_from_slice(&0u64.to_le_bytes()); // updated_at
+        m.extend_from_slice(&0u32.to_le_bytes()); // unmined_since
+        m.extend_from_slice(&0u32.to_le_bytes()); // delete_at_height
+        m.extend_from_slice(&0u32.to_le_bytes()); // preserve_until
+        // Extended: block_height + block_count(0) + parent_count(0).
+        m.extend_from_slice(&0u32.to_le_bytes()); // block_height
+        m.push(0); // mined_block_infos count
+        m.extend_from_slice(&0u16.to_le_bytes()); // parent_txids count
+        // ExternalRef (65 bytes): store_type + content_hash + total_size +
+        // input_count + output_count + inputs_offset + outputs_offset.
+        m.push(1); // store_type
+        m.extend_from_slice(&digest_sha256);
+        m.extend_from_slice(&total_size.to_le_bytes());
+        m.extend_from_slice(&0u32.to_le_bytes()); // input_count
+        m.extend_from_slice(&0u32.to_le_bytes()); // output_count
+        m.extend_from_slice(&0u64.to_le_bytes()); // inputs_offset
+        m.extend_from_slice(&0u64.to_le_bytes()); // outputs_offset
+        m
+    }
+
+    /// Headline regression: a STREAMED external blob (`OP_STREAM_*` wrote the
+    /// bytes to the master's blob store; the create's wire `cold_data` is
+    /// empty) must be shipped INLINE to the replica. Before the fix the master
+    /// shipped `cold_data: None`, leaving the replica with a live EXTERNAL
+    /// record + ExternalRef but no blob — payload lost on promotion.
+    #[test]
+    fn streamed_external_create_ships_blob_to_replica() {
+        use crate::record::ExternalRef;
+        use crate::replication::receiver::apply_op;
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+
+        let txid = DispatchTestHarness::make_txid(91);
+        let payload = b"streamed external transaction payload bytes".to_vec();
+
+        // Master: blob arrived via OP_STREAM_*, so it is already in the store
+        // and the create carries an EMPTY inline cold_data. `DispatchTestHarness`
+        // holds the non-reentrant global metrics test-lock for its lifetime, so
+        // the master must be dropped before the replica harness is built —
+        // scope it and hand the emitted op out of the block.
+        let op = {
+            let mut m = DispatchTestHarness::new();
+            let master_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+            m.engine.set_blob_store(master_store.clone());
+            let digest = master_store.put(&txid, &payload).unwrap();
+
+            let item = WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 0,
+                size_in_bytes: payload.len() as u64,
+                extended_size: payload.len() as u64,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: FLAG_EXTERNAL_BLOB,
+                utxo_hashes: vec![[0xAB; 32]],
+                cold_data: vec![], // streamed — empty inline body
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            let resp = m.request_with_blob_store(
+                OP_CREATE_BATCH,
+                encode_create_batch(&[item]),
+                &*master_store,
+            );
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "master external create must succeed"
+            );
+
+            // Capture the cold_data the master's replica-op builder produces —
+            // this is the exact production decision (`item.cold_data` is empty,
+            // so the fix reads the blob back from the master store).
+            let cold_data = match create_repl_cold_data(&m.engine, &txid, true, &[]) {
+                CreateReplColdData::Ship(cold_data) => cold_data,
+                CreateReplColdData::SkipReplicationBlobMissing => {
+                    panic!("blob is present + pinned; must ship it, not skip replication")
+                }
+            };
+            assert_eq!(
+                cold_data,
+                Some(payload.clone()),
+                "streamed external create must ship the blob inline (was None before the fix)",
+            );
+
+            // Build the full ReplicaOp::Create the master emits.
+            ReplicaOp::Create {
+                tx_key: TxKey { txid },
+                metadata_bytes: external_create_metadata_bytes(digest.sha256, digest.length),
+                utxo_hashes: vec![[0xAB; 32]],
+                cold_data,
+                is_external: true,
+            }
+        };
+
+        // Apply the captured op to a fresh replica.
+        let mut r = DispatchTestHarness::new();
+        let replica_store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        r.engine.set_blob_store(replica_store.clone());
+        apply_op(&r.engine, &op).expect("replica apply of streamed external create");
+
+        // The replica now resolves the external payload — before the fix this
+        // returned BlobNotFound.
+        let got = r
+            .engine
+            .read_cold_data(&TxKey { txid })
+            .expect("replica must resolve the external blob after apply");
+        assert_eq!(
+            got, payload,
+            "replica external payload must match the master"
+        );
+
+        // Sanity: the replica record really is EXTERNAL with the master's ref
+        // (content_hash == SHA256(payload)).
+        let meta = r.engine.read_metadata(&TxKey { txid }).unwrap();
+        assert!(meta.flags.contains(crate::record::TxFlags::EXTERNAL));
+        let ext: ExternalRef = meta.external_ref;
+        let ch = ext.content_hash;
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut hasher, &payload);
+        let expected: [u8; 32] = sha2::Digest::finalize(hasher).into();
+        assert_eq!(ch, expected);
+    }
+
+    /// Regression guard: a NON-external create still follows the historical
+    /// inline rule — empty wire body → `None`, non-empty → `Some(bytes)`.
+    #[test]
+    fn non_external_create_repl_cold_data_follows_inline_rule() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(92);
+
+        match create_repl_cold_data(&h.engine, &txid, false, &[]) {
+            CreateReplColdData::Ship(None) => {}
+            CreateReplColdData::Ship(Some(v)) => {
+                panic!("empty non-external body must ship None, got {v:?}")
+            }
+            CreateReplColdData::SkipReplicationBlobMissing => {
+                panic!("non-external create must never skip replication")
+            }
+        }
+
+        let body = vec![0x01, 0x02, 0x03, 0x04];
+        match create_repl_cold_data(&h.engine, &txid, false, &body) {
+            CreateReplColdData::Ship(Some(v)) => assert_eq!(v, body),
+            CreateReplColdData::Ship(None) => panic!("non-empty body must ship Some"),
+            CreateReplColdData::SkipReplicationBlobMissing => {
+                panic!("non-external create must never skip replication")
+            }
+        }
+    }
+
+    /// Degraded path: an EXTERNAL item whose blob is absent from the master
+    /// store must NOT ship a blob-less Create — the builder signals
+    /// skip-replication (caller logs + skips the repl op while keeping the
+    /// master's own create reported as success). This reproduces the
+    /// should-never-happen inconsistency directly at the builder, since the
+    /// create-path digest check makes the missing-blob state unreachable
+    /// through the full dispatch handler.
+    #[test]
+    fn external_create_missing_blob_skips_replication_not_client_error() {
+        use crate::storage::blobstore::{BlobStore, MemoryBlobStore};
+
+        let txid = DispatchTestHarness::make_txid(93);
+
+        // Blob store present but the blob is absent (intentionally not put).
+        // `DispatchTestHarness` holds the global metrics test-lock for its
+        // lifetime, so each harness must be dropped before the next is built
+        // (the lock is not reentrant) — scope them.
+        {
+            let mut h = DispatchTestHarness::new();
+            let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+            h.engine.set_blob_store(store.clone());
+            match create_repl_cold_data(&h.engine, &txid, true, &[]) {
+                CreateReplColdData::SkipReplicationBlobMissing => {}
+                CreateReplColdData::Ship(v) => {
+                    panic!("missing external blob must not ship a Create, got {v:?}")
+                }
+            }
+        }
+
+        // No blob store configured at all: the same external item must also
+        // skip (never ship a blob-less external Create).
+        {
+            let h2 = DispatchTestHarness::new();
+            match create_repl_cold_data(&h2.engine, &txid, true, &[]) {
+                CreateReplColdData::SkipReplicationBlobMissing => {}
+                CreateReplColdData::Ship(v) => {
+                    panic!("no blob store must not ship an external Create, got {v:?}")
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
