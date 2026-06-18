@@ -1226,30 +1226,28 @@ pub(crate) fn handle_request(
                 }
             }
 
-            // Verify the actual record count matches expected exactly
-            // using the O(1) per-shard counter.
-            let actual = engine.shard_record_count(shard);
-            let count_ok = if expected_records == 0 {
-                actual == 0
-            } else {
-                actual == expected_records
-            };
-
-            if !count_ok {
-                return error_response(
-                    request.request_id,
-                    ERR_MIGRATION_IN_PROGRESS,
-                    &format!(
-                        "shard {shard} record count mismatch: expected {expected_records}, got {actual}"
-                    ),
-                );
-            }
-
-            // Only treat the exact-entry manifest as "verified" when it is
-            // non-empty AND its length matches the expected record count.
-            // An empty exact-entry list with `record_count > 0` is not
-            // evidence of anything — the receiver must still verify via
-            // the SHA-256 manifest (H3 safety requirement).
+            // Exact-entry verification runs BEFORE the count decision so it can
+            // serve as the SUPERSET proof (Fix B). When the source ships an exact
+            // (txid, generation) manifest, proving every source key is present
+            // locally at the matching generation is strictly stronger evidence
+            // than a count equality: it confirms the target holds EVERY record
+            // the source streamed, regardless of how many EXTRA records the
+            // target also holds.
+            //
+            // NOTE: concurrent multi-source inbound migration of the SAME shard
+            // (overlapping plans during a rolling restart / epoch churn) is
+            // intentionally TOLERATED here, not serialized. Several sources may
+            // stream the same shard to this target; the target's per-shard count
+            // is then the UNION (superset) of all sources. We accept each
+            // source's completion on a verified superset (below) and gate the
+            // actual COMMIT on `!has_pending_inbound_shard` so the handoff only
+            // commits once EVERY pending source has completed.
+            //
+            // Only treat the exact-entry manifest as usable when it is non-empty
+            // AND its length matches the expected record count. An empty
+            // exact-entry list with `record_count > 0` is not evidence of
+            // anything — the receiver must still verify via the SHA-256 manifest
+            // (H3 safety requirement).
             let exact_entries_verified = if let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
@@ -1258,6 +1256,9 @@ pub(crate) fn handle_request(
                     let meta = match engine.read_metadata(key) {
                         Ok(meta) => meta,
                         Err(e) => {
+                            // Missing source key: the target does NOT hold a
+                            // record the source streamed. No-loss reject — never
+                            // commit when a source key is absent.
                             return error_response(
                                 request.request_id,
                                 ERR_MIGRATION_IN_PROGRESS,
@@ -1281,6 +1282,84 @@ pub(crate) fn handle_request(
             } else {
                 false
             };
+
+            // EPOCH-CURRENCY of the completion. A superset accept (below) may
+            // only COMMIT the shard when the completion is stamped with the
+            // node's currently-activated epoch. This is the discriminator that
+            // separates the two superset cases:
+            //
+            //   * CONCURRENT MULTI-SOURCE (the bug Fix B fixes): overlapping
+            //     CURRENT-epoch migration plans stream the same shard to this
+            //     target during a rolling restart. The target's extra records
+            //     come from OTHER current-epoch sources and are live — safe to
+            //     accept + commit even though THIS source is not the master.
+            //
+            //   * STALE-EPOCH SHORT MANIFEST (task #29): a completion from a
+            //     SUPERSEDED migration plan whose manifest lags the live
+            //     topology. Its extra local records may be genuinely-stale
+            //     residue (e.g. a UTXO the authoritative master already spent).
+            //     Committing on its verified subset would unfence the shard and
+            //     let those possibly-stale extras be served. Such a completion is
+            //     NOT epoch-current, so it falls through to the STRICT count
+            //     check and is rejected (shard stays fenced) — exactly the #29
+            //     anti-stale-serving guarantee. The #29 prune gate above already
+            //     retains the extras; this keeps them unservable until the
+            //     authoritative current-epoch migration reconciles them.
+            //
+            // A legacy no-epoch completion (epoch == 0) cannot be proven current
+            // and is treated as not-current → strict.
+            let completion_epoch_current = if let Some(cluster) = cluster {
+                let shard_table = cluster.shard_table();
+                let table = shard_table.read();
+                migration_epoch > 0 && migration_epoch == table.version
+            } else {
+                false
+            };
+
+            // Count decision (Fix B — accept a VERIFIED, EPOCH-CURRENT superset).
+            //
+            //   * expected_records == 0: a CURRENT-epoch source that streamed
+            //     ZERO records (empty snapshot / stale re-attempt) is allowed to
+            //     complete regardless of the target's total. The target's records
+            //     belong to OTHER concurrent sources whose own completions verify
+            //     them; the empty source has nothing to transfer, and the
+            //     relinquish disposition (#25) only drops EMPTY shards from a
+            //     source, so an empty completion never causes the source to drop
+            //     real data. Gated on epoch currency so a stale empty completion
+            //     cannot unfence a shard holding possibly-stale extras.
+            //
+            //   * exact_entries_verified && epoch-current: the per-key loop above
+            //     already proved the target holds EVERY source key at the matching
+            //     generation — a verified superset. Accept `actual >=
+            //     expected_records`; the EXTRA local keys are legitimate
+            //     current-epoch shard records (other concurrent sources /
+            //     pre-existing replica copies) and are KEPT.
+            //
+            //   * hash-only manifest (no usable exact entries): the manifest hash
+            //     folds over ALL keys_for_shard(target), so any superset changes
+            //     the hash. A superset cannot be verified via hash, so this path
+            //     KEEPS the strict `actual == expected_records` requirement.
+            //
+            //   * anything not epoch-current: STRICT `actual == expected_records`
+            //     (preserves #29).
+            let actual = engine.shard_record_count(shard);
+            let count_ok = if expected_records == 0 && completion_epoch_current {
+                true
+            } else if exact_entries_verified && completion_epoch_current {
+                actual >= expected_records
+            } else {
+                actual == expected_records
+            };
+
+            if !count_ok {
+                return error_response(
+                    request.request_id,
+                    ERR_MIGRATION_IN_PROGRESS,
+                    &format!(
+                        "shard {shard} record count mismatch: expected {expected_records}, got {actual}"
+                    ),
+                );
+            }
 
             // Skip the expensive O(N) manifest hash scan when exact-entry
             // verification already confirmed every key's generation — the
@@ -14773,6 +14852,365 @@ mod tests {
         );
     }
 
+    /// Fix B (superset accept — keystone). Under concurrent dual-source
+    /// migration of the same shard, one source's exact-entry manifest is a
+    /// SUBSET of the target's per-shard record set (the target also holds the
+    /// other source's keys). The completion must SUCCEED on a verified superset:
+    /// every source key is present at the matching generation, and the EXTRA
+    /// local key is RETAINED (never pruned, never deleted). The source here is a
+    /// NON-master node so the #29 prune gate does NOT run — exactly the
+    /// concurrent-source case.
+    #[test]
+    fn migration_complete_accepts_verified_superset() {
+        let h = DispatchTestHarness::new();
+        let shard = 50u16;
+        let txid_src = txid_for_shard(shard, 11);
+        let txid_extra = txid_for_shard(shard, 12);
+        assert_eq!(h.create_tx(txid_src, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_extra, 1).status, STATUS_OK);
+
+        let key_src = TxKey { txid: txid_src };
+        let meta_src = h.engine.read_metadata(&key_src).unwrap();
+        // Source streamed ONLY its one key; target holds it PLUS an extra.
+        let entries = vec![(key_src, meta_src.generation)];
+
+        let members = vec![
+            crate::cluster::shards::NodeId(1),
+            crate::cluster::shards::NodeId(2),
+        ];
+        let epoch = 60u64;
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 2, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[
+                (
+                    crate::cluster::shards::NodeId(1),
+                    "127.0.0.1:4710".parse().unwrap(),
+                ),
+                (
+                    crate::cluster::shards::NodeId(2),
+                    "127.0.0.1:4711".parse().unwrap(),
+                ),
+            ],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // Completion from a NON-master source (NodeId(9)) so the #29 prune gate
+        // is NOT authoritative-complete and never runs, but stamped with the
+        // CURRENT epoch so superset-accept is permitted (the concurrent
+        // multi-source case). The verify/count path runs; no prune occurs.
+        let payload =
+            build_migration_complete_payload(1, 0, epoch, None, Some(&entries), Some(NodeId(9)));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "verified superset (source key present at matching gen) must succeed"
+        );
+        // No-loss: BOTH records retained — the extra was never pruned.
+        assert_eq!(
+            h.engine.shard_record_count(shard),
+            2,
+            "superset accept must KEEP the extra local record"
+        );
+        assert!(h.engine.read_metadata(&key_src).is_ok());
+        assert!(h.engine.read_metadata(&TxKey { txid: txid_extra }).is_ok());
+    }
+
+    /// Fix B (no-loss). When the target is MISSING one of the source's exact
+    /// keys, the completion must REJECT with ERR_MIGRATION_IN_PROGRESS and leave
+    /// the shard pending — never commit when a source key is absent.
+    #[test]
+    fn migration_complete_rejects_missing_source_key() {
+        let h = DispatchTestHarness::new();
+        let shard = 51u16;
+        let txid_present = txid_for_shard(shard, 13);
+        let txid_missing = txid_for_shard(shard, 14);
+        assert_eq!(h.create_tx(txid_present, 1).status, STATUS_OK);
+
+        let key_present = TxKey { txid: txid_present };
+        let meta_present = h.engine.read_metadata(&key_present).unwrap();
+        // Source claims TWO keys; the target only holds one. The second is
+        // genuinely absent (never created).
+        let entries = vec![
+            (key_present, meta_present.generation),
+            (TxKey { txid: txid_missing }, 1),
+        ];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 61, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4712".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload =
+            build_migration_complete_payload(2, 0, 0, None, Some(&entries), Some(NodeId(9)));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err_code, ERR_MIGRATION_IN_PROGRESS,
+            "missing source key must reject as ERR_MIGRATION_IN_PROGRESS"
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "no-loss: missing source key must NOT clear pending inbound"
+        );
+    }
+
+    /// Fix B (no-loss). A generation MISMATCH on a source key (target holds the
+    /// key at a different generation) must REJECT — the superset proof requires
+    /// the matching generation.
+    #[test]
+    fn migration_complete_rejects_generation_mismatch() {
+        let h = DispatchTestHarness::new();
+        let shard = 52u16;
+        let txid = txid_for_shard(shard, 15);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+
+        let key = TxKey { txid };
+        let meta = h.engine.read_metadata(&key).unwrap();
+        // Claim a generation that does NOT match the stored one.
+        let wrong_gen = meta.generation.wrapping_add(7);
+        let entries = vec![(key, wrong_gen)];
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 62, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4713".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        let payload =
+            build_migration_complete_payload(1, 0, 0, None, Some(&entries), Some(NodeId(9)));
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(resp.status, STATUS_ERROR);
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err_code, ERR_MIGRATION_IN_PROGRESS,
+            "generation mismatch must reject as ERR_MIGRATION_IN_PROGRESS"
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "no-loss: generation mismatch must NOT clear pending inbound"
+        );
+    }
+
+    /// Fix B (expected_records == 0). A source that streamed ZERO records (empty
+    /// snapshot / stale re-attempt) must be allowed to COMPLETE even when the
+    /// target holds records belonging to OTHER concurrent sources — the COUNT
+    /// check must not reject on the target's non-empty total. Pre-fix the
+    /// `actual == 0` requirement rejected with `expected 0, got 1`. Manifest
+    /// evidence (R-219) is independent and unchanged, so we supply a hash that
+    /// matches the target's actual contents; the assertion under test is that
+    /// the COUNT gate no longer rejects.
+    #[test]
+    fn migration_complete_zero_records_accepts_non_empty_target() {
+        let h = DispatchTestHarness::new();
+        let shard = 53u16;
+        let txid_other = txid_for_shard(shard, 16);
+        // Target already holds a record (from another concurrent source).
+        assert_eq!(h.create_tx(txid_other, 1).status, STATUS_OK);
+
+        // Manifest hash over the target's ACTUAL contents so the (unchanged,
+        // still-strict) hash gate passes and the test isolates the count gate.
+        let key_other = TxKey { txid: txid_other };
+        let meta_other = h.engine.read_metadata(&key_other).unwrap();
+        let mut hasher = crate::cluster::coordinator::ManifestHasher::new();
+        hasher.fold(&txid_other, meta_other.generation);
+        let target_hash = hasher.finalize();
+
+        let epoch = 63u64;
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4714".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // expected_records == 0, hash-only manifest matching the target, stamped
+        // with the current epoch so the count gate accepts (epoch-current).
+        let payload = build_migration_complete_payload(0, 0, epoch, Some(target_hash), None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "expected_records==0 must not reject on a non-empty target (count gate)"
+        );
+        // The other source's record is untouched.
+        assert_eq!(h.engine.shard_record_count(shard), 1);
+        assert!(h.engine.read_metadata(&key_other).is_ok());
+    }
+
+    /// Fix B (hash-only path stays strict). A hash manifest folds over ALL local
+    /// keys, so a target SUPERSET changes the hash. The hash-only path must keep
+    /// the strict requirement and REJECT a superset (count mismatch fires before
+    /// the hash, since the hash count was computed for the smaller source set).
+    #[test]
+    fn migration_complete_hash_only_rejects_superset() {
+        let h = DispatchTestHarness::new();
+        let shard = 54u16;
+        let txid_a = txid_for_shard(shard, 17);
+        let txid_b = txid_for_shard(shard, 18);
+        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
+
+        // Source's hash manifest covers ONLY key A (it never saw B). With
+        // record_count == 1 the count check rejects the superset (actual == 2).
+        let key_a = TxKey { txid: txid_a };
+        let meta_a = h.engine.read_metadata(&key_a).unwrap();
+        let mut hasher = crate::cluster::coordinator::ManifestHasher::new();
+        hasher.fold(&txid_a, meta_a.generation);
+        let source_hash = hasher.finalize();
+
+        let members = vec![crate::cluster::shards::NodeId(1)];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, 64, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster(
+            crate::cluster::shards::NodeId(1),
+            table,
+            &[(
+                crate::cluster::shards::NodeId(1),
+                "127.0.0.1:4715".parse().unwrap(),
+            )],
+            &members,
+            &[shard],
+            &[],
+            &[],
+            1,
+        );
+
+        // Hash-only (no exact entries), record_count == 1, target holds 2.
+        let payload = build_migration_complete_payload(1, 0, 0, Some(source_hash), None, None);
+        let req = RequestFrame {
+            request_id: shard as u64,
+            op_code: OP_MIGRATION_COMPLETE,
+            flags: 0,
+            payload: payload.into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "hash-only path must stay strict and reject a superset"
+        );
+        let err_code = u16::from_le_bytes(resp.payload[..2].try_into().unwrap());
+        assert_eq!(
+            err_code, ERR_MIGRATION_IN_PROGRESS,
+            "hash-only superset must reject on count mismatch"
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            1,
+            "hash-only reject must NOT clear pending inbound"
+        );
+    }
+
     /// Task #29 (no-resurrection / preserve-the-prune): an AUTHORITATIVE-complete
     /// completion — stamped with the CURRENT committed epoch and sent by the
     /// shard's committed MASTER — that omits a key the target still holds DOES
@@ -15029,16 +15467,27 @@ mod tests {
         assert_eq!(cluster.inbound_pending_count(), 1);
     }
 
-    /// Task #29 (no-loss, same-epoch case): an EPOCH-CURRENT completion whose
-    /// source is NOT the authoritative holder of the shard (neither the committed
-    /// master nor the effective/old master mid-handoff) must NOT prune, even
-    /// though its epoch is current. This is the scenario_05 failure mode: a
-    /// rejoining node still assembling its set sends a SHORT manifest at the live
-    /// epoch; pruning every holder down to it strands the records
-    /// (`holders=[N,N,N]`). A current epoch is necessary but not sufficient —
-    /// the source must also be the authoritative holder. B is RETAINED.
+    /// Task #29 (no-loss, same-epoch case) + Fix B interaction. An EPOCH-CURRENT
+    /// completion whose source is NOT the authoritative holder of the shard
+    /// (neither the committed master nor the effective/old master mid-handoff)
+    /// must NOT PRUNE, even though its epoch is current — pruning every holder
+    /// down to a short manifest strands records (`holders=[N,N,N]`). The #29
+    /// prune gate keys off authoritative-completeness, not just epoch currency,
+    /// so B is RETAINED here. This is the load-bearing no-loss assertion and it
+    /// is unchanged.
     ///
-    /// Fail-before (epoch-only gate): B deleted. Pass-after: B retained.
+    /// Fix B changes the COMPLETION OUTCOME for this exact wire shape: a
+    /// non-master, epoch-current, exact-entry SUBSET completion is now ACCEPTED
+    /// as a verified superset (the target provably holds every source key plus
+    /// the legitimate extra B). It is no longer rejected to stay fenced; instead
+    /// the commit is gated on `!has_pending_inbound_shard`, so an INCOMPLETE
+    /// target (one with other pending inbound sources still streaming) still
+    /// defers commit, while a complete superset (this case — the only registered
+    /// source has now completed) commits. No prune, no loss: B is kept and served
+    /// as a genuine shard record.
+    ///
+    /// Fail-before (epoch-only prune gate): B deleted. After: B retained, and the
+    /// verified superset is accepted.
     #[test]
     fn migration_complete_epoch_current_non_authoritative_source_retains_record() {
         let h = DispatchTestHarness::new();
@@ -15110,7 +15559,8 @@ mod tests {
             None,
         );
 
-        // No-loss: B retained because the source is not the authoritative holder.
+        // No-loss (load-bearing, unchanged): B retained because the source is
+        // not the authoritative holder, so the #29 prune gate never runs.
         assert!(
             h.engine.read_metadata(&key_b).is_ok(),
             "epoch-current but non-authoritative source must NOT prune B"
@@ -15118,10 +15568,19 @@ mod tests {
         assert!(h.engine.read_metadata(&key_a).is_ok());
         assert_eq!(h.engine.shard_record_count(shard), 2);
 
-        // No-resurrection: rejected as retryable, inbound stays pending.
-        assert_eq!(resp.status, STATUS_ERROR);
-        let (code, _) = decode_error_payload(&resp.payload).unwrap();
-        assert_eq!(code, ERR_MIGRATION_IN_PROGRESS);
+        // Fix B: the verified, epoch-current superset is ACCEPTED (no longer
+        // rejected to stay fenced). The only registered inbound source has
+        // completed, so the commit gate (`!has_pending_inbound_shard`) is
+        // satisfied and the completion succeeds.
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "Fix B: epoch-current verified superset is accepted"
+        );
+        assert_eq!(
+            cluster.inbound_pending_count(),
+            0,
+            "all registered inbound sources completed -> pending cleared"
+        );
     }
 
     /// Task #29 (preserve-the-prune): an EPOCH-CURRENT completion from the shard's
@@ -15343,13 +15802,18 @@ mod tests {
             1,
         );
 
-        // FAIL-BEFORE (the stall): a plain exact-count completion is rejected
-        // because the target's count (2) exceeds the source's expected (1) —
-        // the source would then roll back to self forever.
+        // Fix B: a PLAIN exact-entry completion (no SUPERSET flag) from a
+        // non-master source now ALSO accepts when the target holds every source
+        // record at the matching generation AND the completion is epoch-current
+        // — the verified-superset path. Before Fix B this rejected with
+        // `expected 1, got 2` (the drain stall); the exact-entry verification IS
+        // the superset proof, so an epoch-current completion no longer requires
+        // count equality. The dedicated SUPERSET probe below remains a valid,
+        // narrower mechanism (and works regardless of epoch, verify-only).
         let plain = build_migration_complete_payload(
             1,
             0,
-            0,
+            60,
             None,
             Some(&entries),
             Some(crate::cluster::shards::NodeId(2)),
@@ -15371,13 +15835,13 @@ mod tests {
             None,
         );
         assert_eq!(
-            plain_resp.status, STATUS_ERROR,
-            "exact-count completion must reject when target holds MORE (the stall)"
+            plain_resp.status, STATUS_OK,
+            "Fix B: plain exact-entry completion accepts a verified superset"
         );
-        let (plain_code, _) = decode_error_payload(&plain_resp.payload).unwrap();
-        assert_eq!(plain_code, ERR_MIGRATION_IN_PROGRESS);
+        // No-loss: verify-only never prunes — both records remain.
+        assert_eq!(h.engine.shard_record_count(shard), 2);
 
-        // PASS-AFTER: the SUPERSET probe accepts — the target holds every source
+        // The SUPERSET probe also accepts — the target holds every source
         // record (A) regardless of the extra B.
         let probe = build_migration_complete_payload(
             1,

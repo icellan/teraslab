@@ -5595,6 +5595,36 @@ fn cleanup_orphaned_shard_if_settled(
     }
 }
 
+/// Fix D: format the `detail` suffix for a failed migration-batch `STATUS_ERROR`
+/// response.
+///
+/// A migration-batch apply failure on the receiver is returned as a
+/// `ReplicaAck::Error` payload (`[tag=1][failed_sequence:u64][msg_len:u32][msg]`),
+/// NOT the `[code:u16][msg_len:u16][msg]` error envelope used by the pre-apply
+/// gates (e.g. ERR_STALE_EPOCH). Decoding the former as the latter mis-reads the
+/// ReplicaAck tag/sequence bytes into a bogus `code=1` / `code=257` / `code=513`
+/// with an empty message, hiding the real failure. This prefers the
+/// `ReplicaAck::Error` decode and only falls back to the `[code][msg]` envelope
+/// for genuine envelope errors. Returns a leading-space suffix, or an empty
+/// string when no detail can be decoded.
+fn decode_migration_batch_error_detail(payload: &[u8]) -> String {
+    use crate::replication::protocol::ReplicaAck;
+    match ReplicaAck::deserialize(payload) {
+        Ok(ReplicaAck::Error {
+            failed_sequence,
+            message,
+        }) => format!(" (replica error at seq {failed_sequence}: {message})"),
+        _ if payload.len() >= 4 => {
+            let code = u16::from_le_bytes([payload[0], payload[1]]);
+            let msg_len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+            let msg = std::str::from_utf8(&payload[4..4 + msg_len.min(payload.len() - 4)])
+                .unwrap_or("(non-utf8)");
+            format!(" (code={code}: {msg})")
+        }
+        _ => String::new(),
+    }
+}
+
 /// Stream baseline records for one shard on an existing TCP connection.
 ///
 /// Returns the manifest hash accumulated over all streamed records
@@ -5773,24 +5803,23 @@ fn stream_shard_baseline(
         let response = exchange_frame(stream, &request, auth_secret)?;
 
         use crate::replication::protocol::ReplicaAck;
-        // Check the frame status BEFORE attempting to parse the payload as a
-        // ReplicaAck. A STATUS_ERROR response carries an error payload
-        // ([code:2][msg_len:2][msg]), not a ReplicaAck; e.g. an
-        // ERR_STALE_EPOCH(24) first byte would otherwise be misread as a
-        // ReplicaAck op type and logged as "unknown op type: 24".
+        // Check the frame status first. A STATUS_ERROR response carries EITHER a
+        // `ReplicaAck::Error` payload (migration-batch apply failure, decoded
+        // below via Fix D) OR a [code:2][msg_len:2][msg] error envelope (e.g.
+        // ERR_STALE_EPOCH from the pre-apply epoch gate). The success path (this
+        // status == STATUS_OK) parses the payload as a ReplicaAck.
         if response.status != STATUS_OK {
-            let detail = if response.payload.len() >= 4 {
-                let code = u16::from_le_bytes(response.payload[..2].try_into().unwrap());
-                let msg_len =
-                    u16::from_le_bytes(response.payload[2..4].try_into().unwrap()) as usize;
-                let msg = std::str::from_utf8(
-                    &response.payload[4..4 + msg_len.min(response.payload.len() - 4)],
-                )
-                .unwrap_or("(non-utf8)");
-                format!(" (code={code}: {msg})")
-            } else {
-                String::new()
-            };
+            // Fix D: a migration-batch apply failure on the receiver is sent as a
+            // STATUS_ERROR frame whose payload is a `ReplicaAck::Error`
+            // ([tag=1][failed_sequence:u64][msg_len:u32][msg]), NOT the
+            // [code:u16][msg_len:u16][msg] error envelope. Decoding it as the
+            // latter mis-reads the tag/sequence bytes into a bogus `code=1`
+            // (or 257 / 513) with an empty message — hiding the real failure
+            // from docker validation. Try the ReplicaAck decode first and, when
+            // it is a `ReplicaAck::Error`, surface its real message. Only fall
+            // back to the [code][msg] envelope for genuine envelope errors
+            // (e.g. ERR_STALE_EPOCH from the pre-apply epoch gate).
+            let detail = decode_migration_batch_error_detail(&response.payload);
             return Err(format!(
                 "migration batch failed with status {}{detail}",
                 response.status
@@ -8884,6 +8913,50 @@ pub(crate) fn new_test_running_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fix D: a `ReplicaAck::Error` payload on a STATUS_ERROR migration-batch
+    /// response is decoded to its REAL message, not the bogus `code=1` the
+    /// `[code:u16][msg_len:u16]` envelope decode produced.
+    #[test]
+    fn migration_batch_error_detail_decodes_replica_ack_error() {
+        use crate::replication::protocol::ReplicaAck;
+        let ack = ReplicaAck::Error {
+            failed_sequence: 42,
+            message: "generation sync: tx absent after apply".to_string(),
+        };
+        let detail = decode_migration_batch_error_detail(&ack.serialize());
+        assert!(
+            detail.contains("replica error at seq 42"),
+            "expected the real ReplicaAck::Error seq, got: {detail}"
+        );
+        assert!(
+            detail.contains("generation sync: tx absent after apply"),
+            "expected the real message, got: {detail}"
+        );
+        assert!(
+            !detail.contains("code=1"),
+            "must NOT mis-decode as the bogus code=1 envelope: {detail}"
+        );
+    }
+
+    /// Fix D: a genuine `[code:u16][msg_len:u16][msg]` error envelope (e.g.
+    /// ERR_STALE_EPOCH from a pre-apply gate) still decodes via the envelope
+    /// fallback, since it is not a valid `ReplicaAck::Error`.
+    #[test]
+    fn migration_batch_error_detail_decodes_code_envelope_fallback() {
+        // code=24 (ERR_STALE_EPOCH), msg "stale". Tag byte 24 is not a known
+        // ReplicaAck tag (0/1/2), so deserialize fails and we fall back.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&24u16.to_le_bytes());
+        let msg = b"stale";
+        payload.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+        payload.extend_from_slice(msg);
+        let detail = decode_migration_batch_error_detail(&payload);
+        assert!(
+            detail.contains("code=24") && detail.contains("stale"),
+            "envelope fallback must surface code+msg, got: {detail}"
+        );
+    }
 
     fn test_engine() -> Engine {
         let dev: Arc<dyn crate::device::BlockDevice> =

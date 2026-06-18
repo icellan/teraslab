@@ -947,7 +947,7 @@ pub fn handle_replica_batch_with_tracker(
     let journal = !is_migration;
     let start_seq = batch.first_sequence + skip_count as u64;
     for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
-        if let Err(msg) = apply_op_journal(engine, op, journal) {
+        if let Err(msg) = apply_op_journal(engine, op, journal, is_migration) {
             let ack = ReplicaAck::Error {
                 failed_sequence: seq,
                 message: msg,
@@ -1080,17 +1080,61 @@ fn existing_create_payload_matches(
     true
 }
 
+/// Decode the master's generation counter from a Create op's metadata bytes.
+///
+/// The generation lives in the extended-lifecycle region at offset 46..50
+/// (little-endian `u32`); it is only present when the master sent the
+/// extended-lifecycle payload (`metadata_bytes.len() >= 70`). Returns `None`
+/// for a legacy/short Create that carries no generation, in which case the
+/// caller cannot prove a same-generation match and falls back to the
+/// replace path.
+fn incoming_create_generation(metadata_bytes: &[u8]) -> Option<u32> {
+    if metadata_bytes.len() >= 50 {
+        Some(u32::from_le_bytes([
+            metadata_bytes[46],
+            metadata_bytes[47],
+            metadata_bytes[48],
+            metadata_bytes[49],
+        ]))
+    } else {
+        None
+    }
+}
+
+/// Read the generation counter of the record currently stored under `tx_key`,
+/// or `None` if the record is absent / unreadable.
+fn existing_record_generation(engine: &Engine, tx_key: &TxKey) -> Option<u32> {
+    engine
+        .read_metadata(tx_key)
+        .ok()
+        .map(|meta| meta.generation)
+}
+
 fn apply_create_replica(
     engine: &Engine,
     tx_key: &TxKey,
     create_req: &CreateRequest<'_>,
     metadata_bytes: &[u8],
     cold_data: &Option<Vec<u8>>,
+    is_migration: bool,
 ) -> std::result::Result<(), String> {
     match engine.create(create_req) {
         Ok(_) => {}
         Err(CreateError::DuplicateTxId)
             if existing_create_payload_matches(engine, create_req, metadata_bytes.len() >= 46) => {}
+        // Fix C: under CONCURRENT multi-source migration of the same shard, two
+        // sources stream the same Create to this target. When the existing
+        // record already carries the SAME generation as the incoming create,
+        // the delete+recreate replace path below would race the other source's
+        // concurrent delete/create (leaving the record transiently absent and
+        // tripping the other apply's generation sync). Prefer an idempotent
+        // SKIP: the record is already present at the right generation, so just
+        // fall through to re-apply lifecycle/blob (idempotent). Gated on
+        // `is_migration` so non-migration replica behaviour is unchanged.
+        Err(CreateError::DuplicateTxId)
+            if is_migration
+                && incoming_create_generation(metadata_bytes)
+                    .is_some_and(|g| existing_record_generation(engine, tx_key) == Some(g)) => {}
         Err(CreateError::DuplicateTxId) => {
             match engine.delete(&DeleteRequest {
                 tx_key: *tx_key,
@@ -1250,7 +1294,7 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
     // discriminator lives in `apply_op_journal`; normal-replication and
     // out-of-band / compensation applies always journal so the replica
     // can self-recover via its own redo log on crash.
-    apply_op_journal(engine, op, true)
+    apply_op_journal(engine, op, true, false)
 }
 
 /// Apply a `ReplicaOp` to the engine, optionally writing the post-apply
@@ -1272,10 +1316,26 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
 /// the bug this skip fixes. Out-of-band / compensation ops are NORMAL
 /// replicated mutations (not re-drivable from a source the same way) and
 /// MUST always journal — callers pass `journal = true` for those.
+///
+/// `is_migration` is `true` only for `FLAG_MIGRATION_BATCH` baseline applies.
+/// It makes two apply paths idempotent under CONCURRENT multi-source migration
+/// of the same shard (Fix C), where two sources stream the same record to the
+/// same target and one source's delete/create races the other's:
+///   * the post-apply generation sync treats "record absent after apply" as a
+///     benign skip rather than a hard batch error (another concurrent source
+///     already deleted+recreated the record — it will be present from that
+///     source's apply);
+///   * a duplicate Create whose existing record has the SAME generation as the
+///     incoming create is a no-op SKIP rather than a delete+recreate, avoiding a
+///     race with another source's concurrent delete/create.
+///
+/// Non-migration replica batches keep the original strict behaviour on both
+/// paths.
 pub fn apply_op_journal(
     engine: &Engine,
     op: &ReplicaOp,
     journal: bool,
+    is_migration: bool,
 ) -> std::result::Result<(), String> {
     // When journalling is disabled (migration-baseline apply), suppress
     // ALL engine-internal redo writes for the duration of this apply too —
@@ -1751,7 +1811,14 @@ pub fn apply_op_journal(
                 external_ref,
                 parent_txids: &parent_txids,
             };
-            apply_create_replica(engine, tx_key, &create_req, metadata_bytes, cold_data)
+            apply_create_replica(
+                engine,
+                tx_key,
+                &create_req,
+                metadata_bytes,
+                cold_data,
+                is_migration,
+            )
         }
         ReplicaOp::Delete { tx_key } => {
             let req = DeleteRequest {
@@ -1858,6 +1925,19 @@ pub fn apply_op_journal(
             .set_record_generation(&tx_key, master_gen)
             .map_err(|e| format!("generation sync: {e}"))?
         {
+            // Fix C: for a CONCURRENT multi-source migration baseline, "absent
+            // after apply" means another source streaming the SAME record to the
+            // same target already deleted+recreated it between this apply and the
+            // generation sync. That is benign: the record will be present from
+            // the other source's apply, and the OP_MIGRATION_COMPLETE handshake
+            // independently verifies every source key is present at the matching
+            // generation before committing. Skip rather than hard-fail the
+            // batch. For NON-migration replica batches this remains a hard error
+            // — there a missing record is a real generation-counter divergence.
+            if is_migration {
+                record_apply_skipped_missing_tx("generation_sync", &tx_key);
+                return Ok(());
+            }
             return Err(format!("generation sync: tx {tx_key:?} absent after apply"));
         }
     }
@@ -2968,6 +3048,141 @@ mod tests {
         assert_eq!({ meta.utxo_count }, 5);
         let slot = engine.read_slot(&k, 4).unwrap();
         assert_eq!(slot.hash, [0xCC; 32]);
+    }
+
+    /// Fix C (gen-sync skip — migration path). An op that carries a
+    /// `master_generation` but whose record is ABSENT after apply (the op arm
+    /// skipped on TxNotFound, e.g. because a concurrent migration source already
+    /// deleted+recreated the record) is a BENIGN skip for a migration batch:
+    /// `apply_op_journal(.., is_migration=true)` returns Ok rather than hard
+    /// erroring.
+    #[test]
+    fn migration_gen_sync_absent_after_apply_is_skipped() {
+        let engine = make_engine();
+        let missing = key(120);
+        // MarkLongestChain carries master_generation and its op arm skips on
+        // TxNotFound, so after the (no-op) apply the record is still absent.
+        let op = ReplicaOp::MarkLongestChain {
+            tx_key: missing,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 5,
+        };
+        // is_migration = true, journal = false (matches a FLAG_MIGRATION_BATCH
+        // baseline apply).
+        let r = apply_op_journal(&engine, &op, false, true);
+        assert!(
+            r.is_ok(),
+            "migration gen-sync on an absent record must be a benign skip, got {r:?}"
+        );
+        // No record was resurrected.
+        assert!(engine.read_metadata(&missing).is_err());
+    }
+
+    /// Fix C (gen-sync hard error — NON-migration path). The SAME absent-after-
+    /// apply condition on a normal replica batch (`is_migration=false`) must
+    /// still be a HARD error: a missing record there is a real generation-counter
+    /// divergence, not a benign concurrent re-create.
+    #[test]
+    fn non_migration_gen_sync_absent_after_apply_hard_errors() {
+        let engine = make_engine();
+        let missing = key(121);
+        let op = ReplicaOp::MarkLongestChain {
+            tx_key: missing,
+            on_longest_chain: true,
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 5,
+        };
+        // is_migration = false (normal replication). journal = true.
+        let err = apply_op_journal(&engine, &op, true, false)
+            .expect_err("non-migration gen-sync on an absent record must hard-error");
+        assert!(
+            err.contains("absent after apply"),
+            "expected the 'absent after apply' hard error, got: {err}"
+        );
+    }
+
+    /// Fix C (duplicate-create same-generation skip — migration path). Under
+    /// concurrent multi-source migration, a duplicate Create whose existing
+    /// record already carries the SAME generation as the incoming create is an
+    /// idempotent no-op SKIP, NOT a delete+recreate. We assert the SAME
+    /// generation incoming create does NOT decrement/replace the record (its
+    /// contents are preserved), proving the delete+recreate replace path was not
+    /// taken.
+    #[test]
+    fn migration_duplicate_create_same_generation_is_skipped() {
+        let engine = make_engine();
+        let k = key(122);
+        // Existing record with a known generation. Build extended metadata
+        // (>=70 bytes) so the generation field at [46..50] is honoured.
+        let utxo_hashes = vec![[0x11u8; 32]; 3];
+        let req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: 0,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        };
+        engine.create(&req).unwrap();
+        let existing_gen = { engine.read_metadata(&k).unwrap().generation };
+
+        // Incoming migration Create with metadata that encodes the SAME
+        // generation at offset [46..50]. Minimal 70-byte lifecycle layout.
+        let mut metadata_bytes = vec![0u8; 70];
+        metadata_bytes[46..50].copy_from_slice(&existing_gen.to_le_bytes());
+
+        // A DIFFERENT utxo hash so that, IF the replace path ran, the slot would
+        // change. The skip must keep the ORIGINAL hash.
+        let incoming_hashes = vec![[0x22u8; 32]; 3];
+        let create_req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: 0,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &incoming_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        };
+        apply_create_replica(&engine, &k, &create_req, &metadata_bytes, &None, true).unwrap();
+
+        // Skip happened: original slot hash preserved (NOT replaced with 0x22).
+        let slot = engine.read_slot(&k, 0).unwrap();
+        assert_eq!(
+            slot.hash, [0x11u8; 32],
+            "same-generation migration duplicate must SKIP, preserving the record"
+        );
     }
 
     #[test]
