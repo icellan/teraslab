@@ -1122,19 +1122,32 @@ fn apply_create_replica(
         Ok(_) => {}
         Err(CreateError::DuplicateTxId)
             if existing_create_payload_matches(engine, create_req, metadata_bytes.len() >= 46) => {}
-        // Fix C: under CONCURRENT multi-source migration of the same shard, two
-        // sources stream the same Create to this target. When the existing
-        // record already carries the SAME generation as the incoming create,
-        // the delete+recreate replace path below would race the other source's
-        // concurrent delete/create (leaving the record transiently absent and
-        // tripping the other apply's generation sync). Prefer an idempotent
-        // SKIP: the record is already present at the right generation, so just
-        // fall through to re-apply lifecycle/blob (idempotent). Gated on
+        // Fix C: under CONCURRENT multi-source migration of the same shard,
+        // multiple sources stream the same Create to this target. The record is
+        // already present, so reconcile IN PLACE by generation (the monotonic
+        // mutation counter) via the lifecycle re-apply below — NEVER via the
+        // destructive delete+recreate path (the non-migration arm below). That
+        // path is unsafe under concurrency for two reasons:
+        //   1. it races a concurrent source's re-create between the delete and
+        //      the create (the observed "replace duplicate create: duplicate
+        //      txid" baseline failures), and
+        //   2. it would DOWNGRADE a newer concurrent copy — deleting a higher
+        //      generation and recreating an older one resurrects a spent UTXO.
+        // If the incoming baseline is STRICTLY OLDER than the record already
+        // present, keep the newer copy and skip entirely (no downgrade).
+        // Otherwise fall through to `apply_create_lifecycle_and_blob`, which
+        // applies the incoming generation/lifecycle atomically in place (and is
+        // an idempotent no-op when generations are equal). Gated on
         // `is_migration` so non-migration replica behaviour is unchanged.
-        Err(CreateError::DuplicateTxId)
-            if is_migration
-                && incoming_create_generation(metadata_bytes)
-                    .is_some_and(|g| existing_record_generation(engine, tx_key) == Some(g)) => {}
+        Err(CreateError::DuplicateTxId) if is_migration => {
+            if let (Some(incoming), Some(existing)) = (
+                incoming_create_generation(metadata_bytes),
+                existing_record_generation(engine, tx_key),
+            ) && incoming < existing
+            {
+                return Ok(());
+            }
+        }
         Err(CreateError::DuplicateTxId) => {
             match engine.delete(&DeleteRequest {
                 tx_key: *tx_key,
@@ -3182,6 +3195,167 @@ mod tests {
         assert_eq!(
             slot.hash, [0x11u8; 32],
             "same-generation migration duplicate must SKIP, preserving the record"
+        );
+    }
+
+    /// Fix C (generation guard — anti-resurrection). Under concurrent
+    /// multi-source migration, an incoming duplicate Create that is STRICTLY
+    /// OLDER (lower generation) than the record already present must be SKIPPED
+    /// entirely — never delete+recreate the newer copy. Downgrading a spent
+    /// (higher-generation) record back to an older unspent snapshot would
+    /// resurrect a spent UTXO. We seed a high existing generation, apply an
+    /// older incoming create, and assert the generation does NOT regress.
+    #[test]
+    fn migration_duplicate_create_older_generation_is_skipped_no_downgrade() {
+        let engine = make_engine();
+        let k = key(123);
+        let utxo_hashes = vec![[0x11u8; 32]; 3];
+        let req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: 0,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        };
+        engine.create(&req).unwrap();
+        // Seed the existing record at a HIGH generation (e.g. it was spent /
+        // mutated 7 times) via the same lifecycle entry point the apply path uses.
+        engine
+            .restore_migrated_lifecycle(&k, 7, 0, 0, 0, 0)
+            .unwrap();
+        let seeded_gen = engine.read_metadata(&k).unwrap().generation;
+        assert_eq!(seeded_gen, 7);
+
+        // Incoming OLDER migration create (generation 3) with a different slot
+        // hash, so a downgrade/replace would be observable.
+        let mut metadata_bytes = vec![0u8; 70];
+        metadata_bytes[46..50].copy_from_slice(&3u32.to_le_bytes());
+        let incoming_hashes = vec![[0x22u8; 32]; 3];
+        let create_req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: 0,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &incoming_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        };
+        apply_create_replica(&engine, &k, &create_req, &metadata_bytes, &None, true).unwrap();
+
+        // No downgrade: generation stays 7, original slot hash preserved.
+        let after_gen = engine.read_metadata(&k).unwrap().generation;
+        assert_eq!(
+            after_gen, 7,
+            "older incoming migration create must NOT downgrade the newer record"
+        );
+        assert_eq!(engine.read_slot(&k, 0).unwrap().hash, [0x11u8; 32]);
+    }
+
+    /// Fix C (apply newer in place — no destructive replace). An incoming
+    /// duplicate Create that is NEWER (higher generation) than the record
+    /// present must update generation/lifecycle IN PLACE via the lifecycle
+    /// re-apply, without taking the racy delete+recreate path. We seed a low
+    /// existing generation, apply a newer incoming create, and assert the
+    /// generation advances without error.
+    #[test]
+    fn migration_duplicate_create_newer_generation_applies_in_place() {
+        let engine = make_engine();
+        let k = key(124);
+        let utxo_hashes = vec![[0x11u8; 32]; 3];
+        let req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: 0,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        };
+        engine.create(&req).unwrap();
+        engine
+            .restore_migrated_lifecycle(&k, 2, 0, 0, 0, 0)
+            .unwrap();
+        let seeded_gen = engine.read_metadata(&k).unwrap().generation;
+        assert_eq!(seeded_gen, 2);
+
+        // Incoming NEWER migration create (generation 9).
+        let mut metadata_bytes = vec![0u8; 70];
+        metadata_bytes[46..50].copy_from_slice(&9u32.to_le_bytes());
+        let create_req = CreateRequest {
+            tx_id: k.txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 0,
+            size_in_bytes: 0,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: &utxo_hashes,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 0,
+            block_height: 0,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        };
+        // Must NOT error (no "replace duplicate create: duplicate txid").
+        apply_create_replica(&engine, &k, &create_req, &metadata_bytes, &None, true).unwrap();
+
+        // Generation advanced in place to the newer value.
+        let final_gen = engine.read_metadata(&k).unwrap().generation;
+        assert_eq!(
+            final_gen, 9,
+            "newer incoming migration create must advance generation in place"
         );
     }
 
