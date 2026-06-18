@@ -1168,7 +1168,7 @@ fn apply_create_replica(
         Err(e) => return Err(format!("create: {e}")),
     }
 
-    apply_create_lifecycle_and_blob(engine, tx_key, metadata_bytes, cold_data)
+    apply_create_lifecycle_and_blob(engine, tx_key, metadata_bytes, cold_data, is_migration)
 }
 
 fn apply_create_lifecycle_and_blob(
@@ -1176,6 +1176,7 @@ fn apply_create_lifecycle_and_blob(
     tx_key: &TxKey,
     metadata_bytes: &[u8],
     cold_data: &Option<Vec<u8>>,
+    is_migration: bool,
 ) -> std::result::Result<(), String> {
     // Apply extended lifecycle metadata if present. Layout after the core
     // 46 bytes: generation(4) + updated_at(8) + unmined_since(4) +
@@ -1221,16 +1222,29 @@ fn apply_create_lifecycle_and_blob(
         // migration target's secondaries stale until its next restart (DAH sweep
         // skipped migrated records, QUERY_OLD_UNMINED missed them, cached-vs-slow
         // GET disagreed).
-        engine
-            .restore_migrated_lifecycle(
-                tx_key,
-                generation,
-                updated_at,
-                unmined_since,
-                delete_at_height,
-                preserve_until,
-            )
-            .map_err(|e| format!("restore migrated lifecycle metadata: {e}"))?;
+        match engine.restore_migrated_lifecycle(
+            tx_key,
+            generation,
+            updated_at,
+            unmined_since,
+            delete_at_height,
+            preserve_until,
+        ) {
+            Ok(()) => {}
+            // Fix C (idempotent migration apply, completion of the contract).
+            // Under concurrent multi-source migration of the same shard, another
+            // source can transiently remove this record between the
+            // duplicate-create check above and this lifecycle patch, so the
+            // index lookup here returns TxNotFound. For a migration baseline
+            // apply this is BENIGN: the apply is best-effort idempotent and the
+            // Fix B completion handshake is the correctness gate — it verifies
+            // every source key is present at the matching generation before
+            // committing the shard, so a genuinely-missing record blocks commit
+            // (retryable) rather than being silently lost. A non-migration
+            // replica apply keeps the hard error (the master must retry).
+            Err(crate::ops::error::SpendError::TxNotFound) if is_migration => {}
+            Err(e) => return Err(format!("restore migrated lifecycle metadata: {e}")),
+        }
     }
 
     // Store cold data in the blobstore if provided. Blob persistence is part
@@ -3356,6 +3370,33 @@ mod tests {
         assert_eq!(
             final_gen, 9,
             "newer incoming migration create must advance generation in place"
+        );
+    }
+
+    /// Fix C (lifecycle TxNotFound tolerance). When the record is concurrently
+    /// absent at the lifecycle-patch step, a migration baseline apply tolerates
+    /// it (best-effort idempotent — the completion handshake is the correctness
+    /// gate), while a non-migration replica apply keeps the hard error so the
+    /// master retries.
+    #[test]
+    fn lifecycle_apply_tolerates_absent_record_only_for_migration() {
+        let engine = make_engine();
+        let k = key(125);
+        // 70-byte lifecycle metadata for a key that was never created -> the
+        // restore_migrated_lifecycle index lookup returns TxNotFound.
+        let mut metadata_bytes = vec![0u8; 70];
+        metadata_bytes[46..50].copy_from_slice(&4u32.to_le_bytes());
+
+        // Migration: tolerated (Ok).
+        apply_create_lifecycle_and_blob(&engine, &k, &metadata_bytes, &None, true)
+            .expect("migration lifecycle apply must tolerate a concurrently-absent record");
+
+        // Non-migration: hard error mentioning the lifecycle restore failure.
+        let err = apply_create_lifecycle_and_blob(&engine, &k, &metadata_bytes, &None, false)
+            .expect_err("non-migration lifecycle apply must hard-error on an absent record");
+        assert!(
+            err.contains("restore migrated lifecycle metadata"),
+            "unexpected error: {err}"
         );
     }
 
