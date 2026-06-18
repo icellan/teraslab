@@ -3728,7 +3728,6 @@ impl ClusterCoordinator {
                     let inbound_bm = inbound_bm.clone();
                     let secret = cluster_secret.clone();
                     let relinquish_ctx = relinquish_ctx.clone();
-                    let node_addrs = node_addrs.clone();
 
                     // Collect all keys for shards going to this target.
                     let mut target_keys: Vec<TxKey> = Vec::new();
@@ -3756,7 +3755,6 @@ impl ClusterCoordinator {
                             self_id,
                             secret,
                             relinquish_ctx.as_deref(),
-                            node_addrs,
                         );
                     });
                 }
@@ -4794,14 +4792,6 @@ pub fn run_migration_chaos_test_batch(
         sync_atomic_migration_bitmaps(&mgr, &fenced_bm, &migrating_bm, &inbound_bm);
     }
 
-    // The orphan-cleanup re-proof probe resolves the shard's current owner from
-    // this map; map the migration target to its address so a fresh probe (if
-    // cleanup fires) can reach it.
-    let node_addrs = Arc::new(RwLock::new(std::collections::HashMap::from([(
-        task.to_node,
-        target_addr,
-    )])));
-
     run_migration_batch(
         vec![task.clone()],
         Some(target_addr),
@@ -4819,7 +4809,6 @@ pub fn run_migration_chaos_test_batch(
         task.from_node,
         None,
         None,
-        node_addrs,
     );
 
     let table = shard_table.read();
@@ -4998,16 +4987,8 @@ fn run_migration_batch(
     self_id: NodeId,
     cluster_secret: Option<Arc<Vec<u8>>>,
     relinquish_ctx: Option<&RelinquishContext>,
-    node_addrs: Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
 ) {
     let auth_secret = cluster_secret.as_deref().map(Vec::as_slice);
-    // Fresh-retention re-proof probe for orphan cleanup (data-loss close): given
-    // a shard's current effective owner + the manifest about to be deleted,
-    // re-confirm the owner durably holds a superset RIGHT NOW. Built once here so
-    // the cleanup paths can reuse the same node-address map + auth secret. It
-    // does network I/O and is only invoked outside the migration/shard locks.
-    let orphan_probe =
-        make_orphan_retention_probe(&node_addrs, self_id, topology_epoch, auth_secret);
     let addr = match target_addr {
         Some(a) => a,
         None => {
@@ -5206,7 +5187,6 @@ fn run_migration_batch(
                             migration,
                             task.shard,
                             topology_epoch,
-                            &orphan_probe,
                         );
                     }
                 } else if fail_or_relinquish_outbound_task(
@@ -5253,12 +5233,8 @@ fn run_migration_batch(
             let ce = engine.clone();
             let cs = shard_table.clone();
             let cm = migration.clone();
-            let cn = node_addrs.clone();
-            let csecret = cluster_secret.clone();
             std::thread::spawn(move || {
-                let auth = csecret.as_deref().map(Vec::as_slice);
-                let probe = make_orphan_retention_probe(&cn, self_id, topology_epoch, auth);
-                run_orphan_cleanup(self_id, &ce, &cs, &cm, topology_epoch, &probe);
+                run_orphan_cleanup(self_id, &ce, &cs, &cm, topology_epoch);
             });
         }
         return;
@@ -5297,9 +5273,6 @@ fn run_migration_batch(
     // churn that is slower than waiting for the in-flight response.
     let tcp_timeout = migration_stream_timeout(batch_size);
 
-    // Shared reference so each `move` worker captures `&orphan_probe` (Copy),
-    // not the probe value — the probe is `Sync` and outlives the scope.
-    let orphan_probe = &orphan_probe;
     std::thread::scope(|scope| {
         for chunk in data_tasks.chunks(chunk_size) {
             let completed = completed.clone();
@@ -5872,7 +5845,6 @@ fn run_migration_batch(
                                 &migration,
                                 task.shard,
                                 topology_epoch,
-                                orphan_probe,
                             );
                         }
                     }
@@ -5932,18 +5904,13 @@ fn run_migration_batch(
         let cleanup_engine = engine.clone();
         let cleanup_st = shard_table.clone();
         let cleanup_mig = migration.clone();
-        let cleanup_addrs = node_addrs.clone();
-        let cleanup_secret = cluster_secret.clone();
         std::thread::spawn(move || {
-            let auth = cleanup_secret.as_deref().map(Vec::as_slice);
-            let probe = make_orphan_retention_probe(&cleanup_addrs, self_id, topology_epoch, auth);
             run_orphan_cleanup(
                 self_id,
                 &cleanup_engine,
                 &cleanup_st,
                 &cleanup_mig,
                 topology_epoch,
-                &probe,
             );
         });
     }
@@ -5979,85 +5946,6 @@ fn run_migration_batch(
     }
 }
 
-/// Pure decision for whether a non-owned shard's last local copy may be
-/// orphan-deleted. Both gates are NECESSARY; neither alone is sufficient.
-///
-/// - `has_committed_handoff` — task #28 evidence: this node positively handed
-///   the shard off at the current epoch (the `STATUS_OK` completion ACK). This
-///   proves the new owner held the records AT ACK TIME.
-/// - `fresh_retention_confirmed` — task #34-style FRESH re-proof: a verify-only
-///   superset probe issued RIGHT NOW confirmed the shard's current effective
-///   owner still durably holds a superset of the records about to be deleted.
-///   This closes the window where the ACK is stale by delete time (the owner
-///   ack'd, then churned/restarted and lost the records before this node's
-///   cleanup ran).
-///
-/// Delete only when BOTH hold. A failing fresh probe (owner behind, missing a
-/// record, mid-restart, or unreachable) forces retain-until-verified: the bytes
-/// linger and the next cleanup cycle retries — never a permanent stall, because
-/// once the owner settles and proves retention the probe passes and cleanup
-/// proceeds.
-fn should_orphan_delete(has_committed_handoff: bool, fresh_retention_confirmed: bool) -> bool {
-    has_committed_handoff && fresh_retention_confirmed
-}
-
-/// Verify-only re-proof that the shard's CURRENT effective owner still durably
-/// holds the records about to be orphan-deleted. Invoked by the cleanup paths
-/// immediately before `engine.delete()`, with NO migration/shard-table lock
-/// held (it performs network I/O — see lock-ordering note on the cleanup fns).
-///
-/// `owner` is the shard's effective master recomputed from the committed table
-/// NOW (not the epoch the committed-handoff was recorded at). `manifest` is the
-/// relaxed superset manifest of this node's live records for the shard. Returns
-/// `true` only when the owner is reachable AND positively confirms it holds a
-/// superset. Owner unreachable / mid-churn / behind → `false` (retain + retry).
-type OrphanRetentionProbe<'a> = dyn Fn(u16, NodeId, &[(TxKey, u32)]) -> bool + Sync + 'a;
-
-/// Build the production [`OrphanRetentionProbe`]: resolve the owner's address
-/// from `node_addrs` and issue a fresh `confirm_target_holds_superset` probe.
-///
-/// An owner with no known address (just-departed / never-learned) yields
-/// `false` → retain. The probe itself is conservative-`false` on transient
-/// failure (see `confirm_target_holds_superset`), so an owner mid-restart that
-/// cannot answer keeps the data here.
-fn make_orphan_retention_probe<'a>(
-    node_addrs: &'a Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>>,
-    self_id: NodeId,
-    topology_epoch: u64,
-    auth_secret: Option<&'a [u8]>,
-) -> impl Fn(u16, NodeId, &[(TxKey, u32)]) -> bool + Sync + 'a {
-    move |shard: u16, owner: NodeId, manifest: &[(TxKey, u32)]| -> bool {
-        if owner == self_id || manifest.is_empty() {
-            // Probing self is meaningless, and an empty manifest means there is
-            // nothing to lose — but the broad/per-shard callers only invoke the
-            // probe when records exist, so an empty manifest here means the live
-            // entries could not be read; be conservative and retain.
-            return false;
-        }
-        let owner_addr = match node_addrs.read().get(&owner).copied() {
-            Some(a) => a,
-            None => {
-                debug_shard_log(
-                    shard,
-                    format!(
-                        "orphan_cleanup RETAIN (owner {} addr unknown — cannot re-prove retention)",
-                        owner.0,
-                    ),
-                );
-                return false;
-            }
-        };
-        confirm_target_holds_superset(
-            owner_addr,
-            shard,
-            self_id,
-            topology_epoch,
-            manifest,
-            auth_secret,
-        )
-    }
-}
-
 /// Delete records for shards this node no longer owns after migration.
 ///
 /// After outbound migrations complete, some records remain on the source
@@ -6074,32 +5962,14 @@ fn make_orphan_retention_probe<'a>(
 ///   incomplete handoff, so without a committed handoff this node may be the
 ///   last holder. Retain-until-verified: genuinely orphaned bytes may linger
 ///   until a real handoff completes, but the last durable copy is never dropped.
-/// - Data-loss guard (FRESH re-proof, task #34 principle): the committed-handoff
-///   ACK only proves the owner held the records AT ACK TIME — it is NOT durable
-///   evidence the owner RETAINED them across ongoing rolling-restart churn (the
-///   owner can ACK, then restart and lose them before this node's cleanup runs;
-///   two nodes then mutually delete overlapping shards → data loss). So before
-///   deleting, this RE-CONFIRMS, via a fresh verify-only superset probe
-///   (`probe`), that the shard's CURRENT effective owner (recomputed from the
-///   committed table NOW) still holds a superset. Delete only when committed
-///   handoff AND fresh probe both pass ([`should_orphan_delete`]). A failing /
-///   unreachable probe → retain + retry next cycle (no-loss, never a permanent
-///   stall once the owner settles).
 /// - `TxNotFound` during delete is non-fatal (concurrent ops may delete first).
 /// - Idempotent: running twice is safe.
-///
-/// LOCK ORDERING: the fresh probe performs blocking network I/O and MUST NOT be
-/// invoked while the migration-manager mutex or the shard-table lock is held —
-/// the probe target may itself need those locks via dispatch. Candidate
-/// selection (under the locks) and the probe (no locks) are therefore separate
-/// phases: locks are dropped before any probe is issued.
 fn run_orphan_cleanup(
     self_id: NodeId,
     engine: &Arc<Engine>,
     shard_table: &Arc<ShardTableLock<ShardTable>>,
     migration: &Arc<Mutex<MigrationManager>>,
     topology_epoch: u64,
-    probe: &OrphanRetentionProbe<'_>,
 ) {
     use crate::cluster::shards::NUM_SHARDS;
     use crate::ops::remaining::DeleteRequest;
@@ -6118,10 +5988,7 @@ fn run_orphan_cleanup(
         return;
     }
 
-    // Phase 1 (under locks): select candidate shards that pass the committed-
-    // handoff gate. Records the CURRENT effective owner so the fresh probe (Phase
-    // 2, no locks) can re-prove retention against the right node.
-    let mut candidates: Vec<(u16, NodeId)> = Vec::new();
+    let mut orphaned_shards: Vec<u16> = Vec::new();
     {
         let table = shard_table.read();
         let mgr = migration.lock();
@@ -6161,46 +6028,33 @@ fn run_orphan_cleanup(
                     engine.shard_record_count(shard),
                 ),
             );
-            candidates.push((shard, assignment.master));
+            orphaned_shards.push(shard);
         }
     }
 
-    if candidates.is_empty() {
+    if orphaned_shards.is_empty() {
         return;
     }
 
+    let total_orphaned: u64 = orphaned_shards
+        .iter()
+        .map(|&s| engine.shard_record_count(s))
+        .sum();
+    tracing::info!(
+        shards = orphaned_shards.len(),
+        records = total_orphaned,
+        "cluster: orphan cleanup — deleting orphaned records",
+    );
+
     let mut total_deleted: u64 = 0;
-    let mut deleted_shards: usize = 0;
-    let mut retained_shards: usize = 0;
-    for &(shard, owner) in &candidates {
+    for &shard in &orphaned_shards {
         // Re-check epoch before each shard.
         if shard_table.read().version != topology_epoch {
             tracing::info!("cluster: orphan cleanup aborted — topology epoch changed");
             break;
         }
 
-        // Phase 2 (NO migration/shard-table lock held): re-prove the current
-        // owner durably holds a superset of the records about to be deleted.
-        // The committed-handoff ACK is stale by now — only this fresh probe
-        // closes the mutual-delete data-loss window. Candidates already passed
-        // the committed-handoff gate (Phase 1), so the decision reduces to the
-        // fresh re-proof, but it is routed through `should_orphan_delete` to
-        // keep BOTH gates explicit at the delete point.
         let keys = engine.keys_for_shard(shard);
-        let fresh_ok = orphan_owner_still_holds(engine, shard, owner, &keys, probe);
-        if !should_orphan_delete(/* has_committed_handoff */ true, fresh_ok) {
-            debug_shard_log(
-                shard,
-                format!(
-                    "orphan_cleanup RETAIN (fresh retention re-proof failed) owner={} records={}",
-                    owner.0,
-                    keys.len(),
-                ),
-            );
-            retained_shards += 1;
-            continue;
-        }
-
         debug_shard_log(
             shard,
             format!("orphan_cleanup deleting {} key(s)", keys.len(),),
@@ -6217,45 +6071,13 @@ fn run_orphan_cleanup(
                 }
             }
         }
-        deleted_shards += 1;
     }
 
     tracing::info!(
         deleted = total_deleted,
-        shards = deleted_shards,
-        retained = retained_shards,
+        shards = orphaned_shards.len(),
         "cluster: orphan cleanup complete",
     );
-}
-
-/// Re-prove that the shard's current effective `owner` durably holds a superset
-/// of this node's live records for `shard`, via a fresh verify-only `probe`.
-///
-/// Reads the live records (`keys`) into a relaxed superset manifest and hands it
-/// to the probe. Returns `true` ONLY on a positive confirmation. An empty live
-/// manifest (every key vanished concurrently) returns `true` — there is nothing
-/// left to lose, so the stale copy may be reclaimed. MUST be called with no
-/// migration/shard-table lock held (the probe does network I/O).
-fn orphan_owner_still_holds(
-    engine: &Engine,
-    shard: u16,
-    owner: NodeId,
-    keys: &[TxKey],
-    probe: &OrphanRetentionProbe<'_>,
-) -> bool {
-    let manifest = relax_superset_manifest(
-        engine,
-        &collect_manifest_entries(engine, shard, keys).unwrap_or_default(),
-    );
-    if manifest.is_empty() {
-        // Nothing to re-prove: either the live records already vanished
-        // (concurrent delete), or every remaining key is locally tombstoned
-        // at-or-ahead its live generation (authoritatively deleted — the owner
-        // is not required to hold it). Either way there is no surviving version
-        // to strand, so the stale copy may be reclaimed.
-        return true;
-    }
-    probe(shard, owner, &manifest)
 }
 
 /// Delete records for one shard as soon as this source has finished every
@@ -6269,18 +6091,6 @@ fn orphan_owner_still_holds(
 /// (`MigrationManager::has_committed_handoff`). On the success path that calls
 /// this, the completion that just committed has already recorded that evidence;
 /// a non-owned shard reached without a committed handoff is retained.
-///
-/// Data-loss guard (FRESH re-proof, task #34 principle): the committed handoff
-/// is NECESSARY but no longer SUFFICIENT. Before deleting, this RE-PROVES, via a
-/// fresh verify-only superset probe of the shard's CURRENT effective owner, that
-/// the owner still durably holds the records — the ACK can be stale by delete
-/// time (the owner restarted/churned and lost them since acking). See
-/// [`run_orphan_cleanup`] and [`should_orphan_delete`]. A failing / unreachable
-/// probe retains the data; the next completion or broad sweep retries.
-///
-/// LOCK ORDERING: the fresh probe does network I/O and is issued with NO
-/// migration/shard-table lock held — the migration lock is taken only to read
-/// the per-shard settle state, then dropped before the probe.
 fn cleanup_orphaned_shard_if_settled(
     self_id: NodeId,
     engine: &Arc<Engine>,
@@ -6288,7 +6098,6 @@ fn cleanup_orphaned_shard_if_settled(
     migration: &Arc<Mutex<MigrationManager>>,
     shard: u16,
     topology_epoch: u64,
-    probe: &OrphanRetentionProbe<'_>,
 ) {
     use crate::ops::remaining::DeleteRequest;
 
@@ -6322,35 +6131,16 @@ fn cleanup_orphaned_shard_if_settled(
         }
     }
 
-    let (owned, owner) = {
+    let owned = {
         let table = shard_table.read();
         let assignment = table.effective_assignment(shard);
-        let owned = assignment.master == self_id || assignment.replicas.contains(&self_id);
-        (owned, assignment.master)
+        assignment.master == self_id || assignment.replicas.contains(&self_id)
     };
     if owned || engine.shard_record_count(shard) == 0 {
         return;
     }
 
     let keys = engine.keys_for_shard(shard);
-    // Fresh re-proof (no lock held): the committed-handoff ACK is stale by now.
-    // Re-confirm the current effective owner still durably holds a superset
-    // before deleting this node's copy. Owner mid-churn / behind / unreachable →
-    // retain; a later cleanup cycle retries once the owner settles. The
-    // committed-handoff gate above already passed, so route both through
-    // `should_orphan_delete` to keep the two NECESSARY conditions explicit.
-    let fresh_ok = orphan_owner_still_holds(engine, shard, owner, &keys, probe);
-    if !should_orphan_delete(/* has_committed_handoff */ true, fresh_ok) {
-        debug_shard_log(
-            shard,
-            format!(
-                "per_shard orphan_cleanup RETAIN (fresh retention re-proof failed) owner={} records={}",
-                owner.0,
-                keys.len(),
-            ),
-        );
-        return;
-    }
     let mut deleted = 0u64;
     for key in &keys {
         match engine.delete(&DeleteRequest {
@@ -10316,26 +10106,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Test probe that always confirms the owner holds the records (settled
-    /// owner). Drives the convergence path: cleanup proceeds.
-    fn probe_always_confirms() -> impl Fn(u16, NodeId, &[(TxKey, u32)]) -> bool + Sync {
-        |_shard, _owner, _manifest| true
-    }
-
-    /// Test probe that always FAILS the fresh re-proof (owner mid-churn /
-    /// behind / unreachable). Drives the no-loss path: records retained.
-    fn probe_always_fails() -> impl Fn(u16, NodeId, &[(TxKey, u32)]) -> bool + Sync {
-        |_shard, _owner, _manifest| false
-    }
-
-    /// Empty node-address map for `run_migration_batch` tests that exercise the
-    /// migration/handoff mechanics (not the orphan-cleanup probe). With no known
-    /// owner addresses the production probe conservatively retains, which does
-    /// not affect these tests' completion/rollback assertions.
-    fn empty_node_addrs() -> Arc<RwLock<std::collections::HashMap<NodeId, SocketAddr>>> {
-        Arc::new(RwLock::new(std::collections::HashMap::new()))
-    }
-
     /// C-3 regression: `read_record_snapshot` (used by `stream_shard_baseline`
     /// for the migration baseline) must return a generation-consistent
     /// snapshot even while a concurrent writer mutates the record. The
@@ -11683,9 +11453,6 @@ mod tests {
             .lock()
             .record_committed_handoff(shard, new_table.version);
 
-        // Fresh re-proof confirms the owner still holds the records (settled
-        // owner) — cleanup must still proceed (convergence preserved).
-        let probe = probe_always_confirms();
         cleanup_orphaned_shard_if_settled(
             NodeId(1),
             &engine,
@@ -11693,7 +11460,6 @@ mod tests {
             &migration,
             shard,
             new_table.version,
-            &probe,
         );
 
         assert_eq!(engine.shard_record_count(shard), 0);
@@ -11724,10 +11490,6 @@ mod tests {
         // off the shard; it may be the last holder.
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
 
-        // Probe would confirm — proving the committed-handoff gate ALONE retains
-        // here (the fresh re-proof is not even reached without a committed
-        // handoff). The new gate must not loosen the #28 guard.
-        let probe = probe_always_confirms();
         cleanup_orphaned_shard_if_settled(
             NodeId(1),
             &engine,
@@ -11735,7 +11497,6 @@ mod tests {
             &migration,
             shard,
             new_table.version,
-            &probe,
         );
 
         assert_eq!(
@@ -11774,16 +11535,12 @@ mod tests {
         // No committed handoff recorded for `shard`.
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
 
-        // Even with a confirming fresh probe, the missing committed handoff
-        // alone retains — the new re-proof is ADDITIVE, never loosening #28.
-        let probe = probe_always_confirms();
         run_orphan_cleanup(
             NodeId(1),
             &engine,
             &shard_table,
             &migration,
             new_table.version,
-            &probe,
         );
 
         assert_eq!(
@@ -11821,192 +11578,18 @@ mod tests {
             .lock()
             .record_committed_handoff(shard, new_table.version);
 
-        // Settled owner: fresh re-proof confirms retention → cleanup still
-        // reclaims (no convergence regression).
-        let probe = probe_always_confirms();
         run_orphan_cleanup(
             NodeId(1),
             &engine,
             &shard_table,
             &migration,
             new_table.version,
-            &probe,
         );
 
         assert_eq!(
             engine.shard_record_count(shard),
             0,
             "run_orphan_cleanup must reclaim a non-owned shard after a committed handoff",
-        );
-    }
-
-    /// Decision-helper truth table (the extracted, testable orphan-delete
-    /// boundary). BOTH the committed-handoff gate AND the fresh retention
-    /// re-proof are NECESSARY; neither alone is SUFFICIENT. Only `(true, true)`
-    /// authorizes deleting the last local copy.
-    #[test]
-    fn should_orphan_delete_requires_both_committed_handoff_and_fresh_reproof() {
-        // Settled: committed handoff AND fresh probe confirm → delete.
-        assert!(
-            should_orphan_delete(true, true),
-            "delete only when committed handoff AND fresh re-proof both hold",
-        );
-        // Stale ACK closed: committed handoff but fresh probe FAILS (owner
-        // churned away since acking) → RETAIN (this is the data-loss fix).
-        assert!(
-            !should_orphan_delete(true, false),
-            "a failing fresh re-proof must block deletion even with a committed handoff",
-        );
-        // No #28 evidence → retain regardless of a confirming probe (the new
-        // gate is additive, never loosens #28).
-        assert!(
-            !should_orphan_delete(false, true),
-            "no committed handoff must block deletion even when the probe confirms",
-        );
-        assert!(
-            !should_orphan_delete(false, false),
-            "neither gate satisfied must block deletion",
-        );
-    }
-
-    /// THE FIX, no-loss pin (broad sweep): a shard WITH a committed handoff but
-    /// whose CURRENT owner FAILS the fresh retention re-proof (owner mid-churn /
-    /// restarted / unreachable since acking) MUST be RETAINED — this is exactly
-    /// the stale-committed-handoff data-loss window the fix closes. Without the
-    /// fresh probe the #28 gate alone would let this delete the last copy while
-    /// the owner has lost it (the observed two-nodes-mutually-delete failure).
-    #[test]
-    fn run_orphan_cleanup_retains_when_fresh_reproof_fails_despite_committed_handoff() {
-        let old_table =
-            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
-        let shard = (0..NUM_SHARDS as u16)
-            .find(|&s| {
-                let old = old_table.target_assignment(s);
-                let new = new_table.target_assignment(s);
-                (old.master == NodeId(1) || old.replicas.contains(&NodeId(1)))
-                    && new.master != NodeId(1)
-                    && !new.replicas.contains(&NodeId(1))
-            })
-            .expect("node1 should hold a shard it no longer owns after removal");
-        let engine = Arc::new(test_engine());
-        let key = tx_key_for_shard(shard, 51);
-        create_test_record(&engine, key);
-        assert_eq!(engine.shard_record_count(shard), 1);
-
-        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
-        let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        // Committed handoff IS present (the #28 gate passes) — proving it is the
-        // FRESH re-proof, not the stale ACK, that now protects the data.
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
-
-        // Owner cannot prove fresh retention (mid-churn / unreachable).
-        let probe = probe_always_fails();
-        run_orphan_cleanup(
-            NodeId(1),
-            &engine,
-            &shard_table,
-            &migration,
-            new_table.version,
-            &probe,
-        );
-
-        assert_eq!(
-            engine.shard_record_count(shard),
-            1,
-            "a committed handoff with a FAILING fresh re-proof must retain the last copy",
-        );
-        assert!(
-            engine.read_metadata(&key).is_ok(),
-            "the retained record must remain readable on the source",
-        );
-    }
-
-    /// THE FIX, no-loss pin (per-shard path): same stale-committed-handoff
-    /// window through `cleanup_orphaned_shard_if_settled`. Committed handoff
-    /// present, fresh probe FAILS → RETAIN.
-    #[test]
-    fn per_shard_orphan_cleanup_retains_when_fresh_reproof_fails_despite_committed_handoff() {
-        let old_table =
-            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
-        let shard = (0..NUM_SHARDS as u16)
-            .find(|&s| {
-                let old = old_table.target_assignment(s);
-                old.master == NodeId(1) || old.replicas.contains(&NodeId(1))
-            })
-            .expect("node1 should hold at least one shard before removal");
-        let engine = Arc::new(test_engine());
-        let key = tx_key_for_shard(shard, 52);
-        create_test_record(&engine, key);
-        assert_eq!(engine.shard_record_count(shard), 1);
-
-        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
-        let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
-
-        let probe = probe_always_fails();
-        cleanup_orphaned_shard_if_settled(
-            NodeId(1),
-            &engine,
-            &shard_table,
-            &migration,
-            shard,
-            new_table.version,
-            &probe,
-        );
-
-        assert_eq!(
-            engine.shard_record_count(shard),
-            1,
-            "per-shard cleanup with a failing fresh re-proof must retain the last copy",
-        );
-    }
-
-    /// Convergence pin (per-shard path): committed handoff AND a passing fresh
-    /// re-proof (settled owner provably holds the records) → cleanup STILL
-    /// deletes. Guards against the fix regressing into never-converge.
-    #[test]
-    fn per_shard_orphan_cleanup_deletes_when_fresh_reproof_confirms() {
-        let old_table =
-            ShardTable::compute_with_epoch(&[NodeId(1), NodeId(2), NodeId(3)], 2, 10, 1);
-        let new_table = ShardTable::compute_with_epoch(&[NodeId(2), NodeId(3)], 2, 11, 1);
-        let shard = (0..NUM_SHARDS as u16)
-            .find(|&s| {
-                let old = old_table.target_assignment(s);
-                old.master == NodeId(1) || old.replicas.contains(&NodeId(1))
-            })
-            .expect("node1 should hold at least one shard before removal");
-        let engine = Arc::new(test_engine());
-        let key = tx_key_for_shard(shard, 53);
-        create_test_record(&engine, key);
-        assert_eq!(engine.shard_record_count(shard), 1);
-
-        let shard_table = Arc::new(ShardTableLock::new(new_table.clone()));
-        let migration = Arc::new(Mutex::new(MigrationManager::new()));
-        migration
-            .lock()
-            .record_committed_handoff(shard, new_table.version);
-
-        let probe = probe_always_confirms();
-        cleanup_orphaned_shard_if_settled(
-            NodeId(1),
-            &engine,
-            &shard_table,
-            &migration,
-            shard,
-            new_table.version,
-            &probe,
-        );
-
-        assert_eq!(
-            engine.shard_record_count(shard),
-            0,
-            "settled owner (committed handoff + confirming re-proof) must still be reclaimed",
         );
     }
 
@@ -12113,17 +11696,13 @@ mod tests {
         assert_eq!(migration.lock().active_count(), 0);
         assert_eq!(migration.lock().failed_count(), 0);
 
-        // Orphan cleanup runs on node2 at epoch N+1. A confirming probe still
-        // must not delete — the stale-discarded handoff left NO committed-handoff
-        // evidence at N+1, so the #28 gate retains regardless of the re-proof.
-        let probe = probe_always_confirms();
+        // Orphan cleanup runs on node2 at epoch N+1.
         run_orphan_cleanup(
             NodeId(2),
             &engine,
             &shard_table,
             &migration,
             table_n1.version,
-            &probe,
         );
 
         assert_eq!(
@@ -12460,8 +12039,6 @@ mod tests {
             &std::collections::HashSet::from([shard]),
         );
 
-        // Confirming probe — proving the active-same-shard guard alone retains.
-        let probe = probe_always_confirms();
         cleanup_orphaned_shard_if_settled(
             NodeId(1),
             &engine,
@@ -12469,7 +12046,6 @@ mod tests {
             &migration,
             shard,
             new_table.version,
-            &probe,
         );
 
         assert_eq!(engine.shard_record_count(shard), 1);
@@ -12507,8 +12083,6 @@ mod tests {
             &std::collections::HashSet::from([other_shard]),
         );
 
-        // Confirming probe — proving the any-active-epoch-work guard alone retains.
-        let probe = probe_always_confirms();
         cleanup_orphaned_shard_if_settled(
             NodeId(1),
             &engine,
@@ -12516,7 +12090,6 @@ mod tests {
             &migration,
             shard,
             new_table.version,
-            &probe,
         );
 
         assert_eq!(engine.shard_record_count(shard), 1);
@@ -12713,7 +12286,6 @@ mod tests {
             old_master,
             None,
             None,
-            empty_node_addrs(),
         );
 
         let table = shard_table.read();
@@ -12829,7 +12401,6 @@ mod tests {
             old_master,
             None,
             None,
-            empty_node_addrs(),
         );
 
         let (op, _req_id) = request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -13026,7 +12597,6 @@ mod tests {
             old_master,
             None,
             None,
-            empty_node_addrs(),
         );
 
         // Pipelined-flow failure contract observed immediately after
@@ -13225,7 +12795,6 @@ mod tests {
             old_master,
             None,
             None,
-            empty_node_addrs(),
         );
 
         // Silent-drop variant of the pipelined failure contract. The
@@ -13413,7 +12982,6 @@ mod tests {
             old_master,
             None,
             None,
-            empty_node_addrs(),
         );
 
         let mut seen = Vec::new();
@@ -13541,7 +13109,6 @@ mod tests {
             old_master,
             None,
             None,
-            empty_node_addrs(),
         );
 
         let (op, _req_id) = request_rx.recv_timeout(Duration::from_secs(3)).unwrap();
