@@ -8942,6 +8942,10 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         // logs the loss and returns OK) and tests. This arm exists so the
         // match stays exhaustive; bucketed with the storage/integrity errors.
         SpendError::ConflictingChildrenFull { .. } => (ERR_STORAGE_IO, vec![]),
+        // BUG-2: block-entry-list capacity overflow — a storage-shaped
+        // structural limit (the on-disk `u8` count cannot hold the 256th
+        // distinct block_id). Bucketed with the storage/integrity errors.
+        SpendError::BlockEntriesFull { .. } => (ERR_STORAGE_IO, vec![]),
     };
     BatchItemError {
         item_index,
@@ -8987,6 +8991,9 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         // KO-5: conflicting-children capacity overflow — a storage-shaped
         // integrity loss (the on-disk list cannot hold the child).
         | SpendError::ConflictingChildrenFull { .. }
+        // BUG-2: block-entry-list capacity overflow — same storage-integrity
+        // bucket as the conflicting-children overflow.
+        | SpendError::BlockEntriesFull { .. }
         | SpendError::ReassignOverflow { .. } => Outcome::ErrStorage,
         SpendError::CoinbaseImmature { .. }
         | SpendError::UtxoNotFound { .. }

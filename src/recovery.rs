@@ -457,6 +457,49 @@ pub fn recover_tombstones(
         };
         let live_gen = entry.generation;
 
+        // BUG-1 fix #4: the generation keep-guard below trusts that the
+        // live entry's cached `generation` belongs to THIS key. That is only
+        // true if the on-device record at the entry's offset is actually
+        // this key's record. An aliased entry (index A→offset but the offset
+        // holds record B) carries B's `generation`, so the keep-guard would
+        // compare the tombstone against a FOREIGN generation and could
+        // wrongly "keep" the corrupt alias. Verify ownership by reading the
+        // on-device metadata: `read_metadata` returns `TxNotFound` precisely
+        // when `meta.tx_id != key.txid`. Only a clean `TxNotFound` proves
+        // the alias; any other error (transient device/backend read) is
+        // ambiguous, so we conservatively treat the entry as owning its
+        // offset and fall back to the normal generation keep-guard rather
+        // than force a removal on an unclear read.
+        let is_alias = matches!(
+            engine.read_metadata(&key),
+            Err(crate::ops::error::SpendError::TxNotFound)
+        );
+
+        if is_alias {
+            // The resurrected entry points at a record that belongs to a
+            // DIFFERENT transaction — pure corruption. Remove the stale index
+            // row UNCONDITIONALLY (no generation guard: its generation is
+            // foreign). This MUST go through the index-only purge: the normal
+            // `delete_for_purge` would itself reject on the tx_id mismatch
+            // (its `read_metadata_for_key` returns `TxNotFound`) and leave the
+            // alias in place. The on-device bytes are left intact — they are
+            // the rightful owner's record, not this key's.
+            match engine.purge_aliased_index_entry(&key) {
+                Ok(true) => stats.records_self_purged += 1,
+                // Already gone (raced away / concurrently removed) — benign.
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        txid = ?&txid[..4],
+                        err = %e,
+                        "tombstone recovery: R2 aliased-entry purge failed; will \
+                         retry on next restart (idempotent)",
+                    );
+                }
+            }
+            continue;
+        }
+
         // Generation guard (design §8.4): purge only when the tombstone is
         // at-or-ahead of the live record. A strictly-higher live generation
         // is a legitimate re-creation post-deletion — keep it.
@@ -846,6 +889,30 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                     ReplayResult::Failed(ReplayCause::LogicError)
                 } else {
                     replay_entry(device, index, entry)
+                }
+            }
+            // BUG-1 fix #1: route the legacy `RedoOp::Create` through the
+            // SAME `is_allocated_range` gate as `CreateV2`. The legacy
+            // create carries no payload, so the range length is derived
+            // from `utxo_count` via `record_size_for`. Without this gate a
+            // stale legacy Create — whose `record_offset` was since freed
+            // and re-handed to a DIFFERENT record — would register an index
+            // entry aliasing another key's record, corrupting reads. The
+            // replication / migration receiver emits this legacy op for
+            // every replicated create, so every replica replays through
+            // this arm on recovery; it must be guarded exactly like V2.
+            RedoOp::Create {
+                tx_key,
+                record_offset,
+                utxo_count,
+            } => {
+                let range_len = TxMetadata::record_size_for(*utxo_count);
+                if let Some(alloc) = allocator.as_deref()
+                    && !alloc.is_allocated_range(*record_offset, range_len)
+                {
+                    ReplayResult::Failed(ReplayCause::LogicError)
+                } else {
+                    replay_create(device, index, tx_key, *record_offset, *utxo_count)
                 }
             }
             RedoOp::CompensateUnsetMined {
@@ -1982,6 +2049,64 @@ fn replay_unfreeze(
     ReplayResult::Applied
 }
 
+/// BUG-1 fix #3: register a recovered create entry while enforcing the
+/// offset-uniqueness invariant — no two keys may map to the same
+/// `record_offset`.
+///
+/// `index.register` rejects a duplicate KEY but NOT a duplicate OFFSET, so
+/// a stale aliased entry `A → record_offset` left in the index (e.g. by a
+/// pre-fix recovery run, or a snapshot taken before this fix) would coexist
+/// with the rightful owner being registered here, and `lookup(A)` would
+/// read the wrong record's bytes.
+///
+/// The caller has already verified (BUG-1 fix #2) that the on-device
+/// metadata at `record_offset` carries `key.txid`, so `key` is the rightful
+/// owner of whatever record currently lives there. Any OTHER key already
+/// mapped to the same offset is therefore the stale alias and is
+/// unregistered before `key` is registered. After this call exactly one
+/// key maps to `record_offset`.
+///
+/// Cost: a single index scan to locate a conflicting different-key entry.
+/// This runs only on the recovery (startup) create path, never the serving
+/// hot path. Returns the underlying [`crate::index::IndexError`] if the
+/// final `register` fails.
+fn register_unique_offset(
+    index: &mut PrimaryBackend,
+    key: TxKey,
+    entry: TxIndexEntry,
+) -> Result<(), crate::index::IndexError> {
+    let record_offset = entry.record_offset;
+
+    // Find any DIFFERENT key already aliasing this offset. With BUG-1
+    // fix #2 in force no NEW alias can be created during this recovery run
+    // (registration only proceeds when the on-device tx_id matches the
+    // key, and one offset holds exactly one record / tx_id), so this scan
+    // exists purely to evict a PRE-EXISTING aliased entry carried in from
+    // a persisted/snapshotted index.
+    let mut aliased: Option<TxKey> = None;
+    for (existing_key, existing_entry) in index.iter() {
+        if existing_entry.record_offset == record_offset && existing_key != key {
+            aliased = Some(existing_key);
+            break;
+        }
+    }
+    if let Some(stale) = aliased {
+        // The rightful owner is `key` (its txid matches the on-device
+        // record per fix #2); drop the stale alias so the offset maps to
+        // exactly one key.
+        index.unregister(&stale);
+        tracing::warn!(
+            target: "teraslab::recovery",
+            stale_txid_prefix = ?&stale.txid[..4],
+            owner_txid_prefix = ?&key.txid[..4],
+            record_offset,
+            "BUG-1: dropped stale index entry aliasing a record offset now owned by another key",
+        );
+    }
+
+    index.register(key, entry)
+}
+
 /// Legacy (pre-`CreateV2`) create replay.
 ///
 /// Replays a `RedoOp::Create` entry written before gap #2 added the
@@ -2057,6 +2182,20 @@ fn replay_create(
         return ReplayResult::Failed(ReplayCause::CorruptEntry);
     }
 
+    // BUG-1 fix #2: the on-device metadata MUST belong to THIS key.
+    // `utxo_count` alone is insufficient — a DIFFERENT record B with the
+    // same `utxo_count` can occupy `record_offset` after the offset was
+    // freed and re-handed out. Seeding the index entry's cached fields
+    // (including `generation`) from B and registering A→record_offset
+    // would alias two keys onto one record, so `lookup(A)` returns B's
+    // bytes. The metadata `tx_id` is write-once, so comparing it to the
+    // key's txid is the decisive, cheap aliasing detector. On mismatch
+    // this legacy Create is stale (the offset was reallocated): do NOT
+    // register. Classify as `CorruptEntry` to match the utxo_count guard.
+    if { meta.tx_id } != tx_key.txid {
+        return ReplayResult::Failed(ReplayCause::CorruptEntry);
+    }
+
     let entry = TxIndexEntry {
         device_id: 0,
         record_offset,
@@ -2068,12 +2207,12 @@ fn replay_create(
         unmined_since: { meta.unmined_since },
         generation: { meta.generation },
     };
-    match index.register(*tx_key, entry) {
+    match register_unique_offset(index, *tx_key, entry) {
         Ok(()) => ReplayResult::Applied,
-        // `index.register` returns `Err` for capacity / duplicate-key /
-        // structural problems — none of which are I/O against the device,
-        // so classify as logic-level so startup fails closed instead of
-        // silently dropping the create.
+        // `register_unique_offset` returns `Err` for capacity /
+        // duplicate-key / offset-aliasing / structural problems — none of
+        // which are I/O against the device, so classify as logic-level so
+        // startup fails closed instead of silently dropping the create.
         Err(_) => ReplayResult::Failed(ReplayCause::LogicError),
     }
 }
@@ -2207,6 +2346,17 @@ fn replay_create_v2(
         return ReplayResult::Failed(ReplayCause::CorruptEntry);
     }
 
+    // BUG-1 fix #2: the reconstructed metadata's `tx_id` MUST match the
+    // redo entry's key. The bytes were just written from the captured
+    // payload, so a mismatch means the captured payload belongs to a
+    // different transaction than the redo entry claims — a corrupt redo
+    // record. Registering it would seed cached fields (and `generation`)
+    // from the wrong record and could alias A→record_offset onto B's
+    // bytes. Fail closed before registering.
+    if { meta.tx_id } != tx_key.txid {
+        return ReplayResult::Failed(ReplayCause::CorruptEntry);
+    }
+
     let entry = TxIndexEntry {
         device_id: 0,
         record_offset,
@@ -2218,7 +2368,7 @@ fn replay_create_v2(
         unmined_since: { meta.unmined_since },
         generation: { meta.generation },
     };
-    if let Err(_e) = index.register(*tx_key, entry) {
+    if let Err(_e) = register_unique_offset(index, *tx_key, entry) {
         return ReplayResult::Failed(ReplayCause::LogicError);
     }
 
@@ -4152,6 +4302,218 @@ mod tests {
         assert!(
             index.lookup(&key).is_none(),
             "invalid CreateV2 offset must not register primary index entry"
+        );
+    }
+
+    /// Build record B's full on-device bytes (metadata `tx_id = b_txid`,
+    /// `utxo_count` unspent slots) at an allocated offset, then FREE that
+    /// offset in the allocator only — leaving B's bytes on the device but
+    /// the region marked free. Returns the offset. This stages the exact
+    /// aliasing precondition: a later legacy `Create` for a DIFFERENT key A
+    /// names this offset, which now holds B's record.
+    fn write_record_b_then_free_in_allocator(
+        data_dev: &MemoryDevice,
+        alloc: &mut SlotAllocator,
+        b_txid: [u8; 32],
+        utxo_count: u32,
+    ) -> u64 {
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = alloc.allocate(record_size).unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = b_txid;
+        meta.record_size = record_size as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(data_dev, offset, &meta, &slots).unwrap();
+        // Free in the allocator ONLY — B's bytes remain on the device.
+        alloc.free(offset, record_size).unwrap();
+        offset
+    }
+
+    /// BUG-1 fix #1: a legacy `RedoOp::Create` whose `record_offset` is NOT
+    /// owned by the allocator (it was freed and the bytes there belong to a
+    /// DIFFERENT record B) must be rejected by the `is_allocated_range`
+    /// gate — exactly like `CreateV2`. Pre-fix this path skipped the gate
+    /// and registered A → offset, aliasing B's record so `lookup(A)` read
+    /// B's bytes.
+    #[test]
+    fn recover_all_rejects_legacy_create_offset_not_owned_by_allocator() {
+        let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let mut dah = DahBackend::from(crate::index::DahIndex::new());
+        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
+
+        let utxo_count = 2;
+        // Record B occupies the offset on device; the region is then freed
+        // in the allocator. B's tx_id starts with 0xBB.
+        let mut b_txid = [0u8; 32];
+        b_txid[0] = 0xBB;
+        let offset =
+            write_record_b_then_free_in_allocator(&data_dev, &mut alloc, b_txid, utxo_count);
+
+        // Key A (≠ B) names B's now-freed offset via a legacy Create.
+        let mut a_txid = [0u8; 32];
+        a_txid[0] = 0xAA;
+        let key_a = TxKey { txid: a_txid };
+
+        let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key_a,
+            record_offset: offset,
+            utxo_count,
+        })
+        .unwrap();
+
+        let stats = recover_all_with_allocator(
+            &*data_dev,
+            &redo,
+            &mut index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut alloc),
+        )
+        .unwrap();
+
+        // The allocator gate fails the entry as a logic error.
+        assert_eq!(stats.entries_failed, 1);
+        assert_eq!(stats.failed_logic, 1);
+        // A must NOT be registered — no A → offset aliasing.
+        assert!(
+            index.lookup(&key_a).is_none(),
+            "legacy Create on a freed offset must not register an aliasing index entry"
+        );
+    }
+
+    /// BUG-1 fix #2: even if the allocator still owns the offset (so the
+    /// `is_allocated_range` gate passes), the on-device metadata `tx_id`
+    /// MUST match the legacy Create's key. Here the offset holds record B's
+    /// bytes (tx_id = B) but the redo Create names key A with a MATCHING
+    /// `utxo_count` — the old `meta.utxo_count == redo.utxo_count` guard is
+    /// satisfied, so only the tx_id guard can catch the alias.
+    #[test]
+    fn recover_all_legacy_create_tx_id_guard_rejects_alias() {
+        let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let mut dah = DahBackend::from(crate::index::DahIndex::new());
+        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
+
+        let utxo_count = 2;
+        // Record B at an offset that STAYS allocated (gate passes).
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = alloc.allocate(record_size).unwrap();
+        let mut b_txid = [0u8; 32];
+        b_txid[0] = 0xBB;
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = b_txid;
+        meta.record_size = record_size as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(&*data_dev, offset, &meta, &slots).unwrap();
+
+        // Legacy Create for key A (≠ B) with the SAME utxo_count → only the
+        // tx_id guard distinguishes it.
+        let mut a_txid = [0u8; 32];
+        a_txid[0] = 0xAA;
+        let key_a = TxKey { txid: a_txid };
+
+        let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key_a,
+            record_offset: offset,
+            utxo_count,
+        })
+        .unwrap();
+
+        let stats = recover_all_with_allocator(
+            &*data_dev,
+            &redo,
+            &mut index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut alloc),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.entries_failed, 1,
+            "tx_id mismatch must fail the legacy Create entry"
+        );
+        assert!(
+            index.lookup(&key_a).is_none(),
+            "legacy Create whose on-device tx_id != key must not register (tx_id guard)"
+        );
+    }
+
+    /// BUG-1 fix #4 (R2): a resurrected primary entry that ALIASES another
+    /// key's record (index A → offset, but on-device tx_id = B) must be
+    /// purged UNCONDITIONALLY by R2 self-purge when a tombstone exists for
+    /// A — the generation keep-guard must NOT apply, because the entry's
+    /// cached `generation` was seeded from the FOREIGN record B.
+    #[test]
+    fn recover_tombstones_r2_purges_aliased_entry_unconditionally() {
+        // Create record B (on-device tx_id = B) under key B, then RE-POINT
+        // the index so key A maps to B's offset and unregister B. The index
+        // now holds the alias A → B's record, with A's cached `generation`
+        // seeded from B (a HIGH value). A LOW-generation tombstone for A
+        // would, under the pre-fix generation keep-guard, be KEPT (tombstone
+        // gen 1 < live gen 9). The BUG-1 fix #4 tx_id guard must override
+        // that and purge A unconditionally.
+        let mut h = RecoveryTestHarness::new();
+        let key_b = h.create_record(0xBB, 2);
+        // Give B a high generation in the index so the keep-guard WOULD fire.
+        h.set_index_generation(&key_b, 9);
+        let b_entry = h.index.lookup(&key_b).unwrap();
+
+        let mut a_txid = [0u8; 32];
+        a_txid[0] = 0xAA;
+        let key_a = TxKey { txid: a_txid };
+        // Alias: A → B's offset/entry (carrying B's generation 9).
+        h.index.register(key_a, b_entry).unwrap();
+        // Remove B so only the aliased A entry remains pointing at the offset.
+        h.index.unregister(&key_b);
+
+        let engine = engine_from_harness(h);
+        // Sanity: A resolves in the index but the on-device record is B's.
+        assert!(engine.lookup_cached(&key_a).is_some());
+        assert!(
+            matches!(
+                engine.read_metadata(&key_a),
+                Err(crate::ops::error::SpendError::TxNotFound)
+            ),
+            "on-device tx_id must NOT match key A (it is B's record)"
+        );
+
+        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
+        // Tombstone for A at LOW generation 1 — below A's live (aliased) gen 9.
+        seed_tombstone(&mut log, &key_a, 1, 150);
+
+        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
+
+        assert_eq!(
+            stats.kept_newer_generation, 0,
+            "aliased entry must NOT be kept by the generation guard (tx_id mismatch)"
+        );
+        assert_eq!(
+            stats.records_self_purged, 1,
+            "aliased entry must be purged unconditionally on tx_id mismatch"
+        );
+        assert!(
+            engine.lookup_cached(&key_a).is_none(),
+            "aliased entry A must be removed from the index after R2"
         );
     }
 

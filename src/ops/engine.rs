@@ -2676,6 +2676,18 @@ impl Engine {
             }
 
             if !exists {
+                // BUG-2: `block_entry_count` is a single `u8`. Adding a new
+                // distinct block entry when the count is already at the
+                // maximum would wrap `255 → 0` (release) or panic (debug)
+                // below, desyncing the count from the overflow list and
+                // zeroing `has_blocks`. Reject with a typed capacity error
+                // before mutating any state — mirroring the children-list
+                // `u8::MAX` guard.
+                if metadata.block_entry_count == u8::MAX {
+                    return Err(SpendError::BlockEntriesFull {
+                        cap: u8::MAX as usize,
+                    });
+                }
                 if count < INLINE_BLOCK_ENTRIES {
                     metadata.block_entries_inline[count] = BlockEntry {
                         block_id: req.block_id,
@@ -3712,8 +3724,41 @@ impl Engine {
                 })?;
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
+
+        // BUG-3: re-evaluate `deleteAtHeight` after the prune. Pruning a
+        // slot decrements `spent_utxos`, so a record that was previously
+        // all-spent (and therefore had a DAH set and a DAH-index entry) is
+        // no longer all-spent and its DAH is now stale. Left untouched it
+        // keeps a `delete_at_height` + DAH-index entry that every DAH sweep
+        // re-scans forever (index bloat). Spend/unspend already run this
+        // re-evaluation; the prune path was the only mutation that did not.
+        //
+        // This path can only ever CLEAR (or reduce) a stale DAH — never set
+        // a new one: the record cannot become all-spent by pruning. The
+        // engine does not store `block_height_retention` (it is per-request
+        // and the prune-by-child caller carries none), but the SET path of
+        // `evaluate_delete_at_height` is unreachable here, so the height /
+        // retention inputs only feed a `new_dah` the clear branch ignores.
+        // A sentinel `(current_height = 0, retention = 1)` reaches past the
+        // `retention == 0` early-return without overflow. We additionally
+        // guard `apply` to a strict DAH reduction so a CONFLICTING record
+        // (whose DAH is driven by conflict state, not all-spent) can never
+        // be handed a spurious sentinel-derived DAH.
+        let old_dah = { meta.delete_at_height };
+        let (_signal, dah_patch) = evaluate_delete_at_height(&meta, 0, 1)?;
+        if let Some(patch) = dah_patch
+            && patch.new_delete_at_height < old_dah
+        {
+            apply_dah_patch(&mut meta, &patch);
+        }
+        let new_dah = { meta.delete_at_height };
+
         self.write_metadata_fast(entry.record_offset, &meta)?;
         self.sync_index_cache(parent_key, &meta)?;
+        // BUG-3: keep the DAH secondary index in lock-step with the cleared
+        // on-record DAH so the now-prunable-by-other-means record stops
+        // being re-scanned on every sweep.
+        self.update_dah_index(parent_key, old_dah, new_dah)?;
         // F-X-022: Aerospike `addDeletedChildren` parity. The prune above
         // is the PRIMARY defense (UTXO_PRUNED is the on-disk slot status
         // every spend path checks first). The append below is the
@@ -5579,6 +5624,59 @@ impl Engine {
     /// [`DoubleFree`]: crate::allocator::AllocatorError::DoubleFree
     pub(crate) fn delete_for_purge(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         self.delete_inner(req, false, true).map(|_| ())
+    }
+
+    /// BUG-1 fix #4: drop a CORRUPT, aliased primary-index entry whose
+    /// on-device record belongs to a DIFFERENT transaction.
+    ///
+    /// Used by recovery R2 self-purge when the resurrected entry for `key`
+    /// points at a `record_offset` whose on-device metadata `tx_id != key`
+    /// (verified by the caller via [`Self::read_metadata`] returning
+    /// [`SpendError::TxNotFound`]). The normal [`Self::delete_for_purge`]
+    /// CANNOT remove such an entry: its `delete_inner` reads
+    /// `read_metadata_for_key`, which itself rejects on the tx_id mismatch
+    /// and returns `TxNotFound` BEFORE removing anything, so the alias would
+    /// survive.
+    ///
+    /// This path is surgical: it removes ONLY the stale index row (and its
+    /// shard count + secondary-index entries derived from the entry's cached
+    /// heights). It deliberately does NOT zero the on-device header and does
+    /// NOT free the region — those bytes belong to the rightful owner record
+    /// B and must be left intact.
+    ///
+    /// Returns `true` if an entry was removed, `false` if the key was already
+    /// absent (idempotent). Propagates [`crate::index::IndexError`] as a
+    /// [`SpendError::StorageError`] on a backend removal failure.
+    pub(crate) fn purge_aliased_index_entry(&self, key: &TxKey) -> Result<bool, SpendError> {
+        let _guard = self.locks.lock(key);
+        let removed =
+            self.unregister_with_shard_count(key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("aliased-entry index unregister failed: {e}"),
+                })?;
+        let Some(entry) = removed else {
+            return Ok(false);
+        };
+
+        // Clean up the secondary indexes derived from the (foreign-seeded)
+        // cached heights, mirroring `delete_inner`'s secondary cleanup. These
+        // remove `key` from the DAH / unmined indexes; `update_*_index` is a
+        // no-op when the old height is 0.
+        let has_preserve =
+            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
+        let old_dah = if has_preserve {
+            0
+        } else {
+            entry.dah_or_preserve
+        };
+        let old_unmined = entry.unmined_since;
+        if old_dah != 0 {
+            self.update_dah_index(key, old_dah, 0)?;
+        }
+        if old_unmined != 0 {
+            self.update_unmined_index(key, old_unmined, 0)?;
+        }
+        Ok(true)
     }
 
     /// Discard ALL local records for `shard` WITHOUT writing tombstones, for
@@ -8165,6 +8263,134 @@ mod tests {
 
         // DAH should be cleared
         assert!(h.engine.dah_index().range_query(u32::MAX).is_empty());
+    }
+
+    /// BUG-3: pruning one slot of an ALL-SPENT record (DAH set, present in
+    /// the DAH index) makes the record no-longer-all-spent, so its DAH is
+    /// now stale. The prune path must re-evaluate `deleteAtHeight`, clear
+    /// the on-record `delete_at_height`, AND remove the DAH-index entry —
+    /// otherwise the record is re-scanned on every sweep forever.
+    #[test]
+    fn prune_slot_clears_stale_dah_and_index_entry() {
+        let h = TestHarness::with_metadata(2, TxFlags::empty(), |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+        });
+
+        // Spend both UTXOs → all-spent, DAH set, DAH-index entry present.
+        h.engine.spend(&h.spend_req(0)).unwrap();
+        h.engine.spend(&h.spend_req(1)).unwrap();
+        let dah_before = { h.engine.read_metadata(&h.key).unwrap().delete_at_height };
+        assert_ne!(dah_before, 0, "all-spent record must have a DAH set");
+        assert!(
+            !h.engine.dah_index().range_query(u32::MAX).is_empty(),
+            "all-spent record must be in the DAH index"
+        );
+
+        // The spend_req uses make_spending_data(0xAB): the child txid is the
+        // first 32 bytes (0xAB, then zeros).
+        let mut child_txid = [0u8; 32];
+        child_txid.copy_from_slice(&h.make_spending_data(0xAB)[..32]);
+
+        // Prune slot 0 by that child.
+        let applied = h
+            .engine
+            .prune_slot_if_spent_by_child(&h.key, 0, child_txid)
+            .unwrap();
+        assert!(applied, "prune must apply against the SPENT slot");
+
+        // The record is no longer all-spent → DAH must be cleared on-record.
+        let dah_after = { h.engine.read_metadata(&h.key).unwrap().delete_at_height };
+        assert_eq!(
+            dah_after, 0,
+            "partial prune must clear the now-stale delete_at_height"
+        );
+        // And the DAH-index entry must be gone (no perpetual re-scan).
+        assert!(
+            h.engine.dah_index().range_query(u32::MAX).is_empty(),
+            "partial prune must remove the stale DAH-index entry"
+        );
+    }
+
+    /// BUG-2: `block_entry_count` is a `u8`. setMined-ing 256 DISTINCT
+    /// block_ids on one tx (no intervening unset) must reject the 256th with
+    /// a typed capacity error — NOT panic (debug) and NOT wrap 255→0
+    /// (release) leaving a non-empty overflow list with a zero count.
+    #[test]
+    fn set_mined_256th_distinct_block_id_rejected_not_wrapped() {
+        let h = TestHarness::new(1, TxFlags::empty());
+
+        // 255 distinct block_ids succeed and fill the u8 count to its max.
+        for block_id in 0..255u32 {
+            let req = SetMinedRequest {
+                tx_key: h.key,
+                block_id,
+                block_height: 900 + block_id,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            };
+            h.engine
+                .set_mined(&req)
+                .unwrap_or_else(|e| panic!("block_id {block_id} must succeed: {e:?}"));
+        }
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(
+            { meta.block_entry_count },
+            u8::MAX,
+            "255 distinct block_ids must fill the count to u8::MAX"
+        );
+
+        // The 256th DISTINCT block_id must be rejected with the typed
+        // capacity error — no wrap, no panic.
+        let req_256 = SetMinedRequest {
+            tx_key: h.key,
+            block_id: 255,
+            block_height: 1155,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        };
+        let err = h
+            .engine
+            .set_mined(&req_256)
+            .expect_err("256th distinct block_id must be rejected");
+        assert!(
+            matches!(err, SpendError::BlockEntriesFull { cap } if cap == u8::MAX as usize),
+            "expected BlockEntriesFull, got {err:?}"
+        );
+
+        // The count must be UNCHANGED (still 255), never wrapped to 0.
+        let meta_after = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!(
+            { meta_after.block_entry_count },
+            u8::MAX,
+            "rejected set_mined must not mutate block_entry_count (no wrap-to-zero)"
+        );
+
+        // Re-applying an EXISTING block_id (idempotent, no new entry) must
+        // still succeed even at capacity — it adds nothing.
+        let req_dup = SetMinedRequest {
+            tx_key: h.key,
+            block_id: 0,
+            block_height: 900,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: false,
+        };
+        h.engine
+            .set_mined(&req_dup)
+            .expect("re-applying an existing block_id at capacity must be a no-op success");
     }
 
     #[test]

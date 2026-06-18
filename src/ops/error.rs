@@ -234,4 +234,22 @@ pub enum SpendError {
         /// The capacity that was hit (the on-disk `u8` count maximum, 255).
         cap: usize,
     },
+
+    /// BUG-2: a record's block-entry list (inline + overflow) is already at
+    /// the on-disk capacity (`u8::MAX` = 255 entries) and cannot accept
+    /// another distinct `block_id`. The on-device metadata stores the count
+    /// in a single `u8` ([`crate::record::TxMetadata::block_entry_count`]),
+    /// so 255 is a hard structural limit.
+    ///
+    /// Pre-fix `set_mined` incremented the count with no upper bound, so the
+    /// 256th distinct `block_id` wrapped `255 → 0` (release) or panicked
+    /// (debug) — desyncing the count from the overflow list and flipping
+    /// `has_blocks` false, which mis-drives the DAH evaluation. It is now a
+    /// distinct typed error so the caller fails closed instead of corrupting
+    /// the block list.
+    #[error("BLOCK_ENTRIES_FULL: record block-entry list at capacity ({cap}), set_mined rejected")]
+    BlockEntriesFull {
+        /// The capacity that was hit (the on-disk `u8` count maximum, 255).
+        cap: usize,
+    },
 }
