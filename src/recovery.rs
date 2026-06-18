@@ -291,6 +291,11 @@ pub fn recover(
 ) -> Result<RecoveryStats, RecoveryError> {
     let entries = redo_log.recover()?;
     let mut stats = RecoveryStats::default();
+    // BUG-1 offset-uniqueness: build the offset→owner reverse map ONCE from
+    // the loaded index (O(N)). `register_unique_offset` then evicts any
+    // pre-existing alias in O(1) per create instead of scanning the whole
+    // index each time.
+    let mut offset_owners = build_offset_owners(index);
 
     for entry in &entries {
         // Height subsystem (design §4; BUG3): fold the max block height across
@@ -298,7 +303,7 @@ pub fn recover(
         if let Some(h) = entry.op.observed_block_height() {
             stats.max_observed_block_height = stats.max_observed_block_height.max(h);
         }
-        match replay_entry(device, index, entry) {
+        match replay_entry(device, index, &mut offset_owners, entry) {
             ReplayResult::Applied => stats.entries_replayed += 1,
             ReplayResult::Skipped => stats.entries_skipped += 1,
             ReplayResult::Failed(cause) => {
@@ -778,6 +783,11 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     let mut processed_since_progress = 0u64;
     let mut last_progress_sequence = 0u64;
     let mut last_safe_sequence = 0u64;
+    // BUG-1 offset-uniqueness: build the offset→owner reverse map ONCE from
+    // the loaded index (O(N)). Each replayed create then evicts any
+    // pre-existing alias in O(1) via `register_unique_offset` instead of
+    // re-scanning the entire index per create.
+    let mut offset_owners = build_offset_owners(index);
     // B-7: keys touched by replayed entries. On a clean recovery only
     // these are reconciled against the durable secondaries, instead of
     // re-scanning the whole primary index.
@@ -888,7 +898,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 {
                     ReplayResult::Failed(ReplayCause::LogicError)
                 } else {
-                    replay_entry(device, index, entry)
+                    replay_entry(device, index, &mut offset_owners, entry)
                 }
             }
             // BUG-1 fix #1: route the legacy `RedoOp::Create` through the
@@ -912,7 +922,14 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 {
                     ReplayResult::Failed(ReplayCause::LogicError)
                 } else {
-                    replay_create(device, index, tx_key, *record_offset, *utxo_count)
+                    replay_create(
+                        device,
+                        index,
+                        &mut offset_owners,
+                        tx_key,
+                        *record_offset,
+                        *utxo_count,
+                    )
                 }
             }
             RedoOp::CompensateUnsetMined {
@@ -948,7 +965,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 *subtree_idx,
                 *unset,
             ),
-            _ => replay_entry(device, index, entry),
+            _ => replay_entry(device, index, &mut offset_owners, entry),
         };
         let progress_safe = matches!(
             outcome,
@@ -1342,6 +1359,7 @@ fn apply_replay_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
 fn replay_entry(
     device: &dyn BlockDevice,
     index: &mut PrimaryBackend,
+    offset_owners: &mut OffsetOwners,
     entry: &RedoEntry,
 ) -> ReplayResult {
     match &entry.op {
@@ -1458,7 +1476,14 @@ fn replay_entry(
             tx_key,
             record_offset,
             utxo_count,
-        } => replay_create(device, index, tx_key, *record_offset, *utxo_count),
+        } => replay_create(
+            device,
+            index,
+            offset_owners,
+            tx_key,
+            *record_offset,
+            *utxo_count,
+        ),
         RedoOp::CreateV2 {
             tx_key,
             record_offset,
@@ -1469,6 +1494,7 @@ fn replay_entry(
         } => replay_create_v2(
             device,
             index,
+            offset_owners,
             tx_key,
             *record_offset,
             *utxo_count,
@@ -2070,27 +2096,73 @@ fn replay_unfreeze(
 /// This runs only on the recovery (startup) create path, never the serving
 /// hot path. Returns the underlying [`crate::index::IndexError`] if the
 /// final `register` fails.
+/// Reverse map from `record_offset` to the single key that currently owns
+/// that offset in the primary index.
+///
+/// BUG-1 offset-uniqueness (fix #3) requires that, after recovery, no two
+/// keys map to the same `record_offset`. The original implementation
+/// enforced this by scanning the entire primary index (`index.iter()`) on
+/// EVERY recovered create to find a pre-existing alias — O(N) per create,
+/// O(M×N) total (M = creates replayed, N = loaded index size). This map
+/// replaces that scan: it is built ONCE at the start of recovery from
+/// `index.iter()` (O(N)), then each create consults it in O(1) and keeps it
+/// in sync. Total cost is therefore O(N) once + O(1) per create.
+///
+/// At the 10M-record target the map holds up to 10M `(u64, [u8; 32])`
+/// pairs ≈ 40 bytes/entry of payload (~400 MB transient, plus `HashMap`
+/// bucket overhead). It lives only for the duration of recovery and is
+/// dropped immediately after, so the peak is a startup-only cost.
+type OffsetOwners = std::collections::HashMap<u64, TxKey>;
+
+/// Build the [`OffsetOwners`] reverse map from the loaded primary index in a
+/// single O(N) pass.
+///
+/// Called ONCE per recovery run, before the replay loop. After this point
+/// the map is the authoritative record of which key owns each offset and is
+/// updated incrementally by [`register_unique_offset`]; the per-create
+/// `index.iter()` scan is gone.
+///
+/// If the loaded index already contains two keys aliasing one offset (an
+/// impossible-but-defensive case from a corrupt snapshot), the last one
+/// visited by `iter()` wins in the map. That does not weaken correctness:
+/// the first legitimate create replayed against that offset will still
+/// evict whichever stale key the map records, and any remaining alias is
+/// caught by the R2 tx_id-mismatch purge.
+fn build_offset_owners(index: &PrimaryBackend) -> OffsetOwners {
+    let mut owners = OffsetOwners::new();
+    for (key, entry) in index.iter() {
+        owners.insert(entry.record_offset, key);
+    }
+    owners
+}
+
+/// Register `key → entry` while preserving the BUG-1 offset-uniqueness
+/// invariant: no two keys may map to the same `record_offset`.
+///
+/// Complexity: O(1). The pre-existing alias (a DIFFERENT key carried in
+/// from a persisted/snapshotted index that maps to the same offset) is
+/// found via an O(1) `offset_owners.get(&record_offset)` instead of a full
+/// `index.iter()` scan. With BUG-1 fix #2 in force no NEW alias can be
+/// created during this recovery run (registration only proceeds when the
+/// on-device tx_id matches the key, and one offset holds exactly one record
+/// / tx_id), so the only alias this evicts is that pre-existing one.
+///
+/// The correctness guarantee is identical to the prior O(N)-scan version:
+/// after the call the offset maps to exactly `key`, and any other key that
+/// previously aliased it has been `unregister`ed. `offset_owners` is kept
+/// in sync so subsequent creates see the new owner.
 fn register_unique_offset(
     index: &mut PrimaryBackend,
+    offset_owners: &mut OffsetOwners,
     key: TxKey,
     entry: TxIndexEntry,
 ) -> Result<(), crate::index::IndexError> {
     let record_offset = entry.record_offset;
 
-    // Find any DIFFERENT key already aliasing this offset. With BUG-1
-    // fix #2 in force no NEW alias can be created during this recovery run
-    // (registration only proceeds when the on-device tx_id matches the
-    // key, and one offset holds exactly one record / tx_id), so this scan
-    // exists purely to evict a PRE-EXISTING aliased entry carried in from
-    // a persisted/snapshotted index.
-    let mut aliased: Option<TxKey> = None;
-    for (existing_key, existing_entry) in index.iter() {
-        if existing_entry.record_offset == record_offset && existing_key != key {
-            aliased = Some(existing_key);
-            break;
-        }
-    }
-    if let Some(stale) = aliased {
+    // O(1) lookup of any DIFFERENT key already aliasing this offset.
+    if let Some(&stale) = offset_owners.get(&record_offset)
+        && stale != key
+    {
         // The rightful owner is `key` (its txid matches the on-device
         // record per fix #2); drop the stale alias so the offset maps to
         // exactly one key.
@@ -2104,7 +2176,11 @@ fn register_unique_offset(
         );
     }
 
-    index.register(key, entry)
+    index.register(key, entry)?;
+    // Record the rightful owner so a later create for the same offset (or a
+    // re-replay of this one) sees `key`, not a stale snapshot alias.
+    offset_owners.insert(record_offset, key);
+    Ok(())
 }
 
 /// Legacy (pre-`CreateV2`) create replay.
@@ -2133,6 +2209,7 @@ fn register_unique_offset(
 fn replay_create(
     device: &dyn BlockDevice,
     index: &mut PrimaryBackend,
+    offset_owners: &mut OffsetOwners,
     tx_key: &TxKey,
     record_offset: u64,
     utxo_count: u32,
@@ -2207,7 +2284,7 @@ fn replay_create(
         unmined_since: { meta.unmined_since },
         generation: { meta.generation },
     };
-    match register_unique_offset(index, *tx_key, entry) {
+    match register_unique_offset(index, offset_owners, *tx_key, entry) {
         Ok(()) => ReplayResult::Applied,
         // `register_unique_offset` returns `Err` for capacity /
         // duplicate-key / offset-aliasing / structural problems — none of
@@ -2293,6 +2370,7 @@ fn replay_delete(
 fn replay_create_v2(
     device: &dyn BlockDevice,
     index: &mut PrimaryBackend,
+    offset_owners: &mut OffsetOwners,
     tx_key: &TxKey,
     record_offset: u64,
     utxo_count: u32,
@@ -2368,7 +2446,7 @@ fn replay_create_v2(
         unmined_since: { meta.unmined_since },
         generation: { meta.generation },
     };
-    if let Err(_e) = register_unique_offset(index, *tx_key, entry) {
+    if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
         return ReplayResult::Failed(ReplayCause::LogicError);
     }
 
@@ -4455,6 +4533,118 @@ mod tests {
         assert!(
             index.lookup(&key_a).is_none(),
             "legacy Create whose on-device tx_id != key must not register (tx_id guard)"
+        );
+    }
+
+    /// BUG-1 fix #3 (offset-uniqueness), O(N) reverse-map version: a STALE
+    /// alias `A → X` carried in from a persisted/snapshot index must be
+    /// evicted when the rightful owner `B` (on-device tx_id = B) is replayed
+    /// via a legitimate `Create(B, X)`. After recovery ONLY `B → X` survives
+    /// and `A` is gone — identical to the prior O(N²) `index.iter()` scan,
+    /// but now via the O(1) `offset_owners.get(&offset)` path
+    /// (`build_offset_owners` builds the map once, O(N)).
+    #[test]
+    fn recover_offset_uniqueness_evicts_preexisting_snapshot_alias_via_reverse_map() {
+        let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let mut dah = DahBackend::from(crate::index::DahIndex::new());
+        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
+
+        let utxo_count = 2;
+        // Offset X holds record B (on-device tx_id = B) and STAYS allocated,
+        // so the `is_allocated_range` gate passes and B is the rightful owner.
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = alloc.allocate(record_size).unwrap();
+        let mut b_txid = [0u8; 32];
+        b_txid[0] = 0xBB;
+        let key_b = TxKey { txid: b_txid };
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = b_txid;
+        meta.generation = 5;
+        meta.record_size = record_size as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i + 1) as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(&*data_dev, offset, &meta, &slots).unwrap();
+
+        // Pre-seed the loaded index with a STALE alias A → X (as if carried
+        // in from a persisted/snapshot index). A's cached fields are seeded
+        // from B's record image — the wrong owner — which is exactly the
+        // corruption offset-uniqueness exists to undo.
+        let mut a_txid = [0u8; 32];
+        a_txid[0] = 0xAA;
+        let key_a = TxKey { txid: a_txid };
+        let stale_entry = TxIndexEntry {
+            device_id: 0,
+            record_offset: offset,
+            utxo_count,
+            block_entry_count: 0,
+            tx_flags: 0,
+            spent_utxos: 0,
+            dah_or_preserve: 0,
+            unmined_since: 0,
+            generation: 5,
+        };
+        index.register(key_a, stale_entry).unwrap();
+        assert!(
+            index.lookup(&key_a).is_some(),
+            "precondition: stale alias A → X is present before recovery"
+        );
+
+        // Legitimate legacy Create for the rightful owner B at offset X.
+        let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key_b,
+            record_offset: offset,
+            utxo_count,
+        })
+        .unwrap();
+
+        let stats = recover_all_with_allocator(
+            &*data_dev,
+            &redo,
+            &mut index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut alloc),
+        )
+        .unwrap();
+
+        // The rightful owner B registered successfully (the create applied).
+        assert_eq!(
+            stats.entries_replayed, 1,
+            "rightful-owner Create(B, X) must apply"
+        );
+        assert_eq!(stats.entries_failed, 0);
+
+        // B → X survives.
+        let b_entry = index
+            .lookup(&key_b)
+            .expect("rightful owner B must be registered at offset X");
+        assert_eq!(b_entry.record_offset, offset);
+
+        // The stale alias A was evicted — offset-uniqueness restored.
+        assert!(
+            index.lookup(&key_a).is_none(),
+            "stale snapshot alias A → X must be evicted by offset-uniqueness"
+        );
+
+        // Exactly one key maps to X across the WHOLE index (the invariant).
+        let owners_of_x: Vec<TxKey> = index
+            .iter()
+            .filter(|(_, e)| e.record_offset == offset)
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            owners_of_x,
+            vec![key_b],
+            "exactly one key (B) may map to offset X after recovery"
         );
     }
 
