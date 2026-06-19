@@ -38,3 +38,11 @@ tarpaulin-report.json
 
 # Local release build artifacts (produced by scripts/cut-release.sh / manual builds)
 dist/
+
+# Local runtime data artifacts (server/test runs)
+*.dat
+*.dat.tombstone
+*.redb
+*.snap
+teraslab-data*
+teraslab-tombstone*

@@ -25,7 +25,7 @@ use std::time::Instant;
 ///
 /// Kept as a separate `const` because Rust does not yet allow taking
 /// `OpCode::all().len()` in a const context when `all()` returns a slice.
-pub const OP_CARDINALITY: usize = 14;
+pub const OP_CARDINALITY: usize = 16;
 
 /// Number of distinct [`Outcome`] values tracked by [`LabeledCounter`].
 pub const OUTCOME_CARDINALITY: usize = 8;
@@ -250,6 +250,10 @@ pub enum OpCode {
     Get = 12,
     /// Read spend state for a specific slot (get_spend).
     GetSpend = 13,
+    /// Remove a child from a parent's conflicting-children list.
+    RemoveConflictingChild = 14,
+    /// Query all transactions flagged conflicting.
+    QueryConflicting = 15,
 }
 
 impl OpCode {
@@ -270,6 +274,8 @@ impl OpCode {
             OpCode::MarkLongestChain => "mark_longest_chain",
             OpCode::Get => "get",
             OpCode::GetSpend => "get_spend",
+            OpCode::RemoveConflictingChild => "remove_conflicting_child",
+            OpCode::QueryConflicting => "query_conflicting",
         }
     }
 
@@ -290,6 +296,8 @@ impl OpCode {
             OpCode::MarkLongestChain,
             OpCode::Get,
             OpCode::GetSpend,
+            OpCode::RemoveConflictingChild,
+            OpCode::QueryConflicting,
         ]
     }
 }
@@ -468,6 +476,18 @@ pub struct ThreadMetrics {
     pub set_conflicting_succeeded: PaddedCounter,
     /// set_conflicting operations that failed.
     pub set_conflicting_failed: PaddedCounter,
+    /// Total remove_conflicting_child batches attempted.
+    pub remove_conflicting_child_attempted: PaddedCounter,
+    /// remove_conflicting_child items that succeeded.
+    pub remove_conflicting_child_succeeded: PaddedCounter,
+    /// remove_conflicting_child items that failed.
+    pub remove_conflicting_child_failed: PaddedCounter,
+    /// Total query_conflicting requests attempted.
+    pub query_conflicting_attempted: PaddedCounter,
+    /// query_conflicting requests that succeeded.
+    pub query_conflicting_succeeded: PaddedCounter,
+    /// query_conflicting requests that failed.
+    pub query_conflicting_failed: PaddedCounter,
     /// Total set_locked operations attempted.
     pub set_locked_attempted: PaddedCounter,
     /// set_locked operations that succeeded.
@@ -577,6 +597,12 @@ impl ThreadMetrics {
             set_conflicting_attempted: PaddedCounter::new(),
             set_conflicting_succeeded: PaddedCounter::new(),
             set_conflicting_failed: PaddedCounter::new(),
+            remove_conflicting_child_attempted: PaddedCounter::new(),
+            remove_conflicting_child_succeeded: PaddedCounter::new(),
+            remove_conflicting_child_failed: PaddedCounter::new(),
+            query_conflicting_attempted: PaddedCounter::new(),
+            query_conflicting_succeeded: PaddedCounter::new(),
+            query_conflicting_failed: PaddedCounter::new(),
             set_locked_attempted: PaddedCounter::new(),
             set_locked_succeeded: PaddedCounter::new(),
             set_locked_failed: PaddedCounter::new(),
@@ -794,6 +820,10 @@ pub struct ThreadHistograms {
     pub reassign_latency: LatencyHistogram,
     /// End-to-end latency of set_conflicting batch handlers.
     pub set_conflicting_latency: LatencyHistogram,
+    /// End-to-end latency of remove_conflicting_child batch handlers.
+    pub remove_conflicting_child_latency: LatencyHistogram,
+    /// End-to-end latency of query_conflicting handlers.
+    pub query_conflicting_latency: LatencyHistogram,
     /// End-to-end latency of set_locked batch handlers.
     pub set_locked_latency: LatencyHistogram,
     /// End-to-end latency of preserve_until batch handlers.
@@ -824,6 +854,8 @@ impl ThreadHistograms {
             mark_longest_chain_latency: LatencyHistogram::new(),
             reassign_latency: LatencyHistogram::new(),
             set_conflicting_latency: LatencyHistogram::new(),
+            remove_conflicting_child_latency: LatencyHistogram::new(),
+            query_conflicting_latency: LatencyHistogram::new(),
             set_locked_latency: LatencyHistogram::new(),
             preserve_until_latency: LatencyHistogram::new(),
             lock_wait: LatencyHistogram::new(),

@@ -744,6 +744,8 @@ pub(crate) fn handle_request(
             OP_DELETE_BATCH => m.deletes_attempted.inc(),
             OP_REASSIGN_BATCH => m.reassign_attempted.inc(),
             OP_SET_CONFLICTING_BATCH => m.set_conflicting_attempted.inc(),
+            OP_REMOVE_CONFLICTING_CHILD_BATCH => m.remove_conflicting_child_attempted.inc(),
+            OP_QUERY_CONFLICTING => m.query_conflicting_attempted.inc(),
             OP_SET_LOCKED_BATCH => m.set_locked_attempted.inc(),
             OP_PRESERVE_UNTIL_BATCH => m.preserve_until_attempted.inc(),
             OP_MARK_LONGEST_CHAIN_BATCH => m.mark_longest_chain_attempted.inc(),
@@ -2178,6 +2180,10 @@ pub(crate) fn handle_request(
             OP_MARK_LONGEST_CHAIN_BATCH => h.mark_longest_chain_latency.record_since(start),
             OP_REASSIGN_BATCH => h.reassign_latency.record_since(start),
             OP_SET_CONFLICTING_BATCH => h.set_conflicting_latency.record_since(start),
+            OP_REMOVE_CONFLICTING_CHILD_BATCH => {
+                h.remove_conflicting_child_latency.record_since(start)
+            }
+            OP_QUERY_CONFLICTING => h.query_conflicting_latency.record_since(start),
             OP_SET_LOCKED_BATCH => h.set_locked_latency.record_since(start),
             OP_PRESERVE_UNTIL_BATCH => h.preserve_until_latency.record_since(start),
             _ => {}
@@ -6818,6 +6824,22 @@ fn handle_remove_conflicting_child_batch(
         }
     };
 
+    let failed_total = errors.len() as u64;
+    let succeeded_total = (pairs.len() as u64).saturating_sub(failed_total);
+    if let Some(m) = DISPATCH_METRICS.get() {
+        m.remove_conflicting_child_succeeded.inc_by(succeeded_total);
+        m.remove_conflicting_child_failed.inc_by(failed_total);
+        use crate::metrics::{OpCode, Outcome};
+        m.operations
+            .inc_by(OpCode::RemoveConflictingChild, Outcome::Ok, succeeded_total);
+        for e in &errors {
+            m.operations.inc(
+                OpCode::RemoveConflictingChild,
+                classify_wire_error_code(e.error_code),
+            );
+        }
+    }
+
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
@@ -8382,6 +8404,15 @@ fn handle_query_conflicting(
     payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
     for key in &keys {
         payload.extend_from_slice(&key.txid);
+    }
+
+    if let Some(m) = DISPATCH_METRICS.get() {
+        // The query reads the in-memory index and always succeeds.
+        m.query_conflicting_succeeded.inc();
+        m.operations.inc(
+            crate::metrics::OpCode::QueryConflicting,
+            crate::metrics::Outcome::Ok,
+        );
     }
 
     ResponseFrame {

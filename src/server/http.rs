@@ -839,6 +839,36 @@ pub(crate) fn render_metrics_text(
     );
     prom_counter(
         &mut out,
+        "teraslab_remove_conflicting_child_attempted_total",
+        m.remove_conflicting_child_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_remove_conflicting_child_succeeded_total",
+        m.remove_conflicting_child_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_remove_conflicting_child_failed_total",
+        m.remove_conflicting_child_failed.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_query_conflicting_attempted_total",
+        m.query_conflicting_attempted.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_query_conflicting_succeeded_total",
+        m.query_conflicting_succeeded.get(),
+    );
+    prom_counter(
+        &mut out,
+        "teraslab_query_conflicting_failed_total",
+        m.query_conflicting_failed.get(),
+    );
+    prom_counter(
+        &mut out,
         "teraslab_set_locked_attempted_total",
         m.set_locked_attempted.get(),
     );
@@ -910,6 +940,16 @@ pub(crate) fn render_metrics_text(
         &mut out,
         "teraslab_set_conflicting_latency_ns",
         &h.set_conflicting_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_remove_conflicting_child_latency_ns",
+        &h.remove_conflicting_child_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_query_conflicting_latency_ns",
+        &h.query_conflicting_latency,
     );
     prom_histogram_ns(
         &mut out,
