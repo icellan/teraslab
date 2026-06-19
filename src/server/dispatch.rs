@@ -823,6 +823,14 @@ pub(crate) fn handle_request(
             redo_log,
             mutation_barrier,
         ),
+        OP_REMOVE_CONFLICTING_CHILD_BATCH => handle_remove_conflicting_child_batch(
+            request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            mutation_barrier,
+        ),
         OP_SET_LOCKED_BATCH => handle_set_locked_batch(
             request,
             engine,
@@ -3802,6 +3810,17 @@ fn compensate_replication_failure(
                         });
                     }
                 }
+                ReplicaOp::RemoveConflictingChild { child_txid, .. } => {
+                    // Reverse a remove by re-appending the child to the parent
+                    // (`key` is the parent). append/remove are exact inverses
+                    // and both idempotent. The forward redo entry mirrors the
+                    // compensating engine call for recovery replay.
+                    let _ = engine.append_conflicting_child(key, *child_txid);
+                    comp_redo.push(RedoOp::AppendConflictingChild {
+                        parent_key: *key,
+                        child_txid: *child_txid,
+                    });
+                }
             }
         }
     }
@@ -4302,6 +4321,7 @@ fn is_mutation_opcode(op: u16) -> bool {
             | OP_UNFREEZE_BATCH
             | OP_REASSIGN_BATCH
             | OP_SET_CONFLICTING_BATCH
+            | OP_REMOVE_CONFLICTING_CHILD_BATCH
             | OP_SET_LOCKED_BATCH
             | OP_PRESERVE_UNTIL_BATCH
             | OP_DELETE_BATCH
@@ -6693,6 +6713,110 @@ fn handle_set_conflicting_batch(
             );
         }
     }
+
+    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
+}
+
+/// `OP_REMOVE_CONFLICTING_CHILD_BATCH` — remove `(parent, child)` links from
+/// parents' conflicting-children lists. Mirrors [`handle_set_conflicting_batch`]'s
+/// WAL-first → engine → replicate structure, but the items are `(parent, child)`
+/// pairs and routing is by the PARENT txid (the record being mutated). The op is
+/// idempotent and carries no generation token; replication uses
+/// [`ReplicaOp::RemoveConflictingChild`].
+fn handle_remove_conflicting_child_batch(
+    req: &RequestFrame,
+    engine: &Engine,
+    max_batch: u32,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+    // C-1: exclusive visibility barrier, released before replication.
+    barrier: Option<MutationBarrier<'_>>,
+) -> ResponseFrame {
+    let pairs = match crate::protocol::codec::decode_conflicting_child_pair_batch_checked(
+        &req.payload,
+        max_batch,
+    ) {
+        Ok(p) => p,
+        Err(e) => return codec_error_response(req.request_id, "remove_conflicting_child batch", e),
+    };
+
+    let mut errors = Vec::new();
+    let mut redo_ops: Vec<RedoOp> = Vec::new();
+
+    // Phase 1: validate ownership (by PARENT) and build redo ops.
+    struct ValidRemove {
+        idx: usize,
+        parent: TxKey,
+        child: [u8; 32],
+    }
+    let mut valid_items: Vec<ValidRemove> = Vec::new();
+    for (i, (parent, child)) in pairs.iter().enumerate() {
+        if let Some(redirect_err) = check_shard_ownership(parent, i as u32, cluster, false) {
+            errors.push(redirect_err);
+            continue;
+        }
+        let parent_key = TxKey { txid: *parent };
+        redo_ops.push(RedoOp::RemoveConflictingChild {
+            parent_key,
+            child_txid: *child,
+        });
+        valid_items.push(ValidRemove {
+            idx: i,
+            parent: parent_key,
+            child: *child,
+        });
+    }
+
+    // Phase 2: WAL-first — write redo before engine mutation.
+    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+        Ok(range) => range,
+        Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
+    };
+
+    // Phase 3: apply engine mutations, build repl ops keyed by parent.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    for v in &valid_items {
+        match engine.remove_conflicting_child(&v.parent, v.child) {
+            Ok(()) => {
+                repl_ops_by_key.push((
+                    v.parent,
+                    vec![ReplicaOp::RemoveConflictingChild {
+                        tx_key: v.parent,
+                        child_txid: v.child,
+                    }],
+                ));
+            }
+            Err(err) => {
+                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
+            }
+        }
+    }
+
+    // Phase 4: replicate (+ compensation on failure).
+    let repl_outcome = match replicate_all_ops_with_barrier(
+        cluster,
+        &repl_ops_by_key,
+        redo_range,
+        &[redo_range],
+        barrier,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            let before_images = no_before_images(&repl_ops_by_key);
+            if let Some(resp) = compensate_replication_failure_or_error(
+                req.request_id,
+                cluster,
+                engine,
+                &repl_ops_by_key,
+                &before_images,
+                redo_log,
+                &[redo_range],
+            ) {
+                return resp;
+            }
+            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
+        }
+    };
 
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
@@ -10081,6 +10205,36 @@ mod tests {
         let resp2 = h.request(OP_QUERY_CONFLICTING, Vec::new());
         let count2 = u32::from_le_bytes(resp2.payload[0..4].try_into().unwrap());
         assert_eq!(count2, 1);
+    }
+
+    #[test]
+    fn dispatch_remove_conflicting_child_batch_removes_link() {
+        let h = DispatchTestHarness::new();
+        let parent = DispatchTestHarness::make_txid(1);
+        assert_eq!(h.create_tx(parent, 2).status, STATUS_OK);
+        let pk = TxKey { txid: parent };
+        let c1 = [0xA1u8; 32];
+        let c2 = [0xB2u8; 32];
+        h.engine.append_conflicting_child(&pk, c1).unwrap();
+        h.engine.append_conflicting_child(&pk, c2).unwrap();
+
+        // [count=1][parent][c1]
+        let payload = crate::protocol::codec::encode_conflicting_child_pair_batch(&[(parent, c1)]);
+        let resp = h.request(OP_REMOVE_CONFLICTING_CHILD_BATCH, payload);
+        assert_eq!(resp.status, STATUS_OK);
+
+        let remaining = h.engine.read_conflicting_children(&pk).unwrap();
+        assert_eq!(
+            remaining,
+            vec![c2],
+            "c1 removed via the batch op, c2 remains"
+        );
+
+        // Idempotent: removing c1 again still succeeds, list unchanged.
+        let payload2 = crate::protocol::codec::encode_conflicting_child_pair_batch(&[(parent, c1)]);
+        let resp2 = h.request(OP_REMOVE_CONFLICTING_CHILD_BATCH, payload2);
+        assert_eq!(resp2.status, STATUS_OK);
+        assert_eq!(h.engine.read_conflicting_children(&pk).unwrap(), vec![c2]);
     }
 
     // -----------------------------------------------------------------------

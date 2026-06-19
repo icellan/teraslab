@@ -210,6 +210,10 @@ enum SecondaryReconcile {
 pub struct PendingAppendConflictingChild {
     pub parent_key: TxKey,
     pub child_txid: [u8; 32],
+    /// `false` = append the child (`Engine::append_conflicting_child`);
+    /// `true` = remove it (`Engine::remove_conflicting_child`). Both are
+    /// drained in redo-log order after engine construction; both idempotent.
+    pub is_remove: bool,
 }
 
 impl RecoveryStats {
@@ -830,6 +834,21 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 pending_conflicting_children.push(PendingAppendConflictingChild {
                     parent_key: *parent_key,
                     child_txid: *child_txid,
+                    is_remove: false,
+                });
+                ReplayResult::Skipped
+            }
+            RedoOp::RemoveConflictingChild {
+                parent_key,
+                child_txid,
+            } => {
+                // Same deferred-drain model as the append: the engine applies
+                // it post-construction via `remove_conflicting_child`. Order is
+                // preserved (log order), and both ops are idempotent.
+                pending_conflicting_children.push(PendingAppendConflictingChild {
+                    parent_key: *parent_key,
+                    child_txid: *child_txid,
+                    is_remove: true,
                 });
                 ReplayResult::Skipped
             }
@@ -1508,6 +1527,7 @@ fn replay_entry(
             record_size,
         } => replay_delete(device, index, tx_key, *record_offset, *record_size),
         RedoOp::AppendConflictingChild { .. } => ReplayResult::Skipped,
+        RedoOp::RemoveConflictingChild { .. } => ReplayResult::Skipped,
         // F-X-022: `AppendDeletedChild` is audit/diagnostic + defense-in-depth
         // at the idempotent-respend short-circuit. The primary spend-rejection
         // path is the slot's `UTXO_PRUNED` status, which the
@@ -3648,6 +3668,7 @@ mod tests {
             vec![PendingAppendConflictingChild {
                 parent_key,
                 child_txid,
+                is_remove: false,
             }]
         );
 

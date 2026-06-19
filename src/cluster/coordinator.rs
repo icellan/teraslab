@@ -6973,6 +6973,23 @@ pub fn redo_entry_to_replica_op(
                 master_generation: gen_for(tx_key),
             })
         }
+        RedoOp::RemoveConflictingChild {
+            parent_key,
+            child_txid,
+        } => {
+            // Forward the removal: unlike an append (re-derived on the target
+            // from the child's Create/SetConflicting), a remove has no
+            // re-derivation source, so dropping it would leave the migration
+            // target with a stale child in the parent's list. Gated on the
+            // PARENT shard (the record being mutated).
+            if ShardTable::shard_for_key(parent_key) != shard {
+                return None;
+            }
+            Some(ReplicaOp::RemoveConflictingChild {
+                tx_key: *parent_key,
+                child_txid: *child_txid,
+            })
+        }
         RedoOp::SetLocked { tx_key, value } => {
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;

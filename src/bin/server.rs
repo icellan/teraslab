@@ -926,13 +926,20 @@ fn main() {
     // loop can pre-filter (audit follow-up FUP-G10-015).
     if !pending_conflicting_children.is_empty() {
         for pending in &pending_conflicting_children {
-            if let Err(e) = engine.append_conflicting_child(&pending.parent_key, pending.child_txid)
-            {
+            // Drain in redo-log order: append vs remove per the recorded intent.
+            // Both engine ops are idempotent, so re-draining is safe.
+            let result = if pending.is_remove {
+                engine.remove_conflicting_child(&pending.parent_key, pending.child_txid)
+            } else {
+                engine.append_conflicting_child(&pending.parent_key, pending.child_txid)
+            };
+            if let Err(e) = result {
                 tracing::error!(
                     parent_key = ?pending.parent_key,
                     child_txid = ?pending.child_txid,
+                    is_remove = pending.is_remove,
                     err = %e,
-                    "recovery: failed to drain conflicting-child append intent; aborting startup",
+                    "recovery: failed to drain conflicting-child intent; aborting startup",
                 );
                 std::process::exit(1);
             }

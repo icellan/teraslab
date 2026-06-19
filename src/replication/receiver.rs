@@ -1665,6 +1665,18 @@ pub fn apply_op_journal(
                 Err(e) => Err(format!("set_conflicting: {e}")),
             }
         }
+        ReplicaOp::RemoveConflictingChild { tx_key, child_txid } => {
+            // `tx_key` is the parent; remove is idempotent and tolerates a
+            // parent absent on this replica (it may not hold the parent shard).
+            match engine.remove_conflicting_child(tx_key, *child_txid) {
+                Ok(()) => Ok(()),
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    record_apply_skipped_missing_tx("remove_conflicting_child", tx_key);
+                    Ok(())
+                }
+                Err(e) => Err(format!("remove_conflicting_child: {e}")),
+            }
+        }
         ReplicaOp::SetLocked { tx_key, value, .. } => {
             let req = SetLockedRequest {
                 tx_key: *tx_key,
@@ -2185,6 +2197,14 @@ fn build_post_apply_redo_op(
             current_block_height: *current_block_height,
             block_height_retention: *retention,
         })),
+        ReplicaOp::RemoveConflictingChild { tx_key, child_txid } => {
+            // Crash-safety: write the received remove to this replica's own
+            // redo log before apply (same deferred-drain replay as the master).
+            Ok(Some(RedoOp::RemoveConflictingChild {
+                parent_key: *tx_key,
+                child_txid: *child_txid,
+            }))
+        }
         ReplicaOp::SetLocked { tx_key, value, .. } => Ok(Some(RedoOp::SetLocked {
             tx_key: *tx_key,
             value: *value,

@@ -15,6 +15,10 @@ pub const OP_SET_LOCKED_BATCH: u16 = 9;
 pub const OP_PRESERVE_UNTIL_BATCH: u16 = 10;
 pub const OP_DELETE_BATCH: u16 = 11;
 pub const OP_MARK_LONGEST_CHAIN_BATCH: u16 = 12;
+/// Remove children from parents' conflicting-children lists. Request payload:
+/// `[count:u32 LE]` then `count` × `[parent_txid:32][child_txid:32]`. Routed by
+/// the parent txid. Backs Teranode's `RemoveFromConflictingChildren`.
+pub const OP_REMOVE_CONFLICTING_CHILD_BATCH: u16 = 13;
 
 // Reads
 pub const OP_GET_BATCH: u16 = 20;

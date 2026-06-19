@@ -4350,6 +4350,165 @@ impl Engine {
         }
     }
 
+    /// Remove a child txid from a parent record's conflicting-children list.
+    ///
+    /// The exact inverse of [`Self::append_conflicting_child`]: same bounded
+    /// CAS/retry loop, same R-024/R-143 ordering (durable intent first, build
+    /// the replacement block outside the stripe lock, re-lock only to validate
+    /// the snapshot and commit, free the old block after the metadata points at
+    /// the replacement).
+    ///
+    /// Idempotent: a no-op (returns `Ok(())`) when the parent is absent (it may
+    /// live on another cluster node), when the list is empty, or when the child
+    /// is not present. The empty-list result writes a `0` offset sentinel and
+    /// allocates no replacement block.
+    pub fn remove_conflicting_child(
+        &self,
+        parent_key: &TxKey,
+        child_txid: [u8; 32],
+    ) -> Result<(), SpendError> {
+        const MAX_RETRIES: u32 = 16;
+        let mut intent_logged = false;
+        let mut attempt: u32 = 0;
+        loop {
+            let (ro, count, offset, mut children) = {
+                let _guard = self.locks.lock(parent_key);
+                // G-4: a backend read error must not collapse to "parent absent".
+                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("index lookup failed: {e}"),
+                    }
+                })? {
+                    Some(e) => e,
+                    None => return Ok(()),
+                };
+                let ro = entry.record_offset;
+                let meta = self.read_metadata_fast(ro)?;
+                let count = { meta.conflicting_children_count } as usize;
+                let offset = { meta.conflicting_children_offset };
+
+                let children = self.read_conflicting_children_at(count, offset)?;
+                // Inverse of append's dedup: if the child isn't present (which
+                // includes the empty-list case), there is nothing to remove.
+                if !children.contains(&child_txid) {
+                    return Ok(());
+                }
+
+                (ro, count, offset, children)
+            };
+
+            children.retain(|c| c != &child_txid);
+            let new_len = children.len();
+
+            // R-221: persist the high-level remove intent before any
+            // allocator/new-block work so a crash after the replacement block
+            // write but before the metadata write can be recovered by replaying
+            // this idempotent remove after engine construction.
+            if !intent_logged {
+                if let Some(log) = self.redo_log_handle() {
+                    log.lock()
+                        .append_and_flush(crate::redo::RedoOp::RemoveConflictingChild {
+                            parent_key: *parent_key,
+                            child_txid,
+                        })
+                        .map_err(|e| SpendError::StorageError {
+                            detail: format!("remove conflicting child redo: {e}"),
+                        })?;
+                }
+                intent_logged = true;
+            }
+
+            // R-024/R-143: build the smaller replacement block unlocked, then
+            // re-lock to validate + commit. An empty result needs no block —
+            // use the `0` offset sentinel (the same one `read_conflicting_children_at`
+            // treats as "no list").
+            let new_offset = if new_len == 0 {
+                0
+            } else {
+                self.allocate_conflicting_children_block(&children)?
+            };
+
+            let mut parent_gone = false;
+            let committed = {
+                let _guard = self.locks.lock(parent_key);
+                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("index lookup failed: {e}"),
+                    }
+                })?;
+                match looked_up {
+                    None => {
+                        parent_gone = true;
+                        false
+                    }
+                    Some(entry) if entry.record_offset != ro => false,
+                    Some(_) => {
+                        let mut meta = self.read_metadata_fast(ro)?;
+                        let latest_count = { meta.conflicting_children_count } as usize;
+                        let latest_offset = { meta.conflicting_children_offset };
+                        if latest_count != count || latest_offset != offset {
+                            false
+                        } else {
+                            meta.conflicting_children_count = new_len as u8;
+                            meta.conflicting_children_offset = new_offset;
+                            meta.generation = { meta.generation }.wrapping_add(1);
+                            meta.updated_at = self.now_millis();
+                            self.write_metadata_fast(ro, &meta)?;
+                            true
+                        }
+                    }
+                }
+            };
+
+            if parent_gone {
+                // The replacement block (if any) is now orphaned.
+                if new_offset != 0 {
+                    self.free_conflicting_children_block(new_offset, new_len)?;
+                }
+                return Ok(());
+            }
+
+            if committed {
+                if count > 0 && offset != 0 {
+                    // Post-commit cleanup of the OLD block (sized by the OLD
+                    // count). A free failure cannot propagate — the remove
+                    // already SUCCEEDED — so surface the leak via tracing.
+                    if let Err(err) = self.free_conflicting_children_block(offset, count) {
+                        tracing::error!(
+                            target: "teraslab::engine::orphan",
+                            orphan = true,
+                            kind = "conflicting_children_old_block",
+                            offset = offset,
+                            bytes = (count * 32) as u64,
+                            error = %err,
+                            "post-commit free of old conflicting-children block failed; bytes leaked until R-049 sweep"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+
+            // CAS lost / record moved: free the speculative new block (if any)
+            // and retry.
+            if new_offset != 0 {
+                self.free_conflicting_children_block(new_offset, new_len)?;
+            }
+
+            attempt += 1;
+            if attempt >= MAX_RETRIES {
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "remove_conflicting_child: CAS contention exceeded \
+                         {MAX_RETRIES} retries on parent — likely concurrent \
+                         reorg storm against the same parent record",
+                    ),
+                });
+            }
+            let backoff_us = 1u64 << attempt.min(15);
+            std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+        }
+    }
+
     fn read_conflicting_children_at(
         &self,
         count: usize,
@@ -9743,6 +9902,89 @@ mod tests {
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert_eq!({ meta.conflicting_children_count }, 3);
         assert_ne!({ meta.conflicting_children_offset }, 0);
+    }
+
+    #[test]
+    fn remove_conflicting_child_filters_one_preserves_rest() {
+        let h = TestHarness::new(1, TxFlags::empty());
+        let c1 = [0xA1u8; 32];
+        let c2 = [0xB2u8; 32];
+        let c3 = [0xC3u8; 32];
+        h.engine.append_conflicting_child(&h.key, c1).unwrap();
+        h.engine.append_conflicting_child(&h.key, c2).unwrap();
+        h.engine.append_conflicting_child(&h.key, c3).unwrap();
+        let gen_before = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        h.engine.remove_conflicting_child(&h.key, c2).unwrap();
+
+        let children = h.engine.read_conflicting_children(&h.key).unwrap();
+        assert_eq!(
+            children,
+            vec![c1, c3],
+            "removed child gone, order preserved"
+        );
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.conflicting_children_count }, 2);
+        assert_ne!({ meta.conflicting_children_offset }, 0);
+        assert!(
+            { meta.generation } > gen_before,
+            "a real remove must bump generation"
+        );
+    }
+
+    #[test]
+    fn remove_conflicting_child_to_empty_sets_offset_zero() {
+        let h = TestHarness::new(1, TxFlags::empty());
+        let c1 = [0xD4u8; 32];
+        h.engine.append_conflicting_child(&h.key, c1).unwrap();
+        h.engine.remove_conflicting_child(&h.key, c1).unwrap();
+
+        assert!(
+            h.engine
+                .read_conflicting_children(&h.key)
+                .unwrap()
+                .is_empty()
+        );
+        let meta = h.engine.read_metadata(&h.key).unwrap();
+        assert_eq!({ meta.conflicting_children_count }, 0);
+        assert_eq!(
+            { meta.conflicting_children_offset },
+            0,
+            "empty list uses the 0 offset sentinel (old block freed)"
+        );
+    }
+
+    #[test]
+    fn remove_conflicting_child_idempotent_missing_child() {
+        let h = TestHarness::new(1, TxFlags::empty());
+        let c1 = [0xE5u8; 32];
+        h.engine.append_conflicting_child(&h.key, c1).unwrap();
+        let gen_before = { h.engine.read_metadata(&h.key).unwrap().generation };
+
+        // Removing a child that was never added is a no-op.
+        h.engine
+            .remove_conflicting_child(&h.key, [0x99u8; 32])
+            .unwrap();
+
+        assert_eq!(
+            h.engine.read_conflicting_children(&h.key).unwrap(),
+            vec![c1]
+        );
+        assert_eq!(
+            { h.engine.read_metadata(&h.key).unwrap().generation },
+            gen_before,
+            "a no-op remove must not bump generation or rewrite metadata"
+        );
+    }
+
+    #[test]
+    fn remove_conflicting_child_idempotent_missing_parent() {
+        let h = TestHarness::new(1, TxFlags::empty());
+        // Parent not in the index -> Ok(()) (the parent may live on another node).
+        let absent = TxKey { txid: [0xFEu8; 32] };
+        h.engine
+            .remove_conflicting_child(&absent, [0x01u8; 32])
+            .unwrap();
     }
 
     /// KO-5 regression: the conflicting-children list is capped at the

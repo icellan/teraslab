@@ -417,6 +417,61 @@ pub fn decode_txid_batch_checked(
     Ok((shared, txids))
 }
 
+/// A `(parent_txid, child_txid)` pair for `OP_REMOVE_CONFLICTING_CHILD_BATCH`.
+pub type ConflictingChildPair = ([u8; 32], [u8; 32]);
+
+/// Encode an `OP_REMOVE_CONFLICTING_CHILD_BATCH` payload: `[count:u32 LE]`
+/// then `count` × `[parent_txid:32][child_txid:32]` (64 bytes/item). No shared
+/// params. The wire layout must match the Go client's
+/// `encodeRemoveConflictingChildBatch`.
+pub fn encode_conflicting_child_pair_batch(pairs: &[ConflictingChildPair]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + pairs.len() * 64);
+    buf.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
+    for (parent, child) in pairs {
+        buf.extend_from_slice(parent);
+        buf.extend_from_slice(child);
+    }
+    buf
+}
+
+/// Decode an `OP_REMOVE_CONFLICTING_CHILD_BATCH` payload — the inverse of
+/// [`encode_conflicting_child_pair_batch`]. Returns `(parent, child)` pairs.
+/// Validates the count against `max_batch` BEFORE allocating (mirrors
+/// [`decode_txid_batch_checked`]).
+pub fn decode_conflicting_child_pair_batch_checked(
+    data: &[u8],
+    max_batch: u32,
+) -> Result<Vec<ConflictingChildPair>, CodecError> {
+    const HEADER: usize = 4;
+    if data.len() < HEADER {
+        return Err(CodecError::HeaderTooShort {
+            need: HEADER,
+            have: data.len(),
+        });
+    }
+    let count = get_u32(data, 0);
+    validate_batch_count(count, max_batch, 64, data.len() - HEADER)?;
+    let count = count as usize;
+    let mut pairs = Vec::with_capacity(count);
+    let mut pos = HEADER;
+    for _ in 0..count {
+        if pos + 64 > data.len() {
+            return Err(CodecError::TruncatedBatch {
+                count: count as u32,
+                per_item_min: 64,
+                available: data.len().saturating_sub(HEADER),
+            });
+        }
+        let mut parent = [0u8; 32];
+        parent.copy_from_slice(&data[pos..pos + 32]);
+        let mut child = [0u8; 32];
+        child.copy_from_slice(&data[pos + 32..pos + 64]);
+        pairs.push((parent, child));
+        pos += 64;
+    }
+    Ok(pairs)
+}
+
 /// Decode a batch of txids with a given shared params size using
 /// [`MAX_DECODE_BATCH`].
 pub fn decode_txid_batch(data: &[u8], shared_len: usize) -> Option<(Vec<u8>, Vec<[u8; 32]>)> {
@@ -1883,6 +1938,35 @@ pub fn decode_stream_end(payload: &[u8]) -> Option<StreamEnd> {
 mod tests {
     use super::*;
     use crate::protocol::opcodes::*;
+
+    #[test]
+    fn conflicting_child_pair_batch_round_trip() {
+        let pairs = vec![
+            ([1u8; 32], [2u8; 32]),
+            ([3u8; 32], [4u8; 32]),
+            ([0xFFu8; 32], [0x00u8; 32]),
+        ];
+        let buf = encode_conflicting_child_pair_batch(&pairs);
+        assert_eq!(buf.len(), 4 + pairs.len() * 64);
+        let got = decode_conflicting_child_pair_batch_checked(&buf, 100).unwrap();
+        assert_eq!(got, pairs);
+    }
+
+    #[test]
+    fn conflicting_child_pair_batch_rejects_oversized_count() {
+        let buf = encode_conflicting_child_pair_batch(&[([1u8; 32], [2u8; 32])]);
+        assert!(matches!(
+            decode_conflicting_child_pair_batch_checked(&buf, 0),
+            Err(CodecError::BatchTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn conflicting_child_pair_batch_rejects_truncated() {
+        let mut buf = encode_conflicting_child_pair_batch(&[([1u8; 32], [2u8; 32])]);
+        buf.truncate(buf.len() - 1); // drop a byte from the last pair
+        assert!(decode_conflicting_child_pair_batch_checked(&buf, 100).is_err());
+    }
 
     fn test_txid(n: u8) -> [u8; 32] {
         let mut t = [0u8; 32];

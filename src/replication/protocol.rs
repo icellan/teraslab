@@ -106,6 +106,12 @@ const OP_PRUNE_SLOT_IF_SPENT_BY: u8 = 15;
 /// disabled. Mirrors the `CreateV2`/`SpendV2` versioning precedent: new tag,
 /// old tag retained.
 const OP_DELETE_V2: u8 = 16;
+/// Remove a child txid from a parent's conflicting-children list. Replicated
+/// so receivers (and migration targets) apply the same removal — there is no
+/// re-derivation path for a removal the way an append is re-derived from a
+/// child's Create/SetConflicting. Idempotent, keyed on (parent, child); no
+/// generation token (like [`OP_DELETE`]/[`OP_DELETE_V2`]).
+const OP_REMOVE_CONFLICTING_CHILD: u8 = 17;
 
 /// Fixed wire payload of a [`ReplicaOp::DeleteV2`] op, AFTER the 1-byte
 /// [`OP_DELETE_V2`] tag. `#[repr(C, packed)]` pins the on-wire byte order to
@@ -192,6 +198,12 @@ pub enum ReplicaOp {
         retention: u32,
         master_generation: u32,
     },
+    /// Remove `child_txid` from `tx_key`'s (the parent's) conflicting-children
+    /// list. Idempotent; carries no generation token.
+    RemoveConflictingChild {
+        tx_key: TxKey,
+        child_txid: [u8; 32],
+    },
     SetLocked {
         tx_key: TxKey,
         value: bool,
@@ -272,6 +284,7 @@ impl ReplicaOp {
             | Self::Unfreeze { tx_key, .. }
             | Self::Reassign { tx_key, .. }
             | Self::SetConflicting { tx_key, .. }
+            | Self::RemoveConflictingChild { tx_key, .. }
             | Self::SetLocked { tx_key, .. }
             | Self::PreserveUntil { tx_key, .. }
             | Self::Create { tx_key, .. }
@@ -331,7 +344,10 @@ impl ReplicaOp {
             Self::Delete { .. }
             | Self::DeleteV2 { .. }
             | Self::PruneSlot { .. }
-            | Self::PruneSlotIfSpentBy { .. } => None,
+            | Self::PruneSlotIfSpentBy { .. }
+            // RemoveConflictingChild is an idempotent (parent, child) remove,
+            // like Delete — no master-generation ordering token.
+            | Self::RemoveConflictingChild { .. } => None,
         }
     }
 }
@@ -467,6 +483,11 @@ impl ReplicaOp {
                 buf.extend_from_slice(&current_block_height.to_le_bytes());
                 buf.extend_from_slice(&retention.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
+            }
+            ReplicaOp::RemoveConflictingChild { tx_key, child_txid } => {
+                buf.push(OP_REMOVE_CONFLICTING_CHILD);
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(child_txid);
             }
             ReplicaOp::SetLocked {
                 tx_key,
@@ -687,6 +708,18 @@ impl ReplicaOp {
                         master_generation: r_u32(rest, 41),
                     },
                     46,
+                ))
+            }
+            OP_REMOVE_CONFLICTING_CHILD => {
+                need(rest, 64)?; // 32 (parent) + 32 (child)
+                let mut child_txid = [0u8; 32];
+                child_txid.copy_from_slice(&rest[32..64]);
+                Ok((
+                    ReplicaOp::RemoveConflictingChild {
+                        tx_key: read_key(rest),
+                        child_txid,
+                    },
+                    65,
                 ))
             }
             OP_SET_LOCKED => {
@@ -1389,6 +1422,10 @@ mod tests {
                 current_block_height: 500,
                 retention: 288,
                 master_generation: 0,
+            },
+            ReplicaOp::RemoveConflictingChild {
+                tx_key: key(8),
+                child_txid: [0xC1; 32],
             },
             ReplicaOp::SetLocked {
                 tx_key: key(9),
