@@ -1,5 +1,19 @@
 # Cluster Bulletproofing — Remediation Plan
 
+> **STATUS — COMPLETE (reconciled against HEAD 2026-06-19).** All waves below
+> have landed; every P-finding they target (P2–P15) is FIXED at HEAD, confirmed
+> by a two-stage (independent verify + adversarial refute) reconciliation sweep.
+> This document is now a historical plan-of-record, not outstanding work.
+> Wave → landed commits:
+> - **W0** (harness/CI): `e28a3fd` (prebuild + budgets, P8/P9), `c5fcf35` (P12 harness bug), `68d5055` (per-scenario SWIM config + dead-script cleanup, P13/P15).
+> - **W1**: `4a37a55` (W1.1 reactivation-vs-election, P2), `38a8c4a` (W1.2 receiver-aware timeout, P4), `4232f26` (W1.3 bounded fan-out permit, P7), `9229e44` (W1.4 sub-batch fence window, P14).
+> - **W2**: `5b7c1b7` (migration applies take SHARED visibility guard, P3).
+> - **W3** (SWIM): `56bda4e` (incarnation refutation + suspect re-probe, W3.1/W3.2), `6ba5e94` (proposal debounce, W3.3), `d5ca9ee` (refutation overflow hardening) — together close P6.
+> - **W4**: `b3e5cfb` (compensation re-drive to current holder set, P5), `163abe3` (error-20 contract, P11).
+> - **W5**: `1915256` (un-mask the three softened oracles, P10).
+> - **W6**: `8d5361f` (rendezvous/HRW bounded-movement placement).
+> - **W7**: validation is operational (CI tiers wired in `weekly.yml` run scenarios 01–16,17); the only remaining gate is the deployment-time tombstone-GC finality soak (feature gated OFF by default).
+
 Source: `CLUSTER_E2E_FLAKINESS.md` (audit of 2026-06-12). Goal: every finding
 fixed or explicitly decided, with the cluster correct under churn, partitions,
 crashes, and migration — then fast. Correctness always wins ties.

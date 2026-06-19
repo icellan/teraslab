@@ -334,23 +334,32 @@ failures is wrong). The current half-and-half maximizes flakiness. See §7 Q3.
 
 ## 5. Severity-ranked findings
 
+> **STATUS — ALL RESOLVED (reconciled against HEAD 2026-06-19).** Every finding
+> below (P1–P15) is FIXED at HEAD. This table's original "OPEN" labels were a
+> 2026-06-12 snapshot that predated the Wave 1–7 remediation; the fixes landed
+> on/after 2026-06-13. Verdicts were re-confirmed by a two-stage (independent
+> verify + adversarial refute) reconciliation sweep, high confidence, each tied
+> to the fix commit shown. The rest of this document (root-cause R1–R9, repro
+> recipes) is retained as historical/reference material — it explains *how* each
+> was fixed, not outstanding work.
+
 | ID | Finding | Severity | Status |
 |---|---|---|---|
-| P1 | Visibility barrier held across replication RTT → bidirectional deadlock, error-20 wedge (R1) | **CRITICAL** (availability collapse; ambiguous-outcome writes) | **FIXED** at HEAD (`e6e65f0`); validated by 2/2 post-fix CI runs |
-| P2 | Reactivation loop vs master election → spontaneous ~2700-shard migration storms on settled clusters (R2) | **HIGH** | OPEN |
-| P3 | Migration batches hold the engine-wide exclusive barrier per 1000-op apply+fsync; foreground ACKs starve (R3) | **HIGH** | OPEN |
-| P4 | Migration-pressure timeout escalation is sender-local; 3 s kept exactly when the replica is slowest (R4) | **HIGH** | OPEN |
-| P5 | Compensation delete may never reach a re-mastered divergent replica (R7b) | **HIGH if confirmed** (durable divergence) | OPEN — needs targeted test |
-| P6 | No SWIM incarnation refutation + dead suspicion-backoff code + zero proposal debounce + (1−1/n) round-robin reshuffle: one flap = two cluster-wide storms (R6) | **HIGH** | OPEN |
-| P7 | Untimed fan-out permit condvar; healthy-shard writes block behind a wedged replica (R5) | MEDIUM | OPEN |
-| P8 | Scenario 01 budget = 120 s including ~60 s compile + 4 cluster lifecycles | **HIGH (test)** — the only live PR-tier flake at HEAD | OPEN |
-| P9 | Budget inversions 09/11/13 (external 300 s < internal 600 s); internal==external everywhere else | MEDIUM (test) | OPEN |
-| P10 | Masked oracles (sc04 4.7 unconditional OK; sc09 spent_utxos filter; sc14.3 ≤90 % NotFound) — flaky tests hiding suspected real replication bugs | **HIGH (test integrity)** | OPEN |
-| P11 | Error-20 retry asymmetry (seed 16× vs spend 0×) + harness reconciliation racing compensation (R7a, R9) | MEDIUM | OPEN |
-| P12 | scenario_15.8:761 waits on the dead node | LOW (test bug) | OPEN |
-| P13 | Test SWIM config (150/1000 ms) 5× more aggressive than defaults on the slowest plausible environment | MEDIUM (config) | OPEN |
-| P14 | `pipeline_batch = chunk.len()` contradicts documented 32-shard sub-batching; fences held across whole chunk (coordinator.rs:3476-3484) | MEDIUM | OPEN |
-| P15 | Dead harness scripts (`scripts/partition_network.sh` etc.), tracked generated artifacts, stale timing comments | LOW | OPEN |
+| P1 | Visibility barrier held across replication RTT → bidirectional deadlock, error-20 wedge (R1) | **CRITICAL** (availability collapse; ambiguous-outcome writes) | **FIXED** (`e6e65f0`); validated by 2/2 post-fix CI runs |
+| P2 | Reactivation loop vs master election → spontaneous ~2700-shard migration storms on settled clusters (R2) | **HIGH** | **FIXED** (`4a37a55`, W1.1) — settled path compares `intended_master` (elected intent), not recomputed round-robin |
+| P3 | Migration batches hold the engine-wide exclusive barrier per 1000-op apply+fsync; foreground ACKs starve (R3) | **HIGH** | **FIXED** (`5b7c1b7`, W2) — migration `OP_REPLICA_BATCH` takes SHARED visibility guard |
+| P4 | Migration-pressure timeout escalation is sender-local; 3 s kept exactly when the replica is slowest (R4) | **HIGH** | **FIXED** (`38a8c4a`, W1.2) — receiver-aware escalation |
+| P5 | Compensation delete may never reach a re-mastered divergent replica (R7b) | **HIGH if confirmed** (durable divergence) | **FIXED** (`b3e5cfb`, W4.1) — compensation re-drives to current shard holder set incl. master |
+| P6 | No SWIM incarnation refutation + dead suspicion-backoff code + zero proposal debounce + (1−1/n) round-robin reshuffle: one flap = two cluster-wide storms (R6) | **HIGH** | **FIXED** (`56bda4e`+`d5ca9ee` refutation/re-probe, `6ba5e94` proposal debounce, `8d5361f` HRW placement) |
+| P7 | Untimed fan-out permit condvar; healthy-shard writes block behind a wedged replica (R5) | MEDIUM | **FIXED** (`4232f26`, W1.3) — bounded per-replica permit wait |
+| P8 | Scenario 01 budget = 120 s including ~60 s compile + 4 cluster lifecycles | **HIGH (test)** | **FIXED** (`e28a3fd`, W0.1/W0.2) — binaries prebuilt outside timeout; budget raised |
+| P9 | Budget inversions 09/11/13 (external 300 s < internal 600 s); internal==external everywhere else | MEDIUM (test) | **FIXED** (`e28a3fd`, W0.2) |
+| P10 | Masked oracles (sc04 4.7 unconditional OK; sc09 spent_utxos filter; sc14.3 ≤90 % NotFound) — flaky tests hiding suspected real replication bugs | **HIGH (test integrity)** | **FIXED** (`1915256`, W5) — three softened oracles restored to strict |
+| P11 | Error-20 retry asymmetry (seed 16× vs spend 0×) + harness reconciliation racing compensation (R7a, R9) | MEDIUM | **FIXED** (`163abe3`, W4.2) |
+| P12 | scenario_15.8:761 waits on the dead node | LOW (test bug) | **FIXED** (`c5fcf35`, W0.3) |
+| P13 | Test SWIM config (150/1000 ms) 5× more aggressive than defaults on the slowest plausible environment | MEDIUM (config) | **FIXED** (`68d5055`, W0.4) — per-scenario SWIM config |
+| P14 | `pipeline_batch = chunk.len()` contradicts documented 32-shard sub-batching; fences held across whole chunk (coordinator.rs:3476-3484) | MEDIUM | **FIXED** (`9229e44`, W1.4) |
+| P15 | Dead harness scripts (`scripts/partition_network.sh` etc.), tracked generated artifacts, stale timing comments | LOW | **FIXED** (`68d5055`, W0.3) |
 
 ---
 
