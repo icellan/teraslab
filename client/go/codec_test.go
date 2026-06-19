@@ -285,12 +285,12 @@ func TestCreateBatch100Items(t *testing.T) {
 			hashes[v][1] = n
 		}
 		items[i] = CreateItem{
-			TxID:           testTxID(n),
-			TxVersion:      2,
-			Fee:            1000 + uint64(i),
-			SizeInBytes:    250,
-			CreatedAt:      1700000000000 + uint64(i),
-			UtxoHashes:     hashes,
+			TxID:        testTxID(n),
+			TxVersion:   2,
+			Fee:         1000 + uint64(i),
+			SizeInBytes: 250,
+			CreatedAt:   1700000000000 + uint64(i),
+			UtxoHashes:  hashes,
 		}
 	}
 	encoded := encodeCreateBatch(nil, items)
@@ -433,9 +433,9 @@ func TestSparseErrorsRoundTrip(t *testing.T) {
 	var buf []byte
 	buf = appendU32(buf, 3) // error_count
 	// Error 1
-	buf = appendU32(buf, 3)                // item_index
+	buf = appendU32(buf, 3)                 // item_index
 	buf = appendU16(buf, ErrCodeTxNotFound) // error_code
-	buf = appendU16(buf, 0)                // data_len
+	buf = appendU16(buf, 0)                 // data_len
 	// Error 2
 	buf = appendU32(buf, 7)
 	buf = appendU16(buf, ErrCodeAlreadySpent)
@@ -752,6 +752,74 @@ func TestQueryOldUnminedResponseDecode(t *testing.T) {
 	}
 	if txids[0] != testTxID(1) || txids[2] != testTxID(3) {
 		t.Error("txid mismatch")
+	}
+}
+
+func TestQueryConflictingEncode(t *testing.T) {
+	encoded := encodeQueryConflicting(nil)
+	if len(encoded) != 0 {
+		t.Fatalf("encoded length = %d, want 0 (empty payload)", len(encoded))
+	}
+}
+
+func TestQueryConflictingResponseDecode(t *testing.T) {
+	t1, t2, t3 := testTxID(1), testTxID(2), testTxID(3)
+	var buf []byte
+	buf = appendU32(buf, 3)
+	buf = append(buf, t1[:]...)
+	buf = append(buf, t2[:]...)
+	buf = append(buf, t3[:]...)
+
+	txids, err := decodeQueryConflictingResponse(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(txids) != 3 {
+		t.Fatalf("got %d txids, want 3", len(txids))
+	}
+	if txids[0] != testTxID(1) || txids[1] != testTxID(2) || txids[2] != testTxID(3) {
+		t.Error("txid mismatch")
+	}
+}
+
+func TestRemoveConflictingChildBatchRoundTrip(t *testing.T) {
+	pairs := []ConflictingChildPair{
+		{Parent: testTxID(1), Child: testTxID(11)},
+		{Parent: testTxID(2), Child: testTxID(22)},
+	}
+	encoded := encodeRemoveConflictingChildBatch(nil, pairs)
+
+	// count(4) + 2 * (parent(32) + child(32)) = 4 + 128 = 132
+	if len(encoded) != 4+2*64 {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), 4+2*64)
+	}
+	if getU32(encoded[0:4]) != 2 {
+		t.Errorf("count = %d, want 2", getU32(encoded[0:4]))
+	}
+
+	// Verify byte layout: parent comes first within each 64-byte item.
+	pos := 4
+	for i, p := range pairs {
+		var gotParent, gotChild TxID
+		copy(gotParent[:], encoded[pos:pos+32])
+		copy(gotChild[:], encoded[pos+32:pos+64])
+		if gotParent != p.Parent {
+			t.Errorf("pair %d: parent mismatch", i)
+		}
+		if gotChild != p.Child {
+			t.Errorf("pair %d: child mismatch", i)
+		}
+		pos += 64
+	}
+}
+
+func TestRemoveConflictingChildBatchEmpty(t *testing.T) {
+	encoded := encodeRemoveConflictingChildBatch(nil, nil)
+	if len(encoded) != 4 {
+		t.Fatalf("encoded length = %d, want 4 (just count)", len(encoded))
+	}
+	if getU32(encoded[0:4]) != 0 {
+		t.Errorf("count = %d, want 0", getU32(encoded[0:4]))
 	}
 }
 

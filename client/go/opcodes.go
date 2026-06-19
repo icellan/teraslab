@@ -17,6 +17,10 @@ const (
 	OpPreserveUntilBatch    uint16 = 10
 	OpDeleteBatch           uint16 = 11
 	OpMarkLongestChainBatch uint16 = 12
+
+	// OpRemoveConflictingChildBatch removes (parent, child) links from
+	// parents' conflicting-children lists. Routed by the PARENT txid.
+	OpRemoveConflictingChildBatch uint16 = 13
 )
 
 // Read opcodes.
@@ -27,9 +31,13 @@ const (
 
 // Pruner opcodes.
 const (
-	OpQueryOldUnmined            uint16 = 30
-	OpPreserveTransactions       uint16 = 31
+	OpQueryOldUnmined             uint16 = 30
+	OpPreserveTransactions        uint16 = 31
 	OpProcessExpiredPreservations uint16 = 32
+
+	// OpQueryConflicting returns all txids currently flagged CONFLICTING.
+	// Request payload is empty; response mirrors QueryOldUnmined.
+	OpQueryConflicting uint16 = 33
 )
 
 // Cluster / admin opcodes.
@@ -67,22 +75,22 @@ const (
 
 // Error codes shared across all batch operations.
 const (
-	ErrCodeOK              uint16 = 0
-	ErrCodeTxNotFound      uint16 = 1
+	ErrCodeOK               uint16 = 0
+	ErrCodeTxNotFound       uint16 = 1
 	ErrCodeUtxoHashMismatch uint16 = 2
-	ErrCodeAlreadySpent    uint16 = 3
-	ErrCodeAlreadyFrozen   uint16 = 4
-	ErrCodeUtxoNotFrozen   uint16 = 5
-	ErrCodeInvalidSpend    uint16 = 6
-	ErrCodeFrozen          uint16 = 7
-	ErrCodeConflicting     uint16 = 8
-	ErrCodeLocked          uint16 = 9
+	ErrCodeAlreadySpent     uint16 = 3
+	ErrCodeAlreadyFrozen    uint16 = 4
+	ErrCodeUtxoNotFrozen    uint16 = 5
+	ErrCodeInvalidSpend     uint16 = 6
+	ErrCodeFrozen           uint16 = 7
+	ErrCodeConflicting      uint16 = 8
+	ErrCodeLocked           uint16 = 9
 	ErrCodeCoinbaseImmature uint16 = 10
-	ErrCodeVoutOutOfRange  uint16 = 11
-	ErrCodeAlreadyExists   uint16 = 12
-	ErrCodeFrozenUntil     uint16 = 13
-	ErrCodeRedirect        uint16 = 14
-	ErrCodeInternal        uint16 = 255
+	ErrCodeVoutOutOfRange   uint16 = 11
+	ErrCodeAlreadyExists    uint16 = 12
+	ErrCodeFrozenUntil      uint16 = 13
+	ErrCodeRedirect         uint16 = 14
+	ErrCodeInternal         uint16 = 255
 )
 
 // Field mask bits for GetBatch requests. Each bit selects a single field.
@@ -140,12 +148,12 @@ const (
 
 // Signal values returned by spend/setMined operations.
 const (
-	SignalNone               uint8 = 0
-	SignalAllSpent           uint8 = 1
-	SignalNotAllSpent        uint8 = 2
-	SignalDeleteAtHeightSet  uint8 = 3
+	SignalNone                uint8 = 0
+	SignalAllSpent            uint8 = 1
+	SignalNotAllSpent         uint8 = 2
+	SignalDeleteAtHeightSet   uint8 = 3
 	SignalDeleteAtHeightUnset uint8 = 4
-	SignalPreserve           uint8 = 5
+	SignalPreserve            uint8 = 5
 )
 
 // MaxFrameSize is the maximum frame payload size (16 MiB).

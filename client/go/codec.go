@@ -276,6 +276,47 @@ func encodeQueryOldUnmined(buf []byte, cutoffHeight uint32) []byte {
 	return appendU32(buf, cutoffHeight)
 }
 
+// encodeQueryConflicting appends a QueryConflicting request payload to buf.
+// The request carries no parameters (CONFLICTING is a boolean flag with no
+// cutoff), so buf is returned unchanged. Wire layout must match the Rust
+// server's handle_query_conflicting (empty request payload).
+func encodeQueryConflicting(buf []byte) []byte {
+	return buf
+}
+
+// decodeQueryConflictingResponse decodes a QueryConflicting response payload.
+// The format is identical to QueryOldUnmined: [count:u32 LE][txid:32]*count.
+func decodeQueryConflictingResponse(data []byte) ([]TxID, error) {
+	if len(data) < 4 {
+		return nil, fmt.Errorf("query conflicting: need 4 bytes, have %d", len(data))
+	}
+	count := int(getU32(data[0:4]))
+	if len(data) < 4+count*32 {
+		return nil, fmt.Errorf("query conflicting: truncated")
+	}
+	txids := make([]TxID, count)
+	pos := 4
+	for i := 0; i < count; i++ {
+		copy(txids[i][:], data[pos:pos+32])
+		pos += 32
+	}
+	return txids, nil
+}
+
+// encodeRemoveConflictingChildBatch appends a RemoveConflictingChildBatch
+// request payload to buf. Format: [count:u32 LE] then count ×
+// [parent_txid:32][child_txid:32] (64 bytes/item, parent first). No shared
+// params. Wire layout must match src/protocol/codec.rs
+// encode_conflicting_child_pair_batch.
+func encodeRemoveConflictingChildBatch(buf []byte, pairs []ConflictingChildPair) []byte {
+	buf = appendU32(buf, uint32(len(pairs)))
+	for i := range pairs {
+		buf = append(buf, pairs[i].Parent[:]...)
+		buf = append(buf, pairs[i].Child[:]...)
+	}
+	return buf
+}
+
 // encodePreserveTransactions appends a PreserveTransactions request payload to buf.
 func encodePreserveTransactions(buf []byte, blockHeight uint32, txids []TxID) []byte {
 	buf = appendU32(buf, uint32(len(txids)))

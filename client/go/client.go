@@ -193,7 +193,6 @@ func (c *Client) followRedirects(ctx context.Context, pool *connPool, opCode uin
 	return responseFrame{}, &TooManyRedirectsError{Hops: maxHops, LastAddr: lastAddr}
 }
 
-
 func handleMutationResponse(resp responseFrame) (*BatchResult, error) {
 	defer recyclePayload(resp.Payload)
 	switch resp.Status {
@@ -967,6 +966,146 @@ func (c *Client) QueryOldUnmined(ctx context.Context, cutoffHeight uint32) ([]Tx
 		return nil, fmt.Errorf("unexpected status: %d", resp.Status)
 	}
 	return decodeQueryOldUnminedResponse(resp.Payload)
+}
+
+// QueryConflicting queries all transactions currently flagged CONFLICTING.
+//
+// The request carries no parameters. Like QueryOldUnmined, this is a
+// single-node operation: in cluster mode getConn returns an error and the
+// caller must target individual nodes directly.
+func (c *Client) QueryConflicting(ctx context.Context) ([]TxID, error) {
+	buf := getBuf(0)
+	payload := encodeQueryConflicting(buf)
+	conn, err := c.getConn(ctx)
+	if err != nil {
+		putBuf(payload)
+		return nil, err
+	}
+	resp, err := c.sendAndRecycle(ctx, conn, OpQueryConflicting, payload)
+	if err != nil {
+		return nil, err
+	}
+	defer recyclePayload(resp.Payload)
+	if resp.Status != StatusOK {
+		if resp.Status == StatusError {
+			code, msg, _ := decodeErrorPayload(resp.Payload)
+			return nil, &ServerError{Code: code, Message: msg}
+		}
+		return nil, fmt.Errorf("unexpected status: %d", resp.Status)
+	}
+	return decodeQueryConflictingResponse(resp.Payload)
+}
+
+// RemoveConflictingChildBatch removes (parent, child) links from parents'
+// conflicting-children lists. Each pair is routed by the PARENT txid (the
+// record being mutated). The operation is idempotent.
+//
+// In cluster mode pairs are grouped by the owning node of the parent txid,
+// fanned out as sub-batches that follow StatusRedirect replies up to
+// MaxRedirects, and per-item errors are merged back into the original index
+// space. A per-item TxNotFound indicates the parent record was absent.
+func (c *Client) RemoveConflictingChildBatch(ctx context.Context, pairs []ConflictingChildPair) (*BatchResult, error) {
+	if c.cluster != nil {
+		return c.removeConflictingChildBatchCluster(ctx, pairs)
+	}
+	buf := getBuf(4 + len(pairs)*64)
+	payload := encodeRemoveConflictingChildBatch(buf, pairs)
+	conn, err := c.pool.get(ctx)
+	if err != nil {
+		putBuf(payload)
+		return nil, err
+	}
+	resp, err := c.sendAndRecycle(ctx, conn, OpRemoveConflictingChildBatch, payload)
+	if err != nil {
+		return nil, err
+	}
+	return handleMutationResponse(resp)
+}
+
+func (c *Client) removeConflictingChildBatchCluster(ctx context.Context, pairs []ConflictingChildPair) (*BatchResult, error) {
+	type subBatch struct {
+		pool        *connPool
+		pairs       []ConflictingChildPair
+		originalIdx []int
+	}
+	groups := make(map[*connPool]*subBatch)
+	for i := range pairs {
+		pool, err := c.cluster.poolForTxID(pairs[i].Parent)
+		if err != nil {
+			return nil, err
+		}
+		g, ok := groups[pool]
+		if !ok {
+			g = &subBatch{pool: pool}
+			groups[pool] = g
+		}
+		g.pairs = append(g.pairs, pairs[i])
+		g.originalIdx = append(g.originalIdx, i)
+	}
+
+	if len(groups) <= 1 {
+		for _, g := range groups {
+			buf := getBuf(4 + len(g.pairs)*64)
+			payload := encodeRemoveConflictingChildBatch(buf, g.pairs)
+			resp, err := c.followRedirects(ctx, g.pool, OpRemoveConflictingChildBatch, payload)
+			putBuf(payload)
+			if err != nil {
+				return nil, err
+			}
+			result, err := handleMutationResponse(resp)
+			if pe, ok := err.(*PartialError); ok {
+				return nil, &PartialError{Errors: remapBatchErrors(pe.Errors, g.originalIdx)}
+			}
+			return result, err
+		}
+		// Empty input: nothing to route, nothing to send.
+		return &BatchResult{}, nil
+	}
+
+	type subResult struct {
+		err    error
+		idxMap []int
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	results := make([]subResult, 0, len(groups))
+
+	for _, g := range groups {
+		wg.Add(1)
+		go func(g *subBatch) {
+			defer wg.Done()
+			buf := getBuf(4 + len(g.pairs)*64)
+			payload := encodeRemoveConflictingChildBatch(buf, g.pairs)
+			resp, err := c.followRedirects(ctx, g.pool, OpRemoveConflictingChildBatch, payload)
+			putBuf(payload)
+			if err != nil {
+				mu.Lock()
+				results = append(results, subResult{err: err, idxMap: g.originalIdx})
+				mu.Unlock()
+				return
+			}
+			_, e := handleMutationResponse(resp)
+			mu.Lock()
+			results = append(results, subResult{err: e, idxMap: g.originalIdx})
+			mu.Unlock()
+		}(g)
+	}
+	wg.Wait()
+
+	var allErrors []BatchItemError
+	for _, r := range results {
+		if r.err != nil {
+			if pe, ok := r.err.(*PartialError); ok {
+				allErrors = append(allErrors, remapBatchErrors(pe.Errors, r.idxMap)...)
+				continue
+			}
+			return nil, r.err
+		}
+	}
+	if len(allErrors) > 0 {
+		return nil, &PartialError{Errors: allErrors}
+	}
+	return &BatchResult{}, nil
 }
 
 // PreserveTransactions preserves transactions until the given block height.

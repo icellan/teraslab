@@ -115,6 +115,15 @@ type SetConflictingParams struct {
 	BlockHeightRetention uint32
 }
 
+// ConflictingChildPair is a single (parent, child) link for a
+// RemoveConflictingChildBatch request. The pair is routed by the Parent txid
+// (the record being mutated). Wire layout: parent(32) + child(32) = 64 bytes
+// per item, parent first.
+type ConflictingChildPair struct {
+	Parent TxID
+	Child  TxID
+}
+
 // MarkLongestChainParams are shared parameters for a MarkLongestChainBatch request.
 type MarkLongestChainParams struct {
 	OnLongestChain       bool
@@ -404,25 +413,25 @@ type ExternalRef struct {
 // Fields are populated according to which per-field bits (0-18) were set
 // in the GetBatch field mask. Unrequested fields remain at their zero value.
 type TxMetadata struct {
-	TxVersion        uint32
-	Locktime         uint32
-	Fee              uint64
-	SizeInBytes      uint64
-	ExtendedSize     uint64
-	Flags            uint8
-	SpendingHeight   uint32
-	CreatedAt        uint64
-	SpentUtxos       uint32
-	PrunedUtxos      uint32
-	UtxoCount        uint32
-	Generation       uint32
-	UpdatedAt        uint64
-	UnminedSince     uint32
-	DeleteAtHeight   uint32
-	PreserveUntil    uint32
-	ExternalRef      ExternalRef
-	ReassignCount    uint8
-	BlockEntryCount  uint8
+	TxVersion       uint32
+	Locktime        uint32
+	Fee             uint64
+	SizeInBytes     uint64
+	ExtendedSize    uint64
+	Flags           uint8
+	SpendingHeight  uint32
+	CreatedAt       uint64
+	SpentUtxos      uint32
+	PrunedUtxos     uint32
+	UtxoCount       uint32
+	Generation      uint32
+	UpdatedAt       uint64
+	UnminedSince    uint32
+	DeleteAtHeight  uint32
+	PreserveUntil   uint32
+	ExternalRef     ExternalRef
+	ReassignCount   uint8
+	BlockEntryCount uint8
 }
 
 // TxMetadataRaw contains the full 256-byte on-disk metadata struct returned
@@ -434,18 +443,18 @@ type TxMetadataRaw struct {
 	Bytes [256]byte
 
 	// Parsed convenience accessors for commonly inspected fields:
-	Magic                    uint32
-	SchemaVersion            uint32
-	RecordSize               uint32
-	UtxoCount                uint32
-	TxID                     TxID
-	Flags                    uint8
-	SpentUtxos               uint32
-	BlockEntryCount          uint8
-	BlockOverflowOffset      uint64
-	ReassignmentOffset       uint64
-	ReassignmentCount        uint8
-	ConflictingChildrenCount uint8
+	Magic                     uint32
+	SchemaVersion             uint32
+	RecordSize                uint32
+	UtxoCount                 uint32
+	TxID                      TxID
+	Flags                     uint8
+	SpentUtxos                uint32
+	BlockEntryCount           uint8
+	BlockOverflowOffset       uint64
+	ReassignmentOffset        uint64
+	ReassignmentCount         uint8
+	ConflictingChildrenCount  uint8
 	ConflictingChildrenOffset uint64
 }
 
