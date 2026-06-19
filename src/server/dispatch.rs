@@ -860,6 +860,7 @@ pub(crate) fn handle_request(
         OP_GET_BATCH => handle_get_batch(request, engine, max_batch_size, cluster),
         OP_GET_SPEND_BATCH => handle_get_spend_batch(request, engine, max_batch_size, cluster),
         OP_QUERY_OLD_UNMINED => handle_query_old_unmined(request, engine, cluster),
+        OP_QUERY_CONFLICTING => handle_query_conflicting(request, engine, cluster),
         OP_PRESERVE_TRANSACTIONS => handle_preserve_transactions(
             request,
             engine,
@@ -4314,7 +4315,11 @@ fn needs_dispatch_visibility_barrier(op: u16) -> bool {
     is_mutation_opcode(op)
         || matches!(
             op,
-            OP_GET_BATCH | OP_GET_SPEND_BATCH | OP_QUERY_OLD_UNMINED | OP_REPLICA_BATCH
+            OP_GET_BATCH
+                | OP_GET_SPEND_BATCH
+                | OP_QUERY_OLD_UNMINED
+                | OP_QUERY_CONFLICTING
+                | OP_REPLICA_BATCH
         )
 }
 
@@ -8224,6 +8229,44 @@ fn handle_query_old_unmined(
     }
 }
 
+/// Return all txids currently flagged CONFLICTING (`OP_QUERY_CONFLICTING`).
+///
+/// Mirrors [`handle_query_old_unmined`] but over the in-memory conflicting
+/// index instead of the unmined-since index. The request payload is empty
+/// (CONFLICTING is a boolean flag, no cutoff). Membership in the index IS the
+/// answer — there is no `preserve_until` re-validation as in the unmined case.
+fn handle_query_conflicting(
+    req: &RequestFrame,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
+    let candidates: Vec<TxKey> = engine.conflicting_index().iter().collect();
+    let mut keys = Vec::with_capacity(candidates.len());
+    for key in candidates {
+        // F-G5-003: skip keys this node does not master. Single-node mode
+        // (no cluster) keeps the prior behaviour.
+        if let Some(c) = cluster {
+            match c.is_master(&key) {
+                crate::cluster::coordinator::MasterQueryResult::Yes => {}
+                _ => continue,
+            }
+        }
+        keys.push(key);
+    }
+
+    let mut payload = Vec::with_capacity(4 + keys.len() * 32);
+    payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in &keys {
+        payload.extend_from_slice(&key.txid);
+    }
+
+    ResponseFrame {
+        request_id: req.request_id,
+        status: STATUS_OK,
+        payload,
+    }
+}
+
 fn handle_preserve_transactions(
     req: &RequestFrame,
     engine: &Engine,
@@ -9985,6 +10028,59 @@ mod tests {
         assert!(returned_txids.contains(&txid_a));
         assert!(returned_txids.contains(&txid_b));
         assert!(!returned_txids.contains(&txid_c));
+    }
+
+    #[test]
+    fn dispatch_query_conflicting_returns_flagged_txids() {
+        let h = DispatchTestHarness::new();
+        let txid_a = DispatchTestHarness::make_txid(1);
+        let txid_b = DispatchTestHarness::make_txid(2);
+        let txid_c = DispatchTestHarness::make_txid(3);
+        assert_eq!(h.create_tx(txid_a, 2).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_b, 2).status, STATUS_OK);
+        assert_eq!(h.create_tx(txid_c, 2).status, STATUS_OK);
+
+        // Flag a and c conflicting (b stays clean).
+        for txid in [txid_a, txid_c] {
+            h.engine
+                .set_conflicting(&crate::ops::remaining::SetConflictingRequest {
+                    tx_key: TxKey { txid },
+                    value: true,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+        }
+
+        // OP_QUERY_CONFLICTING takes an empty payload.
+        let resp = h.request(OP_QUERY_CONFLICTING, Vec::new());
+        assert_eq!(resp.status, STATUS_OK);
+
+        let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(count, 2);
+        let mut returned: Vec<[u8; 32]> = Vec::new();
+        for i in 0..count as usize {
+            let start = 4 + i * 32;
+            let mut txid = [0u8; 32];
+            txid.copy_from_slice(&resp.payload[start..start + 32]);
+            returned.push(txid);
+        }
+        assert!(returned.contains(&txid_a));
+        assert!(returned.contains(&txid_c));
+        assert!(!returned.contains(&txid_b));
+
+        // After clearing one, the query reflects the change.
+        h.engine
+            .set_conflicting(&crate::ops::remaining::SetConflictingRequest {
+                tx_key: TxKey { txid: txid_a },
+                value: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        let resp2 = h.request(OP_QUERY_CONFLICTING, Vec::new());
+        let count2 = u32::from_le_bytes(resp2.payload[0..4].try_into().unwrap());
+        assert_eq!(count2, 1);
     }
 
     // -----------------------------------------------------------------------

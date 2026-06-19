@@ -24,6 +24,11 @@ pub const OP_GET_SPEND_BATCH: u16 = 21;
 pub const OP_QUERY_OLD_UNMINED: u16 = 30;
 pub const OP_PRESERVE_TRANSACTIONS: u16 = 31;
 pub const OP_PROCESS_EXPIRED_PRESERVATIONS: u16 = 32;
+/// Return all txids currently carrying the CONFLICTING flag (bit 0x02).
+///
+/// Request payload: empty. Response (`STATUS_OK`): `[count:u32 LE][txid:32]*count`.
+/// Backs Teranode's `GetConflictingTxIterator`.
+pub const OP_QUERY_CONFLICTING: u16 = 33;
 
 // Cluster / admin
 pub const OP_GET_PARTITION_MAP: u16 = 100;

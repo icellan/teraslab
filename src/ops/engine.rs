@@ -165,6 +165,10 @@ pub struct Engine {
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
     unmined_index: parking_lot::Mutex<UnminedBackend>,
+    /// In-memory set of CONFLICTING transactions, backing the
+    /// `OP_QUERY_CONFLICTING` query. No redo/redb durability: rebuilt at
+    /// startup from the primary index via [`Self::rebuild_conflicting_index`].
+    conflicting_index: parking_lot::Mutex<crate::index::ConflictingIndex>,
     /// Per-engine visibility barrier used by TCP dispatch and checkpointing.
     ///
     /// Client-facing reads take this barrier so they cannot observe the local
@@ -365,6 +369,7 @@ impl Engine {
             locks,
             dah_index: parking_lot::Mutex::new(dah_index.into()),
             unmined_index: parking_lot::Mutex::new(unmined_index.into()),
+            conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_log: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
@@ -3124,6 +3129,14 @@ impl Engine {
                 })?;
         }
 
+        // Conflicting secondary index: this record carries the CONFLICTING
+        // flag (set above), so track it for OP_QUERY_CONFLICTING.
+        if req.conflicting {
+            self.conflicting_index
+                .lock()
+                .insert(TxKey { txid: req.tx_id });
+        }
+
         // Update parent records' conflicting-children lists. Drop the stripe
         // guard first: `append_conflicting_child_best_effort` locks each
         // parent's stripe, and a parent txid may hash to this key's stripe.
@@ -3401,6 +3414,14 @@ impl Engine {
                 .map_err(|e| CreateError::StorageError {
                     detail: format!("{e}"),
                 })?;
+        }
+
+        // Conflicting secondary index: this record carries the CONFLICTING
+        // flag (set above), so track it for OP_QUERY_CONFLICTING.
+        if req.conflicting {
+            self.conflicting_index
+                .lock()
+                .insert(TxKey { txid: req.tx_id });
         }
 
         // Drop the stripe guard before touching parent records:
@@ -4958,6 +4979,15 @@ impl Engine {
         // its own R-221 redo intent before allocating the replacement list
         // block; this call remains best-effort for availability, but failures
         // must be visible.
+        // Maintain the in-memory conflicting index for OP_QUERY_CONFLICTING.
+        // `req.value` is the post-state of TxFlags::CONFLICTING written above
+        // (both fast and slow paths converge here). Done under the stripe guard.
+        if req.value {
+            self.conflicting_index.lock().insert(req.tx_key);
+        } else {
+            self.conflicting_index.lock().remove(&req.tx_key);
+        }
+
         // Drop the child lock before taking parent locks.
         if req.value {
             drop(_guard);
@@ -5652,6 +5682,14 @@ impl Engine {
             self.update_unmined_index(&req.tx_key, old_unmined, 0)?;
         }
 
+        // Drop any conflicting-index entry for the deleted record. The cached
+        // entry's flags reflect the record's last-published CONFLICTING state;
+        // `remove` is a no-op if absent, so this covers all delete variants
+        // (they route through `delete_inner`).
+        if TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::CONFLICTING) {
+            self.conflicting_index.lock().remove(&req.tx_key);
+        }
+
         Ok(tombstone_info)
     }
 
@@ -6142,6 +6180,29 @@ impl Engine {
     /// Get the unmined index (for testing).
     pub fn unmined_index(&self) -> parking_lot::MutexGuard<'_, UnminedBackend> {
         self.unmined_index.lock()
+    }
+
+    /// Get the conflicting index (backs `OP_QUERY_CONFLICTING`; also used in tests).
+    pub fn conflicting_index(&self) -> parking_lot::MutexGuard<'_, crate::index::ConflictingIndex> {
+        self.conflicting_index.lock()
+    }
+
+    /// Rebuild the in-memory conflicting index by scanning the primary index.
+    ///
+    /// Called once at startup after recovery has reconstructed the primary
+    /// index. Every record whose cached `tx_flags` carries
+    /// [`TxFlags::CONFLICTING`] (bit `0x02`) is inserted. Idempotent: clears
+    /// first, so re-running is safe. The conflicting index has no on-device
+    /// durability of its own; this is how it is re-derived after a crash.
+    pub fn rebuild_conflicting_index(&self) {
+        let mut conflicting = self.conflicting_index.lock();
+        conflicting.clear();
+        let index = self.index.read();
+        for (key, entry) in index.iter() {
+            if TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::CONFLICTING) {
+                conflicting.insert(key);
+            }
+        }
     }
 
     /// Read on-device metadata for a transaction.
@@ -12317,6 +12378,80 @@ mod tests {
 
         let meta = engine.read_metadata(&key).unwrap();
         assert!(meta.flags.contains(TxFlags::CONFLICTING));
+    }
+
+    #[test]
+    fn conflicting_index_tracks_create_set_delete_and_rebuild() {
+        let engine = create_engine();
+
+        // create(conflicting=true) -> tracked in the conflicting index.
+        let (_, mut req) = make_create_req(210, 3);
+        req.conflicting = true;
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        assert!(
+            engine.conflicting_index().contains(&key),
+            "create-conflicting must be tracked"
+        );
+
+        // create(conflicting=false) -> NOT tracked.
+        let (_, req2) = make_create_req(211, 3);
+        let key2 = req2.tx_key();
+        engine.create(&req2).unwrap();
+        assert!(!engine.conflicting_index().contains(&key2));
+
+        // set_conflicting(false) on key -> removed.
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        assert!(!engine.conflicting_index().contains(&key));
+
+        // set_conflicting(true) on key2 -> added.
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key2,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        assert!(engine.conflicting_index().contains(&key2));
+
+        // delete(key2) -> removed.
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key2,
+                due_guard: None,
+            })
+            .unwrap();
+        assert!(!engine.conflicting_index().contains(&key2));
+
+        // Re-mark key conflicting, then simulate a fresh boot: clear the
+        // in-memory index and rebuild it from the recovered primary index.
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        engine.conflicting_index().clear();
+        assert!(!engine.conflicting_index().contains(&key));
+        engine.rebuild_conflicting_index();
+        assert!(
+            engine.conflicting_index().contains(&key),
+            "rebuild must reconstruct from the primary CONFLICTING flag"
+        );
+        assert!(
+            !engine.conflicting_index().contains(&key2),
+            "deleted record must not reappear on rebuild"
+        );
     }
 
     #[test]

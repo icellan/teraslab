@@ -943,6 +943,11 @@ fn main() {
         );
     }
 
+    // Rebuild the in-memory conflicting index from the recovered primary
+    // index. It carries no on-device durability of its own, so it is
+    // re-derived here from each record's authoritative CONFLICTING flag.
+    engine.rebuild_conflicting_index();
+
     // Attach the redo log so the engine performs two-phase durability for
     // secondary index updates (redo fsync BEFORE redb commit).
     if let Some(ref log) = redo_log {

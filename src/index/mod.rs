@@ -5,6 +5,7 @@
 //! - [`UnminedIndex`]: secondary index for `unmined_since` pruner queries
 
 pub mod backend;
+pub mod conflicting_index;
 pub mod dah_index;
 pub mod hashtable;
 pub mod migration;
@@ -17,6 +18,7 @@ pub mod unmined_index;
 mod util;
 
 pub use backend::PrimaryBackend;
+pub use conflicting_index::ConflictingIndex;
 pub use dah_index::{DahIndex, DahRedoEntry};
 pub use hashtable::{TxIndexEntry, TxKey};
 pub use redb_primary::CachedFieldsUpdate;
