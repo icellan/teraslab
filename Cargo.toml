@@ -10,7 +10,7 @@
 # sibling crate, add matching CI steps for it there.
 [package]
 name = "teraslab"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 # Server application, not a published library — prevents accidental
 # `cargo publish` and lets cargo-deny's `licenses.private` skip the
