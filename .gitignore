@@ -35,3 +35,6 @@ tarpaulin-report.json
 
 # Scenario debug log dumps
 /teraslab-tests/client/debug-logs/
+
+# Local release build artifacts (produced by scripts/cut-release.sh / manual builds)
+dist/
