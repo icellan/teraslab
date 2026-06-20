@@ -387,12 +387,33 @@ func coldDataSize(item *CreateItem) int {
 // Response decoders
 // ===========================================================================
 
+// checkElemCount guards a slice allocation that is sized from a count read off
+// the wire. A response can never hold more than remaining/minElemBytes elements,
+// so a larger declared count means the frame is malformed or misframed (for
+// example when a sparse-error payload is speculatively decoded with the
+// signal-format decoder). Returning an error here — instead of make()-ing the
+// slice — prevents a corrupt or hostile response from forcing an unbounded
+// (multi-gigabyte) allocation before the per-element bounds checks ever run.
+func checkElemCount(what string, count, minElemBytes, remaining int) error {
+	if count < 0 {
+		return fmt.Errorf("%s: negative element count %d", what, count)
+	}
+	if minElemBytes > 0 && count > remaining/minElemBytes {
+		return fmt.Errorf("%s: declared count %d exceeds %d remaining payload bytes", what, count, remaining)
+	}
+	return nil
+}
+
 // decodeSparseErrors decodes a sparse error list from a PartialError response.
 func decodeSparseErrors(data []byte) ([]BatchItemError, error) {
 	if len(data) < 4 {
 		return nil, fmt.Errorf("sparse errors: need 4 bytes, have %d", len(data))
 	}
 	count := int(getU32(data[0:4]))
+	// Each error entry is at least 8 bytes (index:4 + code:2 + dataLen:2).
+	if err := checkElemCount("sparse errors", count, 8, len(data)-4); err != nil {
+		return nil, err
+	}
 	errors := make([]BatchItemError, 0, count)
 	pos := 4
 	for i := 0; i < count; i++ {
@@ -429,6 +450,10 @@ func decodePartialWithSignals(data []byte) ([]BatchItemSuccess, []BatchItemError
 
 	successCount := int(getU32(data[pos : pos+4]))
 	pos += 4
+	// Each success entry is at least 6 bytes (index:4 + signal:1 + bidCount:1).
+	if err := checkElemCount("partial signals successes", successCount, 6, len(data)-pos); err != nil {
+		return nil, nil, err
+	}
 	successes := make([]BatchItemSuccess, successCount)
 	for i := 0; i < successCount; i++ {
 		if pos+6 > len(data) {
@@ -455,6 +480,12 @@ func decodePartialWithSignals(data []byte) ([]BatchItemSuccess, []BatchItemError
 	}
 	errorCount := int(getU32(data[pos : pos+4]))
 	pos += 4
+	// Each error entry is at least 8 bytes (index:4 + code:2 + dataLen:2). This
+	// is the guard that stops a sparse payload — misread by this signal decoder —
+	// from yielding a garbage errorCount and a multi-gigabyte allocation.
+	if err := checkElemCount("partial signals errors", errorCount, 8, len(data)-pos); err != nil {
+		return nil, nil, err
+	}
 	errors := make([]BatchItemError, errorCount)
 	for i := 0; i < errorCount; i++ {
 		if pos+8 > len(data) {
@@ -505,6 +536,10 @@ func decodeGetResponse(data []byte) ([]GetResult, error) {
 		return nil, fmt.Errorf("get response: need 4 bytes, have %d", len(data))
 	}
 	count := int(getU32(data[0:4]))
+	// Each result is at least 5 bytes (status:1 + dataLen:4).
+	if err := checkElemCount("get response", count, 5, len(data)-4); err != nil {
+		return nil, err
+	}
 	results := make([]GetResult, count)
 	pos := 4
 	for i := 0; i < count; i++ {
@@ -530,6 +565,10 @@ func decodeGetSpendResponse(data []byte) ([]GetSpendResult, error) {
 		return nil, fmt.Errorf("get spend response: need 4 bytes, have %d", len(data))
 	}
 	count := int(getU32(data[0:4]))
+	// Each result is a fixed 40 bytes.
+	if err := checkElemCount("get spend response", count, 40, len(data)-4); err != nil {
+		return nil, err
+	}
 	results := make([]GetSpendResult, count)
 	pos := 4
 	for i := 0; i < count; i++ {
@@ -556,6 +595,10 @@ func decodePartitionMap(data []byte) (*PartitionMap, error) {
 	nodeCount := int(getU32(data[8:12]))
 	pos := 12
 
+	// Each node is at least 10 bytes (id:8 + addrLen:2).
+	if err := checkElemCount("partition map nodes", nodeCount, 10, len(data)-pos); err != nil {
+		return nil, err
+	}
 	pm.Nodes = make([]NodeInfo, 0, nodeCount)
 	for i := 0; i < nodeCount; i++ {
 		if pos+10 > len(data) {
