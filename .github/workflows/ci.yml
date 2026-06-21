@@ -110,6 +110,24 @@ jobs:
         # they never ran in CI.
         run: cargo test --features fault-injection --test fault_injection --test cluster_delayed_activation --test crash_sweep_ops
 
+      - name: Block-device size ioctl on a real Linux loop device (AUDIT M3.15)
+        # Exercises the BLKGETSIZE64 path on a real block device (the macOS RAM
+        # disk only covers the Darwin ioctl). Attaches a known-size backing file
+        # as a loop device, grants the runner read/write, and points the
+        # env-driven test at it; the test skips cleanly when the env is unset.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          img="$(mktemp)"
+          truncate -s 64M "$img"
+          dev="$(sudo losetup --find --show "$img")"
+          sudo chmod a+rw "$dev"
+          size="$(sudo blockdev --getsize64 "$dev")"
+          TERASLAB_TEST_BLOCK_DEVICE="$dev" TERASLAB_TEST_BLOCK_DEVICE_SIZE="$size" \
+            cargo test --test block_device_size block_device_size_query_against_env_device -- --nocapture
+          sudo losetup -d "$dev"
+          rm -f "$img"
+
       - name: Run Rust client crate tests
         run: cargo test --manifest-path client/rust/Cargo.toml --all
 

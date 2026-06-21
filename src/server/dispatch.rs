@@ -18645,6 +18645,79 @@ mod tests {
     // split-brain.
     // -----------------------------------------------------------------------
 
+    /// AUDIT M2.8 — a topology PROPOSE whose vote is accepted but whose
+    /// persist-before-reply fails must surface `ERR_TOPOLOGY_PERSIST_FAILED`
+    /// (code 23) to the proposer, not a silent STATUS_OK. (Codes 25/26/37 are
+    /// already covered: `err_cluster_not_ready_gates_writes_when_joining`,
+    /// the `secondary_readiness_*` suite, and `migration_transfer_request_*`.)
+    #[test]
+    fn topology_propose_persist_failure_returns_err_topology_persist_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Force persist to fail: put a regular FILE where the path's parent
+        // directory would be, so ensure_parent_dir() (create_dir_all) errors
+        // and persist_topology() returns Err.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("node.topology");
+
+        let h = DispatchTestHarness::new();
+        let self_id = crate::cluster::shards::NodeId(1);
+        let other = crate::cluster::shards::NodeId(2);
+        let members = vec![self_id, other];
+        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&[self_id], 1, 10, 1);
+        let cluster = crate::cluster::coordinator::new_test_running_cluster_with_topology_path(
+            self_id,
+            table,
+            &[(self_id, "127.0.0.1:4720".parse().unwrap())],
+            &[self_id],
+            &[],
+            &[],
+            &[],
+            1,
+            Some(path.clone()),
+        );
+        cluster
+            .topology_authority()
+            .set_committed_voter_ever_seen(&[self_id, other]);
+
+        // A subsuming proposal that handle_propose accepts (same shape as
+        // topology_vote_persisted_before_reply), so the accepted-vote +
+        // failed-persist branch is exercised.
+        let propose = crate::cluster::topology::TopologyTerm::new(
+            500,
+            members.clone(),
+            other,
+            crate::cluster::topology::ClusterId::UNSET,
+            1,
+        );
+        let req = RequestFrame {
+            request_id: 1,
+            op_code: OP_TOPOLOGY_PROPOSE,
+            flags: 0,
+            payload: propose.serialize().into(),
+        };
+        let mut conn_state = crate::server::ConnectionState::new();
+        let resp = handle_request(
+            &req,
+            &h.engine,
+            8192,
+            Some(&cluster),
+            None,
+            &mut conn_state,
+            None,
+        );
+
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "an accepted vote whose persist fails must return STATUS_ERROR",
+        );
+        assert_eq!(
+            extract_err(&resp),
+            ERR_TOPOLOGY_PERSIST_FAILED,
+            "persist failure must surface code 23",
+        );
+    }
+
     #[test]
     fn topology_vote_persisted_before_reply() {
         let tmp = tempfile::TempDir::new().unwrap();

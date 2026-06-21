@@ -115,6 +115,59 @@ impl Drop for RamDisk {
     }
 }
 
+/// AUDIT M3.15 — exercise the BLKGETSIZE64 ioctl size-query branch against a
+/// REAL block device supplied via the environment. The privileged loop-device
+/// setup lives in CI (`.github/workflows/ci.yml`): it attaches a known-size
+/// backing file, grants the runner access, and exports the node in
+/// `TERASLAB_TEST_BLOCK_DEVICE` with its byte size in
+/// `TERASLAB_TEST_BLOCK_DEVICE_SIZE`. Skips cleanly when unset, so it is a
+/// no-op on dev hosts and macOS while still covering the real Linux NVMe-class
+/// ioctl path the macOS RAM-disk test cannot reach.
+#[test]
+fn block_device_size_query_against_env_device() {
+    let path = match std::env::var("TERASLAB_TEST_BLOCK_DEVICE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return, // not configured — skip cleanly, assert nothing
+    };
+    let expected: u64 = std::env::var("TERASLAB_TEST_BLOCK_DEVICE_SIZE")
+        .expect("TERASLAB_TEST_BLOCK_DEVICE set without TERASLAB_TEST_BLOCK_DEVICE_SIZE")
+        .parse()
+        .expect("TERASLAB_TEST_BLOCK_DEVICE_SIZE must be a u64 byte count");
+
+    // A deliberately wrong, tiny open hint: for a block device it MUST be
+    // ignored and the kernel ioctl geometry used instead.
+    let bogus_hint = 4096u64;
+    let dev = DirectDevice::open(std::path::Path::new(&path), bogus_hint, 4096)
+        .expect("DirectDevice::open on the configured block device must succeed");
+
+    assert!(
+        dev.is_block_device(),
+        "{path} must be detected as S_IFBLK; otherwise the ioctl size-query \
+         branch never ran"
+    );
+    assert_eq!(
+        dev.size(),
+        expected,
+        "BLKGETSIZE64 ioctl returned the wrong device size (open hint {bogus_hint} \
+         must have been ignored)"
+    );
+    assert_ne!(
+        dev.size(),
+        bogus_hint,
+        "size() returned the open hint, not the ioctl-reported geometry"
+    );
+
+    // The bounds check that consumes the ioctl size must fire: a pread at
+    // exactly size() (first offset past the last valid block) is out of bounds.
+    let mut oob_buf = AlignedBuf::new(4096, 4096);
+    match dev.pread(&mut oob_buf, expected) {
+        Err(DeviceError::OutOfBounds { offset, .. }) => {
+            assert_eq!(offset, expected, "OutOfBounds reported the wrong offset");
+        }
+        other => panic!("pread at size() must be OutOfBounds, got {other:?}"),
+    }
+}
+
 #[test]
 fn block_device_size_query_against_real_ram_disk() {
     let ram = match RamDisk::attach() {
