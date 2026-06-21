@@ -105,7 +105,10 @@ jobs:
         # explicitly so the feature-gated integration tests execute.
         # cluster_delayed_activation is the W1.1 regression test for the
         # delayed-topology-activation masterless-shard deadlock.
-        run: cargo test --features fault-injection --test fault_injection --test cluster_delayed_activation
+        # crash_sweep_ops (AUDIT M2.10) runs the 9 WAL-boundary kill/restart
+        # sweeps which are also gated behind `fault-injection`; without this
+        # they never ran in CI.
+        run: cargo test --features fault-injection --test fault_injection --test cluster_delayed_activation --test crash_sweep_ops
 
       - name: Run Rust client crate tests
         run: cargo test --manifest-path client/rust/Cargo.toml --all

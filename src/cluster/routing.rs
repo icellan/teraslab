@@ -95,6 +95,18 @@ impl RoutingInfo {
             buf.extend_from_slice(&master.0.to_le_bytes());
         }
 
+        // AUDIT M4.18 — append the committed_members and placement_version
+        // trailers that `decode` reads, so an encode→decode round-trip is
+        // lossless. Previously `encode` dropped both, forcing HRW clients that
+        // adopt an encoded snapshot to default to placement_version v1 even
+        // when the cluster had moved to v2. Both remain backward-compatible:
+        // `decode` already treats them as optional (absent ⇒ empty / v1).
+        buf.extend_from_slice(&(self.committed_members.len() as u32).to_le_bytes());
+        for member in &self.committed_members {
+            buf.extend_from_slice(&member.0.to_le_bytes());
+        }
+        buf.extend_from_slice(&self.placement_version.to_le_bytes());
+
         buf
     }
 
@@ -263,19 +275,39 @@ mod tests {
             ],
             (0..NUM_SHARDS as u16).map(|s| (s, NodeId(1))).collect(),
         );
-        let mut encoded = info.encode();
+        // committed_members [NodeId(1), NodeId(3)] — different from the alive
+        // nodes — exercises the case where the committed topology has a
+        // different member set than SWIM's current view. After AUDIT M4.18
+        // `encode` writes this trailer itself, so the round-trip is symmetric.
+        let mut info = info;
+        info.committed_members = vec![NodeId(1), NodeId(3)];
 
-        // Append committed_members [NodeId(1), NodeId(3)] — different from
-        // the alive nodes — to simulate the scenario where the committed
-        // topology has a different member set than SWIM's current view.
-        encoded.extend_from_slice(&2u32.to_le_bytes()); // count = 2
-        encoded.extend_from_slice(&1u64.to_le_bytes()); // NodeId(1)
-        encoded.extend_from_slice(&3u64.to_le_bytes()); // NodeId(3)
-
-        let decoded = RoutingInfo::decode(&encoded).unwrap();
+        let decoded = RoutingInfo::decode(&info.encode()).unwrap();
         assert_eq!(decoded.committed_members.len(), 2);
         assert_eq!(decoded.committed_members[0], NodeId(1));
         assert_eq!(decoded.committed_members[1], NodeId(3));
+    }
+
+    /// AUDIT M4.18 — `encode` must preserve `placement_version` so an HRW client
+    /// that adopts an encoded snapshot recomputes its shard table at the
+    /// cluster's actual version instead of silently defaulting to v1.
+    #[test]
+    fn routing_info_placement_version_round_trips() {
+        let mut info = RoutingInfo::new(
+            7,
+            vec![NodeInfo {
+                id: NodeId(1),
+                addr: "127.0.0.1:3000".parse().unwrap(),
+                is_alive: true,
+            }],
+            (0..NUM_SHARDS as u16).map(|s| (s, NodeId(1))).collect(),
+        );
+        info.placement_version = 2;
+        let decoded = RoutingInfo::decode(&info.encode()).unwrap();
+        assert_eq!(
+            decoded.placement_version, 2,
+            "encode must round-trip placement_version (M4.18)",
+        );
     }
 
     #[test]

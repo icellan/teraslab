@@ -5,9 +5,24 @@
 //! protocol or leader election needed.
 
 use crate::index::TxKey;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Total number of shards (12-bit hash → 4096).
 pub const NUM_SHARDS: usize = 4096;
+
+/// AUDIT M4.19 — process-wide count of shards detected as permanently lost
+/// during a topology change: the old master is dead and no replica survives, so
+/// no migration source exists (e.g. RF=1 with the master dead, or RF=2 with both
+/// holders dead). A non-zero value is a data-loss alarm for operators; the
+/// `migration_plan` computation also logs an ERROR per lost shard. Read via
+/// [`lost_shards_total`].
+static LOST_SHARDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide count of shards detected as permanently lost (see
+/// [`struct@LOST_SHARDS_TOTAL`]). Exposed for metrics/alerting.
+pub fn lost_shards_total() -> u64 {
+    LOST_SHARDS_TOTAL.load(Ordering::Relaxed)
+}
 
 /// Highest placement-version algorithm this build understands.
 ///
@@ -509,8 +524,13 @@ impl ShardTable {
 
     /// Which node is the master for this key?
     pub fn master_for_key(&self, key: &TxKey) -> NodeId {
-        let shard = Self::shard_for_key(key) as usize;
-        self.assignments[shard].master
+        // AUDIT M3.12 — route through effective_assignment so callers get the
+        // CURRENTLY-serving master during an active handoff (the old master
+        // keeps serving through Copying/ServingCurrent/CommitReady) rather than
+        // the eventual target, which has not yet received the shard's data.
+        // Outside a handoff this is identical to the target assignment.
+        let shard = Self::shard_for_key(key);
+        self.effective_assignment(shard).master
     }
 
     /// Which nodes hold replicas for this key?
@@ -703,8 +723,22 @@ impl ShardTable {
                         to_node: new_master,
                         is_master: true,
                     });
+                } else {
+                    // AUDIT M4.19 — no surviving replica: the shard's data is
+                    // permanently lost (RF=1 master dead, or RF=2 with both
+                    // holders dead). No migration can recover it. Surface a
+                    // runtime alarm (counter + ERROR) so operators are not left
+                    // with only silent absence of a migration task.
+                    LOST_SHARDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        target: "teraslab::cluster",
+                        shard,
+                        old_master = old_master.0,
+                        new_master = new_master.0,
+                        "AUDIT M4.19: shard permanently lost during topology change — \
+                         old master dead and no surviving replica; data loss for this shard",
+                    );
                 }
-                // If no surviving replica, the data is lost (RF=2, both nodes dead)
             } else {
                 // Old master is alive — always generate a migration task.
                 // The full handoff (Copying + delta streaming) ensures that
@@ -957,6 +991,21 @@ mod tests {
         let s2 = ShardTable::shard_for_key(&key);
         assert_eq!(s1, s2);
         assert!(s1 < NUM_SHARDS as u16);
+    }
+
+    /// AUDIT M4.17 — cross-language golden vector pinning the shard formula
+    /// `u16_le(txid[0..2]) & 0x0FFF`. Matches the Go client's golden test
+    /// (`0xAB,0xCD -> 3499`): LE u16 of {0xAB,0xCD} = 0xCDAB; & 0x0FFF = 0x0DAB.
+    #[test]
+    fn shard_for_key_golden_vector_matches_go_client() {
+        let mut txid = [0u8; 32];
+        txid[0] = 0xAB;
+        txid[1] = 0xCD;
+        assert_eq!(
+            ShardTable::shard_for_key(&TxKey { txid }),
+            3499,
+            "shard formula must match the Go client golden vector",
+        );
     }
 
     #[test]
@@ -1758,6 +1807,33 @@ mod tests {
             );
             assert!(task.to_node == NodeId(1) || task.to_node == NodeId(2));
         }
+    }
+
+    /// AUDIT M4.19 — when the old master is dead and no replica survives (RF=1),
+    /// the shard is permanently lost: no migration task names the dead node as a
+    /// source AND the lost-shards counter increments so operators get a runtime
+    /// alarm rather than only a silent absence of migration tasks.
+    #[test]
+    fn migration_plan_rf1_dead_master_counts_lost_shards() {
+        // RF=1: each shard has a master and no replicas.
+        let old = ShardTable::compute_with_epoch(&nodes(&[1, 2]), 1, 1, 1);
+        let new = ShardTable::compute_with_epoch(&nodes(&[2]), 1, 2, 1); // node 1 dead
+
+        let before = lost_shards_total();
+        let plan = ShardTable::migration_plan(&old, &new);
+        let after = lost_shards_total();
+
+        for task in &plan {
+            assert_ne!(
+                task.from_node,
+                NodeId(1),
+                "dead RF=1 master cannot be a migration source",
+            );
+        }
+        assert!(
+            after > before,
+            "lost-shards counter must increment for RF=1 dead-master shards",
+        );
     }
 
     #[test]

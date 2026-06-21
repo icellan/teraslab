@@ -3482,6 +3482,13 @@ impl ClusterCoordinator {
                     .cloned()
                     .collect();
                 mgr.start_outbound(&new_tasks, self_id, &populated_shards);
+                // AUDIT M1.2 — push the just-updated inbound/fence/migrating
+                // state into the atomic bitmaps the write hot path reads. Without
+                // this, the new master could serve a CREATE arriving immediately
+                // after activation before `inbound_atomic` reflects the pending
+                // inbound migration (the next event-loop sync runs too late),
+                // i.e. accept a write on a shard it has not finished receiving.
+                sync_atomic_migration_bitmaps(&mgr, fenced_bm, migrating_bm, inbound_bm);
             }
 
             // Phase 2 (worker thread): key snapshot + migration spawning.
@@ -7408,7 +7415,7 @@ fn persist_topology_state(
     use std::io::Write as _;
     let tmp = path.with_extension("cluster.tmp");
     let data = state.serialize();
-    let result = (|| -> std::io::Result<()> {
+    let attempt = || -> std::io::Result<()> {
         // W1.1 FIX D: the first persist can race data-dir creation at
         // boot (the vote handler persists as soon as a proposal arrives,
         // which can precede the server's directory setup). A missing
@@ -7424,10 +7431,24 @@ fn persist_topology_state(
             persist_topology_multi_node_marker(path, peak)?;
         }
         Ok(())
-    })();
+    };
+    // AUDIT M1.3 — this persist is safety-critical for restart quorum, so a
+    // single transient failure (e.g. a briefly-missing dir, EINTR) should not
+    // silently leave a stale peak/term on disk. Retry once (the whole write is
+    // idempotent: tmp is overwritten then atomically renamed), and on a hard
+    // failure escalate to ERROR so operators see the durability gap rather than
+    // a buried warning.
+    let result = attempt().or_else(|first| {
+        tracing::warn!(err = %first, "cluster: topology persist failed; retrying once");
+        attempt()
+    });
     if let Err(ref e) = result {
         PERSIST_FAILURES.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(err = %e, "cluster: failed to persist topology state");
+        tracing::error!(
+            err = %e,
+            "cluster: topology state persist FAILED after retry; on-disk peak/term \
+             may be stale until the next successful persist (restart quorum at risk)",
+        );
     }
     result
 }
@@ -8248,6 +8269,16 @@ impl RunningCluster {
         // A node that is the authoritative master for a shard but still has
         // pending inbound migration data is a subset master: it must not
         // serve requests until migration completes.
+        //
+        // AUDIT M1.5 — the fence reads only the lock-free `inbound_atomic`
+        // bitmap, NOT the shard table's `master_subset` flag. They are not
+        // equivalent: `master_subset` is set for every subset-master shard at
+        // table-compute time, including shards whose old master is dead and
+        // whose migration can therefore never run — fencing those would brick
+        // the shard forever. `inbound_atomic` reflects only migrations that are
+        // actually pending, and M1.2 makes it fresh by syncing immediately
+        // after `start_outbound`, which is the correct fix for the lag the
+        // audit flagged.
         if self.inbound_atomic.test(shard) && auth_master == self.self_id {
             return MasterQueryResult::Transitioning {
                 last_known_term: committed,
@@ -8774,8 +8805,19 @@ impl RunningCluster {
     }
 
     /// Highest cluster size ever observed (for quorum calculation).
+    ///
+    /// Unifies the two peak sources so write gating can never use a stale value:
+    /// the SWIM-fed `peak_size` atomic AND the `TopologyAuthority`'s
+    /// commit-raised peak. `handle_commit` raises only the authority's peak
+    /// (`topology.rs`), so a node that committed an N-member topology without a
+    /// corresponding SWIM burst would otherwise gate writes on a smaller peak
+    /// and wrongly accept mutations that should return `ERR_NO_QUORUM`. Taking
+    /// the max only ever raises the effective peak (the safe, more-conservative
+    /// direction for quorum).
     pub fn peak_cluster_size(&self) -> usize {
-        self.peak_size.load(Ordering::Relaxed)
+        self.peak_size
+            .load(Ordering::Relaxed)
+            .max(self.topology_authority.peak_cluster_size() as usize)
     }
 
     /// Current monotonic topology epoch.
@@ -12175,6 +12217,52 @@ mod tests {
     /// breaks graceful drain (e.g. the fabricated commit stops satisfying the
     /// proof, so `handle_commit` silently drops it) fails here loudly; a
     /// refactor that wrongly lets the drain lower the peak also fails here.
+    /// AUDIT M1.1 (CRITICAL) regression — a node that committed an N-member
+    /// topology must gate writes on that peak even when the SWIM-fed `peak_size`
+    /// atomic never caught up (e.g. a catch-up node that adopted a committed
+    /// topology without a corresponding SWIM membership burst).
+    ///
+    /// Before the fix, `peak_cluster_size()` read only the stale SWIM atomic, so
+    /// `check_quorum` used peak=1 and accepted writes that should have returned
+    /// `ERR_NO_QUORUM`; `persisted_state` likewise wrote the stale peak,
+    /// weakening quorum across restart.
+    #[test]
+    fn committed_topology_peak_unifies_swim_and_authority() {
+        let members = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let table = ShardTable::compute_with_epoch(&members, 2, 4, 1);
+        let live_nodes = [(NodeId(1), "127.0.0.1:12101".parse().unwrap())];
+        // Committed 3-member topology raises ONLY the TopologyAuthority peak
+        // (via handle_commit in the helper); the SWIM peak_size atomic is left
+        // stale at 1 — the exact divergence the audit flagged.
+        let cluster = new_test_running_cluster(
+            NodeId(1),
+            table,
+            &live_nodes,
+            &members, // committed members -> authority peak == 3
+            &[],
+            &[],
+            &[],
+            1, // SWIM peak_size atomic stays 1
+        );
+
+        // Read side (runtime write gating): must see the committed peak.
+        assert_eq!(
+            cluster.peak_cluster_size(),
+            3,
+            "peak must unify the committed-topology peak with the SWIM atomic; \
+             a quorum gate reading 1 here would accept split-brain writes",
+        );
+
+        // Persist side (restart durability): the on-disk peak must not regress
+        // below the committed cluster size even when the caller passes the stale
+        // SWIM peak.
+        let persisted = cluster.topology_authority.persisted_state(1, 0);
+        assert_eq!(
+            persisted.peak_cluster_size, 3,
+            "persisted peak must be clamped to the committed cluster size",
+        );
+    }
+
     #[test]
     fn quiesce_fabricated_commit_is_accepted_and_preserves_peak_floor() {
         let members = vec![NodeId(1), NodeId(2), NodeId(3)];

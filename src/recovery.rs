@@ -216,6 +216,20 @@ pub struct PendingAppendConflictingChild {
     pub is_remove: bool,
 }
 
+/// AUDIT M2.6 — engine-level deleted-child append intent collected during
+/// recovery. Like [`PendingAppendConflictingChild`], low-level replay cannot
+/// apply it (it needs the engine's allocator and stripe locks), so startup
+/// drains these after constructing the engine via `Engine::append_deleted_child`
+/// (idempotent: a re-applied append deduplicates). Without this, a crash between
+/// `PruneSlotIfSpentBy` and the deleted-child append dropped the audit /
+/// idempotent-respend-defense entry — the spend was still rejected via
+/// `UTXO_PRUNED`, but the defense-in-depth trail was lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingAppendDeletedChild {
+    pub parent_key: TxKey,
+    pub child_txid: [u8; 32],
+}
+
 impl RecoveryStats {
     /// Account for a per-entry [`ReplayCause`] failure. Updates both the
     /// per-cause counter and the back-compat `entries_failed` total.
@@ -591,22 +605,42 @@ pub fn repair_torn_slots(
     let entries = redo_log.recover()?;
     let mut report = RepairReport::default();
 
+    // How a torn slot is reconstructed from its redo entry. SpendV2/UnspendV2
+    // carry an optional hash (V3); FreezeV2/UnfreezeV2 always carry it.
+    enum Rebuild {
+        Spent([u8; 36]),
+        Unspent,
+        Frozen,
+    }
+
     for entry in &entries {
-        let (tx_key, offset, spending_data, hash, is_unspend) = match &entry.op {
+        let (tx_key, offset, hash, kind) = match &entry.op {
             RedoOp::SpendV2 {
                 tx_key,
                 offset,
                 spending_data,
                 utxo_hash,
                 ..
-            } => (tx_key, *offset, *spending_data, *utxo_hash, false),
+            } => (tx_key, *offset, *utxo_hash, Rebuild::Spent(*spending_data)),
             RedoOp::UnspendV2 {
                 tx_key,
                 offset,
-                spending_data,
                 utxo_hash,
                 ..
-            } => (tx_key, *offset, *spending_data, *utxo_hash, true),
+            } => (tx_key, *offset, *utxo_hash, Rebuild::Unspent),
+            // AUDIT M2.7 — the repair CLI must reconstruct the same torn freeze
+            // slots that `replay_freeze`/`replay_unfreeze` now self-heal (M1.4),
+            // so an operator-run repair recovers FreezeV2/UnfreezeV2 too.
+            RedoOp::FreezeV2 {
+                tx_key,
+                offset,
+                utxo_hash,
+            } => (tx_key, *offset, Some(*utxo_hash), Rebuild::Frozen),
+            RedoOp::UnfreezeV2 {
+                tx_key,
+                offset,
+                utxo_hash,
+            } => (tx_key, *offset, Some(*utxo_hash), Rebuild::Unspent),
             _ => continue,
         };
         report.entries_scanned += 1;
@@ -637,10 +671,10 @@ pub fn repair_torn_slots(
             continue;
         };
 
-        let rebuilt = if is_unspend {
-            UtxoSlot::new_unspent(hash)
-        } else {
-            UtxoSlot::new_spent(hash, spending_data)
+        let rebuilt = match kind {
+            Rebuild::Spent(spending_data) => UtxoSlot::new_spent(hash, spending_data),
+            Rebuild::Unspent => UtxoSlot::new_unspent(hash),
+            Rebuild::Frozen => UtxoSlot::new_frozen(hash),
         };
         if io::write_utxo_slot(device, ie.record_offset, offset, &rebuilt).is_ok() {
             report.slots_repaired += 1;
@@ -701,7 +735,7 @@ pub fn recover_all_with_allocator(
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
 ) -> Result<RecoveryStats, RecoveryError> {
-    let (stats, _) = recover_all_with_allocator_collecting_pending_conflicts(
+    let (stats, _, _) = recover_all_with_allocator_collecting_pending_conflicts(
         device, redo_log, index, dah, unmined, allocator,
     )?;
     Ok(stats)
@@ -717,7 +751,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
-) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
+) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>, Vec<PendingAppendDeletedChild>), RecoveryError> {
     let entries = redo_log.recover()?;
     recover_entries_with_allocator_collecting_pending_conflicts(
         device,
@@ -752,7 +786,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
     full_secondary_rebuild: bool,
-) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
+) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>, Vec<PendingAppendDeletedChild>), RecoveryError> {
     let entries = redo_log.recover()?;
     let secondary_reconcile = if full_secondary_rebuild {
         SecondaryReconcile::FullScan
@@ -781,9 +815,10 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     mut allocator: Option<&mut SlotAllocator>,
     mut progress: Option<(&mut RedoLog, u64)>,
     secondary_reconcile: SecondaryReconcile,
-) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>), RecoveryError> {
+) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>, Vec<PendingAppendDeletedChild>), RecoveryError> {
     let mut stats = RecoveryStats::default();
     let mut pending_conflicting_children = Vec::new();
+    let mut pending_deleted_children: Vec<PendingAppendDeletedChild> = Vec::new();
     let mut processed_since_progress = 0u64;
     let mut last_progress_sequence = 0u64;
     let mut last_safe_sequence = 0u64;
@@ -849,6 +884,19 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                     parent_key: *parent_key,
                     child_txid: *child_txid,
                     is_remove: true,
+                });
+                ReplayResult::Skipped
+            }
+            // AUDIT M2.6 — collect deleted-child appends for the same
+            // post-engine deferred drain as conflicting children. Drained in
+            // log order via `Engine::append_deleted_child` (idempotent).
+            RedoOp::AppendDeletedChild {
+                parent_key,
+                child_txid,
+            } => {
+                pending_deleted_children.push(PendingAppendDeletedChild {
+                    parent_key: *parent_key,
+                    child_txid: *child_txid,
                 });
                 ReplayResult::Skipped
             }
@@ -1082,7 +1130,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         }
     }
 
-    Ok((stats, pending_conflicting_children))
+    Ok((stats, pending_conflicting_children, pending_deleted_children))
 }
 
 fn reconcile_secondary_indexes_from_metadata(
@@ -2018,40 +2066,57 @@ fn replay_freeze(
         None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
-    let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
-        Ok(s) => s,
+    // B-5 parity with SpendV3: a CRC-failing (torn) slot in the WAL window is
+    // exactly what this redo entry exists to repair. A FreezeV2 entry carries
+    // the slot's `utxo_hash` (passed as `expected_hash`), so rebuild the frozen
+    // slot from the durable intent instead of fail-closed-bricking recovery. A
+    // non-corruption device I/O error still fails — the WAL cannot repair that.
+    let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
+        Ok(s) => Some(s),
+        Err(DeviceError::RecordCorruption { .. }) => None,
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
-    if let Some(expected_hash) = expected_hash
-        && slot.hash != *expected_hash
-    {
-        return ReplayResult::Skipped;
-    }
+    let frozen = match read {
+        Some(slot) => {
+            if let Some(expected_hash) = expected_hash
+                && slot.hash != *expected_hash
+            {
+                return ReplayResult::Skipped;
+            }
 
-    if slot.status == UTXO_FROZEN {
-        return ReplayResult::Skipped;
-    }
-    // F-G4-005: a legacy Freeze entry (no expected_hash) cannot verify
-    // that the slot at (record_offset, offset) is still the same UTXO
-    // the original Freeze targeted. Conservatively skip replay over
-    // anything other than UNSPENT — SPENT/PRUNED/LOCKED states have
-    // moved on and re-stamping FROZEN would silently overwrite a
-    // status another replay path depends on. Log the unusual case so
-    // operators can correlate with upstream reorderings.
-    if slot.status != UTXO_UNSPENT {
-        if expected_hash.is_none() {
-            tracing::warn!(
-                target: "teraslab::recovery",
-                slot_status = slot.status,
-                offset,
-                "F-G4-005: skipping legacy Freeze replay over non-UNSPENT slot",
-            );
+            if slot.status == UTXO_FROZEN {
+                return ReplayResult::Skipped;
+            }
+            // F-G4-005: a legacy Freeze entry (no expected_hash) cannot verify
+            // that the slot at (record_offset, offset) is still the same UTXO
+            // the original Freeze targeted. Conservatively skip replay over
+            // anything other than UNSPENT — SPENT/PRUNED/LOCKED states have
+            // moved on and re-stamping FROZEN would silently overwrite a
+            // status another replay path depends on. Log the unusual case so
+            // operators can correlate with upstream reorderings.
+            if slot.status != UTXO_UNSPENT {
+                if expected_hash.is_none() {
+                    tracing::warn!(
+                        target: "teraslab::recovery",
+                        slot_status = slot.status,
+                        offset,
+                        "F-G4-005: skipping legacy Freeze replay over non-UNSPENT slot",
+                    );
+                }
+                return ReplayResult::Skipped;
+            }
+            UtxoSlot::new_frozen(slot.hash)
         }
-        return ReplayResult::Skipped;
-    }
+        None => match expected_hash {
+            // Torn slot rebuilt directly from the FreezeV2 redo entry's hash.
+            Some(h) => UtxoSlot::new_frozen(*h),
+            // Legacy V1 entry without the hash: unrepairable here. Fail closed
+            // so the operator can run the repair CLI.
+            None => return ReplayResult::Failed(ReplayCause::IoError),
+        },
+    };
 
-    let frozen = UtxoSlot::new_frozen(slot.hash);
     if io::write_utxo_slot(device, ie.record_offset, offset, &frozen).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
@@ -2070,25 +2135,37 @@ fn replay_unfreeze(
         None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
     };
 
-    let slot = match io::read_utxo_slot(device, ie.record_offset, offset) {
-        Ok(s) => s,
+    // B-5 parity with SpendV3 (see replay_freeze): rebuild a torn slot from the
+    // UnfreezeV2 entry's `utxo_hash` rather than fail-closed-bricking recovery.
+    let read = match io::read_utxo_slot(device, ie.record_offset, offset) {
+        Ok(s) => Some(s),
+        Err(DeviceError::RecordCorruption { .. }) => None,
         Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
     };
 
-    if let Some(expected_hash) = expected_hash
-        && slot.hash != *expected_hash
-    {
-        return ReplayResult::Skipped;
-    }
+    let unspent = match read {
+        Some(slot) => {
+            if let Some(expected_hash) = expected_hash
+                && slot.hash != *expected_hash
+            {
+                return ReplayResult::Skipped;
+            }
 
-    if slot.status == UTXO_UNSPENT {
-        return ReplayResult::Skipped;
-    }
-    if slot.status != UTXO_FROZEN {
-        return ReplayResult::Skipped;
-    }
+            if slot.status == UTXO_UNSPENT {
+                return ReplayResult::Skipped;
+            }
+            if slot.status != UTXO_FROZEN {
+                return ReplayResult::Skipped;
+            }
+            UtxoSlot::new_unspent(slot.hash)
+        }
+        None => match expected_hash {
+            // Torn slot rebuilt directly from the UnfreezeV2 redo entry's hash.
+            Some(h) => UtxoSlot::new_unspent(*h),
+            None => return ReplayResult::Failed(ReplayCause::IoError),
+        },
+    };
 
-    let unspent = UtxoSlot::new_unspent(slot.hash);
     if io::write_utxo_slot(device, ie.record_offset, offset, &unspent).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
     }
@@ -3529,11 +3606,59 @@ mod tests {
             Some(&mut h.alloc),
             true,
         );
-        let (stats, _pending) =
+        let (stats, _pending, _deleted) =
             result.expect("recovery must complete on a full log, not abort with LogFull");
         // The freeze entries replayed/skipped; none failed fatally.
         assert_eq!(stats.failed_io, 0);
         assert_eq!(stats.failed_corrupt, 0);
+    }
+
+    /// AUDIT M2.7 — the offline repair pass also rebuilds torn slots covered by
+    /// FreezeV2 / UnfreezeV2 entries, matching the M1.4 self-heal in `recover`.
+    #[test]
+    fn repair_torn_slots_rebuilds_freeze_and_unfreeze() {
+        let mut h = RecoveryTestHarness::new();
+        let key_freeze = h.create_record(0xF5, 2);
+        let key_unfreeze = h.create_record(0xF6, 2);
+        let freeze_hash = [0x55u8; 32];
+        let unfreeze_hash = [0x66u8; 32];
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreezeV2 {
+            tx_key: key_freeze,
+            offset: 0,
+            utxo_hash: freeze_hash,
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::UnfreezeV2 {
+            tx_key: key_unfreeze,
+            offset: 0,
+            utxo_hash: unfreeze_hash,
+        })
+        .unwrap();
+        drop(redo);
+
+        h.corrupt_slot(&key_freeze, 0);
+        h.corrupt_slot(&key_unfreeze, 0);
+
+        let redo = h.redo_log();
+        let report = repair_torn_slots(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(report.entries_scanned, 2);
+        assert_eq!(report.slots_repaired, 2, "freeze + unfreeze torn slots rebuilt");
+        assert!(
+            report.unrecoverable.is_empty(),
+            "V2 freeze/unfreeze entries always carry the hash"
+        );
+
+        let fie = h.index.lookup(&key_freeze).unwrap();
+        let fslot = io::read_utxo_slot(&*h.data_dev, fie.record_offset, 0).unwrap();
+        assert_eq!(fslot.status, UTXO_FROZEN);
+        assert_eq!(fslot.hash, freeze_hash);
+
+        let uie = h.index.lookup(&key_unfreeze).unwrap();
+        let uslot = io::read_utxo_slot(&*h.data_dev, uie.record_offset, 0).unwrap();
+        assert_eq!(uslot.status, UTXO_UNSPENT);
+        assert_eq!(uslot.hash, unfreeze_hash);
     }
 
     /// B-5: the offline repair pass rebuilds a torn slot from a V3 entry
@@ -3651,7 +3776,7 @@ mod tests {
 
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
-        let (stats, pending) = recover_all_with_allocator_collecting_pending_conflicts(
+        let (stats, pending, _deleted) = recover_all_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             &redo,
             &mut h.index,
@@ -3701,6 +3826,80 @@ mod tests {
             engine.read_conflicting_children(&parent_key).unwrap(),
             vec![child_txid],
             "draining the same pending intent twice must not duplicate the child",
+        );
+    }
+
+    /// AUDIT M2.6 — an `AppendDeletedChild` redo entry is collected as a pending
+    /// deferred drain and applied post-engine via `append_deleted_child`,
+    /// idempotently, restoring the deleted-children audit/defense trail that a
+    /// crash between prune and append would otherwise drop.
+    #[test]
+    fn append_deleted_child_recovery_replays_pending_intent() {
+        let mut h = RecoveryTestHarness::new();
+        let parent_key = h.create_record(0xDA, 1);
+        let child_txid = [0xDB; 32];
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::AppendDeletedChild {
+            parent_key,
+            child_txid,
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let (stats, _pending, deleted) = recover_all_with_allocator_collecting_pending_conflicts(
+            &*h.data_dev,
+            &redo,
+            &mut h.index,
+            &mut dah,
+            &mut unmined,
+            Some(&mut h.alloc),
+        )
+        .unwrap();
+
+        // Low-level replay skips it (needs the engine); it is surfaced as a
+        // pending deferred drain instead.
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(
+            deleted,
+            vec![PendingAppendDeletedChild {
+                parent_key,
+                child_txid,
+            }]
+        );
+
+        let data_dev = h.data_dev.clone();
+        let engine = Engine::new(
+            data_dev,
+            h.index,
+            h.alloc,
+            StripedLocks::new(1024),
+            dah,
+            unmined,
+        );
+
+        for intent in &deleted {
+            engine
+                .append_deleted_child(&intent.parent_key, intent.child_txid)
+                .unwrap();
+        }
+        assert_eq!(
+            engine.read_deleted_children(&parent_key).unwrap(),
+            vec![child_txid],
+        );
+
+        // Idempotent: draining the same intent again must not duplicate.
+        for intent in &deleted {
+            engine
+                .append_deleted_child(&intent.parent_key, intent.child_txid)
+                .unwrap();
+        }
+        assert_eq!(
+            engine.read_deleted_children(&parent_key).unwrap(),
+            vec![child_txid],
+            "draining the same deleted-child intent twice must not duplicate",
         );
     }
 
@@ -5025,6 +5224,67 @@ mod tests {
         let meta = io::read_metadata(&*h.data_dev, record_offset).unwrap();
         assert_eq!({ meta.block_entry_count }, 1);
         assert_eq!({ meta.generation }, 1);
+    }
+
+    /// AUDIT M1.4 regression — a torn (CRC-failing) slot covered by a FreezeV2
+    /// redo entry must be rebuilt from the entry's `utxo_hash`, exactly like
+    /// SpendV3, rather than failing closed and bricking recovery.
+    #[test]
+    fn corrupt_slot_with_freeze_v2_entry_self_heals() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xF1, 2);
+        let hash0 = h.slot_hash(0);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::FreezeV2 {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: hash0,
+        })
+        .unwrap();
+        drop(redo);
+
+        h.corrupt_slot(&key, 0);
+
+        let redo = h.redo_log();
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.failed_io, 0, "FreezeV2 entry must not fail closed");
+        assert_eq!(stats.entries_replayed, 1, "torn slot rebuilt and frozen");
+
+        let ie = h.index.lookup(&key).unwrap();
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.status, UTXO_FROZEN);
+        assert_eq!(slot.hash, hash0, "rebuilt slot carries the redo-entry hash");
+    }
+
+    /// AUDIT M1.4 regression — a torn slot covered by an UnfreezeV2 entry is
+    /// rebuilt to UNSPENT from the entry's `utxo_hash` instead of failing closed.
+    #[test]
+    fn corrupt_slot_with_unfreeze_v2_entry_self_heals() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xF2, 2);
+        let hash0 = h.slot_hash(0);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::UnfreezeV2 {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: hash0,
+        })
+        .unwrap();
+        drop(redo);
+
+        h.corrupt_slot(&key, 0);
+
+        let redo = h.redo_log();
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.failed_io, 0, "UnfreezeV2 entry must not fail closed");
+        assert_eq!(stats.entries_replayed, 1, "torn slot rebuilt and unspent");
+
+        let ie = h.index.lookup(&key).unwrap();
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        assert_eq!(slot.hash, hash0, "rebuilt slot carries the redo-entry hash");
     }
 
     #[test]

@@ -950,7 +950,17 @@ impl TopologyAuthority {
     pub fn restore(&self, state: &PersistedTopologyState) {
         // E-01: reinstate the persisted peak so a node that reboots into
         // a partition cannot self-activate a shrunken topology.
-        self.observe_peak_cluster_size(state.peak_cluster_size);
+        //
+        // AUDIT M1.3 — floor the restored peak at the persisted committed
+        // member count. A file written before the persist-side clamp, or by a
+        // failed/partial earlier persist, could carry a peak below the committed
+        // membership; loading it verbatim would weaken quorum on restart. This
+        // is raise-only and self-heals such a stale on-disk peak at load time.
+        self.observe_peak_cluster_size(
+            state
+                .peak_cluster_size
+                .max(state.committed_members.len() as u64),
+        );
         self.committed_term
             .store(state.committed_term, Ordering::Relaxed);
         self.voted_term.store(state.voted_term, Ordering::Relaxed);
@@ -1052,7 +1062,12 @@ impl TopologyAuthority {
     /// after restart the node can resume with a strictly higher value.
     pub fn persisted_state(&self, peak: u64, incarnation: u64) -> PersistedTopologyState {
         PersistedTopologyState {
-            peak_cluster_size: peak,
+            // Never persist a peak below this authority's own commit-raised peak.
+            // Callers pass the SWIM-fed atomic, which can lag a committed
+            // topology; clamping here keeps the on-disk peak (loaded at restart
+            // for quorum gating) from regressing below the largest committed
+            // cluster size. Raise-only, matching observe_peak_cluster_size.
+            peak_cluster_size: peak.max(self.peak_cluster_size()),
             committed_term: self.committed_term.load(Ordering::Relaxed),
             committed_members: self.committed_members.read().unwrap().clone(),
             committed_voters: self.committed_voters.read().unwrap().clone(),

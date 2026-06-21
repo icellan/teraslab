@@ -781,6 +781,7 @@ fn main() {
     // allocator so freelist mutations between snapshots are not lost.
     let mut allocator = allocator;
     let mut pending_conflicting_children = Vec::new();
+    let mut pending_deleted_children = Vec::new();
     // Height subsystem (deletion-tombstone design §4; BUG3): the max block
     // height the replayed redo entries prove this node has durably seen. Folded
     // into the last-durable-height floor below so a lost/corrupt `.height` file
@@ -807,8 +808,9 @@ fn main() {
             Some(&mut allocator),
             full_secondary_rebuild,
         ) {
-            Ok((stats, pending)) => {
+            Ok((stats, pending, deleted)) => {
                 pending_conflicting_children = pending;
+                pending_deleted_children = deleted;
                 recovery_height_floor = stats.max_observed_block_height;
                 tracing::info!(
                     replayed = stats.entries_replayed,
@@ -947,6 +949,30 @@ fn main() {
         tracing::info!(
             drained = pending_conflicting_children.len(),
             "recovery: drained pending conflicting-child append intents",
+        );
+    }
+
+    // AUDIT M2.6 — drain deleted-child append intents the same way. A crash
+    // between the prune and the deleted-child append left this list short;
+    // `Engine::append_deleted_child` is idempotent so re-draining is safe and
+    // restores the idempotent-respend-defense / audit trail.
+    if !pending_deleted_children.is_empty() {
+        for pending in &pending_deleted_children {
+            if let Err(e) =
+                engine.append_deleted_child(&pending.parent_key, pending.child_txid)
+            {
+                tracing::error!(
+                    parent_key = ?pending.parent_key,
+                    child_txid = ?pending.child_txid,
+                    err = %e,
+                    "recovery: failed to drain deleted-child intent; aborting startup",
+                );
+                std::process::exit(1);
+            }
+        }
+        tracing::info!(
+            drained = pending_deleted_children.len(),
+            "recovery: drained pending deleted-child append intents",
         );
     }
 

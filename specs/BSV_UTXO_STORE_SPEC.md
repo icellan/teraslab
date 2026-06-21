@@ -1350,8 +1350,20 @@ The replication factor (RF) is configurable per deployment:
 | 3 | Master + 2 replicas | High availability, prerequisite for SC mode (Raft) |
 
 With RF=3, the master sends `ReplicaOp` to **both** replicas in parallel. Acknowledgment policy is configurable:
-- **write-all** (default): wait for all replicas to ACK before responding to client
+- **write-all**: wait for all replicas to ACK before responding to client
 - **write-majority**: wait for ⌊RF/2⌋+1 ACKs (e.g., 2 of 3) — lower latency, used for SC mode with Raft
+- **auto** (default): resolves per RF — `write-all` for RF≤2 (so RF=2 still
+  requires 2-of-2) and `write-majority` for RF≥3 (so RF=3 requires 2-of-3, not
+  3-of-3). This matches the implementation's `ack_policy = auto` resolution; a
+  deployment that needs strict 3-of-3 at RF=3 must set `write-all` explicitly.
+
+**Isolated-remnant write gating (`ERR_NO_QUORUM`, code 15):** a node that was
+part of a larger committed topology will not accept mutations once its live,
+committed membership drops below the majority of the **peak** cluster size it
+has ever observed — it returns `ERR_NO_QUORUM` instead. This prevents a minority
+remnant of a partitioned cluster from accepting writes that the majority side
+cannot see. (Not present in earlier drafts of this spec; it is implemented and
+tested.)
 
 ### 8.4 Synchronous Replication Path
 
@@ -1365,7 +1377,13 @@ With RF=3, the master sends `ReplicaOp` to **both** replicas in parallel. Acknow
 
 ### 8.5 Failure Handling
 
-- **Replica timeout**: Master returns success after local commit, marks replica as lagging
+- **Replica timeout**: when the master cannot confirm the required replica ACKs
+  within the timeout it returns **`ERR_REPLICATION_FAILED` (code 20)** — an
+  *ambiguous* outcome — and runs the asynchronous compensation/convergence path,
+  NOT a client-visible success. (Earlier drafts of this spec said the master
+  returns success after local commit; the implementation fails closed instead.
+  See §8.7 for the full client contract.) The lagging replica is also tracked
+  for catch-up.
 - **Replica crash**: On recovery, replica requests replay from master's redo log starting at last ACK'd sequence
 - **Master crash**: Replica promotes to master, serves reads; new replica backfills from promoted master's redo log
 - **Network partition**: Operations continue on master side; replica catches up when partition heals
