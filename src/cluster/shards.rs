@@ -18,8 +18,9 @@ pub const NUM_SHARDS: usize = 4096;
 /// [`lost_shards_total`].
 static LOST_SHARDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-/// Process-wide count of shards detected as permanently lost (see
-/// [`struct@LOST_SHARDS_TOTAL`]). Exposed for metrics/alerting.
+/// Process-wide count of shards detected as permanently lost (the
+/// `LOST_SHARDS_TOTAL` counter raised by `migration_plan`). Exposed for
+/// metrics/alerting.
 pub fn lost_shards_total() -> u64 {
     LOST_SHARDS_TOTAL.load(Ordering::Relaxed)
 }
@@ -173,7 +174,7 @@ impl ShardTable {
     /// - Shard N's replica i = `members[(N + i) % len]` (if != master)
     ///
     /// **v2 (rendezvous / HRW):**
-    /// - Shard N's master = the member maximizing [`hrw_weight`]`(N, node)`
+    /// - Shard N's master = the member maximizing `hrw_weight`(N, node)
     /// - Shard N's replicas = the next RF-1 distinct members by descending
     ///   weight. Ties (equal weight) break toward the LOWER `NodeId`.
     ///

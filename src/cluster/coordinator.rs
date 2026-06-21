@@ -4428,7 +4428,7 @@ pub enum RejoinGateDecision {
 /// - `gc_enabled` — when `false` the gate is INERT and always returns
 ///   [`RejoinGateDecision::Admit`] (byte-identical pre-Phase-4 behavior).
 /// - `cluster_tip` — the estimated cluster tip height (MAX over reachable
-///   seed/committed peers, [`max_tip_from_results`]); `None` when no peer
+///   seed/committed peers, `max_tip_from_results`); `None` when no peer
 ///   answered, in which case the gate has no staleness evidence and admits.
 /// - `self_height` — this node's `last_durable_height`.
 /// - `rejoin_grace_blocks` — the shared staleness bound.

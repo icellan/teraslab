@@ -127,7 +127,7 @@ pub enum ReplayCause {
     /// entry's `record_offset` failed (the record bytes were never synced
     /// before the node stopped, or the offset was later reclaimed).
     ///
-    /// Unlike [`MissingRecordBytes`] (a `CreateV2` short device I/O, which
+    /// Unlike [`ReplayCause::MissingRecordBytes`] (a `CreateV2` short device I/O, which
     /// signals a misbehaving device), a legacy `Create` carries NO captured
     /// bytes and is only ever written by the replication / migration
     /// receiver (`replication::receiver`) for a SECONDARY copy whose
@@ -377,7 +377,7 @@ pub struct TombstoneRecoveryStats {
 /// For every tombstone key, if the primary index STILL holds that key AND the
 /// tombstone's generation is at-or-ahead of the live record's generation
 /// (wrapping comparison, [`crate::record::generation_at_or_ahead`]), the
-/// record is removed locally via [`crate::ops::engine::Engine::delete_for_purge`]
+/// record is removed locally via `crate::ops::engine::Engine::delete_for_purge`
 /// (which does NOT write a new tombstone — the tombstone already exists). This
 /// collapses any record the node resurrected from its own redo/device load of
 /// a key the cluster authoritatively deleted, making the node safe even before
@@ -405,7 +405,7 @@ pub struct TombstoneRecoveryStats {
 /// free-list is AUTHORITATIVE that the region is dead, and a second `free` of an
 /// already-free range is (correctly) rejected as a double-free. R2's actual
 /// goal is narrower — drop the stale primary-index entry so the resurrected key
-/// is gone. [`crate::ops::engine::Engine::delete_for_purge`] therefore tolerates
+/// is gone. `crate::ops::engine::Engine::delete_for_purge` therefore tolerates
 /// an already-free region: it removes the index entry (durably, via the redb
 /// primary index `commit`, so the key cannot reappear on the next restart — no
 /// per-restart purge loop) and SKIPS the redundant free when the region is fully

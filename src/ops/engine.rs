@@ -88,10 +88,10 @@ impl Drop for MigrationJournalGuard {
 ///
 /// # Atomic-apply invariant (F-G5-022 / A-4)
 ///
-/// Each mutation entry point ([`Self::spend`], [`Self::unspend`],
-/// [`Self::set_mined`] / `Self::set_mined_inner`, [`Self::set_locked`],
-/// [`Self::create`], [`Self::delete`], [`Self::freeze`], [`Self::unfreeze`],
-/// [`Self::reassign`], [`Self::mark_on_longest_chain`], etc.) acquires the
+/// Each mutation entry point (`Self::spend`, `Self::unspend`,
+/// `Self::set_mined` / `Self::set_mined_inner`, `Self::set_locked`,
+/// `Self::create`, `Self::delete`, `Self::freeze`, `Self::unfreeze`,
+/// `Self::reassign`, `Self::mark_on_longest_chain`, etc.) acquires the
 /// per-tx stripe mutex *as its first action* and holds it for the entire
 /// read → validate → write → index-sync sequence. The mutex is released
 /// only after every observable side effect (slot write, metadata write,
@@ -108,8 +108,8 @@ impl Drop for MigrationJournalGuard {
 /// downgrades the stripe mutex to an RwLock with shared validation, will
 /// surface as ≥2 winners and a panicking test.
 ///
-/// Read-only paths ([`Self::read_metadata`], [`Self::read_slot`],
-/// [`Self::read_slots`], [`Self::read_block_entry`], [`Self::get_spend`])
+/// Read-only paths (`Self::read_metadata`, `Self::read_slot`,
+/// `Self::read_slots`, `Self::read_block_entry`, `Self::get_spend`)
 /// intentionally skip the per-tx stripe mutex for throughput. Torn-read
 /// safety on these paths comes from the record-keyed [`crate::locks::StripedRwLocks`]
 /// table inside [`crate::io`] (F-X-007 / BC-02): every `*_direct` helper
@@ -440,7 +440,7 @@ impl Engine {
     /// resync of every replica because replica recovery would have no
     /// log to replay.
     ///
-    /// Unlike [`Self::redo_log_handle`], this accessor is NOT affected by
+    /// Unlike `Self::redo_log_handle`, this accessor is NOT affected by
     /// migration-baseline journal suppression: callers use it to inspect
     /// or attach the log itself, not to decide whether to journal a
     /// mutation.
@@ -557,7 +557,7 @@ impl Engine {
     /// The highest block height this node has durably observed (design §4).
     ///
     /// Served over the wire by `OP_GET_NODE_HEIGHT` and consumed by the GC
-    /// horizon ([`crate::cluster::coordinator::ClusterCoordinator::min_member_finalized_height`])
+    /// horizon ([`crate::cluster::coordinator::RunningCluster::min_member_finalized_height`])
     /// and the rejoin-eligibility gate. Monotone within a process; restored
     /// (and floored) across restarts by [`Self::restore_last_durable_height`].
     pub fn last_durable_height(&self) -> u32 {
@@ -5557,7 +5557,7 @@ impl Engine {
     ///
     /// # Deletion tombstone (deletion-tombstone Phase 3)
     ///
-    /// When the feature is active ([`Self::tombstone_write_active`]) this
+    /// When the feature is active (`Self::tombstone_write_active`) this
     /// path also writes a durable [`crate::tombstone::Tombstone`] so the
     /// cluster's physical removal is self-describing across a restart /
     /// rejoin. The tombstone is made durable BEFORE the primary-index
@@ -5945,7 +5945,7 @@ impl Engine {
     /// about to re-receive and pull fresh baselines. This is a LOCAL discard,
     /// NOT a cluster delete: it must NOT write tombstones (a tombstone would
     /// wrongly mark the key deleted cluster-wide), so it routes through
-    /// [`Self::delete_for_purge`] (`write_tombstone = false`), which otherwise
+    /// `Self::delete_for_purge` (`write_tombstone = false`), which otherwise
     /// performs the identical, audited header-zero → fsync → primary-index
     /// removal → region-free → secondary-cleanup sequence.
     ///
@@ -6061,7 +6061,7 @@ impl Engine {
     /// Record a tombstone replicated from the master with *exact* carried
     /// fields (deletion-tombstone §6, replica `DeleteV2` apply).
     ///
-    /// Unlike [`Self::append_delete_tombstone`] — which derives the fields from
+    /// Unlike `Self::append_delete_tombstone` — which derives the fields from
     /// the local record at delete time — this writes the master's
     /// `deletion_height` / `generation` / `cause` verbatim, so the replica's
     /// tombstone matches the master's. The receiver calls it AFTER removing the

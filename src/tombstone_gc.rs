@@ -183,7 +183,7 @@ pub fn perform_gc_round(
 /// Spawn the tombstone-GC daemon thread (deletion-tombstone design §4.6).
 ///
 /// Mirrors [`crate::checkpoint::spawn_checkpoint_task`]: a named OS thread
-/// running [`run_gc_loop`] until `shutdown` is set. The thread is cheap when
+/// running `run_gc_loop` until `shutdown` is set. The thread is cheap when
 /// disabled (it wakes on cadence, checks the flag, and returns immediately),
 /// so it is always spawned and gated internally on `config.enabled`.
 pub fn spawn_tombstone_gc_task(

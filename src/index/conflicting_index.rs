@@ -8,7 +8,7 @@
 //! Unlike the unmined / DAH secondaries, this index carries **no** redo-log
 //! durability and **no** redb backing — it is a plain in-memory set. It is
 //! rebuilt at startup from the primary index
-//! (see [`crate::ops::Engine::rebuild_conflicting_index`]), so a crash simply
+//! (see [`crate::ops::engine::Engine::rebuild_conflicting_index`]), so a crash simply
 //! re-derives it from the authoritative on-device CONFLICTING flags. The
 //! conflicting flag is only ever toggled by `create` (with the flag set) and
 //! `set_conflicting`, and cleared by `delete`; those are the maintenance
