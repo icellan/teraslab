@@ -2,7 +2,7 @@
 //!
 //! A tombstone is a tiny durable record `(txid, shard, deletion_height,
 //! generation, cause)` written when the cluster physically removes a UTXO
-//! record. Its purpose (see `DELETION_TOMBSTONE_DESIGN.md`) is to make the
+//! record. Its purpose is to make the
 //! *absence* of a key self-describing — "absent because the cluster deleted
 //! it" rather than "absent, never received" — so a stale rejoinee can drop a
 //! deleted key instead of resurrecting it.
@@ -164,7 +164,7 @@ impl TombstoneCause {
 
 /// Fixed-size on-device tombstone entry — exactly 56 bytes, 8-byte aligned.
 ///
-/// Field layout (per `DELETION_TOMBSTONE_DESIGN.md` §2):
+/// Field layout:
 ///
 /// | field | bytes | offset |
 /// |---|---|---|
@@ -1042,7 +1042,7 @@ fn lcm(a: usize, b: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 /// The action to take for a single local key during tombstone-driven migration
-/// reconciliation (`DELETION_TOMBSTONE_DESIGN.md` §7).
+/// reconciliation.
 ///
 /// Produced by [`classify_reconcile`] against the authoritative source's
 /// live + tombstone manifest for the shard. The three outcomes partition the
@@ -1069,7 +1069,7 @@ pub enum ReconcileAction {
 }
 
 /// Classify one local key against a single authoritative source's manifest
-/// (`DELETION_TOMBSTONE_DESIGN.md` §7 — the 4-row table).
+/// (the 4-row classification table).
 ///
 /// This is the PURE decision core of tombstone-driven migration reconciliation:
 /// no cluster, no engine, no I/O. It is exhaustively unit-testable in isolation
@@ -1130,7 +1130,7 @@ pub fn classify_reconcile(
 }
 
 /// Classify one local key against the UNION of ALL pending sources' manifests
-/// (`DELETION_TOMBSTONE_DESIGN.md` §9.1 #1 — the multi-source union rule).
+/// (the multi-source union rule).
 ///
 /// This is the load-bearing correctness point of multi-source migration. A
 /// single-source [`classify_reconcile`] is WRONG when several sources stream the

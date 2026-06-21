@@ -611,8 +611,7 @@ fn full_lifecycle_single_tx() {
 ///
 /// Audit N-5 / G-6: the engine suite otherwise only ever constructs an
 /// in-memory index. A step that succeeds on Memory but fails on
-/// redb/file-backed is a real backend defect (see
-/// `audit/raw/G-index-backends.md`), not a test artifact.
+/// redb/file-backed is a real backend defect, not a test artifact.
 fn engine_lifecycle_for_backend(mode: IndexBackendMode) {
     const TX_N: u32 = 0x4C00;
     const UTXO_COUNT: u32 = 4;

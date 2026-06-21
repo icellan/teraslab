@@ -16,5 +16,6 @@ and several `src/ops/*.rs` doc comments by line number).
 The file is checked in unchanged so the line-number citations in the spec and code
 comments resolve against a version-pinned baseline. Do **not** edit the copy; if the
 upstream UDF changes and the parity baseline must move, re-copy the new revision and
-update the commit hash above. The function-by-function parity audit against this exact
-file lives in `audit/raw/lua-parity.md`.
+update the commit hash above. TeraSlab's UTXO ops are implemented for
+function-by-function parity against this exact file (see the `src/ops/*.rs` doc
+comments that cite it by line number).

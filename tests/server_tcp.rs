@@ -2527,7 +2527,7 @@ fn per_ip_connection_cap_disabled_when_set_to_zero() {
 // and unspend lifecycle — also run against redb and file-backed servers.
 //
 // A failure that reproduces only on `redb`/`file_backed` (and not `memory`)
-// is a real backend bug, not a test artifact (see audit/raw/G-index-backends.md).
+// is a real backend bug, not a test artifact.
 // ---------------------------------------------------------------------------
 
 /// Connect a client to a backend-parametrized test server with a read timeout.
