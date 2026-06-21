@@ -45,8 +45,9 @@ use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::{
-    WireCreateItem, WireGetSpendItem, decode_get_spend_response, encode_create_batch,
-    encode_get_spend_batch,
+    SetMinedBatchParams, WireCreateItem, WireGetSpendItem, decode_get_spend_response,
+    decode_partial_with_signals, encode_create_batch, encode_get_spend_batch,
+    encode_set_mined_batch,
 };
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
@@ -291,6 +292,159 @@ fn single_sparse_error_code(resp: &ResponseFrame, context: &str) -> u16 {
 ///     (reads pass through the write fence);
 /// (c) once the fence lifts (migration completion), the identical SPEND
 ///     succeeds and the spend is durably visible.
+/// AUDIT M2.9 — the migration write-fence must reject CREATE, DELETE and
+/// SET_MINED on a fenced shard with `ERR_MIGRATION_IN_PROGRESS`, not only SPEND.
+/// The fence is enforced uniformly for every mutation opcode
+/// (`is_mutation_opcode` + `check_shard_ownership`); this pins that contract for
+/// the non-SPEND money/lifecycle ops the original F-02 test did not cover.
+#[test]
+fn fenced_shard_rejects_create_delete_set_mined() {
+    let node1 = create_node(451, &[], 1);
+    let node2 = create_node(452, &[node1.swim_port], 1);
+
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(20),
+    )
+    .expect("2-node topology should commit on both nodes");
+
+    let mut key_txid = None;
+    for i in 0..8192u32 {
+        let txid = make_txid(960_000 + i);
+        if matches!(
+            node1.cluster.is_master(&TxKey { txid }),
+            MasterQueryResult::Yes
+        ) {
+            key_txid = Some(txid);
+            break;
+        }
+    }
+    let txid = key_txid.expect("node1 should master at least one candidate key");
+    let utxo_hash = make_txid(970_001);
+    let key = TxKey { txid };
+    let shard = ShardTable::shard_for_key(&key);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Seed a record (DELETE / SET_MINED need an existing target) before fencing.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 1,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_payload(&txid, &utxo_hash).into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "seed create before the fence");
+
+    node1.cluster.test_fence_shard(shard);
+    assert!(
+        node1.cluster.is_shard_write_fenced(&key),
+        "fence must be visible on the hot-path bitmap"
+    );
+
+    // A fresh txid on the SAME shard (same first two bytes) for the CREATE arm.
+    let mut create_txid = txid;
+    create_txid[31] ^= 0xFF;
+    assert_eq!(
+        ShardTable::shard_for_key(&TxKey { txid: create_txid }),
+        shard,
+        "create_txid must map to the fenced shard"
+    );
+
+    // (a) CREATE on the fenced shard → code 19.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 2,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_payload(&create_txid, &utxo_hash).into(),
+        },
+    );
+    assert_eq!(
+        single_sparse_error_code(&resp, "create on fenced shard"),
+        ERR_MIGRATION_IN_PROGRESS,
+    );
+
+    // (b) DELETE on the fenced shard → code 19.
+    let mut del = Vec::new();
+    del.extend_from_slice(&1u32.to_le_bytes());
+    del.extend_from_slice(&txid);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 3,
+            op_code: OP_DELETE_BATCH,
+            flags: 0,
+            payload: del.into(),
+        },
+    );
+    assert_eq!(
+        single_sparse_error_code(&resp, "delete on fenced shard"),
+        ERR_MIGRATION_IN_PROGRESS,
+    );
+
+    // (c) SET_MINED on the fenced shard → code 19.
+    let sm = encode_set_mined_batch(
+        &SetMinedBatchParams {
+            block_id: 1,
+            block_height: 1,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1,
+            block_height_retention: 288,
+        },
+        &[txid],
+    );
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 4,
+            op_code: OP_SET_MINED_BATCH,
+            flags: 0,
+            payload: sm.into(),
+        },
+    );
+    // SET_MINED uses the signal response format (successes + errors), so decode
+    // it that way rather than the sparse format used by CREATE/DELETE.
+    let (successes, errors) =
+        decode_partial_with_signals(&resp.payload).expect("set_mined fenced response must decode");
+    assert!(successes.is_empty(), "fenced set_mined must yield no success");
+    assert_eq!(errors.len(), 1, "fenced set_mined must yield one item error");
+    assert_eq!(
+        errors[0].error_code, ERR_MIGRATION_IN_PROGRESS,
+        "fenced set_mined must fail with code 19",
+    );
+
+    // Fence lifts → a CREATE on the same shard now succeeds.
+    node1.cluster.test_unfence_shard(shard);
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 5,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_create_payload(&create_txid, &utxo_hash).into(),
+        },
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "CREATE on the shard must succeed once the fence lifts"
+    );
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+}
+
 #[test]
 fn fenced_shard_rejects_spend_serves_read_then_spend_succeeds_after_fence_lifts() {
     // RF=1 two-node cluster: replication is irrelevant to the fence and

@@ -9852,6 +9852,73 @@ mod tests {
         assert_eq!({ meta.spent_utxos }, 5);
     }
 
+    /// AUDIT M3.13 — concurrent spend AND unspend racing on the SAME slot must
+    /// not corrupt state. The per-key stripe lock serializes the two mutation
+    /// paths, so the slot always ends in a coherent spent-or-unspent state and
+    /// the spent-counter (re-derived from on-device slots) can never exceed the
+    /// single slot's count. Pre-fix counter-drift / torn-slot bugs would make
+    /// `spent_utxos` exceed 1 or the threads panic/deadlock.
+    #[test]
+    fn concurrent_spend_unspend_same_slot_no_corruption() {
+        let h = TestHarness::new(4, TxFlags::empty());
+        let engine = h.engine.clone();
+        let key = h.key;
+        let slot0_hash = [0u8; 32]; // TestHarness slot i hash = [i,0,0,...]; slot 0 = zero
+        let sd = {
+            let mut s = [0u8; 36];
+            s[0] = 0xAB; // shared spending data so unspend ownership can match
+            s[32..36].copy_from_slice(&1u32.to_le_bytes());
+            s
+        };
+
+        let mut handles = vec![];
+        for t in 0..16u32 {
+            let engine = engine.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    if t % 2 == 0 {
+                        let req = SpendMultiRequest {
+                            tx_key: key,
+                            spends: vec![SpendItem {
+                                offset: 0,
+                                utxo_hash: slot0_hash,
+                                spending_data: sd,
+                                idx: 0,
+                            }],
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 1000,
+                            block_height_retention: 288,
+                        };
+                        // May succeed or report already-spent — both are fine;
+                        // the point is no panic / torn slot under contention.
+                        let _ = engine.spend_multi(&req);
+                    } else {
+                        let req = UnspendRequest {
+                            tx_key: key,
+                            offset: 0,
+                            utxo_hash: slot0_hash,
+                            spending_data: sd,
+                            current_block_height: 1000,
+                            block_height_retention: 288,
+                        };
+                        let _ = engine.unspend(&req);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let meta = engine.read_metadata(&key).unwrap();
+        let spent = { meta.spent_utxos };
+        assert!(
+            spent <= 1,
+            "single slot spent-counter must be 0 or 1 after the race, got {spent}",
+        );
+    }
+
     // -- Mutation bookkeeping additional tests --
 
     /// R-024 (BC-09 / BC-44 / Codex F5) regression: appending multiple
