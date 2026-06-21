@@ -150,14 +150,40 @@ func (p *connPool) healthLoop() {
 }
 
 func (p *connPool) checkHealth() {
+	// Snapshot the current connections so the actual ping round-trips happen
+	// without holding the pool lock.
 	p.mu.Lock()
-	// Remove dead connections.
+	snapshot := make([]*pipeConn, len(p.conns))
+	copy(snapshot, p.conns)
+	p.mu.Unlock()
+
+	// Actively probe each live connection. A connection whose TCP peer has
+	// gone away but hasn't been written to since will still report alive()==true
+	// (it only tracks the closed flag); an OpPing round-trip surfaces it.
+	dead := make(map[*pipeConn]struct{})
+	for _, c := range snapshot {
+		if !c.alive() {
+			dead[c] = struct{}{}
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), p.config.DialTimeout)
+		resp, err := c.roundTrip(ctx, OpPing, 0, nil)
+		cancel()
+		if err != nil || resp.Status != StatusOK {
+			dead[c] = struct{}{}
+			continue
+		}
+		recyclePayload(resp.Payload)
+	}
+
+	p.mu.Lock()
+	// Remove dead/unresponsive connections.
 	alive := p.conns[:0]
 	for _, c := range p.conns {
-		if c.alive() {
-			alive = append(alive, c)
-		} else {
+		if _, isDead := dead[c]; isDead || !c.alive() {
 			c.close()
+		} else {
+			alive = append(alive, c)
 		}
 	}
 	p.conns = alive

@@ -18,6 +18,8 @@ type ClusterConfig struct {
 	RefreshInterval time.Duration
 	// MaxRedirects is the maximum number of redirect retries per request (default: 3).
 	MaxRedirects int
+	// ClusterSecret HMAC-signs inter-node opcodes (OP_GET_PARTITION_MAP) when set.
+	ClusterSecret []byte
 }
 
 func (c *ClusterConfig) defaults() {
@@ -84,8 +86,8 @@ func (c *cluster) bootstrapFromSeeds(ctx context.Context) error {
 			continue
 		}
 
-		// Fetch partition map.
-		resp, err := conn.roundTrip(ctx, OpGetPartitionMap, 0, nil)
+		// Fetch partition map (HMAC-signed when a cluster secret is configured).
+		resp, err := conn.roundTrip(ctx, OpGetPartitionMap, 0, signPartitionMapPayload(c.config.ClusterSecret, nil))
 		if err != nil {
 			pool.close()
 			lastErr = err
@@ -129,6 +131,33 @@ func (c *cluster) bootstrapFromSeeds(ctx context.Context) error {
 		return nil
 	}
 	return fmt.Errorf("failed to connect to any seed: %w", lastErr)
+}
+
+// currentVersion returns the version of the client's last-known partition map,
+// or 0 if no map has been loaded yet.
+func (c *cluster) currentVersion() uint64 {
+	pm := c.partMap.Load()
+	if pm == nil {
+		return 0
+	}
+	return pm.Version
+}
+
+// allPools returns one connection pool per distinct node address. Used by
+// per-node queries (pruner/iterator ops) that must reach every master.
+func (c *cluster) allPools() []*connPool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := make(map[string]struct{}, len(c.pools))
+	pools := make([]*connPool, 0, len(c.pools))
+	for _, p := range c.pools {
+		if _, ok := seen[p.addr]; ok {
+			continue
+		}
+		seen[p.addr] = struct{}{}
+		pools = append(pools, p)
+	}
+	return pools
 }
 
 // poolForTxID returns the connection pool for the node that owns this txid's shard.
@@ -200,7 +229,7 @@ func (c *cluster) refreshPartitionMap(ctx context.Context) error {
 			lastErr = err
 			continue
 		}
-		resp, err := conn.roundTrip(ctx, OpGetPartitionMap, 0, nil)
+		resp, err := conn.roundTrip(ctx, OpGetPartitionMap, 0, signPartitionMapPayload(c.config.ClusterSecret, nil))
 		if err != nil {
 			lastErr = err
 			continue

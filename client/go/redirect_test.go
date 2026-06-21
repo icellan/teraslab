@@ -82,6 +82,17 @@ func (n *fakeNode) handleConn(t *testing.T, conn net.Conn) {
 			Payload:   append([]byte{}, buf[12:]...),
 		}
 		n.requests.Add(1)
+		// OP_HELLO is an infrastructure handshake issued automatically by New();
+		// answer it directly with the protocol version and don't count it as a
+		// workload request so per-test workload assertions stay stable.
+		if req.OpCode == OpHello {
+			var pl []byte
+			pl = appendU16(pl, ProtocolVersion)
+			if _, err := conn.Write(encodeResponseFrame(responseFrame{RequestID: req.RequestID, Status: StatusOK, Payload: pl})); err != nil {
+				return
+			}
+			continue
+		}
 		if req.OpCode != OpGetPartitionMap {
 			n.workloadRequests.Add(1)
 		}

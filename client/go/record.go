@@ -29,7 +29,14 @@ type TxRecord struct {
 
 	// BlockEntries lists the blocks this transaction has been mined into.
 	// Non-nil when FieldBlockEntries was requested and the record exists.
+	// Capped at MaxInlineBlockEntries; see BlockEntriesTruncated.
 	BlockEntries []BlockEntry
+
+	// BlockEntriesTruncated is true when the record declares more block entries
+	// than fit in the inline section (MaxInlineBlockEntries). The surplus is
+	// stored in on-disk overflow and is absent from BlockEntries; reading it
+	// requires repair tooling that follows block_overflow_offset.
+	BlockEntriesTruncated bool
 
 	// ConflictingChildren contains txids of transactions that were created
 	// as conflicting and reference this transaction's UTXOs as inputs.
@@ -124,16 +131,16 @@ func decodeRecord(fieldMask uint32, data []byte) (TxRecord, error) {
 
 	if fieldMask&FieldBlockEntries != 0 {
 		if pos < len(data) {
-			entries, err := DecodeBlockEntries(data[pos:])
+			entries, total, err := DecodeBlockEntriesWithCount(data[pos:])
 			if err != nil {
 				return rec, err
 			}
 			rec.BlockEntries = entries
-			// Advance past: 1-byte count + min(count, 3) * 12 bytes
-			count := int(data[pos])
-			inlineCount := count
-			if inlineCount > 3 {
-				inlineCount = 3
+			rec.BlockEntriesTruncated = total > len(entries)
+			// Advance past: 1-byte count + min(count, MaxInlineBlockEntries) * 12 bytes
+			inlineCount := total
+			if inlineCount > MaxInlineBlockEntries {
+				inlineCount = MaxInlineBlockEntries
 			}
 			pos += 1 + inlineCount*12
 		}

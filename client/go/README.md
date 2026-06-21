@@ -166,7 +166,10 @@ params := teraslab.UnspendBatchParams{
 }
 
 items := []teraslab.UnspendItem{
-    {TxID: txid, Vout: 0, UtxoHash: utxoHash},
+    // SpendingData is REQUIRED: the server only reverses a spend whose
+    // recorded spending data matches. It must be the original spending child's
+    // txid (32) + vin (4 LE); omitting it makes the unspend a no-op.
+    {TxID: txid, Vout: 0, UtxoHash: utxoHash, SpendingData: spendingData},
 }
 
 result, err := client.UnspendBatch(ctx, params, items)
@@ -275,6 +278,12 @@ Use field mask constants to select which data to fetch. The response contains ra
 data per item which can be parsed with the `DecodeTxMetadata`, `DecodeUtxoSlots`, and
 `DecodeBlockEntries` helpers.
 
+> **Block entries are capped at `MaxInlineBlockEntries` (3) inline.** A transaction mined
+> into more blocks keeps the surplus in on-disk overflow, which the inline `GetBatch`
+> response does not carry. `DecodeBlockEntriesWithCount` returns the declared total so
+> truncation is detectable, and `TxRecord.BlockEntriesTruncated` is set when entries were
+> omitted. Reading the overflow requires repair tooling that follows `block_overflow_offset`.
+
 ```go
 // Use GetRecordBatch for automatic decoding based on field mask.
 records, err := client.GetRecordBatch(ctx, teraslab.FieldAllMetadata|teraslab.FieldUtxoSlots, []teraslab.TxID{txid})
@@ -355,8 +364,10 @@ Check whether specific UTXOs are spent without fetching the full record.
 
 ```go
 items := []teraslab.GetSpendItem{
-    {TxID: txid, Vout: 0},
-    {TxID: txid, Vout: 1},
+    // UtxoHash is required so the server can validate the slot after a
+    // reassignment (a mismatched hash returns ErrCodeUtxoHashMismatch).
+    {TxID: txid, Vout: 0, UtxoHash: utxoHash0},
+    {TxID: txid, Vout: 1, UtxoHash: utxoHash1},
 }
 
 results, err := client.GetSpendBatch(ctx, items)
@@ -383,6 +394,9 @@ for i, r := range results {
 ```go
 // Find transactions unmined since before height 799000.
 txids, err := client.QueryOldUnmined(ctx, 799000)
+
+// Find all transactions currently flagged CONFLICTING.
+conflicting, err := client.QueryConflicting(ctx)
 
 // Preserve parent transactions from being pruned.
 _, err = client.PreserveTransactions(ctx, 900000, txids)
@@ -487,7 +501,34 @@ Mutation operations return per-item signals indicating state transitions:
 | `ErrCodeAlreadyExists` | 12 | Transaction already exists (on create) |
 | `ErrCodeFrozenUntil` | 13 | Reassignment cooldown not met |
 | `ErrCodeRedirect` | 14 | Shard owned by another node |
+| `ErrCodeNoQuorum` | 15 | Replication quorum not met (triggers refresh + retry) |
+| `ErrCodeStreamNotFound` | 16 | Blob stream id not found |
+| `ErrCodeBlobNotFound` | 17 | External blob not found |
+| `ErrCodeStreamOffsetMismatch` | 18 | Blob chunk offset mismatch |
+| `ErrCodeMigrationInProgress` | 19 | Shard handoff in flight (retryable) |
+| `ErrCodeReplicationFailed` | 20 | Ambiguous replication outcome (idempotent-retryable) |
+| `ErrCodeMigrationManifest` | 21 | Migration manifest error |
+| `ErrCodeMigrationManifestStale` | 22 | Migration manifest stale |
+| `ErrCodeTopologyPersistFailed` | 23 | Topology persistence failed |
+| `ErrCodeStaleEpoch` | 24 | Local epoch mismatch (retryable) |
+| `ErrCodeClusterNotReady` | 25 | Cluster still starting up |
+| `ErrCodeIndexDegraded` | 26 | Secondary index degraded |
+| `ErrCodeClusterAuthFailed` | 27 | Inter-node HMAC auth failed |
+| `ErrCodePayloadMalformed` | 28 | Request payload malformed |
+| `ErrCodeOpcodeUnsupported` | 29 | Server does not support the opcode |
+| `ErrCodeStorageIO` | 30 | Storage I/O error |
+| `ErrCodeRateLimited` | 31 | Rate limited |
+| `ErrCodeNotClustered` | 32 | Cluster op issued against a single node |
+| `ErrCodeInvariantViolation` | 33 | Server invariant violation |
+| `ErrCodeStreamInvariant` | 34 | Blob stream invariant violation |
+| `ErrCodeDeletedChildren` | 35 | Operation blocked by deleted children |
+| `ErrCodeNotDue` | 36 | Preservation not yet due |
+| `ErrCodeMigrationTargetNotReady` | 37 | Migration target not ready |
 | `ErrCodeInternal` | 255 | Unexpected server error |
+
+Response status `StatusDegradedDurability` (5) is a successful-but-weak ack: the
+mutation was committed locally under a relaxed replication policy. The client
+treats it as success.
 
 ## Cluster Routing
 
@@ -498,12 +539,33 @@ shard := teraslab.ShardForTxID(txid) // txid[0:2] as LE uint16, masked to 0x0FFF
 ```
 
 The 4096 shards are mapped to nodes via the partition map fetched from the server.
-For batch operations spanning multiple txids, the client automatically splits the batch by
-target node, sends sub-batches in parallel, and merges the results back with correct item
-indices.
 
-If a node returns a redirect response (shard moved during rebalancing), the client retries
-against the indicated node and triggers a background partition map refresh.
+**Fan-out.** All multi-txid batch operations split by target node, dispatch
+sub-batches in parallel, and merge per-item results/errors back into the
+caller's original index order. This covers `SpendBatch`, `UnspendBatch`,
+`CreateBatch`, `SetMinedBatch`, `FreezeBatch`, `UnfreezeBatch`, `ReassignBatch`,
+`GetBatch`, `GetSpendBatch`, `SetConflictingBatch`, `SetLockedBatch`,
+`PreserveUntilBatch`, `DeleteBatch`, `MarkLongestChainBatch`, and
+`RemoveConflictingChildBatch` (routed by parent txid). The parameterless query
+ops (`QueryOldUnmined`, `QueryConflicting`) fan out to every node and return the
+deduplicated union — each node answers for the shards it masters.
+
+**Redirects.** If a node returns a redirect (a shard moved during rebalancing),
+the client follows it and triggers a background partition-map refresh. Redirects
+carry the server's shard-table version: a redirect whose version is not newer
+than the client's known map is treated as stale (loop guard) and stops the
+chain. Per-item `ErrCodeRedirect` results in a partial response cause only the
+redirected items to be re-sent after a refresh.
+
+**Transient retry.** `ErrCodeMigrationInProgress`, `ErrCodeStaleEpoch`, and
+`ErrCodeReplicationFailed` are retried against the same node with bounded
+backoff; `ErrCodeNoQuorum` triggers a partition-map refresh and retry.
+
+**Authentication.** Set `ClientConfig.ClusterSecret` to HMAC-sign the
+`OP_GET_PARTITION_MAP` bootstrap against clusters configured with a shared
+secret. The client also performs an `OP_HELLO` protocol-version handshake on
+connect (`Client.NegotiatedVersion()`), degrading to version 1 against older
+servers.
 
 ## Testing
 

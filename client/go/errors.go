@@ -69,6 +69,22 @@ func (e *TooManyRedirectsError) Error() string {
 	return fmt.Sprintf("too many redirects: %d hops, last addr=%s", e.Hops, e.LastAddr)
 }
 
+// StaleRedirectError is returned when a redirect chain is stopped because the
+// server's shard-table version was not newer than the client's last-known
+// version. Following such a redirect risks an infinite loop against a stale
+// route; the caller (or the transient-retry layer) should refresh the
+// partition map and retry. Addr is the redirect target that was refused.
+type StaleRedirectError struct {
+	Addr           string
+	ServerVersion  uint64
+	ClientVersion  uint64
+}
+
+func (e *StaleRedirectError) Error() string {
+	return fmt.Sprintf("stale redirect to %s: server version %d <= client version %d",
+		e.Addr, e.ServerVersion, e.ClientVersion)
+}
+
 // NotFoundError indicates the requested record was not found (response status = 2).
 type NotFoundError struct{}
 
@@ -109,6 +125,52 @@ func ErrorCodeString(code uint16) string {
 		return "FROZEN_UNTIL"
 	case ErrCodeRedirect:
 		return "REDIRECT"
+	case ErrCodeNoQuorum:
+		return "NO_QUORUM"
+	case ErrCodeStreamNotFound:
+		return "STREAM_NOT_FOUND"
+	case ErrCodeBlobNotFound:
+		return "BLOB_NOT_FOUND"
+	case ErrCodeStreamOffsetMismatch:
+		return "STREAM_OFFSET_MISMATCH"
+	case ErrCodeMigrationInProgress:
+		return "MIGRATION_IN_PROGRESS"
+	case ErrCodeReplicationFailed:
+		return "REPLICATION_FAILED"
+	case ErrCodeMigrationManifest:
+		return "MIGRATION_MANIFEST"
+	case ErrCodeMigrationManifestStale:
+		return "MIGRATION_MANIFEST_STALE"
+	case ErrCodeTopologyPersistFailed:
+		return "TOPOLOGY_PERSIST_FAILED"
+	case ErrCodeStaleEpoch:
+		return "STALE_EPOCH"
+	case ErrCodeClusterNotReady:
+		return "CLUSTER_NOT_READY"
+	case ErrCodeIndexDegraded:
+		return "INDEX_DEGRADED"
+	case ErrCodeClusterAuthFailed:
+		return "CLUSTER_AUTH_FAILED"
+	case ErrCodePayloadMalformed:
+		return "PAYLOAD_MALFORMED"
+	case ErrCodeOpcodeUnsupported:
+		return "OPCODE_UNSUPPORTED"
+	case ErrCodeStorageIO:
+		return "STORAGE_IO"
+	case ErrCodeRateLimited:
+		return "RATE_LIMITED"
+	case ErrCodeNotClustered:
+		return "NOT_CLUSTERED"
+	case ErrCodeInvariantViolation:
+		return "INVARIANT_VIOLATION"
+	case ErrCodeStreamInvariant:
+		return "STREAM_INVARIANT"
+	case ErrCodeDeletedChildren:
+		return "DELETED_CHILDREN"
+	case ErrCodeNotDue:
+		return "NOT_DUE"
+	case ErrCodeMigrationTargetNotReady:
+		return "MIGRATION_TARGET_NOT_READY"
 	case ErrCodeInternal:
 		return "INTERNAL"
 	default:

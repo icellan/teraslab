@@ -45,7 +45,16 @@ const (
 	OpGetPartitionMap uint16 = 100
 	OpHealth          uint16 = 101
 	OpPing            uint16 = 102
+
+	// OpHello negotiates the wire protocol version. Request payload is empty;
+	// the response is StatusOK + a 2-byte LE protocol version. Servers that
+	// predate the handshake reply with ErrCodeOpcodeUnsupported.
+	OpHello uint16 = 107
 )
+
+// ProtocolVersion is the wire protocol version this client implements.
+// Matches src/protocol/opcodes.rs PROTOCOL_VERSION.
+const ProtocolVersion uint16 = 2
 
 // Streaming blob upload opcodes.
 const (
@@ -71,9 +80,15 @@ const (
 	StatusNotFound     uint8 = 2
 	StatusRedirect     uint8 = 3
 	StatusPartialError uint8 = 4
+	// StatusDegradedDurability indicates the mutation was applied but
+	// replicated under a weakened acknowledgement policy (e.g. quorum not
+	// fully met). The data is committed locally; callers should treat it as a
+	// successful-but-weak ack, not an error.
+	StatusDegradedDurability uint8 = 5
 )
 
-// Error codes shared across all batch operations.
+// Error codes shared across all batch operations. Mirrors
+// src/protocol/opcodes.rs (ERR_* constants).
 const (
 	ErrCodeOK               uint16 = 0
 	ErrCodeTxNotFound       uint16 = 1
@@ -90,8 +105,51 @@ const (
 	ErrCodeAlreadyExists    uint16 = 12
 	ErrCodeFrozenUntil      uint16 = 13
 	ErrCodeRedirect         uint16 = 14
-	ErrCodeInternal         uint16 = 255
+
+	// Cluster / streaming / operational error codes (15-37).
+	ErrCodeNoQuorum               uint16 = 15
+	ErrCodeStreamNotFound         uint16 = 16
+	ErrCodeBlobNotFound           uint16 = 17
+	ErrCodeStreamOffsetMismatch   uint16 = 18
+	ErrCodeMigrationInProgress    uint16 = 19
+	ErrCodeReplicationFailed      uint16 = 20
+	ErrCodeMigrationManifest      uint16 = 21
+	ErrCodeMigrationManifestStale uint16 = 22
+	ErrCodeTopologyPersistFailed  uint16 = 23
+	ErrCodeStaleEpoch             uint16 = 24
+	ErrCodeClusterNotReady        uint16 = 25
+	ErrCodeIndexDegraded          uint16 = 26
+	ErrCodeClusterAuthFailed      uint16 = 27
+	ErrCodePayloadMalformed       uint16 = 28
+	ErrCodeOpcodeUnsupported      uint16 = 29
+	ErrCodeStorageIO              uint16 = 30
+	ErrCodeRateLimited            uint16 = 31
+	ErrCodeNotClustered           uint16 = 32
+	ErrCodeInvariantViolation     uint16 = 33
+	ErrCodeStreamInvariant        uint16 = 34
+	ErrCodeDeletedChildren        uint16 = 35
+	ErrCodeNotDue                 uint16 = 36
+	ErrCodeMigrationTargetNotReady uint16 = 37
+
+	ErrCodeInternal uint16 = 255
 )
+
+// isRetryableErrorCode reports whether a server error code denotes a transient
+// condition that is safe to retry against the SAME target node after a backoff.
+// Mirrors client/rust is_retryable_error_code: migration-in-progress and
+// stale-epoch are same-target transients; replication-failed is an ambiguous
+// outcome that is only safe to retry for idempotent operations.
+//
+// ErrCodeNoQuorum is intentionally NOT included here — it is handled by a
+// partition-map refresh + single retry, not same-target backoff.
+func isRetryableErrorCode(code uint16) bool {
+	switch code {
+	case ErrCodeMigrationInProgress, ErrCodeStaleEpoch, ErrCodeReplicationFailed:
+		return true
+	default:
+		return false
+	}
+}
 
 // Field mask bits for GetBatch requests. Each bit selects a single field.
 const (

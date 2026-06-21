@@ -81,6 +81,10 @@ func handleClientTestConn(conn net.Conn, tracker *blobTracker) {
 		switch opCode {
 		case OpPing:
 			resp = responseFrame{RequestID: reqID, Status: StatusOK}
+		case OpHello:
+			var p []byte
+			p = appendU16(p, ProtocolVersion)
+			resp = responseFrame{RequestID: reqID, Status: StatusOK, Payload: p}
 		case OpHealth:
 			resp = responseFrame{RequestID: reqID, Status: StatusOK, Payload: []byte("ok")}
 		case OpGetPartitionMap:

@@ -80,6 +80,29 @@ func TestErrorCodeStringAll(t *testing.T) {
 		{ErrCodeAlreadyExists, "ALREADY_EXISTS"},
 		{ErrCodeFrozenUntil, "FROZEN_UNTIL"},
 		{ErrCodeRedirect, "REDIRECT"},
+		{ErrCodeNoQuorum, "NO_QUORUM"},
+		{ErrCodeStreamNotFound, "STREAM_NOT_FOUND"},
+		{ErrCodeBlobNotFound, "BLOB_NOT_FOUND"},
+		{ErrCodeStreamOffsetMismatch, "STREAM_OFFSET_MISMATCH"},
+		{ErrCodeMigrationInProgress, "MIGRATION_IN_PROGRESS"},
+		{ErrCodeReplicationFailed, "REPLICATION_FAILED"},
+		{ErrCodeMigrationManifest, "MIGRATION_MANIFEST"},
+		{ErrCodeMigrationManifestStale, "MIGRATION_MANIFEST_STALE"},
+		{ErrCodeTopologyPersistFailed, "TOPOLOGY_PERSIST_FAILED"},
+		{ErrCodeStaleEpoch, "STALE_EPOCH"},
+		{ErrCodeClusterNotReady, "CLUSTER_NOT_READY"},
+		{ErrCodeIndexDegraded, "INDEX_DEGRADED"},
+		{ErrCodeClusterAuthFailed, "CLUSTER_AUTH_FAILED"},
+		{ErrCodePayloadMalformed, "PAYLOAD_MALFORMED"},
+		{ErrCodeOpcodeUnsupported, "OPCODE_UNSUPPORTED"},
+		{ErrCodeStorageIO, "STORAGE_IO"},
+		{ErrCodeRateLimited, "RATE_LIMITED"},
+		{ErrCodeNotClustered, "NOT_CLUSTERED"},
+		{ErrCodeInvariantViolation, "INVARIANT_VIOLATION"},
+		{ErrCodeStreamInvariant, "STREAM_INVARIANT"},
+		{ErrCodeDeletedChildren, "DELETED_CHILDREN"},
+		{ErrCodeNotDue, "NOT_DUE"},
+		{ErrCodeMigrationTargetNotReady, "MIGRATION_TARGET_NOT_READY"},
 		{ErrCodeInternal, "INTERNAL"},
 		{99, "UNKNOWN(99)"},
 	}
@@ -87,6 +110,24 @@ func TestErrorCodeStringAll(t *testing.T) {
 		got := ErrorCodeString(tc.code)
 		if got != tc.name {
 			t.Errorf("ErrorCodeString(%d) = %q, want %q", tc.code, got, tc.name)
+		}
+	}
+}
+
+func TestIsRetryableErrorCode(t *testing.T) {
+	retryable := []uint16{ErrCodeMigrationInProgress, ErrCodeStaleEpoch, ErrCodeReplicationFailed}
+	for _, code := range retryable {
+		if !isRetryableErrorCode(code) {
+			t.Errorf("isRetryableErrorCode(%s) = false, want true", ErrorCodeString(code))
+		}
+	}
+	notRetryable := []uint16{
+		ErrCodeOK, ErrCodeTxNotFound, ErrCodeRedirect, ErrCodeNoQuorum,
+		ErrCodeConflicting, ErrCodeClusterNotReady, ErrCodeInternal,
+	}
+	for _, code := range notRetryable {
+		if isRetryableErrorCode(code) {
+			t.Errorf("isRetryableErrorCode(%s) = true, want false", ErrorCodeString(code))
 		}
 	}
 }

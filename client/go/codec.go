@@ -518,16 +518,66 @@ func decodeErrorPayload(data []byte) (uint16, string, error) {
 	return code, string(data[4 : 4+msgLen]), nil
 }
 
-// decodeRedirect decodes a redirect response payload.
+// decodeRedirect decodes a redirect response payload, ignoring any trailing
+// shard-table version. Kept for callers that only need the target address.
 func decodeRedirect(data []byte) (string, error) {
+	addr, _, _, err := decodeRedirectWithVersion(data)
+	return addr, err
+}
+
+// decodeRedirectWithVersion decodes a redirect payload of the form
+// [addr_len:2 LE][addr][shard_table_version:8 LE]. The version is optional:
+// servers predating R-041 omit it. Returns the target address, the server's
+// shard-table version, and whether a version was present.
+//
+// The trailing tail after the address must be either empty (legacy, no version)
+// or exactly 8 bytes (a version); any other length is treated as malformed.
+func decodeRedirectWithVersion(data []byte) (addr string, version uint64, hasVersion bool, err error) {
 	if len(data) < 2 {
-		return "", fmt.Errorf("redirect: need 2 bytes, have %d", len(data))
+		return "", 0, false, fmt.Errorf("redirect: need 2 bytes, have %d", len(data))
 	}
 	addrLen := int(getU16(data[0:2]))
 	if len(data) < 2+addrLen {
-		return "", fmt.Errorf("redirect: truncated address")
+		return "", 0, false, fmt.Errorf("redirect: truncated address")
 	}
-	return string(data[2 : 2+addrLen]), nil
+	addr = string(data[2 : 2+addrLen])
+	tail := data[2+addrLen:]
+	switch len(tail) {
+	case 0:
+		return addr, 0, false, nil
+	case 8:
+		return addr, getU64(tail[0:8]), true, nil
+	default:
+		return "", 0, false, fmt.Errorf("redirect: malformed version tail (%d bytes)", len(tail))
+	}
+}
+
+// redirectDecision classifies whether a versioned redirect should be followed.
+type redirectDecision int
+
+const (
+	// redirectFollow: the server's shard-table version is newer than ours, so
+	// the redirect reflects a topology change we haven't seen — follow it.
+	redirectFollow redirectDecision = iota
+	// redirectStale: the server's version is not newer than ours, so following
+	// would risk a loop against a stale route — stop.
+	redirectStale
+	// redirectUnknown: no version was supplied (legacy server) — fall back to
+	// the hop-counter loop guard.
+	redirectUnknown
+)
+
+// classifyRedirect decides how to handle a redirect given the server-reported
+// shard-table version and the client's last-known version. Mirrors the Rust
+// client's classify_redirect (src/protocol/codec.rs).
+func classifyRedirect(serverVersion uint64, hasVersion bool, clientVersion uint64) redirectDecision {
+	if !hasVersion {
+		return redirectUnknown
+	}
+	if serverVersion > clientVersion {
+		return redirectFollow
+	}
+	return redirectStale
 }
 
 // decodeGetResponse decodes a GetBatch response payload.
@@ -861,21 +911,42 @@ func DecodeUtxoSlots(data []byte) ([]UtxoSlot, error) {
 	return slots, nil
 }
 
-// DecodeBlockEntries parses the block entries section from a GetResult.Data field.
+// MaxInlineBlockEntries is the number of block entries carried in a record's
+// inline metadata. Transactions mined into more blocks than this store the
+// surplus on disk behind block_overflow_offset, which is not reachable through
+// the inline GetBatch response.
+const MaxInlineBlockEntries = 3
+
+// DecodeBlockEntries parses the inline block entries section from a
+// GetResult.Data field.
+//
+// At most MaxInlineBlockEntries entries are returned: records mined into more
+// blocks keep the overflow on disk behind block_overflow_offset, which this
+// inline decode does not follow. Use DecodeBlockEntriesWithCount to detect when
+// entries were omitted.
 func DecodeBlockEntries(data []byte) ([]BlockEntry, error) {
+	entries, _, err := DecodeBlockEntriesWithCount(data)
+	return entries, err
+}
+
+// DecodeBlockEntriesWithCount is like DecodeBlockEntries but also returns the
+// total number of block entries the record declares (the on-wire count byte).
+// When total > len(entries) the inline section was capped at
+// MaxInlineBlockEntries and the remaining entries live in on-disk overflow.
+func DecodeBlockEntriesWithCount(data []byte) (entries []BlockEntry, total int, err error) {
 	if len(data) < 1 {
-		return nil, fmt.Errorf("block entries: need 1 byte, have %d", len(data))
+		return nil, 0, fmt.Errorf("block entries: need 1 byte, have %d", len(data))
 	}
 	count := int(data[0])
 	pos := 1
 	inlineCount := count
-	if inlineCount > 3 {
-		inlineCount = 3
+	if inlineCount > MaxInlineBlockEntries {
+		inlineCount = MaxInlineBlockEntries
 	}
 	if pos+inlineCount*12 > len(data) {
-		return nil, fmt.Errorf("block entries: truncated")
+		return nil, 0, fmt.Errorf("block entries: truncated")
 	}
-	entries := make([]BlockEntry, inlineCount)
+	entries = make([]BlockEntry, inlineCount)
 	for i := 0; i < inlineCount; i++ {
 		entries[i] = BlockEntry{
 			BlockID:     getU32(data[pos : pos+4]),
@@ -884,5 +955,5 @@ func DecodeBlockEntries(data []byte) ([]BlockEntry, error) {
 		}
 		pos += 12
 	}
-	return entries, nil
+	return entries, count, nil
 }
