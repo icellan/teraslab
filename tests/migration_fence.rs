@@ -418,8 +418,15 @@ fn fenced_shard_rejects_create_delete_set_mined() {
     // it that way rather than the sparse format used by CREATE/DELETE.
     let (successes, errors) =
         decode_partial_with_signals(&resp.payload).expect("set_mined fenced response must decode");
-    assert!(successes.is_empty(), "fenced set_mined must yield no success");
-    assert_eq!(errors.len(), 1, "fenced set_mined must yield one item error");
+    assert!(
+        successes.is_empty(),
+        "fenced set_mined must yield no success"
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "fenced set_mined must yield one item error"
+    );
     assert_eq!(
         errors[0].error_code, ERR_MIGRATION_IN_PROGRESS,
         "fenced set_mined must fail with code 19",

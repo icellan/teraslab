@@ -751,7 +751,14 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
-) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>, Vec<PendingAppendDeletedChild>), RecoveryError> {
+) -> Result<
+    (
+        RecoveryStats,
+        Vec<PendingAppendConflictingChild>,
+        Vec<PendingAppendDeletedChild>,
+    ),
+    RecoveryError,
+> {
     let entries = redo_log.recover()?;
     recover_entries_with_allocator_collecting_pending_conflicts(
         device,
@@ -786,7 +793,14 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
     full_secondary_rebuild: bool,
-) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>, Vec<PendingAppendDeletedChild>), RecoveryError> {
+) -> Result<
+    (
+        RecoveryStats,
+        Vec<PendingAppendConflictingChild>,
+        Vec<PendingAppendDeletedChild>,
+    ),
+    RecoveryError,
+> {
     let entries = redo_log.recover()?;
     let secondary_reconcile = if full_secondary_rebuild {
         SecondaryReconcile::FullScan
@@ -815,7 +829,14 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     mut allocator: Option<&mut SlotAllocator>,
     mut progress: Option<(&mut RedoLog, u64)>,
     secondary_reconcile: SecondaryReconcile,
-) -> Result<(RecoveryStats, Vec<PendingAppendConflictingChild>, Vec<PendingAppendDeletedChild>), RecoveryError> {
+) -> Result<
+    (
+        RecoveryStats,
+        Vec<PendingAppendConflictingChild>,
+        Vec<PendingAppendDeletedChild>,
+    ),
+    RecoveryError,
+> {
     let mut stats = RecoveryStats::default();
     let mut pending_conflicting_children = Vec::new();
     let mut pending_deleted_children: Vec<PendingAppendDeletedChild> = Vec::new();
@@ -1130,7 +1151,11 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         }
     }
 
-    Ok((stats, pending_conflicting_children, pending_deleted_children))
+    Ok((
+        stats,
+        pending_conflicting_children,
+        pending_deleted_children,
+    ))
 }
 
 fn reconcile_secondary_indexes_from_metadata(
@@ -3644,7 +3669,10 @@ mod tests {
         let redo = h.redo_log();
         let report = repair_torn_slots(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(report.entries_scanned, 2);
-        assert_eq!(report.slots_repaired, 2, "freeze + unfreeze torn slots rebuilt");
+        assert_eq!(
+            report.slots_repaired, 2,
+            "freeze + unfreeze torn slots rebuilt"
+        );
         assert!(
             report.unrecoverable.is_empty(),
             "V2 freeze/unfreeze entries always carry the hash"

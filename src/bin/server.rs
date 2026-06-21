@@ -958,9 +958,7 @@ fn main() {
     // restores the idempotent-respend-defense / audit trail.
     if !pending_deleted_children.is_empty() {
         for pending in &pending_deleted_children {
-            if let Err(e) =
-                engine.append_deleted_child(&pending.parent_key, pending.child_txid)
-            {
+            if let Err(e) = engine.append_deleted_child(&pending.parent_key, pending.child_txid) {
                 tracing::error!(
                     parent_key = ?pending.parent_key,
                     child_txid = ?pending.child_txid,
