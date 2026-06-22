@@ -15,6 +15,13 @@ var respChanPool = sync.Pool{
 	New: func() any { return make(chan responseFrame, 1) },
 }
 
+// testHookReadLoopDeliver, when non-nil, is invoked by readLoop after it has
+// claimed a pending channel (LoadAndDelete) but before it sends the response on
+// that channel. It is nil in production (a single nil check per response) and
+// exists only so tests can deterministically interleave a caller's
+// cancellation with response delivery.
+var testHookReadLoopDeliver func(reqID uint64)
+
 // pipeConn is a pipelined TCP connection that supports multiple in-flight
 // requests matched by request_id. It is safe for concurrent use.
 type pipeConn struct {
@@ -45,6 +52,19 @@ func dial(ctx context.Context, addr string, timeout time.Duration) (*pipeConn, e
 	return pc, nil
 }
 
+// releaseChan returns ch to respChanPool, but only if this goroutine still owns
+// the pending entry for reqID. Winning the LoadAndDelete guarantees that neither
+// readLoop nor closeInternal will send on ch (they remove the entry before
+// sending), so ch is empty and safe to reuse. If we lose the race, the winner
+// will send a frame on ch; returning it to the pool would leak that buffered
+// frame into the next request that reuses the channel, so we drop it instead and
+// let the GC reclaim it.
+func (c *pipeConn) releaseChan(reqID uint64, ch chan responseFrame) {
+	if _, ok := c.pending.LoadAndDelete(reqID); ok {
+		respChanPool.Put(ch)
+	}
+}
+
 // roundTrip sends a request and waits for its response.
 // The request_id is assigned automatically.
 func (c *pipeConn) roundTrip(ctx context.Context, opCode uint16, flags uint16, payload []byte) (responseFrame, error) {
@@ -69,8 +89,7 @@ func (c *pipeConn) roundTrip(ctx context.Context, opCode uint16, flags uint16, p
 	c.writeBuf, err = writeRequest(c.conn, f, c.writeBuf)
 	c.mu.Unlock()
 	if err != nil {
-		c.pending.Delete(reqID)
-		respChanPool.Put(ch)
+		c.releaseChan(reqID, ch)
 		return responseFrame{}, fmt.Errorf("write: %w", err)
 	}
 
@@ -84,12 +103,10 @@ func (c *pipeConn) roundTrip(ctx context.Context, opCode uint16, flags uint16, p
 		}
 		return resp, nil
 	case <-ctx.Done():
-		c.pending.Delete(reqID)
-		respChanPool.Put(ch)
+		c.releaseChan(reqID, ch)
 		return responseFrame{}, ctx.Err()
 	case <-c.readDone:
-		c.pending.Delete(reqID)
-		respChanPool.Put(ch)
+		c.releaseChan(reqID, ch)
 		return responseFrame{}, c.getErr()
 	}
 }
@@ -108,6 +125,9 @@ func (c *pipeConn) readLoop() {
 			return
 		}
 		if ch, ok := c.pending.LoadAndDelete(resp.RequestID); ok {
+			if testHookReadLoopDeliver != nil {
+				testHookReadLoopDeliver(resp.RequestID)
+			}
 			ch.(chan responseFrame) <- resp
 		} else {
 			// No pending entry — response is for a cancelled request.
