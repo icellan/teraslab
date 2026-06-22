@@ -1,10 +1,19 @@
 name: CI
 
 on:
+  # Only run on direct pushes to the default branch (post-merge validation).
+  # PR branches are covered by the `pull_request` trigger below; running both
+  # on a same-repo PR branch ran every job twice.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
     branches: ["**"]
+
+# Cancel an in-progress CI run when a newer commit is pushed to the same ref
+# (PR branch or main) so superseded runs don't pile up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
