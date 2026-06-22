@@ -5921,15 +5921,21 @@ fn handle_create_batch(
         });
     }
 
-    // Phase 1b: reserve all successful create candidates with one allocator
-    // WAL fsync. The redo log still contains ordinary AllocateRegion entries,
-    // so recovery does not need a new on-disk operation.
+    // Phase 1b: reserve all successful create candidates IN MEMORY (issue #14).
+    // The `AllocateRegion` entries are NOT journaled here — they are written
+    // ATOMICALLY with the `CreateV2` entries in Phase 2's single batch, so a
+    // redo-log-full create can never leave a durable allocation without its
+    // record. On a Phase 2 failure the reservations are rolled back in memory
+    // (no journal needed, which is essential since the log is full). This
+    // window is safe against a concurrent checkpoint persisting the un-journaled
+    // reservation because the create holds the exclusive mutation barrier (the
+    // same lock the checkpoint task takes) across Phases 1b–3.
     let reservation_sizes: Vec<u64> = pending_items
         .iter()
         .map(|pending| pending.reservation_size)
         .collect();
-    let allocated_regions = match engine.allocator().lock().allocate_batch(&reservation_sizes) {
-        Ok(regions) => regions,
+    let mut pending_alloc = match engine.allocator().lock().reserve_batch(&reservation_sizes) {
+        Ok(p) => p,
         Err(e) => {
             // M-01: `attempted` already ticked; nothing has applied yet, so
             // every item not already in `errors` counts as ErrStorage-failed.
@@ -5942,6 +5948,13 @@ fn handle_create_batch(
             return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
         }
     };
+    // Seed the redo batch with the not-yet-durable AllocateRegion entries so
+    // they fsync together with the CreateV2 entries pushed in the loop below.
+    // They replay before any CreateV2 (lower sequence numbers), so every record
+    // has its region allocated first. AllocateRegion has no replica op, so the
+    // Phase 4 fan-out (driven by `repl_ops_by_key`) ignores them.
+    redo_ops.extend_from_slice(pending_alloc.allocate_region_redo_ops());
+    let allocated_regions = std::mem::take(&mut pending_alloc.regions);
 
     for (pending, allocated) in pending_items.into_iter().zip(allocated_regions) {
         let Some(region) = allocated else {
@@ -5977,31 +5990,21 @@ fn handle_create_batch(
         });
     }
 
-    // Phase 2: WAL-first — write redo before engine mutation.
+    // Phase 2: WAL-first — write [AllocateRegion… + CreateV2…] as ONE atomic
+    // batch (a single fsync, all-or-nothing).
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
-        Ok(range) => range,
+        Ok(range) => {
+            // The AllocateRegion entries are now durable alongside their
+            // CreateV2 — finalize the in-memory reservations.
+            engine.allocator().lock().commit_pending(pending_alloc);
+            range
+        }
         Err(e) => {
-            // Redo failed: free all pre-allocated space.
-            let mut rollback_errors = Vec::new();
-            for v in &valid_items {
-                if let Err(rollback_err) = release_create_reservation(
-                    engine,
-                    v.record_offset,
-                    v.reservation_size,
-                    "create redo write failure",
-                ) {
-                    tracing::error!(err = %rollback_err, "create batch rollback failed");
-                    rollback_errors.push(rollback_err);
-                }
-            }
-            let msg = if rollback_errors.is_empty() {
-                e
-            } else {
-                format!(
-                    "{e}; allocator rollback errors: {}",
-                    rollback_errors.join("; ")
-                )
-            };
+            // Redo failed (e.g. LogFull): roll the reservations back IN MEMORY.
+            // Nothing was journaled, so there is no durable allocation to
+            // orphan and no compensating redo write is needed (which is the
+            // whole point — the log is full). Issue #14.
+            engine.allocator().lock().rollback_pending(pending_alloc);
             // M-01: `attempted` already ticked; nothing has applied yet, so
             // every item not already in `errors` counts as ErrStorage-failed.
             if let Some(m) = DISPATCH_METRICS.get() {
@@ -6010,7 +6013,7 @@ fn handle_create_batch(
                     tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
                 m.creates_failed.inc_by(failed);
             }
-            return error_response(req.request_id, ERR_STORAGE_IO, &msg);
+            return error_response(req.request_id, ERR_STORAGE_IO, &e);
         }
     };
 
@@ -20077,29 +20080,39 @@ mod tests {
         );
     }
 
-    /// M-01 (create): both batch-wide `ERR_STORAGE_IO` early returns in
-    /// handle_create_batch — the CreateV2 redo-append failure and the
-    /// allocator `allocate_batch` failure — must tick `creates_failed`
-    /// and `operations{create,err_storage}`.
+    /// M-01 (create): a create whose Phase-2 redo batch cannot be written
+    /// (redo log full) returns `ERR_STORAGE_IO` and ticks `creates_failed` +
+    /// `operations{create,err_storage}`.
+    ///
+    /// Issue #14: with the atomic `AllocateRegion`+`CreateV2` batch, a create
+    /// that FITS the remaining redo space now succeeds in ONE flush (the old
+    /// code did two flushes and could fail the second after durably allocating
+    /// — an orphan). So with an 8 KiB log (header block + ONE entries block),
+    /// the first create succeeds and only the second — which has no block left —
+    /// fails.
     #[test]
     fn handle_create_batch_redo_log_full_ticks_err_storage() {
         use crate::metrics::{OpCode, Outcome};
         let m = test_metrics();
         let _ = test_histograms();
 
-        // 8 KiB region = header block + one entries block; the allocator
-        // append+flush consumes the entire entries region, so the CreateV2
-        // append fails (see `create_batch_redo_write_failure_surfaces_...`).
         let h = RedoDispatchHarness::new_with_exact_redo_log_size(8192);
+
+        // First create: the atomic [AllocateRegion + CreateV2] batch fills the
+        // single entries block in one flush → succeeds (no orphan).
+        let resp1 = h.create_tx(DispatchTestHarness::make_txid(194), 1);
+        assert_eq!(
+            resp1.status, STATUS_OK,
+            "atomic create batch fits the one entries block"
+        );
 
         let before_att = m.creates_attempted.get();
         let before_succ = m.creates_succeeded.get();
         let before_fail = m.creates_failed.get();
         let before_err_storage = m.operations.get(OpCode::Create, Outcome::ErrStorage);
 
-        // First create: allocator reservation WAL succeeds (fills the log),
-        // CreateV2 WAL append fails → redo-failure early return.
-        let resp = h.create_tx(DispatchTestHarness::make_txid(194), 1);
+        // Second create: no entries block left → Phase-2 redo write fails.
+        let resp = h.create_tx(DispatchTestHarness::make_txid(195), 1);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
         assert_eq!(code, ERR_STORAGE_IO);
@@ -20116,26 +20129,42 @@ mod tests {
             1,
             "operations{{create,err_storage}} += 1"
         );
+    }
 
-        // Second create: the allocator's own redo append now fails inside
-        // `allocate_batch` → the other early return.
-        let before_att2 = m.creates_attempted.get();
-        let before_fail2 = m.creates_failed.get();
-        let before_err_storage2 = m.operations.get(OpCode::Create, Outcome::ErrStorage);
-        let resp2 = h.create_tx(DispatchTestHarness::make_txid(195), 1);
-        assert_eq!(resp2.status, STATUS_ERROR);
-        let (code2, _msg2) = decode_error_payload(&resp2.payload).unwrap();
-        assert_eq!(code2, ERR_STORAGE_IO);
-        assert_eq!(m.creates_attempted.get() - before_att2, 1);
+    /// Issue #14 hardening: a create that fails because the redo log is full
+    /// must NOT durably allocate. The in-memory reservation is rolled back, so
+    /// the allocator high-water mark is unchanged and recovery finds no orphan
+    /// region. Pre-hardening this leaked a durable `AllocateRegion` with no
+    /// `CreateV2` (the unrecoverable-rebuild bug).
+    #[test]
+    fn create_redo_full_rolls_back_reservation_no_orphan() {
+        let _m = test_metrics();
+        let _ = test_histograms();
+
+        let h = RedoDispatchHarness::new_with_exact_redo_log_size(8192);
+
+        // Fill the single entries block with one successful create.
         assert_eq!(
-            m.creates_failed.get() - before_fail2,
-            1,
-            "creates_failed += 1 (allocate_batch failed)"
+            h.create_tx(DispatchTestHarness::make_txid(200), 1).status,
+            STATUS_OK
         );
+
+        // High-water mark before the doomed create.
+        let next_offset_before = h.engine.allocator().lock().next_offset();
+
+        // This create reserves in memory, then the Phase-2 redo batch can't be
+        // written (no block left) → it must roll the reservation back.
+        let resp = h.create_tx(DispatchTestHarness::make_txid(201), 1);
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) = decode_error_payload(&resp.payload).unwrap();
+        assert_eq!(code, ERR_STORAGE_IO);
+
+        // The reservation was rolled back: the high-water mark is unchanged, so
+        // no region was durably allocated / orphaned by the failed create.
+        let next_offset_after = h.engine.allocator().lock().next_offset();
         assert_eq!(
-            m.operations.get(OpCode::Create, Outcome::ErrStorage) - before_err_storage2,
-            1,
-            "operations{{create,err_storage}} += 1 on allocate_batch failure"
+            next_offset_before, next_offset_after,
+            "a redo-full create must not leak a durable allocation (issue #14)"
         );
     }
 
@@ -22078,36 +22107,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn create_batch_redo_failure_surfaces_allocator_rollback_failure() {
-        // F-G4-001: the redo region must hold a header block (one
-        // alignment unit) plus at least one entries block. With a
-        // 8 KiB region the entries capacity is exactly one alignment
-        // unit (4 KiB), and because F-G4-004 block-aligns write_pos
-        // after every flush, the very first allocator append+flush
-        // consumes the entire entries region. The next append
-        // (CreateV2) therefore fails with LogFull, exercising the
-        // "create redo write failure + allocator rollback errors"
-        // path the test asserts on.
-        let h = RedoDispatchHarness::new_with_exact_redo_log_size(8192);
-        let resp = h.create_tx(DispatchTestHarness::make_txid(158), 1);
-
-        assert_eq!(resp.status, STATUS_ERROR);
-        let (code, msg) = decode_error_payload(&resp.payload).expect("error payload");
-        assert_eq!(code, ERR_STORAGE_IO);
-        assert!(
-            msg.contains("redo log append"),
-            "expected primary redo failure in error: {msg}"
-        );
-        assert!(
-            msg.contains("allocator rollback errors"),
-            "expected rollback failure to be surfaced in error: {msg}"
-        );
-        assert!(
-            msg.contains("create reservation rollback failed after create redo write failure"),
-            "expected create reservation rollback context in error: {msg}"
-        );
-    }
+    // (Removed by issue #14 hardening: `create_batch_redo_failure_surfaces_
+    // allocator_rollback_failure` tested the OLD path where a create's redo
+    // failure triggered a journaled allocator `free()` that could ALSO fail and
+    // surface "allocator rollback errors". That path no longer exists — the
+    // AllocateRegion is now journaled atomically with CreateV2 and a Phase-2
+    // failure rolls the reservation back IN MEMORY (infallible, no journal). The
+    // new behavior is covered by `create_redo_full_rolls_back_reservation_no_orphan`.)
 
     #[test]
     fn create_batch_fsync_count_optimized() {
@@ -22177,16 +22183,16 @@ mod tests {
         );
 
         assert_eq!(resp.status, STATUS_OK);
-        // F-G4-001: each effective flush emits two device syncs (one
-        // for the entries pwrite, one for the persisted-header rewrite
-        // carrying the new `next_sequence`). Two effective flushes
-        // (allocator reservations + CreateV2 WAL) therefore produce
-        // four device syncs.
+        // Issue #14: AllocateRegion + CreateV2 are now written in ONE atomic
+        // redo flush, so the create batch fsyncs ONCE — two device syncs (the
+        // entries pwrite + the F-G4-001 persisted-header rewrite carrying the
+        // new `next_sequence`). This also halves the create fsync count vs the
+        // old separate allocator-reservation + CreateV2 flushes.
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
-            4,
-            "create batch should fsync twice for allocator reservations \
-             and twice for CreateV2 WAL (entries + F-G4-001 header per flush)"
+            2,
+            "create batch should fsync ONCE (entries + F-G4-001 header) now that \
+             AllocateRegion and CreateV2 share one atomic redo batch"
         );
 
         let entries = redo_log.lock().recover().unwrap();

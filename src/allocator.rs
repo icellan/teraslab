@@ -209,6 +209,33 @@ pub struct AllocatedRegion {
     pub size: u64,
 }
 
+/// A batch of regions reserved IN MEMORY but not yet durably journaled, returned
+/// by [`SlotAllocator::reserve_batch`]. The freelist already reflects the
+/// reservations; the caller must journal [`Self::allocate_region_redo_ops`]
+/// (atomically with its own redo, e.g. `CreateV2`) and then call
+/// [`SlotAllocator::commit_pending`], or call
+/// [`SlotAllocator::rollback_pending`] if it cannot. See `reserve_batch` for the
+/// issue-#14 orphan-prevention rationale.
+#[must_use = "a PendingBatchAllocation must be passed to commit_pending or rollback_pending"]
+pub struct PendingBatchAllocation {
+    /// Per-input result in `sizes` order: `Some(region)` when reserved, `None`
+    /// when the device was full for that size.
+    pub regions: Vec<Option<AllocatedRegion>>,
+    /// In-memory reservation handles kept so `rollback_pending` can undo them.
+    reservations: Vec<(u64, Reservation)>,
+    /// `AllocateRegion` redo entries the caller must journal before committing.
+    alloc_redo_ops: Vec<RedoOp>,
+}
+
+impl PendingBatchAllocation {
+    /// The `AllocateRegion` redo entries to journal (atomically with the
+    /// caller's own redo ops) before calling
+    /// [`SlotAllocator::commit_pending`].
+    pub fn allocate_region_redo_ops(&self) -> &[RedoOp] {
+        &self.alloc_redo_ops
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SlotAllocator
 // ---------------------------------------------------------------------------
@@ -654,6 +681,89 @@ impl SlotAllocator {
         self.record_allocation_metrics(allocated_count, allocated_bytes);
 
         Ok(results)
+    }
+
+    /// Reserve a batch of regions IN MEMORY ONLY, deferring the durable
+    /// `AllocateRegion` journaling to the caller.
+    ///
+    /// Issue #14 (orphan prevention): [`Self::allocate_batch`] fsyncs its
+    /// `AllocateRegion` entries in its OWN flush, BEFORE the create path writes
+    /// the matching `CreateV2` entries. Under a redo-log-full window the
+    /// `CreateV2` write then fails and the compensating `free()` also can't
+    /// journal — leaving a DURABLE allocation with no record (an orphan that
+    /// crash-loops rebuild before the tolerant-rebuild fix, and leaks space
+    /// after it). `reserve_batch` instead applies the reservations to the
+    /// freelist in memory and returns the `AllocateRegion` redo ops UNwritten,
+    /// so the caller can journal them ATOMICALLY in the same batch as the
+    /// `CreateV2` entries (one fsync — all-or-nothing) and roll the reservations
+    /// back in memory if that batch fails. No `AllocateRegion` is ever made
+    /// durable without its `CreateV2`.
+    ///
+    /// The returned [`PendingBatchAllocation`] MUST be passed to exactly one of
+    /// [`Self::commit_pending`] (after the caller durably journaled the redo
+    /// ops) or [`Self::rollback_pending`] (if it could not). The caller must do
+    /// this within the same exclusive mutation barrier it holds for the create,
+    /// so a concurrent checkpoint cannot persist the allocator header while a
+    /// reservation is in memory but not yet journaled.
+    pub fn reserve_batch(&mut self, sizes: &[u64]) -> Result<PendingBatchAllocation> {
+        let mut regions = Vec::with_capacity(sizes.len());
+        let mut reservations: Vec<(u64, Reservation)> = Vec::new();
+        let mut alloc_redo_ops: Vec<RedoOp> = Vec::new();
+
+        for size in sizes {
+            let aligned_size = self.align_up(*size);
+            match self.reserve_aligned(aligned_size) {
+                Ok((offset, reservation)) => {
+                    regions.push(Some(AllocatedRegion {
+                        offset,
+                        size: aligned_size,
+                    }));
+                    reservations.push((aligned_size, reservation));
+                    alloc_redo_ops.push(RedoOp::AllocateRegion {
+                        offset,
+                        size: aligned_size,
+                        device_id: self.redo_device_id,
+                    });
+                }
+                Err(AllocatorError::DeviceFull { .. }) => {
+                    regions.push(None);
+                }
+                Err(e) => {
+                    // Undo what we reserved so far (in memory; nothing journaled).
+                    for (aligned_size, reservation) in reservations.into_iter().rev() {
+                        self.rollback_reservation(aligned_size, reservation);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(PendingBatchAllocation {
+            regions,
+            reservations,
+            alloc_redo_ops,
+        })
+    }
+
+    /// Finalize a [`PendingBatchAllocation`] whose `AllocateRegion` redo ops the
+    /// caller has now durably journaled. The reservations are already reflected
+    /// in the freelist, so this only records allocation metrics and drops the
+    /// rollback handles.
+    pub fn commit_pending(&mut self, pending: PendingBatchAllocation) {
+        let count = pending.reservations.len() as u64;
+        let bytes: u64 = pending.reservations.iter().map(|(sz, _)| *sz).sum();
+        self.record_allocation_metrics(count, bytes);
+    }
+
+    /// Roll back a [`PendingBatchAllocation`] whose redo batch could NOT be
+    /// durably journaled — restores the freelist to its pre-reserve state in
+    /// memory. Because no `AllocateRegion` was journaled, there is nothing
+    /// durable to compensate, so this needs no redo write (and works even when
+    /// the redo log is full — the condition that motivated it).
+    pub fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
+        for (aligned_size, reservation) in pending.reservations.into_iter().rev() {
+            self.rollback_reservation(aligned_size, reservation);
+        }
     }
 
     /// Return a region to the freelist.
