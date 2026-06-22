@@ -701,7 +701,6 @@ impl Index {
         let aligned_read = read_size.div_ceil(align) * align;
 
         let mut offset = start;
-        let mut skipped_malformed: u64 = 0;
         while offset + aligned_read as u64 <= end {
             if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
                 let free_end = free_offset.saturating_add(free_size).min(end);
@@ -724,27 +723,45 @@ impl Index {
                 continue;
             }
 
-            // Issue #14: tolerate a malformed/orphan region instead of
-            // fatal-aborting — skip + resync one aligned block. Mirrors
-            // `Index::rebuild`.
-            let (meta, aligned_advance) =
-                match classify_scanned_record(&buf[..METADATA_SIZE], offset, align, end) {
-                    ScannedRecord::Valid {
-                        meta,
-                        aligned_advance,
-                    } => (meta, aligned_advance),
-                    ScannedRecord::Skip { advance, reason } => {
-                        skipped_malformed += 1;
-                        tracing::warn!(
-                            target: "teraslab::recovery",
-                            offset,
-                            reason,
-                            "rebuild_secondary: skipping malformed/orphan region (issue #14)"
-                        );
-                        offset += advance;
-                        continue;
-                    }
-                };
+            // NOTE (issue #14): the SECONDARY rebuild stays fail-closed on a
+            // malformed record — unlike the PRIMARY paths which skip-and-recover
+            // to avoid a crash loop. A secondary rebuild error is caught by
+            // `startup::rebuild_in_memory_secondaries` and converted to
+            // *degraded mode* (DAH/unmined ops rejected with ERR_INDEX_DEGRADED),
+            // which already boots the node — so there is no crash loop to avoid
+            // here, and degrading is safer than silently serving an incomplete
+            // DAH/unmined view (wrong pruning / mining decisions).
+            let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Err(IndexError::FormatError {
+                        detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
+                    });
+                }
+            };
+            if { meta.magic } != METADATA_MAGIC {
+                return Err(IndexError::FormatError {
+                    detail: format!("invalid metadata magic at allocated offset {offset}"),
+                });
+            }
+
+            let record_size = { meta.record_size } as u64;
+            if record_size == 0 {
+                return Err(IndexError::FormatError {
+                    detail: format!("zero record_size at allocated offset {offset}"),
+                });
+            }
+            let utxo_count = { meta.utxo_count };
+            let expected_record_size = TxMetadata::record_size_for(utxo_count);
+            if record_size != expected_record_size {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record_size mismatch at allocated offset {offset}: \
+                         declared {record_size}, expected {expected_record_size} \
+                         for utxo_count={utxo_count}"
+                    ),
+                });
+            }
 
             let key = TxKey { txid: meta.tx_id };
             let dah_val = { meta.delete_at_height };
@@ -756,16 +773,16 @@ impl Index {
             if unmined_val != 0 {
                 unmined.insert(unmined_val, key);
             }
-            offset += aligned_advance;
-        }
 
-        if skipped_malformed > 0 {
-            tracing::error!(
-                target: "teraslab::recovery",
-                skipped_malformed,
-                "rebuild_secondary: completed with malformed/orphan region(s) skipped \
-                 (issue #14)"
-            );
+            let record_aligned = (record_size as usize).div_ceil(align) * align;
+            if offset + record_aligned as u64 > end {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "record at allocated offset {offset} extends past allocator high-water mark"
+                    ),
+                });
+            }
+            offset += record_aligned as u64;
         }
 
         Ok((dah, unmined))
@@ -2092,34 +2109,37 @@ mod tests {
         assert_eq!(unmined.len(), 5);
     }
 
-    // Issue #14: the secondary rebuild tolerates a malformed allocated record
-    // (skips it, recovers the rest) rather than fatal-aborting. (Pre-#14 these
-    // two asserted a fatal `FormatError`.)
+    // Issue #14: unlike the PRIMARY rebuild (which skips-and-recovers to avoid a
+    // crash loop), the SECONDARY rebuild stays fail-closed on a malformed
+    // record — the caller converts the error into degraded mode (boots, rejects
+    // DAH/unmined ops with ERR_INDEX_DEGRADED), so there is no crash loop to
+    // avoid and degrading is safer than serving an incomplete DAH/unmined view.
     #[test]
-    fn rebuild_secondary_skips_corrupted_allocated_record() {
+    fn rebuild_secondary_fails_on_corrupted_allocated_record() {
         let (dev, alloc, records) = setup_device_with_records(20);
 
-        // Corrupt record 0 (which has both dah and unmined set).
+        // Corrupt record 0 (which has both dah and unmined set)
         let offset = records[0].1;
         corrupt_magic_and_restamp_crc(&*dev, offset);
 
-        let (dah, _unmined) =
-            Index::rebuild_secondary(&*dev, &alloc).expect("rebuild must tolerate the bad region");
-        // The other records' DAH entries are still recovered (record 2 has
-        // dah=300, etc.), and record 0's height=100 entry is gone.
-        let at_100 = dah.range_query(100);
-        assert!(
-            !at_100.iter().any(|k| *k == records[0].0),
-            "the corrupted record's DAH entry must be skipped"
-        );
-        assert!(
-            !dah.range_query(u32::MAX).is_empty(),
-            "non-corrupted records' DAH entries must still be recovered"
-        );
+        let err = match Index::rebuild_secondary(&*dev, &alloc) {
+            Ok(_) => panic!("corrupt allocated secondary record must fail rebuild"),
+            Err(err) => err,
+        };
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("invalid metadata magic"),
+                    "expected magic-mismatch detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
     }
 
     #[test]
-    fn rebuild_secondary_skips_crc_mismatch_in_allocated_record() {
+    fn rebuild_secondary_fails_on_crc_mismatch_in_allocated_record() {
         let (dev, alloc, records) = setup_device_with_records(20);
 
         let offset = records[0].1;
@@ -2129,12 +2149,20 @@ mod tests {
         buf[0..4].copy_from_slice(&[0u8; 4]);
         dev.pwrite_all_at(&buf, offset).unwrap();
 
-        let (dah, _unmined) =
-            Index::rebuild_secondary(&*dev, &alloc).expect("rebuild must tolerate the bad region");
-        assert!(
-            !dah.range_query(u32::MAX).is_empty(),
-            "non-corrupted records' DAH entries must still be recovered"
-        );
+        let err = match Index::rebuild_secondary(&*dev, &alloc) {
+            Ok(_) => panic!("corrupt CRC must fail secondary rebuild"),
+            Err(err) => err,
+        };
+        match err {
+            IndexError::FormatError { detail } => {
+                assert!(
+                    detail.contains("corrupt metadata at allocated offset"),
+                    "expected CRC-error detail, got: {detail}"
+                );
+                assert!(detail.contains(&offset.to_string()));
+            }
+            other => panic!("expected FormatError, got {other:?}"),
+        }
     }
 
     #[test]

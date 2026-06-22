@@ -25,9 +25,7 @@ use teraslab::ops::set_mined::*;
 use teraslab::ops::spend::*;
 use teraslab::ops::unspend::*;
 use teraslab::record::*;
-use teraslab::server::startup::{
-    RebuildError, load_primary_index_in_memory, rebuild_in_memory_secondaries,
-};
+use teraslab::server::startup::{load_primary_index_in_memory, rebuild_in_memory_secondaries};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -1719,11 +1717,13 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
 }
 
 #[test]
-fn snapshot_deletion_with_corrupt_header_fails_closed() {
-    // B-04 companion: when the snapshot is lost AND a record header on
-    // the device is CRC-corrupt, the device-scan rebuild must fail
-    // closed with `RebuildError::InMemoryPrimary` — never return an
-    // empty or partial index that silently drops the corrupt record.
+fn snapshot_deletion_with_corrupt_header_primary_recovers_secondary_degrades() {
+    // Issue #14 / B-04 companion: when the snapshot is lost AND a record
+    // header on the device is CRC-corrupt, the PRIMARY device-scan rebuild must
+    // NOT crash-loop the store — it skips the corrupt record (loudly) and
+    // recovers every other record. The SECONDARY rebuild over the same device
+    // stays fail-closed and degrades explicitly (ERR_INDEX_DEGRADED) rather
+    // than silently serving an incomplete DAH/unmined view.
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let dir = TempDir::new().unwrap();
     let snap_path = dir.path().join("index.snap");
@@ -1768,20 +1768,32 @@ fn snapshot_deletion_with_corrupt_header_fails_closed() {
     dev.pwrite_all_at(&buf, corrupt_offset).unwrap();
 
     let alloc = SlotAllocator::recover(dev.clone()).unwrap();
-    let err = load_primary_index_in_memory(&*dev, &alloc)
-        .expect_err("a CRC-corrupt header must fail the rebuild closed");
-    match err {
-        RebuildError::InMemoryPrimary { ref rebuild_err } => {
-            assert!(
-                rebuild_err.contains("corrupt metadata at allocated offset"),
-                "rebuild error must identify header corruption: {rebuild_err}"
-            );
-            assert!(
-                rebuild_err.contains(&corrupt_offset.to_string()),
-                "rebuild error must name the corrupt offset: {rebuild_err}"
-            );
-        }
-        other => panic!("expected RebuildError::InMemoryPrimary, got {other:?}"),
+    // PRIMARY rebuild (issue #14): the corrupt victim is skipped, the rest
+    // recovered — no crash loop.
+    let primary = load_primary_index_in_memory(&*dev, &alloc)
+        .expect("a CRC-corrupt header must be skipped, not crash the rebuild");
+    assert_eq!(
+        primary.len(),
+        2,
+        "the two intact records must be recovered (victim skipped)"
+    );
+    assert!(
+        primary
+            .lookup(&TxKey {
+                txid: make_tx_id(0x7201),
+            })
+            .is_none(),
+        "the CRC-corrupt victim record must be skipped"
+    );
+    for n in [0x7200u32, 0x7202] {
+        assert!(
+            primary
+                .lookup(&TxKey {
+                    txid: make_tx_id(n),
+                })
+                .is_some(),
+            "intact record {n:#x} must survive the rebuild"
+        );
     }
 
     // The secondary rebuild over the same corrupt device must degrade
