@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "teraslab"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "axum",
  "bitflags",
