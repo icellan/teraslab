@@ -203,6 +203,94 @@ pub(crate) fn classify_scan_header(
     Ok(None)
 }
 
+/// Outcome of validating one scanned record header during a device rebuild.
+///
+/// The `Valid` variant carries a full `TxMetadata` (large) while `Skip` is
+/// small; this value is created and immediately destructured inside the scan
+/// loop and never stored in a collection, so the size disparity costs nothing —
+/// boxing the metadata would instead add a per-record heap allocation on the
+/// rebuild hot path.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ScannedRecord {
+    /// A valid record: index it, then advance the scan by `aligned_advance`.
+    Valid {
+        meta: TxMetadata,
+        aligned_advance: u64,
+    },
+    /// A malformed or orphan region (issue #14): the header is unparseable,
+    /// has the wrong magic, a zero/inconsistent `record_size`, or would extend
+    /// past the allocator high-water mark. The caller logs + counts it and
+    /// advances by `advance` (ONE alignment block) to resync at the next
+    /// aligned record WITHOUT trusting the bad `record_size` — block-by-block
+    /// advance cannot skip a legitimate (always block-aligned) record.
+    Skip { advance: u64, reason: String },
+}
+
+/// Validate the metadata header read at `offset` during a device rebuild.
+///
+/// Issue #14: a redo-log-full window could leave an allocated region with no
+/// (or a stale/torn) record. Previously rebuild fatal-aborted on the first
+/// such region, crash-looping the whole store. This returns [`ScannedRecord::Skip`]
+/// for any malformed header so a single bad region cannot render the store
+/// unrecoverable; the caller is expected to emit a loud WARN and continue,
+/// preserving the original fail-closed concern (never advance by an untrusted
+/// `record_size`) by advancing one aligned block instead.
+///
+/// Callers must FIRST run [`classify_scan_header`] (free-hole / deleted-marker /
+/// all-zero handling) — this function assumes a live-looking header.
+pub(crate) fn classify_scanned_record(
+    meta_bytes: &[u8],
+    offset: u64,
+    align: usize,
+    end: u64,
+) -> ScannedRecord {
+    let align_u64 = align as u64;
+    let meta = match TxMetadata::from_bytes(meta_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            return ScannedRecord::Skip {
+                advance: align_u64,
+                reason: format!("corrupt metadata: {e}"),
+            };
+        }
+    };
+    if { meta.magic } != METADATA_MAGIC {
+        return ScannedRecord::Skip {
+            advance: align_u64,
+            reason: "invalid metadata magic".to_string(),
+        };
+    }
+    let record_size = { meta.record_size } as u64;
+    if record_size == 0 {
+        return ScannedRecord::Skip {
+            advance: align_u64,
+            reason: "zero record_size".to_string(),
+        };
+    }
+    let utxo_count = { meta.utxo_count };
+    let expected_record_size = TxMetadata::record_size_for(utxo_count);
+    if record_size != expected_record_size {
+        return ScannedRecord::Skip {
+            advance: align_u64,
+            reason: format!(
+                "record_size mismatch: declared {record_size}, expected \
+                 {expected_record_size} for utxo_count={utxo_count}"
+            ),
+        };
+    }
+    let aligned_advance = ((record_size as usize).div_ceil(align) * align) as u64;
+    if offset + aligned_advance > end {
+        return ScannedRecord::Skip {
+            advance: align_u64,
+            reason: "record extends past allocator high-water mark".to_string(),
+        };
+    }
+    ScannedRecord::Valid {
+        meta,
+        aligned_advance,
+    }
+}
+
 impl Index {
     /// Create a new index sized for `expected_records` entries.
     ///
@@ -513,6 +601,7 @@ impl Index {
         let aligned_read = read_size.div_ceil(align) * align;
 
         let mut offset = start;
+        let mut skipped_malformed: u64 = 0;
         while offset + aligned_read as u64 <= end {
             if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
                 let free_end = free_offset.saturating_add(free_size).min(end);
@@ -541,43 +630,32 @@ impl Index {
                 continue;
             }
 
-            let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
-                Ok(m) => m,
-                Err(e) => {
-                    return Err(IndexError::FormatError {
-                        detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
-                    });
-                }
-            };
-            if { meta.magic } != METADATA_MAGIC {
-                return Err(IndexError::FormatError {
-                    detail: format!("invalid metadata magic at allocated offset {offset}"),
-                });
-            }
+            // Issue #14: a malformed/orphan region (e.g. an allocation a
+            // redo-log-full create committed without ever writing the record)
+            // must NOT fatal-abort the whole rebuild and brick the store. Skip
+            // it — advancing ONE aligned block to resync at the next record
+            // (block-aligned, so a legitimate record is never skipped) — and
+            // continue, loudly.
+            let (meta, aligned_advance) =
+                match classify_scanned_record(&buf[..METADATA_SIZE], offset, align, end) {
+                    ScannedRecord::Valid {
+                        meta,
+                        aligned_advance,
+                    } => (meta, aligned_advance),
+                    ScannedRecord::Skip { advance, reason } => {
+                        skipped_malformed += 1;
+                        tracing::warn!(
+                            target: "teraslab::recovery",
+                            offset,
+                            reason,
+                            "rebuild: skipping malformed/orphan region (issue #14)"
+                        );
+                        offset += advance;
+                        continue;
+                    }
+                };
 
-            let record_size = { meta.record_size } as u64;
-            if record_size == 0 {
-                return Err(IndexError::FormatError {
-                    detail: format!("zero record_size at allocated offset {offset}"),
-                });
-            }
-            // F-G3-014: cross-check `record_size` against the layout
-            // implied by `utxo_count`. A CRC-valid header whose
-            // `record_size` disagrees with `record_size_for(utxo_count)`
-            // is corrupt — advancing by the declared size would skip
-            // legitimate records and produce a quiet partial rebuild.
             let utxo_count = { meta.utxo_count };
-            let expected_record_size = TxMetadata::record_size_for(utxo_count);
-            if record_size != expected_record_size {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record_size mismatch at allocated offset {offset}: \
-                         declared {record_size}, expected {expected_record_size} \
-                         for utxo_count={utxo_count}"
-                    ),
-                });
-            }
-
             let key = TxKey { txid: meta.tx_id };
             let entry = TxIndexEntry {
                 device_id: 0,
@@ -591,17 +669,16 @@ impl Index {
                 generation: 0,
             };
             index.register(key, entry)?;
+            offset += aligned_advance;
+        }
 
-            // Advance past this record (aligned)
-            let record_aligned = (record_size as usize).div_ceil(align) * align;
-            if offset + record_aligned as u64 > end {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record at allocated offset {offset} extends past allocator high-water mark"
-                    ),
-                });
-            }
-            offset += record_aligned as u64;
+        if skipped_malformed > 0 {
+            tracing::error!(
+                target: "teraslab::recovery",
+                skipped_malformed,
+                "rebuild: completed with malformed/orphan region(s) skipped — possible data \
+                 loss; investigate device integrity (issue #14)"
+            );
         }
 
         Ok(index)
@@ -624,6 +701,7 @@ impl Index {
         let aligned_read = read_size.div_ceil(align) * align;
 
         let mut offset = start;
+        let mut skipped_malformed: u64 = 0;
         while offset + aligned_read as u64 <= end {
             if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
                 let free_end = free_offset.saturating_add(free_size).min(end);
@@ -646,41 +724,27 @@ impl Index {
                 continue;
             }
 
-            let meta = match TxMetadata::from_bytes(&buf[..METADATA_SIZE]) {
-                Ok(m) => m,
-                Err(e) => {
-                    return Err(IndexError::FormatError {
-                        detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
-                    });
-                }
-            };
-            if { meta.magic } != METADATA_MAGIC {
-                return Err(IndexError::FormatError {
-                    detail: format!("invalid metadata magic at allocated offset {offset}"),
-                });
-            }
-
-            let record_size = { meta.record_size } as u64;
-            if record_size == 0 {
-                return Err(IndexError::FormatError {
-                    detail: format!("zero record_size at allocated offset {offset}"),
-                });
-            }
-            // F-G3-014: same cross-check as `Index::rebuild` — a CRC-valid
-            // header whose declared `record_size` disagrees with the
-            // layout implied by `utxo_count` cannot be trusted to advance
-            // the offset correctly.
-            let utxo_count = { meta.utxo_count };
-            let expected_record_size = TxMetadata::record_size_for(utxo_count);
-            if record_size != expected_record_size {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record_size mismatch at allocated offset {offset}: \
-                         declared {record_size}, expected {expected_record_size} \
-                         for utxo_count={utxo_count}"
-                    ),
-                });
-            }
+            // Issue #14: tolerate a malformed/orphan region instead of
+            // fatal-aborting — skip + resync one aligned block. Mirrors
+            // `Index::rebuild`.
+            let (meta, aligned_advance) =
+                match classify_scanned_record(&buf[..METADATA_SIZE], offset, align, end) {
+                    ScannedRecord::Valid {
+                        meta,
+                        aligned_advance,
+                    } => (meta, aligned_advance),
+                    ScannedRecord::Skip { advance, reason } => {
+                        skipped_malformed += 1;
+                        tracing::warn!(
+                            target: "teraslab::recovery",
+                            offset,
+                            reason,
+                            "rebuild_secondary: skipping malformed/orphan region (issue #14)"
+                        );
+                        offset += advance;
+                        continue;
+                    }
+                };
 
             let key = TxKey { txid: meta.tx_id };
             let dah_val = { meta.delete_at_height };
@@ -692,16 +756,16 @@ impl Index {
             if unmined_val != 0 {
                 unmined.insert(unmined_val, key);
             }
+            offset += aligned_advance;
+        }
 
-            let record_aligned = (record_size as usize).div_ceil(align) * align;
-            if offset + record_aligned as u64 > end {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record at allocated offset {offset} extends past allocator high-water mark"
-                    ),
-                });
-            }
-            offset += record_aligned as u64;
+        if skipped_malformed > 0 {
+            tracing::error!(
+                target: "teraslab::recovery",
+                skipped_malformed,
+                "rebuild_secondary: completed with malformed/orphan region(s) skipped \
+                 (issue #14)"
+            );
         }
 
         Ok((dah, unmined))
@@ -1626,34 +1690,36 @@ mod tests {
         }
     }
 
+    // Issue #14: a malformed header in an allocated region (orphan left by a
+    // redo-log-full create, or a torn write) must NOT fatal-abort the rebuild
+    // and brick the store. The bad region is skipped (loudly) and every OTHER
+    // record is still recovered. (Pre-#14 these three tests asserted a fatal
+    // `FormatError`.)
     #[test]
-    fn rebuild_fails_on_corrupted_magic_in_allocated_region() {
+    fn rebuild_skips_corrupted_magic_in_allocated_region() {
         let (dev, alloc, records) = setup_device_with_records(10);
 
         let offset = records[3].1;
         corrupt_magic_and_restamp_crc(&*dev, offset);
 
-        let err = Index::rebuild(&*dev, &alloc).unwrap_err();
-        match err {
-            IndexError::FormatError { detail } => {
-                assert!(
-                    detail.contains("invalid metadata magic"),
-                    "expected magic-mismatch detail, got: {detail}"
-                );
-                assert!(detail.contains(&offset.to_string()));
+        let index = Index::rebuild(&*dev, &alloc).expect("rebuild must tolerate the bad region");
+        assert_eq!(index.len(), 9, "the 9 intact records must be recovered");
+        assert!(
+            index.lookup(&records[3].0).is_none(),
+            "the corrupted record must be skipped"
+        );
+        for (i, (key, _)) in records.iter().enumerate() {
+            if i == 3 {
+                continue;
             }
-            other => panic!("expected FormatError, got {other:?}"),
+            assert!(index.lookup(key).is_some(), "record {i} must survive");
         }
     }
 
     #[test]
-    fn rebuild_fails_on_crc_mismatch_in_allocated_region() {
-        // Companion to the magic-mismatch test: when the magic bytes are
-        // zeroed WITHOUT restamping the CRC, `TxMetadata::from_bytes`
-        // rejects the header on CRC before the magic check is reached.
-        // The rebuild path must surface the CRC error in its detail
-        // string so operators can distinguish torn-write corruption
-        // from "valid header pointing at the wrong record type".
+    fn rebuild_skips_crc_mismatch_in_allocated_region() {
+        // Magic bytes zeroed WITHOUT restamping the CRC: `from_bytes` rejects
+        // the header on CRC. The region is skipped, the rest is recovered.
         let (dev, alloc, records) = setup_device_with_records(10);
 
         let offset = records[3].1;
@@ -1663,25 +1729,17 @@ mod tests {
         buf[0..4].copy_from_slice(&[0u8; 4]);
         dev.pwrite_all_at(&buf, offset).unwrap();
 
-        let err = Index::rebuild(&*dev, &alloc).unwrap_err();
-        match err {
-            IndexError::FormatError { detail } => {
-                assert!(
-                    detail.contains("corrupt metadata at allocated offset"),
-                    "expected CRC-error detail, got: {detail}"
-                );
-                assert!(detail.contains(&offset.to_string()));
-            }
-            other => panic!("expected FormatError, got {other:?}"),
-        }
+        let index = Index::rebuild(&*dev, &alloc).expect("rebuild must tolerate the bad region");
+        assert_eq!(index.len(), 9);
+        assert!(index.lookup(&records[3].0).is_none());
     }
 
-    // F-G3-014: a CRC-valid header whose `record_size` disagrees with the
-    // size implied by `utxo_count` must fail the rebuild rather than
-    // advance the scan by the (wrong) declared size — pre-fix the scan
-    // would skip legitimate records and produce a quiet partial rebuild.
+    // F-G3-014 / issue #14: a CRC-valid header whose `record_size` disagrees
+    // with the size implied by `utxo_count` is skipped — and crucially the
+    // scan resyncs by ONE aligned block, so it does NOT advance by the (wrong)
+    // declared size and skip legitimate records: every other record survives.
     #[test]
-    fn rebuild_fails_on_record_size_inconsistent_with_utxo_count() {
+    fn rebuild_skips_record_size_inconsistent_with_utxo_count() {
         let (dev, alloc, records) = setup_device_with_records(10);
 
         let offset = records[3].1;
@@ -1689,25 +1747,15 @@ mod tests {
         let mut buf = AlignedBuf::new(align, align);
         dev.pread_exact_at(&mut buf, offset).unwrap();
 
-        // Read the current record_size, then write a value that disagrees
-        // with the layout implied by `meta.utxo_count`. Restamp CRC so
-        // `TxMetadata::from_bytes` accepts the header and the
-        // record_size cross-check is the gate that fires.
-        // `record_size` is the third u32 in the metadata struct:
-        // magic(4) + schema_version(4) = offset 8.
+        // `record_size` is the third u32: magic(4) + schema_version(4) = 8.
         let record_size_offset = 8usize;
         let original = u32::from_le_bytes(
             buf[record_size_offset..record_size_offset + 4]
                 .try_into()
                 .unwrap(),
         );
-        // Pick a deliberately wrong size — half the original is guaranteed
-        // not to match `record_size_for(utxo_count)` because every record
-        // has a non-zero metadata block.
         let wrong = (original / 2).max(METADATA_SIZE as u32);
         buf[record_size_offset..record_size_offset + 4].copy_from_slice(&wrong.to_le_bytes());
-        // Restamp CRC (clear the CRC slot before hashing — matches
-        // `TxMetadata::stamp_crc`).
         let mut hash_buf = [0u8; METADATA_SIZE];
         hash_buf.copy_from_slice(&buf[..METADATA_SIZE]);
         hash_buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
@@ -1715,16 +1763,18 @@ mod tests {
         buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
         dev.pwrite_all_at(&buf, offset).unwrap();
 
-        let err = Index::rebuild(&*dev, &alloc).unwrap_err();
-        match err {
-            IndexError::FormatError { detail } => {
-                assert!(
-                    detail.contains("record_size mismatch"),
-                    "expected record_size mismatch detail, got: {detail}"
-                );
-                assert!(detail.contains(&offset.to_string()));
+        let index = Index::rebuild(&*dev, &alloc).expect("rebuild must tolerate the bad region");
+        assert_eq!(
+            index.len(),
+            9,
+            "block-by-block resync must not skip legitimate records"
+        );
+        assert!(index.lookup(&records[3].0).is_none());
+        for (i, (key, _)) in records.iter().enumerate() {
+            if i == 3 {
+                continue;
             }
-            other => panic!("expected FormatError, got {other:?}"),
+            assert!(index.lookup(key).is_some(), "record {i} must survive");
         }
     }
 
@@ -2042,32 +2092,34 @@ mod tests {
         assert_eq!(unmined.len(), 5);
     }
 
+    // Issue #14: the secondary rebuild tolerates a malformed allocated record
+    // (skips it, recovers the rest) rather than fatal-aborting. (Pre-#14 these
+    // two asserted a fatal `FormatError`.)
     #[test]
-    fn rebuild_secondary_fails_on_corrupted_allocated_record() {
+    fn rebuild_secondary_skips_corrupted_allocated_record() {
         let (dev, alloc, records) = setup_device_with_records(20);
 
-        // Corrupt record 0 (which has both dah and unmined set)
+        // Corrupt record 0 (which has both dah and unmined set).
         let offset = records[0].1;
         corrupt_magic_and_restamp_crc(&*dev, offset);
 
-        let err = match Index::rebuild_secondary(&*dev, &alloc) {
-            Ok(_) => panic!("corrupt allocated secondary record must fail rebuild"),
-            Err(err) => err,
-        };
-        match err {
-            IndexError::FormatError { detail } => {
-                assert!(
-                    detail.contains("invalid metadata magic"),
-                    "expected magic-mismatch detail, got: {detail}"
-                );
-                assert!(detail.contains(&offset.to_string()));
-            }
-            other => panic!("expected FormatError, got {other:?}"),
-        }
+        let (dah, _unmined) =
+            Index::rebuild_secondary(&*dev, &alloc).expect("rebuild must tolerate the bad region");
+        // The other records' DAH entries are still recovered (record 2 has
+        // dah=300, etc.), and record 0's height=100 entry is gone.
+        let at_100 = dah.range_query(100);
+        assert!(
+            !at_100.iter().any(|k| *k == records[0].0),
+            "the corrupted record's DAH entry must be skipped"
+        );
+        assert!(
+            !dah.range_query(u32::MAX).is_empty(),
+            "non-corrupted records' DAH entries must still be recovered"
+        );
     }
 
     #[test]
-    fn rebuild_secondary_fails_on_crc_mismatch_in_allocated_record() {
+    fn rebuild_secondary_skips_crc_mismatch_in_allocated_record() {
         let (dev, alloc, records) = setup_device_with_records(20);
 
         let offset = records[0].1;
@@ -2077,20 +2129,12 @@ mod tests {
         buf[0..4].copy_from_slice(&[0u8; 4]);
         dev.pwrite_all_at(&buf, offset).unwrap();
 
-        let err = match Index::rebuild_secondary(&*dev, &alloc) {
-            Ok(_) => panic!("corrupt CRC must fail secondary rebuild"),
-            Err(err) => err,
-        };
-        match err {
-            IndexError::FormatError { detail } => {
-                assert!(
-                    detail.contains("corrupt metadata at allocated offset"),
-                    "expected CRC-error detail, got: {detail}"
-                );
-                assert!(detail.contains(&offset.to_string()));
-            }
-            other => panic!("expected FormatError, got {other:?}"),
-        }
+        let (dah, _unmined) =
+            Index::rebuild_secondary(&*dev, &alloc).expect("rebuild must tolerate the bad region");
+        assert!(
+            !dah.range_query(u32::MAX).is_empty(),
+            "non-corrupted records' DAH entries must still be recovered"
+        );
     }
 
     #[test]

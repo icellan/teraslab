@@ -131,7 +131,11 @@ fn decode_meta(bytes: &[u8]) -> Option<([u8; 32], u64)> {
 /// best-effort no-op (this server targets Linux/Unix).
 #[cfg(unix)]
 fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // `parent()` is `Some("")` for a bare relative name, not `None` (issue #13).
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let dir = std::fs::File::open(parent)?;
     dir.sync_all()
 }

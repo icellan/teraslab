@@ -551,6 +551,7 @@ impl PrimaryBackend {
         let mut batch = Vec::with_capacity(BATCH_SIZE);
 
         let mut offset = start;
+        let mut skipped_malformed: u64 = 0;
         while offset + aligned_read as u64 <= end {
             if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
                 let free_end = free_offset.saturating_add(free_size).min(end);
@@ -577,41 +578,33 @@ impl PrimaryBackend {
                 continue;
             }
 
-            let meta =
-                match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return Err(IndexError::FormatError {
-                            detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
-                        });
-                    }
-                };
-            if { meta.magic } != crate::record::METADATA_MAGIC {
-                return Err(IndexError::FormatError {
-                    detail: format!("invalid metadata magic at allocated offset {offset}"),
-                });
-            }
+            // Issue #14: tolerate a malformed/orphan region (skip + resync one
+            // aligned block) instead of fatal-aborting the rebuild. Mirrors
+            // `Index::rebuild`.
+            let (meta, aligned_advance) = match crate::index::classify_scanned_record(
+                &buf[..crate::record::METADATA_SIZE],
+                offset,
+                align,
+                end,
+            ) {
+                crate::index::ScannedRecord::Valid {
+                    meta,
+                    aligned_advance,
+                } => (meta, aligned_advance),
+                crate::index::ScannedRecord::Skip { advance, reason } => {
+                    skipped_malformed += 1;
+                    tracing::warn!(
+                        target: "teraslab::recovery",
+                        offset,
+                        reason,
+                        "rebuild_redb: skipping malformed/orphan region (issue #14)"
+                    );
+                    offset += advance;
+                    continue;
+                }
+            };
 
-            let record_size = { meta.record_size } as u64;
-            if record_size == 0 {
-                return Err(IndexError::FormatError {
-                    detail: format!("zero record_size at allocated offset {offset}"),
-                });
-            }
-            // F-G3-014: same record_size/utxo_count cross-check as the
-            // in-memory rebuild path in `Index::rebuild` (src/index/mod.rs).
             let utxo_count = { meta.utxo_count };
-            let expected_record_size = crate::record::TxMetadata::record_size_for(utxo_count);
-            if record_size != expected_record_size {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record_size mismatch at allocated offset {offset}: \
-                         declared {record_size}, expected {expected_record_size} \
-                         for utxo_count={utxo_count}"
-                    ),
-                });
-            }
-
             let key = TxKey { txid: meta.tx_id };
             let entry = TxIndexEntry {
                 device_id: 0,
@@ -630,21 +623,21 @@ impl PrimaryBackend {
                 primary.register_batch(&batch)?;
                 batch.clear();
             }
-
-            let record_aligned = (record_size as usize).div_ceil(align) * align;
-            if offset + record_aligned as u64 > end {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record at allocated offset {offset} extends past allocator high-water mark"
-                    ),
-                });
-            }
-            offset += record_aligned as u64;
+            offset += aligned_advance;
         }
 
         // Flush remaining entries
         if !batch.is_empty() {
             primary.register_batch(&batch)?;
+        }
+
+        if skipped_malformed > 0 {
+            tracing::error!(
+                target: "teraslab::recovery",
+                skipped_malformed,
+                "rebuild_redb: completed with malformed/orphan region(s) skipped — possible \
+                 data loss; investigate device integrity (issue #14)"
+            );
         }
 
         Ok(Self::OnDisk(primary))
@@ -671,6 +664,7 @@ impl PrimaryBackend {
         let aligned_read = read_size.div_ceil(align) * align;
 
         let mut offset = start;
+        let mut skipped_malformed: u64 = 0;
         while offset + aligned_read as u64 <= end {
             if let Some((free_offset, free_size)) = allocator.free_region_containing(offset) {
                 let free_end = free_offset.saturating_add(free_size).min(end);
@@ -697,41 +691,33 @@ impl PrimaryBackend {
                 continue;
             }
 
-            let meta =
-                match crate::record::TxMetadata::from_bytes(&buf[..crate::record::METADATA_SIZE]) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return Err(IndexError::FormatError {
-                            detail: format!("corrupt metadata at allocated offset {offset}: {e}"),
-                        });
-                    }
-                };
-            if { meta.magic } != crate::record::METADATA_MAGIC {
-                return Err(IndexError::FormatError {
-                    detail: format!("invalid metadata magic at allocated offset {offset}"),
-                });
-            }
+            // Issue #14: tolerate a malformed/orphan region (skip + resync one
+            // aligned block) instead of fatal-aborting the rebuild. Mirrors
+            // `Index::rebuild`.
+            let (meta, aligned_advance) = match crate::index::classify_scanned_record(
+                &buf[..crate::record::METADATA_SIZE],
+                offset,
+                align,
+                end,
+            ) {
+                crate::index::ScannedRecord::Valid {
+                    meta,
+                    aligned_advance,
+                } => (meta, aligned_advance),
+                crate::index::ScannedRecord::Skip { advance, reason } => {
+                    skipped_malformed += 1;
+                    tracing::warn!(
+                        target: "teraslab::recovery",
+                        offset,
+                        reason,
+                        "rebuild_file_backed: skipping malformed/orphan region (issue #14)"
+                    );
+                    offset += advance;
+                    continue;
+                }
+            };
 
-            let record_size = { meta.record_size } as u64;
-            if record_size == 0 {
-                return Err(IndexError::FormatError {
-                    detail: format!("zero record_size at allocated offset {offset}"),
-                });
-            }
-            // F-G3-014: cross-check `record_size` against the layout
-            // implied by `utxo_count` (same as the other two rebuild paths).
             let utxo_count = { meta.utxo_count };
-            let expected_record_size = crate::record::TxMetadata::record_size_for(utxo_count);
-            if record_size != expected_record_size {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record_size mismatch at allocated offset {offset}: \
-                         declared {record_size}, expected {expected_record_size} \
-                         for utxo_count={utxo_count}"
-                    ),
-                });
-            }
-
             let key = TxKey { txid: meta.tx_id };
             let entry = TxIndexEntry {
                 device_id: 0,
@@ -745,16 +731,16 @@ impl PrimaryBackend {
                 generation: 0,
             };
             index.register(key, entry)?;
+            offset += aligned_advance;
+        }
 
-            let record_aligned = (record_size as usize).div_ceil(align) * align;
-            if offset + record_aligned as u64 > end {
-                return Err(IndexError::FormatError {
-                    detail: format!(
-                        "record at allocated offset {offset} extends past allocator high-water mark"
-                    ),
-                });
-            }
-            offset += record_aligned as u64;
+        if skipped_malformed > 0 {
+            tracing::error!(
+                target: "teraslab::recovery",
+                skipped_malformed,
+                "rebuild_file_backed: completed with malformed/orphan region(s) skipped — \
+                 possible data loss; investigate device integrity (issue #14)"
+            );
         }
 
         index.sync();
@@ -1173,8 +1159,10 @@ mod tests {
         assert_eq!(rebuilt.len(), 0);
     }
 
+    // Issue #14: redb rebuild tolerates a malformed allocated region (skips +
+    // recovers the rest) rather than fatal-aborting. (Pre-#14: fatal.)
     #[test]
-    fn rebuild_redb_fails_on_corrupted_magic_in_allocated_region() {
+    fn rebuild_redb_skips_corrupted_magic_in_allocated_region() {
         let dir = tempfile::tempdir().unwrap();
         let config = redb_config(dir.path());
         let (dev, alloc, records) = setup_device_with_records(10);
@@ -1182,21 +1170,14 @@ mod tests {
         let offset = records[3].1;
         corrupt_magic_and_restamp_crc(&*dev, offset);
 
-        let err = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap_err();
-        match err {
-            IndexError::FormatError { detail } => {
-                assert!(
-                    detail.contains("invalid metadata magic"),
-                    "expected magic-mismatch detail, got: {detail}"
-                );
-                assert!(detail.contains(&offset.to_string()));
-            }
-            other => panic!("expected FormatError, got {other:?}"),
-        }
+        let rebuilt = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc)
+            .expect("rebuild must tolerate the bad region");
+        assert_eq!(rebuilt.len(), 9);
+        assert!(rebuilt.lookup(&records[3].0).is_none());
     }
 
     #[test]
-    fn rebuild_redb_fails_on_crc_mismatch_in_allocated_region() {
+    fn rebuild_redb_skips_crc_mismatch_in_allocated_region() {
         let dir = tempfile::tempdir().unwrap();
         let config = redb_config(dir.path());
         let (dev, alloc, records) = setup_device_with_records(10);
@@ -1208,17 +1189,10 @@ mod tests {
         buf[0..4].copy_from_slice(&[0u8; 4]);
         dev.pwrite_all_at(&buf, offset).unwrap();
 
-        let err = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap_err();
-        match err {
-            IndexError::FormatError { detail } => {
-                assert!(
-                    detail.contains("corrupt metadata at allocated offset"),
-                    "expected CRC-error detail, got: {detail}"
-                );
-                assert!(detail.contains(&offset.to_string()));
-            }
-            other => panic!("expected FormatError, got {other:?}"),
-        }
+        let rebuilt = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc)
+            .expect("rebuild must tolerate the bad region");
+        assert_eq!(rebuilt.len(), 9);
+        assert!(rebuilt.lookup(&records[3].0).is_none());
     }
 
     #[test]

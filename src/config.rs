@@ -1155,9 +1155,42 @@ impl ServerConfig {
         }
     }
 
+    /// Resolve the index snapshot file path.
+    ///
+    /// Uses [`Self::index_snapshot_path`] verbatim when it carries a directory
+    /// component (absolute, or relative with a parent like `data/snap`). When
+    /// it is a **bare relative name** (no directory — e.g. the default
+    /// `teraslab-index.snap`), co-locate it with the first device's directory
+    /// so the checkpoint writes the snapshot into the (persisted, writable)
+    /// data directory rather than the process's current working directory.
+    ///
+    /// Issue #13: a bare relative name also tripped an ENOENT in the parent-dir
+    /// fsync (fixed in `fsync_parent_dir`), but even with that fixed, writing
+    /// the snapshot to the container cwd (`/`, not a mounted volume) would lose
+    /// it on every restart and force a full device rebuild — so the default is
+    /// co-located with the data device here.
+    ///
+    /// Falls back to the configured path unchanged when no device directory can
+    /// be derived (`validate_safe_defaults` gates an empty device list).
+    pub fn resolved_index_snapshot_path(&self) -> PathBuf {
+        if let Some(parent) = self.index_snapshot_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            return self.index_snapshot_path.clone();
+        }
+        let file_name = self
+            .index_snapshot_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("teraslab-index.snap"));
+        match self.device_paths.first().and_then(|d| d.parent()) {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(file_name),
+            _ => self.index_snapshot_path.clone(),
+        }
+    }
+
     /// Resolve the durable node-height file path. Uses
     /// `last_durable_height_path` if explicitly set, otherwise derives it from
-    /// the index snapshot path by appending `.height`.
+    /// the resolved index snapshot path by appending `.height`.
     ///
     /// Deriving from the snapshot path (rather than a device path) co-locates
     /// the height with the other engine-derived durable artifacts the
@@ -1167,7 +1200,7 @@ impl ServerConfig {
         match &self.last_durable_height_path {
             Some(p) => p.clone(),
             None => {
-                let mut p = self.index_snapshot_path.clone().into_os_string();
+                let mut p = self.resolved_index_snapshot_path().into_os_string();
                 p.push(".height");
                 PathBuf::from(p)
             }
@@ -2541,6 +2574,52 @@ replication_factor = 1
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         cfg.validate_safe_defaults()
             .expect("true single-node mode needs no cluster_secret");
+    }
+
+    #[test]
+    fn resolved_index_snapshot_path_colocates_bare_name_with_device_dir() {
+        // Issue #13: the default bare-relative snapshot name must resolve into
+        // the first device's directory (a persisted volume) rather than the
+        // process cwd.
+        let cfg = ServerConfig {
+            index_snapshot_path: PathBuf::from("teraslab-index.snap"),
+            device_paths: vec![PathBuf::from("/data/teraslab.dat")],
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_index_snapshot_path(),
+            PathBuf::from("/data/teraslab-index.snap"),
+        );
+        // The derived height path co-locates too.
+        assert_eq!(
+            cfg.resolved_last_durable_height_path(),
+            PathBuf::from("/data/teraslab-index.snap.height"),
+        );
+    }
+
+    #[test]
+    fn resolved_index_snapshot_path_honors_explicit_directory() {
+        // An absolute path (or any path with a directory component) is used
+        // verbatim — co-location only kicks in for a bare name.
+        let cfg = ServerConfig {
+            index_snapshot_path: PathBuf::from("/snapshots/idx.snap"),
+            device_paths: vec![PathBuf::from("/data/teraslab.dat")],
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_index_snapshot_path(),
+            PathBuf::from("/snapshots/idx.snap"),
+        );
+
+        let cfg_rel = ServerConfig {
+            index_snapshot_path: PathBuf::from("sub/idx.snap"),
+            device_paths: vec![PathBuf::from("/data/teraslab.dat")],
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            cfg_rel.resolved_index_snapshot_path(),
+            PathBuf::from("sub/idx.snap"),
+        );
     }
 
     // E-2: cross-check between the server's secret (ServerConfig) and the

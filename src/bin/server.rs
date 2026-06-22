@@ -618,7 +618,8 @@ fn main() {
         (primary, secondaries)
     } else {
         // In-memory backend (default)
-        let snap_path = &config.index_snapshot_path;
+        let snap_path = config.resolved_index_snapshot_path();
+        let snap_path = snap_path.as_path();
         if snap_path.exists() {
             match PrimaryBackend::restore_all(snap_path) {
                 Ok((idx, dah, unmined, flags)) => {
@@ -1547,7 +1548,7 @@ fn main() {
     // would erase.
     let checkpoint_handle = redo_log.as_ref().map(|log| {
         let mut cfg =
-            teraslab::checkpoint::CheckpointConfig::new(config.index_snapshot_path.clone());
+            teraslab::checkpoint::CheckpointConfig::new(config.resolved_index_snapshot_path());
         // BC-01: honour operator-configured hysteresis band and poll
         // cadence rather than the library defaults. Config validation
         // guarantees `0 < low_water < high_water < 1` and
@@ -1724,7 +1725,7 @@ fn main() {
         inner: server.clone(),
         shutdown: shutdown_flag.clone(),
         engine,
-        snap_path: config.index_snapshot_path.clone(),
+        snap_path: config.resolved_index_snapshot_path(),
         device,
         cluster,
         otlp_provider,
