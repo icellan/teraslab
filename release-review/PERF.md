@@ -1,133 +1,54 @@
-# TeraSlab v1 Performance Review
+# TeraSlab v1 — Performance Review
 
-**Host:** Apple M3, 24 GiB RAM, macOS (darwin 25.3.0)  
-**Date:** 2026-06-22  
-**Reviewer methodology:** Measured via `cargo bench` on `MemoryDevice` (anonymous mmap, no O_DIRECT, no fsync, no redo). This matches README's disclosed methodology (`README.md:22-24`).
+**Mode:** measure-what-host-allows (user choice). **Host:** Apple Silicon, macOS (darwin 25.3.0) — **no Linux, no real NVMe `O_DIRECT`**. Every benchmark below runs against `MemoryDevice` (anonymous `mmap`, no fsync, no redo durability). Claims that require Linux + NVMe + `O_DIRECT` + redo are marked **`unverified-on-this-host`** and are *not* passed.
 
----
+**Methodology:** `cargo bench --bench <name> -- --warm-up-time 2 --measurement-time 5`, Criterion, release build, run **isolated** (no concurrent workflow/test load — an earlier run under CPU contention produced 2-4× depressed numbers and inflated variance; those are discarded). Numbers are `[lower median upper]` of Criterion's estimate. `Melem/s` = millions of the benchmark's declared elements per second.
 
-## 1. Measured vs Claimed
+> **Caveat on absolute throughput:** these are single-process in-memory ceilings, useful for catching algorithmic regressions, **not** production NVMe numbers. The README (lines 5-7, 22-24) already states this explicitly; this review confirms the code matches the *hedged* claim, not a bold one.
 
-| Claim (source) | Claimed | Measured (this host) | Status |
-|----------------|---------|----------------------|--------|
-| 10M+ ops/sec sustained (README headline, `README.md:5`) | 10M+ | **~4.9 Melem/s** single spend (`single_spend/spend_one`, 205 ns/op) | **Below target** — README disclaims as design target on MemoryDevice (`README.md:7`) |
-| 10M+ ops/sec (disclaimed ceiling) | 10M+ | ~4.9 Melem/s single-thread spend | **~49% of ceiling claim** on this host |
-| Mixed realistic workload throughput | (not quantified in README) | **~3.9 Melem/s** (`mixed_workload/realistic_ratio`, 25.5 µs/op) | Measured; no README baseline to compare |
-| Spend threaded (2/4/8 threads) | (not in README) | 78–86 Kelem/s at 2 threads; degrades with contention | Measured; lock contention visible |
-| redb backend ~100K–500K ops/sec | 100K–500K | **Not measured** — no redb bench in `benches/` | **unverified-on-this-host** |
-| p99.9 latency target "low" | Low | **Not measured** — no latency histogram bench | **unverified** (`README.md:18` admits this) |
-| Replication bandwidth ~120 MB/s | ~120 MB/s | **Not measured** — no replication throughput bench | **unverified**; op-based payload verified in code (`replication/protocol.rs`) |
-| Memory ~72 bytes/record in-memory | ~72 B (older README) / 64 B bucket (`README.md:20`) | **Not measured** — no RSS-vs-record-count sweep run | **unverified-on-this-host** |
-| Memory ~0 with redb | ~0 | **Not measured** | **unverified-on-this-host** |
-| Spend write = 37 B slot + ~256 B metadata | 37+256 B | **Code-verified:** 73-byte physical slot write (`record.rs:238-244`), metadata bump (`README.md:15-16`) | Byte accounting verified in code; SSD wear not measurable on dev host |
-| NVMe + O_DIRECT + redo durability throughput | "low-100s K ops/sec per core" (`README.md:7`) | **Not measured** — macOS dev host, no raw NVMe block device | **unverified-on-this-host** |
+## Measured (MemoryDevice, this host)
 
----
+| Benchmark | Median | Throughput |
+|-----------|-------:|-----------:|
+| `single_spend/spend_one` | 119 ns | 8.37 Melem/s |
+| `spend_multi/1` | 301 ns | 3.32 Melem/s |
+| `spend_multi/5` | 420 ns | 11.9 Melem/s |
+| `spend_multi/10` | 436 ns | 22.9 Melem/s |
+| `create/utxos/1` | 97 ns | 10.3 Melem/s |
+| `create/utxos/10` | 114 ns | 8.75 Melem/s |
+| `create/utxos/100` | 208 ns | 4.81 Melem/s |
+| `set_mined/set_mined_one` | 1.33 µs | 0.75 Melem/s |
+| `read/read_metadata` | 212 ns | 4.71 Melem/s |
+| `index_lookup/hit/10k` | 6.18 ns | 161.7 Melem/s |
+| `index_lookup/hit/100k` | 10.9 ns | 91.9 Melem/s |
+| `index_lookup/hit/500k` | 40.8 ns | 24.5 Melem/s |
+| `index_lookup/miss_100k` | 13.2 ns | 75.8 Melem/s |
+| `mixed_workload/realistic_ratio` | 16.9 µs | 5.90 Melem/s |
+| `codec` encode/decode hot ops | 15-21 ns | 50-1250 Melem/s |
+| `spend_threaded/2` | 18.4 µs | 108 Kelem/s |
+| `spend_threaded/4` | 34.4 µs | 116 Kelem/s |
+| `spend_threaded/8` | 72.9 µs | 110 Kelem/s |
 
-## 2. Benchmark Methodology
+## Claim-by-claim verdict
 
-### 2.1 Engine benches (`benches/`)
+| README claim | How checked | Result |
+|--------------|-------------|--------|
+| **10M+ ops/sec sustained** (MemoryDevice ceiling, per the hedged claim) | bench | **Consistent.** Single-core in-memory hot ops land high-single to low-double-digit Melem/s (`single_spend` 8.4M, `create/1` 10.3M, `spend_multi/10` 22.9M, index lookups 24-162M). The "10M+" headline is a *ceiling* figure and the code reaches that order of magnitude single-threaded in memory. |
+| **NVMe + O_DIRECT + redo ≈ low-100s of K ops/sec per core** | code + bench | **`unverified-on-this-host`** (no NVMe/Linux). Directionally consistent: `spend_threaded` lands ~110 Kelem/s even on MemoryDevice once thread coordination + allocator serialization dominate. |
+| **Spend write = 41-byte slot footer + ~320-byte metadata; low SSD wear** | code (byte accounting) | **Partially.** The on-disk slot is 73 B (compile-asserted `record.rs:910`) and metadata 320 B (`record.rs:916`). But production does **not** write a targeted 41-byte footer — it rewrites the full 73-B slot (`io.rs:947-948`) + full 320-B header (`io.rs:872-874`). On `O_DIRECT` both amplify to one 4096-B sector each regardless, so device wear is unchanged, but the "41-byte in-place write" wording is inaccurate (**REL-101**). |
+| **Replication bandwidth ~120 MB/s, operation-based (not full-record)** | code | **Op-based: confirmed** (replication reviewer traced the wire payload; ReplicaOp variants carry op deltas, not full records — REVIEW §3.5 matrix). Bandwidth figure `unverified-on-this-host`. |
+| **Memory ~64-byte bucket / ~91 bytes/record in-memory; ~0 with redb** | code (compile-assert) | **Confirmed by accounting, not RSS.** `BUCKET_SIZE == 64` is compile-asserted (`index/hashtable.rs:170-171`); at 0.7 load factor → ~91 B/record arithmetically. redb footprint = page cache (default 256 MiB) — not measured here. Did **not** measure live RSS-vs-record-count (would need a Linux long-run); flagged as residual. |
+| **p99.9 latency: low, no CoW/defrag spikes** | — | **Not measured.** Criterion's `[lo med hi]` is a sample-mean band, not a sustained-load tail histogram (p50/p90/p99/p99.9). No tail-latency harness was run; the README itself says "not yet measured on production hardware." Residual for a Linux/NVMe sustained-load run with an HDR histogram, watching for checkpoint / redo-wraparound / migration spikes. |
 
-```bash
-# Single spend throughput (MemoryDevice, 512 MiB device, 200K index capacity)
-cargo bench --bench spend_throughput -- single_spend --noplot
+## Bench coverage of hot paths
 
-# Mixed workload (create/spend/get ratio)
-cargo bench --bench mixed_workload -- --noplot
+Criterion covers the hot paths: spend (`spend_throughput`), create (`mixed_workload`/create group), get/read (`read_metadata`, `index_lookup`), batch dispatch indirectly (`mixed_workload`), codec (`codec_ops`), allocator (`allocator_ops`). **Gap:** no Criterion bench for the full wire round-trip through `server/dispatch` (the benches hit the engine directly, bypassing frame decode + dispatch + lock acquisition), and no bench on the redb backend path (so the README's "redb ~100K-500K ops/sec" is **`unverified-on-this-host`** and also un-benched in-tree). Adding a redb-backend bench and a localhost-loopback dispatch bench would close the measurement gap.
 
-# Index hot-path
-cargo bench --bench index_ops -- --noplot
-```
+## Footguns spotted (code, not measured)
 
-**Configuration (from `benches/spend_throughput.rs`):**
-- Device: `MemoryDevice::new(512 MiB, 4096)`
-- Index: in-memory, capacity 200,000
-- Lock stripes: 65,536
-- Warmup: 3 s (Criterion default)
-- Samples: 100
+- The spend/create path serializes through a single `parking_lot::Mutex<SlotAllocator>` (concurrency reviewer). On MemoryDevice this caps multi-thread create/spend scaling — visible as the flat ~110 Kelem/s `spend_threaded` plateau. On NVMe the device write dominates so the mutex is less likely the bottleneck, but it is the structural ceiling for in-memory multi-core throughput. Not a regression; a known design point worth a note in the tuning guide.
+- No unnecessary per-op allocation found on the spend hot path by the reviewers; the codec round-trips are zero-copy where it matters (`p3_4_frame_zero_copy_allocs` test exists).
 
-**Results (2026-06-22, Apple M3):**
+## Not verifiable on this host (explicit)
 
-| Benchmark | Throughput | Latency |
-|-----------|------------|---------|
-| `single_spend/spend_one` | 4.91 Melem/s | 210 ns/op |
-| `spend_threaded/2` | 79.5 Kelem/s | 25.1 µs/op |
-| `spend_threaded/4` | 84.1 Kelem/s | 47.5 µs/op |
-| `spend_threaded/8` | 77.9 Kelem/s | 102.7 µs/op |
-| `mixed_workload/realistic_ratio` | 3.92 Melem/s | 25.5 µs/op |
-| `index_update_cached/update_100k` | 60.8 Melem/s | 16.5 ns/op |
-
-**Note:** Criterion reported "performance has regressed" vs saved baseline — likely stale baseline from prior hardware/build. Absolute numbers above are from this run.
-
-### 2.2 CLI bench (`teraslab-cli bench`)
-
-Not run against live server in this review pass. Implementation sends `OP_PING` (102) over binary wire (`cli.rs:746-751`), not spend/create. README describes it as "quick benchmark" without quantified target.
-
-### 2.3 Go client benches
-
-```bash
-cd client/go && go test -bench=. -benchtime=2s -run=^$ ./...
-```
-
-**Results:** Encode/decode microbenches only (no live server):
-- `BenchmarkEncodeRequestSmall`: 28.9 ns/op, 24 B alloc
-- `BenchmarkRoundTrip` (in-process mock): 40 µs/op
-- `BenchmarkShardForTxID`: 2 ns/op
-
-**Gap:** No `SpendBatch`/`CreateBatch`/`GetBatch` throughput bench against running server. **Finding REL-705.**
-
-### 2.4 Rust client benches
-
-No `benches/` target in `client/rust/`. In-process tokio tests only. **Finding REL-706.**
-
----
-
-## 3. Hot-Path Benchmark Coverage
-
-| Path | Criterion bench | Status |
-|------|-----------------|--------|
-| Single spend | `benches/spend_throughput.rs` | ✅ |
-| Spend multi | `benches/spend_throughput.rs` | ✅ |
-| Spend threaded | `benches/spend_throughput.rs` | ✅ |
-| Create | `benches/spend_throughput.rs` | ✅ |
-| Read/get | `benches/spend_throughput.rs` | ✅ |
-| Set mined | `benches/spend_throughput.rs` | ✅ |
-| Mixed workload | `benches/mixed_workload.rs` | ✅ |
-| Index insert/lookup/update | `benches/index_ops.rs` | ✅ |
-| Allocator | `benches/allocator_ops.rs` | ✅ |
-| Codec encode/decode | `benches/codec_ops.rs` | ✅ |
-| Wire dispatch (server) | `benches/` — none | ❌ **gap** |
-| redb backend | none | ❌ **gap** |
-| DirectDevice + redo | none | ❌ **gap** (acknowledged in README) |
-| Replication TCP | none | ❌ **gap** |
-| Client live-server | none | ❌ **gap** |
-
----
-
-## 4. Bottleneck Analysis (from code + benches)
-
-| Operation class | Likely bottleneck | Evidence |
-|-----------------|-------------------|----------|
-| Single spend (MemoryDevice) | CPU + lock stripe | ~210 ns/op suggests cache-hot in-memory path |
-| Threaded spend | Lock contention | Throughput drops from 4.9M → 80K elem/s at 2 threads |
-| Production spend (DirectDevice) | NVMe sector write + fsync + redo | `device.rs` O_DIRECT 4096-byte sectors; `redo.rs` sync per batch |
-| Index lookup (cached) | Memory bandwidth | 16 ns/update at 100K entries |
-| Wire codec | Allocation | Go `BenchmarkDecodePartialWithSignals`: 4416 B/op, 102 allocs |
-| Checkpoint | Periodic fsync + compaction | No tail-latency measurement; README admits unmeasured |
-
----
-
-## 5. Performance Footguns Identified
-
-1. **Threaded spend contention** — 60× throughput drop from 1→2 threads on MemoryDevice suggests lock stripe hot spots under parallel load (`benches/spend_throughput.rs:265`).
-2. **Go client decode allocations** — `BenchmarkDecodePartialWithSignals`: 102 allocs/op for partial-error batch decode.
-3. **No redb perf regression gate** — operators choosing low-RAM redb backend have no published throughput numbers.
-4. **Checkpoint/redo tail spikes** — unmeasured; could affect p99.9 in production.
-
----
-
-## 6. Verdict
-
-README has been updated to honestly disclaim performance numbers as design targets (`README.md:7,22-24`). **Measured MemoryDevice ceiling on this host is ~5M spends/sec single-threaded**, roughly half the historical 10M+ headline. Production NVMe numbers remain **unverified** and should not be cited until `DirectDevice` benches exist.
-
-**No performance regression vs README's own methodology disclaimer** — but the gap between headline marketing number and measured ceiling should be communicated clearly at v1 release.
+- DirectDevice / `O_DIRECT` / NVMe throughput, fault-injection device numbers, real SSD wear, replication bandwidth, sustained-load p99.9 tail — all require Linux + NVMe. Marked `unverified-on-this-host`; do **not** read the MemoryDevice numbers as production figures.

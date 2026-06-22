@@ -1,71 +1,43 @@
-# TeraSlab v1 Release Recommendation
+# TeraSlab v1.0 (target 0.7.0) — Release Recommendation
 
-**Date:** 2026-06-22 (updated after clean test rerun)  
-**Recommendation:** **NO-GO**
+## Verdict: **NO-GO** — clearable with 2 small fixes
 
----
+The engine is v1-grade. Two narrow defects on durability/correctness-critical paths must land first; both have small fixes using primitives already in the tree. This is a "fix two things and re-gate," not a "not ready" verdict.
 
-## Decision
+Date: 2026-06-23. HEAD `920ac32` (version bumped to 0.7.0 this session). Baseline: build clean (0 warnings); `cargo test --all` clean isolated **2710 / 0 / 0**; clippy clean.
 
-TeraSlab is **not ready for a v1.0 durability-and-correctness tag** on the evidence collected in this review. Core server-side WAL/recovery, UTXO spend semantics, and the full test suite are strong — **2710 tests passed / 0 failed / 0 ignored** on a clean isolated rerun. One release-blocking gap remains: a **client–server wire contract bug** that silently disables preservation expiry.
+## Must clear before tagging (blockers)
 
----
+| ID | What | Fix size |
+|----|------|----------|
+| **REL-001** | Delete-tombstone write is a non-atomic data race (UB) vs the lock-free read path (`engine.rs:1518-1525`). Route it through `io_locks().write` + `atomic_store_from` like every other direct writer; add an aarch64-release/loom torn-header test. | small |
+| **REL-002** | Cluster peak/topology persist doesn't fsync the parent dir after `rename` (`coordinator.rs:7454-7522`) → crash can roll the split-brain peak back → minority self-activation. Call the existing `fsync_parent_dir` post-rename; add a rename-durability crash test (REL-111). | small |
 
-## Blockers (must clear before tagging v1)
+## Strongly recommended before v1 (majors — gate owner's shortlist)
 
-| ID | Finding | Why it blocks |
-|----|---------|---------------|
-| **REL-403** | Go + Rust clients send 4-byte `ProcessExpiredPreservations`; server skips expiry when `block_height_retention=0` | Teranode pruner parity broken; preserved transactions leak indefinitely — silent data retention failure |
+These don't strictly corrupt data on the happy path, but they break documented cluster behavior and leave the cardinal contract ungated. At least the CI-gating and client-redirect ones should land for a credible v1:
 
----
+- **REL-015** — promote `scenario_14` (split-brain) + `scenario_15` (crash recovery) to nightly + gate `release.yml` on them. The no-double-spend contract must be a release gate, not weekly.
+- **REL-016** — run the Go client `integration` tests against a real server in CI.
+- **REL-012 / REL-013** — Go client must follow per-item `ERR_REDIRECT` for batch mutations (the form the server actually emits), and its redirect tests must use the real wire shape.
+- **REL-010 / REL-011** — Rust client: support `cluster_secret` (bootstrap a default secure cluster) and shard-fan-out/redirect for `unspend`/`get_spend` — or document the limitations loudly. (Lower priority if Teranode uses the Go client; confirm which client ships.)
+- **REL-014** — both clients should send the 8-byte `ProcessExpiredPreservations` so the expiry phase actually runs (currently a silent no-op).
+- **REL-017** — make the index snapshot/export round-trip tests assert full `TxIndexEntry` equality with non-zero fields (cheap; guards a silent-corruption path).
+- **REL-018 / REL-019** — document the on-by-default tombstone subsystem; fix the `DEPLOYMENT_ASSUMPTIONS.md` `strict_auth` default (it says the opposite of shipped).
 
-## Strong secondary gates (should clear; escalate if deferred)
+## Can ship as v1 with follow-ups (minors)
 
-| ID | Finding | Risk if deferred |
-|----|---------|------------------|
-| REL-307 | `cluster_swim` timing-sensitive under extreme parallel CPU contention | Flaky CI if multiple heavy jobs share host; passes cleanly in isolated rerun |
-| REL-308 | E2E scenarios 13/14 use `% 4096` shard formula | Migration/split-brain tests may validate wrong routing for 1/16 of keyspace |
-| REL-104/105 | Opcodes 103, 105 have zero tests | Topology adoption and post-commit migration planning untested at wire boundary |
-| REL-601 | `migration_crash` / `migration_fence` not in CI | Migration crash-safety regressions undetected at PR tier |
-| REL-605 | Go integration tests excluded from CI; Rust client lacks pool/conn tests | Client bitrot against live cluster |
+45 minors, overwhelmingly docs drift (stale sizes/defaults, io_uring still referenced + still a declared dep, README test count `2234`→`2710`, undocumented config keys) plus dead-code cleanup and small test gaps. None block. A docs-accuracy sweep before tagging is worthwhile since v1 docs are a contract — see FINDINGS REL-100..REL-144.
 
----
+## What was NOT reviewed / not verifiable on this host (per the rules, stated explicitly)
 
-## What passed review
+- **NVMe/Linux performance** — throughput, redb throughput, SSD wear, replication bandwidth, sustained-load **p99.9 tail**, and live RSS-vs-records. Host is macOS, no `O_DIRECT`/NVMe. Marked `unverified-on-this-host`. The README's quantitative perf table remains **unvalidated** (though already hedged) until a Linux+NVMe run exists. Not a code blocker.
+- **`cargo clippy --features fault-injection`** — not re-run this session (README claims clean; base clippy is clean).
+- **Embedded `/ui/` dashboard behavior** — only route registration confirmed.
+- **Raw `/dev/nvme` `BLKGETSIZE64` test** and **deep `cargo-fuzz` nightly** — pre-existing known residuals (README documents both).
 
-- **Full test suite green** — `cargo test --all`: 2710 passed, 0 failed, 0 ignored (clean rerun 2026-06-22)
-- **`cluster_swim`** — 11/11 pass in 5.75s (after concurrent-agent contention ruled out)
-- WAL-first durability ordering (redo fsync before ack) — REL-200 verified
-- Idempotent recovery replay — REL-203 verified
-- Spend correctness: `ALREADY_SPENT` 36-byte payload, double-spend rejection — REL-111/112 verified
-- Error codes 0–20, 255 wire triggerability (core item errors) — REL-109 verified
-- O_DIRECT 4096 alignment — REL-209 verified
-- Cluster quorum / NO_QUORUM / HMAC auth — REL-301–306 verified
-- Zero `#[ignore]` on correctness tests — REL-003 verified
-- Clippy clean — REL-004 verified
+These are deferred with justification (§8 of REVIEW.md), not silently skipped. No source subsystem was left unreviewed.
 
----
+## Bottom line
 
-## Performance posture
-
-README honestly disclaims 10M+ ops/sec as a MemoryDevice design target. Measured ~4.9 Melem/s single spend on Apple M3. **No blocker** for performance claims given README disclaimer, but NVMe production numbers remain unpublished.
-
----
-
-## Minimum remediation path to GO
-
-1. **Fix REL-403:** Update `client/go/codec.go` and `client/rust/src/lib.rs` to send 8-byte payload `[current_height:4][block_height_retention:4]`. Add client conformance test.
-2. **Fix REL-308:** Replace `% 4096` with `& 0x0FFF` in scenarios 13/14.
-3. Run weekly Docker tier (`teraslab-tests/docker/run_all.sh --tier release`) and record results.
-4. Consider hardening `cluster_swim` against parallel CPU starvation (REL-307).
-
-After (1)–(3): reassess as **GO-WITH-CAVEATS** if remaining majors (REL-104/105, REL-402, REL-601) are explicitly deferred with operator runbook mitigations.
-
----
-
-## Unreviewed / incomplete in this pass
-
-- Per-`unsafe` block safety invariant audit (168 occurrences, 15 files) — sampled, not exhaustive
-- Live-server client throughput benchmarks (Go + Rust)
-- Linux NVMe block-device bench on real hardware
-- Docker weekly e2e tier (17 scenarios) — not executed in this review pass
+Fix REL-001 and REL-002 → re-run the full suite + the cluster e2e tier → **GO**. Land the major shortlist (especially REL-015/016 CI-gating and the client redirect fixes) for a v1 that holds up under cluster rebalance and crash, and do a docs-accuracy sweep. The perf table stays labeled "design targets / MemoryDevice ceiling" until measured on Linux+NVMe.

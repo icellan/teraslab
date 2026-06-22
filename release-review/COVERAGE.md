@@ -1,170 +1,50 @@
-# TeraSlab v1 Test Coverage Review
+# TeraSlab v1 — Coverage Review
 
-**Date:** 2026-06-22
+Per-subsystem, what is and is **not** covered by tests. Baseline: clean isolated `cargo test --all` = **2710 passed / 0 failed / 0 ignored** (70 suites). No `#[ignore]`, no `assert!(true)`, no bare `.is_ok()/.is_err()` asserts found anywhere; all `#[allow(...)]` carry justifications except those in REL-104.
 
----
+The opcode→handler→test and code→trigger→test matrices live in `REVIEW.md` §3; this file is the gap inventory.
 
-## 1. Test Suite Baseline
+## Strong coverage (verified, non-vacuous)
 
-| Command | Result (review host) |
-|---------|---------------------|
-| `cargo test --all` (initial, concurrent agent on host) | **FAILED** — 3 failures in `cluster_swim` (contention artifact) |
-| `cargo test --all` (clean rerun, 2026-06-22) | **2710 passed / 0 failed / 0 ignored** across 70 test binaries |
-| `cluster_swim` (within clean rerun) | **11 passed, 0 failed** in 5.75s |
-| `cargo clippy --all -- -D warnings` | Clean |
-| `cd client/go && go test ./...` | Pass (unit only; integration tag excluded) |
-| `#[ignore]` on correctness tests | **0** |
+- **UTXO ops / record** — all 12 mutation opcodes + GET/GET_SPEND have handler+test (matrix in REVIEW §3.1). Double-spend: 100-thread concurrent test asserts exactly one winner and that every loser reads the winner's exact 36-byte spending_data (`engine.rs:8910,15648`). Per-slot + per-header CRC with explicit torn-payload rejection. Coinbase maturity / frozen-until cooldown with boundary heights. Unspend ownership semantics. DAH eval matrix incl. overflow (checked, not saturating), reassigned-exclusion, preserve_until blocking.
+- **Durability / recovery** — WAL-before-ack ordering enforced per mutation; idempotent replay with value-level + idempotent-second-pass assertions across the BeforeRedoFsync / AfterRedoFsync / AfterApplyBeforeSync crash windows (`tests/fault_injection.rs`, `tests/recovery_crash_boundaries.rs`, `tests/crash_sweep_ops.rs` — all 12 ops). Torn-tail recovery + sequence continuity; F-G4-001 header CRC; B-3 compaction crash-safety via CrashCowDevice; direct-I/O alignment rejection; checkpoint↔mutation mutual exclusion. Replay-op→handler→idempotency-token matrix in REVIEW §3.3.
+- **Concurrency / allocator** — best-fit/coalesce, double-free + overlapping-free rejection, redo journaling + rollback on flush failure, replay idempotency, header CRC tamper detection; striped-lock seed-stability + collision-resistance + RwLock exclusion; simulation determinism pinned by `simulation_reproducibility` (`e2e_workload.rs:770`).
+- **Cluster** — shard mapping deterministic + Go golden vector; HRW/round-robin placement permutation-invariance/RF-invariance/single-master/minimal-movement property tests; quorum/split-brain at unit (`activation_quorum_needed`, M1.3 restore-floors-peak) and e2e (`cluster_partition.rs::partitioned_minority_never_self_activates_topology`, `g8_split_brain.rs`); SWIM HMAC convergence; placement-version refusal on propose+commit. Error/feature→trigger→test matrix in REVIEW §3.5.
+- **Replication** — per-key ACK quorum + status mapping (`d6_per_key_quorum_*`), strict-zero-acks-is-hard-error, degraded→status-5 only at RF=1, timeout escalation; the d39a612 double-length-prefix HMAC fix has a RED-before-fix apply-and-verify test; receiver sequencing (gap NAK, dup-skip, watermark) + wrapping generation guard. ReplicaOp→handler→token→round-trip matrix in REVIEW §3.5.
+- **Storage / blobs** — external-blob double integrity (store SHA-256 sidecar + record-anchored ExternalRef re-validation; swap-attack test g9_002); GC orphan TOCTOU closed by mtime grace (g9_004) + pin handshake (g9_018) with real race tests; stream codes 16/17/18/34, byte cap, concurrent-stream cap, idle/close cleanup all e2e.
+- **Protocol / server** — codec round-trip/truncation/oversize/sub-header; all batch decoders count-before-alloc + per-item caps + fuzz-non-panic (`wire_fuzz_smoke.rs`); real inflight-bytes + connection-cap accounting tests; admin auth SHA-256 + constant-time compare; error-code conformance asserts exact wire codes + data-payload sizes (full code matrix in REVIEW §3.7).
+- **Index** — Robin Hood insert/get/remove/resize/collision/adversarial-DoS + file-backed reopen + crash-after-resize sentinel; primary device-scan rebuild tolerance across all 3 primary backends; secondary fail-closed → ERR_INDEX_DEGRADED; snapshot checksum/truncation/version/poison rejection; import-in-progress sentinel; redb durability (append+fsync before commit).
+- **Config / startup** — RemoteBindRefused, StrictAuthRequiresSecret/ClusterId, AdminTokenRequired, ack_policy/degraded best-effort rejection at RF>1, device_id/cluster_id pinning, cluster-secret agreement — all with non-vacuous tests; startup fail-closed per-cause (no in-memory WAL fallback).
+- **Security** — every non-test `unsafe` carries an upheld contract; vout validated vs utxo_count before direct slot access; oversize-frame/conn-cap/per-IP/slow-loris/stream-DoS all assert typed wire codes; AArch64 torn-read regression test backs the io_locks design.
+- **End-to-end durability** — YES, it exists: in-process WAL-boundary kill/restart sweep for all 12 ops (`crash_sweep_ops.rs`), deterministic 10-seed crash injection (`e2e_workload.rs`), real-SIGKILL 3-node Docker suite with full consistency reconciliation + atomicity (`scenario_15`), cluster double-spend rejection (`scenario_03`), split-brain prevention (`scenario_14`). Op→crash-sweep→cluster-e2e→double-spend-guard matrix in REVIEW §4.
 
----
+## Gaps (correctness-critical paths with thin/absent or mis-gated coverage)
 
-## 2. Subsystem → Test Mapping
+| ID | Gap | Severity |
+|----|-----|----------|
+| REL-015 | Cluster crash-recovery (`scenario_15`) + split-brain (`scenario_14`) — the authoritative "no acked write lost / no double-spend after SIGKILL" proof — run **weekly only**, never PR/nightly/release gate. | major |
+| REL-016 | Go client never exercised against a real server in CI (`integration_test.go` build-tag-gated; CI omits the tag). | major |
+| REL-017 | Snapshot + portable export/import round-trip tests only insert all-zero cached fields and assert only `record_offset` — a field-zeroing/offset-swap regression on the most fidelity-critical serialization path would pass CI. | major (test-gap) |
+| REL-001 | `g2_delete_race` asserts functional non-aliasing but cannot detect the torn-read/UB on the unguarded tombstone memcpy (no TSan/loom/aarch64-release torn-header assertion). | (blocker fix needs this test) |
+| REL-111 | On-disk durability of persisted peak/committed-term across a real crash/rename boundary is untested (only in-memory `restore()`); this is exactly why REL-002 went uncaught. | minor (→ would catch a blocker) |
+| REL-105 | Issue-#14 orphan absence asserted by in-memory `next_offset()` proxy, not a crash+recovery cycle. | minor |
+| REL-107 | No `recover()` test for valid-magic header with out-of-range `count` (where REL-100 lives). | minor |
+| REL-108 | `stress_random_operations` partitions txids per thread → no same-stripe/same-txid interleaving exercised at the engine level. | minor |
+| REL-116 | `STREAM_END` declared-size-mismatch branch untested. | minor |
+| REL-122 | `remove()` of a probe-distance-capped (>254) entry never executed by tests. | minor |
+| REL-130 | Cluster e2e double-spend oracle checks `spent_count` only, not per-slot spending_data (in-process tests do check it). | minor |
+| REL-131 | `http_observability` tests check metric name presence, not increment-on-op (value coverage exists in `prometheus_conformance`/`e5_auth_metrics`). | minor |
+| REL-132 | `block_device_size` sandbox path can pass with zero assertions when a loop device can't attach (CI forces the real env-device variant). | minor |
+| — | DELETED_CHILDREN (code 35) defense-in-depth: no focused engine test found that resurrects-then-prunes a child and asserts idempotent re-spend → `DeletedChildren`. Conformance test asserts the wire code/1B payload; verify an engine-level test exists or add one. | minor |
+| — | Full "create external → delete → run GC → assert blob gone" loop covered piecewise (delete path + GC no-index deletion) but not as one regression. | minor |
+| REL-200/201 | Reviewers flagged "config entropy/sizing validators" and "Go `classifyRetry`" as untested; adversarial verification **refuted both** (coverage exists / low-risk). Recorded as dropped; a `classifyRetry` table test is still cheap and worth adding. | dropped |
 
-### Durability / WAL / Recovery
+## CI gating summary (where the real risk is)
 
-| Component | Unit (`src/`) | Integration (`tests/`) | Docker E2E | CI |
-|-----------|---------------|------------------------|------------|-----|
-| Redo log | `redo.rs` extensive | `g4_*` (14 files) | — | PR |
-| Recovery replay | `recovery.rs` | `recovery_crash_boundaries.rs` | — | PR |
-| Checkpoint | `checkpoint.rs` | — | — | PR |
-| Crash sweep (all ops × 3 windows) | — | `crash_sweep_ops.rs` | — | PR (fault-injection) |
-| Migration crash | — | `migration_crash.rs` | — | **NOT in CI** |
-| Migration fence | — | `migration_fence.rs` | — | **NOT in CI** |
-| Property crash+replay | — | `property_utxo.rs` | — | PR |
-| SIGKILL mid-write | — | — | `scenario_15` | Weekly |
+| Tier | Runs | Holds |
+|------|------|-------|
+| PR (`ci.yml`) | every PR | unit/lib (2710), `crash_sweep_ops`, `fault_injection`, e2e scenarios **01/02/03** (incl. cluster double-spend reject), Go unit (no `-tags integration`), Rust client tests |
+| Nightly | nightly | `e2e_workload` crash injection (10 seeds) |
+| Weekly | weekly | release tier: **scenario_14 split-brain, scenario_15 crash-recovery**, 16, 17 |
 
-### UTXO Operations
-
-| Component | Unit | Integration | Docker E2E | CI |
-|-----------|------|-------------|------------|-----|
-| Engine (all ops) | `ops/engine.rs` ~200+ | `integration.rs`, `server_tcp.rs` | `scenario_02` | PR |
-| Error code conformance | `dispatch.rs` | `error_code_conformance.rs`, `server_tcp.rs:477` | — | PR |
-| Spend correctness | `ops/spend.rs`, `engine.rs` | `server_tcp.rs:706-761`, `property_utxo.rs` | `scenario_02` | PR |
-| Delete eval | `ops/delete_eval.rs` | `integration.rs` | — | PR |
-| Pruning ops 30–32 | `dispatch.rs` unit | `server_tcp.rs:1631` (op 32 only, 8-byte form) | — | Partial |
-
-### Index
-
-| Component | Unit | Integration | CI |
-|-----------|------|-------------|-----|
-| Hashtable | `index/hashtable.rs` | `integration.rs` | PR |
-| redb primary/DAH/unmined | `index/redb_*.rs` | `secondary_redb_degraded.rs` | PR |
-| Backend matrix (TCP) | — | `server_tcp.rs:3107` — ping/create/spend/get only | PR |
-| Export/import | `index/migration.rs` | `cli_integration.rs` | PR |
-
-### Cluster / Replication
-
-| Component | Unit | Integration | Docker E2E | CI |
-|-----------|------|-------------|------------|-----|
-| SWIM | `cluster/swim.rs` | `cluster_swim.rs` (11/11 clean; timing-sensitive under extreme CPU contention) | `scenario_01` | PR |
-| Coordinator/topology | `cluster/coordinator.rs` | `cluster_tcp.rs`, `cluster_partition.rs` | `scenario_14` | PR |
-| Replication TCP | `replication/*.rs` | `replication_tcp.rs` | `scenario_03` | PR |
-| Split-brain | — | `g8_split_brain.rs` | `scenario_14` | Weekly |
-| Migration under load | — | — | `scenario_13` | Weekly |
-
-### Storage / Blobs / Streaming
-
-| Component | Unit | Integration | CI |
-|-----------|------|-------------|-----|
-| BlobStore | `storage/blobstore.rs` | `server_tcp.rs:2120-2198` | PR |
-| Stream errors | `dispatch.rs` | `g_h1_h2_stream_dos.rs` | PR |
-| Stream → external create E2E | — | **None** | — |
-| Tier boundaries (8KiB/1MiB) | `storage/tiers.rs` | Partial (`e2e_workload.rs` ~4KiB only) | — |
-
-### Protocol / Wire
-
-| Component | Unit | Integration | CI |
-|-----------|------|-------------|-----|
-| Frame/codec | `protocol/frame.rs`, `codec.rs` | `wire_fuzz_smoke.rs` | PR |
-| Deadline enforcement | — | **None** | — |
-| libFuzzer deep fuzz | `fuzz/decode_request` | — | Nightly manual |
-
-### Clients
-
-| Client | Unit/Mock | Live Integration | CI |
-|--------|-----------|------------------|-----|
-| Go (`client/go/`) | 16 `*_test.go` files | `integration_test.go` (build tag `integration`) | Unit only |
-| Rust (`client/rust/`) | 13 tests in `lib.rs` | 5 in-process tokio tests | PR |
-| Test harness (`teraslab-tests/client/`) | lib helpers | 17 Docker scenarios | PR: 01–03; Weekly: all |
-
----
-
-## 3. Opcode Test Matrix (README-scoped)
-
-| Opcode | Wire integration test | Unit test |
-|--------|----------------------|-----------|
-| 1 SpendBatch | ✅ `server_tcp.rs` | ✅ |
-| 2 UnspendBatch | ✅ | ✅ |
-| 3 SetMinedBatch | ✅ | ✅ |
-| 4 CreateBatch | ✅ | ✅ |
-| 5–12 mutations | ✅ | ✅ |
-| 20 GetBatch | ✅ | ✅ |
-| 21 GetSpendBatch | ✅ | ✅ |
-| 30 QueryOldUnmined | ❌ | ✅ `dispatch.rs` |
-| 31 PreserveTransactions | ❌ | ✅ `dispatch.rs` |
-| 32 ProcessExpiredPreservations | ✅ (8-byte payload) | ✅ |
-| 100 GetPartitionMap | ✅ `cluster_tcp.rs` | ✅ |
-| 101 Health | ❌ | ✅ |
-| 102 Ping | ✅ | ✅ |
-| 200 StreamChunk | ✅ | ✅ |
-| 201 StreamEnd | ✅ | ✅ |
-| 103 GetCommittedTopology | ❌ | ❌ |
-| 105 PartitionVersionReport | ❌ | ❌ |
-
----
-
-## 4. Error Code Test Matrix (0–20, 255)
-
-All codes 0–20 and 255 have at least one wire or unit test observing the code, except:
-- Code 0 (OK) — ubiquitous
-- Codes triggered only via cluster paths (14, 15, 19, 20) — covered in `cluster_tcp.rs`, `migration_fence.rs`, `g8_split_brain.rs`
-
-**Client conformance gap:** `ProcessExpiredPreservations` server expiry phase untested via shipped clients (4-byte vs 8-byte payload). See REL-403.
-
----
-
-## 5. Weak / Problematic Tests
-
-| Test | Issue | Severity |
-|------|-------|----------|
-| `cluster_swim.rs` | Failed only under concurrent-agent CPU contention; passes cleanly in isolated rerun. Suspect-vs-Dead race latent under extreme load | **Medium** |
-| `scenario_13/14` shard routing | `% 4096` ≠ `& 0x0FFF` — tests wrong shard for 1/16 keyspace | **Major** |
-| `scenario_15` crash subtests | `sleep(5ms)` before SIGKILL — probabilistic, not mid-WAL deterministic | **Medium** |
-| `ko1_legacy_payload_skips_expiry_phase` | Documents that 4-byte payload skips expiry — **confirms client bug** | Info |
-| `backend_matrix!` | Would pass if pruning/streaming broken on redb backend | **Medium** |
-
----
-
-## 6. Durability E2E Tiers
-
-| Tier | Tests | Deterministic mid-write? |
-|------|-------|--------------------------|
-| A — In-process | `recovery_crash_boundaries.rs`, `crash_sweep_ops.rs`, `fault_injection.rs`, `secondary_two_phase_durability.rs` | ✅ Yes (sync-point injection) |
-| B — Simulation | `e2e_workload.rs`, `property_utxo.rs` | Probabilistic |
-| C — Docker SIGKILL | `scenario_15`, `scenario_04`, `scenario_16` | Probabilistic (sleep-gated) |
-
-**Release gate implication:** PR CI does not run Tier C. Weekly tier (`run_all.sh --tier release`) is intended pre-release gate.
-
----
-
-## 7. Coverage Gaps (Correctness-Critical, No Test)
-
-1. `OP_GET_COMMITTED_TOPOLOGY` (103) — topology adoption wire path
-2. `OP_PARTITION_VERSION_REPORT` (105) — post-commit migration planning
-3. `src/protocol/deadline.rs` — request timeout enforcement
-4. Real SIGTERM → graceful shutdown with in-flight writes
-5. Shipped client `ProcessExpiredPreservations` 8-byte wire conformance
-6. Stream → external blob create → read cold data (TCP E2E)
-7. `WriteAll` replication under partition at Docker scale
-8. redb backend pruning/streaming parity via `backend_matrix!`
-
----
-
-## 8. CI Tier Summary
-
-| Gate | Docker scenarios | Fault-injection | Client live |
-|------|------------------|-----------------|-------------|
-| PR | 01–03 | `fault_injection`, `crash_sweep_ops`, `cluster_delayed_activation` | Go unit; Rust in-process |
-| Nightly | 01–11, 17 | + `e2e_workload` | Same |
-| Weekly | 01–17 | + real SIGKILL | Same |
-
-**Missing from PR fault-injection step:** `migration_crash`, `migration_fence` (REL-601).
+The cardinal-contract cluster tests (14, 15) are weekly-only and not a release gate — see REL-015.
