@@ -659,8 +659,19 @@ Each transaction occupies a contiguous region on the block device:
 
 A write-ahead redo log records all mutations. On crash recovery:
 1. Open the redo log and scan for the last checkpoint
-2. Replay all entries after the checkpoint (operations are idempotent)
+2. Replay all entries after the checkpoint
 3. Resume normal operation
+
+Replay is **idempotent and identity-checked**: each replay handler re-validates
+the same precondition the live operation enforced before mutating. Some handlers
+(unspend, freeze, unfreeze, reassign) write their redo entry *before* the engine
+validates the request, so a request the engine then rejects (e.g.
+`UTXO_HASH_MISMATCH`, `UTXO_NOT_FROZEN`) can still leave a durable redo entry.
+To prevent a rejected operation from becoming a durable mutation after a crash,
+those entries carry the slot's prior `utxo_hash` (the `*V2`/`*V3` redo variants)
+and replay skips any entry whose carried identity no longer matches the on-disk
+slot — exactly mirroring the live rejection. Replaying an entry that was already
+applied is a no-op via generation guards and slot-state checks.
 
 The redo log is a fixed-size **linear** log on a separate device file (not a circular buffer): `write_pos` advances monotonically and never wraps in place. When the log fills before the next checkpoint, appends return `RedoError::LogFull` and writers stall until the periodic checkpoint task snapshots engine state and resets `write_pos` back to the start. Size `redo_log_size` so the log holds the mutations produced between checkpoints under peak load.
 

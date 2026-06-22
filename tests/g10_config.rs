@@ -235,10 +235,12 @@ cluster_secret = "short"
 
 #[test]
 fn long_cluster_secret_passes_validation() {
+    // Clustered config under strict-auth default also needs a cluster_id (F-E2).
     let toml = r#"
 node_id = 1
 replication_factor = 2
 cluster_secret = "this-is-a-long-enough-secret-from-openssl-rand"
+cluster_id = "00112233445566778899aabbccddeeff"
 "#;
     let cfg: ServerConfig = toml::from_str(toml).unwrap();
     cfg.validate_safe_defaults()
@@ -329,9 +331,11 @@ fn strict_auth_with_cluster_and_secret_passes() {
         node_id: 1,
         replication_factor: 2,
         cluster_secret: Some(Secret::new("openssl-rand-base64-24-bytes-ok")),
+        // F-E2: clustered + strict_auth also requires a cluster_id.
+        cluster_id: Some("00112233445566778899aabbccddeeff".to_string()),
         strict_auth: true,
         ..ServerConfig::default()
     };
     cfg.validate_safe_defaults()
-        .expect("strict_auth with a valid secret must validate");
+        .expect("strict_auth with a valid secret + cluster_id must validate");
 }

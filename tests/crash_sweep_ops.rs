@@ -80,6 +80,7 @@ use teraslab::index::{DahBackend, PrimaryBackend, TxKey, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
+use teraslab::ops::mark_longest_chain::MarkOnLongestChainRequest;
 use teraslab::ops::remaining::{
     DeleteRequest, FreezeRequest, PreserveUntilRequest, ReassignRequest, SetConflictingRequest,
     SetLockedRequest, UnfreezeRequest,
@@ -515,6 +516,85 @@ fn sweep_unspend() {
     }
 }
 
+/// F-A1 regression: a WRONG-HASH unspend that the live engine REJECTS
+/// (ERR_UTXO_HASH_MISMATCH) must NOT become a durable un-spend after any crash
+/// window. Before the fix, the WAL-first `UnspendV2` intent was fsynced before
+/// validation and `replay_unspend` ignored the hash on a healthy SPENT slot —
+/// so crash-replay would flip an already-spent UTXO back to UNSPENT (a
+/// double-spend re-opening). The slot must stay SPENT.
+#[test]
+fn sweep_unspend_wrong_hash_leaves_slot_spent() {
+    for crash in CRASH_WINDOWS {
+        let h = Harness::new();
+        h.seed_record(20, 2);
+        let k = key(20);
+        let sd = spending_data(0xCD);
+
+        // Durably spend slot 0.
+        h.engine
+            .spend(&SpendRequest {
+                tx_key: k,
+                offset: 0,
+                utxo_hash: slot_hash(20, 0),
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: CURRENT_HEIGHT,
+                block_height_retention: RETENTION,
+            })
+            .unwrap();
+        h.make_durable();
+
+        let wrong_hash = slot_hash(20, 200);
+        assert_ne!(wrong_hash, slot_hash(20, 0));
+
+        let rec = drive(
+            &h,
+            crash,
+            |redo| {
+                // WAL-first intent carries the WRONG hash (what dispatch writes
+                // in Phase 1, before the engine validates in Phase 3).
+                redo.lock()
+                    .append_and_flush(RedoOp::UnspendV2 {
+                        tx_key: k,
+                        offset: 0,
+                        spending_data: sd,
+                        new_spent_count: 0,
+                        current_block_height: CURRENT_HEIGHT,
+                        block_height_retention: RETENTION,
+                        target_generation: 2,
+                        updated_at: 0,
+                        utxo_hash: Some(wrong_hash),
+                    })
+                    .ok();
+            },
+            |engine| {
+                // Live path rejects before mutating — no-op.
+                let r = engine.unspend(&UnspendRequest {
+                    tx_key: k,
+                    offset: 0,
+                    utxo_hash: wrong_hash,
+                    spending_data: sd,
+                    current_block_height: CURRENT_HEIGHT,
+                    block_height_retention: RETENTION,
+                });
+                assert!(r.is_err(), "wrong-hash unspend must be rejected live");
+            },
+        );
+
+        let spent = assert_record_consistent(&rec, &k);
+        assert_eq!(
+            spent, 1,
+            "wrong-hash unspend must NOT un-spend the slot after crash window {crash:?}",
+        );
+        let slot = rec.read_slot(&k, 0).unwrap();
+        assert!(
+            slot.is_spent(),
+            "slot must remain SPENT after a rejected wrong-hash unspend ({crash:?})",
+        );
+    }
+}
+
 /// SetMined: WAL-first `SetMined` + `engine.set_mined`. Recovery is consistent
 /// and the record's slots stay unspent (set_mined is not a spend).
 #[test]
@@ -803,6 +883,76 @@ fn sweep_reassign() {
     }
 }
 
+/// F-A1 (reassign) regression: a reassign whose `prior_utxo_hash` the live
+/// engine REJECTS (ERR_UTXO_HASH_MISMATCH) must NOT be applied on crash-replay.
+/// The dispatch path writes a `ReassignV2` intent carrying the prior hash; the
+/// guarded replay must skip it and leave the slot FROZEN with its real hash,
+/// not stamp a fresh UNSPENT slot under the attacker-supplied new hash.
+#[test]
+fn sweep_reassign_wrong_hash_leaves_slot_frozen() {
+    for crash in CRASH_WINDOWS {
+        let h = Harness::new();
+        h.seed_record(21, 2);
+        let k = key(21);
+        h.engine
+            .freeze(&FreezeRequest {
+                tx_key: k,
+                offset: 0,
+                utxo_hash: slot_hash(21, 0),
+            })
+            .unwrap();
+        h.make_durable();
+
+        let real_hash = slot_hash(21, 0);
+        let new_hash = slot_hash(21, 99);
+        let wrong_prior = slot_hash(21, 200);
+        assert_ne!(wrong_prior, real_hash);
+
+        let rec = drive(
+            &h,
+            crash,
+            |redo| {
+                redo.lock()
+                    .append_and_flush(RedoOp::ReassignV2 {
+                        tx_key: k,
+                        offset: 0,
+                        new_hash,
+                        block_height: CURRENT_HEIGHT,
+                        spendable_after: 0,
+                        prior_utxo_hash: wrong_prior,
+                    })
+                    .ok();
+            },
+            |engine| {
+                let r = engine.reassign(&ReassignRequest {
+                    tx_key: k,
+                    offset: 0,
+                    utxo_hash: wrong_prior,
+                    new_utxo_hash: new_hash,
+                    block_height: CURRENT_HEIGHT,
+                    spendable_after: 0,
+                });
+                assert!(
+                    r.is_err(),
+                    "wrong-prior-hash reassign must be rejected live"
+                );
+            },
+        );
+
+        assert_record_consistent(&rec, &k);
+        let slot = rec.read_slot(&k, 0).unwrap();
+        assert_eq!(
+            slot.status, UTXO_FROZEN,
+            "slot must remain FROZEN after a rejected wrong-hash reassign ({crash:?})",
+        );
+        assert_eq!(
+            slot.hash, real_hash,
+            "frozen slot hash must be unchanged ({crash:?})",
+        );
+        assert_ne!(slot.hash, new_hash);
+    }
+}
+
 /// SetConflicting: WAL-first `SetConflicting` + `engine.set_conflicting`.
 #[test]
 fn sweep_set_conflicting() {
@@ -903,6 +1053,60 @@ fn sweep_preserve_until() {
         );
 
         assert_record_consistent(&rec, &k);
+    }
+}
+
+/// MarkOnLongestChain: WAL-first `MarkOnLongestChain` + `engine.mark_on_longest_chain`.
+/// F-B4 gap closure — this mutator had no crash sweep. Driving `on_longest_chain
+/// = false` sets `unmined_since = CURRENT_HEIGHT`; a durable intent must replay
+/// to that state, and recovery must stay record-consistent across every window.
+#[test]
+fn sweep_mark_longest_chain() {
+    for crash in CRASH_WINDOWS {
+        let h = Harness::new();
+        h.seed_record(22, 2);
+        let k = key(22);
+
+        // Mirror dispatch: the replay idempotency token is the post-op
+        // generation (pre-op generation + 1).
+        let pre_gen = { h.engine.read_metadata(&k).unwrap().generation };
+        let target_generation = pre_gen.wrapping_add(1);
+
+        let rec = drive(
+            &h,
+            crash,
+            |redo| {
+                redo.lock()
+                    .append_and_flush(RedoOp::MarkOnLongestChain {
+                        tx_key: k,
+                        on_longest_chain: false,
+                        current_block_height: CURRENT_HEIGHT,
+                        block_height_retention: RETENTION,
+                        generation: target_generation,
+                    })
+                    .ok();
+            },
+            |engine| {
+                engine
+                    .mark_on_longest_chain(&MarkOnLongestChainRequest {
+                        tx_key: k,
+                        on_longest_chain: false,
+                        current_block_height: CURRENT_HEIGHT,
+                        block_height_retention: RETENTION,
+                    })
+                    .ok();
+            },
+        );
+
+        assert_record_consistent(&rec, &k);
+        if crash.intent_durable() {
+            let meta = rec.read_metadata(&k).expect("metadata readable");
+            assert_eq!(
+                { meta.unmined_since },
+                CURRENT_HEIGHT,
+                "durable mark-not-on-longest-chain must replay unmined_since ({crash:?})",
+            );
+        }
     }
 }
 

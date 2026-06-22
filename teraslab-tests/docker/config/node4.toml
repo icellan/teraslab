@@ -21,3 +21,7 @@ block_height_retention = 288
 cluster_secret = "docker-test-cluster-shared-secret-do-not-use-in-prod"
 enable_remote_bind = true
 enable_admin_endpoints = true
+
+# F-E2: shared cluster_id for every node of THIS test cluster (32 hex = 16 bytes).
+# Required under the default strict_auth so the cross-cluster merge guard is armed.
+cluster_id = "ababababababababababababababab01"

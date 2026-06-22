@@ -1816,6 +1816,17 @@ fn replay_unspend(
             if slot.status != UTXO_SPENT {
                 return ReplayResult::Skipped;
             }
+            // F-A1: the live `engine.unspend` rejects a hash mismatch
+            // (ERR_UTXO_HASH_MISMATCH) BEFORE mutating. Recovery must be
+            // symmetric: a redo entry whose `utxo_hash` no longer matches the
+            // on-disk slot identity is replaying an operation the master
+            // reported as an error, so skip it rather than flipping the slot
+            // to UNSPENT. Mirrors the `replay_freeze`/`replay_unfreeze` guard.
+            if let Some(expected_hash) = utxo_hash
+                && slot.hash != *expected_hash
+            {
+                return ReplayResult::Skipped;
+            }
             if let Some(expected_spending_data) = expected_spending_data
                 && slot.spending_data != *expected_spending_data
             {
@@ -2623,6 +2634,45 @@ fn replay_metadata_op(
             };
             // Idempotent: already reassigned if hash matches new_hash and status is UNSPENT
             if slot.hash == *new_hash && slot.status == UTXO_UNSPENT {
+                return ReplayResult::Skipped;
+            }
+            let spendable_height = block_height.saturating_add(*spendable_after);
+            let mut new_slot = UtxoSlot::new_unspent(*new_hash);
+            new_slot.spending_data[0..4].copy_from_slice(&spendable_height.to_le_bytes());
+            if io::write_utxo_slot(device, ie.record_offset, *offset, &new_slot).is_err() {
+                return ReplayResult::Failed(ReplayCause::IoError);
+            }
+            ReplayResult::Applied
+        }
+        RedoOp::ReassignV2 {
+            tx_key,
+            offset,
+            new_hash,
+            block_height,
+            spendable_after,
+            prior_utxo_hash,
+        } => {
+            let ie = match index.lookup(tx_key) {
+                Some(e) => e,
+                None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
+            };
+            let slot = match io::read_utxo_slot(device, ie.record_offset, *offset) {
+                Ok(s) => s,
+                Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
+            };
+            // Idempotent: already reassigned if hash matches new_hash and status is UNSPENT.
+            if slot.hash == *new_hash && slot.status == UTXO_UNSPENT {
+                return ReplayResult::Skipped;
+            }
+            // F-A1 (reassign): the live `engine.reassign` requires the slot to
+            // be FROZEN with `slot.hash == request.utxo_hash` BEFORE mutating
+            // (ERR_UTXO_HASH_MISMATCH / ERR_UTXO_NOT_FROZEN otherwise). Recovery
+            // must be symmetric: a redo entry whose `prior_utxo_hash` no longer
+            // matches the on-disk slot identity, or whose slot is no longer
+            // FROZEN, is replaying an operation the master reported as an error
+            // — skip it rather than stamping a fresh slot the live path refused.
+            // Mirrors the `replay_freeze`/`replay_unspend` identity guards.
+            if slot.status != UTXO_FROZEN || slot.hash != *prior_utxo_hash {
                 return ReplayResult::Skipped;
             }
             let spendable_height = block_height.saturating_add(*spendable_after);
@@ -4296,6 +4346,56 @@ mod tests {
     }
 
     #[test]
+    fn replay_unspend_rejects_wrong_hash_without_clearing_slot() {
+        // F-A1: a UnspendV2 redo entry whose `utxo_hash` no longer matches the
+        // on-disk spent slot is replaying an unspend the live engine rejected
+        // (ERR_UTXO_HASH_MISMATCH). Recovery must skip it and leave the slot
+        // SPENT — otherwise a rejected unspend becomes a durable un-spend after
+        // crash, re-opening an already-spent UTXO (double-spend risk).
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0xA3, 1);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let slot0 = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let real_hash = slot0.hash;
+        let stored_spending_data = [0x11; 36];
+        let spent = UtxoSlot::new_spent(real_hash, stored_spending_data);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &spent).unwrap();
+        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        meta.spent_utxos = 1;
+        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+
+        let wrong_hash = [0xEE; 32];
+        assert_ne!(real_hash, wrong_hash);
+        let mut redo = h.redo_log();
+        // Correct spending_data, WRONG hash — exactly what the live engine
+        // rejects with ERR_UTXO_HASH_MISMATCH before mutating.
+        redo.append_and_flush(RedoOp::UnspendV2 {
+            tx_key: key,
+            offset: 0,
+            spending_data: stored_spending_data,
+            new_spent_count: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            target_generation: 2,
+            updated_at: 0,
+            utxo_hash: Some(wrong_hash),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_skipped, 1);
+
+        // Slot remains SPENT with its real hash and spending data; counter unchanged.
+        let post_slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert!(post_slot.is_spent());
+        assert_eq!(post_slot.hash, real_hash);
+        assert_eq!(post_slot.spending_data, stored_spending_data);
+        let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ post_meta.spent_utxos }, 1);
+    }
+
+    #[test]
     fn crash_between_redo_and_data_write_spend() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(1, 5);
@@ -5620,6 +5720,110 @@ mod tests {
         assert_eq!(slot.status, UTXO_UNSPENT);
         let spendable_h = u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
         assert_eq!(spendable_h, 1100);
+    }
+
+    #[test]
+    fn replay_reassign_v2_applies_on_matching_prior_hash() {
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x52, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Freeze slot 0 (reassign requires frozen state); capture the prior hash.
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let prior_hash = slot.hash;
+        let frozen = UtxoSlot::new_frozen(prior_hash);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &frozen).unwrap();
+
+        let new_hash = [0xCC; 32];
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReassignV2 {
+            tx_key: key,
+            offset: 0,
+            new_hash,
+            block_height: 1000,
+            spendable_after: 100,
+            prior_utxo_hash: prior_hash,
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.hash, new_hash);
+        assert_eq!(slot.status, UTXO_UNSPENT);
+    }
+
+    #[test]
+    fn replay_reassign_v2_skips_on_prior_hash_mismatch() {
+        // F-A1 (reassign): a ReassignV2 redo entry whose `prior_utxo_hash` no
+        // longer matches the on-disk frozen slot is replaying a reassign the
+        // live engine would reject (ERR_UTXO_HASH_MISMATCH). Recovery must
+        // skip it and leave the slot FROZEN — NOT stamp a fresh UNSPENT slot.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x53, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let real_hash = slot.hash;
+        let frozen = UtxoSlot::new_frozen(real_hash);
+        io::write_utxo_slot(&*h.data_dev, ie.record_offset, 0, &frozen).unwrap();
+
+        let new_hash = [0xCC; 32];
+        let wrong_prior = [0xEE; 32];
+        assert_ne!(real_hash, wrong_prior);
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReassignV2 {
+            tx_key: key,
+            offset: 0,
+            new_hash,
+            block_height: 1000,
+            spendable_after: 100,
+            prior_utxo_hash: wrong_prior,
+        })
+        .unwrap();
+
+        recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+
+        // Slot is untouched: still FROZEN with the real hash, NOT reassigned.
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.status, UTXO_FROZEN);
+        assert_eq!(slot.hash, real_hash);
+        assert_ne!(slot.hash, new_hash);
+    }
+
+    #[test]
+    fn replay_reassign_v2_skips_when_slot_not_frozen() {
+        // A ReassignV2 entry over a slot that is no longer FROZEN (e.g. the
+        // engine rejected it with ERR_UTXO_NOT_FROZEN) must be skipped.
+        let mut h = RecoveryTestHarness::new();
+        let key = h.create_record(0x54, 5);
+        let ie = h.index.lookup(&key).unwrap();
+
+        // Leave slot 0 in its created UNSPENT state (not frozen).
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        let prior_hash = slot.hash;
+        assert_eq!(slot.status, UTXO_UNSPENT);
+
+        let new_hash = [0xCC; 32];
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::ReassignV2 {
+            tx_key: key,
+            offset: 0,
+            new_hash,
+            block_height: 1000,
+            spendable_after: 100,
+            prior_utxo_hash: prior_hash,
+        })
+        .unwrap();
+
+        recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+
+        // Untouched: still the original UNSPENT slot, not re-stamped to new_hash.
+        let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
+        assert_eq!(slot.status, UTXO_UNSPENT);
+        assert_eq!(slot.hash, prior_hash);
+        assert_ne!(slot.hash, new_hash);
     }
 
     #[test]

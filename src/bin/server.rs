@@ -416,6 +416,27 @@ fn main() {
         );
     }
 
+    // F-E2 — split-brain safety. A clustered node without a persisted
+    // `cluster_id` cannot reject a foreign cluster's membership merge, so two
+    // independently-bootstrapped clusters sharing a `cluster_secret` can merge.
+    // `validate_safe_defaults` hard-rejects this under `strict_auth`; in the
+    // trusted-overlay default mode, warn prominently so operators arm the guard.
+    let cluster_id_unset = config
+        .resolved_cluster_id()
+        .map(|id| id.is_unset())
+        .unwrap_or(false);
+    if config.is_clustered() && cluster_id_unset && !config.strict_auth {
+        tracing::warn!(
+            target: "teraslab::security",
+            node_id = config.node_id,
+            "clustered node has no cluster_id configured: the cross-cluster merge guard is \
+             DISARMED. Two independently-bootstrapped clusters that share a cluster_secret can \
+             silently merge into one (split-brain / data divergence). Set a stable 32-hex-char \
+             `cluster_id` (identical on every node of THIS cluster, distinct from any other \
+             cluster) to arm the guard. See docs/DEPLOYMENT_ASSUMPTIONS.md.",
+        );
+    }
+
     // 1. Open device
     let device_path = &config.device_paths[0];
     let device: Arc<dyn BlockDevice> =

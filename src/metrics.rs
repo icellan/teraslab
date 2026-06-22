@@ -933,6 +933,14 @@ pub struct ReplicationMetrics {
     /// investigate disk pressure or permission errors as soon as
     /// this starts climbing.
     pub ack_tracker_flush_failures: PaddedCounter,
+    /// F-D1: master-side counter — incremented when `AckTracker::new`
+    /// finds a corrupt/truncated ACK file on load. The file is a
+    /// re-derivable hint, so the tracker fails closed (discards the
+    /// garbage and starts empty, forcing a full idempotent catch-up)
+    /// rather than parsing a partial map that could mask replica lag.
+    /// A non-zero counter means the on-disk ACK watermarks were lost
+    /// and replicas are being re-verified from scratch.
+    pub ack_tracker_load_failures: PaddedCounter,
     /// F-G7-009: master-side counter — incremented every time the
     /// `replicate_batch` fan-out's scoped worker panics. The panic
     /// payload is logged + the replica transitions to Down via the
@@ -1014,6 +1022,7 @@ impl ReplicationMetrics {
             replica_apply_skipped_missing_tx: PaddedCounter::new(),
             replica_apply_divergence_total: PaddedCounter::new(),
             ack_tracker_flush_failures: PaddedCounter::new(),
+            ack_tracker_load_failures: PaddedCounter::new(),
             replica_worker_panics_total: PaddedCounter::new(),
             replica_unauthenticated_accept_total: PaddedCounter::new(),
             replica_rejected_sequence_gap: PaddedCounter::new(),

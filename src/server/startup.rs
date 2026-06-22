@@ -899,6 +899,78 @@ mod tests {
     }
 
     #[test]
+    fn redb_primary_rebuild_succeeds_after_corrupt_file_removed() {
+        // F-G1: proves the operator recovery path for a corrupt redb primary.
+        // The fail-closed contract (see `redb_primary_rebuild_failure_preserves_file`)
+        // intentionally preserves a corrupt file and refuses to auto-rescan —
+        // a silent full device scan could mask a failing disk. Once the operator
+        // moves the corrupt file aside, `load_primary_index_redb` must rebuild
+        // the index from a device scan and recover every record.
+        use crate::index::TxKey;
+        use crate::io::write_full_record;
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        // Ground truth: 5 real records on the device.
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut records = Vec::new();
+        for i in 0..5u64 {
+            let mut meta = TxMetadata::new(5);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[8..16].copy_from_slice(&i.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
+            meta.tx_id = txid;
+            let offset = alloc.allocate(TxMetadata::record_size_for(5)).unwrap();
+            let slots: Vec<UtxoSlot> = (0..5)
+                .map(|s| {
+                    let mut h = [0u8; 32];
+                    h[0] = s;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+            write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            records.push((TxKey { txid }, offset));
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let redb_path = tmp.path().join("primary.redb");
+        let cfg = IndexConfig {
+            redb_path: redb_path.clone(),
+            redb_dah_path: tmp.path().join("dah.redb"),
+            redb_unmined_path: tmp.path().join("unmined.redb"),
+            ..IndexConfig::default()
+        };
+
+        // Corrupt primary → fail closed (preserves file, no silent auto-rescan).
+        std::fs::write(&redb_path, b"this is not a redb file").unwrap();
+        let err = load_primary_index_redb(&cfg, &*dev, &alloc)
+            .expect_err("corrupt primary must fail closed");
+        assert!(
+            matches!(err, RebuildError::RedbPrimary { .. }),
+            "expected fail-closed RedbPrimary, got {err:?}"
+        );
+        assert!(redb_path.exists(), "corrupt file preserved for inspection");
+
+        // Operator action: move the corrupt file aside (per the runbook).
+        std::fs::rename(&redb_path, tmp.path().join("primary.redb.corrupt")).unwrap();
+
+        // Reboot: device-scan rebuild succeeds and recovers every record.
+        let loaded = load_primary_index_redb(&cfg, &*dev, &alloc)
+            .expect("rebuild from device scan must succeed once the corrupt file is removed");
+        assert_eq!(
+            loaded.len(),
+            5,
+            "rebuilt index must hold all device records"
+        );
+        for (key, offset) in &records {
+            let e = loaded
+                .lookup(key)
+                .expect("device record must be present after rebuild");
+            assert_eq!(e.record_offset, *offset);
+        }
+    }
+
+    #[test]
     fn startup_refuses_when_import_sentinel_present() {
         // R-047: If `import_index` crashed mid-way it leaves the
         // sentinel file behind. `load_primary_index_redb` MUST refuse

@@ -943,7 +943,7 @@ pub(crate) fn handle_request(
             payload: vec![], // No-op compatibility shim
         },
         OP_STREAM_CHUNK => handle_stream_chunk(request, conn_state, blob_store, cluster),
-        OP_STREAM_END => handle_stream_end(request, conn_state),
+        OP_STREAM_END => handle_stream_end(request, conn_state, cluster),
         OP_REPLICA_BATCH => {
             // Dispatch replication batch to the receiver's apply logic.
             // During migration, flags bit FLAG_MIGRATION_BATCH is set
@@ -5069,12 +5069,28 @@ fn handle_spend_batch(
 // NOTE ON WAL ORDERING: Unlike `handle_spend_batch` which holds the
 // per-txid lock across redo write + engine mutation (because spend uses
 // validate-then-apply), the handlers below (unspend, set_mined, freeze,
-// etc.) write redo ops BEFORE acquiring the engine lock. This is safe
-// because ALL redo operations in these paths are idempotent — replaying
-// a redo entry that was already applied is a no-op due to generation
-// guards and slot-state checks. If a non-idempotent redo op is ever
-// added to these paths, this pattern must be restructured to match
-// the spend path's WAL-first-under-lock discipline.
+// etc.) write redo ops BEFORE acquiring the engine lock. The redo entry is
+// fsynced before the engine validates the request, so a request the engine
+// then REJECTS still leaves a durable redo entry. This is only safe when
+// the corresponding `replay_*` function re-validates identity exactly as the
+// live engine does, so a rejected op replays as a no-op. Concretely, redo
+// entries in these paths fall into three classes:
+//
+//   (a) intentional no-op redo — the op was an idempotent no-op live (e.g.
+//       unspend of an already-UNSPENT slot, freeze of an already-FROZEN
+//       slot); replay observes the same state and skips.
+//   (b) validation-failure redo — the engine rejected the request
+//       (ERR_UTXO_HASH_MISMATCH, ERR_UTXO_NOT_FROZEN, …). The matching
+//       `replay_*` MUST re-check the same precondition (slot hash / status)
+//       and skip, so a rejected op never becomes durable. This is why
+//       unspend uses `UnspendV2 { utxo_hash }` and reassign uses
+//       `ReassignV2 { prior_utxo_hash }` — the prior identity is carried in
+//       the entry precisely so replay can reject what the engine rejected.
+//   (c) mutation redo — a confirmed transition; replay applies it.
+//
+// If a redo op is added here whose `replay_*` cannot re-validate the live
+// precondition, this pattern must be restructured to match the spend path's
+// validate-then-redo-under-lock discipline instead.
 fn handle_unspend_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -6466,12 +6482,19 @@ fn handle_reassign_batch(
             continue;
         }
         let key = TxKey { txid: item.txid };
-        redo_ops.push(RedoOp::Reassign {
+        // F-A1 (reassign): write the V2 entry carrying `prior_utxo_hash` (the
+        // hash the engine validates against). This redo is fsynced BEFORE the
+        // engine validates the request, so a reassign the engine then rejects
+        // (wrong prior hash / not frozen) leaves a durable entry. Carrying the
+        // prior hash lets `replay_metadata_op` re-validate identity on replay
+        // and skip a rejected reassign instead of stamping a fresh slot.
+        redo_ops.push(RedoOp::ReassignV2 {
             tx_key: key,
             offset: item.vout,
             new_hash: item.new_utxo_hash,
             block_height: params.block_height,
             spendable_after: params.spendable_after,
+            prior_utxo_hash: item.utxo_hash,
         });
         valid_items.push(ValidReassign { idx: i, key, item });
     }
@@ -8788,7 +8811,27 @@ fn handle_get_spend_batch(
         if !local_read && let Some(cluster) = cluster {
             let key = TxKey { txid: item.txid };
             match cluster.is_master(&key) {
-                crate::cluster::coordinator::MasterQueryResult::Yes => {}
+                crate::cluster::coordinator::MasterQueryResult::Yes => {
+                    // F-F1: mirror GET_BATCH's inbound fence. If we're the
+                    // committed master but the data hasn't migrated in yet,
+                    // return a retryable MIGRATION_IN_PROGRESS instead of
+                    // letting `get_spend` below report ERR_TX_NOT_FOUND
+                    // (terminal) for a tx that is present-but-not-yet-migrated.
+                    if engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                        tracing::debug!(
+                            shard,
+                            "dispatch: get_spend still waiting for inbound migration"
+                        );
+                        results.push(WireGetSpendResult {
+                            status: 1,
+                            error_code: ERR_MIGRATION_IN_PROGRESS,
+                            slot_status: 0,
+                            spending_data: [0; 36],
+                        });
+                        continue;
+                    }
+                }
                 crate::cluster::coordinator::MasterQueryResult::Transitioning {
                     last_known_term,
                 } => {
@@ -9064,7 +9107,11 @@ fn handle_stream_chunk(
 /// Removes the active stream session from the connection state, verifies
 /// the total bytes received match the declared total, and calls `finish`
 /// on the blob stream writer to atomically commit the blob.
-fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState) -> ResponseFrame {
+fn handle_stream_end(
+    req: &RequestFrame,
+    conn_state: &mut super::ConnectionState,
+    cluster: Option<&RunningCluster>,
+) -> ResponseFrame {
     let end = match decode_stream_end(&req.payload) {
         Some(e) => e,
         None => {
@@ -9086,6 +9133,17 @@ fn handle_stream_end(req: &RequestFrame, conn_state: &mut super::ConnectionState
             );
         }
     };
+
+    // H-01: finalizing a blob is a mutation on the master, so it must be fenced
+    // by shard ownership exactly like OP_STREAM_CHUNK (8961). Ownership can
+    // change between the last accepted chunk and this END frame (mid-migration),
+    // so re-check here — otherwise a client could commit a blob to a node that
+    // no longer owns the shard, orphaning it. Abort the writer so the partial
+    // tmp file is cleaned up rather than left behind.
+    if let Some(redirect_err) = check_shard_ownership(&end.txid, 0, cluster, false) {
+        let _ = stream.writer.abort();
+        return error_response(req.request_id, redirect_err.error_code, "shard not owned");
+    }
 
     // Verify total size matches what was received.
     if stream.bytes_received != end.total_size {
@@ -11469,7 +11527,7 @@ mod tests {
             flags: 0,
             payload: encode_stream_end(&stale_txid, 4).into(),
         };
-        let resp = handle_stream_end(&end_req, &mut conn_state);
+        let resp = handle_stream_end(&end_req, &mut conn_state, None);
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _msg) = decode_error_payload(&resp.payload).expect("typed error payload");
         assert_eq!(

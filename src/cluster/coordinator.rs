@@ -1460,12 +1460,22 @@ impl ClusterCoordinator {
                                 term = fallback_proposal.term,
                                 "cluster: fallback proposer stepping up",
                             );
-                            if let Some(ref path) = topo_state_path_event {
-                                let peak = peak_size_event.load(Ordering::Relaxed) as u64;
-                                let inc = swim_incarnation_event.load(Ordering::Relaxed);
-                                let _ = persist_topology_state(
-                                    path,
-                                    &topo_authority_event.persisted_state(peak, inc),
+                            // F-E1 / H10: persist the fallback proposal term
+                            // before self-voting; skip the step-up if it isn't
+                            // durable (the fallback timer re-fires on the next
+                            // timeout). `persisted_ok` short-circuits the
+                            // self-vote so no unpersisted vote is recorded.
+                            let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                            let inc = swim_incarnation_event.load(Ordering::Relaxed);
+                            let persisted_ok = persist_topology_state_durable(
+                                topo_state_path_event.as_deref(),
+                                &topo_authority_event.persisted_state(peak, inc),
+                            );
+                            if !persisted_ok {
+                                tracing::error!(
+                                    term = fallback_proposal.term,
+                                    "cluster: fallback proposer NOT stepping up — term persist \
+                                     failed; will retry on next timeout (H10)",
                                 );
                             }
                             // Check single-node quorum (self-vote already recorded).
@@ -1478,7 +1488,9 @@ impl ClusterCoordinator {
                                 voter_placement_support:
                                     crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                             };
-                            if let Some(commit) = topo_authority_event.handle_vote(&self_vote) {
+                            if persisted_ok
+                                && let Some(commit) = topo_authority_event.handle_vote(&self_vote)
+                            {
                                 let active_members = active_topology_members_event.read().clone();
                                 if topology_commit_already_activated(
                                     commit.term,
@@ -1519,7 +1531,7 @@ impl ClusterCoordinator {
                                     last_activation_at = std::time::Instant::now();
                                 }
                                 topo_authority_event.handle_commit(&commit);
-                            } else {
+                            } else if persisted_ok {
                                 // Multi-node: spawn proposer thread.
                                 let ta = topo_authority_event.clone();
                                 let na = node_addrs_for_topo.clone();
@@ -1575,34 +1587,44 @@ impl ClusterCoordinator {
                             None
                         };
                         if let Some(upgrade_proposal) = pending_upgrade {
-                            if let Some(ref path) = topo_state_path_event {
-                                let peak = peak_size_event.load(Ordering::Relaxed) as u64;
-                                let inc = swim_incarnation_event.load(Ordering::Relaxed);
-                                let _ = persist_topology_state(
-                                    path,
-                                    &topo_authority_event.persisted_state(peak, inc),
+                            // F-E1 / H10: persist the upgrade term before spawning
+                            // the proposer that broadcasts it; skip the spawn if
+                            // it isn't durable (the settle gate re-evaluates on a
+                            // later timeout).
+                            let peak = peak_size_event.load(Ordering::Relaxed) as u64;
+                            let inc = swim_incarnation_event.load(Ordering::Relaxed);
+                            let persisted_ok = persist_topology_state_durable(
+                                topo_state_path_event.as_deref(),
+                                &topo_authority_event.persisted_state(peak, inc),
+                            );
+                            if persisted_ok {
+                                let ta = topo_authority_event.clone();
+                                let na = node_addrs_for_topo.clone();
+                                let tx = topology_commit_tx_event.clone();
+                                let tp = topo_state_path_event.clone();
+                                let ps = peak_size_event.clone();
+                                let si = swim_incarnation_event.clone();
+                                let secret = cluster_secret_event.clone();
+                                std::thread::spawn(move || {
+                                    run_topology_proposer(
+                                        upgrade_proposal,
+                                        ta,
+                                        na,
+                                        self_id,
+                                        tx,
+                                        tp,
+                                        ps,
+                                        si,
+                                        secret,
+                                    );
+                                });
+                            } else {
+                                tracing::error!(
+                                    term = upgrade_proposal.term,
+                                    "cluster: NOT spawning placement-upgrade proposer — term \
+                                     persist failed; will retry once durable (H10)",
                                 );
                             }
-                            let ta = topo_authority_event.clone();
-                            let na = node_addrs_for_topo.clone();
-                            let tx = topology_commit_tx_event.clone();
-                            let tp = topo_state_path_event.clone();
-                            let ps = peak_size_event.clone();
-                            let si = swim_incarnation_event.clone();
-                            let secret = cluster_secret_event.clone();
-                            std::thread::spawn(move || {
-                                run_topology_proposer(
-                                    upgrade_proposal,
-                                    ta,
-                                    na,
-                                    self_id,
-                                    tx,
-                                    tp,
-                                    ps,
-                                    si,
-                                    secret,
-                                );
-                            });
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2612,13 +2634,25 @@ impl ClusterCoordinator {
                         members = proposal.members.len(),
                         "cluster: proposing topology",
                     );
-                    // Persist voted_term before broadcasting.
-                    if let Some(path) = topology_state_path {
-                        let peak = peak_size.load(Ordering::Relaxed) as u64;
-                        let inc = swim_incarnation.load(Ordering::Relaxed);
-                        let _ = persist_topology_state(
-                            path,
-                            &topology_authority.persisted_state(peak, inc),
+                    // F-E1 / H10: persist voted_term BEFORE self-voting or
+                    // broadcasting. If the term isn't durable, do NOT advertise
+                    // or record a vote for it — abort this round and let the
+                    // fallback/debounced re-proposal retry once durability is
+                    // restored. `persisted_ok` short-circuits `handle_vote`
+                    // (which records the self-vote) so no unpersisted vote is
+                    // ever taken.
+                    let peak = peak_size.load(Ordering::Relaxed) as u64;
+                    let inc = swim_incarnation.load(Ordering::Relaxed);
+                    let persisted_ok = persist_topology_state_durable(
+                        topology_state_path.as_deref(),
+                        &topology_authority.persisted_state(peak, inc),
+                    );
+                    if !persisted_ok {
+                        tracing::error!(
+                            term = proposal.term,
+                            "cluster: aborting topology proposal — voted-term persist failed; \
+                             will retry (H10: refusing to advertise a vote that could be lost \
+                             across a crash)",
                         );
                     }
 
@@ -2632,7 +2666,8 @@ impl ClusterCoordinator {
                         voter_placement_support:
                             crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                     };
-                    if let Some(commit) = topology_authority.handle_vote(&self_vote) {
+                    if persisted_ok && let Some(commit) = topology_authority.handle_vote(&self_vote)
+                    {
                         // Single-node: quorum met immediately. Activate directly.
                         topology_epoch.store(commit.term, Ordering::Relaxed);
                         tracing::info!(
@@ -2661,6 +2696,11 @@ impl ClusterCoordinator {
                             migration_throttle,
                             cluster_secret,
                         );
+                        // POST-commit persist: the term is already committed +
+                        // activated in memory and cannot be rolled back, so this
+                        // proceeds regardless of outcome. A failure is surfaced
+                        // by `persist_topology_state` (ERROR + PERSIST_FAILURES);
+                        // the next event / SWIM peak re-raise re-persists.
                         if let Some(path) = topology_state_path {
                             let peak = peak_size.load(Ordering::Relaxed) as u64;
                             let inc = swim_incarnation.load(Ordering::Relaxed);
@@ -2669,7 +2709,7 @@ impl ClusterCoordinator {
                                 &topology_authority.persisted_state(peak, inc),
                             );
                         }
-                    } else {
+                    } else if persisted_ok {
                         // Multi-node: spawn proposer thread to broadcast proposal,
                         // collect votes, and signal commit via channel.
                         let ta = topology_authority.clone();
@@ -2999,6 +3039,13 @@ impl ClusterCoordinator {
                                         members = remote_members.len(),
                                         "cluster: catch-up: applied term from peer",
                                     );
+                                    // POST-commit persist: the peer's term is
+                                    // already applied to the in-memory authority
+                                    // (handle_commit above) and cannot be rolled
+                                    // back, so this proceeds regardless. A failure
+                                    // is surfaced by `persist_topology_state`
+                                    // (ERROR + PERSIST_FAILURES); catch-up is
+                                    // idempotent and re-converges on restart.
                                     if let Some(ref path) = *topology_state_path {
                                         let peak = peak_size.load(Ordering::Relaxed) as u64;
                                         let inc = swim_incarnation.load(Ordering::Relaxed);
@@ -3035,12 +3082,19 @@ impl ClusterCoordinator {
                                     members = proposal.members.len(),
                                     "cluster: catch-up: re-proposing topology",
                                 );
-                                if let Some(path) = topology_state_path {
-                                    let peak = peak_size.load(Ordering::Relaxed) as u64;
-                                    let inc = swim_incarnation.load(Ordering::Relaxed);
-                                    let _ = persist_topology_state(
-                                        path,
-                                        &topology_authority.persisted_state(peak, inc),
+                                // F-E1 / H10: persist the re-proposal term before
+                                // self-voting; skip if it isn't durable.
+                                let peak = peak_size.load(Ordering::Relaxed) as u64;
+                                let inc = swim_incarnation.load(Ordering::Relaxed);
+                                let persisted_ok = persist_topology_state_durable(
+                                    topology_state_path.as_deref(),
+                                    &topology_authority.persisted_state(peak, inc),
+                                );
+                                if !persisted_ok {
+                                    tracing::error!(
+                                        term = proposal.term,
+                                        "cluster: catch-up: NOT re-proposing — term persist \
+                                         failed; will retry (H10)",
                                     );
                                 }
                                 let self_vote = crate::cluster::topology::TopologyVote {
@@ -3052,12 +3106,14 @@ impl ClusterCoordinator {
                                     voter_placement_support:
                                         crate::cluster::shards::MAX_SUPPORTED_PLACEMENT_VERSION,
                                 };
-                                if let Some(commit) = topology_authority.handle_vote(&self_vote) {
+                                if persisted_ok
+                                    && let Some(commit) = topology_authority.handle_vote(&self_vote)
+                                {
                                     // Single-node quorum: signal the event loop to activate.
                                     topology_authority.handle_commit(&commit);
                                     let _ = topology_commit_tx
                                         .send((commit.members.clone(), commit.term));
-                                } else {
+                                } else if persisted_ok {
                                     let ta = topology_authority.clone();
                                     let na = node_addrs_for_topo.clone();
                                     let tx = topology_commit_tx.clone();
@@ -4235,6 +4291,10 @@ fn try_run_topology_proposal(
 
     // Apply commit locally.
     topology_authority.handle_commit(&commit);
+    // POST-commit persist: the term is already committed in the in-memory
+    // authority and cannot be rolled back, so this proceeds regardless. A
+    // failure is surfaced by `persist_topology_state` (ERROR + PERSIST_FAILURES)
+    // and re-persisted by a later event / SWIM peak re-raise.
     if let Some(path) = topology_state_path {
         let peak = peak_size.load(Ordering::Relaxed) as u64;
         let inc = swim_incarnation.load(Ordering::Relaxed);
@@ -6950,6 +7010,14 @@ pub fn redo_entry_to_replica_op(
             new_hash,
             block_height,
             spendable_after,
+        }
+        | RedoOp::ReassignV2 {
+            tx_key,
+            offset,
+            new_hash,
+            block_height,
+            spendable_after,
+            ..
         } => {
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
@@ -7451,6 +7519,33 @@ fn persist_topology_state(
         );
     }
     result
+}
+
+/// F-E1: persist topology state for a background (event-loop / proposer) site
+/// and report whether the state is now durable.
+///
+/// Returns `true` when there is nothing to persist (`path` is `None` — no state
+/// file configured, e.g. an ephemeral single-node test) or the persist
+/// succeeded. Returns `false` on a durable-write failure (already retried,
+/// ERROR-logged, and counted in [`PERSIST_FAILURES`] by [`persist_topology_state`]).
+///
+/// PRE-broadcast callers (those about to self-vote or advertise a proposal)
+/// MUST NOT proceed when this returns `false`: a node must never advertise or
+/// record a vote/term it could lose across a crash (H10), which would risk a
+/// double-vote at the same term or a weakened restart quorum. Such callers
+/// abort the round and rely on the fallback/re-proposal timers to retry once
+/// the durability problem clears. POST-commit callers (recording an
+/// already-applied term that cannot be rolled back) proceed regardless — the
+/// ERROR log + `PERSIST_FAILURES` counter is their durability signal and a
+/// later event re-persists the committed state.
+fn persist_topology_state_durable(
+    path: Option<&std::path::Path>,
+    state: &crate::cluster::topology::PersistedTopologyState,
+) -> bool {
+    match path {
+        Some(p) => persist_topology_state(p, state).is_ok(),
+        None => true,
+    }
 }
 
 fn topology_multi_node_marker_path(path: &std::path::Path) -> std::path::PathBuf {

@@ -1480,6 +1480,209 @@ fn create_preserve_until_get() {
     server.shutdown();
 }
 
+/// K-02 — prune + reorg + respend crossover, end-to-end over TCP.
+///
+/// Pruning (preservation expiry sweep) and reorg (mark on/off longest chain)
+/// were covered separately at the engine/stress level and individually over
+/// TCP, but never interleaved on a real connection. This drives the full
+/// crossover and asserts the server stays CONSISTENT and responsive throughout:
+/// a record reorged off then back onto the longest chain is respendable, and a
+/// preservation sweep does not prune a still-preserved record out from under a
+/// concurrent respend.
+#[test]
+fn prune_reorg_respend_crossover_over_tcp() {
+    let (server, port) = start_test_server();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let tx_n = 850u32;
+    let txid = test_txid(tx_n);
+
+    // 1. Create txA with 2 UTXOs.
+    let resp = create_records(&mut stream, &[make_create_item(txid, 2, tx_n)], 850);
+    assert_eq!(resp.status, STATUS_OK);
+
+    // 2. set_mined on the longest chain at height 5000.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 851,
+            op_code: OP_SET_MINED_BATCH,
+            flags: 0,
+            payload: encode_set_mined_batch(
+                &SetMinedBatchParams {
+                    block_id: 100,
+                    block_height: 5000,
+                    subtree_idx: 0,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                    current_block_height: 5000,
+                    block_height_retention: 288,
+                },
+                &[txid],
+            )
+            .into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+
+    // Helper: encode a mark-longest-chain request (on/off) at a height.
+    let mark = |on: bool, height: u32| {
+        let mut shared = Vec::new();
+        shared.push(u8::from(on));
+        shared.extend_from_slice(&height.to_le_bytes());
+        shared.extend_from_slice(&288u32.to_le_bytes());
+        encode_txid_batch(&[txid], &shared)
+    };
+
+    // 3. Reorg: mark OFF the longest chain at 5001 → record becomes unmined.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 852,
+            op_code: OP_MARK_LONGEST_CHAIN_BATCH,
+            flags: 0,
+            payload: mark(false, 5001).into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+
+    // 4. Reorg resolves: mark BACK ON the longest chain at 5002 → unmined cleared.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 853,
+            op_code: OP_MARK_LONGEST_CHAIN_BATCH,
+            flags: 0,
+            payload: mark(true, 5002).into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 854,
+            op_code: OP_GET_BATCH,
+            flags: 0,
+            payload: encode_get_batch(FieldMask::ALL_METADATA, &[txid]).into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+    let results = decode_get_response(&resp.payload).unwrap();
+    assert_eq!(results[0].status, 0, "txA must survive the reorg");
+    // unmined_since (offset 69..73 in ALL_METADATA: it directly precedes the
+    // dah(73..77) and preserve_until(77..81) fields verified in
+    // create_preserve_until_get).
+    let unmined_since = u32::from_le_bytes(results[0].data[69..73].try_into().unwrap());
+    assert_eq!(
+        unmined_since, 0,
+        "back on the longest chain, unmined_since must be cleared",
+    );
+
+    // 5. Respend a UTXO after the reorg churn — must succeed (still unspent).
+    let mut sd = [0u8; 36];
+    sd[0..4].copy_from_slice(&0xCAFEu32.to_le_bytes());
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 855,
+            op_code: OP_SPEND_BATCH,
+            flags: 0,
+            payload: encode_spend_batch(
+                &SpendBatchParams {
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 5002,
+                    block_height_retention: 288,
+                },
+                &[WireSpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: test_utxo_hash(tx_n, 0),
+                    spending_data: sd,
+                }],
+            )
+            .into(),
+        },
+    );
+    assert_eq!(
+        resp.status, STATUS_OK,
+        "spend of an unspent UTXO after reorg must succeed",
+    );
+
+    // 6. Preserve the record so the expiry sweep must NOT delete it.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 856,
+            op_code: OP_PRESERVE_UNTIL_BATCH,
+            flags: 0,
+            payload: encode_txid_batch(&[txid], &9000u32.to_le_bytes()).into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+
+    // 7. Prune sweep at a height well past the original retention but BELOW the
+    //    preservation horizon — the record must survive (preserved), proving the
+    //    sweep honours preservation across the reorg+respend history.
+    let mut prune_payload = Vec::with_capacity(8);
+    prune_payload.extend_from_slice(&5500u32.to_le_bytes());
+    prune_payload.extend_from_slice(&288u32.to_le_bytes());
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 857,
+            op_code: OP_PROCESS_EXPIRED_PRESERVATIONS,
+            flags: 0,
+            payload: prune_payload.into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK, "prune sweep must complete cleanly");
+
+    // 8. Consistency: txA is still present, slot 0 is spent, slot 1 is unspent.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 858,
+            op_code: OP_GET_SPEND_BATCH,
+            flags: 0,
+            payload: encode_get_spend_batch(&[
+                WireGetSpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: test_utxo_hash(tx_n, 0),
+                },
+                WireGetSpendItem {
+                    txid,
+                    vout: 1,
+                    utxo_hash: test_utxo_hash(tx_n, 1),
+                },
+            ])
+            .into(),
+        },
+    );
+    let results = decode_get_spend_response(&resp.payload).unwrap();
+    assert_eq!(results[0].slot_status, 0x01, "slot 0 must be SPENT");
+    assert_eq!(results[1].slot_status, 0x00, "slot 1 must be UNSPENT");
+
+    // Server is still responsive after the whole crossover.
+    let resp = send_request(
+        &mut stream,
+        &RequestFrame {
+            request_id: 859,
+            op_code: OP_PING,
+            flags: 0,
+            payload: vec![].into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+
+    server.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Batch tests
 // ---------------------------------------------------------------------------
@@ -1735,6 +1938,14 @@ fn invalid_opcode_returns_error() {
         },
     );
     assert_eq!(resp.status, STATUS_ERROR);
+    // F-audit: prove the TYPED code on the wire, not just STATUS_ERROR — an
+    // unknown opcode must surface ERR_OPCODE_UNSUPPORTED (29) to the client.
+    let (code, _msg) = decode_error_payload(&resp.payload).expect("typed error payload");
+    assert_eq!(
+        code,
+        teraslab::protocol::opcodes::ERR_OPCODE_UNSUPPORTED,
+        "unknown opcode must surface ERR_OPCODE_UNSUPPORTED (29) on the wire",
+    );
 
     // Should still be connected — send a ping to verify
     let resp = send_request(
@@ -1857,7 +2068,10 @@ fn oversized_frame_rejected() {
     assert_eq!(consumed, full.len());
     assert_eq!(resp.request_id, 0);
     assert_eq!(resp.status, STATUS_ERROR);
-    assert_eq!(resp.payload, b"frame too large");
+    // H-03: oversize frames now return a TYPED error payload (decodable as
+    // ERR_PAYLOAD_MALFORMED), not a raw text payload a client would mis-decode.
+    let (code, _msg) = decode_error_payload(&resp.payload).expect("typed error payload");
+    assert_eq!(code, ERR_PAYLOAD_MALFORMED);
 
     server.shutdown();
 }

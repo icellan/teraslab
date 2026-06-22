@@ -713,11 +713,27 @@ fn t6_reserved_spending_data_returns_invalid_spend_with_empty_payload() {
 //                                   hash disagrees with the local shard
 //                                   contents; not cluster-gated.
 //   - 23 ERR_TOPOLOGY_PERSIST_FAILED, 24 ERR_STALE_EPOCH,
-//     25 ERR_CLUSTER_NOT_READY, 26 ERR_INDEX_DEGRADED, and
-//     STATUS_DEGRADED_DURABILITY are produced ONLY behind RunningCluster /
-//     degraded-backend / RF=1 best-effort state that a single-node test
-//     server never enters, so they are not wire-reachable here without fault
-//     injection. They remain pinned by the constant tests in codec.rs.
+//     25 ERR_CLUSTER_NOT_READY, 26 ERR_INDEX_DEGRADED, 37
+//     ERR_MIGRATION_TARGET_NOT_READY, and STATUS_DEGRADED_DURABILITY are
+//     produced ONLY behind RunningCluster / degraded-backend / RF=1
+//     best-effort state that a single-node test server never enters, so they
+//     are not wire-reachable here without standing up a real multi-node
+//     cluster or injecting a persist/backend fault.
+//
+//     HARNESS-ONLY CONTRACT (audit F-A1 follow-up): each is exercised where it
+//     is actually produced, at the dispatch-handler level via in-process
+//     `handle_request(...)` unit tests rather than over a socket:
+//       - 23 → src/server/dispatch.rs `topology_*persist*` unit tests
+//             (the OP_TOPOLOGY_VOTE/COMMIT handler returns it on persist
+//             failure; see also the `persist_topology` dispatch path).
+//       - 24 → src/server/dispatch.rs + src/replication/receiver.rs stale-epoch
+//             unit tests.
+//       - 25 → src/server/dispatch.rs cluster-not-ready unit test (Joining node).
+//       - 37 → src/server/dispatch.rs migration-target-not-ready unit tests +
+//             tests/cluster_delayed_activation.rs (convergence behaviour).
+//     The numeric values themselves are pinned by their `pub const`
+//     definitions in src/protocol/opcodes.rs. F-G2 below adds a real on-wire
+//     proof for 26 (corrupt secondary redb → degraded over TCP).
 // ---------------------------------------------------------------------------
 
 /// Start a single-node server (no `RunningCluster`) that accepts UNSIGNED

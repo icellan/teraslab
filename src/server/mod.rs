@@ -870,10 +870,17 @@ fn handle_connection_inner(
                 .map(|_| crate::cluster::auth::SIGNED_SUFFIX_LEN as u32)
                 .unwrap_or(0);
         if total_length > max_wire_frame_size {
+            // H-03: return a TYPED error payload (ERR_PAYLOAD_MALFORMED) like
+            // every other rejection on this path, not a raw text payload — a
+            // client decoding the `[code:2][msg]` layout would otherwise read
+            // the ASCII bytes "fr" as a bogus error code.
             let resp = ResponseFrame {
                 request_id: 0,
                 status: STATUS_ERROR,
-                payload: b"frame too large".to_vec(),
+                payload: encode_error_payload(
+                    ERR_PAYLOAD_MALFORMED,
+                    &format!("frame too large: {total_length} > {max_wire_frame_size}"),
+                ),
             };
             let _ = stream.write_all(&resp.encode());
             return Err(format!(

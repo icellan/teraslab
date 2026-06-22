@@ -196,6 +196,20 @@ pub enum ConfigError {
     )]
     StrictAuthRequiresSecret,
 
+    /// F-E2: `--strict-auth` was set (or `strict_auth = true`) on a clustered
+    /// node (`node_id > 0`) but no `cluster_id` is configured. Without a
+    /// persisted `cluster_id`, two independently-bootstrapped clusters that
+    /// share a `cluster_secret` can silently merge (the cross-cluster
+    /// membership reject only fires when BOTH sides advertise a real id), risking
+    /// split-brain. Strict mode requires the merge guard to be armed.
+    #[error(
+        "strict_auth = true (or --strict-auth) requires a persisted cluster_id on clustered \
+         nodes (node_id > 0), found none. A missing cluster_id lets two clusters sharing a \
+         cluster_secret merge (split-brain risk). Set a 32-hex-char cluster_id, or drop \
+         --strict-auth to fall back to trusted-overlay defaults (a warning will be logged)"
+    )]
+    StrictAuthRequiresClusterId,
+
     /// E-2: the `cluster_secret` seen by the TCP server (from
     /// [`ServerConfig`]) does not match the one the attached
     /// [`crate::cluster::coordinator::RunningCluster`] uses for inter-node
@@ -1479,6 +1493,20 @@ impl ServerConfig {
             });
         }
 
+        // (3c) F-E2 — split-brain safety. A clustered node with a shared
+        // cluster_secret but an UNSET cluster_id cannot reject a foreign
+        // cluster's membership merge (the cross-cluster guard needs BOTH sides
+        // to advertise a real id), so two independently-bootstrapped clusters
+        // can merge. Under strict_auth, require a persisted, well-formed
+        // cluster_id on clustered nodes so the guard is always armed. Mirrors
+        // the cluster_secret requirement above (trusted-overlay model: warn by
+        // default, hard-reject only under strict_auth). Checked after the
+        // cluster_secret presence/length gates so those errors take precedence.
+        // `resolved_cluster_id` also surfaces a malformed id here.
+        if self.is_clustered() && self.strict_auth && self.resolved_cluster_id()?.is_unset() {
+            return Err(ConfigError::StrictAuthRequiresClusterId);
+        }
+
         // (4) enable_admin_endpoints requires a non-empty admin_token.
         // We treat both `None` and `Some("")` as "no token configured" so a
         // degenerate TOML entry (`admin_token = ""`) is rejected on the same
@@ -2413,14 +2441,74 @@ strict_auth = false
 
     #[test]
     fn rf_gt_one_with_cluster_secret_is_accepted() {
+        // Clustered (node_id>0) config under the strict-auth default now also
+        // requires a cluster_id (F-E2 split-brain guard), so a valid one is set.
+        let toml_str = r#"
+node_id = 1
+replication_factor = 3
+cluster_secret = "0123456789abcdef"
+cluster_id = "00112233445566778899aabbccddeeff"
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        cfg.validate_safe_defaults()
+            .expect("RF>1 with cluster_secret + cluster_id must pass");
+    }
+
+    #[test]
+    fn clustered_without_cluster_id_under_strict_auth_is_rejected() {
+        // F-E2: a clustered node (node_id>0) with a valid cluster_secret but no
+        // cluster_id cannot arm the cross-cluster merge guard. Under the
+        // strict-auth default this must be rejected.
         let toml_str = r#"
 node_id = 1
 replication_factor = 3
 cluster_secret = "0123456789abcdef"
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.strict_auth, "default config must have strict_auth=true");
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("strict_auth + clustered + no cluster_id must be rejected");
+        match err {
+            ConfigError::StrictAuthRequiresClusterId => {}
+            other => panic!("expected StrictAuthRequiresClusterId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clustered_without_cluster_id_under_trusted_overlay_is_accepted() {
+        // F-E2 opt-out: with `strict_auth = false` the missing-cluster_id check
+        // is downgraded to a boot-time warning (emitted from src/bin/server.rs),
+        // matching the cluster_secret trusted-overlay model.
+        let toml_str = r#"
+node_id = 1
+replication_factor = 3
+cluster_secret = "0123456789abcdef"
+strict_auth = false
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         cfg.validate_safe_defaults()
-            .expect("RF>1 with non-empty cluster_secret must pass");
+            .expect("strict_auth = false clustered config without cluster_id must validate");
+    }
+
+    #[test]
+    fn empty_cluster_id_under_strict_auth_is_rejected() {
+        // An explicit empty cluster_id resolves to UNSET and is treated as
+        // "missing" by the strict-auth split-brain check.
+        let toml_str = r#"
+node_id = 1
+replication_factor = 3
+cluster_secret = "0123456789abcdef"
+cluster_id = ""
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("strict_auth + clustered + empty cluster_id must be rejected");
+        match err {
+            ConfigError::StrictAuthRequiresClusterId => {}
+            other => panic!("expected StrictAuthRequiresClusterId, got {other:?}"),
+        }
     }
 
     #[test]

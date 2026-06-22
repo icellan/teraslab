@@ -370,6 +370,15 @@ const OP_UNSPEND_V3: u8 = 36;
 /// model (the operation needs the engine allocator + stripe locks, so low-level
 /// replay collects it and the engine drains it after construction). Idempotent.
 const OP_REMOVE_CONFLICTING_CHILD: u8 = 37;
+/// F-A1/reassign: reassign redo entry that additionally carries the slot's
+/// `prior_utxo_hash` (the hash the live `engine.reassign` validated against
+/// before mutating). Legacy [`OP_REASSIGN`] entries carry only the new hash,
+/// so a reassign the engine *rejected* (wrong prior hash) could become a
+/// durable mutation on crash-replay — recovery had no way to re-validate
+/// identity. V2 entries let `replay_metadata_op` skip a reassign whose prior
+/// hash no longer matches the on-disk slot, exactly as the live path rejects
+/// it. Legacy V1 entries remain decodable.
+const OP_REASSIGN_V2: u8 = 38;
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `CreateV2` redo entry. Bitcoin transactions in practice rarely have
@@ -467,6 +476,20 @@ pub enum RedoOp {
         new_hash: [u8; 32],
         block_height: u32,
         spendable_after: u32,
+    },
+    /// Reassign entry written by the dispatch path that additionally carries
+    /// the `prior_utxo_hash` the request validated against. Recovery uses it
+    /// to skip a reassign whose prior hash no longer matches the on-disk slot
+    /// (i.e. an operation the live engine would have rejected), preventing a
+    /// rejected reassign from becoming a durable mutation after crash-replay.
+    /// Legacy [`RedoOp::Reassign`] entries remain decodable.
+    ReassignV2 {
+        tx_key: TxKey,
+        offset: u32,
+        new_hash: [u8; 32],
+        block_height: u32,
+        spendable_after: u32,
+        prior_utxo_hash: [u8; 32],
     },
     PruneSlot {
         tx_key: TxKey,
@@ -817,6 +840,7 @@ impl RedoOp {
             RedoOp::Unfreeze { .. } => OP_UNFREEZE,
             RedoOp::UnfreezeV2 { .. } => OP_UNFREEZE_V2,
             RedoOp::Reassign { .. } => OP_REASSIGN,
+            RedoOp::ReassignV2 { .. } => OP_REASSIGN_V2,
             RedoOp::PruneSlot { .. } => OP_PRUNE_SLOT,
             RedoOp::PruneSlotIfSpentBy { .. } => OP_PRUNE_SLOT_IF_SPENT_BY,
             RedoOp::Create { .. } => OP_CREATE,
@@ -859,6 +883,7 @@ impl RedoOp {
             | RedoOp::Unfreeze { tx_key, .. }
             | RedoOp::UnfreezeV2 { tx_key, .. }
             | RedoOp::Reassign { tx_key, .. }
+            | RedoOp::ReassignV2 { tx_key, .. }
             | RedoOp::PruneSlot { tx_key, .. }
             | RedoOp::PruneSlotIfSpentBy { tx_key, .. }
             | RedoOp::Create { tx_key, .. }
@@ -923,6 +948,7 @@ impl RedoOp {
             } => Some(*current_block_height),
             RedoOp::SetMined { block_height, .. }
             | RedoOp::Reassign { block_height, .. }
+            | RedoOp::ReassignV2 { block_height, .. }
             | RedoOp::PreserveUntil { block_height, .. }
             | RedoOp::CompensateUnsetMined { block_height, .. } => Some(*block_height),
             // No height carried (or V1 ops predating the height field) — these
@@ -1088,6 +1114,21 @@ impl RedoOp {
                 buf.extend_from_slice(new_hash);
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&spendable_after.to_le_bytes());
+            }
+            RedoOp::ReassignV2 {
+                tx_key,
+                offset,
+                new_hash,
+                block_height,
+                spendable_after,
+                prior_utxo_hash,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.extend_from_slice(&offset.to_le_bytes());
+                buf.extend_from_slice(new_hash);
+                buf.extend_from_slice(&block_height.to_le_bytes());
+                buf.extend_from_slice(&spendable_after.to_le_bytes());
+                buf.extend_from_slice(prior_utxo_hash);
             }
             RedoOp::Create {
                 tx_key,
@@ -1467,6 +1508,23 @@ impl RedoOp {
                     new_hash: nh,
                     block_height: u32::from_le_bytes(data[68..72].try_into().unwrap()),
                     spendable_after: u32::from_le_bytes(data[72..76].try_into().unwrap()),
+                })
+            }
+            OP_REASSIGN_V2 if data.len() >= 108 => {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let offset = u32::from_le_bytes(data[32..36].try_into().unwrap());
+                let mut nh = [0u8; 32];
+                nh.copy_from_slice(&data[36..68]);
+                let mut prior = [0u8; 32];
+                prior.copy_from_slice(&data[76..108]);
+                Some(RedoOp::ReassignV2 {
+                    tx_key: TxKey { txid },
+                    offset,
+                    new_hash: nh,
+                    block_height: u32::from_le_bytes(data[68..72].try_into().unwrap()),
+                    spendable_after: u32::from_le_bytes(data[72..76].try_into().unwrap()),
+                    prior_utxo_hash: prior,
                 })
             }
             OP_CREATE if data.len() >= 44 => {
@@ -3880,6 +3938,26 @@ mod tests {
             new_hash,
             block_height: 1_000_000,
             spendable_after: 500,
+        });
+    }
+
+    #[test]
+    fn round_trip_reassign_v2() {
+        let mut new_hash = [0u8; 32];
+        for (i, b) in new_hash.iter_mut().enumerate() {
+            *b = 0xFF_u8.wrapping_sub(i as u8);
+        }
+        let mut prior_utxo_hash = [0u8; 32];
+        for (i, b) in prior_utxo_hash.iter_mut().enumerate() {
+            *b = 0x10_u8.wrapping_add(i as u8);
+        }
+        assert_round_trip(RedoOp::ReassignV2 {
+            tx_key: make_txid(0xF8),
+            offset: 11,
+            new_hash,
+            block_height: 2_000_000,
+            spendable_after: 750,
+            prior_utxo_hash,
         });
     }
 

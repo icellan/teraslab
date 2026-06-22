@@ -128,7 +128,30 @@ impl AckTracker {
     ///
     /// If the file exists, loads the persisted state. Otherwise starts empty.
     pub fn new(path: PathBuf) -> Self {
-        let last_acked = Self::load_from_disk(&path).unwrap_or_default();
+        // F-D1: the ACK file is a re-derivable master-side hint — the
+        // empty-batch ACK probe re-establishes per-replica watermarks at
+        // runtime. A corrupt/truncated file must NOT be parsed into a PARTIAL
+        // map: a partial map can carry stale-high watermarks that MASK replica
+        // lag (the opposite of safe). Fail closed by discarding the whole file
+        // and starting from empty (which forces a full, idempotent catch-up),
+        // and surface the loss loudly via ERROR + a metric — never silently
+        // trust a half-parsed map. (Contrast the previous `unwrap_or_default`
+        // which silently kept a partial parse.)
+        let last_acked = match Self::load_from_disk(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(m) = crate::metrics::replication_metrics() {
+                    m.ack_tracker_load_failures.inc();
+                }
+                tracing::error!(
+                    err = %e,
+                    path = %path.display(),
+                    "ack_tracker: load failed (corrupt/truncated ACK file); discarding it and \
+                     starting from empty — replica progress will be re-verified via catch-up",
+                );
+                HashMap::new()
+            }
+        };
         Self {
             path,
             inner: Mutex::new(AckTrackerInner {
@@ -230,8 +253,20 @@ impl AckTracker {
             Err(e) => return Err(e),
         };
 
-        if data.len() < 4 {
+        if data.is_empty() {
             return Ok(HashMap::new());
+        }
+        // F-D1: fail closed on a corrupt/truncated file (matches
+        // `ReplicaAppliedTracker::read_from_disk`). The caller (`AckTracker::new`)
+        // turns an `Err` into "discard + start empty", never a partial map.
+        fn corrupt(msg: &str) -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("ack_tracker file corrupt: {msg}"),
+            )
+        }
+        if data.len() < 4 {
+            return Err(corrupt("truncated header"));
         }
 
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
@@ -240,21 +275,23 @@ impl AckTracker {
 
         for _ in 0..count {
             if pos + 2 > data.len() {
-                break;
+                return Err(corrupt("truncated entry length"));
             }
             let addr_len = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
             if pos + addr_len + 8 > data.len() {
-                break;
+                return Err(corrupt("truncated entry body"));
             }
-            let addr_str = std::str::from_utf8(&data[pos..pos + addr_len]).unwrap_or("");
+            let addr_str = std::str::from_utf8(&data[pos..pos + addr_len])
+                .map_err(|e| corrupt(&format!("invalid utf8 addr: {e}")))?;
             pos += addr_len;
             let seq = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
 
-            if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                result.insert(addr, seq);
-            }
+            let addr = addr_str
+                .parse::<SocketAddr>()
+                .map_err(|e| corrupt(&format!("invalid socket addr {addr_str:?}: {e}")))?;
+            result.insert(addr, seq);
         }
 
         Ok(result)
@@ -1254,6 +1291,58 @@ mod tests {
             "ack_tracker_flush_failures must bump on persist error \
              (was {before}, now {after})",
         );
+    }
+
+    /// F-D1: a truncated/corrupt ACK file must NOT be parsed into a partial
+    /// map (which could carry stale-high watermarks that mask replica lag). The
+    /// tracker fails closed: it discards the file, starts empty (forcing full
+    /// idempotent catch-up), and bumps `ack_tracker_load_failures`.
+    #[test]
+    fn corrupt_ack_file_is_discarded_and_starts_empty() {
+        static TEST_METRICS: std::sync::OnceLock<&'static crate::metrics::ReplicationMetrics> =
+            std::sync::OnceLock::new();
+        let metrics_ref = *TEST_METRICS
+            .get_or_init(|| Box::leak(Box::new(crate::metrics::ReplicationMetrics::new())));
+        crate::metrics::init_replication_metrics(metrics_ref);
+        let metrics =
+            crate::metrics::replication_metrics().expect("replication metrics installed for test");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+
+        // Write a well-formed file first (2 entries), then truncate it mid-entry
+        // so it claims a count it cannot satisfy.
+        let good = AckTracker::new(path.clone());
+        good.record_ack(test_addr(5000), 42);
+        good.record_ack(test_addr(5001), 99);
+        good.flush();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 6);
+        std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap(); // chop a tail entry
+
+        let before = metrics.ack_tracker_load_failures.get();
+        let reopened = AckTracker::new(path);
+        let after = metrics.ack_tracker_load_failures.get();
+
+        // Fail-closed: empty map (NOT a partial parse of the surviving entry).
+        assert_eq!(
+            reopened.all_acked().len(),
+            0,
+            "corrupt ACK file must yield an EMPTY tracker, not a partial map",
+        );
+        assert!(
+            after > before,
+            "ack_tracker_load_failures must bump on a corrupt load (was {before}, now {after})",
+        );
+    }
+
+    #[test]
+    fn truncated_ack_header_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ack.dat");
+        std::fs::write(&path, [0x01, 0x02]).unwrap(); // < 4 bytes: truncated header
+        let tracker = AckTracker::new(path);
+        assert_eq!(tracker.all_acked().len(), 0);
     }
 
     #[test]
