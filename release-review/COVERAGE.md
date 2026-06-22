@@ -8,8 +8,9 @@
 
 | Command | Result (review host) |
 |---------|---------------------|
-| `cargo test --all` (parallel) | **FAILED** — 3 failures in `cluster_swim` (8 passed in that binary); lib tests 2250 passed before failure |
-| `cargo test --test cluster_swim -- --test-threads=1` | **11 passed, 0 failed** |
+| `cargo test --all` (initial, concurrent agent on host) | **FAILED** — 3 failures in `cluster_swim` (contention artifact) |
+| `cargo test --all` (clean rerun, 2026-06-22) | **2710 passed / 0 failed / 0 ignored** across 70 test binaries |
+| `cluster_swim` (within clean rerun) | **11 passed, 0 failed** in 5.75s |
 | `cargo clippy --all -- -D warnings` | Clean |
 | `cd client/go && go test ./...` | Pass (unit only; integration tag excluded) |
 | `#[ignore]` on correctness tests | **0** |
@@ -54,7 +55,7 @@
 
 | Component | Unit | Integration | Docker E2E | CI |
 |-----------|------|-------------|------------|-----|
-| SWIM | `cluster/swim.rs` | `cluster_swim.rs` (**flaky parallel**) | `scenario_01` | PR |
+| SWIM | `cluster/swim.rs` | `cluster_swim.rs` (11/11 clean; timing-sensitive under extreme CPU contention) | `scenario_01` | PR |
 | Coordinator/topology | `cluster/coordinator.rs` | `cluster_tcp.rs`, `cluster_partition.rs` | `scenario_14` | PR |
 | Replication TCP | `replication/*.rs` | `replication_tcp.rs` | `scenario_03` | PR |
 | Split-brain | — | `g8_split_brain.rs` | `scenario_14` | Weekly |
@@ -125,7 +126,7 @@ All codes 0–20 and 255 have at least one wire or unit test observing the code,
 
 | Test | Issue | Severity |
 |------|-------|----------|
-| `cluster_swim.rs` (3 tests) | Fail under parallel `cargo test --all`; timing/Suspect-vs-Dead race | **Major** |
+| `cluster_swim.rs` | Failed only under concurrent-agent CPU contention; passes cleanly in isolated rerun. Suspect-vs-Dead race latent under extreme load | **Medium** |
 | `scenario_13/14` shard routing | `% 4096` ≠ `& 0x0FFF` — tests wrong shard for 1/16 keyspace | **Major** |
 | `scenario_15` crash subtests | `sleep(5ms)` before SIGKILL — probabilistic, not mid-WAL deterministic | **Medium** |
 | `ko1_legacy_payload_skips_expiry_phase` | Documents that 4-byte payload skips expiry — **confirms client bug** | Info |

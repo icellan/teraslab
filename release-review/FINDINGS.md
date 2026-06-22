@@ -8,8 +8,8 @@ Append-only ledger. Status: `open` | `verified` | `deferred`.
 
 | ID | Severity | Category | Status | Evidence | Description |
 |----|----------|----------|--------|----------|-------------|
-| REL-001 | **blocker** | CI / tests | verified | `tests/cluster_swim.rs:347,468,501`; `cargo test --all` exit 101 | Three `cluster_swim` tests fail under default parallel `cargo test --all` on Apple M3 (2026-06-22): `dead_node_restarts_with_new_incarnation`, `cluster_event_node_joined_emitted`, `membership_changed_sorted_member_list`. Pass with `--test-threads=1`. |
-| REL-002 | major | docs | verified | `README.md:34` vs test run | README claims `2234 passed / 0 failed`; review host observed 3 failures in `cluster_swim` under parallel test execution. |
+| REL-001 | major | CI / tests | verified | `tests/cluster_swim.rs:347,468,501` | Initial `cargo test --all` run failed 3 `cluster_swim` tests while another agent held build/file locks and ran tests concurrently. **Clean rerun (2026-06-22, no contention): 2710 passed / 0 failed / 0 ignored**, including `cluster_swim` 11/11 in 5.75s. Timing race remains possible under heavy parallel CPU load (Suspect→Alive vs Dead→Alive for `NodeJoined`). |
+| REL-002 | minor | docs | verified | `README.md:34` vs clean rerun | README claims `2234 passed / 0 failed`; clean rerun counted **2710 passed** across 70 test binaries. Count drift, not functional failure. |
 | REL-003 | — | CI / tests | verified | Grep `#[ignore]` across `**/*.rs` | Zero `#[ignore]` on correctness tests. Compliant with project rules. |
 | REL-004 | — | build | verified | `cargo build --release`, `cargo build`, `cargo clippy --all -- -D warnings` | All clean, zero warnings (2026-06-22). |
 | REL-005 | minor | code quality | open | `src/**/*.rs` — 3000+ `.unwrap()`/`.expect()` occurrences across library `src/` | Project rules ban `unwrap`/`expect` in library code; widespread use is latent panic surface on invariant violations. |
@@ -70,7 +70,7 @@ Append-only ledger. Status: `open` | `verified` | `deferred`.
 | REL-304 | — | replication | verified | `dispatch.rs:3206-3253`, `opcodes.rs:298` | Per-key replication quorum; `ERR_REPLICATION_FAILED` on timeout. |
 | REL-305 | — | migration | verified | `dispatch.rs:4626-4664`, `migration.rs:474-477` | `MIGRATION_IN_PROGRESS` write fencing enforced. |
 | REL-306 | — | security | verified | `swim.rs:786-794`, `auth.rs:159-181`, `config.rs:189-195` | HMAC-SHA256 on SWIM + inter-node TCP when `cluster_secret` set. |
-| REL-307 | **major** | CI / tests | verified | `tests/cluster_swim.rs:347-373`; `membership.rs:158-174` | `cluster_swim` flaky under parallel load; `NodeJoined` only on Dead→Alive, not Suspect→Alive race. |
+| REL-307 | major | CI / tests | verified | `tests/cluster_swim.rs:347-373`; `membership.rs:158-174` | `cluster_swim` timing-sensitive under extreme parallel CPU contention (observed when another agent ran tests simultaneously). Passes cleanly in isolated rerun. `NodeJoined` only on Dead→Alive, not Suspect→Alive — latent flake under load. |
 | REL-308 | **major** | tests | open | `scenario_13_data_migration_under_load.rs:311`, `scenario_14_split_brain_prevention.rs:295` | E2E harness uses `% 4096` instead of `& 0x0FFF` for shard routing — wrong for ~1/16 of keyspace. |
 | REL-309 | minor | docs | open | `cluster_swim.rs:354-356` vs `swim.rs:455` | Stale test comment about `SystemTime` incarnation; actual uses `persisted_incarnation + 1`. |
 

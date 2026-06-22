@@ -91,3 +91,12 @@ Started: 2026-06-22
 ### 2026-06-22 — Deliverables written
 - FINDINGS.md (REL-001 through REL-804)
 - PERF.md, COVERAGE.md, GO-NOGO.md (NO-GO), REVIEW.md
+
+### 2026-06-22 — Clean test rerun (user correction: concurrent agent caused initial failure)
+- Killed stale duplicate `cargo test` from prior session
+- `cargo test --all` clean rerun: **2710 passed / 0 failed / 0 ignored** (70 test binaries)
+- `cluster_swim`: 11/11 pass in 5.75s (all 3 previously-failing tests green)
+- `cargo clippy --all -- -D warnings`: clean on rerun
+- Updated REL-001: blocker → major (contention artifact, not reproducible clean)
+- Updated REL-002: README count drift (2234 claimed vs 2710 measured)
+- GO-NOGO: single blocker remains REL-403 (client ProcessExpired wire bug)
