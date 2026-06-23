@@ -123,6 +123,9 @@ pub struct HttpState {
     pub cluster: Option<Arc<RunningCluster>>,
     /// Redo log for status queries (None if not available).
     pub redo_log: Option<Arc<parking_lot::Mutex<RedoLog>>>,
+    /// Lock-free mirror of the redo log's space accounting, so `/admin/top`
+    /// reads `write_position`/`available_space` without taking the writer lock.
+    pub redo_atomics: Option<std::sync::Arc<crate::redo::RedoAtomics>>,
     /// Active TCP connection count (shared with the Server struct).
     pub active_connections: Arc<AtomicUsize>,
     /// HTTP port used by this node (for deriving other nodes' HTTP addresses).
@@ -1895,12 +1898,51 @@ async fn handle_admin_drain(
 // /admin/top — full metrics snapshot for real-time monitoring
 // ---------------------------------------------------------------------------
 
+/// Last-known allocator + index stats cache so `/admin/top` can show a stable
+/// number during a write burst instead of blocking or returning zeros.
+///
+/// Contended only among snapshot readers (the 1-second `/ws/top` loop and
+/// operator polls) — NEVER by the write path. The tuple is `(AllocatorStats,
+/// IndexStats)`. `None` means the first call hasn't seeded it yet.
+static TOP_STATS_CACHE: std::sync::Mutex<
+    Option<(crate::allocator::AllocatorStats, crate::index::IndexStats)>,
+> = std::sync::Mutex::new(None);
+
 /// Build this node's local metrics snapshot as JSON.
 fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
     let m = state.metrics;
     let h = state.histograms;
-    let index_stats = state.engine.index_stats();
-    let alloc_stats = state.engine.allocator_stats();
+
+    // Non-blocking: try to acquire without waiting on the write path.
+    let alloc_try = state.engine.allocator_stats_try();
+    let index_try = state.engine.index_stats_try();
+
+    // Helper: acquire TOP_STATS_CACHE, recovering from any poison.
+    let cache_lock = || TOP_STATS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+
+    let (alloc_stats, index_stats) = match (alloc_try, index_try) {
+        (Some(a), Some(i)) => {
+            // Both succeeded — best-effort cache refresh via try_lock so
+            // this hot path never blocks a concurrent cache reader.
+            if let Ok(mut guard) = TOP_STATS_CACHE.try_lock() {
+                *guard = Some((a.clone(), i.clone()));
+            }
+            (a, i)
+        }
+        _ => {
+            // At least one lock was contended.  Fall back to cached values.
+            match cache_lock().clone() {
+                Some((a, i)) => (a, i),
+                None => {
+                    // Cold start: no cache yet.  Block once to seed it.
+                    let a = state.engine.allocator_stats();
+                    let i = state.engine.index_stats();
+                    *cache_lock() = Some((a.clone(), i.clone()));
+                    (a, i)
+                }
+            }
+        }
+    };
 
     let node_id = state.cluster.as_ref().map(|c| c.self_id().0).unwrap_or(0);
 
@@ -1909,18 +1951,25 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let redo = if let Some(ref rl) = state.redo_log {
-        let log = rl.lock();
-        let avail = log.available_space();
-        let pos = log.write_position();
+    let redo = if let Some(atomics) = state.redo_atomics.as_ref() {
+        let pos = atomics.write_position();
+        let avail = atomics.available_space();
         let total = pos + avail;
         let utilization = if total > 0 {
             pos as f64 / total as f64
         } else {
             0.0
         };
+        // current_sequence still needs the lock; try_lock so a write burst never
+        // stalls the snapshot — fall back to 0 when momentarily contended.
+        let current_sequence = state
+            .redo_log
+            .as_ref()
+            .and_then(|rl| rl.try_lock())
+            .map(|g| g.current_sequence())
+            .unwrap_or(0);
         serde_json::json!({
-            "current_sequence": log.current_sequence(),
+            "current_sequence": current_sequence,
             "write_position": pos,
             "available_space": avail,
             "utilization": utilization,
@@ -3335,6 +3384,7 @@ mod tests {
             log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
             cluster: None,
             redo_log: None,
+            redo_atomics: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 10_000,
@@ -3508,6 +3558,7 @@ mod tests {
             log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
             cluster: None,
             redo_log: None,
+            redo_atomics: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 10_000,
@@ -3594,6 +3645,7 @@ mod tests {
             log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
             cluster: None,
             redo_log: None,
+            redo_atomics: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 10_000,
@@ -3779,6 +3831,7 @@ mod tests {
             log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
             cluster,
             redo_log: None,
+            redo_atomics: None,
             active_connections: Arc::new(AtomicUsize::new(0)),
             http_port: 0,
             replica_lag_warn_threshold_ops: 0,

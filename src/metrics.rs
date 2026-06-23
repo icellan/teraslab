@@ -92,6 +92,50 @@ impl PaddedCounter {
     }
 }
 
+/// Number of writers currently executing inside a secondary-index commit.
+/// A gauge, not a monotonic counter. Process-global and decoupled from
+/// `ThreadMetrics` so it works even before `init_dispatch_metrics` runs.
+static WRITERS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+/// High-water mark of [`WRITERS_IN_FLIGHT`]. Reset between measured runs.
+static WRITERS_IN_FLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// RAII guard: increments the in-flight-writers gauge on creation and
+/// decrements it on drop, updating the high-water mark.
+#[must_use = "the gauge decrements when this guard is dropped"]
+pub struct WriterGauge {
+    _private: (),
+}
+
+impl Drop for WriterGauge {
+    fn drop(&mut self) {
+        WRITERS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Enter the secondary-index critical section: bump the in-flight gauge and
+/// the high-water mark. The returned guard restores the gauge on drop.
+pub fn writer_enter() -> WriterGauge {
+    let now = WRITERS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+    WRITERS_IN_FLIGHT_MAX.fetch_max(now, Ordering::Relaxed);
+    WriterGauge { _private: () }
+}
+
+/// Current number of writers in flight.
+pub fn writers_in_flight() -> u64 {
+    WRITERS_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+/// High-water mark of concurrent writers observed since the last reset.
+pub fn writers_in_flight_max() -> u64 {
+    WRITERS_IN_FLIGHT_MAX.load(Ordering::Relaxed)
+}
+
+/// Reset the high-water mark to the current in-flight count (call before a
+/// measured run so prior load does not pollute the reading).
+pub fn reset_writers_max() {
+    WRITERS_IN_FLIGHT_MAX.store(WRITERS_IN_FLIGHT.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
 /// Fixed-size array of [`PaddedCounter`]s indexed by an enum discriminant.
 ///
 /// Each cell is cache-line padded so concurrent increments on different
@@ -1809,6 +1853,28 @@ mod tests {
             limit_ms,
         );
         assert_eq!(c.get(OpCode::Spend, Outcome::Ok), iterations);
+    }
+
+    #[test]
+    fn writer_gauge_tracks_concurrency_high_water() {
+        reset_writers_max();
+        assert_eq!(writers_in_flight(), 0);
+        {
+            let _a = writer_enter();
+            assert_eq!(writers_in_flight(), 1);
+            {
+                let _b = writer_enter();
+                assert_eq!(writers_in_flight(), 2);
+                assert_eq!(writers_in_flight_max(), 2);
+            }
+            // _b dropped: current falls, max stays.
+            assert_eq!(writers_in_flight(), 1);
+            assert_eq!(writers_in_flight_max(), 2);
+        }
+        assert_eq!(writers_in_flight(), 0);
+        assert_eq!(writers_in_flight_max(), 2);
+        reset_writers_max();
+        assert_eq!(writers_in_flight_max(), 0);
     }
 
     #[test]

@@ -47,6 +47,7 @@ fn start_test_server() -> u16 {
         log_level: Arc::new(AtomicU8::new(2)),
         cluster: None,
         redo_log: None,
+        redo_atomics: None,
         active_connections: Arc::new(AtomicUsize::new(0)),
         http_port: 0,
         replica_lag_warn_threshold_ops: 10_000,
