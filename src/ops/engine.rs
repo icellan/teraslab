@@ -1086,6 +1086,13 @@ impl Engine {
         self.allocator.lock().stats()
     }
 
+    /// Non-blocking allocator stats for observability: returns `None` if the
+    /// allocator lock is momentarily held by the write path, so `/admin/top`
+    /// never stalls behind a write burst.
+    pub fn allocator_stats_try(&self) -> Option<crate::allocator::AllocatorStats> {
+        self.allocator.try_lock().map(|g| g.stats())
+    }
+
     /// Get a reference to the allocator mutex.
     ///
     /// Used by the dispatch layer to free pre-allocated space when a redo
@@ -6603,6 +6610,12 @@ impl Engine {
     /// Primary index statistics for monitoring.
     pub fn index_stats(&self) -> crate::index::IndexStats {
         self.index.read().stats()
+    }
+
+    /// Non-blocking primary-index stats for observability (see `allocator_stats_try`).
+    /// Returns `None` if the index write lock is momentarily held by the create path.
+    pub fn index_stats_try(&self) -> Option<crate::index::IndexStats> {
+        self.index.try_read().map(|g| g.stats())
     }
 
     /// Test-only: arm a synthetic failure in the next primary-index read so
