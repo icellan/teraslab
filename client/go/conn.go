@@ -137,6 +137,8 @@ func (c *pipeConn) roundTripSigned(ctx context.Context, opCode uint16, flags uin
 	reqID := c.nextID.Add(1)
 	ch := respChanPool.Get().(chan responseFrame)
 	c.pending.Store(reqID, ch)
+	c.inflight.Add(1)
+	defer c.inflight.Add(-1)
 
 	f := &requestFrame{
 		RequestID: reqID,
