@@ -93,6 +93,16 @@ pub enum RecordError {
         /// CRC value computed over the header bytes on read.
         actual: u32,
     },
+    /// The source slice was shorter than [`METADATA_SIZE`], so a full header
+    /// could not be read. Returned by [`TxMetadata::from_bytes`] instead of
+    /// risking an out-of-bounds slice panic on a truncated/torn read.
+    #[error("metadata slice too short: have {actual} bytes, need {required}")]
+    TooShort {
+        /// Number of bytes actually available in the source slice.
+        actual: usize,
+        /// Minimum number of bytes required (`METADATA_SIZE`).
+        required: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -688,9 +698,19 @@ impl TxMetadata {
     /// rot; callers must propagate the error — silent acceptance of
     /// corrupted metadata can break UTXO correctness.
     ///
+    /// Returns [`RecordError::TooShort`] if `src` is shorter than
+    /// [`METADATA_SIZE`]. This is a real runtime check (not just a
+    /// `debug_assert!`) so that release builds fail closed on a truncated or
+    /// torn read rather than risking an out-of-bounds slice panic.
+    ///
     /// The source must be at least `METADATA_SIZE` bytes.
     pub fn from_bytes(src: &[u8]) -> Result<Self, RecordError> {
-        debug_assert!(src.len() >= METADATA_SIZE);
+        if src.len() < METADATA_SIZE {
+            return Err(RecordError::TooShort {
+                actual: src.len(),
+                required: METADATA_SIZE,
+            });
+        }
         let crc_off = CRC32_OFFSET;
         let mut expected = [0u8; 4];
         expected.copy_from_slice(&src[crc_off..crc_off + 4]);
@@ -1733,6 +1753,25 @@ mod tests {
             RecordError::CrcMismatch { expected, actual } => {
                 assert_ne!(expected, actual, "CRC must differ after bit flip");
             }
+            other => panic!("expected CrcMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_from_bytes_rejects_short_slice() {
+        // REL-129: a slice shorter than METADATA_SIZE must fail closed with
+        // a descriptive error in release builds too, not slice-panic. Cover
+        // an empty slice, a one-byte-short slice, and an arbitrary truncation.
+        for short_len in [0usize, METADATA_SIZE - 1, METADATA_SIZE / 2] {
+            let buf = vec![0u8; short_len];
+            let err = TxMetadata::from_bytes(&buf).unwrap_err();
+            match err {
+                RecordError::TooShort { actual, required } => {
+                    assert_eq!(actual, short_len, "reported length must match slice");
+                    assert_eq!(required, METADATA_SIZE, "required length must be METADATA_SIZE");
+                }
+                other => panic!("len={short_len}: expected TooShort, got {other:?}"),
+            }
         }
     }
 
@@ -1757,7 +1796,9 @@ mod tests {
         // Zero out the CRC slot.
         buf[CRC32_OFFSET..CRC32_OFFSET + 4].copy_from_slice(&[0u8; 4]);
         let err = TxMetadata::from_bytes(&buf).unwrap_err();
-        let RecordError::CrcMismatch { expected, actual } = err;
+        let RecordError::CrcMismatch { expected, actual } = err else {
+            panic!("expected CrcMismatch, got {err:?}");
+        };
         assert_eq!(expected, 0, "stored CRC was zeroed");
         assert_ne!(actual, 0, "computed CRC over populated header is non-zero");
     }
