@@ -34,6 +34,8 @@ pub(crate) struct PipeConn {
     next_id: AtomicU64,
     /// Whether this connection is still alive, shared with the read loop.
     alive: Arc<AtomicBool>,
+    /// Per-request round-trip timeout.
+    request_timeout: Duration,
     /// Handle to the background read loop task. Kept alive until dropped.
     _read_task: JoinHandle<()>,
 }
@@ -41,11 +43,22 @@ pub(crate) struct PipeConn {
 impl PipeConn {
     /// Establish a new pipelined connection to the given address.
     ///
+    /// # Parameters
+    ///
+    /// - `addr`: The `host:port` address to connect to.
+    /// - `dial_timeout`: Timeout for establishing the TCP connection.
+    /// - `request_timeout`: Per-request round-trip timeout used by
+    ///   [`Self::round_trip`].
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::Connection`] if the TCP connection fails or times out.
-    pub async fn dial(addr: &str, timeout: Duration) -> Result<Self, ClientError> {
-        let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+    pub async fn dial(
+        addr: &str,
+        dial_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, ClientError> {
+        let stream = tokio::time::timeout(dial_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| ClientError::Connection(format!("dial timeout: {}", addr)))?
             .map_err(|e| ClientError::Connection(format!("dial {}: {}", addr, e)))?;
@@ -73,6 +86,7 @@ impl PipeConn {
             pending,
             next_id: AtomicU64::new(0),
             alive,
+            request_timeout,
             _read_task: read_task,
         })
     }
@@ -86,7 +100,8 @@ impl PipeConn {
     /// # Errors
     ///
     /// Returns [`ClientError::Connection`] if the connection is dead or the
-    /// write fails, or [`ClientError::Timeout`] if the default timeout elapses.
+    /// write fails, or [`ClientError::Timeout`] if the configured
+    /// `request_timeout` elapses before a response arrives.
     pub async fn round_trip(
         &self,
         op_code: u16,
@@ -123,8 +138,8 @@ impl PipeConn {
             }
         }
 
-        // Wait for the response with a generous timeout.
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        // Wait for the response with the configured per-request timeout.
+        match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => {
                 // Sender was dropped (connection closed).

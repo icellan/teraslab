@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use teraslab::protocol::opcodes::{OP_PING, STATUS_OK};
 use tokio::task::JoinHandle;
 
 use crate::conn::PipeConn;
@@ -26,6 +27,8 @@ pub struct PoolConfig {
     pub dial_timeout: Duration,
     /// Interval for health-checking idle connections (default: 15s).
     pub health_check: Duration,
+    /// Per-request round-trip timeout (default: 30s).
+    pub request_timeout: Duration,
 }
 
 impl Default for PoolConfig {
@@ -35,6 +38,7 @@ impl Default for PoolConfig {
             max_conns: 16,
             dial_timeout: Duration::from_secs(5),
             health_check: Duration::from_secs(15),
+            request_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -53,6 +57,9 @@ impl PoolConfig {
         }
         if self.health_check == Duration::ZERO {
             self.health_check = Duration::from_secs(15);
+        }
+        if self.request_timeout == Duration::ZERO {
+            self.request_timeout = Duration::from_secs(30);
         }
         self
     }
@@ -155,7 +162,14 @@ impl ConnPool {
             }
         }
 
-        let c = Arc::new(PipeConn::dial(&self.addr, self.config.dial_timeout).await?);
+        let c = Arc::new(
+            PipeConn::dial(
+                &self.addr,
+                self.config.dial_timeout,
+                self.config.request_timeout,
+            )
+            .await?,
+        );
 
         {
             let mut conns = self.conns.lock();
@@ -204,19 +218,52 @@ async fn health_loop(
     }
 }
 
-/// Remove dead connections and replenish to min_conns.
+/// Actively probe connections, drop dead ones, and replenish to min_conns.
+///
+/// A connection only tracks a local `alive` flag, so a half-open TCP peer that
+/// went away without an explicit close still reports `alive() == true`. To
+/// surface those, each live connection is probed with an `OP_PING` round-trip
+/// (matching the Go pool's `checkHealth`); a failed ping or non-OK status
+/// marks the connection dead and it is dropped.
 async fn check_health(addr: &str, config: &PoolConfig, conns: &Arc<Mutex<Vec<Arc<PipeConn>>>>) {
+    // Snapshot connections so the ping round-trips happen without holding the
+    // pool lock.
+    let snapshot: Vec<Arc<PipeConn>> = {
+        let guard = conns.lock();
+        guard.clone()
+    };
+
+    // Identify dead connections by their Arc pointer address (a stable
+    // identity key; using `usize` keeps the future `Send` across awaits).
+    let mut dead: Vec<usize> = Vec::new();
+    for c in &snapshot {
+        if !c.alive() {
+            dead.push(Arc::as_ptr(c) as usize);
+            continue;
+        }
+        match c.round_trip(OP_PING, 0, Vec::new()).await {
+            Ok(resp) if resp.status == STATUS_OK => {}
+            _ => {
+                // Failed or non-OK ping: the peer is gone. Close so the
+                // background read loop is aborted and waiters wake.
+                c.close().await;
+                dead.push(Arc::as_ptr(c) as usize);
+            }
+        }
+    }
+
     let deficit = {
         let mut guard = conns.lock();
-        // Remove dead connections.
-        guard.retain(|c| c.alive());
+        // Remove connections we found dead during probing, plus any that
+        // died concurrently.
+        guard.retain(|c| c.alive() && !dead.contains(&(Arc::as_ptr(c) as usize)));
         let current = guard.len();
         config.min_conns.saturating_sub(current)
     };
 
     // Replenish to min_conns.
     for _ in 0..deficit {
-        match PipeConn::dial(addr, config.dial_timeout).await {
+        match PipeConn::dial(addr, config.dial_timeout, config.request_timeout).await {
             Ok(c) => {
                 let mut guard = conns.lock();
                 guard.push(Arc::new(c));
