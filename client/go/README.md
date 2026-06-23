@@ -401,8 +401,8 @@ conflicting, err := client.QueryConflicting(ctx)
 // Preserve parent transactions from being pruned.
 _, err = client.PreserveTransactions(ctx, 900000, txids)
 
-// Delete expired preserved transactions.
-result, err := client.ProcessExpiredPreservations(ctx, 800100)
+// Delete expired preserved transactions (currentHeight, blockHeightRetention).
+result, err := client.ProcessExpiredPreservations(ctx, 800100, 144)
 fmt.Printf("deleted %d, failed %d\n", result.Deleted, result.Failed)
 ```
 

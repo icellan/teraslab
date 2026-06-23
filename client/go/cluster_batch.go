@@ -214,8 +214,15 @@ func sendItemMutationClusterOnce[T any](
 // per-item signals and errors back into the original index space. Unlike the
 // generic mutation helper it preserves the signal payload (SpendBatchResponse).
 func (c *Client) setMinedBatchCluster(ctx context.Context, params SetMinedBatchParams, txids []TxID) (*SpendBatchResponse, error) {
-	return withTransientRetry(ctx, c, func() (*SpendBatchResponse, error) {
+	res, err := withTransientRetry(ctx, c, func() (*SpendBatchResponse, error) {
 		return c.setMinedBatchClusterOnce(ctx, params, txids)
+	})
+	return c.resolveSignalRedirects(ctx, res, err, func(redirectIdx []int) (*SpendBatchResponse, error) {
+		sub := make([]TxID, len(redirectIdx))
+		for i, idx := range redirectIdx {
+			sub[i] = txids[idx]
+		}
+		return c.setMinedBatchClusterOnce(ctx, params, sub)
 	})
 }
 

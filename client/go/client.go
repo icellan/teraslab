@@ -440,9 +440,73 @@ func (c *Client) SpendBatch(ctx context.Context, params SpendBatchParams, items 
 }
 
 func (c *Client) spendBatchCluster(ctx context.Context, params SpendBatchParams, items []SpendItem) (*SpendBatchResponse, error) {
-	return withTransientRetry(ctx, c, func() (*SpendBatchResponse, error) {
+	res, err := withTransientRetry(ctx, c, func() (*SpendBatchResponse, error) {
 		return c.spendBatchClusterOnce(ctx, params, items)
 	})
+	return c.resolveSignalRedirects(ctx, res, err, func(redirectIdx []int) (*SpendBatchResponse, error) {
+		sub := make([]SpendItem, len(redirectIdx))
+		for i, idx := range redirectIdx {
+			sub[i] = items[idx]
+		}
+		return c.spendBatchClusterOnce(ctx, params, sub)
+	})
+}
+
+// resolveSignalRedirects re-sends only the items that came back with a per-item
+// ERR_REDIRECT (the shape the server emits inside STATUS_PARTIAL_ERROR for batch
+// mutations) after refreshing the partition map, merging their signals/results
+// back into the original index space and leaving genuine per-item failures
+// intact. Bounded by maxRefreshRetries passes. No-op in single-node mode or when
+// there are no redirect-coded errors. Used by the spend and setMined paths,
+// which return per-item signals (SpendBatchResponse). resend takes the redirected
+// items' ORIGINAL indices and returns a sub-batch result whose item indices are
+// in sub-batch (0-based) space.
+func (c *Client) resolveSignalRedirects(ctx context.Context, res *SpendBatchResponse, err error, resend func(redirectIdx []int) (*SpendBatchResponse, error)) (*SpendBatchResponse, error) {
+	if c.cluster == nil {
+		return res, err
+	}
+	for pass := 0; pass < maxRefreshRetries; pass++ {
+		pe, ok := err.(*PartialError)
+		if !ok {
+			return res, err
+		}
+		var redirectIdx []int
+		var otherErrs []BatchItemError
+		for _, be := range pe.Errors {
+			if be.Code == ErrCodeRedirect {
+				redirectIdx = append(redirectIdx, int(be.ItemIndex))
+			} else {
+				otherErrs = append(otherErrs, be)
+			}
+		}
+		if len(redirectIdx) == 0 {
+			return res, err
+		}
+
+		// Refresh the map and re-send only the redirected items.
+		c.cluster.tryRefresh()
+		subRes, subErr := resend(redirectIdx)
+
+		// Successes carried alongside the prior partial response stay in the
+		// merged result; genuine (non-redirect) errors are preserved.
+		merged := &SpendBatchResponse{Successes: append([]BatchItemSuccess(nil), pe.Successes...)}
+		combinedErrs := append([]BatchItemError(nil), otherErrs...)
+		if subRes != nil {
+			merged.Successes = append(merged.Successes, remapBatchSuccesses(subRes.Successes, redirectIdx)...)
+		}
+		if subPe, ok := subErr.(*PartialError); ok {
+			combinedErrs = append(combinedErrs, remapBatchErrors(subPe.Errors, redirectIdx)...)
+		} else if subErr != nil {
+			return nil, subErr
+		}
+
+		merged.Errors = combinedErrs
+		if len(combinedErrs) == 0 {
+			return merged, nil
+		}
+		res, err = merged, &PartialError{Successes: merged.Successes, Errors: combinedErrs}
+	}
+	return res, err
 }
 
 func (c *Client) spendBatchClusterOnce(ctx context.Context, params SpendBatchParams, items []SpendItem) (*SpendBatchResponse, error) {
@@ -595,6 +659,15 @@ func remapBatchErrors(errs []BatchItemError, indexMap []int) []BatchItemError {
 	return errs
 }
 
+func remapBatchSuccesses(succs []BatchItemSuccess, indexMap []int) []BatchItemSuccess {
+	for i := range succs {
+		if int(succs[i].ItemIndex) < len(indexMap) {
+			succs[i].ItemIndex = uint32(indexMap[succs[i].ItemIndex])
+		}
+	}
+	return succs
+}
+
 // sendTxIDBatch is a helper for cluster-aware txid-list batch operations.
 // In cluster mode each shard's sub-batch follows StatusRedirect replies up
 // to MaxRedirects.
@@ -617,9 +690,60 @@ func (c *Client) sendTxIDBatch(ctx context.Context, opCode uint16, txids []TxID,
 }
 
 func (c *Client) sendTxIDBatchCluster(ctx context.Context, opCode uint16, txids []TxID, encodePayload func([]byte, []TxID) []byte) (*BatchResult, error) {
-	return withTransientRetry(ctx, c, func() (*BatchResult, error) {
+	res, err := withTransientRetry(ctx, c, func() (*BatchResult, error) {
 		return c.sendTxIDBatchClusterOnce(ctx, opCode, txids, encodePayload)
 	})
+	return c.resolveTxIDRedirects(ctx, opCode, txids, encodePayload, res, err)
+}
+
+// resolveTxIDRedirects re-sends only the txids that came back with a per-item
+// ERR_REDIRECT (the shape the server emits inside STATUS_PARTIAL_ERROR for batch
+// mutations) after refreshing the partition map, leaving genuine per-item
+// failures intact. Bounded by maxRefreshRetries passes. No-op in single-node
+// mode or when there are no redirect-coded errors. Mirrors resolveItemRedirects.
+func (c *Client) resolveTxIDRedirects(ctx context.Context, opCode uint16, txids []TxID, encodePayload func([]byte, []TxID) []byte, res *BatchResult, err error) (*BatchResult, error) {
+	if c.cluster == nil {
+		return res, err
+	}
+	for pass := 0; pass < maxRefreshRetries; pass++ {
+		pe, ok := err.(*PartialError)
+		if !ok {
+			return res, err
+		}
+		var redirectIdx []int
+		var otherErrs []BatchItemError
+		for _, be := range pe.Errors {
+			if be.Code == ErrCodeRedirect {
+				redirectIdx = append(redirectIdx, int(be.ItemIndex))
+			} else {
+				otherErrs = append(otherErrs, be)
+			}
+		}
+		if len(redirectIdx) == 0 {
+			return res, err
+		}
+
+		// Refresh the map and re-send only the redirected txids.
+		c.cluster.tryRefresh()
+		sub := make([]TxID, len(redirectIdx))
+		for i, idx := range redirectIdx {
+			sub[i] = txids[idx]
+		}
+		_, subErr := c.sendTxIDBatchClusterOnce(ctx, opCode, sub, encodePayload)
+
+		combined := append([]BatchItemError(nil), otherErrs...)
+		if subPe, ok := subErr.(*PartialError); ok {
+			combined = append(combined, remapBatchErrors(subPe.Errors, redirectIdx)...)
+		} else if subErr != nil {
+			return nil, subErr
+		}
+
+		if len(combined) == 0 {
+			return &BatchResult{}, nil
+		}
+		res, err = nil, &PartialError{Errors: combined}
+	}
+	return res, err
 }
 
 func (c *Client) sendTxIDBatchClusterOnce(ctx context.Context, opCode uint16, txids []TxID, encodePayload func([]byte, []TxID) []byte) (*BatchResult, error) {
@@ -1181,10 +1305,13 @@ func (c *Client) PreserveTransactions(ctx context.Context, blockHeight uint32, t
 	return handleMutationResponse(resp)
 }
 
-// ProcessExpiredPreservations triggers deletion of expired preserved transactions.
-func (c *Client) ProcessExpiredPreservations(ctx context.Context, currentHeight uint32) (*ProcessExpiredResult, error) {
-	buf := getBuf(4)
-	payload := encodeProcessExpired(buf, currentHeight)
+// ProcessExpiredPreservations triggers deletion of expired preserved
+// transactions. blockHeightRetention is the number of blocks of retention
+// applied past expiry; it must be supplied because the server treats a missing
+// (legacy) value as 0, which silently skips the expiry phase.
+func (c *Client) ProcessExpiredPreservations(ctx context.Context, currentHeight, blockHeightRetention uint32) (*ProcessExpiredResult, error) {
+	buf := getBuf(8)
+	payload := encodeProcessExpired(buf, currentHeight, blockHeightRetention)
 	conn, err := c.getConn(ctx)
 	if err != nil {
 		putBuf(payload)

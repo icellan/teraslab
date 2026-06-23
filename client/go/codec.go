@@ -327,9 +327,14 @@ func encodePreserveTransactions(buf []byte, blockHeight uint32, txids []TxID) []
 	return buf
 }
 
-// encodeProcessExpired appends a ProcessExpiredPreservations request payload to buf.
-func encodeProcessExpired(buf []byte, currentHeight uint32) []byte {
-	return appendU32(buf, currentHeight)
+// encodeProcessExpired appends a ProcessExpiredPreservations request payload to
+// buf. Format: [current_height:4 LE][block_height_retention:4 LE]. The server
+// treats a 4-byte (legacy) payload as retention=0, which silently skips the
+// expiry phase, so the retention must be sent explicitly.
+func encodeProcessExpired(buf []byte, currentHeight, blockHeightRetention uint32) []byte {
+	buf = appendU32(buf, currentHeight)
+	buf = appendU32(buf, blockHeightRetention)
+	return buf
 }
 
 // ---------------------------------------------------------------------------
