@@ -30,8 +30,42 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::cluster::shards::ShardTable;
 use crate::index::backend::PrimaryBackend;
 use crate::index::redb_primary::CachedFieldsUpdate;
-use crate::index::{IndexError, IndexStats, TxIndexEntry, TxKey};
+use crate::index::{
+    DahIndex, Index, IndexError, IndexStats, RestoreFlags, TxIndexEntry, TxKey, UnminedIndex,
+};
 use crate::record::TxFlags;
+
+// ---------------------------------------------------------------------------
+// v2 N-shard snapshot format
+// ---------------------------------------------------------------------------
+
+/// Magic identifying a v2 N-shard sharded-index snapshot manifest.
+///
+/// DISTINCT from the v1 single-table primary magic
+/// ([`crate::index::PRIMARY_SNAPSHOT_MAGIC`] = `b"TSIX"`) so the two formats
+/// are unambiguous: [`ShardedIndex::restore_all`] dispatches on the first four
+/// bytes and never has to guess. `b"TSX2"` = "TeraSlab indeX, format 2".
+const V2_MAGIC: [u8; 4] = *b"TSX2";
+
+/// Version stamp inside a v2 manifest header. A reader that sees `V2_MAGIC`
+/// but a version other than this fails closed rather than guessing the layout.
+const V2_VERSION: u32 = 2;
+
+/// Byte length of the fixed v2 manifest header that precedes the per-shard
+/// region table:
+/// `magic(4) + version(4) + shard_count(4) + seed(8)`.
+const V2_HEADER_SIZE: usize = 4 + 4 + 4 + 8;
+
+/// Byte length of one entry in the v2 per-shard region table:
+/// `region_offset(8) + region_len(8)`. Offsets are absolute from the start of
+/// the file; lengths cover one full v1 primary payload.
+const V2_REGION_ENTRY_SIZE: usize = 8 + 8;
+
+/// Upper bound on `shard_count` accepted from an on-disk v2 manifest. Mirrors
+/// the `[1, 256]` clamp the live constructors enforce; a manifest claiming an
+/// absurd shard count (corruption or a hostile file) is rejected up front so
+/// the region-table allocation cannot be driven huge.
+const V2_MAX_SHARD_COUNT: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Process-local seed
@@ -64,6 +98,20 @@ fn index_shard_seed() -> u64 {
 fn clamp_shard_count(n: usize) -> usize {
     let n = n.clamp(1, 256);
     n.next_power_of_two().min(256)
+}
+
+/// Panic-free `&[u8]` → `[u8; 4]`. The v2 parser only ever calls this on a
+/// slice it has already length-checked, so the fallback (all-zeros) is
+/// unreachable in practice; it keeps the library code free of `unwrap`.
+#[inline]
+fn arr4(s: &[u8]) -> [u8; 4] {
+    s.try_into().unwrap_or([0u8; 4])
+}
+
+/// Panic-free `&[u8]` → `[u8; 8]`. See [`arr4`].
+#[inline]
+fn arr8(s: &[u8]) -> [u8; 8] {
+    s.try_into().unwrap_or([0u8; 8])
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +184,27 @@ impl ShardedIndex {
             shards: vec![RwLock::new(backend)],
             shard_mask: 0,
             seed: index_shard_seed(),
+        }
+    }
+
+    /// Build a `ShardedIndex` from a vector of already-populated backends under
+    /// an explicit `seed`.
+    ///
+    /// `backends.len()` MUST already be a power of two in `[1, 256]` (the
+    /// caller is the v2 restore path, which validates the manifest shard count
+    /// before calling). The `seed` is installed verbatim so that
+    /// [`Self::index_shard_for_key`] maps every key back to the shard region it
+    /// was snapshotted from — i.e. routing is consistent with the layout the
+    /// backends were placed in. This is why the v2 manifest persists the seed:
+    /// without it a fresh process seed would scatter keys to different shards
+    /// than their region, breaking the direct (matching-count) restore.
+    fn from_backends_with_seed(backends: Vec<PrimaryBackend>, seed: u64) -> Self {
+        let shards: Vec<RwLock<PrimaryBackend>> = backends.into_iter().map(RwLock::new).collect();
+        let mask = shards.len().saturating_sub(1);
+        Self {
+            shards,
+            shard_mask: mask,
+            seed,
         }
     }
 
@@ -602,34 +671,317 @@ impl ShardedIndex {
 
     /// Snapshot the primary index and both secondary indexes to `path`.
     ///
-    /// At a single shard this delegates straight to the wrapped backend's
-    /// [`PrimaryBackend::snapshot_all`], producing a snapshot byte-for-byte
-    /// identical to the pre-sharding engine. For more than one shard a v2
-    /// N-shard manifest format is required (Task 4); until that lands a
-    /// multi-shard snapshot would silently capture only one shard, so this
-    /// fails closed instead.
+    /// # Format
+    ///
+    /// - **At one shard** this delegates straight to the wrapped backend's
+    ///   [`PrimaryBackend::snapshot_all`], producing a v1 (`TSIX`) snapshot
+    ///   byte-for-byte identical to the pre-sharding engine. The engine runs at
+    ///   one shard for now, so its checkpoint snapshots stay readable by the
+    ///   existing [`PrimaryBackend::restore_all`] path.
+    /// - **At more than one shard** this writes a v2 N-shard manifest: a fixed
+    ///   header `{ magic = TSX2, version = 2, shard_count, seed }`, a per-shard
+    ///   region table `{ offset, len }`, the `N` per-shard v1 primary payloads,
+    ///   the (unsharded) dah/unmined secondary sections, and a trailing CRC32
+    ///   over everything. The `seed` is persisted so a matching-count restore
+    ///   can place region `i` back into shard `i` and have
+    ///   [`Self::index_shard_for_key`] route every key to its own region.
+    ///
+    /// Secondary indexes (dah/unmined) are NOT sharded — they are written once.
+    ///
+    /// Only the in-memory backend produces a file; the redb / file-backed
+    /// shards are self-persistent, so a non-`InMemory` shard is rejected
+    /// (mirroring [`PrimaryBackend::snapshot_all`], which is a no-op for those
+    /// variants — a sharded multi-region file would be meaningless for them).
+    ///
+    /// The snapshot is written atomically via a temp file + rename + parent
+    /// directory fsync.
     ///
     /// # Errors
     ///
-    /// Returns [`IndexError`] from the underlying backend's snapshot, or an
-    /// [`IndexError::FormatError`] if called with more than one shard (the
-    /// v2 multi-shard format is not yet implemented).
+    /// Returns [`IndexError::FormatError`] if the secondary backends are not
+    /// the in-memory variants, or if any shard is not an in-memory backend;
+    /// [`IndexError::Io`] on a filesystem failure; and propagates the v1
+    /// delegate's error at one shard.
     pub fn snapshot_all(
         &self,
         dah: &crate::index::DahBackend,
         unmined: &crate::index::UnminedBackend,
         path: &std::path::Path,
     ) -> Result<(), IndexError> {
-        if self.shards.len() != 1 {
+        // One shard: keep the v1 format so the engine's checkpoint snapshots
+        // round-trip through the unchanged `PrimaryBackend::restore_all`.
+        if self.shards.len() == 1 {
+            return self.shards[0].read().snapshot_all(dah, unmined, path);
+        }
+
+        // Multi-shard: build the v2 manifest. Secondary backends must be the
+        // in-memory variants (redb secondaries are self-durable and the v1
+        // `snapshot_all` skips them; we mirror that by requiring InMemory here
+        // so the written sections are well-defined).
+        let (
+            crate::index::DahBackend::InMemory(dah_idx),
+            crate::index::UnminedBackend::InMemory(unmined_idx),
+        ) = (dah, unmined)
+        else {
+            return Err(IndexError::FormatError {
+                detail: "ShardedIndex::snapshot_all v2 requires in-memory dah/unmined backends"
+                    .into(),
+            });
+        };
+
+        let data = self.serialize_v2(dah_idx, unmined_idx)?;
+
+        // Atomic write: temp file + fsync + rename + parent dir fsync, matching
+        // `Index::snapshot_all`.
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &data)?;
+        let f = std::fs::File::open(&tmp_path)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, path)?;
+        crate::index::util::fsync_parent_dir(path)?;
+        Ok(())
+    }
+
+    /// Serialize this index into the v2 N-shard manifest byte layout.
+    ///
+    /// Returns [`IndexError::FormatError`] if any shard is not an in-memory
+    /// backend (the only variant that participates in the in-memory snapshot).
+    fn serialize_v2(&self, dah: &DahIndex, unmined: &UnminedIndex) -> Result<Vec<u8>, IndexError> {
+        let shard_count = self.shards.len();
+
+        // Serialize each shard's primary payload first so we know region sizes.
+        let mut regions: Vec<Vec<u8>> = Vec::with_capacity(shard_count);
+        for (i, shard) in self.shards.iter().enumerate() {
+            let guard = shard.read();
+            let idx = guard
+                .as_in_memory_index()
+                .ok_or_else(|| IndexError::FormatError {
+                    detail: format!(
+                        "ShardedIndex::snapshot_all v2 requires in-memory shards; shard {i} is {}",
+                        guard.backend_name()
+                    ),
+                })?;
+            regions.push(idx.serialize_primary());
+        }
+
+        let region_table_size = shard_count * V2_REGION_ENTRY_SIZE;
+        let regions_start = V2_HEADER_SIZE + region_table_size;
+
+        // Compute absolute offsets for each region.
+        let mut region_offsets: Vec<u64> = Vec::with_capacity(shard_count);
+        let mut cursor = regions_start as u64;
+        for region in &regions {
+            region_offsets.push(cursor);
+            cursor += region.len() as u64;
+        }
+
+        let secondary = crate::index::serialize_secondary_sections(dah, unmined);
+        let total_body: usize =
+            regions_start + regions.iter().map(|r| r.len()).sum::<usize>() + secondary.len();
+
+        let mut buf = Vec::with_capacity(total_body + 4);
+        // Header.
+        buf.extend_from_slice(&V2_MAGIC);
+        buf.extend_from_slice(&V2_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(shard_count as u32).to_le_bytes());
+        buf.extend_from_slice(&self.seed.to_le_bytes());
+        // Region table.
+        for (off, region) in region_offsets.iter().zip(&regions) {
+            buf.extend_from_slice(&off.to_le_bytes());
+            buf.extend_from_slice(&(region.len() as u64).to_le_bytes());
+        }
+        // Shard regions.
+        for region in &regions {
+            buf.extend_from_slice(region);
+        }
+        // Unsharded secondary sections.
+        buf.extend_from_slice(&secondary);
+        // Trailing CRC32 over everything above.
+        let checksum = crc32fast::hash(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        Ok(buf)
+    }
+
+    /// Restore a sharded in-memory index from a snapshot at `path`, targeting
+    /// `target_shard_count` shards.
+    ///
+    /// Dispatches on the snapshot's leading magic:
+    ///
+    /// - **v2 manifest** (`TSX2`) whose `shard_count == clamp(target_shard_count)`:
+    ///   each region is restored directly into its shard and the persisted seed
+    ///   is reinstalled, so [`Self::index_shard_for_key`] maps every key back to
+    ///   its region — no rehash beyond the per-shard table restore.
+    /// - **v2 manifest with a mismatched shard count**, or a **v1 single-table
+    ///   snapshot** (`TSIX`): RE-SHARD. Every entry is read out and `register`ed
+    ///   into the shard the *target* [`Self::index_shard_for_key`] selects under
+    ///   a fresh process seed.
+    /// - **unknown magic, or `TSX2` with an unsupported version**: fail closed
+    ///   with [`IndexError::FormatError`] — never guess, never panic.
+    ///
+    /// The dah/unmined secondary indexes are returned unsharded, restored
+    /// exactly as the v1 path does (independent-section recovery via
+    /// [`crate::index::parse_secondary_sections`]).
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Io`] if the file cannot be read; [`IndexError::FormatError`]
+    /// on an unknown/short/corrupt manifest or unsupported version;
+    /// [`IndexError::ChecksumMismatch`] if the v2 trailer CRC fails; and any
+    /// error propagated from the underlying primary restore.
+    pub fn restore_all(
+        path: &std::path::Path,
+        target_shard_count: usize,
+    ) -> Result<(Self, DahIndex, UnminedIndex, RestoreFlags), IndexError> {
+        let data = std::fs::read(path)?;
+        if data.len() < 4 {
             return Err(IndexError::FormatError {
                 detail: format!(
-                    "ShardedIndex::snapshot_all requires the v2 N-shard format \
-                     for shard_count > 1 (have {}); not yet implemented",
-                    self.shards.len()
+                    "snapshot too small ({} bytes) to contain a magic",
+                    data.len()
                 ),
             });
         }
-        self.shards[0].read().snapshot_all(dah, unmined, path)
+        let magic = &data[0..4];
+        if magic == V2_MAGIC {
+            Self::restore_v2(&data, target_shard_count)
+        } else if magic == crate::index::PRIMARY_SNAPSHOT_MAGIC {
+            // v1 single-table snapshot: load via the existing path, then
+            // re-shard every entry into the target layout.
+            let (index, dah, unmined, flags) = Index::restore_all(path)?;
+            let sharded = Self::reshard_from_index(&index, target_shard_count)?;
+            Ok((sharded, dah, unmined, flags))
+        } else {
+            Err(IndexError::FormatError {
+                detail: format!(
+                    "unknown index snapshot magic {magic:?}; expected v2 {V2_MAGIC:?} or \
+                     v1 {:?}",
+                    crate::index::PRIMARY_SNAPSHOT_MAGIC
+                ),
+            })
+        }
+    }
+
+    /// Parse and restore a v2 N-shard manifest from `data`.
+    fn restore_v2(
+        data: &[u8],
+        target_shard_count: usize,
+    ) -> Result<(Self, DahIndex, UnminedIndex, RestoreFlags), IndexError> {
+        if data.len() < V2_HEADER_SIZE + 4 {
+            return Err(IndexError::FormatError {
+                detail: format!(
+                    "v2 snapshot too small ({} bytes) for header + crc",
+                    data.len()
+                ),
+            });
+        }
+        // Magic already matched by the caller; check the version.
+        let version = u32::from_le_bytes(arr4(&data[4..8]));
+        if version != V2_VERSION {
+            return Err(IndexError::FormatError {
+                detail: format!("unsupported v2 snapshot version {version}; expected {V2_VERSION}"),
+            });
+        }
+        let shard_count = u32::from_le_bytes(arr4(&data[8..12])) as usize;
+        if shard_count == 0 || shard_count > V2_MAX_SHARD_COUNT {
+            return Err(IndexError::FormatError {
+                detail: format!(
+                    "v2 snapshot shard_count {shard_count} out of range (1..={V2_MAX_SHARD_COUNT})"
+                ),
+            });
+        }
+        let seed = u64::from_le_bytes(arr8(&data[12..20]));
+
+        // Verify the trailing CRC over the whole file (minus the 4-byte CRC).
+        let body_end = data.len() - 4;
+        let stored_crc = u32::from_le_bytes(arr4(&data[body_end..]));
+        let computed_crc = crc32fast::hash(&data[..body_end]);
+        if stored_crc != computed_crc {
+            return Err(IndexError::ChecksumMismatch {
+                expected: stored_crc,
+                actual: computed_crc,
+            });
+        }
+
+        // Region table.
+        let region_table_size = shard_count
+            .checked_mul(V2_REGION_ENTRY_SIZE)
+            .ok_or_else(|| IndexError::FormatError {
+                detail: "v2 region table size overflows usize".into(),
+            })?;
+        let regions_start = V2_HEADER_SIZE
+            .checked_add(region_table_size)
+            .ok_or_else(|| IndexError::FormatError {
+                detail: "v2 regions start overflows usize".into(),
+            })?;
+        if body_end < regions_start {
+            return Err(IndexError::FormatError {
+                detail: "v2 snapshot truncated before region table end".into(),
+            });
+        }
+
+        let mut region_bounds: Vec<(usize, usize)> = Vec::with_capacity(shard_count);
+        let mut secondary_start = regions_start;
+        for i in 0..shard_count {
+            let base = V2_HEADER_SIZE + i * V2_REGION_ENTRY_SIZE;
+            let off = u64::from_le_bytes(arr8(&data[base..base + 8])) as usize;
+            let len = u64::from_le_bytes(arr8(&data[base + 8..base + 16])) as usize;
+            let end = off
+                .checked_add(len)
+                .ok_or_else(|| IndexError::FormatError {
+                    detail: format!("v2 region {i} offset+len overflows usize"),
+                })?;
+            if off < regions_start || end > body_end {
+                return Err(IndexError::FormatError {
+                    detail: format!(
+                        "v2 region {i} bounds [{off}, {end}) out of range \
+                         [{regions_start}, {body_end})"
+                    ),
+                });
+            }
+            region_bounds.push((off, end));
+            secondary_start = secondary_start.max(end);
+        }
+
+        // Secondary sections live after the last region.
+        let (dah, unmined, flags) =
+            crate::index::parse_secondary_sections(&data[secondary_start..]);
+
+        let target = clamp_shard_count(target_shard_count);
+        if shard_count == target {
+            // Matching count: restore each region directly into its shard and
+            // reinstall the persisted seed so routing matches the layout.
+            let mut backends: Vec<PrimaryBackend> = Vec::with_capacity(shard_count);
+            for &(off, end) in &region_bounds {
+                let (idx, _consumed) = Index::deserialize_primary_with_offset(&data[off..end])?;
+                backends.push(PrimaryBackend::InMemory(idx));
+            }
+            let sharded = Self::from_backends_with_seed(backends, seed);
+            Ok((sharded, dah, unmined, flags))
+        } else {
+            // Mismatched count: re-shard every entry into the target layout
+            // under a fresh process seed.
+            let sharded = Self::new_in_memory(0, target)?;
+            for &(off, end) in &region_bounds {
+                let (idx, _consumed) = Index::deserialize_primary_with_offset(&data[off..end])?;
+                for (key, entry) in idx.iter() {
+                    sharded.register(key, entry)?;
+                }
+            }
+            // Drop interior mutability: `register` took `&self`, but we own
+            // `sharded` here, so returning it by value is fine.
+            Ok((sharded, dah, unmined, flags))
+        }
+    }
+
+    /// Re-shard every entry of an existing single [`Index`] into a fresh
+    /// `target_shard_count`-shard in-memory index (the v1 → v2 load path).
+    fn reshard_from_index(index: &Index, target_shard_count: usize) -> Result<Self, IndexError> {
+        let sharded = Self::new_in_memory(index.len().max(1), target_shard_count)?;
+        for (key, entry) in index.iter() {
+            sharded.register(key, entry)?;
+        }
+        Ok(sharded)
     }
 
     /// Test-only: arm a synthetic read failure on every shard's backend.
@@ -779,10 +1131,12 @@ mod tests {
         }
     }
 
-    /// At one shard, `snapshot_all` produces a snapshot that restores to the
-    /// same contents; the multi-shard case fails closed (v2 format is Task 4).
+    /// At one shard, `snapshot_all` produces a v1 snapshot that the unchanged
+    /// `PrimaryBackend::restore_all` reads back to the same contents. At more
+    /// than one shard it now writes the v2 manifest (Task 4) which round-trips
+    /// through `ShardedIndex::restore_all`.
     #[test]
-    fn from_single_snapshot_roundtrips_and_multishard_fails_closed() {
+    fn from_single_snapshot_roundtrips_and_multishard_uses_v2() {
         use crate::index::{DahBackend, DahIndex, UnminedBackend, UnminedIndex};
 
         let dir = std::env::temp_dir().join(format!(
@@ -813,13 +1167,24 @@ mod tests {
             assert_eq!(e.record_offset, i * 2, "restored offset wrong for key {i}");
         }
 
-        // Multi-shard snapshot must fail closed (Task 4 implements v2).
+        // Multi-shard snapshot now writes v2 and round-trips through the
+        // sharded restore (the pre-Task-4 fail-closed expectation is gone).
+        let ms_path = dir.join("snapshot-ms.bin");
         let multishard = ShardedIndex::new_in_memory(1000, 4).unwrap();
-        let err = multishard.snapshot_all(&dah, &unmined, &path);
-        assert!(
-            matches!(err, Err(IndexError::FormatError { .. })),
-            "multi-shard snapshot must fail closed, got {err:?}"
-        );
+        for i in 0..150u64 {
+            multishard.register(make_key(i), make_entry(i * 2)).unwrap();
+        }
+        multishard.snapshot_all(&dah, &unmined, &ms_path).unwrap();
+        let head = std::fs::read(&ms_path).unwrap();
+        assert_eq!(&head[0..4], &V2_MAGIC, "multi-shard snapshot must be v2");
+        let (ms_restored, _d, _u, _f) = ShardedIndex::restore_all(&ms_path, 4).unwrap();
+        assert_eq!(ms_restored.len(), 150, "v2 multi-shard restore count");
+        for i in 0..150u64 {
+            assert!(
+                ms_restored.lookup(&make_key(i)).is_some(),
+                "v2 multi-shard restore missing key {i}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1432,5 +1797,361 @@ mod tests {
             matches!(err, Err(IndexError::FormatError { .. })),
             "out-of-range shard_idx must return FormatError, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 4: v2 N-shard snapshot + re-shard-on-restore
+    // -----------------------------------------------------------------------
+
+    use crate::index::{DahBackend, DahIndex, UnminedBackend, UnminedIndex};
+    use crate::record::TxFlags;
+
+    /// Collect every `(key, entry)` from a `ShardedIndex` into a txid-keyed map
+    /// for order-agnostic content comparison.
+    fn collect_entries(idx: &ShardedIndex) -> std::collections::HashMap<[u8; 32], TxIndexEntry> {
+        let mut m = std::collections::HashMap::new();
+        idx.for_each(|k, e| {
+            m.insert(k.txid, *e);
+        });
+        m
+    }
+
+    /// Build a populated 16-shard index plus matching dah/unmined backends with
+    /// a mix of flags so snapshot/restore exercises every field.
+    fn populate_dah_unmined() -> (DahBackend, UnminedBackend) {
+        let mut dah = DahIndex::new();
+        let mut unmined = UnminedIndex::new();
+        for i in 0..40u64 {
+            dah.insert(1000 + i as u32, make_key(i));
+        }
+        for i in 0..25u64 {
+            unmined.insert(2000 + i as u32, make_key(i + 100));
+        }
+        (DahBackend::InMemory(dah), UnminedBackend::InMemory(unmined))
+    }
+
+    /// Test 1: a v2 N=16 snapshot round-trips — every key lands back in its own
+    /// shard, dah/unmined match, and per-entry flags (CONFLICTING /
+    /// HAS_PRESERVE_UNTIL) are preserved.
+    #[test]
+    fn v2_roundtrip_n16() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.snap");
+
+        let sharded = ShardedIndex::new_in_memory(4000, 16).unwrap();
+        assert_eq!(sharded.shard_count(), 16);
+
+        // Register a spread of keys; vary flags so the bits are non-trivial.
+        for i in 0..2000u64 {
+            let mut entry = make_entry(i * 7 + 1);
+            if i % 5 == 0 {
+                entry.tx_flags |= TxFlags::CONFLICTING.bits();
+            }
+            if i % 7 == 0 {
+                entry.tx_flags |= TxFlags::HAS_PRESERVE_UNTIL.bits();
+                entry.dah_or_preserve = 5_000 + i as u32;
+            }
+            sharded.register(make_key(i), entry).unwrap();
+        }
+
+        let before = collect_entries(&sharded);
+        // Record which shard each key was in so we can assert the layout
+        // survives a matching-count restore.
+        let shard_of: std::collections::HashMap<[u8; 32], usize> = before
+            .keys()
+            .map(|txid| (*txid, sharded.index_shard_for_key(&TxKey { txid: *txid })))
+            .collect();
+
+        let (dah, unmined) = populate_dah_unmined();
+        sharded.snapshot_all(&dah, &unmined, &path).unwrap();
+
+        // File must start with the v2 magic, NOT the v1 magic.
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(&head[0..4], &V2_MAGIC, "multi-shard snapshot must be v2");
+
+        let (restored, rdah, runmined, flags) = ShardedIndex::restore_all(&path, 16).unwrap();
+        assert!(!flags.dah_needs_rebuild && !flags.unmined_needs_rebuild);
+        assert_eq!(restored.shard_count(), 16);
+
+        // Identical contents.
+        let after = collect_entries(&restored);
+        assert_eq!(after, before, "restored entry set must equal the original");
+
+        // Every key must be findable AND in the SAME shard as before (the
+        // persisted seed makes routing consistent with the region layout).
+        for (txid, &shard) in &shard_of {
+            let key = TxKey { txid: *txid };
+            assert!(
+                restored.lookup(&key).is_some(),
+                "key {txid:?} missing after restore"
+            );
+            assert_eq!(
+                restored.index_shard_for_key(&key),
+                shard,
+                "key {txid:?} moved shard across matching-count restore"
+            );
+        }
+
+        // Secondary indexes match.
+        assert_eq!(rdah.len(), 40, "dah entry count must survive");
+        assert_eq!(runmined.len(), 25, "unmined entry count must survive");
+        assert_eq!(
+            rdah.range_query(1039).len(),
+            40,
+            "all dah heights must be queryable"
+        );
+        assert_eq!(
+            runmined.range_query(2024).len(),
+            25,
+            "all unmined heights must be queryable"
+        );
+    }
+
+    /// Test 2: re-shard 8 → 16. Snapshot at N=8, restore at N=16; every entry
+    /// must be present and live in the shard `index_shard_for_key` picks under
+    /// the N=16 instance.
+    #[test]
+    fn v2_reshard_8_to_16() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-8.snap");
+
+        let src = ShardedIndex::new_in_memory(4000, 8).unwrap();
+        assert_eq!(src.shard_count(), 8);
+        for i in 0..1500u64 {
+            src.register(make_key(i), make_entry(i * 3 + 2)).unwrap();
+        }
+        let before = collect_entries(&src);
+
+        let (dah, unmined) = populate_dah_unmined();
+        src.snapshot_all(&dah, &unmined, &path).unwrap();
+
+        let (restored, _rdah, _runmined, _flags) = ShardedIndex::restore_all(&path, 16).unwrap();
+        assert_eq!(
+            restored.shard_count(),
+            16,
+            "restore must honour target N=16"
+        );
+
+        // All entries present and identical.
+        let after = collect_entries(&restored);
+        assert_eq!(after, before, "every entry must survive the re-shard");
+
+        // Each key sits in the shard the N=16 router selects, and lookup finds
+        // it there.
+        for txid in before.keys() {
+            let key = TxKey { txid: *txid };
+            let shard = restored.index_shard_for_key(&key);
+            assert!(shard < 16, "shard index {shard} out of range for N=16");
+            assert!(
+                restored.lookup(&key).is_some(),
+                "key {txid:?} not found after re-shard to N=16"
+            );
+        }
+    }
+
+    /// Test 3a: a genuine v1 single-table snapshot (written by `Index::snapshot_all`)
+    /// loads through `ShardedIndex::restore_all`, re-sharding every entry into
+    /// the N=16 layout.
+    #[test]
+    fn v1_single_table_loads_and_reshards_to_16() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.snap");
+
+        // Produce a real v1 snapshot via the single-table Index path.
+        let mut idx = Index::new(2000).unwrap();
+        let mut expected: std::collections::HashMap<[u8; 32], TxIndexEntry> =
+            std::collections::HashMap::new();
+        for i in 0..1000u64 {
+            let key = make_key(i);
+            let entry = make_entry(i * 11 + 4);
+            idx.register(key, entry).unwrap();
+            expected.insert(key.txid, entry);
+        }
+        let mut dah = DahIndex::new();
+        dah.insert(123, make_key(1));
+        dah.insert(456, make_key(2));
+        let mut unmined = UnminedIndex::new();
+        unmined.insert(789, make_key(3));
+        idx.snapshot_all(&dah, &unmined, &path).unwrap();
+
+        // Sanity: it really is a v1 file (TSIX magic).
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &head[0..4],
+            &crate::index::PRIMARY_SNAPSHOT_MAGIC,
+            "fixture must be a v1 TSIX snapshot"
+        );
+
+        let (restored, rdah, runmined, flags) = ShardedIndex::restore_all(&path, 16).unwrap();
+        assert!(!flags.dah_needs_rebuild && !flags.unmined_needs_rebuild);
+        assert_eq!(restored.shard_count(), 16, "v1 load must target N=16");
+
+        // Every v1 entry must be present in the correct N=16 shard.
+        let after = collect_entries(&restored);
+        assert_eq!(after, expected, "v1 entries must all load");
+        for txid in expected.keys() {
+            let key = TxKey { txid: *txid };
+            assert!(
+                restored.lookup(&key).is_some(),
+                "v1 key {txid:?} missing after re-shard"
+            );
+        }
+        assert_eq!(rdah.len(), 2, "v1 dah must survive");
+        assert_eq!(runmined.len(), 1, "v1 unmined must survive");
+    }
+
+    /// Test 3b: the v1 magic is explicitly recognised by `restore_all` (it does
+    /// not fall into the unknown-magic fail-closed branch).
+    #[test]
+    fn v1_magic_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-tiny.snap");
+
+        let mut idx = Index::new(16).unwrap();
+        idx.register(make_key(1), make_entry(64)).unwrap();
+        idx.snapshot_all(&DahIndex::new(), &UnminedIndex::new(), &path)
+            .unwrap();
+
+        // Restoring at a single shard exercises the v1 recognition path
+        // (target N=1 == clamp(1)); the result must NOT be an error.
+        let result = ShardedIndex::restore_all(&path, 1);
+        let (restored, _d, _u, _f) = result.expect("v1 snapshot must be recognised, not rejected");
+        assert_eq!(restored.len(), 1, "the single v1 entry must load");
+        assert!(restored.lookup(&make_key(1)).is_some());
+    }
+
+    /// Test 4: an unknown magic and an unsupported v2 version both fail closed
+    /// with `FormatError` (never panic, never guess).
+    #[test]
+    fn restore_all_fails_closed_on_unknown_format() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) Garbage magic.
+        let bad_path = dir.path().join("garbage.snap");
+        std::fs::write(&bad_path, b"NOPEnot-a-real-snapshot-payload").unwrap();
+        match ShardedIndex::restore_all(&bad_path, 16) {
+            Err(IndexError::FormatError { detail }) => {
+                assert!(
+                    detail.contains("unknown index snapshot magic"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            Err(other) => panic!("unknown magic must fail closed with FormatError, got {other:?}"),
+            Ok(_) => panic!("unknown magic must not restore successfully"),
+        }
+
+        // (b) A real v2 snapshot whose version byte is bumped to an unsupported
+        //     value (and CRC restamped so the version check is the gate).
+        let v2_path = dir.path().join("v2-badver.snap");
+        let sharded = ShardedIndex::new_in_memory(500, 4).unwrap();
+        for i in 0..100u64 {
+            sharded.register(make_key(i), make_entry(i * 5)).unwrap();
+        }
+        sharded
+            .snapshot_all(
+                &DahBackend::InMemory(DahIndex::new()),
+                &UnminedBackend::InMemory(UnminedIndex::new()),
+                &v2_path,
+            )
+            .unwrap();
+        let mut data = std::fs::read(&v2_path).unwrap();
+        // version lives at bytes [4..8]; set it to an unsupported value.
+        data[4..8].copy_from_slice(&(V2_VERSION + 99).to_le_bytes());
+        // Restamp the trailing CRC so the version check (not the CRC) is hit.
+        let end = data.len() - 4;
+        let crc = crc32fast::hash(&data[..end]);
+        data[end..].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&v2_path, &data).unwrap();
+
+        match ShardedIndex::restore_all(&v2_path, 4) {
+            Err(IndexError::FormatError { detail }) => {
+                assert!(
+                    detail.contains("unsupported v2 snapshot version"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            Err(other) => panic!("unsupported v2 version must fail closed, got {other:?}"),
+            Ok(_) => panic!("unsupported v2 version must not restore successfully"),
+        }
+
+        // (c) A v2 snapshot with a corrupted body byte must fail the trailing
+        //     CRC (ChecksumMismatch), not panic.
+        let v2_corrupt = dir.path().join("v2-corrupt.snap");
+        sharded
+            .snapshot_all(
+                &DahBackend::InMemory(DahIndex::new()),
+                &UnminedBackend::InMemory(UnminedIndex::new()),
+                &v2_corrupt,
+            )
+            .unwrap();
+        let mut data = std::fs::read(&v2_corrupt).unwrap();
+        let mid = data.len() / 2;
+        data[mid] ^= 0xFF;
+        std::fs::write(&v2_corrupt, &data).unwrap();
+        match ShardedIndex::restore_all(&v2_corrupt, 4) {
+            Err(IndexError::ChecksumMismatch { .. }) => {}
+            Err(other) => panic!("corrupt v2 body must yield ChecksumMismatch, got {other:?}"),
+            Ok(_) => panic!("corrupt v2 body must not restore successfully"),
+        }
+    }
+
+    /// Test 5: the engine still runs at one shard and `snapshot_all` at N=1
+    /// produces a v1 (`TSIX`) snapshot that round-trips through BOTH the
+    /// unchanged `PrimaryBackend::restore_all` (the engine/checkpoint path) and
+    /// the new `ShardedIndex::restore_all`.
+    #[test]
+    fn n1_snapshot_is_v1_and_roundtrips_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("n1.snap");
+
+        let sharded = ShardedIndex::from_single(PrimaryBackend::new_in_memory(2000).unwrap());
+        assert_eq!(sharded.shard_count(), 1);
+        for i in 0..500u64 {
+            sharded
+                .register(make_key(i), make_entry(i * 9 + 3))
+                .unwrap();
+        }
+        let before = collect_entries(&sharded);
+
+        let mut dah = DahIndex::new();
+        dah.insert(11, make_key(1));
+        let mut unmined = UnminedIndex::new();
+        unmined.insert(22, make_key(2));
+        sharded
+            .snapshot_all(
+                &DahBackend::InMemory(dah),
+                &UnminedBackend::InMemory(unmined),
+                &path,
+            )
+            .unwrap();
+
+        // N=1 must be the v1 format so the engine/checkpoint path keeps reading.
+        let head = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &head[0..4],
+            &crate::index::PRIMARY_SNAPSHOT_MAGIC,
+            "N=1 snapshot must be v1 TSIX"
+        );
+
+        // Path A: the unchanged PrimaryBackend restore.
+        let (pb, pb_dah, pb_unmined, _flags) = PrimaryBackend::restore_all(&path).unwrap();
+        assert_eq!(
+            pb.len(),
+            500,
+            "PrimaryBackend::restore_all must read N=1 v1"
+        );
+        assert_eq!(pb_dah.len(), 1);
+        assert_eq!(pb_unmined.len(), 1);
+        for txid in before.keys() {
+            assert!(
+                pb.lookup(&TxKey { txid: *txid }).is_some(),
+                "PrimaryBackend restore missing key {txid:?}"
+            );
+        }
+
+        // Path B: the sharded restore (v1 recognition → re-shard at target).
+        let (restored, _d, _u, _f) = ShardedIndex::restore_all(&path, 1).unwrap();
+        let after = collect_entries(&restored);
+        assert_eq!(after, before, "ShardedIndex restore of N=1 v1 must match");
     }
 }

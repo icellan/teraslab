@@ -6590,11 +6590,16 @@ impl Engine {
     /// Returns [`crate::index::IndexError`] on I/O failure or if the snapshot
     /// directory is not writable.
     pub fn snapshot_index(&self, path: &std::path::Path) -> crate::index::Result<()> {
+        // lock order: dah -> unmined -> shard.read, inverted vs set_cached_fields;
+        // safe only because checkpoint holds dispatch_visibility_barrier.write()
         let dah = self.dah_index.lock();
         let unmined = self.unmined_index.lock();
-        // At one shard this delegates to the single backend's `snapshot_all`,
-        // producing a byte-for-byte identical snapshot to the pre-sharding
-        // engine. The v2 N-shard snapshot format lands in a later task.
+        // `ShardedIndex::snapshot_all` writes the v1 (`TSIX`) format at one
+        // shard — byte-for-byte identical to the pre-sharding engine, so the
+        // existing `PrimaryBackend::restore_all` checkpoint path keeps reading
+        // it — and the v2 N-shard manifest at more than one shard. The engine
+        // currently runs at one shard, so this stays on the v1 path until the
+        // shard count is wired through config in a later task.
         self.index.snapshot_all(&dah, &unmined, path)
     }
 

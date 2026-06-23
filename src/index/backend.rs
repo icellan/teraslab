@@ -392,6 +392,20 @@ impl PrimaryBackend {
     // Snapshot / restore
     // -----------------------------------------------------------------------
 
+    /// Borrow the inner in-memory [`Index`] if this is the `InMemory` variant.
+    ///
+    /// Returns `None` for the `OnDisk` (redb) and `FileBacked` variants, which
+    /// are self-persistent and never participate in the in-memory snapshot
+    /// path. Exposed to the crate so the v2 sharded snapshot
+    /// ([`crate::index::sharded::ShardedIndex::snapshot_all`]) can serialize
+    /// each shard's primary payload region.
+    pub(crate) fn as_in_memory_index(&self) -> Option<&Index> {
+        match self {
+            Self::InMemory(idx) => Some(idx),
+            Self::OnDisk(_) | Self::FileBacked(_) => None,
+        }
+    }
+
     /// Snapshot the primary index to a file.
     ///
     /// For the redb backend, this is a no-op (redb is already crash-durable).

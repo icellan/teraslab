@@ -70,6 +70,12 @@ pub type Result<T> = std::result::Result<T, IndexError>;
 const SNAPSHOT_MAGIC: [u8; 4] = *b"TSIX"; // TeraSlab IndeX
 const SNAPSHOT_VERSION: u32 = 1;
 
+/// First four bytes of a v1 single-table primary snapshot. Re-exported to the
+/// crate so the sharded snapshot layer ([`crate::index::sharded`]) can
+/// distinguish a v1 snapshot (loaded via the re-shard path) from a v2 N-shard
+/// manifest without duplicating the literal.
+pub(crate) const PRIMARY_SNAPSHOT_MAGIC: [u8; 4] = SNAPSHOT_MAGIC;
+
 const DAH_SECTION_MAGIC: [u8; 4] = *b"DAHI";
 const UNMINED_SECTION_MAGIC: [u8; 4] = *b"UNMI";
 const SECONDARY_VERSION: u32 = 1;
@@ -555,51 +561,7 @@ impl Index {
     ) -> Result<(Self, DahIndex, UnminedIndex, RestoreFlags)> {
         let data = std::fs::read(path)?;
         let (index, primary_end) = Self::deserialize_primary_with_offset(&data)?;
-
-        let mut flags = RestoreFlags::default();
-        let mut dah = DahIndex::new();
-        let mut unmined = UnminedIndex::new();
-
-        let remaining = &data[primary_end..];
-
-        // Attempt DAH section parse at the expected offset (right after
-        // primary). On success we know where unmined begins. On failure we
-        // fall back to a targeted scan for the unmined section magic.
-        let (dah_ok, unmined_slice): (bool, &[u8]) =
-            match deserialize_secondary(remaining, &DAH_SECTION_MAGIC) {
-                Ok((entries, consumed)) => {
-                    for (h, k) in entries {
-                        dah.insert(h, k);
-                    }
-                    (true, &remaining[consumed..])
-                }
-                Err(_) => {
-                    flags.dah_needs_rebuild = true;
-                    // DAH offset is unknown; locate unmined by scanning for
-                    // its magic marker. Because magic bytes can in theory
-                    // appear inside DAH payload data, the first match with
-                    // a successfully-parsable header is preferred; if no
-                    // candidate parses cleanly, unmined is also flagged.
-                    (false, locate_unmined_section(remaining))
-                }
-            };
-
-        // Parse unmined section from the located slice (or continue after
-        // DAH in the happy path).
-        match deserialize_secondary(unmined_slice, &UNMINED_SECTION_MAGIC) {
-            Ok((entries, _)) => {
-                for (h, k) in entries {
-                    unmined.insert(h, k);
-                }
-            }
-            Err(_) => {
-                flags.unmined_needs_rebuild = true;
-            }
-        }
-
-        // Suppress unused-variable lint when both succeed.
-        let _ = dah_ok;
-
+        let (dah, unmined, flags) = parse_secondary_sections(&data[primary_end..]);
         Ok((index, dah, unmined, flags))
     }
 
@@ -813,7 +775,15 @@ impl Index {
     // Serialization helpers
     // -----------------------------------------------------------------------
 
-    fn serialize_primary(&self) -> Vec<u8> {
+    /// Serialize ONLY the primary index (no secondary sections) into the v1
+    /// `[magic][version][count][capacity][entries…][crc32]` byte layout.
+    ///
+    /// Exposed to the crate so the sharded snapshot layer can embed one full
+    /// primary payload per shard inside the v2 N-shard manifest. The bytes are
+    /// byte-for-byte identical to what [`Index::snapshot`] writes for a
+    /// single table, so they round-trip through
+    /// [`Index::deserialize_primary_with_offset`].
+    pub(crate) fn serialize_primary(&self) -> Vec<u8> {
         let count = self.table.len() as u64;
         let capacity = self.table.capacity() as u64;
         let header_size = 4 + 4 + 8 + 8; // magic + version + count + capacity
@@ -849,7 +819,16 @@ impl Index {
         Ok(index)
     }
 
-    fn deserialize_primary_with_offset(data: &[u8]) -> Result<(Self, usize)> {
+    /// Deserialize a v1 primary payload from the front of `data`, returning the
+    /// rebuilt [`Index`] and the number of bytes consumed (so a caller can
+    /// continue parsing trailing sections, e.g. the per-shard regions of a v2
+    /// manifest or the dah/unmined sections of a v1 `snapshot_all`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::FormatError`] on a bad magic/version/size and
+    /// [`IndexError::ChecksumMismatch`] on a CRC failure.
+    pub(crate) fn deserialize_primary_with_offset(data: &[u8]) -> Result<(Self, usize)> {
         let header_size = 4 + 4 + 8 + 8;
         if data.len() < header_size + 4 {
             return Err(IndexError::FormatError {
@@ -996,6 +975,67 @@ fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKe
     let checksum = crc32fast::hash(&buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
     buf
+}
+
+/// Serialize the DAH + unmined secondary sections into the exact byte layout
+/// that [`Index::snapshot_all`] appends after the primary payload (a `DAHI`
+/// section followed by a `UNMI` section). Exposed to the crate so the v2
+/// sharded manifest can write the (unsharded) secondaries once, identically to
+/// the single-table path, and have them round-trip through
+/// [`parse_secondary_sections`].
+pub(crate) fn serialize_secondary_sections(dah: &DahIndex, unmined: &UnminedIndex) -> Vec<u8> {
+    let mut buf = serialize_secondary(&DAH_SECTION_MAGIC, dah.iter());
+    buf.extend_from_slice(&serialize_secondary(&UNMINED_SECTION_MAGIC, unmined.iter()));
+    buf
+}
+
+/// Parse the DAH + unmined secondary sections from `data` (the bytes that
+/// follow the primary payload), reproducing the independent-section recovery
+/// of [`Index::restore_all`]:
+///
+/// - The DAH section is parsed at the front of `data`. If it is corrupt,
+///   `dah_needs_rebuild` is set and the unmined section is located by scanning
+///   for its magic (so a corrupt DAH section never hides an intact unmined
+///   one).
+/// - The unmined section is parsed from immediately after the DAH section (the
+///   happy path) or from the located offset. A corrupt/missing unmined section
+///   sets `unmined_needs_rebuild`.
+///
+/// Shared by the v1 [`Index::restore_all`] path and the v2 sharded restore so
+/// the secondary-index recovery semantics stay identical across formats.
+pub(crate) fn parse_secondary_sections(data: &[u8]) -> (DahIndex, UnminedIndex, RestoreFlags) {
+    let mut flags = RestoreFlags::default();
+    let mut dah = DahIndex::new();
+    let mut unmined = UnminedIndex::new();
+
+    // Attempt DAH section parse at the expected offset (right after primary).
+    // On success we know where unmined begins. On failure we fall back to a
+    // targeted scan for the unmined section magic.
+    let unmined_slice: &[u8] = match deserialize_secondary(data, &DAH_SECTION_MAGIC) {
+        Ok((entries, consumed)) => {
+            for (h, k) in entries {
+                dah.insert(h, k);
+            }
+            &data[consumed..]
+        }
+        Err(_) => {
+            flags.dah_needs_rebuild = true;
+            locate_unmined_section(data)
+        }
+    };
+
+    match deserialize_secondary(unmined_slice, &UNMINED_SECTION_MAGIC) {
+        Ok((entries, _)) => {
+            for (h, k) in entries {
+                unmined.insert(h, k);
+            }
+        }
+        Err(_) => {
+            flags.unmined_needs_rebuild = true;
+        }
+    }
+
+    (dah, unmined, flags)
 }
 
 /// Scan the provided slice for a byte window that begins with the unmined
