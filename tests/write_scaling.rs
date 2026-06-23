@@ -4,6 +4,7 @@
 //! assertion (8 clients >= N x 1 client) is enabled once the write path is
 //! parallelized (plan Task 2c). The heavy multi-client run is gated behind
 //! the `slow-tests` feature; a small smoke runs per-PR.
+#![allow(clippy::disallowed_macros)] // integration tests may use println! for diagnostics
 
 mod common;
 use common::*;

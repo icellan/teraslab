@@ -15,6 +15,7 @@
 //! jitter — both present equally in control and burst — while still catching
 //! gross re-coupling. On a real fsync device the burst-vs-control gap would be
 //! hundreds of milliseconds to seconds, so this bound remains meaningful there.
+#![allow(clippy::disallowed_macros)] // integration tests may use println! for diagnostics
 
 mod common;
 use common::*;
