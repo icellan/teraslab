@@ -166,6 +166,16 @@ func (p *connPool) checkHealth() {
 			dead[c] = struct{}{}
 			continue
 		}
+		// Skip connections with in-flight requests: they are demonstrably in
+		// active use, so a liveness probe is unnecessary, and — critically —
+		// under load the ping response queues behind the in-flight work and can
+		// exceed the timeout, producing a false "dead" verdict that would close
+		// the connection and abort those legitimate requests with "connection
+		// closed" (the server then sees a broken pipe writing the response). A
+		// genuinely failed connection surfaces via its own read/write path.
+		if c.hasInflight() {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), p.config.DialTimeout)
 		resp, err := c.roundTrip(ctx, OpPing, 0, nil)
 		cancel()
@@ -177,10 +187,13 @@ func (p *connPool) checkHealth() {
 	}
 
 	p.mu.Lock()
-	// Remove dead/unresponsive connections.
+	// Remove dead/unresponsive connections, but never force-close one that has
+	// in-flight requests — closing aborts them mid-flight. Keep it and let the
+	// next cycle re-probe once its requests drain.
 	alive := p.conns[:0]
 	for _, c := range p.conns {
-		if _, isDead := dead[c]; isDead || !c.alive() {
+		_, isDead := dead[c]
+		if (isDead || !c.alive()) && !c.hasInflight() {
 			c.close()
 		} else {
 			alive = append(alive, c)
