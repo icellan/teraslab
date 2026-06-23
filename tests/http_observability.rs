@@ -230,6 +230,29 @@ fn ws_handshake(port: u16, path: &str, extra_headers: &str) -> (u16, String) {
     (status_code, response)
 }
 
+/// Minimal, dependency-free base64url (no padding) encoder for the WS
+/// subprotocol auth tests. Mirrors the `TextEncoder` + `btoa` + url-safe
+/// transform the UI performs in `b64urlToken` (ui/app.js).
+fn b64url_nopad(input: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
 #[test]
 fn metrics_returns_prometheus_text_format() {
     let (port, _state) = start_test_http_server();
@@ -957,6 +980,67 @@ fn ws_top_auth_via_subprotocol() {
     // No token transport at all → 401.
     let (status, _) = ws_handshake(port, "/ws/top", "");
     assert_eq!(status, 401, "no token transport at all must 401");
+}
+
+/// `admin_token` is recommended (docs/DEPLOYMENT_ASSUMPTIONS.md) to be
+/// `openssl rand -base64` output, which contains `+ / =` — illegal in a raw
+/// WebSocket subprotocol token, so `new WebSocket(url, ['Bearer.<token>'])`
+/// would throw in the browser and live metrics would never connect. The UI
+/// therefore base64url-wraps the token as `Bearer64.<...>`; the server
+/// decodes it and compares the same bytes. This must upgrade for valid
+/// tokens, reject wrong tokens, and never panic on malformed base64.
+#[test]
+fn ws_top_auth_via_base64_subprotocol_handles_token_grammar_unsafe_chars() {
+    // Shaped like `openssl rand -base64` output: '+', '/', '=' present.
+    let token = "Aa0+bb/cc1+dd/ee2==";
+    assert!(token.len() >= 16);
+    let (port, _state) = start_test_http_server_with_admin(true, Some(token.to_string()));
+
+    let good = format!(
+        "Sec-WebSocket-Protocol: teraslab.v1, Bearer64.{}\r\n",
+        b64url_nopad(token.as_bytes())
+    );
+    let (status, resp) = ws_handshake(port, "/ws/top", &good);
+    assert_eq!(
+        status, 101,
+        "base64url-wrapped token must upgrade (101); response was:\n{resp}",
+    );
+    assert!(
+        resp.to_lowercase()
+            .contains("sec-websocket-protocol: teraslab.v1"),
+        "101 response must still echo teraslab.v1; response was:\n{resp}",
+    );
+
+    let bad = format!(
+        "Sec-WebSocket-Protocol: teraslab.v1, Bearer64.{}\r\n",
+        b64url_nopad(b"some-other-token-value")
+    );
+    let (status, _) = ws_handshake(port, "/ws/top", &bad);
+    assert_eq!(status, 401, "wrong base64url-wrapped token must 401");
+
+    // Malformed base64 in the Bearer64 entry must fail closed (401), never
+    // 500/panic/hang.
+    let (status, _) = ws_handshake(
+        port,
+        "/ws/top",
+        "Sec-WebSocket-Protocol: teraslab.v1, Bearer64.@@@not-base64@@@\r\n",
+    );
+    assert_eq!(status, 401, "malformed base64 must 401, not crash");
+}
+
+/// A `Sec-WebSocket-Protocol` header carrying non-ASCII bytes must be
+/// rejected gracefully (401), never panic the server on a sub-codepoint
+/// slice. (`HeaderValue::to_str` already rejects non-ASCII, but the parser
+/// is also slice-panic-proof as defense in depth.)
+#[test]
+fn ws_top_auth_non_ascii_subprotocol_does_not_crash() {
+    let (port, _state) = start_test_http_server();
+    let (status, _) = ws_handshake(
+        port,
+        "/ws/top",
+        "Sec-WebSocket-Protocol: \u{00e9}Bearer.tok\r\n",
+    );
+    assert_eq!(status, 401, "non-ASCII subprotocol must 401, not crash");
 }
 
 /// The `Authorization: Bearer` path must keep working for `/ws/top` so

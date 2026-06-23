@@ -53,6 +53,11 @@ slow-tests = []
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
+# base64url decode for the `/ws/top` Sec-WebSocket-Protocol auth path: the UI
+# base64url-wraps the admin token (`Bearer64.<...>`) because the recommended
+# `openssl rand -base64` token contains `+ / =`, which are illegal in a raw
+# WebSocket subprotocol. Already in the tree transitively via axum.
+base64 = "0.22"
 bitflags = "2"
 # Zero-copy byte buffer for the wire-protocol frame decoder. Already a
 # transitive dep via tokio/axum; promoting to a direct dep makes the

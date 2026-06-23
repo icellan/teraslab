@@ -44,6 +44,18 @@
         if (t) h['Authorization'] = 'Bearer ' + t;
         return h;
     }
+    // base64url (no padding) of the token's UTF-8 bytes. Used for the WS
+    // subprotocol channel: the recommended `openssl rand -base64` admin token
+    // contains '+', '/', '=', which are illegal in a raw WebSocket
+    // subprotocol token (new WebSocket() would throw). base64url uses only
+    // [A-Za-z0-9-_], all valid subprotocol chars. Server decodes it from the
+    // `Bearer64.` prefix (extract_ws_subprotocol_token in src/server/http.rs).
+    function b64urlToken(t) {
+        const utf8 = new TextEncoder().encode(t);
+        let bin = '';
+        for (let i = 0; i < utf8.length; i++) bin += String.fromCharCode(utf8[i]);
+        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
     // Single choke point for every authenticated request: injects the bearer
     // header and surfaces the login prompt on 401 so a missing/rotated token
     // is recoverable without a reload.
@@ -741,10 +753,12 @@
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = proto + '//' + location.host + '/ws/top';
         // Browsers can't set Authorization on a WebSocket handshake, so the
-        // token rides as a second offered subprotocol. The server selects and
-        // echoes the non-secret 'teraslab.v1' marker (see WS_TOP_SUBPROTOCOL /
-        // require_admin_bearer in src/server/http.rs).
-        ws = new WebSocket(url, ['teraslab.v1', 'Bearer.' + getToken()]);
+        // token rides as a second offered subprotocol, base64url-wrapped so any
+        // token (incl. `openssl rand -base64` with +/=) is a valid subprotocol.
+        // The server decodes the Bearer64 entry and echoes the non-secret
+        // 'teraslab.v1' marker (see WS_TOP_SUBPROTOCOL / require_admin_bearer in
+        // src/server/http.rs).
+        ws = new WebSocket(url, ['teraslab.v1', 'Bearer64.' + b64urlToken(getToken())]);
         ws.onopen = () => { store.wsConnected = true; renderCurrentPage(); };
         ws.onmessage = e => {
             store.prevSnapshot = store.topSnapshot;

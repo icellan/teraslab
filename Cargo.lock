@@ -2352,6 +2352,7 @@ name = "teraslab"
 version = "0.5.1"
 dependencies = [
  "axum",
+ "base64",
  "bitflags",
  "bytes",
  "clap",
