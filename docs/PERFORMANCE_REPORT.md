@@ -41,13 +41,14 @@ Run `cargo test --test e2e_workload -- --nocapture perf_` to see numbers.
 
 ## Memory Per Record
 
-- Hash table bucket: 72 bytes (1 occupied + 2 probe_distance + 32 txid + 8 fingerprint + 27 TxIndexEntry + padding)
-- Core index entry (TxIndexEntry): 27 bytes (device_id, record_offset, utxo_count, cold_offset, cold_size, flags)
-- Hash table uses Robin Hood open addressing; at load factor 0.5, total allocated is ~144 bytes per record including empty buckets
+- Hash table bucket: 64 bytes / one cache line (1 probe_distance + 32 txid + 31 TxIndexEntry; `#[repr(C, packed)]`)
+- Core index entry (TxIndexEntry): 31 bytes (device_id, record_offset, utxo_count, block_entry_count, tx_flags, spent_utxos, dah_or_preserve, unmined_since, generation)
+- Hash table uses Robin Hood open addressing; at load factor 0.5, total allocated is ~128 bytes per record including empty buckets
 
 ## Design Targets (from SPEC_BRIEFING.md)
 
-These targets assume production hardware (NVMe SSD, O_DIRECT, io_uring):
+These targets assume production hardware (NVMe SSD, synchronous O_DIRECT
+I/O via `src/device.rs` — the io_uring backend was removed 2026-05-28):
 
 | Metric | Target | Status |
 |--------|--------|--------|
@@ -57,7 +58,7 @@ These targets assume production hardware (NVMe SSD, O_DIRECT, io_uring):
 | SpendMulti (batch 10) | > 200K batches/sec | Requires NVMe benchmark |
 | SetMined throughput | > 500K ops/sec | Requires NVMe benchmark |
 | Create (10 UTXOs) | > 100K ops/sec | Requires NVMe benchmark |
-| Memory per record | < 64 bytes | 72 bytes per bucket (see notes) |
+| Memory per record | < 64 bytes | 64 bytes per bucket / one cache line (see notes) |
 | SSD write amplification | < 10x | Requires NVMe measurement |
 
 ## Correctness Validation

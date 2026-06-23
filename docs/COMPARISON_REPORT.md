@@ -9,9 +9,9 @@
 | Index | In-memory hash (sprigs) | mmap'd hash table with hugepage support |
 | Write path | Log-structured (requires defrag) | Direct-placement with freelist (no defrag) |
 | UTXO logic | Lua UDF on server | Native Rust implementation |
-| Spend I/O | Read full record → Lua → write full record | Read slot (69B) → validate → write 37B slot status + 256B metadata |
+| Spend I/O | Read full record → Lua → write full record | Read slot (73B incl. 4-byte CRC) → validate → write 73B slot + 320B metadata |
 | Replication | Built-in (complex) | Operation-based, purpose-built |
-| Tiered storage | None (all inline) | Inline / separate NVMe / external blob |
+| Tiered storage | None (all inline) | Inline / external blob (separate-NVMe middle tier **not implemented** — see below) |
 
 ## Expected Performance Advantages
 
@@ -22,16 +22,16 @@ The original implementation writes the entire record on every mutation
 transaction with 100 UTXOs:
 
 - **Original**: ~7.5 KB written per spend (full record rewrite)
-- **TeraSlab**: ~37 bytes written per UTXO slot (status + spending data) + 256 bytes metadata
+- **TeraSlab**: ~73 bytes written per UTXO slot (69-byte payload + 4-byte CRC32 footer) + 320 bytes metadata
 
 **Reduction: ~10-30x less SSD wear per spend operation.**
 
 ### Memory Per Record
 
 - **Original**: 64 bytes per record (in-memory index)
-- **TeraSlab**: 72 bytes per hash table bucket (1 occupied + 2 probe_distance + 32 txid + 8 fingerprint + 27 TxIndexEntry + padding). The core index entry (TxIndexEntry) is 27 bytes; the full bucket including Robin Hood metadata and key is 72 bytes.
+- **TeraSlab**: 64 bytes per hash table bucket = 1 probe_distance + 32 txid + 31 TxIndexEntry (one cache line, `#[repr(C, packed)]`). The core index entry (TxIndexEntry) is 31 bytes; the full bucket including the Robin Hood probe byte and key is exactly 64 bytes.
 
-**TeraSlab uses ~72 bytes per bucket including all overhead.** At load factor 0.5 (recommended), effective memory per record is ~144 bytes counting empty buckets. Actual resident memory depends on load factor.
+**TeraSlab uses 64 bytes per bucket (one cache line) including all overhead.** At load factor 0.5 (recommended), effective memory per record is ~128 bytes counting empty buckets. Actual resident memory depends on load factor.
 
 ### Latency
 

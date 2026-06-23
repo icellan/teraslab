@@ -4,16 +4,27 @@ Companion document to `BSV_UTXO_STORE_SPEC.md`. Lists recommended crates for eac
 
 ---
 
-## 1. io_uring
+## 1. Device I/O (io_uring — NOT used)
 
-| Crate | Version | Notes | Recommendation |
-|-------|---------|-------|---------------|
-| **`io-uring`** | 0.7+ | Low-level, thin wrapper over `liburing`. Full control over SQE/CQE lifecycle. No runtime dependency. | **Primary choice** — maximum control for custom batching architecture |
-| `tokio-uring` | 0.5+ | Tokio integration for io_uring. Provides async/await over io_uring ops. | Consider if using Tokio for networking layer |
-| `glommio` | 0.9+ | Thread-per-core runtime built on io_uring. Opinionated architecture. | Too opinionated — conflicts with custom thread model |
-| `nuclei` | 0.4+ | Proactive I/O runtime. Less mature. | Not recommended — insufficient maturity |
+> **Superseded (2026-05-28).** The io_uring backend was evaluated and then
+> removed. The production write path is **synchronous O_DIRECT** I/O via
+> `src/device.rs` (per-connection worker threads issue blocking `pread`/
+> `pwrite` against an O_DIRECT fd or raw device). None of the crates below
+> are dependencies of the shipped server. This section is retained for
+> historical context only.
 
-**Recommendation**: Use **`io-uring`** directly. The custom batching architecture (per-device submission threads, ring buffers, batch coalescing) requires low-level control that higher-level wrappers abstract away. The submission thread draining model described in the spec maps directly to `io-uring`'s API.
+| Crate | Version | Notes | Status |
+|-------|---------|-------|--------|
+| `io-uring` | 0.7+ | Low-level, thin wrapper over `liburing`. Full control over SQE/CQE lifecycle. No runtime dependency. | Not used — replaced by synchronous O_DIRECT |
+| `tokio-uring` | 0.5+ | Tokio integration for io_uring. Provides async/await over io_uring ops. | Not used |
+| `glommio` | 0.9+ | Thread-per-core runtime built on io_uring. Opinionated architecture. | Not used |
+| `nuclei` | 0.4+ | Proactive I/O runtime. Less mature. | Not used |
+
+**Actual approach**: synchronous O_DIRECT (`std::fs` / `libc` `pread`/`pwrite`
+on an O_DIRECT fd) on dedicated per-connection worker threads. This was
+chosen over io_uring after the May-2026 review found the async-io
+scaffolding was unused dead code; the synchronous path is simpler and
+meets the write-amplification and latency targets.
 
 ---
 
@@ -30,7 +41,7 @@ Companion document to `BSV_UTXO_STORE_SPEC.md`. Lists recommended crates for eac
 
 **Recommendation**: Use **`tokio`** for the networking layer (client connections, replication streams, heartbeat). Use raw TCP with a custom binary protocol (as spec'd) rather than gRPC — the UTXO workload benefits from a purpose-built framing protocol. Use **`axum`** for the HTTP observability endpoints (`/metrics`, `/health`, `/status`).
 
-**Note on io_uring + tokio**: The storage layer uses `io-uring` directly (not tokio's I/O), while the networking layer uses tokio's TCP. These can coexist — storage I/O runs on dedicated submission/completion threads, networking runs on tokio's runtime.
+**Note on storage I/O + tokio**: The storage layer uses synchronous O_DIRECT I/O on dedicated worker threads (not tokio's I/O, and not io_uring — see §1), while the networking layer uses tokio's TCP. These coexist — blocking device I/O runs off the async runtime so it never stalls tokio's reactor.
 
 ---
 
@@ -178,7 +189,7 @@ struct ThreadMetrics {
 
 **Recommendation**:
 - **`proptest`** for property-based testing of UTXO operations (idempotency, counter consistency, spend/unspend reversibility)
-- **`criterion`** for all performance benchmarks (spend throughput, index lookup, io_uring batching)
+- **`criterion`** for all performance benchmarks (spend throughput, index lookup, device I/O batching)
 - **`loom`** for testing lock-free data structures (ring buffers, concurrent index operations)
 - **`tempfile`** for creating temporary block devices in tests
 
@@ -234,7 +245,7 @@ struct ThreadMetrics {
 
 | Subsystem | Primary Crates |
 |-----------|---------------|
-| **Storage I/O** | `io-uring`, `libc` |
+| **Storage I/O** | `libc` (synchronous O_DIRECT; io_uring removed — see §1) |
 | **Networking** | `tokio`, `bytes`, `byteorder` |
 | **Cluster Membership** | `foca` (SWIM protocol) |
 | **Index** | Custom + `libc` (hugepages), `memmap2` (checkpoints) |

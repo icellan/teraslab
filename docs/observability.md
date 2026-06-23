@@ -66,7 +66,7 @@ five groups:
    histogram per operation plus `teraslab_lock_wait_ns`. Buckets are
    cumulative, the `+Inf` terminator is always emitted, and every
    histogram emits `_sum` and `_count` lines.
-4. **Subsystem surfaces (Phase 5)** — replication, io_uring, redo,
+4. **Subsystem surfaces (Phase 5)** — replication, redo,
    migration, SWIM, and allocator blocks, each behind a `OnceLock`
    install hook. In production the server binary calls every
    `init_*_metrics` in `src/bin/server.rs`; in tests the blocks resolve
@@ -125,14 +125,21 @@ asserts this end-to-end.
 
 ### Runtime log-level control
 
-The HTTP server exposes a read/write log-level endpoint:
+The HTTP server exposes a read/write log-level endpoint. It is a **gated
+admin endpoint**: it is only mounted when `enable_admin_endpoints = true`
+and an `admin_token` is configured, and every request must carry a
+matching bearer token (`require_admin_bearer` in
+`src/server/http.rs`). The default HTTP port is `9100`
+(`http_listen_addr`).
 
 ```sh
 # read
-curl -s http://127.0.0.1:9090/debug/log-level
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:9100/debug/log-level
 
 # write — one of trace|debug|info|warn|error
-curl -X PUT -d 'debug' http://127.0.0.1:9090/debug/log-level
+curl -X PUT -H "Authorization: Bearer $TOKEN" -d 'debug' \
+  http://127.0.0.1:9100/debug/log-level
 ```
 
 This flips the atomic `log_level` in `HttpState` which the fmt layer
@@ -194,8 +201,8 @@ containing the full criterion stdout/stderr.
   coverage set `trace_sampling_ratio = 1.0`. Re-sampling at event time
   is non-trivial in the current `opentelemetry_sdk` `ShouldSample` API
   and is left as a follow-up.
-- **Cluster-wide aggregation** of the six new metric blocks
-  (`replication_metrics`, `uring_metrics`, `redo_metrics`,
+- **Cluster-wide aggregation** of the five new metric blocks
+  (`replication_metrics`, `redo_metrics`,
   `migration_metrics`, `swim_metrics`, `allocator_metrics`) is not
   summed across nodes in `aggregate_snapshots`. The UI reads them
   from the first node only. Multi-node aggregation is a follow-up.

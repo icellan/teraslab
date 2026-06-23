@@ -11,8 +11,8 @@ TeraSlab uses a **WAL-first** commit model with a **mandatory redo log**.
 > not match the implemented code and is unsafe under crashes that hit
 > mid-engine-write: the engine can have a partial / torn write on the device
 > while the redo log has no record of the operation, so recovery cannot
-> reconstruct the intended post-state. Gap #2 in
-> `docs/TERANODE_PRODUCTION_READINESS_GAPS.md` flagged this drift.
+> reconstruct the intended post-state. This document supersedes that earlier
+> drift and is the authoritative description of the durability contract.
 >
 > The current document describes the actual implementation. Operators
 > integrating with TeraSlab MUST treat WAL-first ordering as part of the
