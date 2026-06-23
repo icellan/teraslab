@@ -1527,6 +1527,7 @@ fn main() {
         log_level: Arc::new(AtomicU8::new(2)), // INFO
         cluster: cluster.clone(),
         redo_log: redo_log.clone(),
+        redo_atomics: redo_log.as_ref().map(|r| r.lock().atomics()),
         active_connections: active_connections.clone(),
         http_port,
         replica_lag_warn_threshold_ops: config.replica_lag_warn_threshold_ops,

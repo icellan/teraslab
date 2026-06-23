@@ -108,6 +108,7 @@ pub fn spawn_write_server() -> WriteServer {
         let _ = server_run.run();
     });
 
+    let redo_atomics = redo.lock().atomics();
     let state = Arc::new(HttpState {
         engine,
         metrics: &TEST_METRICS,
@@ -115,6 +116,7 @@ pub fn spawn_write_server() -> WriteServer {
         ready: Arc::new(AtomicBool::new(true)),
         log_level: Arc::new(AtomicU8::new(2)),
         cluster: None,
+        redo_atomics: Some(redo_atomics),
         redo_log: Some(redo),
         active_connections: active,
         http_port,

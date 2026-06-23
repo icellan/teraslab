@@ -152,6 +152,7 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
         log_level: Arc::new(AtomicU8::new(2)),
         cluster: None,
         redo_log: None,
+        redo_atomics: None,
         active_connections: Arc::new(AtomicUsize::new(0)),
         http_port: port,
         replica_lag_warn_threshold_ops: 10_000,
