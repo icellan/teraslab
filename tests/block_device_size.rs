@@ -82,7 +82,10 @@ fn size_accessor_and_oob_bounds_check_on_regular_file() {
             device_size,
             ..
         }) => {
-            assert_eq!(offset, EXPECTED_SIZE, "OutOfBounds reported the wrong offset");
+            assert_eq!(
+                offset, EXPECTED_SIZE,
+                "OutOfBounds reported the wrong offset"
+            );
             assert_eq!(
                 device_size, EXPECTED_SIZE,
                 "OutOfBounds device_size must agree with size()"

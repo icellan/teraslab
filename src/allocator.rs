@@ -2160,7 +2160,7 @@ mod tests {
         // so the variant is CorruptedHeader, not HeaderCorruption.
         for bad_count in [
             (MAX_PERSISTED_FREE_REGIONS as u64) + 1,
-            u64::MAX, // would overflow `count * 16` if multiplied unchecked
+            u64::MAX,            // would overflow `count * 16` if multiplied unchecked
             (u64::MAX / 16) + 1, // smallest value whose *16 overflows usize on 64-bit
         ] {
             let dev = test_device(16);
@@ -2179,7 +2179,9 @@ mod tests {
                 Err(other) => {
                     panic!("count={bad_count}: expected CorruptedHeader, got: {other}")
                 }
-                Ok(_) => panic!("count={bad_count}: expected CorruptedHeader, but recover succeeded"),
+                Ok(_) => {
+                    panic!("count={bad_count}: expected CorruptedHeader, but recover succeeded")
+                }
             }
         }
     }

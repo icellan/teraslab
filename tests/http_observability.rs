@@ -265,15 +265,18 @@ fn metrics_counters_reflect_operations_performed() {
         scrape_counter(&after, "teraslab_creates_attempted_total").expect("counter must render");
 
     assert_eq!(
-        spends_att_after - spends_att_before, 7,
+        spends_att_after - spends_att_before,
+        7,
         "spends_attempted_total must advance by the 7 simulated spend attempts",
     );
     assert_eq!(
-        spends_ok_after - spends_ok_before, 5,
+        spends_ok_after - spends_ok_before,
+        5,
         "spends_succeeded_total must advance by the 5 simulated successful spends",
     );
     assert_eq!(
-        creates_att_after - creates_att_before, 3,
+        creates_att_after - creates_att_before,
+        3,
         "creates_attempted_total must advance by the 3 simulated create attempts",
     );
 }

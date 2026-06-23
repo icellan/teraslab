@@ -386,7 +386,10 @@ fn tombstone_write_never_torn_under_concurrent_reads() {
     let reads = reads.load(Ordering::Relaxed);
     let cycles = cycles.load(Ordering::Relaxed);
     assert!(reads >= 100, "test did not stress reads enough: {reads}");
-    assert!(cycles >= 20, "test did not stress tombstone writes enough: {cycles}");
+    assert!(
+        cycles >= 20,
+        "test did not stress tombstone writes enough: {cycles}"
+    );
     assert_eq!(
         bad, 0,
         "{bad} reads observed a torn/aliased header (out of {reads} reads, {cycles} tombstone cycles)",

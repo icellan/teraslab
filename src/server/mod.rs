@@ -1410,10 +1410,8 @@ mod tests {
         let total_length = u32::from_le_bytes(len_buf) as usize;
         let mut body = vec![0u8; total_length];
         client.read_exact(&mut body).unwrap();
-        let (resp, _) = ResponseFrame::decode(
-            &[len_buf.as_slice(), body.as_slice()].concat(),
-        )
-        .expect("response frame must decode");
+        let (resp, _) = ResponseFrame::decode(&[len_buf.as_slice(), body.as_slice()].concat())
+            .expect("response frame must decode");
         assert_eq!(resp.status, STATUS_ERROR);
         let (code, _msg) =
             decode_error_payload(&resp.payload).expect("typed [code:2][msg] error payload");

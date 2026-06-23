@@ -1768,7 +1768,10 @@ mod tests {
             match err {
                 RecordError::TooShort { actual, required } => {
                     assert_eq!(actual, short_len, "reported length must match slice");
-                    assert_eq!(required, METADATA_SIZE, "required length must be METADATA_SIZE");
+                    assert_eq!(
+                        required, METADATA_SIZE,
+                        "required length must be METADATA_SIZE"
+                    );
                 }
                 other => panic!("len={short_len}: expected TooShort, got {other:?}"),
             }

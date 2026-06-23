@@ -11395,7 +11395,8 @@ mod tests {
             Some(&*blob_store),
         );
         assert_eq!(
-            chunk_resp.status, STATUS_OK,
+            chunk_resp.status,
+            STATUS_OK,
             "the 10-byte chunk must be accepted; payload: {:?}",
             String::from_utf8_lossy(&chunk_resp.payload),
         );

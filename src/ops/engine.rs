@@ -1522,11 +1522,7 @@ impl Engine {
             // CRC-alone defense does not cover (it is empirically insufficient
             // on aarch64 release builds; see `io::read_metadata_direct`).
             unsafe {
-                io::write_metadata_header_bytes_direct(
-                    self.device_ptr,
-                    record_offset,
-                    &header,
-                );
+                io::write_metadata_header_bytes_direct(self.device_ptr, record_offset, &header);
             }
             Ok(())
         } else {
