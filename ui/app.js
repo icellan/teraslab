@@ -24,6 +24,115 @@
     let ws = null;
 
     // ---------------------------------------------------------------------------
+    // Admin auth
+    //
+    // The live API (/admin/*, /debug/*, /ws/top) is bearer-gated by
+    // require_admin_bearer in src/server/http.rs. fetch() calls send the token
+    // in the Authorization header; new WebSocket() cannot set that header, so
+    // /ws/top takes the token as a Sec-WebSocket-Protocol subprotocol offer
+    // (see connectWs). The token is kept in localStorage so it survives
+    // reloads; a 401 surfaces the login prompt for re-entry.
+    // ---------------------------------------------------------------------------
+    const TOKEN_KEY = 'teraslab-admin-token';
+    let authFailed = false;
+    let loginShown = false;
+    function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+    function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
+    function authHeaders(extra) {
+        const h = Object.assign({}, extra || {});
+        const t = getToken();
+        if (t) h['Authorization'] = 'Bearer ' + t;
+        return h;
+    }
+    // base64url (no padding) of the token's UTF-8 bytes. Used for the WS
+    // subprotocol channel: the recommended `openssl rand -base64` admin token
+    // contains '+', '/', '=', which are illegal in a raw WebSocket
+    // subprotocol token (new WebSocket() would throw). base64url uses only
+    // [A-Za-z0-9-_], all valid subprotocol chars. Server decodes it from the
+    // `Bearer64.` prefix (extract_ws_subprotocol_token in src/server/http.rs).
+    function b64urlToken(t) {
+        const utf8 = new TextEncoder().encode(t);
+        let bin = '';
+        for (let i = 0; i < utf8.length; i++) bin += String.fromCharCode(utf8[i]);
+        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+    // Single choke point for every authenticated request: injects the bearer
+    // header and surfaces the login prompt on 401 so a missing/rotated token
+    // is recoverable without a reload.
+    async function apiFetch(path, opts) {
+        opts = opts || {};
+        opts.headers = authHeaders(opts.headers);
+        const r = await fetch(path, opts);
+        if (r.status === 401) { authFailed = true; showLogin('Token rejected (401). Enter a valid admin token.'); }
+        return r;
+    }
+    function ensureLoginOverlay() {
+        let el = document.getElementById('login-overlay');
+        if (el) return el;
+        const style = document.createElement('style');
+        style.textContent =
+            '#login-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;' +
+            'justify-content:center;background:rgba(5,7,10,0.72);backdrop-filter:blur(3px);' +
+            'font-family:var(--ts-sans,sans-serif)}' +
+            '#login-overlay[hidden]{display:none}' +
+            '#login-overlay .login-card{width:min(92vw,380px);background:var(--ts-bg-1,#0f1217);' +
+            'border:1px solid var(--ts-line,#232a36);border-radius:10px;padding:24px;' +
+            'box-shadow:0 16px 48px rgba(0,0,0,0.5)}' +
+            '#login-overlay .login-title{font-size:18px;font-weight:600;color:var(--ts-text,#e6ecf3);margin-bottom:6px}' +
+            '#login-overlay .login-sub{font-size:13px;color:var(--ts-text-2,#a8b2c0);margin-bottom:16px;line-height:1.4}' +
+            '#login-overlay input{width:100%;box-sizing:border-box;padding:10px 12px;font-size:13px;' +
+            'font-family:var(--ts-mono,monospace);color:var(--ts-text,#e6ecf3);background:var(--ts-bg,#0a0c10);' +
+            'border:1px solid var(--ts-line-2,#2e3644);border-radius:6px;outline:none}' +
+            '#login-overlay input:focus{border-color:var(--ts-accent,#c8ff5e)}' +
+            '#login-overlay button{width:100%;margin-top:12px;padding:10px 12px;font-size:13px;font-weight:600;' +
+            'cursor:pointer;color:#0a0c10;background:var(--ts-accent,#c8ff5e);border:0;border-radius:6px}' +
+            '#login-overlay .login-hint{margin-top:14px;font-size:11px;color:var(--ts-text-3,#6b7686);line-height:1.4}';
+        document.head.appendChild(style);
+        el = document.createElement('div');
+        el.id = 'login-overlay';
+        el.hidden = true;
+        el.innerHTML =
+            '<div class="login-card">' +
+            '<div class="login-title">TeraSlab Admin</div>' +
+            '<div class="login-sub" id="login-msg">Enter the admin token to view live metrics.</div>' +
+            '<input id="login-token" type="password" placeholder="admin token" autocomplete="off" spellcheck="false" />' +
+            '<button id="login-submit">Connect</button>' +
+            '<div class="login-hint">Stored in this browser (localStorage) and sent as a bearer credential ' +
+            'to the admin API and the live metrics WebSocket.</div>' +
+            '</div>';
+        document.body.appendChild(el);
+        const submit = () => {
+            const v = el.querySelector('#login-token').value.trim();
+            if (!v) return;
+            setToken(v);
+            authFailed = false;
+            hideLogin();
+            if (ws) { try { ws.close(); } catch (e) { /* already closing */ } ws = null; }
+            connectWs();
+            refreshAll();
+        };
+        el.querySelector('#login-submit').addEventListener('click', submit);
+        el.querySelector('#login-token').addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+        return el;
+    }
+    function showLogin(msg) {
+        const el = ensureLoginOverlay();
+        if (msg) el.querySelector('#login-msg').textContent = msg;
+        const input = el.querySelector('#login-token');
+        // Pre-fill the stored (rejected) token once so a typo is editable;
+        // don't clobber what the operator is actively typing on repeat calls.
+        if (!loginShown) input.value = getToken();
+        el.hidden = false;
+        loginShown = true;
+        input.focus();
+    }
+    function hideLogin() {
+        const el = document.getElementById('login-overlay');
+        if (el) el.hidden = true;
+        loginShown = false;
+    }
+
+    // ---------------------------------------------------------------------------
     // Formatting
     // ---------------------------------------------------------------------------
     function fmt(n) {
@@ -147,16 +256,26 @@
     // API
     // ---------------------------------------------------------------------------
     async function fetchJson(path) {
-        try { const r = await fetch(path); if (!r.ok) return null; return await r.json(); } catch { return null; }
+        try { const r = await apiFetch(path); if (!r.ok) return null; return await r.json(); } catch { return null; }
     }
     async function refreshAll() {
+        // /status is public; everything else is admin-gated. With no token or
+        // a known-bad one, only poll /status so the 3s timer doesn't generate a
+        // 401 storm (and log noise) behind the login overlay. The gated fetches
+        // resume the moment a valid token is entered.
+        if (!getToken() || authFailed) {
+            store.status = await fetchJson('/status');
+            updateClusterPill();
+            renderCurrentPage();
+            return;
+        }
         const [status, index, freelist, redo, nodes, memory, records, replication, migrations, logLevel] =
             await Promise.all([
                 fetchJson('/status'), fetchJson('/debug/index'), fetchJson('/debug/freelist'),
                 fetchJson('/debug/redo'), fetchJson('/admin/nodes'), fetchJson('/admin/memory'),
                 fetchJson('/admin/records'), fetchJson('/admin/replication'),
                 fetchJson('/admin/migration_status'),
-                fetch('/debug/log-level').then(r => r.text()).catch(() => null),
+                apiFetch('/debug/log-level').then(r => r.ok ? r.text() : null).catch(() => null),
             ]);
         Object.assign(store, { status, index, freelist, redo, nodes, memory, records, replication, migrations, logLevel });
         updateClusterPill();
@@ -637,9 +756,19 @@
     // Live (/top) — kept from original, restyled
     // ---------------------------------------------------------------------------
     function connectWs() {
+        // No token, or the token was already rejected by a fetch: prompt
+        // instead of hammering the gate with doomed handshakes.
+        if (!getToken() || authFailed) { showLogin(authFailed ? null : 'Enter the admin token to view live metrics.'); return; }
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(proto + '//' + location.host + '/ws/top');
+        const url = proto + '//' + location.host + '/ws/top';
+        // Browsers can't set Authorization on a WebSocket handshake, so the
+        // token rides as a second offered subprotocol, base64url-wrapped so any
+        // token (incl. `openssl rand -base64` with +/=) is a valid subprotocol.
+        // The server decodes the Bearer64 entry and echoes the non-secret
+        // 'teraslab.v1' marker (see WS_TOP_SUBPROTOCOL / require_admin_bearer in
+        // src/server/http.rs).
+        ws = new WebSocket(url, ['teraslab.v1', 'Bearer64.' + b64urlToken(getToken())]);
         ws.onopen = () => { store.wsConnected = true; renderCurrentPage(); };
         ws.onmessage = e => {
             store.prevSnapshot = store.topSnapshot;
@@ -647,7 +776,13 @@
             pushHistory();
             if (['top', 'dashboard', 'flow', 'observability'].includes(currentPage())) renderCurrentPage();
         };
-        ws.onclose = () => { store.wsConnected = false; renderCurrentPage(); setTimeout(connectWs, 2000); };
+        ws.onclose = () => {
+            store.wsConnected = false;
+            renderCurrentPage();
+            // Reconnect only while a token is present and not known-bad; a 401
+            // on the fetch side flips authFailed and stops the retry storm.
+            if (getToken() && !authFailed) setTimeout(connectWs, 2000);
+        };
         ws.onerror = () => ws.close();
     }
 
@@ -1285,13 +1420,13 @@
         const txid = document.getElementById('txid-input').value.trim();
         const el = document.getElementById('record-result');
         if (!txid || txid.length !== 64) { el.innerHTML = '<div class="alert warning">Enter a valid 64-char hex txid</div>'; return; }
-        const r = await fetch('/debug/records/' + txid);
+        const r = await apiFetch('/debug/records/' + txid);
         if (!r.ok) { el.innerHTML = '<div class="alert warning">Record not found</div>'; return; }
         const d = await r.json();
         el.innerHTML = '<table><tbody>' + Object.entries(d).map(kv => `<tr><td>${escapeHtml(kv[0])}</td><td style="color:var(--ts-text)">${escapeHtml(displayValue(kv[1]))}</td></tr>`).join('') + '</tbody></table>';
     };
     window._setLogLevel = async function (level) {
-        await fetch('/debug/log-level', { method: 'PUT', body: level });
+        await apiFetch('/debug/log-level', { method: 'PUT', body: level });
         store.logLevel = level; renderCurrentPage();
     };
 
@@ -1305,6 +1440,9 @@
     });
     window.addEventListener('hashchange', renderCurrentPage);
 
+    // Prompt up front when there is no stored token; otherwise the first
+    // admin fetch would 401 and surface the same prompt a beat later.
+    if (!getToken()) showLogin('Enter the admin token to view live metrics.');
     refreshAll();
     refreshTimer = setInterval(refreshAll, 3000);
 })();

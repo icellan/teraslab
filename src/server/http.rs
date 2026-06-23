@@ -296,9 +296,12 @@ fn install_http_panic_hook_once() {
 ///
 /// When `enable_admin_endpoints` is `true`, the full `/admin/*` and
 /// `/debug/*` surface is merged into the router behind an
-/// [`axum::middleware::from_fn_with_state`] guard that checks
-/// `Authorization: Bearer <admin_token>` on every request, comparing
-/// against the configured token in constant time. The gated set now
+/// [`axum::middleware::from_fn_with_state`] guard ([`require_admin_bearer`])
+/// that checks the admin token on every request — supplied via either
+/// `Authorization: Bearer <admin_token>` or, for browser WebSocket clients
+/// that cannot set that header, a `Bearer64.<base64url(admin_token)>` entry in
+/// the `Sec-WebSocket-Protocol` header — comparing against the configured token
+/// in constant time. The gated set now
 /// includes BOTH the mutating routes (`PUT /admin/quiesce|rebalance|drain`,
 /// `PUT /debug/log-level`, `GET /debug/index|redo|records/{txid}`,
 /// `GET /admin/top`, `GET /ws/top`) AND the read-only dashboards
@@ -440,22 +443,35 @@ pub(crate) fn build_http_router(
     public.merge(gated)
 }
 
-/// Axum middleware enforcing `Authorization: Bearer <admin_token>` on the
-/// gated `/admin/*` and `/debug/*` sub-router.
+/// Axum middleware enforcing the admin token on the gated `/admin/*` and
+/// `/debug/*` sub-router (which also carries `/admin/top` and `/ws/top`).
+///
+/// The token may be supplied via **either** transport — both feed the same
+/// constant-time comparison, so the WebSocket path is no weaker than the
+/// header path:
+///
+/// - `Authorization: Bearer <token>` — CLI / non-browser clients and every
+///   `fetch()` from the bundled UI.
+/// - A `Bearer64.<base64url-token>` (browser UI) or `Bearer.<token>`
+///   (non-browser) entry in the `Sec-WebSocket-Protocol` request header — the
+///   only channel a browser can use to authenticate `new WebSocket()`, since
+///   the `Authorization` header cannot be set on a WS handshake. See
+///   [`extract_ws_subprotocol_token`].
 ///
 /// Behaviour:
 ///
-/// - Missing or malformed `Authorization` header → 401 Unauthorized.
-/// - Header present but the scheme is not `Bearer` (case-insensitive per
-///   RFC 6750 §2.1) → 401.
-/// - Bearer token does not match the configured token → 401.
-/// - Bearer token matches → request is forwarded to the inner handler.
+/// - No usable token in either transport → 401 Unauthorized.
+/// - `Authorization` present but the scheme is not `Bearer` (case-insensitive
+///   per RFC 6750 §2.1) → falls through to the subprotocol check, then 401.
+/// - Token does not match the configured token → 401.
+/// - Token matches → request is forwarded to the inner handler.
 /// - Defensive: if the middleware was installed with no configured token
 ///   (programmer error in `build_http_router`), every request is rejected
 ///   with 401 rather than letting it through.
 ///
-/// The token comparison uses [`subtle::ConstantTimeEq`] so reply timing
-/// does not leak the matching prefix length of an attacker-supplied token.
+/// The token comparison uses [`subtle::ConstantTimeEq`] over SHA-256 digests
+/// so reply timing leaks neither the content nor the length of an
+/// attacker-supplied token.
 async fn require_admin_bearer(
     State(auth): State<AdminAuthState>,
     headers: HeaderMap,
@@ -476,13 +492,15 @@ async fn require_admin_bearer(
         }
     };
 
-    let supplied = match extract_bearer_token(&headers) {
+    let supplied = match extract_admin_token(&headers) {
         Some(t) => t,
         None => {
             return http_error(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
-                "missing or malformed Authorization: Bearer <token> header",
+                "missing or malformed Authorization: Bearer <token> header \
+                 (or a Sec-WebSocket-Protocol Bearer64.<base64url-token> / \
+                 Bearer.<token> entry for WebSocket clients)",
             );
         }
     };
@@ -496,7 +514,7 @@ async fn require_admin_bearer(
     // SHA-256 digest and compare those — every call now compares a
     // fixed-size buffer of constant length.
     use sha2::Digest;
-    let supplied_digest = sha2::Sha256::digest(supplied.as_bytes());
+    let supplied_digest = sha2::Sha256::digest(&supplied);
     let expected_digest = sha2::Sha256::digest(expected);
     if supplied_digest.ct_eq(expected_digest.as_slice()).into() {
         next.run(request).await
@@ -536,6 +554,120 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     }
     let token = &rest[1..];
     if token.is_empty() { None } else { Some(token) }
+}
+
+/// Subprotocol-offer prefix carrying a base64url-encoded admin token on a
+/// WebSocket handshake. This is the channel the bundled UI uses: the
+/// recommended `openssl rand -base64` token (docs/DEPLOYMENT_ASSUMPTIONS.md)
+/// contains `+ / =`, which are illegal in a raw WebSocket subprotocol token,
+/// so `new WebSocket(url, ['Bearer.<token>'])` would throw in the browser.
+/// base64url (no padding) uses only `A-Za-z0-9-_`, every char a valid
+/// subprotocol token, so `Bearer64.<base64url(token)>` always transmits.
+const WS_BEARER64_SUBPROTOCOL_PREFIX: &str = "Bearer64.";
+
+/// Subprotocol-offer prefix carrying a raw (un-encoded) admin token. Kept for
+/// non-browser WebSocket clients and tokens that are already subprotocol-safe
+/// (hex, base64url). Matched case-insensitively to mirror the RFC 6750
+/// `Bearer` scheme handling in [`extract_bearer_token`]. The browser UI does
+/// NOT use this prefix — an arbitrary token here could violate the
+/// subprotocol grammar and make `new WebSocket()` throw.
+const WS_BEARER_SUBPROTOCOL_PREFIX: &str = "Bearer.";
+
+/// Extract the admin token bytes from a request, accepting either transport
+/// and preferring the `Authorization` header.
+///
+/// 1. `Authorization: Bearer <token>` (see [`extract_bearer_token`]).
+/// 2. A `Bearer64.<base64url-token>` or `Bearer.<token>` entry in the
+///    `Sec-WebSocket-Protocol` header (see [`extract_ws_subprotocol_token`]).
+///
+/// All paths return the raw token *bytes* and feed the SAME constant-time
+/// comparison in [`require_admin_bearer`] — there is deliberately no separate
+/// (and potentially weaker) verification for the WebSocket path. The
+/// `Authorization` path borrows; the WebSocket path may allocate (the
+/// base64url decode) — acceptable on the once-per-request auth path. Returns
+/// `None` when no transport carries a non-empty token.
+///
+/// The `Sec-WebSocket-Protocol` channel is honored ONLY when the request is an
+/// actual WebSocket upgrade (`Upgrade: websocket`), so the admin secret can
+/// ride that header only on genuine handshakes — every other gated route still
+/// requires `Authorization: Bearer`. This keeps the secret's transport surface
+/// narrow (e.g. infra that redacts `Authorization` but logs other headers
+/// cannot capture the token on ordinary `/admin/*` requests).
+fn extract_admin_token(headers: &HeaderMap) -> Option<Vec<u8>> {
+    if let Some(token) = extract_bearer_token(headers) {
+        return Some(token.as_bytes().to_vec());
+    }
+    if is_websocket_upgrade(headers) {
+        return extract_ws_subprotocol_token(headers);
+    }
+    None
+}
+
+/// Whether the request is a WebSocket upgrade, i.e. carries
+/// `Upgrade: websocket` (the token list is comma-separated and the value is
+/// matched case-insensitively per RFC 6455 / RFC 9110). Used to confine the
+/// `Sec-WebSocket-Protocol` admin-token channel to real handshakes.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("websocket"))
+        })
+}
+
+/// Extract the admin token bytes from a `Bearer64.<base64url-token>` or
+/// `Bearer.<token>` entry in the `Sec-WebSocket-Protocol` request header.
+///
+/// The header is a comma-separated list of subprotocols the client offers
+/// (e.g. `teraslab.v1, Bearer64.<...>`). Each entry is trimmed of optional
+/// whitespace; the first that matches a known prefix (case-insensitively) and
+/// yields a non-empty token wins. A `Bearer64.` entry whose payload is not
+/// valid base64url is skipped (the request then fails closed as 401) — it is
+/// never allowed to panic.
+///
+/// All slicing goes through `str::get`, so even though
+/// [`axum::http::HeaderValue::to_str`] already guarantees the value is
+/// visible-ASCII (and therefore every byte index is a char boundary), a
+/// malformed header can never trigger a sub-codepoint slice panic.
+fn extract_ws_subprotocol_token(headers: &HeaderMap) -> Option<Vec<u8>> {
+    let raw = headers.get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)?;
+    let s = raw.to_str().ok()?;
+    for proto in s.split(',') {
+        let proto = proto.trim();
+        // Prefer the base64url channel (browsers; any token bytes).
+        if let Some(encoded) = strip_prefix_ci(proto, WS_BEARER64_SUBPROTOCOL_PREFIX) {
+            if encoded.is_empty() {
+                continue;
+            }
+            match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded)
+            {
+                Ok(bytes) if !bytes.is_empty() => return Some(bytes),
+                _ => continue,
+            }
+        }
+        // Fall back to the raw channel (non-browser clients; safe tokens).
+        if let Some(token) = strip_prefix_ci(proto, WS_BEARER_SUBPROTOCOL_PREFIX)
+            && !token.is_empty()
+        {
+            return Some(token.as_bytes().to_vec());
+        }
+    }
+    None
+}
+
+/// Case-insensitive prefix strip that is panic-proof on any input: slices via
+/// `str::get`, so a prefix length landing mid-codepoint yields `None` instead
+/// of panicking. Returns the remainder after `prefix` when `s` starts with it
+/// (ignoring ASCII case), else `None`.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        s.get(prefix.len()..)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2394,12 +2526,33 @@ async fn handle_admin_top(
 // /ws/top — WebSocket push of metrics every second
 // ---------------------------------------------------------------------------
 
+/// Non-secret subprotocol the server negotiates on `/ws/top`.
+///
+/// Browsers authenticate the WebSocket by offering
+/// `Bearer64.<base64url(token)>` in the `Sec-WebSocket-Protocol` header (see
+/// [`require_admin_bearer`]). The server must echo one of the client's offered
+/// subprotocols in the handshake response or the browser fails the connection,
+/// but echoing the dynamic `Bearer64.<...>` value would round-trip the secret
+/// in the response. The UI therefore offers this static marker as a second
+/// subprotocol; the handler selects and echoes only this one, keeping the
+/// token out of the response.
+const WS_TOP_SUBPROTOCOL: &str = "teraslab.v1";
+
 /// Upgrade to WebSocket and push metrics snapshots every second.
+///
+/// Auth is enforced upstream by [`require_admin_bearer`], which accepts the
+/// admin token via `Authorization: Bearer` (CLI) or a
+/// `Bearer64.<base64url(token)>` entry in `Sec-WebSocket-Protocol` (browsers).
+/// When the client offers
+/// [`WS_TOP_SUBPROTOCOL`] it is selected and echoed in the 101 response;
+/// clients that authenticate via the `Authorization` header and offer no
+/// subprotocol simply upgrade with no negotiated subprotocol.
 async fn handle_ws_top(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<HttpState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_top_loop(socket, state))
+    ws.protocols([WS_TOP_SUBPROTOCOL])
+        .on_upgrade(move |socket| ws_top_loop(socket, state))
 }
 
 /// WebSocket loop: send cluster-wide JSON metrics snapshot every second.
