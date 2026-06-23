@@ -156,3 +156,7 @@ harness = false
 [[bench]]
 name = "alloc_profile"
 harness = false
+
+[[bench]]
+name = "write_path"
+harness = false
