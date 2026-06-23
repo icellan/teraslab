@@ -586,11 +586,35 @@ const WS_BEARER_SUBPROTOCOL_PREFIX: &str = "Bearer.";
 /// `Authorization` path borrows; the WebSocket path may allocate (the
 /// base64url decode) — acceptable on the once-per-request auth path. Returns
 /// `None` when no transport carries a non-empty token.
+///
+/// The `Sec-WebSocket-Protocol` channel is honored ONLY when the request is an
+/// actual WebSocket upgrade (`Upgrade: websocket`), so the admin secret can
+/// ride that header only on genuine handshakes — every other gated route still
+/// requires `Authorization: Bearer`. This keeps the secret's transport surface
+/// narrow (e.g. infra that redacts `Authorization` but logs other headers
+/// cannot capture the token on ordinary `/admin/*` requests).
 fn extract_admin_token(headers: &HeaderMap) -> Option<Vec<u8>> {
     if let Some(token) = extract_bearer_token(headers) {
         return Some(token.as_bytes().to_vec());
     }
-    extract_ws_subprotocol_token(headers)
+    if is_websocket_upgrade(headers) {
+        return extract_ws_subprotocol_token(headers);
+    }
+    None
+}
+
+/// Whether the request is a WebSocket upgrade, i.e. carries
+/// `Upgrade: websocket` (the token list is comma-separated and the value is
+/// matched case-insensitively per RFC 6455 / RFC 9110). Used to confine the
+/// `Sec-WebSocket-Protocol` admin-token channel to real handshakes.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("websocket"))
+        })
 }
 
 /// Extract the admin token bytes from a `Bearer64.<base64url-token>` or

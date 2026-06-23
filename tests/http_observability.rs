@@ -194,15 +194,20 @@ fn ws_handshake(port: u16, path: &str, extra_headers: &str) -> (u16, String) {
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
 
-    let req = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: 127.0.0.1:{port}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         {extra_headers}\r\n"
-    );
+    // Built by concatenating column-0 lines so there is unambiguously no
+    // leading whitespace on any header line. (A `\`-newline continuation would
+    // also strip the indentation, but spelling it out leaves nothing to doubt.)
+    let req = [
+        format!("GET {path} HTTP/1.1\r\n"),
+        format!("Host: 127.0.0.1:{port}\r\n"),
+        "Upgrade: websocket\r\n".to_string(),
+        "Connection: Upgrade\r\n".to_string(),
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n".to_string(),
+        "Sec-WebSocket-Version: 13\r\n".to_string(),
+        extra_headers.to_string(),
+        "\r\n".to_string(),
+    ]
+    .concat();
     stream.write_all(req.as_bytes()).unwrap();
 
     let mut buf: Vec<u8> = Vec::new();
@@ -1041,6 +1046,37 @@ fn ws_top_auth_non_ascii_subprotocol_does_not_crash() {
         "Sec-WebSocket-Protocol: \u{00e9}Bearer.tok\r\n",
     );
     assert_eq!(status, 401, "non-ASCII subprotocol must 401, not crash");
+}
+
+/// The `Sec-WebSocket-Protocol` auth channel must be honored ONLY on genuine
+/// WebSocket upgrade handshakes. A plain (non-upgrade) request that carries
+/// the admin token in that header must NOT authenticate — this keeps the
+/// secret's transport surface narrow (it can ride `Sec-WebSocket-Protocol`
+/// only when `Upgrade: websocket` is present).
+#[test]
+fn subprotocol_token_rejected_on_non_websocket_request() {
+    let (port, _state) = start_test_http_server();
+    let extra = format!("Sec-WebSocket-Protocol: Bearer.{R056_TEST_TOKEN}\r\n");
+    let (status, _, _) = http_get_with_extra_headers(port, "/admin/top", &extra);
+    assert_eq!(
+        status, 401,
+        "a subprotocol token on a non-WS request must NOT authenticate",
+    );
+
+    // Same for the base64url variant.
+    let extra64 = format!(
+        "Sec-WebSocket-Protocol: Bearer64.{}\r\n",
+        b64url_nopad(R056_TEST_TOKEN.as_bytes())
+    );
+    let (status, _, _) = http_get_with_extra_headers(port, "/admin/top", &extra64);
+    assert_eq!(
+        status, 401,
+        "a Bearer64 subprotocol token on a non-WS request must NOT authenticate",
+    );
+
+    // Sanity: the Authorization header still authenticates the same route.
+    let (status, _, _) = http_get_auth(port, "/admin/top", R056_TEST_TOKEN);
+    assert_eq!(status, 200, "Authorization: Bearer must still authenticate");
 }
 
 /// The `Authorization: Bearer` path must keep working for `/ws/top` so
