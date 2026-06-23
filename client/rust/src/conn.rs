@@ -108,6 +108,40 @@ impl PipeConn {
         flags: u16,
         payload: Vec<u8>,
     ) -> Result<ResponseFrame, ClientError> {
+        self.send_frame(op_code, flags, payload, None).await
+    }
+
+    /// Like [`Self::round_trip`] but HMAC-signs the **entire frame body**
+    /// (`request_id || op_code || flags || payload`) with the cluster secret.
+    ///
+    /// The server's `strict_auth` gate verifies inter-node opcodes (e.g.
+    /// `OP_GET_PARTITION_MAP`) by HMAC-ing the whole frame body via
+    /// [`teraslab::cluster::auth::verify_frame`]; signing only the payload (or
+    /// signing without the on-wire `request_id`) fails that gate. This delegates
+    /// to the server's own [`teraslab::cluster::auth::sign_frame`] so the bytes
+    /// verify byte-for-byte, signing the frame **after** `request_id` is
+    /// assigned so the signature covers the exact bytes on the wire.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::round_trip`], plus [`ClientError::Connection`] if signing fails.
+    pub async fn round_trip_signed(
+        &self,
+        op_code: u16,
+        flags: u16,
+        payload: Vec<u8>,
+        secret: &[u8],
+    ) -> Result<ResponseFrame, ClientError> {
+        self.send_frame(op_code, flags, payload, Some(secret)).await
+    }
+
+    async fn send_frame(
+        &self,
+        op_code: u16,
+        flags: u16,
+        payload: Vec<u8>,
+        sign_secret: Option<&[u8]>,
+    ) -> Result<ResponseFrame, ClientError> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(ClientError::Connection("connection closed".to_string()));
         }
@@ -121,7 +155,8 @@ impl PipeConn {
             pending.insert(req_id, tx);
         }
 
-        // Encode and write the request frame.
+        // Encode the request frame, then (for inter-node opcodes) HMAC-sign the
+        // whole encoded body so the wire bytes match the server's verify gate.
         let frame = RequestFrame {
             request_id: req_id,
             op_code,
@@ -129,10 +164,20 @@ impl PipeConn {
             payload: payload.into(),
         };
         let encoded = frame.encode();
+        let to_write = match sign_secret {
+            Some(secret) => match teraslab::cluster::auth::sign_frame(secret, &encoded) {
+                Ok(signed) => signed,
+                Err(e) => {
+                    self.pending.lock().remove(&req_id);
+                    return Err(ClientError::Connection(format!("sign frame: {}", e)));
+                }
+            },
+            None => encoded,
+        };
 
         {
             let mut writer = self.writer.lock().await;
-            if let Err(e) = writer.write_all(&encoded).await {
+            if let Err(e) = writer.write_all(&to_write).await {
                 self.pending.lock().remove(&req_id);
                 return Err(ClientError::Connection(format!("write: {}", e)));
             }

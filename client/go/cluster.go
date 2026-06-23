@@ -46,9 +46,9 @@ type cluster struct {
 	pools      map[uint64]*connPool // nodeID -> pool
 	addrToNode map[string]uint64    // addr -> nodeID (for redirect lookup)
 
-	refreshMu   sync.Mutex // serializes partition map refreshes
-	closeCh      chan struct{}
-	closeWg      sync.WaitGroup
+	refreshMu sync.Mutex // serializes partition map refreshes
+	closeCh   chan struct{}
+	closeWg   sync.WaitGroup
 }
 
 // newCluster creates a cluster manager. It fetches the initial partition map
@@ -75,6 +75,16 @@ func newCluster(ctx context.Context, cfg ClusterConfig) (*cluster, error) {
 	return c, nil
 }
 
+// fetchPartitionMap issues OP_GET_PARTITION_MAP, HMAC-signing the whole frame
+// when a cluster secret is configured (required by the server's strict_auth
+// gate) and sending it unsigned otherwise (trusted-overlay default).
+func (c *cluster) fetchPartitionMap(ctx context.Context, conn *pipeConn) (responseFrame, error) {
+	if len(c.config.ClusterSecret) > 0 {
+		return conn.roundTripSigned(ctx, OpGetPartitionMap, 0, nil, c.config.ClusterSecret)
+	}
+	return conn.roundTrip(ctx, OpGetPartitionMap, 0, nil)
+}
+
 func (c *cluster) bootstrapFromSeeds(ctx context.Context) error {
 	var lastErr error
 	for _, addr := range c.config.Seeds {
@@ -87,7 +97,7 @@ func (c *cluster) bootstrapFromSeeds(ctx context.Context) error {
 		}
 
 		// Fetch partition map (HMAC-signed when a cluster secret is configured).
-		resp, err := conn.roundTrip(ctx, OpGetPartitionMap, 0, signPartitionMapPayload(c.config.ClusterSecret, nil))
+		resp, err := c.fetchPartitionMap(ctx, conn)
 		if err != nil {
 			pool.close()
 			lastErr = err
@@ -229,7 +239,7 @@ func (c *cluster) refreshPartitionMap(ctx context.Context) error {
 			lastErr = err
 			continue
 		}
-		resp, err := conn.roundTrip(ctx, OpGetPartitionMap, 0, signPartitionMapPayload(c.config.ClusterSecret, nil))
+		resp, err := c.fetchPartitionMap(ctx, conn)
 		if err != nil {
 			lastErr = err
 			continue

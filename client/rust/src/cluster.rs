@@ -86,49 +86,6 @@ pub fn shard_for_txid(txid: &TxID) -> u16 {
     u16::from_le_bytes([txid[0], txid[1]]) & 0x0FFF
 }
 
-/// Sign an inter-node opcode payload with the cluster secret, returning the
-/// signed wire payload `[payload][timestamp_ms:8 LE][tag:32]`.
-///
-/// The HMAC-SHA256 tag covers `payload || timestamp_ms_le`, matching the Go
-/// client's `signFramePayload` (client/go/auth.go) and the server's
-/// `cluster::auth::sign` verification (src/cluster/auth.rs). When `secret` is
-/// `None`, the payload is returned unchanged so behaviour is identical to an
-/// unsecured (trusted-overlay) cluster.
-///
-/// # Parameters
-///
-/// - `secret`: Optional shared cluster secret. `None` (or empty) means no
-///   signature is applied.
-/// - `payload`: The original request payload to sign.
-pub(crate) fn sign_inter_node_payload(secret: Option<&[u8]>, payload: Vec<u8>) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let secret = match secret {
-        Some(s) if !s.is_empty() => s,
-        _ => return payload,
-    };
-
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-
-    let mut out = payload;
-    out.extend_from_slice(&ts_ms.to_le_bytes());
-
-    // HMAC-SHA256 accepts keys of any length per RFC 2104, so construction
-    // cannot fail; map the impossible error rather than unwrap.
-    let mut mac = match Hmac::<Sha256>::new_from_slice(secret) {
-        Ok(m) => m,
-        Err(_) => return out,
-    };
-    mac.update(&out);
-    let tag = mac.finalize().into_bytes();
-    out.extend_from_slice(&tag);
-    out
-}
-
 /// Cluster manager that routes requests to the correct node based on shard ownership.
 ///
 /// Maintains a partition map, per-node connection pools, and a background
@@ -232,8 +189,23 @@ impl Cluster {
                 }
             };
 
-            let signed = sign_inter_node_payload(self.config.cluster_secret.as_deref(), Vec::new());
-            let resp = match conn.round_trip(OP_GET_PARTITION_MAP, 0, signed).await {
+            // Strict-auth clusters require the whole inter-node frame to be
+            // HMAC-signed (request_id||op||flags||payload); sign via the
+            // server's own sign_frame so it verifies byte-for-byte. Unsecured
+            // clusters send it unsigned (trusted-overlay default).
+            let secret = self
+                .config
+                .cluster_secret
+                .as_deref()
+                .filter(|s| !s.is_empty());
+            let rt = match secret {
+                Some(s) => {
+                    conn.round_trip_signed(OP_GET_PARTITION_MAP, 0, Vec::new(), s)
+                        .await
+                }
+                None => conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await,
+            };
+            let resp = match rt {
                 Ok(r) => r,
                 Err(e) => {
                     pool.close().await;
@@ -405,8 +377,23 @@ impl Cluster {
                 }
             };
 
-            let signed = sign_inter_node_payload(self.config.cluster_secret.as_deref(), Vec::new());
-            let resp = match conn.round_trip(OP_GET_PARTITION_MAP, 0, signed).await {
+            // Strict-auth clusters require the whole inter-node frame to be
+            // HMAC-signed (request_id||op||flags||payload); sign via the
+            // server's own sign_frame so it verifies byte-for-byte. Unsecured
+            // clusters send it unsigned (trusted-overlay default).
+            let secret = self
+                .config
+                .cluster_secret
+                .as_deref()
+                .filter(|s| !s.is_empty());
+            let rt = match secret {
+                Some(s) => {
+                    conn.round_trip_signed(OP_GET_PARTITION_MAP, 0, Vec::new(), s)
+                        .await
+                }
+                None => conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await,
+            };
+            let resp = match rt {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = Some(e);
@@ -479,8 +466,23 @@ impl Cluster {
                     continue;
                 }
             };
-            let signed = sign_inter_node_payload(self.config.cluster_secret.as_deref(), Vec::new());
-            let resp = match conn.round_trip(OP_GET_PARTITION_MAP, 0, signed).await {
+            // Strict-auth clusters require the whole inter-node frame to be
+            // HMAC-signed (request_id||op||flags||payload); sign via the
+            // server's own sign_frame so it verifies byte-for-byte. Unsecured
+            // clusters send it unsigned (trusted-overlay default).
+            let secret = self
+                .config
+                .cluster_secret
+                .as_deref()
+                .filter(|s| !s.is_empty());
+            let rt = match secret {
+                Some(s) => {
+                    conn.round_trip_signed(OP_GET_PARTITION_MAP, 0, Vec::new(), s)
+                        .await
+                }
+                None => conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await,
+            };
+            let resp = match rt {
                 Ok(r) => r,
                 Err(e) => {
                     pool.close().await;
@@ -608,54 +610,54 @@ pub(crate) fn decode_partition_map(data: &[u8]) -> Result<PartitionMap, ClientEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teraslab::protocol::frame::RequestFrame;
 
-    /// REL-010: a payload signed by the client's `sign_inter_node_payload`
-    /// must verify against the *server's* HMAC verifier with the same secret.
-    /// This is the exact gate `OP_GET_PARTITION_MAP` passes through under
-    /// `strict_auth`. The original payload is recovered byte-for-byte.
-    #[test]
-    fn sign_inter_node_payload_verifies_against_server() {
-        let secret = b"super-secret-cluster-key";
-        let payload = b"partition-map-request".to_vec();
-
-        let signed = sign_inter_node_payload(Some(secret), payload.clone());
-
-        // Suffix is exactly [timestamp_ms:8][tag:32] over the original payload.
-        assert_eq!(
-            signed.len(),
-            payload.len() + 8 + 32,
-            "signed payload must append an 8-byte timestamp and 32-byte tag",
-        );
-
-        let recovered = teraslab::cluster::auth::verify(secret, &signed)
-            .expect("server must accept the client-signed payload");
-        assert_eq!(
-            recovered,
-            &payload[..],
-            "server verify must recover the exact original payload",
-        );
+    /// Reproduce exactly what `PipeConn::send_frame` writes for a signed
+    /// inter-node opcode: encode the frame, then `sign_frame` the whole encoded
+    /// body. This is the canonical helper used by the test below.
+    fn client_signed_frame(secret: &[u8], request_id: u64) -> Vec<u8> {
+        let frame = RequestFrame {
+            request_id,
+            op_code: OP_GET_PARTITION_MAP,
+            flags: 0,
+            payload: Vec::new().into(),
+        };
+        teraslab::cluster::auth::sign_frame(secret, &frame.encode())
+            .expect("sign_frame must succeed")
     }
 
-    /// The empty `OP_GET_PARTITION_MAP` payload (the real bootstrap case)
-    /// also signs and verifies, recovering an empty payload.
+    /// REL-010: the bytes the client puts on the wire for a signed
+    /// `OP_GET_PARTITION_MAP` must pass the SERVER's whole-frame verify gate
+    /// (`verify_frame`, the same primitive `verify_signed_body_streaming` uses),
+    /// recovering the original frame byte-for-byte. Signing only the payload (the
+    /// previous approach) fails this gate because the server HMACs the entire
+    /// frame body `request_id||op_code||flags||payload`.
     #[test]
-    fn sign_empty_payload_verifies_against_server() {
-        let secret = b"k";
-        let signed = sign_inter_node_payload(Some(secret), Vec::new());
-        assert_eq!(signed.len(), 8 + 32, "empty payload -> just suffix");
-        let recovered = teraslab::cluster::auth::verify(secret, &signed)
-            .expect("server must accept the signed empty payload");
-        assert!(
-            recovered.is_empty(),
-            "recovered payload for an empty request must be empty",
+    fn signed_frame_verifies_against_server_gate() {
+        let secret = b"super-secret-cluster-key";
+        let frame = RequestFrame {
+            request_id: 7,
+            op_code: OP_GET_PARTITION_MAP,
+            flags: 0,
+            payload: Vec::new().into(),
+        };
+        let encoded = frame.encode();
+        let signed =
+            teraslab::cluster::auth::sign_frame(secret, &encoded).expect("sign_frame must succeed");
+
+        let recovered = teraslab::cluster::auth::verify_frame(secret, &signed)
+            .expect("server gate must accept the client-signed frame");
+        assert_eq!(
+            recovered, encoded,
+            "verify_frame must recover the exact original frame (incl. request_id)",
         );
     }
 
     /// A different secret must NOT verify — confirms the tag is keyed.
     #[test]
-    fn sign_with_wrong_secret_fails_verification() {
-        let signed = sign_inter_node_payload(Some(b"right-key"), b"hello".to_vec());
-        let err = teraslab::cluster::auth::verify(b"wrong-key", &signed)
+    fn signed_frame_wrong_secret_rejected() {
+        let signed = client_signed_frame(b"right-key", 1);
+        let err = teraslab::cluster::auth::verify_frame(b"wrong-key", &signed)
             .expect_err("verification under the wrong key must fail");
         assert_eq!(
             err.kind(),
@@ -664,20 +666,18 @@ mod tests {
         );
     }
 
-    /// `None` (and empty) secret returns the payload unchanged — identical
-    /// behaviour to an unsecured/trusted-overlay cluster.
+    /// The signature covers the `request_id`: tampering with it after signing
+    /// breaks verification. This is precisely why payload-only signing failed —
+    /// the server HMACs the request_id that arrives on the wire.
     #[test]
-    fn no_secret_returns_payload_unchanged() {
-        let payload = b"raw".to_vec();
-        assert_eq!(
-            sign_inter_node_payload(None, payload.clone()),
-            payload,
-            "None secret must not modify the payload",
-        );
-        assert_eq!(
-            sign_inter_node_payload(Some(&[]), payload.clone()),
-            payload,
-            "empty secret must not modify the payload",
-        );
+    fn signed_frame_covers_request_id() {
+        let secret = b"cluster-key";
+        let mut signed = client_signed_frame(secret, 42);
+        // Frame layout: [length:4][request_id:8][op:2][flags:2][payload..][ts:8][tag:32].
+        // Flip a bit in the request_id region (bytes 4..12).
+        signed[4] ^= 0x01;
+        let err = teraslab::cluster::auth::verify_frame(secret, &signed)
+            .expect_err("a tampered request_id must fail whole-frame verification");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

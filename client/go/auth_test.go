@@ -9,56 +9,74 @@ import (
 	"time"
 )
 
-func TestSignFramePayloadLayout(t *testing.T) {
+// TestSignFrameLayout verifies signFrame produces the exact on-wire layout the
+// server's verify_frame expects: [signedBodyLen:4][body][ts:8][tag:32] where the
+// HMAC tag covers the WHOLE frame body (request_id||op||flags||payload) || ts.
+func TestSignFrameLayout(t *testing.T) {
 	secret := []byte("cluster-secret")
-	payload := []byte{0x01, 0x02, 0x03}
+	f := &requestFrame{
+		RequestID: 7,
+		OpCode:    OpGetPartitionMap,
+		Flags:     0,
+		Payload:   []byte{0x01, 0x02, 0x03},
+	}
+	encoded := encodeRequest(nil, f)
+	body := encoded[4:] // request_id||op||flags||payload
 	const ts uint64 = 1_700_000_000_000
 
-	signed := signFramePayload(secret, payload, ts)
+	signed := signFrame(secret, encoded, ts)
 
-	// Layout: [payload][timestamp:8 LE][tag:32].
-	wantLen := len(payload) + authTimestampLen + authTagLen
-	if len(signed) != wantLen {
-		t.Fatalf("signed len = %d, want %d", len(signed), wantLen)
+	wantBodyLen := len(body) + authTimestampLen + authTagLen
+	if int(getU32(signed[:4])) != wantBodyLen {
+		t.Fatalf("length prefix = %d, want %d", getU32(signed[:4]), wantBodyLen)
 	}
-	if !bytes.Equal(signed[:len(payload)], payload) {
-		t.Fatalf("payload prefix mismatch")
+	if len(signed) != 4+wantBodyLen {
+		t.Fatalf("signed len = %d, want %d", len(signed), 4+wantBodyLen)
 	}
-	if getU64(signed[len(payload):len(payload)+8]) != ts {
+	// The body (including request_id) must be preserved verbatim.
+	if !bytes.Equal(signed[4:4+len(body)], body) {
+		t.Fatalf("frame body not preserved in signed frame")
+	}
+	if getU64(signed[4+len(body):4+len(body)+authTimestampLen]) != ts {
 		t.Fatalf("timestamp mismatch")
 	}
-
-	// Recompute the expected tag over payload || timestamp.
+	// Tag is HMAC over body || ts (everything after the length prefix, minus tag).
 	mac := hmac.New(sha256.New, secret)
-	mac.Write(signed[:len(payload)+authTimestampLen])
+	mac.Write(signed[4 : 4+len(body)+authTimestampLen])
 	wantTag := mac.Sum(nil)
-	gotTag := signed[len(payload)+authTimestampLen:]
+	gotTag := signed[4+len(body)+authTimestampLen:]
 	if !hmac.Equal(gotTag, wantTag) {
 		t.Fatalf("tag mismatch")
 	}
 }
 
-func TestSignPartitionMapPayloadNoSecret(t *testing.T) {
-	if got := signPartitionMapPayload(nil, nil); got != nil {
-		t.Fatalf("expected nil payload with no secret, got %d bytes", len(got))
-	}
-	raw := []byte{0xAA}
-	if got := signPartitionMapPayload(nil, raw); !bytes.Equal(got, raw) {
-		t.Fatalf("expected raw payload unchanged with no secret")
-	}
-}
+// TestSignFrameCoversRequestID confirms the request_id is inside the HMAC input:
+// changing it after signing must invalidate the tag. This is exactly why
+// payload-only signing failed the server gate.
+func TestSignFrameCoversRequestID(t *testing.T) {
+	secret := []byte("cluster-secret")
+	f := &requestFrame{RequestID: 42, OpCode: OpGetPartitionMap, Flags: 0, Payload: nil}
+	signed := signFrame(secret, encodeRequest(nil, f), 1_700_000_000_000)
 
-func TestSignPartitionMapPayloadWithSecret(t *testing.T) {
-	secret := []byte("s3cr3t")
-	got := signPartitionMapPayload(secret, nil)
-	// Empty payload + timestamp(8) + tag(32) = 40 bytes.
-	if len(got) != authTimestampLen+authTagLen {
-		t.Fatalf("signed empty payload len = %d, want %d", len(got), authTimestampLen+authTagLen)
+	// Recompute the tag as the server would, but with a different request_id.
+	body := make([]byte, 0, 12)
+	body = appendU64(body, 43) // tampered request_id
+	body = appendU16(body, OpGetPartitionMap)
+	body = appendU16(body, 0)
+	ts := signed[4+12 : 4+12+authTimestampLen]
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	mac.Write(ts)
+	wrongTag := mac.Sum(nil)
+	gotTag := signed[4+12+authTimestampLen:]
+	if hmac.Equal(gotTag, wrongTag) {
+		t.Fatal("tag must change when request_id changes (request_id must be in the HMAC input)")
 	}
 }
 
 // TestClusterBootstrapSignsPartitionMap verifies the bootstrap GET_PARTITION_MAP
-// request carries a valid HMAC tag when a ClusterSecret is configured.
+// request carries a valid WHOLE-FRAME HMAC tag when a ClusterSecret is
+// configured — verified exactly the way the server's verify_frame does.
 func TestClusterBootstrapSignsPartitionMap(t *testing.T) {
 	secret := []byte("bootstrap-secret")
 	node := newFakeNode(t)
@@ -68,12 +86,19 @@ func TestClusterBootstrapSignsPartitionMap(t *testing.T) {
 	verified := make(chan bool, 4)
 	node.setHandler(func(req requestFrame) responseFrame {
 		if req.OpCode == OpGetPartitionMap {
-			// Validate the signed payload: [..][ts:8][tag:32] with empty body.
 			ok := false
+			// Whole-frame signing: the original payload was empty, so the
+			// decoded frame payload is exactly [ts:8][tag:32], and the tag
+			// covers request_id||op||flags||payload||ts.
 			if len(req.Payload) == authTimestampLen+authTagLen {
-				// body is empty, so the signed prefix is just the timestamp.
+				body := make([]byte, 0, 12)
+				body = appendU64(body, req.RequestID)
+				body = appendU16(body, req.OpCode)
+				body = appendU16(body, req.Flags)
+				ts := req.Payload[:authTimestampLen]
 				mac := hmac.New(sha256.New, secret)
-				mac.Write(req.Payload[:authTimestampLen])
+				mac.Write(body)
+				mac.Write(ts)
 				want := mac.Sum(nil)
 				got := req.Payload[authTimestampLen:]
 				ok = hmac.Equal(got, want)
@@ -108,7 +133,7 @@ func TestClusterBootstrapSignsPartitionMap(t *testing.T) {
 	select {
 	case ok := <-verified:
 		if !ok {
-			t.Fatal("bootstrap partition-map request had an invalid HMAC tag")
+			t.Fatal("bootstrap partition-map request had an invalid whole-frame HMAC tag")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("never observed a partition-map request")

@@ -47,33 +47,44 @@ func TestGoldenRedirectWithVersion(t *testing.T) {
 	}
 }
 
-// TestGoldenHMACFramePayload pins the signed inter-node payload layout:
-// [body][timestamp_ms:8 LE][tag:32] with tag = HMAC-SHA256(secret, body||ts).
-func TestGoldenHMACFramePayload(t *testing.T) {
+// TestGoldenHMACFrame pins the signed inter-node FRAME layout produced by
+// signFrame: given an encoded frame [length:4][body], the output is
+// [signedBodyLen:4][body][timestamp_ms:8 LE][tag:32] with
+// tag = HMAC-SHA256(secret, body||ts). This mirrors src/cluster/auth.rs::sign_frame.
+func TestGoldenHMACFrame(t *testing.T) {
 	secret := []byte("test-secret-key")
 	body := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	const ts uint64 = 0x0000_0123_4567_89AB
 
-	signed := signFramePayload(secret, body, ts)
+	// signFrame takes a full encoded frame [length:4][body].
+	encoded := make([]byte, 4, 4+len(body))
+	putU32(encoded, uint32(len(body)))
+	encoded = append(encoded, body...)
 
-	// body prefix.
-	if !bytes.Equal(signed[:len(body)], body) {
-		t.Fatal("body prefix mismatch")
+	signed := signFrame(secret, encoded, ts)
+
+	// length prefix = len(body)+8+32.
+	if int(getU32(signed[:4])) != len(body)+8+32 {
+		t.Fatalf("length prefix = %d, want %d", getU32(signed[:4]), len(body)+8+32)
+	}
+	// body, preserved after the new length prefix.
+	if !bytes.Equal(signed[4:4+len(body)], body) {
+		t.Fatal("body mismatch")
 	}
 	// timestamp, LE, immediately after body.
 	wantTS := []byte{0xAB, 0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00}
-	if !bytes.Equal(signed[len(body):len(body)+8], wantTS) {
-		t.Fatalf("timestamp bytes = %x, want %x", signed[len(body):len(body)+8], wantTS)
+	if !bytes.Equal(signed[4+len(body):4+len(body)+8], wantTS) {
+		t.Fatalf("timestamp bytes = %x, want %x", signed[4+len(body):4+len(body)+8], wantTS)
 	}
 	// tag = HMAC-SHA256 over body||ts.
 	mac := hmac.New(sha256.New, secret)
-	mac.Write(signed[:len(body)+8])
+	mac.Write(signed[4 : 4+len(body)+8])
 	wantTag := mac.Sum(nil)
-	if !bytes.Equal(signed[len(body)+8:], wantTag) {
+	if !bytes.Equal(signed[4+len(body)+8:], wantTag) {
 		t.Fatalf("tag mismatch")
 	}
-	if len(signed) != len(body)+8+32 {
-		t.Fatalf("total len = %d, want %d", len(signed), len(body)+8+32)
+	if len(signed) != 4+len(body)+8+32 {
+		t.Fatalf("total len = %d, want %d", len(signed), 4+len(body)+8+32)
 	}
 }
 

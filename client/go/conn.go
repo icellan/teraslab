@@ -111,6 +111,54 @@ func (c *pipeConn) roundTrip(ctx context.Context, opCode uint16, flags uint16, p
 	}
 }
 
+// roundTripSigned is like roundTrip but HMAC-signs the WHOLE frame body
+// (request_id || op_code || flags || payload) with the cluster secret, as
+// required by the server's strict_auth gate for inter-node opcodes (e.g.
+// OP_GET_PARTITION_MAP). The frame is signed AFTER request_id is assigned via
+// signFrame (mirroring src/cluster/auth.rs::sign_frame) so the signature covers
+// the exact bytes on the wire.
+func (c *pipeConn) roundTripSigned(ctx context.Context, opCode uint16, flags uint16, payload, secret []byte) (responseFrame, error) {
+	if c.closed.Load() {
+		return responseFrame{}, c.getErr()
+	}
+
+	reqID := c.nextID.Add(1)
+	ch := respChanPool.Get().(chan responseFrame)
+	c.pending.Store(reqID, ch)
+
+	f := &requestFrame{
+		RequestID: reqID,
+		OpCode:    opCode,
+		Flags:     flags,
+		Payload:   payload,
+	}
+	encoded := encodeRequest(nil, f)
+	signed := signFrame(secret, encoded, uint64(time.Now().UnixMilli()))
+
+	c.mu.Lock()
+	_, err := c.conn.Write(signed)
+	c.mu.Unlock()
+	if err != nil {
+		c.releaseChan(reqID, ch)
+		return responseFrame{}, fmt.Errorf("write: %w", err)
+	}
+
+	select {
+	case resp := <-ch:
+		respChanPool.Put(ch)
+		if resp.RequestID == 0 && c.closed.Load() {
+			return responseFrame{}, c.getErr()
+		}
+		return resp, nil
+	case <-ctx.Done():
+		c.releaseChan(reqID, ch)
+		return responseFrame{}, ctx.Err()
+	case <-c.readDone:
+		c.releaseChan(reqID, ch)
+		return responseFrame{}, c.getErr()
+	}
+}
+
 // readLoop runs in a goroutine, reading response frames and dispatching
 // them to waiting callers.
 func (c *pipeConn) readLoop() {

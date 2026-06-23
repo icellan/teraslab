@@ -2005,10 +2005,17 @@ impl Client {
         }
 
         // Single-node mode: fetch from the server. OP_GET_PARTITION_MAP is an
-        // inter-node auth opcode; sign it when a cluster secret is configured.
+        // inter-node auth opcode; under strict_auth the server HMACs the whole
+        // frame, so sign the frame (not just the payload) when a secret is set.
         let conn = self.get_conn().await?;
-        let signed = cluster::sign_inter_node_payload(self.cluster_secret.as_deref(), Vec::new());
-        let resp = conn.round_trip(OP_GET_PARTITION_MAP, 0, signed).await?;
+        let secret = self.cluster_secret.as_deref().filter(|s| !s.is_empty());
+        let resp = match secret {
+            Some(s) => {
+                conn.round_trip_signed(OP_GET_PARTITION_MAP, 0, Vec::new(), s)
+                    .await?
+            }
+            None => conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await?,
+        };
         if resp.status != STATUS_OK {
             if resp.status == STATUS_ERROR {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
