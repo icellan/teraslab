@@ -5,6 +5,7 @@
 //! production-scale parameters.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -12,6 +13,7 @@ use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
+use teraslab::ops::error::SpendError;
 use teraslab::ops::mark_longest_chain::*;
 use teraslab::ops::remaining::*;
 use teraslab::ops::set_mined::*;
@@ -198,6 +200,146 @@ pub fn stress_random_operations() {
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
         assert_eq!(meta.block_entry_count, 1);
+    }
+
+    // ----- Contended phase (REL-108) -----
+    //
+    // The phase above partitions txids into disjoint per-thread ranges, so no
+    // two threads ever touch the same key or contend on the same engine stripe.
+    // That never exercises the per-stripe mutual-exclusion contract. Here every
+    // thread races to spend the SAME (txid, offset) pairs with DISTINCT
+    // spending_data. The striped lock must serialize them so that, per
+    // (txid, offset): exactly ONE thread wins (UNSPENT -> SPENT once) and all
+    // others observe an AlreadySpent error — never a torn slot, lost increment,
+    // or double-spend.
+    stress_random_operations_contended();
+}
+
+/// Shared-key contention variant of [`stress_random_operations`]: many threads
+/// hammer the same stripes/keys concurrently and we assert the engine stays
+/// internally consistent (exactly-once spend per UTXO under the stripe lock).
+fn stress_random_operations_contended() {
+    let engine = create_engine(64 * 1024 * 1024);
+    let thread_count = 8usize;
+    // Use a txid range disjoint from the partitioned phase's keys.
+    let shared_tx_base = 1_000_000u32;
+    let shared_tx_count = 64u32;
+    let utxos_per_tx = 5u32;
+
+    for i in 0..shared_tx_count {
+        create_stress_tx(&engine, shared_tx_base + i, utxos_per_tx);
+    }
+
+    // One success counter per (tx, offset). After the race, each must be
+    // exactly 1: the stripe lock guarantees a single UNSPENT -> SPENT
+    // transition even though `thread_count` threads attempted it.
+    let success_counts: Arc<Vec<AtomicU32>> = Arc::new(
+        (0..(shared_tx_count * utxos_per_tx))
+            .map(|_| AtomicU32::new(0))
+            .collect(),
+    );
+
+    let handles: Vec<_> = (0..thread_count)
+        .map(|t| {
+            let engine = engine.clone();
+            let success_counts = success_counts.clone();
+            std::thread::spawn(move || {
+                let mut already_spent = 0u32;
+                for i in 0..shared_tx_count {
+                    let key = TxKey {
+                        txid: make_tx_id(shared_tx_base + i),
+                    };
+                    for v in 0..utxos_per_tx {
+                        // Each thread uses DISTINCT spending_data for the same
+                        // UTXO, so a second spend cannot be idempotent — it must
+                        // be rejected as AlreadySpent once the slot is SPENT.
+                        let mut sd = [0u8; 36];
+                        sd[0..4].copy_from_slice(&(t as u32 + 1).to_le_bytes());
+                        sd[4..8].copy_from_slice(&i.to_le_bytes());
+                        sd[32..36].copy_from_slice(&v.to_le_bytes());
+
+                        match engine.spend(&SpendRequest {
+                            tx_key: key,
+                            offset: v,
+                            utxo_hash: make_utxo_hash(shared_tx_base + i, v),
+                            spending_data: sd,
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 2000,
+                            block_height_retention: 288,
+                        }) {
+                            Ok(_) => {
+                                success_counts[(i * utxos_per_tx + v) as usize]
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(SpendError::AlreadySpent { offset, .. }) => {
+                                assert_eq!(offset, v, "AlreadySpent reported wrong offset");
+                                already_spent += 1;
+                            }
+                            Err(other) => panic!(
+                                "contended spend on tx {} offset {} from thread {} \
+                                 must succeed or be AlreadySpent, got {other:?}",
+                                shared_tx_base + i,
+                                v,
+                                t
+                            ),
+                        }
+                    }
+                }
+                already_spent
+            })
+        })
+        .collect();
+
+    let total_already_spent: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+    // Each UTXO is spent exactly once across all threads (stripe mutual
+    // exclusion); every other attempt is a clean AlreadySpent.
+    let total_utxos = shared_tx_count * utxos_per_tx;
+    for (idx, c) in success_counts.iter().enumerate() {
+        assert_eq!(
+            c.load(Ordering::Relaxed),
+            1,
+            "UTXO #{idx} must transition UNSPENT->SPENT exactly once under contention"
+        );
+    }
+    let expected_already_spent = total_utxos * (thread_count as u32 - 1);
+    assert_eq!(
+        total_already_spent, expected_already_spent,
+        "every losing thread must observe exactly one AlreadySpent per UTXO"
+    );
+
+    // Final state per record must be internally consistent: all UTXOs spent
+    // exactly once, and the persisted slot reflects a single winner with a
+    // valid SPENT status (no torn slot).
+    for i in 0..shared_tx_count {
+        let key = TxKey {
+            txid: make_tx_id(shared_tx_base + i),
+        };
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            { meta.spent_utxos },
+            utxos_per_tx,
+            "tx {} spent_utxos must equal the number of contended UTXOs",
+            shared_tx_base + i
+        );
+        for v in 0..utxos_per_tx {
+            let slot = engine.read_slot(&key, v).unwrap();
+            assert!(
+                slot.is_spent(),
+                "tx {} offset {v} must be SPENT after contention",
+                shared_tx_base + i
+            );
+            // Exactly one thread's spending_data must have landed: the winner's
+            // thread id (1..=thread_count) is encoded in the first 4 bytes.
+            let winner = u32::from_le_bytes(slot.spending_data[0..4].try_into().unwrap());
+            assert!(
+                winner >= 1 && winner <= thread_count as u32,
+                "tx {} offset {v} slot holds spending_data from an unknown writer \
+                 (torn slot?): winner tag {winner}",
+                shared_tx_base + i
+            );
+        }
     }
 }
 

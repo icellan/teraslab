@@ -37,6 +37,71 @@ const SECTORS: u64 = 4096;
 /// Expected total byte size of the RAM disk.
 const EXPECTED_SIZE: u64 = SECTORS * SECTOR_SIZE;
 
+/// REL-132: the two RAM-disk / env-device tests below both skip cleanly when no
+/// real block device can be attached (sandbox / CI), asserting nothing. This
+/// test always runs: it exercises the same `actual_size`-consuming logic — the
+/// `size()` accessor and the on-device OOB bounds check that every record read
+/// trusts — through the regular-file branch of `DirectDevice::open`, which needs
+/// no privileges or capabilities. The block-device branch only differs in HOW
+/// `actual_size` is sourced (ioctl geometry vs. the grow hint); the bounds-check
+/// arithmetic that consumes it is identical, so this guards the contract
+/// unconditionally even when no `S_IFBLK` node is available.
+#[test]
+fn size_accessor_and_oob_bounds_check_on_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("teraslab-size-test.dev");
+
+    // Open through the production constructor. For a regular file the size hint
+    // is honored (grow-only), so `size()` must report exactly EXPECTED_SIZE.
+    let dev = DirectDevice::open(&path, EXPECTED_SIZE, 4096)
+        .expect("DirectDevice::open on a fresh regular file must succeed");
+
+    // 1. A regular file must NOT be detected as a block device — this is the
+    //    branch that makes the ioctl size-query path unreachable, so pinning it
+    //    documents exactly why the RAM-disk test exists.
+    assert!(
+        !dev.is_block_device(),
+        "a regular file must report is_block_device() == false"
+    );
+
+    // 2. `size()` must equal the honored grow hint, not 0 or some rounded value.
+    assert_eq!(
+        dev.size(),
+        EXPECTED_SIZE,
+        "regular-file size() must equal the grow hint it was opened with"
+    );
+
+    // 3. The bounds check that consumes `actual_size` must fire: a pread whose
+    //    end exceeds size() is out of bounds, and the reported device_size must
+    //    agree with size(). This is the identical arithmetic the block-device
+    //    path relies on.
+    let mut oob_buf = AlignedBuf::new(4096, 4096);
+    match dev.pread(&mut oob_buf, EXPECTED_SIZE) {
+        Err(DeviceError::OutOfBounds {
+            offset,
+            device_size,
+            ..
+        }) => {
+            assert_eq!(offset, EXPECTED_SIZE, "OutOfBounds reported the wrong offset");
+            assert_eq!(
+                device_size, EXPECTED_SIZE,
+                "OutOfBounds device_size must agree with size()"
+            );
+        }
+        other => panic!("pread at size() must be OutOfBounds, got {other:?}"),
+    }
+
+    // 4. A read of the LAST valid aligned block (offset size()-4096) must be in
+    //    bounds and succeed — proving the bounds check is exact, not off-by-one.
+    let mut last_buf = AlignedBuf::new(4096, 4096);
+    let last_offset = EXPECTED_SIZE - 4096;
+    let n = dev
+        .pread_exact_at(&mut last_buf, last_offset)
+        .map(|()| 4096)
+        .expect("read of the last valid block must succeed");
+    assert_eq!(n, 4096, "last valid block read must return a full block");
+}
+
 /// RAII guard that detaches the RAM disk on drop, including on panic /
 /// assertion failure. Never leak a RAM disk.
 struct RamDisk {

@@ -212,6 +212,72 @@ fn metrics_includes_all_counters() {
     assert!(body.contains("teraslab_dah_removes_total"));
 }
 
+/// Extract the value of an unlabelled Prometheus counter line
+/// (`<name> <value>`) from a `/metrics` scrape body. Returns `None` when the
+/// line is absent so callers can distinguish "missing" from "zero".
+fn scrape_counter(body: &str, name: &str) -> Option<u64> {
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix(name) {
+            // Skip labelled variants like `<name>{op="spend"} 3`.
+            if let Some(value) = rest.strip_prefix(' ') {
+                return value.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// REL-131: a name-presence check alone cannot catch a render path that emits
+/// the counter line but reads from the wrong (always-zero) source. Bump the
+/// same `ThreadMetrics` the endpoint renders, scrape twice, and assert the
+/// parsed counter values advance by exactly the number of simulated
+/// operations. The metrics static is shared across the test binary, so we
+/// assert on the BEFORE/AFTER delta rather than absolute values.
+#[test]
+fn metrics_counters_reflect_operations_performed() {
+    let (port, _state) = start_test_http_server();
+
+    // Scrape 1: baseline. Every counter line must already be present and parse
+    // to a concrete number (proves the render path is wired, not just named).
+    let (_, _, before) = http_get(port, "/metrics");
+    let spends_att_before =
+        scrape_counter(&before, "teraslab_spends_attempted_total").expect("counter must render");
+    let spends_ok_before =
+        scrape_counter(&before, "teraslab_spends_succeeded_total").expect("counter must render");
+    let creates_att_before =
+        scrape_counter(&before, "teraslab_creates_attempted_total").expect("counter must render");
+
+    // Simulate real operations landing on the metrics the endpoint scrapes:
+    // 7 spend attempts (5 succeeding), 3 create attempts. The HTTP server
+    // renders `TEST_METRICS`, so bumping it is exactly what the dispatch layer
+    // does on a live spend/create.
+    TEST_METRICS.spends_attempted.inc_by(7);
+    TEST_METRICS.spends_succeeded.inc_by(5);
+    TEST_METRICS.creates_attempted.inc_by(3);
+
+    // Scrape 2: the parsed values must reflect the operations, not just exist.
+    let (_, _, after) = http_get(port, "/metrics");
+    let spends_att_after =
+        scrape_counter(&after, "teraslab_spends_attempted_total").expect("counter must render");
+    let spends_ok_after =
+        scrape_counter(&after, "teraslab_spends_succeeded_total").expect("counter must render");
+    let creates_att_after =
+        scrape_counter(&after, "teraslab_creates_attempted_total").expect("counter must render");
+
+    assert_eq!(
+        spends_att_after - spends_att_before, 7,
+        "spends_attempted_total must advance by the 7 simulated spend attempts",
+    );
+    assert_eq!(
+        spends_ok_after - spends_ok_before, 5,
+        "spends_succeeded_total must advance by the 5 simulated successful spends",
+    );
+    assert_eq!(
+        creates_att_after - creates_att_before, 3,
+        "creates_attempted_total must advance by the 3 simulated create attempts",
+    );
+}
+
 #[test]
 fn metrics_includes_gauges() {
     let (port, _state) = start_test_http_server();
