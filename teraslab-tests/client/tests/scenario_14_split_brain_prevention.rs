@@ -46,6 +46,7 @@ async fn try_create_on_port(
         cluster_refresh_interval: Duration::from_secs(30),
         max_redirects: 0,
         addr_map: docker.docker_addr_map(),
+        ..Default::default()
     };
     let client = Client::new(config).await?;
 

@@ -114,6 +114,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             cluster_refresh_interval: Duration::from_secs(300),
             max_redirects: 0,
             addr_map: std::collections::HashMap::new(),
+            ..Default::default()
         };
         // The connection to node3 may fail outright (if node3 is refusing connections)
         // or the create may fail with a replication error (since node3 cannot reach peers).
@@ -173,6 +174,7 @@ async fn run_scenario() -> Result<(), ClientError> {
                     cluster_refresh_interval: Duration::from_secs(300),
                     max_redirects: 0,
                     addr_map: std::collections::HashMap::new(),
+                    ..Default::default()
                 };
                 let rejected = match Client::new(retry_config).await {
                     Ok(retry_client) => {
@@ -554,6 +556,7 @@ async fn run_scenario() -> Result<(), ClientError> {
             cluster_refresh_interval: Duration::from_secs(30),
             max_redirects: 5,
             addr_map: docker.docker_addr_map(),
+            ..Default::default()
         };
         let client = Client::new(slow_config).await?;
         client.refresh_routing().await?;
