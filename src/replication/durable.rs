@@ -794,6 +794,10 @@ pub fn check_redo_truncation(
 /// earliest available redo entry, or `None` if the log is empty. Used to
 /// detect redo log truncation: if the earliest entry is beyond `from_seq`,
 /// the log has wrapped and a full resync is required instead.
+// Catch-up driver: the sequence-range/batching scalars and the two distinct
+// closures (read-ops-from-seq and send-chunk) are independent inputs the caller
+// supplies separately; bundling them into a struct would not reduce the
+// genuine parameter count, so the allow stands.
 #[allow(clippy::too_many_arguments)]
 pub fn run_catchup_for_replica(
     addr: &std::net::SocketAddr,
@@ -875,6 +879,10 @@ pub type OnLaggingReplica = std::sync::Arc<dyn Fn(SocketAddr, u64, u64) + Send +
 /// loop or master restart. Passing `None` preserves the warn-only behavior.
 ///
 /// Returns a join handle. The thread runs until `shutdown` is set to true.
+// Thread-spawn entry point: arguments are independent runtime knobs (tracker,
+// current-seq fn, shutdown flag, interval, two thresholds, optional callback)
+// configured separately by the caller; they have no cohesive grouping, so the
+// count is warranted.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_lag_monitor(
     tracker: &'static AckTracker,

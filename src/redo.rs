@@ -3,16 +3,36 @@
 //! Operations are appended to the log before data writes. On crash recovery,
 //! all entries after the last checkpoint are replayed idempotently.
 //!
-//! R-027 (BC-13): the on-disk layout is **linear**, not circular: `write_pos`
-//! advances monotonically until the periodic checkpoint task (see
-//! [`crate::checkpoint`]) snapshots the engine state, calls
-//! [`RedoLog::mark_checkpoint`], and then [`RedoLog::reset`]s `write_pos` back to
-//! zero so future appends start at the beginning of the log region. The
-//! prior module documentation called this "circular" and described "wrapping
-//! around", which set false expectations — there is no in-place wrap; a
-//! full log returns [`RedoError::LogFull`] until the checkpoint task
-//! completes. The naming has been corrected here; the public type names
-//! retain `RedoLog` for back-compat.
+//! R-027 (BC-13): the on-disk layout is **linear**, not circular. `write_pos`
+//! advances monotonically and is only ever rewound by reclaiming an already
+//! durable prefix; there is no in-place wrap. A full log returns
+//! [`RedoError::LogFull`] until the checkpoint task frees space. The prior
+//! module documentation called this "circular" and described "wrapping
+//! around", which set false expectations. The naming has been corrected here;
+//! the public type names retain `RedoLog` for back-compat.
+//!
+//! ## Production checkpoint / reclamation flow
+//!
+//! The periodic checkpoint task (see [`crate::checkpoint`]) reclaims log
+//! space without writing a `Checkpoint` marker:
+//!
+//! 1. It snapshots the engine state to a durable index snapshot and runs the
+//!    data/index barrier (fsync).
+//! 2. It writes a **recovery-progress fence** via
+//!    [`RedoLog::mark_recovery_progress`] at the sequence the snapshot covers.
+//!    This is *not* a whole-engine checkpoint: recovery must still replay any
+//!    post-fence entries, because non-dispatch producers can append while the
+//!    snapshot is being written.
+//! 3. It reclaims only the covered prefix with
+//!    [`RedoLog::compact_prefix_through`], which rewinds `write_pos` past the
+//!    fenced entries while leaving every entry after the fence intact.
+//!    Sequence numbers continue monotonically across the reclaim.
+//!
+//! The legacy [`RedoLog::mark_checkpoint`] (which appends a
+//! [`RedoOp::Checkpoint`] marker) and the wholesale [`RedoLog::reset`] (which
+//! rewinds `write_pos` to zero) are **test-only**: production never calls
+//! them. [`RedoOp::Checkpoint`] is still recognised on replay (skipped, see
+//! [`crate::recovery`]) so logs written by older builds remain readable.
 //!
 //! ## On-disk layout (F-G4-001)
 //!

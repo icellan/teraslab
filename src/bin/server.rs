@@ -155,6 +155,11 @@ struct CatchupContext {
     /// Cluster HMAC secret (None in unsecured clusters).
     auth_secret: Option<Vec<u8>>,
     source_node_id: u64,
+    /// Per-chunk ACK timeout for catch-up sends. Threaded from the configured
+    /// `replication_timeout_ms` so the catch-up path matches the foreground
+    /// fan-out (`cluster.replication_timeout()`) instead of using a hardcoded
+    /// value (REL-112).
+    replication_timeout: std::time::Duration,
 }
 
 /// Run one bounded catch-up pass for a single replica and persist the new ACK
@@ -164,11 +169,12 @@ struct CatchupContext {
 /// `max_ops_per_pass`) to `addr` through the same authenticated, dense-stream
 /// fan-out used by steady-state replication, then records the achieved
 /// `through_sequence` into the process ACK tracker. On `RedoReclaimed` (the
-/// circular redo log wrapped past `from_seq`) it posts a full-shard resync
-/// request via the coordinator instead. Other transport errors are logged and
-/// left for the next pass to retry — the function is idempotent because the
-/// replica applies ops idempotently and the ACK tracker only advances on
-/// success.
+/// linear redo log reclaimed its prefix past `from_seq`) it posts a full-shard
+/// resync request via the coordinator instead, retrying the signal with bounded
+/// backoff so a transiently-unknown address does not silently drop the resync.
+/// Other transport errors are logged and left for the next pass to retry — the
+/// function is idempotent because the replica applies ops idempotently and the
+/// ACK tracker only advances on success.
 ///
 /// Returns `true` if the replica's ACK advanced this pass (i.e. progress was
 /// made), `false` otherwise.
@@ -223,7 +229,7 @@ fn run_one_catchup_pass(
             teraslab::server::dispatch::send_replica_ops_to(
                 addr,
                 chunk,
-                std::time::Duration::from_secs(5),
+                ctx.replication_timeout,
                 auth_secret.as_deref(),
                 cluster_key_handle.load(Ordering::Acquire),
                 ctx.source_node_id,
@@ -244,13 +250,38 @@ fn run_one_catchup_pass(
         Err(e) => {
             tracing::warn!(%addr, err = %e, "catchup: replica catch-up failed");
             if let teraslab::replication::durable::CatchupError::RedoReclaimed { .. } = e {
-                let queued = ctx.resync_handle.signal_for_addr(&addr, Vec::new());
+                // The redo prefix the replica still needs has been reclaimed,
+                // so the only safe repair is a full-shard resync. A dropped
+                // resync request must not be silently lost (REL-113): the
+                // common cause of `signal_for_addr` returning false is that the
+                // node-address map has not yet learned `addr` (transient on
+                // join), so retry with bounded backoff. If it still fails, the
+                // receiver is gone (shutdown) or the address is genuinely
+                // unknown; escalate to error-level so the gap is observable.
+                // Either way the ACK tracker has NOT advanced, so the next
+                // lag-monitor tick re-detects the lag and re-runs this pass.
+                const RESYNC_SIGNAL_ATTEMPTS: u32 = 3;
+                let mut queued = false;
+                for attempt in 0..RESYNC_SIGNAL_ATTEMPTS {
+                    if ctx.resync_handle.signal_for_addr(&addr, Vec::new()) {
+                        queued = true;
+                        break;
+                    }
+                    if attempt + 1 < RESYNC_SIGNAL_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            50 * (attempt as u64 + 1),
+                        ));
+                    }
+                }
                 if queued {
                     tracing::info!(%addr, "catchup: posted full-shard resync request");
                 } else {
-                    tracing::warn!(
+                    tracing::error!(
                         %addr,
-                        "catchup: resync request dropped (unknown addr or coordinator stopped)",
+                        attempts = RESYNC_SIGNAL_ATTEMPTS,
+                        "catchup: resync request could not be queued (unknown addr or \
+                         coordinator stopped); replica remains behind and will be \
+                         retried on the next lag-monitor tick",
                     );
                 }
             }
@@ -1407,6 +1438,9 @@ fn main() {
                 resync_handle: running.resync_sender_handle(),
                 auth_secret: running.cluster_secret().map(|s| s.to_vec()),
                 source_node_id: config.node_id,
+                replication_timeout: std::time::Duration::from_millis(
+                    config.replication_timeout_ms.max(1),
+                ),
             };
             // Stash for the runtime lag monitor (spawned after this block).
             catchup_ctx = Some(ctx.clone());
