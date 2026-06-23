@@ -20,6 +20,7 @@ pub mod cluster;
 pub mod config;
 pub mod device;
 pub mod fault_injection;
+pub(crate) mod fsutil;
 pub mod index;
 pub mod io;
 pub mod locks;

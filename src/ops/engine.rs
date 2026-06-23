@@ -1508,21 +1508,26 @@ impl Engine {
         if !self.device_ptr.is_null() {
             // SAFETY: `device_ptr` is non-null (checked above) and points to
             // this engine's owned device region; `record_offset` is an
-            // allocator-aligned, in-bounds record offset, so
-            // `device_ptr.add(record_offset)` is in-bounds and writing
-            // `METADATA_SIZE` bytes from it stays within the record (the
-            // record is at least `METADATA_SIZE` bytes). The caller holds the
-            // record's stripe lock for this tombstone write (delete path),
-            // and the following `Release` fence publishes the marker to other
-            // threads.
+            // allocator-aligned, in-bounds record offset, so the write of
+            // `METADATA_SIZE` bytes stays within the record (the record is at
+            // least `METADATA_SIZE` bytes). The caller holds the record's
+            // stripe lock for this tombstone write (delete path).
+            //
+            // F-X-007 (BC-02): publish the marker through the SAME record
+            // write-guard + atomic-store path every other direct writer uses
+            // (`write_metadata_direct`/`write_utxo_slot_direct`). A bare
+            // `copy_nonoverlapping` here would race the lock-free direct
+            // readers (`read_metadata_direct`/`read_identity_direct`), which
+            // take only the `io_locks().read` guard — a data race the
+            // CRC-alone defense does not cover (it is empirically insufficient
+            // on aarch64 release builds; see `io::read_metadata_direct`).
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    header.as_ptr(),
-                    self.device_ptr.add(record_offset as usize),
-                    METADATA_SIZE,
+                io::write_metadata_header_bytes_direct(
+                    self.device_ptr,
+                    record_offset,
+                    &header,
                 );
             }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             Ok(())
         } else {
             let align = self.device.alignment();

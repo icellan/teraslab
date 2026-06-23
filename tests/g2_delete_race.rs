@@ -286,3 +286,109 @@ fn delete_does_not_alias_concurrent_create() {
         "{alias} reads observed cross-tx aliasing (out of {reads} successful reads, {cycles} delete/create cycles)",
     );
 }
+
+/// REL-001: the delete tombstone writer must publish through the same
+/// `io_locks().write` + atomic-store path as every other direct writer, so a
+/// concurrent lock-free reader of the SAME record never observes a torn header.
+///
+/// This isolates the tombstone-vs-read race (no allocator reuse / no cross-tx
+/// aliasing): a single record is repeatedly deleted and recreated in place
+/// while readers hammer `read_metadata` / `get_spend`. Every `Ok` must be a
+/// CRC-valid header for exactly `tx_a`; a delete may legitimately surface as
+/// `TxNotFound`, and a torn read is allowed to surface as a `StorageError`
+/// (CRC failure) — but never a hybrid header that passes CRC with wrong
+/// content, and never an unexpected error variant or panic. Before the fix the
+/// tombstone write was a bare non-atomic memcpy racing these readers (UB).
+#[test]
+fn tombstone_write_never_torn_under_concurrent_reads() {
+    let engine = build_engine();
+
+    let mut tx_a = [0u8; 32];
+    tx_a[0] = 0xAA;
+    tx_a[1] = 0x07;
+    let hashes_a: &'static [[u8; 32]] = leak_hashes(0x5A);
+    engine.create(&make_create_req(tx_a, hashes_a)).unwrap();
+    let key_a = TxKey::from_bytes(tx_a);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let bad = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let cycles = Arc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+
+    // One writer: delete (tombstone) then recreate the same record in place,
+    // keeping the tombstone path hot on a single offset.
+    {
+        let engine = engine.clone();
+        let stop = stop.clone();
+        let cycles = cycles.clone();
+        handles.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = engine.delete(&DeleteRequest {
+                    tx_key: key_a,
+                    due_guard: None,
+                });
+                let _ = engine.create(&make_create_req(tx_a, hashes_a));
+                cycles.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for _ in 0..8 {
+        let engine = engine.clone();
+        let stop = stop.clone();
+        let bad = bad.clone();
+        let reads = reads.clone();
+        handles.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match engine.read_metadata(&key_a) {
+                    Ok(meta) => {
+                        let tx_id = { meta.tx_id };
+                        if tx_id != tx_a {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                        }
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(SpendError::TxNotFound) => {}
+                    Err(SpendError::StorageError { .. }) => {}
+                    Err(other) => panic!("unexpected read_metadata err: {other:?}"),
+                }
+                match engine.get_spend(&GetSpendRequest {
+                    tx_key: key_a,
+                    offset: 0,
+                    utxo_hash: hashes_a[0],
+                }) {
+                    Ok(_) | Err(SpendError::TxNotFound) | Err(SpendError::StorageError { .. }) => {}
+                    Err(SpendError::UtxoHashMismatch { .. }) => {}
+                    Err(other) => panic!("unexpected get_spend err: {other:?}"),
+                }
+            }
+        }));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if reads.load(Ordering::Relaxed) >= 200 && cycles.load(Ordering::Relaxed) >= 40 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let bad = bad.load(Ordering::Relaxed);
+    let reads = reads.load(Ordering::Relaxed);
+    let cycles = cycles.load(Ordering::Relaxed);
+    assert!(reads >= 100, "test did not stress reads enough: {reads}");
+    assert!(cycles >= 20, "test did not stress tombstone writes enough: {cycles}");
+    assert_eq!(
+        bad, 0,
+        "{bad} reads observed a torn/aliased header (out of {reads} reads, {cycles} tombstone cycles)",
+    );
+}

@@ -882,6 +882,37 @@ pub unsafe fn write_metadata_direct(base_ptr: *mut u8, record_offset: u64, metad
     }
 }
 
+/// Write a raw, already-serialized metadata-header image directly to a
+/// memory-mapped device region under the record write guard.
+///
+/// Identical concurrency contract to [`write_metadata_direct`] (F-X-007 /
+/// BC-02), but takes pre-serialized header bytes rather than a [`TxMetadata`].
+/// Used by the delete tombstone path, which writes a `DeletedRecordMarker`
+/// image (marker prefix + zeroed remainder) rather than a live header. Routing
+/// it through the same `io_locks().write` + `atomic_store_from` path keeps the
+/// tombstone write from racing the lock-free direct readers
+/// (`read_metadata_direct` / `read_identity_direct`), which a bare
+/// `copy_nonoverlapping` would (a data race / UB the CRC-alone defense does not
+/// cover — see `read_metadata_direct`'s doc).
+///
+/// # Safety
+///
+/// `base_ptr` must be valid for at least `record_offset + METADATA_SIZE` bytes.
+/// Caller must hold the per-transaction stripe lock.
+#[inline]
+pub unsafe fn write_metadata_header_bytes_direct(
+    base_ptr: *mut u8,
+    record_offset: u64,
+    header: &[u8; METADATA_SIZE],
+) {
+    let _w = io_locks().write(record_offset);
+    unsafe {
+        let dst = base_ptr.add(off_to_usize(record_offset));
+        atomic_store_from(dst, header);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Read a single [`UtxoSlot`] directly from a memory-mapped device region.
 ///
 /// # Safety
@@ -1027,6 +1058,11 @@ pub fn read_utxo_slot(
     let aligned_base = slot_offset / align as u64 * align as u64;
     let intra_offset = (slot_offset - aligned_base) as usize;
     let total_read = align_up(intra_offset + UTXO_SLOT_SIZE, align);
+
+    // F-X-007 (BC-02): record-level read guard, matching `read_all_utxo_slots`
+    // — so a concurrent `write_record_bytes` (create into a reused region) or a
+    // slot write cannot be observed mid-copy. Keyed by the record base offset.
+    let _r = io_locks().read(record_offset);
 
     let mut buf = AlignedBuf::new(total_read, align);
     device.pread_exact_at(&mut buf, aligned_base)?;

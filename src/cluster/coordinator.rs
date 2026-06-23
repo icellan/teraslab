@@ -7461,6 +7461,10 @@ fn persist_cluster_state(path: &std::path::Path, peak: u64, epoch: u64) {
         f.write_all(&epoch.to_le_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        // The rename's directory entry is not durable until the parent dir is
+        // fsync'd; without this a crash can roll the persisted peak/epoch back
+        // to the prior value, weakening restart quorum (split-brain risk).
+        crate::fsutil::fsync_parent_dir(path)?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -7495,6 +7499,10 @@ fn persist_topology_state(
         f.write_all(&data)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        // Make the rename's directory entry durable — see persist_cluster_state.
+        // This is the safety-critical restart-quorum state (peak/committed_term);
+        // a crash before the dir fsync could resurrect a stale peak.
+        crate::fsutil::fsync_parent_dir(path)?;
         if let Some(peak) = topology_multi_node_evidence_peak(state) {
             persist_topology_multi_node_marker(path, peak)?;
         }
@@ -7585,7 +7593,9 @@ fn persist_topology_multi_node_marker(path: &std::path::Path, peak: u64) -> std:
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(&marker_peak.to_le_bytes())?;
     f.sync_all()?;
-    std::fs::rename(&tmp, marker)?;
+    std::fs::rename(&tmp, &marker)?;
+    // Make the rename's directory entry durable — see persist_cluster_state.
+    crate::fsutil::fsync_parent_dir(&marker)?;
     Ok(())
 }
 
@@ -7638,7 +7648,11 @@ pub fn load_startup_topology_state(
 }
 
 /// Backward-compatible alias for callers that only persist peak.
-#[allow(dead_code)]
+///
+/// Test-only: the production paths persist full topology state (peak +
+/// committed_term + members). Gated `#[cfg(test)]` rather than
+/// `#[allow(dead_code)]` so it is genuinely compiled out of release builds.
+#[cfg(test)]
 fn persist_peak_cluster_size(path: &std::path::Path, peak: u64) {
     persist_cluster_state(path, peak, 0);
 }
@@ -14061,6 +14075,34 @@ mod tests {
 
         let loaded = load_topology_state(&path);
         assert_eq!(loaded.peak_cluster_size, 3);
+    }
+
+    /// REL-002 / REL-111 — the persist paths now fsync the parent directory
+    /// after the atomic rename (so the rename's directory entry is durable, not
+    /// just the file contents). This exercises that path end-to-end: a persist
+    /// into a real directory must succeed (the added `fsync_parent_dir` call
+    /// must not error) and the safety-critical peak/committed_term must reload
+    /// intact. Real crash/power-loss rollback can't be unit-tested without a
+    /// crash-injecting filesystem, but this pins the durable round-trip and
+    /// guards against the fsync call regressing into an error on a normal path.
+    #[test]
+    fn persist_topology_state_dir_fsync_round_trips_peak_and_term() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("node.cluster.topo");
+
+        let authority = Arc::new(crate::cluster::topology::TopologyAuthority::new(
+            NodeId(1),
+            Duration::from_secs(1),
+        ));
+        // Persist into an existing directory; the added post-rename
+        // `fsync_parent_dir` call must not error on a normal path, and the
+        // safety-critical peak/committed_term must reload intact.
+        persist_topology_state(&path, &authority.persisted_state(3, 7))
+            .expect("persist (with dir fsync) must succeed");
+
+        let loaded = load_topology_state(&path);
+        assert_eq!(loaded.peak_cluster_size, 3, "peak must round-trip");
+        assert_eq!(loaded.incarnation, 7, "incarnation must round-trip");
     }
 
     #[test]

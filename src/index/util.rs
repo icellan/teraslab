@@ -6,20 +6,11 @@ use std::path::Path;
 /// fsync the parent directory of `path` so directory-entry updates (renames,
 /// creates) survive a crash.
 ///
-/// Falls back to fsyncing `.` if `path.parent()` is empty (e.g. relative path
-/// with no directory component).
+/// Thin wrapper over the canonical [`crate::fsutil::fsync_parent_dir`] (kept so
+/// existing `index::*` callers need no change); see that function for the full
+/// rationale (including the issue-#13 bare-relative-path handling).
 pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
-    // `Path::parent()` returns `Some("")` (an EMPTY path) for a bare relative
-    // name like `teraslab-index.snap`, not `None` — so `unwrap_or(".")` did not
-    // catch it and `File::open("")` failed with ENOENT, failing every
-    // checkpoint for a relative `index_snapshot_path` (issue #13). Treat an
-    // empty parent as the current directory, matching the documented behavior.
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let dir = std::fs::File::open(parent)?;
-    dir.sync_all()
+    crate::fsutil::fsync_parent_dir(path)
 }
 
 #[cfg(test)]
