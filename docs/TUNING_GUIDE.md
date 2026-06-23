@@ -38,15 +38,15 @@
 | `swim_probe_interval_ms` | 200 | SWIM protocol probe interval. Lower = faster failure detection, higher network overhead. |
 | `swim_suspicion_timeout_ms` | 5000 | Time before a suspected node is declared dead. |
 | `max_migration_threads` | 16 | Max concurrent migration threads per topology change. Prevents resource exhaustion during rapid churn. |
-| `migration_pool_size` | 4 | Parallel TCP connections per migration target. More connections = higher throughput for large migrations. |
-| `migration_batch_size` | 100 | Records per baseline streaming batch during migration. Larger batches reduce round-trip overhead. |
+| `migration_pool_size` | 128 | Parallel TCP connections per migration target. More connections = higher throughput for large migrations. |
+| `migration_batch_size` | 500 | Records per baseline streaming batch during migration. Larger batches reduce round-trip overhead. |
 
 ### Server
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
-| `listen_addr` | `0.0.0.0:3300` | TCP listen address for the binary wire protocol. |
-| `http_listen_addr` | `0.0.0.0:9100` | HTTP address for observability endpoints. |
+| `listen_addr` | `127.0.0.1:3300` | TCP listen address for the binary wire protocol. Loopback by default; non-loopback binds require `enable_remote_bind = true`. |
+| `http_listen_addr` | `127.0.0.1:9100` | HTTP address for observability endpoints. Loopback by default. |
 | `max_connections` | 1024 | Maximum concurrent TCP connections. |
 | `max_batch_size` | 8192 | Maximum items per batch request. |
 

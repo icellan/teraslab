@@ -42,27 +42,35 @@ production deployments TeraSlab assumes:
    No empty / missing token allowed; the HTTP middleware uses
    constant-time compare (`subtle`) against the bearer header.
 
-### Hard mode: `--strict-auth`
+### Hard mode: `strict_auth` (default `true`)
 
-The daemon supports a hard-mode toggle for production:
+`strict_auth` defaults to **`true`** (`ServerConfig::default()`,
+src/config.rs). With it enabled, a **clustered configuration**
+(`node_id > 0` OR `replication_factor > 1`) that does not set a
+`cluster_secret` **refuses to start** with
+`ConfigError::StrictAuthRequiresSecret`. This is the safe default: a
+multi-node deployment cannot come up with unauthenticated cluster /
+replication frames.
+
+To opt out — only appropriate for single-node demos, bench rigs, or a
+fully trusted overlay where you accept unauthenticated cluster frames —
+set it explicitly:
 
 ```bash
-teraslab-server --config /etc/teraslab/config.toml --strict-auth
+teraslab-server --config /etc/teraslab/config.toml --strict-auth=false
 ```
 
 or in TOML:
 
 ```toml
-strict_auth = true
+strict_auth = false
 ```
 
-With `strict_auth = true`, **multi-node configurations without a
-`cluster_secret` refuse to start** with
-`ConfigError::StrictAuthRequiresSecret`. The default (`strict_auth =
-false`) downgrades the same condition to a prominent
-`tracing::warn!(target = "teraslab::security", ...)` at boot, so single-
-node demos work without ceremony but operators always see the missing-
-secret state in their log aggregator.
+With `strict_auth = false`, the same missing-secret condition is
+downgraded to a prominent
+`tracing::warn!(target = "teraslab::security", ...)` at boot instead of
+a hard refusal, so first-run demos work without ceremony but operators
+always see the missing-secret state in their log aggregator.
 
 `cluster_secret` length: when set, must be ≥ 16 bytes
 (`ServerConfig::MIN_CLUSTER_SECRET_LEN`). Pre-fix a single-byte secret
