@@ -582,13 +582,31 @@ impl Server {
                         // handshakes and superset probes — together far above
                         // the client cap. Counting peer traffic against the cap
                         // resets those connections and stalls handoff/relinquish
-                        // convergence under a rolling restart (sc09/sc05). Peer
-                        // traffic is already authenticated by `cluster_secret` on
-                        // every inter-node frame, so it needs no per-IP throttle.
-                        let peer_exempt = self
-                            .cluster
-                            .as_ref()
-                            .is_some_and(|c| c.is_known_peer_ip(addr.ip()));
+                        // convergence under a rolling restart (sc09/sc05).
+                        //
+                        // REL-128: the exemption is only sound when inter-node
+                        // frames are actually AUTHENTICATED. Under the default
+                        // (`strict_auth = true`, which config validation pairs
+                        // with a required `cluster_secret` for multi-node
+                        // clusters) every inter-node frame carries an HMAC, so a
+                        // forged source IP cannot claim peer identity. But under
+                        // the explicit fail-open opt-out (`strict_auth = false`
+                        // AND no `cluster_secret`) inter-node frames are
+                        // UNauthenticated — `is_known_peer_ip` then rests on the
+                        // attacker-spoofable source IP alone. So we gate the
+                        // exemption on auth being enforced. This does not break
+                        // legitimate clusters: the default config always has a
+                        // secret set (validation requires it under strict_auth),
+                        // so the gate passes; only a deployment that deliberately
+                        // turned auth off loses the exemption, which is correct —
+                        // there is nothing to back the exemption in that mode.
+                        let cluster_auth_enforced =
+                            self.config.strict_auth || self.config.cluster_secret.is_some();
+                        let peer_exempt = cluster_auth_enforced
+                            && self
+                                .cluster
+                                .as_ref()
+                                .is_some_and(|c| c.is_known_peer_ip(addr.ip()));
                         let per_ip_guard = if self.config.max_connections_per_ip > 0 && !peer_exempt
                         {
                             let peer_ip = addr.ip();
@@ -885,6 +903,36 @@ fn handle_connection_inner(
             let _ = stream.write_all(&resp.encode());
             return Err(format!(
                 "frame too large: {total_length} > MAX_FRAME_SIZE {max_wire_frame_size}"
+            ));
+        }
+
+        // REL-119: a frame whose declared `total_length` is below the fixed
+        // request-header size (`request_id(8) + op_code(2) + flags(2)` =
+        // MIN_REQUEST_BODY) can never decode into a valid request. Pre-fix
+        // these slipped through the length checks, were assembled, then
+        // failed in `RequestFrame::decode_bytes` (TooShort) and fell through
+        // to the connection loop's generic decode-error arm — a BARE socket
+        // close with no diagnostic frame. Symmetric with the oversize guard
+        // above: return a typed ERR_PAYLOAD_MALFORMED frame so the client
+        // learns WHY the connection is dropping instead of seeing an opaque
+        // disconnect. `request_id` is unknown here (it lives inside the body
+        // we are refusing to read), so 0 is used as on the oversize path.
+        if total_length < crate::protocol::frame::MIN_REQUEST_BODY {
+            let resp = ResponseFrame {
+                request_id: 0,
+                status: STATUS_ERROR,
+                payload: encode_error_payload(
+                    ERR_PAYLOAD_MALFORMED,
+                    &format!(
+                        "frame below minimum size: total_length {total_length} < {}",
+                        crate::protocol::frame::MIN_REQUEST_BODY
+                    ),
+                ),
+            };
+            let _ = stream.write_all(&resp.encode());
+            return Err(format!(
+                "frame below minimum size: total_length {total_length} < MIN_REQUEST_BODY {}",
+                crate::protocol::frame::MIN_REQUEST_BODY
             ));
         }
 
@@ -1297,6 +1345,92 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("silent client should be dropped after read timeout");
         assert!(result.is_ok(), "connection result was {result:?}");
+    }
+
+    /// REL-119: a frame whose declared `total_length` is below the fixed
+    /// request-header size (`MIN_REQUEST_BODY` = 12) is undecodable. Pre-fix
+    /// the server silently closed the connection with no diagnostic frame;
+    /// the contract now mirrors the oversize path — the client receives a
+    /// typed `ERR_PAYLOAD_MALFORMED` (wire code 28) response frame BEFORE the
+    /// connection is dropped, so it learns WHY rather than seeing an opaque
+    /// disconnect.
+    #[test]
+    fn sub_minimum_frame_returns_payload_malformed() {
+        use crate::protocol::codec::decode_error_payload;
+        use std::io::Read as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    read_timeout: Duration::from_secs(2),
+                    frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
+                    write_timeout: Duration::from_secs(1),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // Declare a 6-byte body — a syntactically decodable length, but below
+        // MIN_REQUEST_BODY (12). No body bytes are sent; the server must
+        // reject on the length prefix alone, before reading any body.
+        const _: () = assert!(6 < crate::protocol::frame::MIN_REQUEST_BODY);
+        client.write_all(&6u32.to_le_bytes()).unwrap();
+
+        // Read the full response frame the server sends before closing.
+        let mut len_buf = [0u8; 4];
+        client
+            .read_exact(&mut len_buf)
+            .expect("server must send a response frame, not a bare disconnect");
+        let total_length = u32::from_le_bytes(len_buf) as usize;
+        let mut body = vec![0u8; total_length];
+        client.read_exact(&mut body).unwrap();
+        let (resp, _) = ResponseFrame::decode(
+            &[len_buf.as_slice(), body.as_slice()].concat(),
+        )
+        .expect("response frame must decode");
+        assert_eq!(resp.status, STATUS_ERROR);
+        let (code, _msg) =
+            decode_error_payload(&resp.payload).expect("typed [code:2][msg] error payload");
+        assert_eq!(
+            code, ERR_PAYLOAD_MALFORMED,
+            "sub-minimum frame must surface wire code ERR_PAYLOAD_MALFORMED(28); got {code}",
+        );
+
+        // The server then closes the connection with a descriptive error.
+        let result = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server thread must finish after rejecting the frame");
+        let err = result.expect_err("sub-minimum frame must end the connection with an error");
+        assert!(
+            err.contains("frame below minimum size"),
+            "rejection should surface as a below-minimum error, got: {err}"
+        );
     }
 
     /// L-01: `CONNECTION_READ_TIMEOUT` is per-syscall — it resets on
