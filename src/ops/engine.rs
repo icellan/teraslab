@@ -700,6 +700,7 @@ impl Engine {
         let log_arc = self.redo_log_handle();
         let log_ref = log_arc.as_deref();
         let mut dah = self.dah_index.lock();
+        let _writer_gauge = crate::metrics::writer_enter();
         if old_height != 0 {
             dah.remove(key, log_ref)
                 .map_err(|e| SpendError::StorageError {
@@ -728,6 +729,7 @@ impl Engine {
         let log_arc = self.redo_log_handle();
         let log_ref = log_arc.as_deref();
         let mut unmined = self.unmined_index.lock();
+        let _writer_gauge = crate::metrics::writer_enter();
         if old_height != 0 {
             unmined
                 .remove(key, log_ref)
