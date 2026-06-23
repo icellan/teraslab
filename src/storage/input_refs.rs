@@ -1,7 +1,13 @@
 //! Input reference storage for large transactions.
 //!
-//! Stores compact outpoint references (prev_txid + prev_vout) on NVMe
-//! for fast spend validation without reading the full cold data blob.
+//! Stores compact outpoint references (prev_txid + prev_vout) on NVMe.
+//!
+//! RESERVED / CURRENTLY UNUSED: this module is not wired into any production
+//! path. There is no live "fast spend validation" feature backed by it — the
+//! shipped parent-lookup path is `Engine::parent_txids_for_child` →
+//! `read_cold_data`. The types and read/write helpers here are fully
+//! implemented and tested, and are retained as a reserved building block for a
+//! future on-NVMe outpoint index; they have no callers today.
 
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 
