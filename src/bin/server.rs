@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
-use teraslab::index::{DahBackend, PrimaryBackend, UnminedBackend};
+use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
     AllocatorMetrics, ClusterAuthMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
@@ -750,7 +750,11 @@ fn main() {
             (primary, secondaries)
         }
     };
-    let (mut index, secondary_outcome) = load_outcome;
+    let (primary, secondary_outcome) = load_outcome;
+    // Wrap in a ShardedIndex so recovery and the engine share the same sharded
+    // index (interior RwLocks, N=1 for now — identical semantics to the old
+    // single-backend path).
+    let index = ShardedIndex::from_single(primary);
     let SecondaryLoadOutcome {
         dah: mut dah_index,
         unmined: mut unmined_index,
@@ -855,7 +859,7 @@ fn main() {
         match teraslab::recovery::recover_all_with_allocator_collecting_pending_conflicts_progress(
             &*device,
             redo,
-            &mut index,
+            &index,
             &mut dah_index,
             &mut unmined_index,
             Some(&mut allocator),
@@ -953,9 +957,10 @@ fn main() {
         index.set_redo_log(log.clone());
     }
 
-    // 4. Create engine
+    // 4. Create engine — index is already a ShardedIndex (from the recovery
+    // path above), so pass it directly to avoid re-wrapping in N=1.
     let locks = StripedLocks::new(config.lock_stripes);
-    let mut engine = Engine::new(
+    let mut engine = Engine::new_with_sharded_index(
         device.clone(),
         index,
         allocator,

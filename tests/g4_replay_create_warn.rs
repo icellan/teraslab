@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{PrimaryBackend, TxIndexEntry, TxKey};
+use teraslab::index::{PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey};
 use teraslab::io;
 use teraslab::record::{TxFlags, TxMetadata};
 use teraslab::recovery::recover;
@@ -25,7 +25,7 @@ fn replay_create_skips_when_already_indexed_with_different_offset() {
 
     // Existing index entry at record_offset 16 KiB; the redo Create
     // entry will reference a different record_offset (4 KiB).
-    let mut index = PrimaryBackend::new_in_memory(64).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(64).unwrap());
     let k = key(0x99);
     let utxo_count = 1u32;
     let other_offset = 16 * 1024u64;
@@ -65,7 +65,7 @@ fn replay_create_skips_when_already_indexed_with_different_offset() {
     })
     .unwrap();
 
-    let stats = recover(&*data as &dyn BlockDevice, &log, &mut index).unwrap();
+    let stats = recover(&*data as &dyn BlockDevice, &log, &index).unwrap();
     assert_eq!(
         stats.entries_replayed, 0,
         "F-G4-014: replay_create with mismatched index must skip, not re-apply",

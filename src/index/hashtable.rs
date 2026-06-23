@@ -2634,7 +2634,9 @@ mod tests {
         let data_dev =
             std::sync::Arc::new(crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let mut alloc = crate::allocator::SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = crate::index::PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = crate::index::ShardedIndex::from_single(
+            crate::index::PrimaryBackend::new_in_memory(1000).unwrap(),
+        );
         let mut dah = crate::index::DahBackend::new_in_memory();
         let mut unmined = crate::index::UnminedBackend::new_in_memory();
 
@@ -2642,7 +2644,7 @@ mod tests {
         let stats = crate::recovery::recover_all_with_allocator(
             &*data_dev,
             &redo_log,
-            &mut index,
+            &index,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),

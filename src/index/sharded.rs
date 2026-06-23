@@ -653,6 +653,18 @@ impl ShardedIndex {
     // Write / flush
     // -----------------------------------------------------------------------
 
+    /// Attach a redo log to every shard for file-backed resize journaling.
+    ///
+    /// Delegates to [`PrimaryBackend::set_redo_log`] on each shard. For
+    /// in-memory and redb shards this is a no-op on each shard; for
+    /// file-backed shards it enables crash-atomic resize (Begin/Commit
+    /// journaling + parent-dir fsync).
+    pub fn set_redo_log(&self, redo_log: std::sync::Arc<parking_lot::Mutex<crate::redo::RedoLog>>) {
+        for shard in &self.shards {
+            shard.write().set_redo_log(redo_log.clone());
+        }
+    }
+
     /// Flush every shard durable.
     ///
     /// Iterates all shard locks (read is sufficient — `flush_durable` takes

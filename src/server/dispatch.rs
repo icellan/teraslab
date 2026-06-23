@@ -12611,18 +12611,18 @@ mod tests {
 
             // Create fresh index + allocator
             let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-            let mut index: crate::index::PrimaryBackend = Index::new(10000).unwrap().into();
+            let primary: crate::index::PrimaryBackend = Index::new(10000).unwrap().into();
+            let index = crate::index::ShardedIndex::from_single(primary);
 
             // Run recovery to rebuild index from redo log
-            let stats =
-                crate::recovery::recover(&*data_dev as &dyn BlockDevice, &redo_log, &mut index)
-                    .unwrap();
+            let stats = crate::recovery::recover(&*data_dev as &dyn BlockDevice, &redo_log, &index)
+                .unwrap();
             eprintln!(
                 "recovery: {} replayed, {} skipped, {} failed",
                 stats.entries_replayed, stats.entries_skipped, stats.entries_failed
             );
 
-            let engine = Engine::new(
+            let engine = Engine::new_with_sharded_index(
                 data_dev.clone() as Arc<dyn BlockDevice>,
                 index,
                 alloc,
@@ -21588,13 +21588,14 @@ mod tests {
                 crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, redo_size)
                     .unwrap();
             let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
-            let mut index: PrimaryBackend = Index::new(10000).unwrap().into();
+            let primary: PrimaryBackend = Index::new(10000).unwrap().into();
+            let index = crate::index::ShardedIndex::from_single(primary);
             let mut dah = DahBackend::new_in_memory();
             let mut unmined = UnminedBackend::new_in_memory();
             crate::recovery::recover_all_with_allocator(
                 &*data_dev as &dyn BlockDevice,
                 &redo_log,
-                &mut index,
+                &index,
                 &mut dah,
                 &mut unmined,
                 Some(&mut alloc),
@@ -21607,7 +21608,7 @@ mod tests {
             // fresh secondaries (the recovered ones already validated that
             // `recover_all_with_allocator` succeeded above).
             let _ = (&dah, &unmined);
-            Engine::new(
+            Engine::new_with_sharded_index(
                 data_dev as Arc<dyn BlockDevice>,
                 index,
                 alloc,

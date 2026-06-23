@@ -404,6 +404,56 @@ impl Engine {
         }
     }
 
+    /// Create a new engine from a pre-built [`ShardedIndex`].
+    ///
+    /// Use this when recovery has already wrapped the primary backend into a
+    /// `ShardedIndex` (e.g. via [`ShardedIndex::from_single`] or
+    /// [`ShardedIndex::new_in_memory`]) and you want the engine to share that
+    /// exact shard layout rather than re-wrapping it.
+    ///
+    /// Identical to [`Engine::new`] except the index parameter is already a
+    /// `ShardedIndex` and is not re-wrapped.
+    pub fn new_with_sharded_index(
+        device: Arc<dyn BlockDevice>,
+        index: ShardedIndex,
+        allocator: SlotAllocator,
+        locks: StripedLocks,
+        dah_index: impl Into<DahBackend>,
+        unmined_index: impl Into<UnminedBackend>,
+    ) -> Self {
+        let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
+        let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
+        let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        Self {
+            device,
+            device_ptr,
+            index,
+            allocator: parking_lot::Mutex::new(allocator),
+            locks,
+            dah_index: parking_lot::Mutex::new(dah_index.into()),
+            unmined_index: parking_lot::Mutex::new(unmined_index.into()),
+            conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
+            dispatch_visibility_barrier: parking_lot::RwLock::new(()),
+            redo_log: std::sync::OnceLock::new(),
+            tombstone_log: std::sync::OnceLock::new(),
+            tombstone_index: std::sync::OnceLock::new(),
+            tombstones_enabled: std::sync::atomic::AtomicBool::new(true),
+            tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool::new(false),
+            last_durable_height: std::sync::atomic::AtomicU32::new(0),
+            last_durable_height_path: std::sync::OnceLock::new(),
+            blob_store: None,
+            blob_pins: crate::storage::blobstore::BlobPinSet::new(),
+            shard_counts,
+            shard_counts_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
+            conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_register: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
     /// Attach a redo log for secondary-index two-phase durability.
     ///
     /// Once attached, every on-disk (redb) secondary index mutation appends
