@@ -177,6 +177,59 @@ fn http_put_with_extra_headers(
     (status_code, resp_body)
 }
 
+/// Perform a raw WebSocket upgrade handshake and return
+/// `(status_code, full_response_headers)`.
+///
+/// Only the response header block is read (up to the terminating
+/// `\r\n\r\n`): a successful `101 Switching Protocols` keeps the socket open
+/// while the server pushes a frame every second, so reading to EOF would
+/// block until the read timeout. `extra_headers` is injected verbatim (each
+/// line `\r\n`-terminated) — callers supply the `Sec-WebSocket-Protocol`
+/// and/or `Authorization` header that carries the admin token. The mandatory
+/// RFC 6455 upgrade headers are always present so the request reaches the
+/// upgrade handler once auth passes.
+fn ws_handshake(port: u16, path: &str, extra_headers: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    let req = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         {extra_headers}\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            buf.truncate(pos + 4);
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    let response = String::from_utf8_lossy(&buf).into_owned();
+    let status_code: u16 = response
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status_code, response)
+}
+
 #[test]
 fn metrics_returns_prometheus_text_format() {
     let (port, _state) = start_test_http_server();
@@ -855,6 +908,68 @@ fn admin_top_requires_bearer_token() {
     assert_eq!(
         status, 401,
         "/ws/top must require admin bearer token (F-G6-003)"
+    );
+}
+
+/// Dashboard auth (F-G6-003 follow-up): a browser cannot set the
+/// `Authorization` header on `new WebSocket()`, so `/ws/top` must also accept
+/// the admin token via the `Sec-WebSocket-Protocol` request header — the one
+/// header `new WebSocket(url, [proto])` can populate. The handshake echoes
+/// the negotiated `teraslab.v1` marker (never the secret token) in the 101
+/// response, and a missing or wrong token must still be rejected with 401 so
+/// there is no security regression versus the header-only gate.
+#[test]
+fn ws_top_auth_via_subprotocol() {
+    let (port, _state) = start_test_http_server();
+
+    // Valid token offered alongside the negotiated subprotocol → 101 upgrade.
+    let offer = format!("Sec-WebSocket-Protocol: teraslab.v1, Bearer.{R056_TEST_TOKEN}\r\n");
+    let (status, resp) = ws_handshake(port, "/ws/top", &offer);
+    assert_eq!(
+        status, 101,
+        "valid token in Sec-WebSocket-Protocol must upgrade (101); response was:\n{resp}",
+    );
+    assert!(
+        resp.to_lowercase()
+            .contains("sec-websocket-protocol: teraslab.v1"),
+        "101 response must echo the negotiated teraslab.v1 subprotocol; response was:\n{resp}",
+    );
+    assert!(
+        !resp.contains(R056_TEST_TOKEN),
+        "the secret token must NOT be echoed back in the handshake response:\n{resp}",
+    );
+
+    // Wrong token in the subprotocol → 401, no upgrade.
+    let bad = "Sec-WebSocket-Protocol: teraslab.v1, Bearer.definitely-not-the-token\r\n";
+    let (status, _) = ws_handshake(port, "/ws/top", bad);
+    assert_eq!(
+        status, 401,
+        "wrong token in Sec-WebSocket-Protocol must 401"
+    );
+
+    // Subprotocol offered but no Bearer entry → 401.
+    let (status, _) = ws_handshake(port, "/ws/top", "Sec-WebSocket-Protocol: teraslab.v1\r\n");
+    assert_eq!(
+        status, 401,
+        "missing token must 401 even when a subprotocol is offered",
+    );
+
+    // No token transport at all → 401.
+    let (status, _) = ws_handshake(port, "/ws/top", "");
+    assert_eq!(status, 401, "no token transport at all must 401");
+}
+
+/// The `Authorization: Bearer` path must keep working for `/ws/top` so
+/// non-browser clients (CLI, `curl` with upgrade headers) are unaffected by
+/// the subprotocol channel added for browsers.
+#[test]
+fn ws_top_auth_via_authorization_header_still_works() {
+    let (port, _state) = start_test_http_server();
+    let hdr = format!("Authorization: Bearer {R056_TEST_TOKEN}\r\n");
+    let (status, resp) = ws_handshake(port, "/ws/top", &hdr);
+    assert_eq!(
+        status, 101,
+        "Authorization: Bearer must still upgrade /ws/top; response:\n{resp}",
     );
 }
 

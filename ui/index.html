@@ -86,7 +86,12 @@
             'allocator_metrics.alloc_total',
         ];
 
-        fetch('/admin/top?local=true')
+        // /admin/top is bearer-gated (require_admin_bearer in
+        // src/server/http.rs); send the token app.js stored in localStorage
+        // so the selfcheck works after the operator has logged in.
+        var scToken = localStorage.getItem('teraslab-admin-token') || '';
+        var scHeaders = scToken ? { Authorization: 'Bearer ' + scToken } : {};
+        fetch('/admin/top?local=true', { headers: scHeaders })
             .then(function (r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 return r.json();
