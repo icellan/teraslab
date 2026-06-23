@@ -30,10 +30,20 @@ type pipeConn struct {
 	writeBuf  []byte     // reusable write buffer, protected by mu
 	pending   sync.Map   // map[uint64]chan responseFrame
 	nextID    atomic.Uint64
+	inflight  atomic.Int64 // count of in-flight roundTrips (incl. health pings)
 	readDone  chan struct{}
 	closeOnce sync.Once
 	closed    atomic.Bool
 	connErr   atomic.Pointer[error]
+}
+
+// hasInflight reports whether the connection currently has in-flight requests.
+// The pool uses this to avoid health-probing or reaping a connection that is in
+// active use: a pipelined conn carrying live requests does not need a liveness
+// ping (a genuine failure surfaces via the read/write path), and closing it
+// would abort those legitimate in-flight requests with "connection closed".
+func (c *pipeConn) hasInflight() bool {
+	return c.inflight.Load() > 0
 }
 
 // dial creates a new pipelined connection to the given address.
@@ -75,6 +85,8 @@ func (c *pipeConn) roundTrip(ctx context.Context, opCode uint16, flags uint16, p
 	reqID := c.nextID.Add(1)
 	ch := respChanPool.Get().(chan responseFrame)
 	c.pending.Store(reqID, ch)
+	c.inflight.Add(1)
+	defer c.inflight.Add(-1)
 
 	// Write the request using the connection's reusable write buffer.
 	f := &requestFrame{
