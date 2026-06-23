@@ -91,6 +91,19 @@ pub struct ClientConfig {
     /// Maps server-advertised internal addresses to host-reachable addresses.
     /// For example: `{"172.30.0.11:3300": "127.0.0.1:13300"}`.
     pub addr_map: std::collections::HashMap<String, String>,
+    /// Optional shared cluster secret for HMAC-signing inter-node opcodes.
+    ///
+    /// `OP_GET_PARTITION_MAP` (the cluster bootstrap/refresh op) is an
+    /// inter-node auth opcode. When the cluster runs with `strict_auth` (the
+    /// production default), it must be HMAC-signed or the server rejects it
+    /// with `ERR_CLUSTER_AUTH_FAILED`. Set this to the cluster's shared
+    /// secret. When `None`, the op is sent unsigned (trusted-overlay only).
+    pub cluster_secret: Option<Vec<u8>>,
+    /// Per-request timeout for a single round-trip (default: 30s).
+    ///
+    /// Applies to every `round_trip` on a pooled connection. Lower it for
+    /// latency-sensitive callers; raise it for slow links.
+    pub request_timeout: Duration,
 }
 
 impl Default for ClientConfig {
@@ -102,6 +115,8 @@ impl Default for ClientConfig {
             cluster_refresh_interval: Duration::from_secs(30),
             max_redirects: 3,
             addr_map: std::collections::HashMap::new(),
+            cluster_secret: None,
+            request_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -115,6 +130,9 @@ pub struct Client {
     cluster: Option<Arc<Cluster>>,
     /// Single-node connection pool (set in single-node mode).
     pool: Option<Arc<ConnPool>>,
+    /// Shared cluster secret for HMAC-signing inter-node opcodes (e.g.
+    /// `OP_GET_PARTITION_MAP` in single-node mode). `None` means unsigned.
+    cluster_secret: Option<Vec<u8>>,
     /// Kept alive for the cluster refresh task.
     _refresh_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -131,14 +149,20 @@ impl Client {
     /// Returns [`ClientError::Connection`] if no server is reachable, or
     /// if neither `addr` nor `seeds` is provided.
     pub async fn new(cfg: ClientConfig) -> Result<Self, ClientError> {
+        // Thread the per-request timeout into the pool config, which carries
+        // it to each `PipeConn`.
+        let mut pool_config = cfg.pool;
+        pool_config.request_timeout = cfg.request_timeout;
+
         if !cfg.seeds.is_empty() {
             let cl = Arc::new(
                 Cluster::new(ClusterConfig {
                     seeds: cfg.seeds,
-                    pool_config: cfg.pool,
+                    pool_config,
                     refresh_interval: cfg.cluster_refresh_interval,
                     max_redirects: cfg.max_redirects,
                     addr_map: cfg.addr_map,
+                    cluster_secret: cfg.cluster_secret.clone(),
                 })
                 .await?,
             );
@@ -146,13 +170,15 @@ impl Client {
             Ok(Self {
                 cluster: Some(cl),
                 pool: None,
+                cluster_secret: cfg.cluster_secret,
                 _refresh_task: Some(refresh_task),
             })
         } else if let Some(addr) = cfg.addr {
-            let pool = Arc::new(ConnPool::new(addr, cfg.pool));
+            let pool = Arc::new(ConnPool::new(addr, pool_config));
             Ok(Self {
                 cluster: None,
                 pool: Some(pool),
+                cluster_secret: cfg.cluster_secret,
                 _refresh_task: None,
             })
         } else {
@@ -891,14 +917,17 @@ impl Client {
         params: &UnspendBatchParams,
         items: &[UnspendItem],
     ) -> Result<BatchResult, ClientError> {
-        let payload = encode_unspend_batch_payload(params, items);
-        let conn = if self.cluster.is_some() && !items.is_empty() {
-            self.get_conn_for_txid(&items[0].txid).await?
-        } else {
-            self.get_conn().await?
-        };
-        let resp = conn.round_trip(OP_UNSPEND_BATCH, 0, payload).await?;
-        Self::handle_mutation_response(&resp)
+        let params = params.clone();
+        self.send_item_batch_cluster(
+            OP_UNSPEND_BATCH,
+            items,
+            |item| &item.txid,
+            move |items, indices| {
+                let sub: Vec<UnspendItem> = indices.iter().map(|&i| items[i].clone()).collect();
+                encode_unspend_batch_payload(&params, &sub)
+            },
+        )
+        .await
     }
 
     /// Mark transactions as mined in a specific block.
@@ -1674,12 +1703,154 @@ impl Client {
         &self,
         items: &[GetSpendItem],
     ) -> Result<Vec<GetSpendResult>, ClientError> {
-        let payload = encode_get_spend_batch_payload(items);
-        let conn = if self.cluster.is_some() && !items.is_empty() {
-            self.get_conn_for_txid(&items[0].txid).await?
-        } else {
-            self.get_conn().await?
-        };
+        // Retry once on connection error (dead node) after routing refresh,
+        // mirroring `get_batch`.
+        for attempt in 0..2u32 {
+            match self.get_spend_batch_inner(items).await {
+                Ok(result) => return Ok(result),
+                Err(ClientError::Connection(ref msg)) if attempt == 0 => {
+                    tracing::warn!(error = %msg, "client: get_spend_batch retry after connection error");
+                    let _ = self.refresh_routing().await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Inner `get_spend_batch`: shard-group items, fan out sub-batches in
+    /// parallel, reassemble in original order, then refresh routing and
+    /// re-route any per-item `ERR_REDIRECT` results once.
+    ///
+    /// Unlike mutations, the server returns get_spend results inline under
+    /// `STATUS_OK`; a misrouted item carries `error_code == ERR_REDIRECT`
+    /// (with no target address), so the retry re-routes by the refreshed
+    /// shard table rather than following an explicit address.
+    async fn get_spend_batch_inner(
+        &self,
+        items: &[GetSpendItem],
+    ) -> Result<Vec<GetSpendResult>, ClientError> {
+        // Single-node or non-cluster: send directly.
+        if self.cluster.is_none() || items.is_empty() {
+            let payload = encode_get_spend_batch_payload(items);
+            let conn = self.get_conn().await?;
+            return Self::send_get_spend_sub(&conn, payload).await;
+        }
+
+        // Group by target pool.
+        let groups = self
+            .group_txids(&items.iter().map(|i| i.txid).collect::<Vec<_>>())
+            .ok_or(ClientError::NoPartitionMap)?;
+
+        let total = items.len();
+        let mut handles = Vec::with_capacity(groups.len());
+        for (_, (pool, idx_map)) in groups {
+            let sub_items: Vec<GetSpendItem> = idx_map.iter().map(|&i| items[i].clone()).collect();
+            let payload = encode_get_spend_batch_payload(&sub_items);
+            handles.push(tokio::spawn(async move {
+                let conn = pool.get().await?;
+                let results = Self::send_get_spend_sub(&conn, payload).await?;
+                Ok::<(Vec<GetSpendResult>, Vec<usize>), ClientError>((results, idx_map))
+            }));
+        }
+
+        let mut merged: Vec<Option<GetSpendResult>> = (0..total).map(|_| None).collect();
+        let mut had_connection_error = false;
+        for handle in handles {
+            let join_result = handle
+                .await
+                .map_err(|e| ClientError::Connection(format!("join: {e}")))?;
+            match join_result {
+                Ok((results, idx_map)) => {
+                    for (sub_idx, result) in results.into_iter().enumerate() {
+                        if sub_idx < idx_map.len() {
+                            merged[idx_map[sub_idx]] = Some(result);
+                        }
+                    }
+                }
+                Err(ClientError::Connection(_)) => {
+                    had_connection_error = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        if had_connection_error {
+            let _ = self.refresh_routing().await;
+            return Err(ClientError::Connection(
+                "sub-batch to unreachable node (routing refreshed)".to_string(),
+            ));
+        }
+
+        // Re-route any per-item ERR_REDIRECT results once, after a routing
+        // refresh, using the refreshed shard table.
+        let redirected: Vec<usize> = merged
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Some(r) if r.status != 0 && r.error_code == ERR_REDIRECT => Some(i),
+                _ => None,
+            })
+            .collect();
+
+        if !redirected.is_empty() {
+            let _ = self.refresh_routing().await;
+            let retry_items: Vec<GetSpendItem> =
+                redirected.iter().map(|&i| items[i].clone()).collect();
+            let retry_groups = self
+                .group_txids(&retry_items.iter().map(|i| i.txid).collect::<Vec<_>>())
+                .ok_or(ClientError::NoPartitionMap)?;
+
+            let mut retry_handles = Vec::with_capacity(retry_groups.len());
+            for (_, (pool, sub_idx_map)) in retry_groups {
+                let sub_items: Vec<GetSpendItem> = sub_idx_map
+                    .iter()
+                    .map(|&i| retry_items[i].clone())
+                    .collect();
+                let payload = encode_get_spend_batch_payload(&sub_items);
+                // Map the retry-local indices back to original batch indices.
+                let orig_idx_map: Vec<usize> = sub_idx_map.iter().map(|&i| redirected[i]).collect();
+                retry_handles.push(tokio::spawn(async move {
+                    let conn = pool.get().await?;
+                    let results = Self::send_get_spend_sub(&conn, payload).await?;
+                    Ok::<(Vec<GetSpendResult>, Vec<usize>), ClientError>((results, orig_idx_map))
+                }));
+            }
+            for handle in retry_handles {
+                if let Ok((results, orig_idx_map)) = handle
+                    .await
+                    .map_err(|e| ClientError::Connection(format!("join: {e}")))?
+                {
+                    for (sub_idx, result) in results.into_iter().enumerate() {
+                        if sub_idx < orig_idx_map.len() {
+                            merged[orig_idx_map[sub_idx]] = Some(result);
+                        }
+                    }
+                }
+            }
+        }
+
+        let results = merged
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or(GetSpendResult {
+                    status: 1,
+                    error_code: ERR_REDIRECT,
+                    slot_status: 0,
+                    spending_data: [0; 36],
+                })
+            })
+            .collect();
+        Ok(results)
+    }
+
+    /// Send one get_spend sub-batch on the given connection and decode the
+    /// per-item results.
+    async fn send_get_spend_sub(
+        conn: &crate::conn::PipeConn,
+        payload: Vec<u8>,
+    ) -> Result<Vec<GetSpendResult>, ClientError> {
         let resp = conn.round_trip(OP_GET_SPEND_BATCH, 0, payload).await?;
         match resp.status {
             STATUS_OK => decode_get_spend_response(&resp.payload),
@@ -1741,14 +1912,29 @@ impl Client {
 
     /// Trigger deletion of expired preserved transactions.
     ///
+    /// Sends the 8-byte payload `[current_height:4 LE][block_height_retention:4 LE]`.
+    /// `block_height_retention` is the retention window the server applies when
+    /// deciding which preserved transactions have expired; sending a non-zero
+    /// value is required for the expiry phase to run (a 4-byte legacy payload
+    /// is interpreted by the server as `retention = 0`, which silently skips
+    /// expiry).
+    ///
+    /// # Parameters
+    ///
+    /// - `current_height`: The current block height.
+    /// - `block_height_retention`: Retention window in blocks.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::Server`] on error.
     pub async fn process_expired_preservations(
         &self,
         current_height: u32,
+        block_height_retention: u32,
     ) -> Result<ProcessExpiredResult, ClientError> {
-        let payload = current_height.to_le_bytes().to_vec();
+        let mut payload = Vec::with_capacity(8);
+        payload.extend_from_slice(&current_height.to_le_bytes());
+        payload.extend_from_slice(&block_height_retention.to_le_bytes());
         let conn = self.get_conn().await?;
         let resp = conn
             .round_trip(OP_PROCESS_EXPIRED_PRESERVATIONS, 0, payload)
@@ -1818,9 +2004,11 @@ impl Client {
             return cl.cached_partition_map().ok_or(ClientError::NoPartitionMap);
         }
 
-        // Single-node mode: fetch from the server.
+        // Single-node mode: fetch from the server. OP_GET_PARTITION_MAP is an
+        // inter-node auth opcode; sign it when a cluster secret is configured.
         let conn = self.get_conn().await?;
-        let resp = conn.round_trip(OP_GET_PARTITION_MAP, 0, Vec::new()).await?;
+        let signed = cluster::sign_inter_node_payload(self.cluster_secret.as_deref(), Vec::new());
+        let resp = conn.round_trip(OP_GET_PARTITION_MAP, 0, signed).await?;
         if resp.status != STATUS_OK {
             if resp.status == STATUS_ERROR {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
@@ -1875,7 +2063,8 @@ impl Client {
         payload: Vec<u8>,
     ) -> Result<(u8, Vec<u8>), ClientError> {
         let dial_timeout = Duration::from_secs(5);
-        let conn = crate::conn::PipeConn::dial(addr, dial_timeout).await?;
+        let request_timeout = Duration::from_secs(30);
+        let conn = crate::conn::PipeConn::dial(addr, dial_timeout, request_timeout).await?;
         let resp = conn.round_trip(op_code, flags, payload).await?;
         Ok((resp.status, resp.payload))
     }
@@ -2994,5 +3183,267 @@ mod tests {
             !all_errors_are_retryable(&errors),
             "presence of any non-retryable code must veto same-target retry",
         );
+    }
+
+    /// REL-135: a short `request_timeout` propagates from `ClientConfig`
+    /// through the pool to `PipeConn`, so a request to an address that never
+    /// responds returns `ClientError::Timeout` well before the 30s default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_timeout_is_configurable() {
+        // Bind a listener that accepts the TCP connection but never replies,
+        // so round_trip must hit the per-request timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold connections open without ever responding.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((sock, _)) => held.push(sock),
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let client = Client::new(ClientConfig {
+            addr: Some(addr.to_string()),
+            request_timeout: Duration::from_millis(150),
+            ..Default::default()
+        })
+        .await
+        .expect("single-node client should construct against an accepting listener");
+
+        let start = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), client.ping()).await;
+        let elapsed = start.elapsed();
+
+        let inner = result.expect("ping must not hang past the outer 5s guard");
+        assert!(
+            matches!(inner, Err(ClientError::Timeout)),
+            "an unresponsive peer must surface ClientError::Timeout, got: {inner:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the 150ms request_timeout must fire well before the 30s default; elapsed = {elapsed:?}",
+        );
+
+        client.close().await;
+    }
+
+    /// REL-011: `unspend_batch` and `get_spend_batch` now route through the
+    /// shard-grouping machinery. This exercises the full create → spend →
+    /// unspend → get_spend round-trip against a clustered node, asserting
+    /// concrete per-item state transitions at each step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unspend_and_get_spend_route_through_cluster_machinery() {
+        let tcp1 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        let txid = txid_for_shard(55);
+        let utxo = [0xAB; 32];
+        let create_item = CreateItem {
+            txid,
+            utxo_hashes: vec![utxo],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        client
+            .create_batch(&[create_item])
+            .await
+            .expect("create_batch should succeed");
+
+        // Spend the single output.
+        let spend_data = [0xC9; 36];
+        let spend_params = SpendBatchParams {
+            ignore_conflicting: true,
+            ignore_locked: true,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        client
+            .spend_batch(
+                &spend_params,
+                &[SpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: utxo,
+                    spending_data: spend_data,
+                }],
+            )
+            .await
+            .expect("spend_batch should succeed");
+
+        // get_spend_batch must report the slot as spent (status 0x01).
+        let spent = client
+            .get_spend_batch(&[GetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: utxo,
+            }])
+            .await
+            .expect("get_spend_batch should succeed");
+        assert_eq!(spent.len(), 1, "one item in, one result out");
+        assert_eq!(spent[0].status, 0, "lookup itself succeeded");
+        assert_eq!(
+            spent[0].slot_status, 0x01,
+            "slot must report spent after spend_batch",
+        );
+
+        // Unspend it via the now-cluster-routed unspend_batch.
+        let unspend_params = UnspendBatchParams {
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let unspend_result = client
+            .unspend_batch(
+                &unspend_params,
+                &[UnspendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: utxo,
+                    spending_data: spend_data,
+                }],
+            )
+            .await
+            .expect("unspend_batch should succeed through the shard machinery");
+        assert!(
+            unspend_result.errors.is_empty(),
+            "fully-successful unspend must carry no per-item errors, got {:?}",
+            unspend_result.errors,
+        );
+
+        // get_spend_batch must now report the slot unspent (status 0x00).
+        let unspent = client
+            .get_spend_batch(&[GetSpendItem {
+                txid,
+                vout: 0,
+                utxo_hash: utxo,
+            }])
+            .await
+            .expect("get_spend_batch should succeed after unspend");
+        assert_eq!(
+            unspent[0].slot_status, 0x00,
+            "slot must report unspent after unspend_batch",
+        );
+
+        client.close().await;
+        shutdown_node(&node1);
+    }
+
+    /// REL-011: `get_spend_batch` reassembles multi-item results in the
+    /// original request order even when items are grouped by shard. With a
+    /// single node all items land in one group, but the reassembly path
+    /// (sub-index -> original-index) is still exercised, and the per-item
+    /// status must line up with each requested slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn get_spend_batch_preserves_request_order() {
+        let tcp1 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        let txid = txid_for_shard(91);
+        let utxo_a = [0x01; 32];
+        let utxo_b = [0x02; 32];
+        let create_item = CreateItem {
+            txid,
+            utxo_hashes: vec![utxo_a, utxo_b],
+            tx_version: 1,
+            locktime: 0,
+            fee: 100,
+            size_in_bytes: 100,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1710000000000,
+            flags: 0,
+            cold_data: vec![],
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        client
+            .create_batch(&[create_item])
+            .await
+            .expect("create_batch should succeed");
+
+        // Spend only vout 0, leaving vout 1 unspent.
+        let spend_params = SpendBatchParams {
+            ignore_conflicting: true,
+            ignore_locked: true,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        client
+            .spend_batch(
+                &spend_params,
+                &[SpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: utxo_a,
+                    spending_data: [0xD0; 36],
+                }],
+            )
+            .await
+            .expect("spend_batch should succeed");
+
+        // Query in order [vout1 (unspent), vout0 (spent)] and check the
+        // results map back to the right request positions.
+        let results = client
+            .get_spend_batch(&[
+                GetSpendItem {
+                    txid,
+                    vout: 1,
+                    utxo_hash: utxo_b,
+                },
+                GetSpendItem {
+                    txid,
+                    vout: 0,
+                    utxo_hash: utxo_a,
+                },
+            ])
+            .await
+            .expect("get_spend_batch should succeed");
+        assert_eq!(results.len(), 2, "two items in, two results out");
+        assert_eq!(
+            results[0].slot_status, 0x00,
+            "request index 0 (vout 1) must report unspent",
+        );
+        assert_eq!(
+            results[1].slot_status, 0x01,
+            "request index 1 (vout 0) must report spent",
+        );
+
+        client.close().await;
+        shutdown_node(&node1);
     }
 }

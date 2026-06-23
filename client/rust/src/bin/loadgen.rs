@@ -68,10 +68,12 @@ async fn main() {
             max_conns: 32,
             dial_timeout: Duration::from_secs(5),
             health_check: Duration::from_secs(15),
+            ..Default::default()
         },
         cluster_refresh_interval: Duration::from_secs(30),
         max_redirects: 3,
         addr_map: Default::default(),
+        ..Default::default()
     };
 
     let client = match Client::new(cfg).await {

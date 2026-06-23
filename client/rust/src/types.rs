@@ -847,7 +847,7 @@ pub struct GetSpendResult {
     pub spending_data: SpendingData,
 }
 
-/// Response from [`ProcessExpiredPreservations`](crate::Client::process_expired_preservations).
+/// Response from [`process_expired_preservations`](crate::Client::process_expired_preservations).
 #[derive(Debug, Clone)]
 pub struct ProcessExpiredResult {
     /// Number of transactions successfully deleted.

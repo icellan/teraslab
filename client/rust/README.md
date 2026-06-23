@@ -51,6 +51,8 @@ pub struct ClientConfig {
     pub cluster_refresh_interval: Duration,        // Partition map refresh (default: 30s)
     pub max_redirects: u32,                        // Redirect retries per request (default: 3)
     pub addr_map: HashMap<String, String>,         // Address remapping for Docker/NAT
+    pub cluster_secret: Option<Vec<u8>>,           // HMAC secret for OP_GET_PARTITION_MAP (strict_auth clusters)
+    pub request_timeout: Duration,                 // Per-request round-trip timeout (default: 30s)
 }
 
 pub struct PoolConfig {
@@ -83,7 +85,7 @@ let items = vec![CreateItem {
     ..Default::default()
 }];
 
-let result = client.create_batch(items).await?;
+let result = client.create_batch(&items).await?;
 ```
 
 Transactions with cold data larger than 1 MiB are automatically uploaded via chunked streaming before the batch request.
@@ -98,7 +100,7 @@ let params = SpendBatchParams {
     block_height_retention: 288,
 };
 
-let resp = client.spend_batch(params, items).await?;
+let resp = client.spend_batch(&params, &items).await?;
 for s in &resp.successes {
     println!("item {}: signal={}", s.item_index, s.signal);
 }
@@ -107,7 +109,7 @@ for s in &resp.successes {
 ### Unspend
 
 ```rust
-let result = client.unspend_batch(params, items).await?;
+let result = client.unspend_batch(&params, &items).await?;
 ```
 
 ### Set Mined
@@ -121,22 +123,22 @@ let params = SetMinedBatchParams {
     ..Default::default()
 };
 
-let resp = client.set_mined_batch(params, txids).await?;
+let resp = client.set_mined_batch(&params, &txids).await?;
 ```
 
 ### Freeze / Unfreeze / Reassign
 
 ```rust
-client.freeze_batch(items).await?;
-client.unfreeze_batch(items).await?;
-client.reassign_batch(params, items).await?;
+client.freeze_batch(&items).await?;
+client.unfreeze_batch(&items).await?;
+client.reassign_batch(&params, &items).await?;
 ```
 
 ### Set Conflicting / Locked
 
 ```rust
-client.set_conflicting_batch(params, txids).await?;
-client.set_locked_batch(true, txids).await?;
+client.set_conflicting_batch(&params, &txids).await?;
+client.set_locked_batch(true, &txids).await?;
 ```
 
 ### Get
@@ -160,7 +162,7 @@ let items = vec![GetSpendItem {
     vout: 0,
     utxo_hash: [0xAA; 32],
 }];
-let results = client.get_spend_batch(items).await?;
+let results = client.get_spend_batch(&items).await?;
 for r in &results {
     match r.slot_status {
         0x00 => println!("unspent"),
@@ -175,8 +177,10 @@ for r in &results {
 
 ```rust
 let txids = client.query_old_unmined(cutoff_height).await?;
-client.preserve_transactions(preserve_until, txids).await?;
-let result = client.process_expired_preservations(current_height).await?;
+client.preserve_transactions(preserve_until, &txids).await?;
+let result = client
+    .process_expired_preservations(current_height, block_height_retention)
+    .await?;
 ```
 
 ### Admin
@@ -185,7 +189,7 @@ let result = client.process_expired_preservations(current_height).await?;
 let rtt = client.ping().await?;
 client.health().await?;
 let pm = client.get_partition_map().await?;
-client.delete_batch(txids).await?;
+client.delete_batch(&txids).await?;
 client.refresh_routing().await?;
 ```
 
@@ -224,7 +228,7 @@ Partial errors contain per-item failures with original batch indices:
 match client.spend_batch(params, items).await {
     Err(ClientError::Partial(pe)) => {
         for e in &pe.errors {
-            eprintln!("item {}: code {}", e.item_index, e.error_code);
+            eprintln!("item {}: code {}", e.item_index, e.code);
         }
     }
     Err(e) => panic!("{}", e),
@@ -239,7 +243,7 @@ match client.spend_batch(params, items).await {
 client.refresh_routing().await?;
 
 // Upload a large blob before create_batch (done automatically for cold_data > 1 MiB)
-client.upload_blob(&cold_data).await?;
+client.upload_blob(&txid, &data).await?;
 ```
 
 ## Cluster Routing
