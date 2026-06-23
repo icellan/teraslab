@@ -308,6 +308,25 @@ impl Index {
         })
     }
 
+    /// Create an index whose hash table has exactly `buckets` slots.
+    ///
+    /// Unlike [`Index::new`], `buckets` is used directly as the bucket count
+    /// (after [`HashTable::new`]'s power-of-two rounding) rather than being
+    /// divided by the load factor. Used by snapshot restore (REL-123), where
+    /// the saved capacity is already a correctly-sized power-of-two bucket
+    /// count and must not be re-inflated. `buckets` is rounded up to the next
+    /// power of two (minimum 16) by the underlying table.
+    fn with_bucket_capacity(buckets: usize) -> Result<Self> {
+        #[cfg(test)]
+        INDEX_NEW_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+        let table = HashTable::new(buckets.max(16))?;
+        Ok(Self {
+            table,
+            resize_threshold: 0.7,
+        })
+    }
+
     /// Open or create a file-backed index at `path`.
     ///
     /// The hash table is pre-allocated to `expected_records / 0.7` buckets
@@ -901,7 +920,19 @@ impl Index {
             });
         }
 
-        let mut index = Self::new(capacity.max(count))?;
+        // REL-123: reuse the saved capacity directly. The snapshot stores the
+        // source table's exact (power-of-two) bucket count, which was already
+        // sized to hold `count` entries below the 0.7 load factor. Passing it
+        // back through `Self::new` would divide by 0.7 and round up to the next
+        // power of two, re-inflating the restored table ~2x. A poisoned
+        // snapshot whose declared `capacity` cannot hold `count` entries (every
+        // bucket occupied → no terminating empty slot for probing) falls back
+        // to load-factor sizing so restore still succeeds.
+        let mut index = if capacity > count {
+            Self::with_bucket_capacity(capacity)?
+        } else {
+            Self::new(count)?
+        };
         let entries_start = header_size;
         for i in 0..count {
             let base = entries_start + i * PRIMARY_ENTRY_SIZE;
@@ -1141,17 +1172,23 @@ mod tests {
         TxKey { txid }
     }
 
+    /// REL-017: populate EVERY field with a distinct, non-zero value derived
+    /// from `offset` so a field-offset swap, width truncation, or field-zeroing
+    /// regression on the snapshot serialization path is caught by full-entry
+    /// equality assertions (rather than slipping past an all-zeros entry that
+    /// only checks `record_offset`). Each field uses a different arithmetic
+    /// shape and stays within its declared width.
     fn make_entry(offset: u64) -> TxIndexEntry {
         TxIndexEntry {
-            device_id: 0,
+            device_id: (offset.wrapping_add(1) & 0xFF) as u8,
             record_offset: offset,
-            utxo_count: 10,
-            block_entry_count: 0,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
+            utxo_count: (offset as u32).wrapping_mul(7).wrapping_add(3),
+            block_entry_count: ((offset.wrapping_add(17)) & 0xFF) as u8,
+            tx_flags: ((offset.wrapping_mul(3).wrapping_add(5)) & 0xFF) as u8,
+            spent_utxos: (offset as u32).wrapping_mul(11).wrapping_add(13),
+            dah_or_preserve: (offset as u32).wrapping_mul(101).wrapping_add(29),
+            unmined_since: (offset as u32).wrapping_add(0x4000_0001),
+            generation: (offset as u32).wrapping_mul(5).wrapping_add(1),
         }
     }
 
@@ -1167,14 +1204,30 @@ mod tests {
             idx.register(make_key(i), make_entry(i * 100)).unwrap();
         }
 
+        let saved_capacity = idx.stats().capacity;
+
         idx.snapshot(&snap_path).unwrap();
         let restored = Index::restore(&snap_path).unwrap();
 
         assert_eq!(restored.len(), 1000);
+        // REL-017: assert FULL entry equality so every serialized field is
+        // verified, not just `record_offset`.
         for i in 0..1000u64 {
-            let e = restored.lookup(&make_key(i)).expect("entry should exist");
-            assert_eq!(e.record_offset, i * 100);
+            let restored_entry = restored.lookup(&make_key(i)).expect("entry should exist");
+            let original = make_entry(i * 100);
+            assert_eq!(
+                restored_entry, original,
+                "restored entry for key {i} must equal the original",
+            );
         }
+
+        // REL-123: restore must reuse the snapshot's saved capacity rather than
+        // re-inflating it through the load-factor divisor.
+        assert_eq!(
+            restored.stats().capacity,
+            saved_capacity,
+            "restored table capacity must equal the snapshot's saved capacity",
+        );
     }
 
     #[test]

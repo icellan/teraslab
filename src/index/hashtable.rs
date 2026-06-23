@@ -2062,6 +2062,62 @@ mod tests {
         assert_eq!(t.get_entry(&kc).unwrap().record_offset, 3);
     }
 
+    /// REL-122: removing an entry whose true probe distance was capped at
+    /// [`MAX_STORED_PROBE`] (254) must exercise the capped backward-shift
+    /// branch (which skips the `probe_distance -= 1` decrement for capped
+    /// cells) and leave the table consistent.
+    ///
+    /// Build a 1000-deep single-bucket chain (the `adversarial_1000` pattern)
+    /// so probe distances run 0..999 and every entry past index 254 is stored
+    /// capped. Removing a capped entry then forces the shift loop to relocate
+    /// further capped entries through the `b.probe_distance < cap` guard.
+    #[test]
+    fn remove_capped_probe_entry_keeps_table_consistent() {
+        const N: u64 = 1000;
+        let mut t = HashTable::new(2048).unwrap();
+        let mask = t.capacity() - 1;
+        let keys: Vec<_> = (0..N).map(|i| make_colliding_key(0, i, mask)).collect();
+
+        for (i, k) in keys.iter().enumerate() {
+            t.insert(*k, make_entry(i as u64 + 1)).unwrap();
+        }
+
+        // The chain is far longer than MAX_STORED_PROBE, so the deepest stored
+        // probe distance must be exactly the cap — proving capped entries exist
+        // to exercise the branch under test.
+        assert_eq!(
+            t.max_probe_distance(),
+            MAX_STORED_PROBE,
+            "1000-deep chain must produce capped (254) probe distances",
+        );
+
+        // Remove a key whose true probe distance is well past the cap so the
+        // backward-shift relocates capped entries (the branch at the
+        // `probe_distance < MAX_STORED_PROBE` guard).
+        let victim_seq = 600usize;
+        let victim = keys[victim_seq];
+        let removed = t.remove(&victim).expect("capped victim must be present");
+        assert_eq!(removed.record_offset, victim_seq as u64 + 1);
+
+        assert_eq!(t.len() as u64, N - 1);
+        // Removed key is gone.
+        assert!(
+            t.get_entry(&victim).is_none(),
+            "removed capped key must be absent",
+        );
+        // Every other key is still found with its original value — the
+        // backward-shift over capped cells did not corrupt the chain.
+        for (i, k) in keys.iter().enumerate() {
+            if i == victim_seq {
+                continue;
+            }
+            let e = t
+                .get_entry(k)
+                .unwrap_or_else(|| panic!("key {i} must survive capped remove"));
+            assert_eq!(e.record_offset, i as u64 + 1, "value for key {i}");
+        }
+    }
+
     #[test]
     fn insert_delete_reinsert() {
         let mut t = HashTable::new(16).unwrap();

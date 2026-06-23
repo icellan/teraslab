@@ -741,17 +741,23 @@ mod tests {
         TxKey { txid }
     }
 
+    /// REL-017: populate EVERY field with a distinct, non-zero value derived
+    /// from `offset` so an offset-swap, width-truncation, or field-zeroing
+    /// regression on the portable export/import serialization path is caught by
+    /// full-entry equality assertions (rather than passing against an all-zeros
+    /// entry that only checks `record_offset`). Each field uses a different
+    /// arithmetic shape and stays within its declared width.
     fn make_entry(offset: u64) -> TxIndexEntry {
         TxIndexEntry {
-            device_id: 0,
+            device_id: (offset.wrapping_add(1) & 0xFF) as u8,
             record_offset: offset,
-            utxo_count: 5,
-            block_entry_count: 0,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
+            utxo_count: (offset as u32).wrapping_mul(7).wrapping_add(3),
+            block_entry_count: ((offset.wrapping_add(17)) & 0xFF) as u8,
+            tx_flags: ((offset.wrapping_mul(3).wrapping_add(5)) & 0xFF) as u8,
+            spent_utxos: (offset as u32).wrapping_mul(11).wrapping_add(13),
+            dah_or_preserve: (offset as u32).wrapping_mul(101).wrapping_add(29),
+            unmined_since: (offset as u32).wrapping_add(0x4000_0001),
+            generation: (offset as u32).wrapping_mul(5).wrapping_add(1),
         }
     }
 
@@ -788,12 +794,13 @@ mod tests {
         assert_eq!(restored_dah.len(), 2);
         assert_eq!(restored_unmined.len(), 1);
 
-        // Verify data
+        // Verify data — REL-017: full entry equality across the
+        // memory→memory round trip, not just `record_offset`.
         for i in 0..50u64 {
             let e = restored_primary
                 .lookup(&make_key(i))
                 .expect("entry should exist");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e, make_entry(i * 100), "entry {i} must survive round trip");
         }
     }
 
@@ -833,11 +840,12 @@ mod tests {
         assert_eq!(restored_dah.len(), 1);
         assert_eq!(restored_unmined.len(), 1);
 
+        // REL-017: full entry equality across the memory→redb round trip.
         for i in 0..20u64 {
             let e = restored_primary
                 .lookup(&make_key(i))
                 .expect("entry should exist");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e, make_entry(i * 100), "entry {i} must survive round trip");
         }
     }
 
@@ -955,11 +963,12 @@ mod tests {
         assert_eq!(restored_dah.len(), 2);
         assert_eq!(restored_unmined.len(), 1);
 
+        // REL-017: full entry equality across the redb→redb round trip.
         for i in 0..30u64 {
             let e = restored_primary
                 .lookup(&make_key(i))
                 .expect("entry should exist");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e, make_entry(i * 100), "entry {i} must survive round trip");
         }
     }
 
@@ -1034,9 +1043,15 @@ mod tests {
         assert_eq!(restored_primary.len(), 25);
         assert_eq!(restored_dah.len(), 9);
         assert_eq!(restored_unmined.len(), 5);
+        // REL-017: full entry equality across the streaming redb→redb round
+        // trip.
         for i in 0..25u64 {
             let entry = restored_primary.lookup(&make_key(i)).unwrap();
-            assert_eq!(entry.record_offset, i * 100);
+            assert_eq!(
+                entry,
+                make_entry(i * 100),
+                "entry {i} must survive streaming round trip",
+            );
         }
     }
 
