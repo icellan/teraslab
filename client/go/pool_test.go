@@ -159,3 +159,86 @@ func TestPoolRoundTripThroughPool(t *testing.T) {
 		t.Errorf("status = %d, want %d", resp.Status, StatusOK)
 	}
 }
+
+// TestCheckHealthSkipsConnWithInflight is a regression test for big-block sync
+// failures: a connection carrying in-flight requests must not be health-probed
+// or reaped. The mock server is single-connection and FIFO, so a held data
+// request blocks any subsequent ping (head-of-line) — exactly the production
+// scenario where, under load, the ping queues behind in-flight work, times out,
+// and the pool would close the connection, aborting the legitimate requests
+// with "connection closed" (the server then sees a broken pipe).
+func TestCheckHealthSkipsConnWithInflight(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	release := make(chan struct{})
+	go mockServer(t, ln, func(req requestFrame) responseFrame {
+		if req.OpCode == OpPing {
+			return responseFrame{RequestID: req.RequestID, Status: StatusOK}
+		}
+		<-release // hold the data request in flight
+		return responseFrame{RequestID: req.RequestID, Status: StatusOK, Payload: []byte("ok")}
+	})
+
+	p := newPool(ln.Addr().String(), PoolConfig{
+		MinConns:    1,
+		MaxConns:    1,
+		DialTimeout: 200 * time.Millisecond, // a real probe of a busy conn would time out fast
+		HealthCheck: 1 * time.Hour,          // drive checkHealth manually
+	})
+	defer p.close()
+
+	c, err := p.get(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		resp responseFrame
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := c.roundTrip(context.Background(), OpGetBatch, 0, []byte("k"))
+		done <- result{resp, err}
+	}()
+
+	// Wait until the request is actually in flight.
+	deadline := time.Now().Add(2 * time.Second)
+	for !c.hasInflight() {
+		if time.Now().After(deadline) {
+			t.Fatal("request never became in-flight")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Health check while the conn is busy must not close or drop it.
+	p.checkHealth()
+
+	if !c.alive() {
+		t.Fatal("checkHealth closed a connection with an in-flight request")
+	}
+	p.mu.Lock()
+	inPool := len(p.conns) == 1 && p.conns[0] == c
+	p.mu.Unlock()
+	if !inPool {
+		t.Fatal("checkHealth removed a busy connection from the pool")
+	}
+
+	// Release and confirm the in-flight request completed cleanly.
+	close(release)
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("in-flight request failed: %v", r.err)
+		}
+		if r.resp.Status != StatusOK {
+			t.Fatalf("unexpected status: %d", r.resp.Status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request did not complete")
+	}
+}
