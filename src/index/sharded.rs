@@ -118,6 +118,27 @@ impl ShardedIndex {
         })
     }
 
+    /// Wrap an existing [`PrimaryBackend`] as a single-shard `ShardedIndex`.
+    ///
+    /// This is the transparent pass-through used by the engine migration: a
+    /// `ShardedIndex` with `shard_count == 1` and `shard_mask == 0` routes every
+    /// key to the one shard, so its behaviour is byte-for-byte identical to the
+    /// wrapped backend behind a plain `RwLock`. A fresh process-local seed is
+    /// installed; at one shard the seed never affects routing (the mask is `0`),
+    /// so its only role is to keep the type uniform with the multi-shard
+    /// constructors.
+    ///
+    /// Used to migrate `Engine.index` to `ShardedIndex` without changing the
+    /// `PrimaryBackend` semantics or the recovery/snapshot on-disk formats —
+    /// the recovered or rebuilt backend is wrapped here at engine construction.
+    pub fn from_single(backend: PrimaryBackend) -> Self {
+        Self {
+            shards: vec![RwLock::new(backend)],
+            shard_mask: 0,
+            seed: index_shard_seed(),
+        }
+    }
+
     /// Number of shards in this index.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
@@ -407,6 +428,50 @@ impl ShardedIndex {
         }
     }
 
+    /// Non-blocking merged statistics.
+    ///
+    /// Attempts a `try_read` on every shard. If ANY shard's read lock is
+    /// momentarily held by a writer, returns `None` immediately rather than
+    /// blocking — the observability/admin path (`/admin/top`) must never stall
+    /// behind the write path. When all shards are readable, returns the same
+    /// merged [`IndexStats`] as [`Self::stats`].
+    pub fn try_stats(&self) -> Option<IndexStats> {
+        let mut total_entries = 0usize;
+        let mut total_capacity = 0usize;
+        let mut total_memory = 0usize;
+        let mut max_probe = 0usize;
+        let mut all_huge = true;
+
+        for shard in &self.shards {
+            let guard = shard.try_read()?;
+            let s = guard.stats();
+            total_entries += s.entry_count;
+            total_capacity += s.capacity;
+            total_memory += s.memory_bytes;
+            if s.max_probe_distance > max_probe {
+                max_probe = s.max_probe_distance;
+            }
+            if !s.hugepage_enabled {
+                all_huge = false;
+            }
+        }
+
+        let load_factor = if total_capacity == 0 {
+            0.0
+        } else {
+            total_entries as f64 / total_capacity as f64
+        };
+
+        Some(IndexStats {
+            entry_count: total_entries,
+            capacity: total_capacity,
+            load_factor,
+            hugepage_enabled: all_huge,
+            max_probe_distance: max_probe,
+            memory_bytes: total_memory,
+        })
+    }
+
     /// The active backend name (from the first shard; all shards share the
     /// same backend type).
     pub fn backend_name(&self) -> &'static str {
@@ -535,6 +600,50 @@ impl ShardedIndex {
         Ok(())
     }
 
+    /// Snapshot the primary index and both secondary indexes to `path`.
+    ///
+    /// At a single shard this delegates straight to the wrapped backend's
+    /// [`PrimaryBackend::snapshot_all`], producing a snapshot byte-for-byte
+    /// identical to the pre-sharding engine. For more than one shard a v2
+    /// N-shard manifest format is required (Task 4); until that lands a
+    /// multi-shard snapshot would silently capture only one shard, so this
+    /// fails closed instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] from the underlying backend's snapshot, or an
+    /// [`IndexError::FormatError`] if called with more than one shard (the
+    /// v2 multi-shard format is not yet implemented).
+    pub fn snapshot_all(
+        &self,
+        dah: &crate::index::DahBackend,
+        unmined: &crate::index::UnminedBackend,
+        path: &std::path::Path,
+    ) -> Result<(), IndexError> {
+        if self.shards.len() != 1 {
+            return Err(IndexError::FormatError {
+                detail: format!(
+                    "ShardedIndex::snapshot_all requires the v2 N-shard format \
+                     for shard_count > 1 (have {}); not yet implemented",
+                    self.shards.len()
+                ),
+            });
+        }
+        self.shards[0].read().snapshot_all(dah, unmined, path)
+    }
+
+    /// Test-only: arm a synthetic read failure on every shard's backend.
+    ///
+    /// Mirrors [`PrimaryBackend::arm_fail_next_read`] across all shards so the
+    /// G-4 engine tests can force the next `lookup_checked` to return an
+    /// [`IndexError`] regardless of which shard the probed key routes to.
+    #[cfg(test)]
+    pub fn arm_fail_next_read(&self) {
+        for shard in &self.shards {
+            shard.read().arm_fail_next_read();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Per-shard resize entry point
     // -----------------------------------------------------------------------
@@ -605,6 +714,114 @@ mod tests {
             unmined_since: 500,
             generation: 7,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 0: from_single pass-through equivalence
+    // -----------------------------------------------------------------------
+
+    /// `from_single` wraps an existing backend as a 1-shard index that behaves
+    /// as a transparent pass-through: shard_count is 1, every key routes to
+    /// shard 0, and register/lookup/len match the wrapped backend exactly.
+    #[test]
+    fn from_single_is_transparent_passthrough() {
+        // Seed a standalone backend, then wrap it.
+        let mut backend = PrimaryBackend::new_in_memory(1000).unwrap();
+        for i in 0..200u64 {
+            backend.register(make_key(i), make_entry(i * 4)).unwrap();
+        }
+        let pre_len = backend.len();
+
+        let sharded = ShardedIndex::from_single(backend);
+
+        // Exactly one shard; mask routes everything to shard 0.
+        assert_eq!(sharded.shard_count(), 1, "from_single must yield one shard");
+        for i in 0..200u64 {
+            assert_eq!(
+                sharded.index_shard_for_key(&make_key(i)),
+                0,
+                "every key must route to shard 0 at shard_count = 1"
+            );
+        }
+
+        // Pre-existing entries survived the wrap (len + lookup match).
+        assert_eq!(sharded.len(), pre_len, "wrapped len must match backend len");
+        for i in 0..200u64 {
+            let entry = sharded
+                .lookup(&make_key(i))
+                .unwrap_or_else(|| panic!("wrapped key {i} missing"));
+            assert_eq!(
+                entry.record_offset,
+                i * 4,
+                "wrong offset for wrapped key {i}"
+            );
+        }
+
+        // Further register/lookup/len behave like the single backend: build a
+        // fresh oracle and replay the same additional ops.
+        let mut oracle = PrimaryBackend::new_in_memory(1000).unwrap();
+        for i in 0..200u64 {
+            oracle.register(make_key(i), make_entry(i * 4)).unwrap();
+        }
+        for i in 200..400u64 {
+            let key = make_key(i);
+            let entry = make_entry(i * 4);
+            sharded.register(key, entry).unwrap();
+            oracle.register(key, entry).unwrap();
+        }
+        assert_eq!(sharded.len(), oracle.len(), "len must track the oracle");
+        for i in 0..400u64 {
+            assert_eq!(
+                sharded.lookup(&make_key(i)),
+                oracle.lookup(&make_key(i)),
+                "lookup mismatch vs oracle for key {i}"
+            );
+        }
+    }
+
+    /// At one shard, `snapshot_all` produces a snapshot that restores to the
+    /// same contents; the multi-shard case fails closed (v2 format is Task 4).
+    #[test]
+    fn from_single_snapshot_roundtrips_and_multishard_fails_closed() {
+        use crate::index::{DahBackend, DahIndex, UnminedBackend, UnminedIndex};
+
+        let dir = std::env::temp_dir().join(format!(
+            "teraslab-sharded-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot.bin");
+
+        let sharded = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+        for i in 0..150u64 {
+            sharded.register(make_key(i), make_entry(i * 2)).unwrap();
+        }
+        let dah = DahBackend::InMemory(DahIndex::new());
+        let unmined = UnminedBackend::InMemory(UnminedIndex::new());
+        sharded.snapshot_all(&dah, &unmined, &path).unwrap();
+
+        let (restored, _dah, _unmined, _flags) = PrimaryBackend::restore_all(&path).unwrap();
+        assert_eq!(restored.len(), 150, "restored entry count must match");
+        for i in 0..150u64 {
+            let e = restored
+                .lookup(&make_key(i))
+                .unwrap_or_else(|| panic!("restored key {i} missing"));
+            assert_eq!(e.record_offset, i * 2, "restored offset wrong for key {i}");
+        }
+
+        // Multi-shard snapshot must fail closed (Task 4 implements v2).
+        let multishard = ShardedIndex::new_in_memory(1000, 4).unwrap();
+        let err = multishard.snapshot_all(&dah, &unmined, &path);
+        assert!(
+            matches!(err, Err(IndexError::FormatError { .. })),
+            "multi-shard snapshot must fail closed, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------

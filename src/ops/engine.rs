@@ -5,7 +5,7 @@
 
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
+use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend};
 use crate::io;
 use crate::locks::StripedLocks;
 use crate::ops::create::*;
@@ -160,7 +160,12 @@ pub struct Engine {
     /// `null_mut()` when the device does not support direct access (falls
     /// back to `pread`/`pwrite` with `AlignedBuf`).
     device_ptr: *mut u8,
-    index: parking_lot::RwLock<PrimaryBackend>,
+    /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
+    /// behind its own `RwLock`, so a write to one shard does not block
+    /// reads/writes on other shards. Constructed at `shard_count = 1`
+    /// (a transparent pass-through over the recovered/rebuilt backend) — the
+    /// multi-shard default lands in a later task.
+    index: ShardedIndex,
     allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
@@ -364,7 +369,11 @@ impl Engine {
         Self {
             device,
             device_ptr,
-            index: parking_lot::RwLock::new(index),
+            // N=1 transparent pass-through over the recovered/rebuilt backend.
+            // Behaviour is identical to the previous `RwLock<PrimaryBackend>`:
+            // every key routes to the single shard. Multi-shard fan-out is a
+            // later task.
+            index: ShardedIndex::from_single(index),
             allocator: parking_lot::Mutex::new(allocator),
             locks,
             dah_index: parking_lot::Mutex::new(dah_index.into()),
@@ -918,7 +927,12 @@ impl Engine {
         } else {
             tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
         }
-        let mut primary_guard = self.index.write();
+        // Hold a single shard write guard across the primary cache update AND
+        // the dah/unmined mutations below — preserving the original atomicity
+        // where a secondary reader cross-checking the primary must wait for
+        // this write to drop. At one shard this is the whole index, exactly as
+        // before; at N shards it is the shard owning `key`.
+        let mut primary_guard = self.index.write_shard(key);
         primary_guard
             .update_cached_fields(
                 key,
@@ -1022,7 +1036,6 @@ impl Engine {
         let _guard = self.locks.lock(key);
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -1140,7 +1153,6 @@ impl Engine {
             return;
         }
 
-        let guard = self.index.read();
         if self
             .shard_counts_initialized
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1149,10 +1161,10 @@ impl Engine {
         }
 
         let mut counts = vec![0u64; crate::cluster::shards::NUM_SHARDS];
-        for (key, _) in guard.iter() {
+        self.index.for_each(|key, _| {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
             counts[shard] += 1;
-        }
+        });
         for (counter, count) in self.shard_counts.iter().zip(counts) {
             counter.store(count, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1201,8 +1213,13 @@ impl Engine {
             }
         }
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
-        let resize_target = {
-            let mut guard = self.index.write();
+        // Route to the index shard owning `key` and hold ONE shard write guard
+        // across the register + count mutation, exactly as the single global
+        // write lock did before sharding. The shard counter mutation still
+        // commits before the guard drops.
+        let index_shard = self.index.index_shard_for_key(&key);
+        let needs_resize = {
+            let mut guard = self.index.write_shard(&key);
             let len_before = guard.len();
             guard.register_without_resize(key, entry)?;
             let inserted = guard.len() > len_before;
@@ -1215,10 +1232,13 @@ impl Engine {
             if inserted && counts_initialized {
                 self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
             }
-            guard.resize_target_capacity()
+            guard.resize_target_capacity().is_some()
         };
-        if let Some(target_capacity) = resize_target {
-            self.resize_primary_index_without_blocking_readers(target_capacity)?;
+        if needs_resize {
+            // Per-shard resize: rehashes only this shard's ~count/N entries,
+            // holding only this shard's write lock (leaving other shards
+            // readable). At one shard this is the whole-table resize as before.
+            self.index.resize_shard_if_needed(index_shard)?;
         }
         Ok(())
     }
@@ -1265,8 +1285,12 @@ impl Engine {
             }
         }
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
-        let resize_target = {
-            let mut guard = self.index.write();
+        // The existence check and insert must run under the SAME shard write
+        // guard so check-then-insert cannot interleave with another writer on
+        // that shard. Route to the owning index shard and hold its guard.
+        let index_shard = self.index.index_shard_for_key(&key);
+        let needs_resize = {
+            let mut guard = self.index.write_shard(&key);
             // Reject-not-overwrite: the only safe insert-if-absent is a
             // check under the same write lock that performs the insert.
             if guard.lookup_checked(&key)?.is_some() {
@@ -1285,10 +1309,10 @@ impl Engine {
             if counts_initialized {
                 self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
             }
-            guard.resize_target_capacity()
+            guard.resize_target_capacity().is_some()
         };
-        if let Some(target_capacity) = resize_target {
-            self.resize_primary_index_without_blocking_readers(target_capacity)?;
+        if needs_resize {
+            self.index.resize_shard_if_needed(index_shard)?;
         }
         Ok(true)
     }
@@ -1313,29 +1337,12 @@ impl Engine {
         }
     }
 
-    fn resize_primary_index_without_blocking_readers(
-        &self,
-        requested_capacity: usize,
-    ) -> Result<(), crate::index::IndexError> {
-        let guard = self.index.upgradable_read();
-        let Some(target_capacity) = guard
-            .resize_target_capacity()
-            .map(|target| target.max(requested_capacity))
-        else {
-            return Ok(());
-        };
-
-        let resized = guard.resized_copy(target_capacity)?;
-        let mut write_guard = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
-        // G-2: the resized copy renamed a fresh file over the backing path
-        // and now owns it. Mark the displaced index defunct before the swap
-        // so its `Drop` does not write the clean-shutdown sentinel for a
-        // path it no longer owns (which would disable torn-write detection
-        // for the rest of uptime).
-        write_guard.mark_defunct_for_resize();
-        *write_guard = resized;
-        Ok(())
-    }
+    // Primary-index resize is now per-shard via
+    // [`ShardedIndex::resize_shard_if_needed`], which holds only the affected
+    // shard's write lock and rehashes only that shard's entries (and performs
+    // the same `mark_defunct_for_resize` swap as the previous whole-table
+    // helper). The old `resize_primary_index_without_blocking_readers` is gone:
+    // the register paths call `resize_shard_if_needed(index_shard)` directly.
 
     /// Unregister a primary-index entry and, if shard counters have been
     /// initialized, decrement the matching shard count atomically within the
@@ -1357,7 +1364,7 @@ impl Engine {
         key: &TxKey,
     ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
-        let mut guard = self.index.write();
+        let mut guard = self.index.write_shard(key);
         let removed = guard.unregister_checked(key)?;
         if removed.is_some()
             && self
@@ -1633,7 +1640,6 @@ impl Engine {
             tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
         }
         self.index
-            .write()
             .update_cached_fields(
                 key,
                 tf,
@@ -1673,7 +1679,7 @@ impl Engine {
         &self,
         key: &TxKey,
     ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
-        self.index.read().lookup_checked(key)
+        self.index.lookup_checked(key)
     }
 
     /// Look up a transaction in the index (infallible convenience).
@@ -1685,7 +1691,7 @@ impl Engine {
     /// I/O failure to `None` here would tell a client a present
     /// transaction does not exist.
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        match self.index.read().lookup_checked(key) {
+        match self.index.lookup_checked(key) {
             Ok(found) => found,
             Err(e) => {
                 tracing::error!(
@@ -1703,7 +1709,7 @@ impl Engine {
     /// Returns a snapshot of all keys currently in the index. This acquires
     /// a read lock briefly and collects all keys into a Vec.
     pub fn all_keys(&self) -> Vec<TxKey> {
-        self.index.read().iter().map(|(k, _)| k).collect()
+        self.index.all_keys()
     }
 
     /// Scan the primary index for records whose preservation has expired.
@@ -1721,19 +1727,7 @@ impl Engine {
     /// lock, so a `preserve_until` cleared or pushed forward after this scan
     /// is handled correctly there.
     pub fn scan_expired_preservations(&self, current_height: u32) -> Vec<TxKey> {
-        self.index
-            .read()
-            .iter()
-            .filter_map(|(k, e)| {
-                let has_preserve =
-                    TxFlags::from_bits_truncate(e.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
-                if has_preserve && e.dah_or_preserve != 0 && e.dah_or_preserve <= current_height {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.index.scan_expired_preservations(current_height)
     }
 
     /// Return keys belonging to a specific shard.
@@ -1742,17 +1736,7 @@ impl Engine {
     /// a subset of shards is needed. Acquires the index read lock once
     /// and filters inline, avoiding a full clone + filter pass.
     pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
-        self.index
-            .read()
-            .iter()
-            .filter_map(|(k, _)| {
-                if crate::cluster::shards::ShardTable::shard_for_key(&k) == shard {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.index.keys_for_shard(shard)
     }
 
     /// All tombstoned keys for `shard`, as `(TxKey, deletion-generation)` pairs.
@@ -1779,13 +1763,7 @@ impl Engine {
     /// where N is the total number of index entries, compared to O(N * S)
     /// if calling `keys_for_shard` for each shard S.
     pub fn keys_by_shard(&self) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        let mut result: std::collections::HashMap<u16, Vec<TxKey>> =
-            std::collections::HashMap::new();
-        for (k, _) in self.index.read().iter() {
-            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
-            result.entry(shard).or_default().push(k);
-        }
-        result
+        self.index.keys_by_shard()
     }
 
     /// Group keys by shard, but only for a specified set of shards.
@@ -1797,15 +1775,7 @@ impl Engine {
         &self,
         shard_filter: &std::collections::HashSet<u16>,
     ) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        let mut result: std::collections::HashMap<u16, Vec<TxKey>> =
-            std::collections::HashMap::new();
-        for (k, _) in self.index.read().iter() {
-            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
-            if shard_filter.contains(&shard) {
-                result.entry(shard).or_default().push(k);
-            }
-        }
-        result
+        self.index.keys_by_shard_filtered(shard_filter)
     }
 
     /// Execute a batch of spends on a single transaction.
@@ -1846,7 +1816,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2097,7 +2066,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2314,7 +2282,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2479,7 +2446,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2603,7 +2569,6 @@ impl Engine {
                     sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
                 }
                 self.index
-                    .write()
                     .update_cached_fields(
                         tx_key,
                         sync_tf.bits(),
@@ -2880,7 +2845,6 @@ impl Engine {
 
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2995,7 +2959,6 @@ impl Engine {
         // duplicate record over an existing txid.
         if self
             .index
-            .read()
             .lookup_checked(&key)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("duplicate-check index lookup failed: {e}"),
@@ -3195,7 +3158,6 @@ impl Engine {
         // read error does not collapse to "absent" and pass the guard.
         if self
             .index
-            .read()
             .lookup_checked(&key)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("duplicate-check index lookup failed: {e}"),
@@ -3291,7 +3253,6 @@ impl Engine {
         // error does not collapse to "absent" and pass the guard.
         if self
             .index
-            .read()
             .lookup_checked(&key)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("duplicate-check index lookup failed: {e}"),
@@ -3632,7 +3593,6 @@ impl Engine {
     pub fn read_cold_data(&self, key: &TxKey) -> Result<Vec<u8>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -3736,14 +3696,16 @@ impl Engine {
         let _guard = self.locks.lock(parent_key);
         // G-4: a backend read error must not collapse to "parent absent"
         // (which would silently report no spent slots).
-        let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(entry) => entry,
-            None => return Ok(Vec::new()),
-        };
+        let entry =
+            match self
+                .index
+                .lookup_checked(parent_key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(entry) => entry,
+                None => return Ok(Vec::new()),
+            };
         let meta = self.read_metadata_fast(entry.record_offset)?;
         let mut offsets = Vec::new();
         let utxo_count = { meta.utxo_count };
@@ -3770,14 +3732,16 @@ impl Engine {
         let _guard = self.locks.lock(parent_key);
         // G-4: a backend read error must not collapse to "parent absent"
         // (which would silently report the slot was not pruned).
-        let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(entry) => entry,
-            None => return Ok(false),
-        };
+        let entry =
+            match self
+                .index
+                .lookup_checked(parent_key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(entry) => entry,
+                None => return Ok(false),
+            };
         let mut meta = self.read_metadata_fast(entry.record_offset)?;
         if offset >= { meta.utxo_count } {
             return Ok(false);
@@ -3902,17 +3866,15 @@ impl Engine {
     /// failure.
     pub fn prune_slot(&self, key: &TxKey, offset: u32) -> Result<bool, SpendError> {
         let _guard = self.locks.lock(key);
-        let entry =
-            match self
-                .index
-                .read()
-                .lookup_checked(key)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index lookup failed: {e}"),
-                })? {
-                Some(entry) => entry,
-                None => return Ok(false),
-            };
+        let entry = match self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })? {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
         let meta = self.read_metadata_fast(entry.record_offset)?;
         if offset >= { meta.utxo_count } {
             return Ok(false);
@@ -3948,17 +3910,15 @@ impl Engine {
     /// failure.
     pub fn set_record_generation(&self, key: &TxKey, generation: u32) -> Result<bool, SpendError> {
         let _guard = self.locks.lock(key);
-        let entry =
-            match self
-                .index
-                .read()
-                .lookup_checked(key)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index lookup failed: {e}"),
-                })? {
-                Some(entry) => entry,
-                None => return Ok(false),
-            };
+        let entry = match self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })? {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
         let mut meta = self.read_metadata_fast(entry.record_offset)?;
         meta.generation = generation;
         self.write_metadata_fast(entry.record_offset, &meta)?;
@@ -3985,7 +3945,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4056,7 +4015,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4106,7 +4064,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4218,7 +4175,7 @@ impl Engine {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would silently no-op the child append).
-                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let entry = match self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4282,7 +4239,7 @@ impl Engine {
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would free the freshly-allocated block as
                 // if the parent vanished). Surface it as a storage error.
-                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let looked_up = self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4384,7 +4341,7 @@ impl Engine {
             let (ro, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent absent".
-                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let entry = match self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4441,7 +4398,7 @@ impl Engine {
             let mut parent_gone = false;
             let committed = {
                 let _guard = self.locks.lock(parent_key);
-                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let looked_up = self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4609,7 +4566,6 @@ impl Engine {
     pub fn read_conflicting_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4716,7 +4672,7 @@ impl Engine {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would silently no-op the child append).
-                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let entry = match self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4772,7 +4728,7 @@ impl Engine {
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would free the freshly-allocated block as
                 // if the parent vanished). Surface it as a storage error.
-                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let looked_up = self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4925,7 +4881,6 @@ impl Engine {
     pub fn read_deleted_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4997,7 +4952,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5091,7 +5045,6 @@ impl Engine {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
             }
             self.index
-                .write()
                 .update_cached_fields(
                     &req.tx_key,
                     sync_tf.bits(),
@@ -5231,7 +5184,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5296,7 +5248,6 @@ impl Engine {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
             }
             self.index
-                .write()
                 .update_cached_fields(
                     &req.tx_key,
                     sync_tf.bits(),
@@ -5364,7 +5315,6 @@ impl Engine {
         let _guard = self.locks.lock(key);
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5400,7 +5350,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5506,7 +5455,7 @@ impl Engine {
         // `due_guard`. We therefore treat a backend read error the same as
         // a missing record (and the same as the existing metadata-read
         // error below), logging it so the operator still sees the fault.
-        let entry = match self.index.read().lookup_checked(key) {
+        let entry = match self.index.lookup_checked(key) {
             Ok(Some(e)) => e,
             Ok(None) => return false,
             Err(e) => {
@@ -5642,14 +5591,16 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
-        let entry = match self.index.read().lookup_checked(&req.tx_key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(e) => e,
-            None => return Err(SpendError::TxNotFound),
-        };
+        let entry =
+            match self
+                .index
+                .lookup_checked(&req.tx_key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(e) => e,
+                None => return Err(SpendError::TxNotFound),
+            };
 
         // KO-3: when invoked by the DAH sweep (`due_guard == Some(height)`),
         // re-validate the delete predicate against fresh metadata *under this
@@ -6228,17 +6179,15 @@ impl Engine {
         }
         let _guard = self.locks.lock(key);
         // G-4: a backend read error must not collapse to "absent".
-        let entry =
-            match self
-                .index
-                .read()
-                .lookup_checked(key)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index lookup failed: {e}"),
-                })? {
-                Some(e) => e,
-                None => return Ok(false),
-            };
+        let entry = match self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
         let ro = entry.record_offset;
 
         let mut meta = self.read_metadata_for_key(key, ro)?;
@@ -6283,7 +6232,6 @@ impl Engine {
     pub fn get_spend(&self, req: &GetSpendRequest) -> Result<GetSpendResponse, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6366,12 +6314,9 @@ impl Engine {
     pub fn rebuild_conflicting_index(&self) {
         let mut conflicting = self.conflicting_index.lock();
         conflicting.clear();
-        let index = self.index.read();
-        for (key, entry) in index.iter() {
-            if TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::CONFLICTING) {
-                conflicting.insert(key);
-            }
-        }
+        self.index.for_each_conflicting(|key| {
+            conflicting.insert(key);
+        });
     }
 
     /// Read on-device metadata for a transaction.
@@ -6392,7 +6337,6 @@ impl Engine {
     pub fn read_metadata(&self, key: &TxKey) -> Result<TxMetadata, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6419,7 +6363,7 @@ impl Engine {
         &self,
         key: &TxKey,
     ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
-        self.index.read().lookup_checked(key)
+        self.index.lookup_checked(key)
     }
 
     /// Infallible convenience variant of [`Self::lookup_cached_checked`].
@@ -6428,7 +6372,7 @@ impl Engine {
     /// For tests / internal diagnostics only; client-visible read paths
     /// MUST use [`Self::lookup_cached_checked`].
     pub fn lookup_cached(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        match self.index.read().lookup_checked(key) {
+        match self.index.lookup_checked(key) {
             Ok(found) => found,
             Err(e) => {
                 tracing::error!(
@@ -6456,7 +6400,6 @@ impl Engine {
     pub fn read_slot(&self, key: &TxKey, offset: u32) -> Result<UtxoSlot, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6484,7 +6427,6 @@ impl Engine {
     pub fn read_slots(&self, key: &TxKey) -> Result<Vec<UtxoSlot>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6538,7 +6480,6 @@ impl Engine {
         let _stripe_guard = self.locks.lock(key);
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6565,7 +6506,6 @@ impl Engine {
     ) -> Result<Option<BlockEntry>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6604,18 +6544,20 @@ impl Engine {
 
     /// Number of entries in the primary index.
     pub fn index_len(&self) -> usize {
-        self.index.read().len()
+        self.index.len()
     }
 
     /// Primary index statistics for monitoring.
     pub fn index_stats(&self) -> crate::index::IndexStats {
-        self.index.read().stats()
+        self.index.stats()
     }
 
     /// Non-blocking primary-index stats for observability (see `allocator_stats_try`).
-    /// Returns `None` if the index write lock is momentarily held by the create path.
+    /// Returns `None` if ANY shard's read lock is momentarily held by a writer
+    /// (e.g. the create path), so `/admin/top` never stalls behind the write
+    /// path.
     pub fn index_stats_try(&self) -> Option<crate::index::IndexStats> {
-        self.index.try_read().map(|g| g.stats())
+        self.index.try_stats()
     }
 
     /// Test-only: arm a synthetic failure in the next primary-index read so
@@ -6625,7 +6567,7 @@ impl Engine {
     /// collapsing to "transaction not found".
     #[cfg(test)]
     pub fn arm_fail_next_index_read(&self) {
-        self.index.read().arm_fail_next_read();
+        self.index.arm_fail_next_read();
     }
 
     /// Access the underlying block device.
@@ -6648,10 +6590,12 @@ impl Engine {
     /// Returns [`crate::index::IndexError`] on I/O failure or if the snapshot
     /// directory is not writable.
     pub fn snapshot_index(&self, path: &std::path::Path) -> crate::index::Result<()> {
-        let index = self.index.read();
         let dah = self.dah_index.lock();
         let unmined = self.unmined_index.lock();
-        index.snapshot_all(&dah, &unmined, path)
+        // At one shard this delegates to the single backend's `snapshot_all`,
+        // producing a byte-for-byte identical snapshot to the pre-sharding
+        // engine. The v2 N-shard snapshot format lands in a later task.
+        self.index.snapshot_all(&dah, &unmined, path)
     }
 
     /// Persist the allocator's freelist and high-water mark to the device header.
@@ -6682,7 +6626,7 @@ impl Engine {
     /// Returns [`crate::index::IndexError`] if any backend's durability
     /// flush fails; the caller must treat all index state as NOT durable.
     pub fn flush_index_durable(&self) -> crate::index::Result<()> {
-        self.index.read().flush_durable()?;
+        self.index.flush_durable()?;
         self.dah_index.lock().flush_durable()?;
         self.unmined_index.lock().flush_durable()
     }
@@ -9602,8 +9546,9 @@ mod tests {
         // stale DAH (1288) with NO preserve discriminant, while the device
         // sits at preserve_until=5000.
         {
-            let mut idx = h.engine.index.write();
-            let updated = idx
+            let updated = h
+                .engine
+                .index
                 .update_cached_fields(
                     &h.key,
                     TxFlags::empty().bits(), // no HAS_PRESERVE_UNTIL
@@ -9636,7 +9581,7 @@ mod tests {
 
         // Cache must now reflect the device truth: preserve discriminant set,
         // dah_or_preserve == preserve_until (5000) — NOT the stale 1288.
-        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        let entry = h.engine.index.lookup(&h.key).unwrap();
         assert_eq!(
             entry.dah_or_preserve, 5000,
             "cache must resync to preserve_until from fresh meta, not the stale DAH",
@@ -9668,11 +9613,10 @@ mod tests {
         });
 
         // Poison cache: stale DAH 1288, no preserve discriminant.
-        {
-            let mut idx = h.engine.index.write();
-            idx.update_cached_fields(&h.key, TxFlags::empty().bits(), 0, 0, 1288, 0, 0)
-                .unwrap();
-        }
+        h.engine
+            .index
+            .update_cached_fields(&h.key, TxFlags::empty().bits(), 0, 0, 1288, 0, 0)
+            .unwrap();
 
         let req = SetMinedRequest {
             tx_key: h.key,
@@ -9701,7 +9645,7 @@ mod tests {
             "block entry must be recorded"
         );
 
-        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        let entry = h.engine.index.lookup(&h.key).unwrap();
         assert_eq!(
             entry.dah_or_preserve, 5000,
             "cache must resync to preserve_until from fresh meta, not the stale DAH",
@@ -10462,7 +10406,7 @@ mod tests {
         // the unusual code path where the slot was reverted after the
         // prune. The deleted-children list is the only thing standing
         // between this re-spend and an accidental accept.
-        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        let entry = h.engine.index.lookup(&h.key).unwrap();
         let mut slot = h.engine.read_slot_fast(entry.record_offset, 1).unwrap();
         slot.status = UTXO_SPENT;
         slot.spending_data = h.make_spending_data(0xAB);
@@ -14122,7 +14066,7 @@ mod tests {
                 })
                 .unwrap();
             let after_conflict = engine.read_metadata(&key).unwrap();
-            let conflict_entry = engine.index.read().lookup(&key).unwrap();
+            let conflict_entry = engine.index.lookup(&key).unwrap();
             assert_eq!(conflicting.generation, { after_conflict.generation });
             assert_eq!(conflict_entry.generation, { after_conflict.generation });
             assert_eq!(conflict_entry.tx_flags, after_conflict.flags.bits());
@@ -14135,7 +14079,7 @@ mod tests {
                 })
                 .unwrap();
             let after_locked = engine.read_metadata(&key).unwrap();
-            let locked_entry = engine.index.read().lookup(&key).unwrap();
+            let locked_entry = engine.index.lookup(&key).unwrap();
             assert_eq!(locked_generation, { after_locked.generation });
             assert_eq!(locked_entry.generation, { after_locked.generation });
             assert_eq!(locked_entry.tx_flags, after_locked.flags.bits());
@@ -16101,14 +16045,14 @@ mod tests {
             UnminedIndex::new(),
         );
 
-        let initial_capacity = engine.index.read().stats().capacity;
+        let initial_capacity = engine.index.stats().capacity;
         for i in 0..20 {
             engine
                 .register_with_shard_count(key(i), entry(i))
                 .expect("register should resize without losing entries");
         }
 
-        let resized_capacity = engine.index.read().stats().capacity;
+        let resized_capacity = engine.index.stats().capacity;
         assert!(
             resized_capacity > initial_capacity,
             "test must cross the resize threshold"
@@ -16122,13 +16066,25 @@ mod tests {
         }
     }
 
+    /// A read guard held on the index shard owning `key` does not block a
+    /// concurrent lookup of that same key — shared reads are compatible.
+    ///
+    /// Pre-sharding this exercised the resize helper's `upgradable_read` lock
+    /// mode (now removed: per-shard resize takes the shard write lock for the
+    /// copy+swap). The migration-faithful property that remains true at any
+    /// shard count is: a shared read guard never excludes other readers. The
+    /// stronger "a write on one shard does not block reads on another shard"
+    /// property is proved by `ShardedIndex::contract_read_not_blocked_by_other_shard_write`
+    /// and is exercised at the engine level once the default rises above one
+    /// shard.
     #[test]
-    fn primary_resize_lock_mode_allows_concurrent_lookups() {
+    fn primary_index_read_guard_allows_concurrent_lookups() {
         let h = TestHarness::new(1, TxFlags::empty());
         let engine = h.engine.clone();
         let key = h.key;
 
-        let resize_like_guard = engine.index.upgradable_read();
+        // Hold a shared read guard on the shard that owns `key`.
+        let read_guard = engine.index.read_shard(&key);
         let (tx, rx) = std::sync::mpsc::channel();
         let reader_engine = engine.clone();
         std::thread::spawn(move || {
@@ -16137,10 +16093,10 @@ mod tests {
 
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(1))
-                .expect("lookup must not block behind an upgradable resize guard"),
-            "lookup should find the existing key while resize copy lock is held"
+                .expect("a shared read must not block behind another shared read guard"),
+            "lookup should find the existing key while a read guard is held"
         );
-        drop(resize_like_guard);
+        drop(read_guard);
     }
 
     /// Sum of per-shard counts observed on `engine`, computed from the
