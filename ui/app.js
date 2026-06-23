@@ -259,6 +259,16 @@
         try { const r = await apiFetch(path); if (!r.ok) return null; return await r.json(); } catch { return null; }
     }
     async function refreshAll() {
+        // /status is public; everything else is admin-gated. With no token or
+        // a known-bad one, only poll /status so the 3s timer doesn't generate a
+        // 401 storm (and log noise) behind the login overlay. The gated fetches
+        // resume the moment a valid token is entered.
+        if (!getToken() || authFailed) {
+            store.status = await fetchJson('/status');
+            updateClusterPill();
+            renderCurrentPage();
+            return;
+        }
         const [status, index, freelist, redo, nodes, memory, records, replication, migrations, logLevel] =
             await Promise.all([
                 fetchJson('/status'), fetchJson('/debug/index'), fetchJson('/debug/freelist'),

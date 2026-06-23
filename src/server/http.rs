@@ -299,8 +299,8 @@ fn install_http_panic_hook_once() {
 /// [`axum::middleware::from_fn_with_state`] guard ([`require_admin_bearer`])
 /// that checks the admin token on every request — supplied via either
 /// `Authorization: Bearer <admin_token>` or, for browser WebSocket clients
-/// that cannot set that header, a `Bearer.<admin_token>` entry in the
-/// `Sec-WebSocket-Protocol` header — comparing against the configured token
+/// that cannot set that header, a `Bearer64.<base64url(admin_token)>` entry in
+/// the `Sec-WebSocket-Protocol` header — comparing against the configured token
 /// in constant time. The gated set now
 /// includes BOTH the mutating routes (`PUT /admin/quiesce|rebalance|drain`,
 /// `PUT /debug/log-level`, `GET /debug/index|redo|records/{txid}`,
@@ -499,7 +499,8 @@ async fn require_admin_bearer(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
                 "missing or malformed Authorization: Bearer <token> header \
-                 (or Sec-WebSocket-Protocol Bearer.<token> for WebSocket clients)",
+                 (or a Sec-WebSocket-Protocol Bearer64.<base64url-token> / \
+                 Bearer.<token> entry for WebSocket clients)",
             );
         }
     };
@@ -2503,20 +2504,22 @@ async fn handle_admin_top(
 
 /// Non-secret subprotocol the server negotiates on `/ws/top`.
 ///
-/// Browsers authenticate the WebSocket by offering `Bearer.<token>` in the
-/// `Sec-WebSocket-Protocol` header (see [`require_admin_bearer`]). The server
-/// must echo one of the client's offered subprotocols in the handshake
-/// response or the browser fails the connection, but echoing the dynamic
-/// `Bearer.<token>` value would round-trip the secret in the response. The UI
-/// therefore offers this static marker as a second subprotocol; the handler
-/// selects and echoes only this one, keeping the token out of the response.
+/// Browsers authenticate the WebSocket by offering
+/// `Bearer64.<base64url(token)>` in the `Sec-WebSocket-Protocol` header (see
+/// [`require_admin_bearer`]). The server must echo one of the client's offered
+/// subprotocols in the handshake response or the browser fails the connection,
+/// but echoing the dynamic `Bearer64.<...>` value would round-trip the secret
+/// in the response. The UI therefore offers this static marker as a second
+/// subprotocol; the handler selects and echoes only this one, keeping the
+/// token out of the response.
 const WS_TOP_SUBPROTOCOL: &str = "teraslab.v1";
 
 /// Upgrade to WebSocket and push metrics snapshots every second.
 ///
 /// Auth is enforced upstream by [`require_admin_bearer`], which accepts the
-/// admin token via `Authorization: Bearer` (CLI) or a `Bearer.<token>` entry
-/// in `Sec-WebSocket-Protocol` (browsers). When the client offers
+/// admin token via `Authorization: Bearer` (CLI) or a
+/// `Bearer64.<base64url(token)>` entry in `Sec-WebSocket-Protocol` (browsers).
+/// When the client offers
 /// [`WS_TOP_SUBPROTOCOL`] it is selected and echoed in the 101 response;
 /// clients that authenticate via the `Authorization` header and offer no
 /// subprotocol simply upgrade with no negotiated subprotocol.
