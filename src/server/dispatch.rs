@@ -11240,11 +11240,11 @@ mod tests {
 
     /// R-044 (GH-06 / GH-09) regression: an active streaming-blob
     /// upload session whose cumulative `bytes_received` would exceed
-    /// the configured per-stream byte cap MUST be aborted with `ERR_INTERNAL`
-    /// — the server must not accept the chunk and must not let the
-    /// counter grow unbounded. Pre-fix the per-stream counter
-    /// incremented on every chunk with no upper bound, so a single
-    /// connection could write multi-terabyte blobs by sending
+    /// the configured per-stream byte cap MUST be aborted with
+    /// `ERR_STREAM_INVARIANT` (wire code 34) — the server must not accept
+    /// the chunk and must not let the counter grow unbounded. Pre-fix the
+    /// per-stream counter incremented on every chunk with no upper bound,
+    /// so a single connection could write multi-terabyte blobs by sending
     /// 4 KiB chunks indefinitely.
     ///
     /// Test installs a 1024-byte cap on the connection state so we can
@@ -11290,9 +11290,11 @@ mod tests {
         );
 
         // Chunk 2: 300 bytes at offset 800 — pushes total to 1100,
-        // exceeding the 1024-byte cap. MUST be rejected with
-        // ERR_INTERNAL and a "exceeds maximum" message in the
-        // payload, and the stream session must be removed.
+        // exceeding the 1024-byte cap. MUST be rejected with wire code
+        // ERR_STREAM_INVARIANT(34) (the cap check at handle_stream_chunk
+        // returns ERR_STREAM_INVARIANT, not ERR_INTERNAL) and a
+        // "exceeds maximum" message in the payload, and the stream session
+        // must be removed.
         let chunk2 = vec![0xBBu8; 300];
         let req2 = RequestFrame {
             request_id: 2,
@@ -11309,11 +11311,16 @@ mod tests {
             &mut conn_state,
             Some(&*blob_store),
         );
-        assert_ne!(
-            resp2.status, STATUS_OK,
+        assert_eq!(
+            resp2.status, STATUS_ERROR,
             "second chunk that pushes total over the cap must be rejected",
         );
-        let msg = String::from_utf8_lossy(&resp2.payload);
+        let (code, msg) = crate::protocol::codec::decode_error_payload(&resp2.payload)
+            .expect("cap rejection must carry a typed [code:2][msg] error payload");
+        assert_eq!(
+            code, ERR_STREAM_INVARIANT,
+            "byte-cap rejection must use wire code ERR_STREAM_INVARIANT(34); got {code}",
+        );
         assert!(
             msg.contains("exceeds maximum"),
             "rejection must include the cap-exceeded reason; got: {msg}",
@@ -11321,6 +11328,131 @@ mod tests {
         assert!(
             !conn_state.streams.contains_key(&txid),
             "stream session must be removed after exceeding the cap",
+        );
+    }
+
+    /// REL-116: `OP_STREAM_END` whose declared `total_size` does not match the
+    /// bytes actually streamed MUST be rejected with wire code
+    /// `ERR_STREAM_INVARIANT(34)` (the declared-size-mismatch branch in
+    /// `handle_stream_end`), the stream session MUST be removed, and the
+    /// partially-written `.tmp` upload artefact MUST be cleaned up (the writer
+    /// is `abort`ed). A real `FileBlobStore` is used so the `.tmp` cleanup is
+    /// observable on disk, not just inferred from the in-memory map.
+    #[test]
+    fn stream_end_size_mismatch_aborts_and_cleans_tmp() {
+        use crate::protocol::codec::{
+            decode_error_payload, encode_stream_chunk, encode_stream_end,
+        };
+        use crate::protocol::opcodes::{OP_STREAM_CHUNK, OP_STREAM_END};
+        use crate::storage::blobstore::{BlobStore, FileBlobStore};
+        use std::path::Path;
+
+        // Recursively count files under `dir` whose name ends in ".tmp".
+        fn count_tmp_files(dir: &Path) -> usize {
+            let mut n = 0;
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return 0,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    n += count_tmp_files(&path);
+                } else if path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.ends_with(".tmp"))
+                {
+                    n += 1;
+                }
+            }
+            n
+        }
+
+        let h = DispatchTestHarness::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blob_store: std::sync::Arc<dyn BlobStore> =
+            std::sync::Arc::new(FileBlobStore::new(tmp.path(), 2));
+        let mut conn_state = crate::server::ConnectionState::new();
+        let txid = DispatchTestHarness::make_txid(0x7E);
+
+        // Stream 10 bytes across one chunk — opens the stream and writes a
+        // `.tmp` artefact to the blob store.
+        let chunk = vec![0x42u8; 10];
+        let chunk_req = RequestFrame {
+            request_id: 1,
+            op_code: OP_STREAM_CHUNK,
+            flags: 0,
+            payload: encode_stream_chunk(&txid, 0, &chunk).into(),
+        };
+        let chunk_resp = handle_request(
+            &chunk_req,
+            &h.engine,
+            8192,
+            None,
+            None,
+            &mut conn_state,
+            Some(&*blob_store),
+        );
+        assert_eq!(
+            chunk_resp.status, STATUS_OK,
+            "the 10-byte chunk must be accepted; payload: {:?}",
+            String::from_utf8_lossy(&chunk_resp.payload),
+        );
+        assert!(
+            conn_state.streams.contains_key(&txid),
+            "stream session must be live after the chunk",
+        );
+        assert_eq!(
+            count_tmp_files(tmp.path()),
+            1,
+            "the in-progress stream must have one .tmp artefact on disk",
+        );
+
+        // STREAM_END declares 99 bytes, but only 10 were received — the
+        // declared-size-mismatch branch must fire.
+        let end_req = RequestFrame {
+            request_id: 2,
+            op_code: OP_STREAM_END,
+            flags: 0,
+            payload: encode_stream_end(&txid, 99).into(),
+        };
+        let end_resp = handle_request(
+            &end_req,
+            &h.engine,
+            8192,
+            None,
+            None,
+            &mut conn_state,
+            Some(&*blob_store),
+        );
+        assert_eq!(end_resp.status, STATUS_ERROR);
+        let (code, msg) = decode_error_payload(&end_resp.payload)
+            .expect("size-mismatch rejection must carry a typed [code:2][msg] payload");
+        assert_eq!(
+            code, ERR_STREAM_INVARIANT,
+            "declared-size mismatch must use wire code ERR_STREAM_INVARIANT(34); got {code}",
+        );
+        assert!(
+            msg.contains("size mismatch"),
+            "rejection must explain the size mismatch; got: {msg}",
+        );
+
+        // The session is gone and the partial writer was aborted, so the
+        // `.tmp` artefact must be cleaned up — no orphaned upload debris.
+        assert!(
+            !conn_state.streams.contains_key(&txid),
+            "stream session must be removed after the size-mismatch abort",
+        );
+        assert_eq!(
+            count_tmp_files(tmp.path()),
+            0,
+            "the aborted stream's .tmp artefact must be removed from disk",
+        );
+        // And no committed blob exists for the txid.
+        assert!(
+            !blob_store.exists(&txid).unwrap(),
+            "a size-mismatched stream must not finalize a blob",
         );
     }
 
@@ -20165,6 +20297,62 @@ mod tests {
         assert_eq!(
             next_offset_before, next_offset_after,
             "a redo-full create must not leak a durable allocation (issue #14)"
+        );
+
+        // REL-105: in-memory high-water-mark equality alone does not prove the
+        // ABSENCE of a durable orphan — the orphan bug (issue #14) was a
+        // DURABLE `AllocateRegion` with no matching `CreateV2`, which only a
+        // crash+recovery cycle surfaces. Reopen the redo log from its backing
+        // device (simulating a restart) and replay it: every recovered
+        // `AllocateRegion` MUST be covered by a `CreateV2` for the same region
+        // offset. A surviving orphan AllocateRegion would fail this check even
+        // though the in-memory `next_offset` looks clean.
+        let recovered = crate::redo::RedoLog::open(
+            h.redo_dev.clone() as Arc<dyn BlockDevice>,
+            0,
+            h.redo_dev.size(),
+        )
+        .expect("reopen redo log from backing device")
+        .recover()
+        .expect("recover replays the persisted entries");
+
+        let allocate_offsets: std::collections::HashSet<u64> = recovered
+            .iter()
+            .filter_map(|entry| match entry.op {
+                RedoOp::AllocateRegion { offset, .. } => Some(offset),
+                _ => None,
+            })
+            .collect();
+        let create_offsets: std::collections::HashSet<u64> = recovered
+            .iter()
+            .filter_map(|entry| match &entry.op {
+                RedoOp::CreateV2 { record_offset, .. } => Some(*record_offset),
+                _ => None,
+            })
+            .collect();
+
+        // The one successful create durably wrote exactly one [AllocateRegion +
+        // CreateV2] pair; the doomed create wrote neither. So recovery sees one
+        // allocate and one create, sharing the same region offset.
+        assert_eq!(
+            allocate_offsets.len(),
+            1,
+            "exactly one region was durably allocated (the successful create); \
+             the redo-full create must not have leaked an AllocateRegion"
+        );
+        assert_eq!(
+            create_offsets.len(),
+            1,
+            "exactly one CreateV2 survived recovery (the successful create)"
+        );
+        let orphans: Vec<u64> = allocate_offsets
+            .difference(&create_offsets)
+            .copied()
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "recovery found durable AllocateRegion(s) with no matching CreateV2 \
+             (orphan region survived a simulated restart): offsets {orphans:?}"
         );
     }
 
