@@ -1,8 +1,14 @@
 //! Blob store trait and file-based implementation.
 //!
-//! Large transaction data (> 1 MiB) is stored in an external blob store
-//! keyed by txid. The file-based implementation uses a directory tree
-//! organized by hash prefix.
+//! Large transaction cold data is stored in an external blob store keyed by a
+//! caller-supplied 32-byte key (the txid). The advisory size guideline for
+//! choosing external placement is 8 KiB of serialized cold data (see
+//! [`crate::storage::tiers::INLINE_THRESHOLD`]); above that, clients are
+//! recommended to pre-upload a blob here. That threshold is *advisory only* —
+//! the server does not enforce it. Placement is client-driven via the
+//! `FLAG_EXTERNAL_BLOB` request flag, so a client may store any size external.
+//! The file-based implementation uses a directory tree organized by the key's
+//! hex prefix.
 //!
 //! # Durability and integrity
 //!

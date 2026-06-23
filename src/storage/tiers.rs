@@ -181,14 +181,10 @@ mod tests {
     }
 
     #[test]
-    fn tier_separate() {
+    fn tier_external() {
+        // One past the inclusive inline boundary is the smallest External size.
         assert_eq!(tier_for_size(INLINE_THRESHOLD + 1), StorageTier::External);
         assert_eq!(tier_for_size(500 * 1024), StorageTier::External);
-    }
-
-    #[test]
-    fn tier_external() {
-        assert_eq!(tier_for_size(INLINE_THRESHOLD + 1), StorageTier::External);
         assert_eq!(tier_for_size(320 * 1024 * 1024), StorageTier::External);
     }
 
