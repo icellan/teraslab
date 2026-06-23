@@ -7361,24 +7361,41 @@ mod tests {
         let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
 
-        // Two-shard index to maximise the probability that key_a and key_b
-        // land in different shards under the process-local seed.
+        // Two-shard index: every shard selection is a single bit flip under the
+        // runtime seed, so there are exactly two shards.
         let index = ShardedIndex::new_in_memory(64, 2).unwrap();
 
-        // Choose two txids that differ only in bytes [0..8] so they both have
-        // the same [24..32] bytes — they WILL land in the same shard. To get
-        // cross-shard aliasing we vary [24..32] as well. We can't know the
-        // runtime seed, so we just pick two different txids; the eviction logic
-        // must work regardless of which shard each key ends up in.
-        let mut txid_a = [0u8; 32];
-        txid_a[0] = 0xAA;
-        txid_a[24] = 0x00; // shard routing byte
-        let key_a = TxKey { txid: txid_a };
+        // Find two keys that are DETERMINISTICALLY in different shards by
+        // iterating over candidate pairs until we find one. This mirrors the
+        // `find_different_shard_keys` helper pattern from the sharded.rs tests
+        // and eliminates any reliance on a random seed producing a specific
+        // split for hard-coded txid bytes.
+        let (key_a, key_b) = {
+            let mut found: Option<(TxKey, TxKey)> = None;
+            'outer: for a in 0u64..100_000 {
+                let mut txid_a = [0u8; 32];
+                txid_a[0] = 0xAA;
+                txid_a[1..9].copy_from_slice(&a.to_le_bytes());
+                txid_a[24..32].copy_from_slice(&a.to_le_bytes());
+                let ka = TxKey { txid: txid_a };
+                let shard_a = index.index_shard_for_key(&ka);
 
-        let mut txid_b = [0u8; 32];
-        txid_b[0] = 0xBB;
-        txid_b[24] = 0xFF; // different shard routing byte
-        let key_b = TxKey { txid: txid_b };
+                for b in (a + 1)..(a + 100).min(100_000) {
+                    let mut txid_b = [0u8; 32];
+                    txid_b[0] = 0xBB;
+                    txid_b[1..9].copy_from_slice(&b.to_le_bytes());
+                    txid_b[24..32].copy_from_slice(&b.to_le_bytes());
+                    let kb = TxKey { txid: txid_b };
+                    if index.index_shard_for_key(&kb) != shard_a {
+                        found = Some((ka, kb));
+                        break 'outer;
+                    }
+                }
+            }
+            found.expect("must find two keys in different shards within 100k candidates")
+        };
+
+        let (txid_a, txid_b) = (key_a.txid, key_b.txid);
 
         // Allocate two adjacent regions. key_a occupies region 1 (offset_a).
         // key_b will claim region 1 via its CreateV2 (the alias scenario).

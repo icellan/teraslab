@@ -27,7 +27,9 @@ use std::sync::OnceLock;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::allocator::SlotAllocator;
 use crate::cluster::shards::ShardTable;
+use crate::device::BlockDevice;
 use crate::index::backend::PrimaryBackend;
 use crate::index::redb_primary::CachedFieldsUpdate;
 use crate::index::{
@@ -543,6 +545,12 @@ impl ShardedIndex {
 
     /// The active backend name (from the first shard; all shards share the
     /// same backend type).
+    ///
+    /// # Invariant
+    ///
+    /// `shards[0]` is always valid: every constructor calls `clamp_shard_count`
+    /// which returns `n.clamp(1, 256).next_power_of_two()`, so `shard_count >= 1`
+    /// is guaranteed and `shards` is never empty.
     pub fn backend_name(&self) -> &'static str {
         self.shards[0].read().backend_name()
     }
@@ -902,6 +910,14 @@ impl ShardedIndex {
                 ),
             });
         }
+        // The live constructors always write a power-of-two count; a non-power-of-two
+        // here means the manifest was corrupted or produced by a code path that
+        // bypassed `clamp_shard_count`. The fail-closed range check above is the
+        // production gate; this assert catches logic bugs in test / debug builds.
+        debug_assert!(
+            shard_count.is_power_of_two(),
+            "snapshot shard_count must be power of two (got {shard_count})"
+        );
         let seed = u64::from_le_bytes(arr8(&data[12..20]));
 
         // Verify the trailing CRC over the whole file (minus the 4-byte CRC).
@@ -955,7 +971,11 @@ impl ShardedIndex {
             secondary_start = secondary_start.max(end);
         }
 
-        // Secondary sections live after the last region.
+        // Secondary sections live after the last region. The trailing CRC (checked
+        // above) covers the entire file body including the secondary bytes, so the
+        // "secondary starts at max(region_end)" assumption is safe: any truncation
+        // or rearrangement of the secondary section would have been caught by the
+        // checksum gate before we reach this point.
         let (dah, unmined, flags) =
             crate::index::parse_secondary_sections(&data[secondary_start..]);
 
@@ -1006,6 +1026,60 @@ impl ShardedIndex {
         for shard in &self.shards {
             shard.read().arm_fail_next_read();
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Device-scan rebuild into sharded layout
+    // -----------------------------------------------------------------------
+
+    /// Rebuild a sharded in-memory index from a full device scan.
+    ///
+    /// This is the LOW-RISK path: it delegates to the proven
+    /// [`PrimaryBackend::rebuild`] to produce a single complete backend, then
+    /// routes every entry from that backend into the correct shard of a fresh
+    /// `ShardedIndex` using [`Self::index_shard_for_key`]. The single-backend
+    /// scan is already battle-tested (issue-#14 tolerance, allocator-freelist
+    /// hole skipping, malformed-header resilience), so all that work is reused
+    /// without duplication.
+    ///
+    /// # Parameters
+    ///
+    /// - `device`: the block device whose allocated regions are scanned.
+    /// - `allocator`: the slot allocator whose freelist is used to skip free
+    ///   holes during the scan (passed unchanged to `PrimaryBackend::rebuild`).
+    /// - `shard_count`: the target number of index shards. Rounded up to the
+    ///   next power of two and clamped to `[1, 256]` by [`clamp_shard_count`].
+    ///   Use `1` for the N=1 degenerate case (single-lock pass-through).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`IndexError`] from `PrimaryBackend::rebuild` (device I/O
+    /// errors, unrecoverable scan failures) or from `ShardedIndex::register`
+    /// (hash-table allocation failure when routing entries to shards).
+    pub fn rebuild_in_memory(
+        device: &dyn BlockDevice,
+        allocator: &SlotAllocator,
+        shard_count: usize,
+    ) -> Result<Self, IndexError> {
+        // Single-backend device scan — reuses all proven scan logic.
+        let single = PrimaryBackend::rebuild(device, allocator)?;
+        let count = single.len();
+
+        // Capacity hint: at least 64 per shard so small devices don't
+        // allocate tiny tables; scale proportionally for larger scans.
+        let per_shard_hint = (count / clamp_shard_count(shard_count).max(1))
+            .max(64)
+            .saturating_mul(2);
+
+        let sharded =
+            Self::new_in_memory(per_shard_hint * clamp_shard_count(shard_count), shard_count)?;
+
+        // Route every entry from the single backend into its target shard.
+        for (key, entry) in single.iter() {
+            sharded.register(key, entry)?;
+        }
+
+        Ok(sharded)
     }
 
     // -----------------------------------------------------------------------
@@ -2165,5 +2239,144 @@ mod tests {
         let (restored, _d, _u, _f) = ShardedIndex::restore_all(&path, 1).unwrap();
         let after = collect_entries(&restored);
         assert_eq!(after, before, "ShardedIndex restore of N=1 v1 must match");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6 tests: rebuild_in_memory (TDD — written before implementation)
+    // -----------------------------------------------------------------------
+
+    /// Set up a `MemoryDevice` populated with `record_count` valid records,
+    /// mirroring the pattern used in `index::mod::setup_device_with_records`.
+    ///
+    /// Returns the populated device, the corresponding `SlotAllocator`, and a
+    /// `Vec<(TxKey, u64)>` of `(key, record_offset)` pairs.
+    fn setup_device_for_rebuild(
+        record_count: usize,
+    ) -> (
+        std::sync::Arc<crate::device::MemoryDevice>,
+        crate::allocator::SlotAllocator,
+        Vec<(TxKey, u64)>,
+    ) {
+        use crate::io::write_full_record;
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        let dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+        let mut records = Vec::with_capacity(record_count);
+
+        for i in 0..record_count {
+            let mut meta = TxMetadata::new(5);
+            let mut txid = [0u8; 32];
+            // Vary [0..8] for record identity
+            txid[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            txid[8..16]
+                .copy_from_slice(&((i as u64).wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
+            // Vary [24..32] so keys spread across index shards
+            txid[24..32]
+                .copy_from_slice(&((i as u64).wrapping_mul(0x517C_C1B7_2722_0A95)).to_le_bytes());
+            meta.tx_id = txid;
+
+            let record_size = TxMetadata::record_size_for(5);
+            let offset = alloc.allocate(record_size).unwrap();
+
+            let slots: Vec<UtxoSlot> = (0..5)
+                .map(|s| {
+                    let mut h = [0u8; 32];
+                    h[0] = s;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+
+            write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            records.push((TxKey { txid }, offset));
+        }
+
+        (dev, alloc, records)
+    }
+
+    /// Test 1 (Task 6): `rebuild_in_memory` round-trips — every key written to
+    /// the device is present in the rebuilt `ShardedIndex`, lives in the shard
+    /// that `index_shard_for_key` selects, and the `record_offset` matches.
+    /// Results also agree with a `PrimaryBackend::rebuild` oracle.
+    #[test]
+    fn rebuild_in_memory_roundtrip() {
+        let (dev, alloc, records) = setup_device_for_rebuild(50);
+
+        let sharded = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16).unwrap();
+        assert_eq!(sharded.shard_count(), 16);
+        assert_eq!(
+            sharded.len(),
+            records.len(),
+            "rebuilt entry count must match records written"
+        );
+
+        // Build a single-backend oracle for comparison
+        let oracle = PrimaryBackend::rebuild(&*dev, &alloc).unwrap();
+        assert_eq!(
+            oracle.len(),
+            records.len(),
+            "oracle must also have all records"
+        );
+
+        for (key, expected_offset) in &records {
+            // Entry is present
+            let entry = sharded
+                .lookup(key)
+                .unwrap_or_else(|| panic!("key {:?} not found in rebuilt ShardedIndex", key.txid));
+
+            // record_offset matches what was written
+            assert_eq!(
+                entry.record_offset, *expected_offset,
+                "record_offset mismatch for key {:?}",
+                key.txid
+            );
+
+            // The entry lives in the shard `index_shard_for_key` selects
+            let expected_shard = sharded.index_shard_for_key(key);
+            let guard = sharded.shards[expected_shard].read();
+            assert!(
+                guard.lookup(key).is_some(),
+                "key {:?} not found in its expected shard {}",
+                key.txid,
+                expected_shard
+            );
+
+            // Entry matches the oracle
+            let oracle_entry = oracle
+                .lookup(key)
+                .unwrap_or_else(|| panic!("oracle missing key {:?}", key.txid));
+            assert_eq!(
+                entry.record_offset, oracle_entry.record_offset,
+                "record_offset disagrees with oracle for key {:?}",
+                key.txid
+            );
+            assert_eq!(
+                entry.utxo_count, oracle_entry.utxo_count,
+                "utxo_count disagrees with oracle for key {:?}",
+                key.txid
+            );
+        }
+    }
+
+    /// Test 2 (Task 6): empty device → `rebuild_in_memory` succeeds with N=16,
+    /// all shards empty, no panic.
+    #[test]
+    fn rebuild_in_memory_empty_device() {
+        let dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+
+        let result = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16);
+        let sharded = result.expect("rebuild_in_memory on empty device must succeed");
+
+        assert_eq!(sharded.shard_count(), 16, "must produce 16 shards");
+        assert_eq!(sharded.len(), 0, "empty device → empty index");
+        assert!(sharded.is_empty(), "is_empty must be true");
+        // Verify every individual shard is empty
+        for (i, shard) in sharded.shards.iter().enumerate() {
+            let guard = shard.read();
+            assert_eq!(guard.len(), 0, "shard {i} must be empty");
+        }
     }
 }
