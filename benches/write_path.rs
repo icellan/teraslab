@@ -1,6 +1,10 @@
 //! Fixed-workload write-path throughput bench: 100K creates and 100K spends
 //! at apply-concurrency K in {1,2,4,8}. Engine-level (no TCP). Provides the
 //! comparable before/after numbers recorded in WRITE_PATH_BASELINE.md.
+//!
+//! Also benchmarks K=8 at shard_count ∈ {1, 16} to isolate the index-lock
+//! contention reduction from sharding (groups `creates_100k_shards` and
+//! `spends_100k_shards`).
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::sync::Arc;
@@ -8,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, ShardedIndex, TxKey, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -36,6 +40,25 @@ fn create_engine() -> Arc<Engine> {
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(2 * N as usize).unwrap();
     Arc::new(Engine::new(
+        dev,
+        index,
+        alloc,
+        StripedLocks::new(65536),
+        DahIndex::new(),
+        UnminedIndex::new(),
+    ))
+}
+
+/// Build an engine backed by a `ShardedIndex` with `shard_count` index shards.
+///
+/// Used to measure the index-lock contention reduction at K=8 concurrency.
+/// `shard_count = 1` is the degenerate (single-shard) baseline; `shard_count = 16`
+/// is the default sharded configuration.
+fn create_engine_sharded(shard_count: usize) -> Arc<Engine> {
+    let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024 * 1024, 4096).unwrap());
+    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+    let index = ShardedIndex::new_in_memory(2 * N as usize, shard_count).unwrap();
+    Arc::new(Engine::new_with_sharded_index(
         dev,
         index,
         alloc,
@@ -154,5 +177,60 @@ fn bench_spends(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_creates, bench_spends);
+/// Creates at K=8 for shard_count ∈ {1, 16}.
+///
+/// Isolates the index-lock contention reduction: with shard_count=1 all K=8
+/// threads serialise on one RwLock; with shard_count=16 they contend on 16
+/// independent shards. The allocator and striped per-key locks are shared in
+/// both cases, so the measured delta reflects the primary-index lock specifically.
+fn bench_creates_shards(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_path/creates_100k_shards");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(N as u64));
+    for shards in [1usize, 16] {
+        group.bench_with_input(BenchmarkId::new("shards", shards), &shards, |b, &shards| {
+            b.iter_batched(
+                || create_engine_sharded(shards),
+                |engine| {
+                    teraslab::metrics::reset_writers_max();
+                    run_concurrent(8, |i| create_one(&engine, i));
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Spends at K=8 for shard_count ∈ {1, 16}.
+fn bench_spends_shards(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_path/spends_100k_shards");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(N as u64));
+    for shards in [1usize, 16] {
+        group.bench_with_input(BenchmarkId::new("shards", shards), &shards, |b, &shards| {
+            b.iter_batched(
+                || {
+                    let engine = create_engine_sharded(shards);
+                    run_concurrent(8, |i| create_one(&engine, i));
+                    engine
+                },
+                |engine| {
+                    teraslab::metrics::reset_writers_max();
+                    run_concurrent(8, |i| spend_one(&engine, i));
+                },
+                criterion::BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_creates,
+    bench_spends,
+    bench_creates_shards,
+    bench_spends_shards
+);
 criterion_main!(benches);

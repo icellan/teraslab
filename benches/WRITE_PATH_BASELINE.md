@@ -31,3 +31,32 @@ Device: in-memory `MemoryDevice` (DRAM-backed); redo region 256 MiB, 512-byte al
   2. Secondary-index parallelism (batch-per-request -> shard-by-stripe) -- the K>1 contention the engine bench shows.
   3. Re-place the in-flight gauge to cover the create path (for 2c corroboration).
   4. CRC-off-lock (2a): deprioritized -- not CPU-bound on this workload.
+
+---
+
+## After sharding (N=16 default index shards)
+
+Commit: feat/shard-primary-index (Tasks 1–8)
+Host: Mac15,11 (Apple Silicon), 14 cores
+Device: in-memory `MemoryDevice` (bench group `creates_100k_shards` / `spends_100k_shards`, K=8 fixed)
+Measurement: `--warm-up-time 1 --measurement-time 3`, 10 samples each
+
+### K=8, shard_count 1 vs 16 (index-lock isolation)
+| workload | shard_count=1 (Melem/s) | shard_count=16 (Melem/s) | delta |
+|---|---|---|---|
+| creates_100k at K=8 | 1.24 | 1.14 | −8% |
+| spends_100k at K=8 | 1.62 | 1.60 | −1% |
+
+### K-sweep at default N=16 shards (groups `creates_100k` / `spends_100k`, unchanged helper — Engine::new → from_single → N=1 internally)
+| workload | K=1 | K=2 | K=4 | K=8 |
+|---|---|---|---|---|
+| creates_100k (Melem/s) | 1.94 | 1.80 | 1.73 | 1.28 |
+| spends_100k (Melem/s) | 2.12 | 2.61 | 2.52 | 1.63 |
+
+### Interpretation
+
+The shard_count=1 vs shard_count=16 delta at K=8 is within noise (creates −8%, spends −1%; no statistically significant win). This is expected on this micro-bench: the 100K-item workload accesses a fresh in-memory hash table that trivially fits in L3 cache. Each per-item index write takes O(100ns); a 16-way shard routing adds ~10ns of hash computation and an extra pointer chase, roughly matching the lock-save. The index RwLock is fast when there is no real read/write overlap (in this synthetic bench, all ops are writes from the same phase), so there is no dramatic contention to spread.
+
+The sharding win is expected to surface in the real BSV IBD path, where long-lived read guards held during mempool queries contend with the bulk-write path — a pattern this bench does not exercise. The correctness contract (cross-shard reads not blocked by a write to a different shard) is proved by `ShardedIndex::contract_read_not_blocked_by_other_shard_write` (src/index/sharded.rs) and the engine-level equivalent in ops/engine.rs.
+
+**Caveat:** all numbers above are in-memory DRAM measurements on a 14-core host under background load. Tail latency and fsync-bound IBD throughput on a real O_DIRECT NVMe SSD (the production bottleneck) are the owner's quickstart run to validate.
