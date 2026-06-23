@@ -8,13 +8,13 @@ TeraSlab exploits the fixed, known workload patterns of UTXO storage to achieve 
 
 ## Key design
 
-TeraSlab pre-allocates UTXO slots at full size during creation and mutates them in place. The logical mutation footprint of a spend is small (1-byte status + 36-byte spending data + 4-byte slot CRC, then a metadata bump), but the on-device write is bounded below by the device sector size.
+TeraSlab pre-allocates UTXO slots at full size during creation and mutates them in place. The *logical* mutation footprint of a spend is small (1-byte status + 36-byte spending data + 4-byte slot CRC = 41 bytes, then a metadata bump), but the *on-device write* rewrites the full 73-byte slot and the full 320-byte metadata header — and that is bounded below by the device sector size anyway.
 
 | Property | Value |
 |----------|-------|
-| Logical spend payload | 41 bytes per slot (1-byte status + 36-byte spending data + 4-byte slot CRC) + 320-byte metadata update |
+| Logical spend mutation | 41 bytes per slot (1-byte status + 36-byte spending data + 4-byte slot CRC) + a metadata bump |
 | Slot total size on disk | 73 bytes (32-byte hash + slot payload + CRC) |
-| On-device write size | One device sector per touched slot, one per metadata block. On `MemoryDevice` this is the exact byte range; on `DirectDevice` with `O_DIRECT` it amplifies to 4096-byte sectors. |
+| On-device write size | The full 73-byte slot is rewritten (not just the 41-byte footer), plus the full 320-byte metadata header. On `MemoryDevice` this is the exact byte range; on `DirectDevice` with `O_DIRECT` each rewrite amplifies to 4096-byte sectors anyway. |
 | p99.9 latency target | Low (no copy-on-write, no defrag spikes) — not yet measured on production hardware |
 | Replication bandwidth | ~120 MB/s target (operation-based, not full-record) |
 | Memory per record | 64-byte hash-table bucket (one cache line) in-memory — effective bytes/record is 64 ÷ load factor; or ~0 with on-disk redb backend |
@@ -31,9 +31,9 @@ The production write path is synchronous `O_DIRECT` I/O via `src/device.rs` (`Di
 
 | Probe | Result |
 |-------|-------:|
-| `cargo test --all` | 2234 passed / 0 failed / 0 ignored |
-| `cargo test --features fault-injection` (gated binaries) | 9 passed / 0 failed |
-| `cd client/rust && cargo test` | 17 passed / 0 failed |
+| `cargo test --all` | 0 failed / 0 ignored (pass count grows with the suite — see CI) |
+| `cargo test --features fault-injection` (gated binaries) | 0 failed (see CI) |
+| `cd client/rust && cargo test` | 0 failed (see CI) |
 | `cargo clippy --all-targets -- -D warnings` | clean (with and without `--features fault-injection`) |
 | `cargo fmt --all -- --check` | clean |
 
@@ -146,6 +146,8 @@ enable_remote_bind = true          # default false; must be true for any non-loo
 max_connections = 1024              # Max concurrent TCP connections
 max_connections_per_ip = 64         # Per-source-IP connection cap (NAT'd client fleets share one)
 max_batch_size = 8192               # Max items per batch request
+max_active_streams_per_connection = 64  # Max in-progress blob uploads one connection may hold open (0 disables)
+stream_idle_timeout_secs = 60       # Idle blob-upload stream reaped after this many secs (0 disables reaper)
 
 # --- Security and access control (all default to off/unset) ---
 enable_admin_endpoints = false      # mount the gated /debug/* and /admin/* HTTP routes + admin opcodes
@@ -167,6 +169,31 @@ device_alignment = 4096               # I/O alignment (4096 for NVMe/SSD)
 # --- Recovery ---
 redo_log_size = 67108864              # Redo log size in bytes (64 MiB)
 redo_log_path = "teraslab-data.dat.redo"  # Optional explicit redo log path
+recovery_missing_primary_tolerance = 65536  # Max MissingPrimary replay failures tolerated during
+                                      # startup recovery before aborting (default 65536)
+
+# --- Deletion & tombstones (on by default; see "Deletion & tombstones" below) ---
+tombstones_enabled = true             # default TRUE: the engine writes a durable deletion tombstone on
+                                      # every physical record delete and recovery reconstructs the index.
+                                      # When true, startup provisions a `.tombstone` device file +
+                                      # the redb tombstone index ([index] redb_tombstone_path).
+tombstone_region_size = 67108864      # On-device tombstone log region size in bytes (default 64 MiB).
+                                      # Unlike the redo log it is NOT reset on checkpoint; bounded only
+                                      # by GC compaction (when gc is enabled).
+# tombstone_log_path = "..."          # Optional explicit tombstone log path
+                                      # (default: first device path + ".tombstone")
+# last_durable_height_path = "..."    # Optional path for the durable node-height file
+                                      # (default: index_snapshot_path + ".height"). ALWAYS maintained,
+                                      # independent of the tombstone flags.
+tombstone_reconciliation_enabled = false  # SOAK-GATED, default FALSE: tombstone-driven migration
+                                      # reconciliation. When false, migration behaves as the pre-Phase-8 path.
+tombstone_gc_enabled = false          # SOAK-GATED, default FALSE: bounded-retention tombstone GC + the
+                                      # coupled rejoin-eligibility gate. When false, tombstones are retained
+                                      # unboundedly and the rejoin gate is inert.
+rejoin_grace_blocks = 100000          # Max staleness (block heights) a rejoining node may carry before it
+                                      # is forced into a full resync. Only consulted when tombstone_gc_enabled.
+tombstone_gc_poll_interval_ms = 60000 # Cadence the background GC daemon evaluates the GC horizon
+                                      # (default 60000 = 1 min). Only active when tombstone_gc_enabled.
 
 # --- Index ---
 index_snapshot_path = "teraslab-index.snap"
@@ -174,11 +201,13 @@ expected_records = 100000             # Hint for initial hash table sizing
 
 # --- Index backend (optional, defaults to in-memory) ---
 [index]
-backend = "memory"                        # "memory" (default) or "redb"
+backend = "memory"                        # "memory" (default), "redb", or "file_backed"
 redb_path = "teraslab-index.redb"         # Primary index redb file
 redb_dah_path = "teraslab-dah.redb"       # DAH secondary index redb file
 redb_unmined_path = "teraslab-unmined.redb" # Unmined secondary index redb file
+redb_tombstone_path = "teraslab-tombstone.redb" # Deletion-tombstone lookup index (used regardless of backend; see "Deletion & tombstones")
 redb_cache_size = 268435456               # redb page cache in bytes (256 MiB default)
+file_backed_path = "teraslab-index.dat"   # mmap primary index file (only used when backend = "file_backed")
 
 # --- Concurrency ---
 lock_stripes = 65536                  # Per-transaction lock stripes (power of 2)
@@ -199,6 +228,9 @@ replication_factor = 1                # 1 = no replication, 2 = master + 1 repli
 swim_probe_interval_ms = 200          # SWIM heartbeat interval
 swim_suspicion_timeout_ms = 5000      # Time before suspect node is declared dead
 topology_propose_timeout_ms = 0       # 0 = max(swim_probe_interval_ms * 3, 500)
+topology_debounce_ms = 0              # Debounce window for coalescing SWIM membership changes before
+                                      # proposing a new topology term. 0 = derive from
+                                      # max(swim_probe_interval_ms * 2, swim_suspicion_timeout_ms / 2)
 cluster_secret = ""                   # Shared secret for HMAC-SHA256 SWIM + inter-node TCP auth
 max_migration_threads = 16            # Max concurrent migration threads per topology change
 
@@ -206,6 +238,8 @@ max_migration_threads = 16            # Max concurrent migration threads per top
 ack_policy = "auto"                   # "auto", "write_all", "write_majority", or "best_effort".
                                       # "best_effort" is rejected at startup when replication_factor > 1.
 replication_timeout_ms = 3000         # Timeout for each replication batch ACK
+replication_timeout_during_migration_ms = 30000  # Timeout floor for foreground replication ACKs while
+                                      # local migration pressure is active (default 30000)
 replication_degraded_mode = "reject"  # "reject" or "best_effort" when ack policy fails.
                                       # "best_effort" is rejected at startup when replication_factor > 1
                                       # (acknowledged writes could be lost if the master crashes before
@@ -237,6 +271,13 @@ Several knobs gate whether the server starts at all and whether the admin surfac
 | `cluster_secret` | unset | Shared secret for HMAC-SHA256 SWIM + inter-node TCP auth. Required under `strict_auth` for clustered configs. With a secret set, the cluster-authority opcodes (including 104 `AdminDiagnoseKey` and 106 `AdminClusterHealth`) require HMAC-signed frames; unsigned clients get `CLUSTER_AUTH_FAILED` (27). |
 | `max_connections_per_ip` | `64` | Per-source-IP connection cap. A NAT'd client fleet sharing one source IP hits this. |
 | `max_inflight_request_bytes` | `256 MiB` | Aggregate in-flight request memory budget; exhaustion returns `RATE_LIMITED` (31). |
+
+> **`strict_auth = false` opens an unauthenticated cluster path.** With `strict_auth = false` **and** no
+> `cluster_secret`, the server runs in trusted-overlay mode and accepts inter-node opcodes
+> (replica batches op 240, migration frames, SWIM/topology frames) **UNAUTHENTICATED** — any peer that can
+> reach the data port can inject them (a per-peer rate-limited warning is logged, but the frame is still
+> accepted). This is a production risk. Keep the default `strict_auth = true` **and** set a `cluster_secret`
+> on any network you do not fully trust.
 
 Other operationally significant knobs (all read, mostly with safe defaults): `max_stream_total_bytes`
 (4 GiB per-connection streaming cap; env `TERASLAB_MAX_STREAM_TOTAL_BYTES`),
@@ -352,6 +393,7 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 10 | `PreserveUntilBatch` | Prevent pruning until block height |
 | 11 | `DeleteBatch` | Delete transaction records |
 | 12 | `MarkLongestChainBatch` | Mark block entry as on longest chain |
+| 13 | `RemoveConflictingChildBatch` | Remove children from parents' conflicting-children lists (backs Teranode's `RemoveFromConflictingChildren`) |
 
 **Reads:**
 
@@ -367,6 +409,7 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 30 | `QueryOldUnmined` | Find unmined transactions before height |
 | 31 | `PreserveTransactions` | Prevent pruning of parent transactions |
 | 32 | `ProcessExpiredPreservations` | Delete expired preserved transactions |
+| 33 | `QueryConflicting` | Return all txids currently carrying the CONFLICTING flag (backs Teranode's `GetConflictingTxIterator`) |
 
 **Streaming (large cold data upload):**
 
@@ -387,6 +430,7 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 105 | `PartitionVersionReport` | Inter-node shard version report after topology commit |
 | 106 | `AdminClusterHealth` | Cluster readiness snapshot for clients/tests. **Cluster-authority opcode:** when a `cluster_secret` is configured, requires an HMAC-signed frame; unsigned clients get `CLUSTER_AUTH_FAILED` (27). |
 | 107 | `Hello` | Protocol-version handshake; empty request, response is the server's 2-byte LE protocol version (pre-v2 servers reject with `OPCODE_UNSUPPORTED` or `INTERNAL`) |
+| 108 | `GetNodeHeight` | Return this node's `last_durable_height` as a 4-byte LE payload. HMAC-gated as an inter-node opcode (mirrors `GetPartitionMap`) |
 
 **Inter-node replication, migration, and topology:**
 
@@ -396,6 +440,7 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 241 | `ReplicaAck` | Acknowledge a replica batch |
 | 242 | `MigrationComplete` | Verify and complete a single shard migration |
 | 243 | `MigrationBatchComplete` | Verify and complete multiple shard migrations |
+| 244 | `MigrationTransferRequest` | Pull-based migration repair: a target asks each source to re-run the outbound migration for the listed shards (idempotent, epoch-validated) |
 | 250 | `Heartbeat` | Inter-node heartbeat |
 | 251 | `TopologyPropose` | Propose a new topology term |
 | 252 | `TopologyVote` | Vote for a topology term |
@@ -442,6 +487,8 @@ All operations are batch-oriented. Single-item operations are batches of size 1.
 | 33 | `INVARIANT_VIOLATION` | Wire-protocol invariant violated by the caller (e.g. upper 48 bits set in a shard-carrying `request_id`) |
 | 34 | `STREAM_INVARIANT` | Stream-protocol invariant violated (chunk offset mismatch, byte counter overflow, stream byte cap exceeded) |
 | 35 | `DELETED_CHILDREN` | Idempotent re-spend rejected: the child txid is present in the parent's deleted-children audit list (error data: 1-byte child_count) |
+| 36 | `NOT_DUE` | A guarded DAH-sweep delete re-validated the record under lock and found it no longer due (e.g. a concurrent `PreserveUntilBatch`); the record is kept, not deleted. Produced only by the internal `ProcessExpiredPreservations` sweep — a direct client `DeleteBatch` is unconditional and never returns this |
+| 37 | `MIGRATION_TARGET_NOT_READY` | A migration completion/transfer handshake arrived stamped with a topology epoch the receiver has not yet activated; retryable (the target will activate the term shortly — never treat as a completed handoff) |
 | 255 | `INTERNAL` | Unexpected server error |
 
 ### Response status codes
@@ -648,7 +695,7 @@ Each transaction occupies a contiguous region on the block device:
 
 **TxMetadata** (320 bytes, compile-asserted, 64-byte aligned) contains: txid, version, locktime, fee, size, extended size, flags (conflicting, locked, external, coinbase, last_spent_all), block entries (up to 3 inline, overflow stored separately), spending height, creation timestamp, generation counter, update timestamp, unmined_since, delete_at_height, preserve_until, reassignment tracking, external storage reference, conflicting children tracking, and a trailing CRC32 over the whole header.
 
-**UtxoSlot** (73 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout), 4-byte CRC32 (torn-write protection per slot — BC-02 / F-X-007). Slots are pre-allocated at full size during creation. A spend writes the 41-byte status+spending+CRC region in place, plus updates the 320-byte metadata (generation, counters, timestamps). On `DirectDevice` (`O_DIRECT`), each in-place write amplifies to the device's sector size (4096 bytes on most NVMe drives).
+**UtxoSlot** (73 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout), 4-byte CRC32 (torn-write protection per slot — BC-02 / F-X-007). Slots are pre-allocated at full size during creation. A spend's *logical* mutation is the 41-byte status+spending+CRC region, but the production write path (`io.rs` `write_utxo_slot_direct`) rewrites the full 73-byte slot in place and (`io.rs` `write_metadata_direct`) rewrites the full 320-byte metadata header (generation, counters, timestamps) — not just a 41-byte footer. On `DirectDevice` (`O_DIRECT`), each write amplifies to the device's sector size (4096 bytes on most NVMe drives) regardless.
 
 ### Tiered storage
 
@@ -674,6 +721,19 @@ slot — exactly mirroring the live rejection. Replaying an entry that was alrea
 applied is a no-op via generation guards and slot-state checks.
 
 The redo log is a fixed-size **linear** log on a separate device file (not a circular buffer): `write_pos` advances monotonically and never wraps in place. When the log fills before the next checkpoint, appends return `RedoError::LogFull` and writers stall until the periodic checkpoint task snapshots engine state and resets `write_pos` back to the start. Size `redo_log_size` so the log holds the mutations produced between checkpoints under peak load.
+
+### Deletion & tombstones
+
+`tombstones_enabled` defaults to **`true`**. With it on, every physical record delete also appends a durable **deletion tombstone**, and startup provisions two extra artifacts: a `.tombstone` device file (sibling to the `.redo` log, default path = first device path + `.tombstone`, sized by `tombstone_region_size`, default 64 MiB) holding the append-only on-device tombstone log, and the redb **tombstone lookup index** at `[index] redb_tombstone_path` (default `teraslab-tombstone.redb`). The on-device log is the durable source of truth; the redb file is a derived index rebuilt from the log on recovery. On startup, recovery reconstructs the index from the log (R1) and self-purges any record this node resurrected for a key the cluster authoritatively deleted (R2). Unlike the redo log, the tombstone log is **not** reset on checkpoint — it is bounded only by GC compaction (see below).
+
+The node's `last_durable_height` is persisted to a tiny CRC-protected file (`last_durable_height_path`, default = index snapshot path + `.height`). This is **always maintained**, independent of the tombstone flags.
+
+Two related capabilities are **soak-gated and ship off by default**:
+
+- `tombstone_reconciliation_enabled` (default `false`) — tombstone-driven migration reconciliation (Phase 8). When off, migration completion behaves byte-identically to the pre-Phase-8 path.
+- `tombstone_gc_enabled` (default `false`) — bounded-retention tombstone GC plus its coupled rejoin-eligibility gate. When off, tombstones are retained unboundedly and a catching-up node is admitted as before. When on, a tombstone becomes GC-eligible once `min_member_finalized_height − deletion_height ≥ rejoin_grace_blocks` (default `100000`), and a node more than `rejoin_grace_blocks` behind the cluster tip is refused incremental rejoin and full-resynced. The GC daemon evaluates the horizon every `tombstone_gc_poll_interval_ms` (default 60000 ms).
+
+Enable the two soak-gated flags only after CI soak validates convergence, no-loss, and no-resurrection.
 
 ## Index backends
 
