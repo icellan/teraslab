@@ -819,6 +819,10 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     )
 }
 
+// Each argument is a distinct recovery input (device, the three index
+// backends, optional allocator, optional redo-progress fence, and the
+// secondary-reconcile mode); they have independent lifetimes/mutability and do
+// not form a natural cohesive struct, so the count is warranted here.
 #[allow(clippy::too_many_arguments)]
 fn recover_entries_with_allocator_collecting_pending_conflicts(
     device: &dyn BlockDevice,
@@ -1677,6 +1681,10 @@ fn replay_entry(
     }
 }
 
+// Hot per-entry replay path: each argument maps directly to a field decoded
+// from the spend redo entry (key, offset, spending data, counts, derived
+// context, utxo hash). Grouping them into a struct would just add a copy on a
+// performance-sensitive path without improving clarity, so the count stands.
 #[allow(clippy::too_many_arguments)]
 fn replay_spend(
     device: &dyn BlockDevice,
@@ -1783,6 +1791,10 @@ fn replay_spend(
     ReplayResult::Applied
 }
 
+// Hot per-entry replay path: arguments mirror the fields decoded from the
+// unspend redo entry (key, offset, expected spending data, counts, derived
+// context, utxo hash). Same rationale as `replay_spend` — a struct adds a copy
+// without clarifying intent.
 #[allow(clippy::too_many_arguments)]
 fn replay_unspend(
     device: &dyn BlockDevice,
@@ -1917,6 +1929,10 @@ fn replay_set_mined(
 /// single-backend `recover` path), the entry fails closed with
 /// `LogicError` instead of silently diverging — production startup
 /// always supplies the allocator via `recover_all_with_allocator`.
+// Per-entry replay path: arguments are the decoded set-mined fields (key,
+// block id/height, subtree index, unset flag) plus the device, index, and
+// optional allocator they act on. Independent inputs with no cohesive grouping,
+// so the count is warranted.
 #[allow(clippy::too_many_arguments)]
 fn replay_set_mined_with_allocator(
     device: &dyn BlockDevice,
@@ -2513,6 +2529,10 @@ fn replay_delete(
 /// previous run already applied this redo entry. Otherwise we always
 /// rewrite the record bytes (overwriting any partial bytes left from a
 /// crashed write) and then register.
+// Per-entry replay path: arguments are the decoded create-v2 fields (key,
+// record offset, utxo count, conflicting flag, raw record bytes, parent txids)
+// plus the device, index, and offset-owner map they act on. Independent inputs,
+// no cohesive grouping, so the count is warranted.
 #[allow(clippy::too_many_arguments)]
 fn replay_create_v2(
     device: &dyn BlockDevice,
