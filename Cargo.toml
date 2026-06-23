@@ -40,17 +40,6 @@ fault-injection = []
 # `bench_insert_throughput` (~520s debug saved on every default test run).
 slow-tests = []
 
-# Compiles the `device_io` subsystem (the `DeviceIo` trait, the
-# (removed 2026-05-28) The `async-io` feature previously gated an
-# unfinished `device_io` module (DeviceIo trait + io_uring/sync
-# fallback backends) that was never wired into the production engine
-# and existed only behind this feature flag to silence clippy. Per
-# the May-2026 external review's code-reviewer P0 finding, the module
-# has been deleted rather than kept as scaffolding indefinitely. If a
-# future phase needs an io_uring-backed write path, reintroduce the
-# trait + backend with a real caller already wired in (don't land
-# dead scaffolding first).
-
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 bitflags = "2"
@@ -115,9 +104,6 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
 opentelemetry-semantic-conventions = "0.31"
 tracing-opentelemetry = "0.32"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
 
 # Portable ioctl wrappers for block-device size queries on Linux + macOS.
 # `nix::ioctl_read!` computes the correct encoded ioctl request number per

@@ -177,6 +177,79 @@ jobs:
       - name: Benchmark (smoke)
         run: go test -bench=. -benchmem -benchtime=1x -timeout 60s ./...
 
+  go-client-integration:
+    name: Go Client Integration (live single-node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: client/go/go.mod
+
+      - name: Build server binary
+        run: cargo build --release --bin teraslab-server
+
+      - name: Start single-node server
+        # Single-node smoke config: binds 127.0.0.1:3300 (client wire protocol)
+        # and 127.0.0.1:9100 (HTTP health), one node (replication_factor=1, no
+        # seeds). strict_auth=false because TestIntegrationGetPartitionMap
+        # issues an inter-node opcode (GetPartitionMap) and the default-on
+        # strict_auth would reject it without a configured cluster_secret; the
+        # single-node Go client sends no HMAC. Data files land in a tmp working
+        # directory. integration_test.go dials TERASLAB_ADDR; the live *cluster*
+        # tests skip cleanly because TERASLAB_CLUSTER_SEEDS is unset.
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          cat > "$workdir/node.toml" <<'EOF'
+          listen_addr = "127.0.0.1:3300"
+          http_listen_addr = "127.0.0.1:9100"
+          strict_auth = false
+          EOF
+          ( cd "$workdir" && "$GITHUB_WORKSPACE/target/release/teraslab-server" --config "$workdir/node.toml" ) \
+            > "$GITHUB_WORKSPACE/teraslab-server.log" 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for server health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9100/health/live >/dev/null; then
+              echo "server healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server did not become healthy in 60s"
+          exit 1
+
+      - name: Run Go integration tests
+        working-directory: client/go
+        env:
+          TERASLAB_ADDR: 127.0.0.1:3300
+        run: go test -tags integration -count=1 -timeout 120s -v ./...
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -n "${SERVER_PID:-}" ]; then
+            kill "$SERVER_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-integration-server-log
+          path: teraslab-server.log
+          if-no-files-found: ignore
+
   docker-e2e-pr:
     name: Docker cluster E2E (PR tier)
     runs-on: ubuntu-latest

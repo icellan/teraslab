@@ -80,7 +80,13 @@ jobs:
   docker-e2e:
     name: Docker cluster E2E (nightly tier)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The nightly tier now includes scenarios 14 (Split-Brain Prevention) and
+    # 15 (Crash Recovery) — the cardinal no-double-spend durability gates that
+    # were previously weekly-only. Their per-scenario timeout caps in
+    # run_all.sh add ~37 min worst-case on top of the rest of the nightly set,
+    # so the job timeout is raised from 90 to 150 min. Real runs finish well
+    # under this; the cap only guards a slow-but-progressing run from CI kill.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
