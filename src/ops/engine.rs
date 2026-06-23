@@ -6597,6 +6597,16 @@ impl Engine {
         self.index.len()
     }
 
+    /// Number of independent index shards backing the primary index.
+    ///
+    /// Each shard is a complete [`crate::index::PrimaryBackend`] behind its own
+    /// `RwLock`; a write to one shard never blocks reads or writes on the other
+    /// shards. The count is the configured `index_shards` rounded up to a power
+    /// of two and clamped to `[1, 256]` (see [`crate::index::ShardedIndex`]).
+    pub fn index_shard_count(&self) -> usize {
+        self.index.shard_count()
+    }
+
     /// Primary index statistics for monitoring.
     pub fn index_stats(&self) -> crate::index::IndexStats {
         self.index.stats()
@@ -12250,6 +12260,170 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         )
+    }
+
+    /// Build an engine whose primary index is a multi-shard `ShardedIndex`
+    /// constructed exactly as the server startup path builds it for the
+    /// in-memory backend: `ShardedIndex::new_in_memory(cap, shard_count)` then
+    /// `Engine::new_with_sharded_index`. Lets the wiring tests exercise the
+    /// real N>1 routing rather than the N=1 `Engine::new` pass-through.
+    fn create_sharded_engine(shard_count: usize) -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = ShardedIndex::new_in_memory(10_000, shard_count).unwrap();
+        Arc::new(Engine::new_with_sharded_index(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    }
+
+    /// Find a `tx_id` (varying only the index-shard bytes `[24..32]`) whose
+    /// `index_shard_for_key` differs from `avoid_shard`. Returns the chosen
+    /// txid. Panics only if no differing shard is found in a large search
+    /// (impossible for shard_count > 1 given the SplitMix64 spread).
+    fn txid_in_other_shard(engine: &Engine, avoid_shard: usize) -> [u8; 32] {
+        for nonce in 0u64..100_000 {
+            let mut txid = [0u8; 32];
+            txid[24..32].copy_from_slice(&nonce.to_le_bytes());
+            let key = TxKey { txid };
+            if engine.index.index_shard_for_key(&key) != avoid_shard {
+                return txid;
+            }
+        }
+        panic!("could not find a txid routing to a shard other than {avoid_shard}");
+    }
+
+    /// The default `IndexConfig` (and therefore the default server wiring)
+    /// builds the in-memory index at 16 shards. The engine must expose that
+    /// count through `index_shard_count()`, proving the config flows end to
+    /// end into the live index layout.
+    #[test]
+    fn default_config_wires_sixteen_index_shards() {
+        let default_shards = crate::config::IndexConfig::default().index_shards;
+        assert_eq!(default_shards, 16, "default index_shards must be 16");
+
+        let engine = create_sharded_engine(default_shards);
+        assert_eq!(
+            engine.index_shard_count(),
+            16,
+            "engine built from default config must expose 16 index shards",
+        );
+    }
+
+    /// Concurrency wiring: a write lock held on one key's shard must NOT block
+    /// a create routed to a different shard. Proves the multi-shard layout
+    /// delivers parallelism through the engine — the create completes well
+    /// within a tight timeout while a foreign shard's write guard is parked.
+    #[test]
+    fn create_on_other_shard_not_blocked_by_held_shard_write() {
+        use std::sync::mpsc;
+
+        let engine = create_sharded_engine(16);
+        assert!(
+            engine.index_shard_count() > 1,
+            "test requires N>1 to be meaningful",
+        );
+
+        // Pick a key (shard A) to hold a write guard on, and a create key that
+        // routes to a different shard (shard B != A).
+        let held_key = TxKey { txid: [0u8; 32] };
+        let held_shard = engine.index.index_shard_for_key(&held_key);
+        let create_txid = txid_in_other_shard(&engine, held_shard);
+        let create_key = TxKey { txid: create_txid };
+        assert_ne!(
+            engine.index.index_shard_for_key(&create_key),
+            held_shard,
+            "create key must route to a different shard than the held write guard",
+        );
+
+        // Park a thread holding shard A's write guard until told to release.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let engine_for_holder = Arc::clone(&engine);
+        let holder = std::thread::spawn(move || {
+            let _guard = engine_for_holder.index.write_shard(&held_key);
+            held_tx.send(()).expect("signal guard acquired");
+            // Hold the guard until the main thread proves the create finished.
+            let _ = release_rx.recv();
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread should acquire the shard write guard");
+
+        // Run the foreign-shard create on another thread and assert it finishes
+        // promptly even though shard A's write guard is still held.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let engine_for_create = Arc::clone(&engine);
+        let creator = std::thread::spawn(move || {
+            let (_hashes, mut req) = make_create_req(99, 2);
+            req.tx_id = create_txid;
+            engine_for_create
+                .create(&req)
+                .expect("foreign-shard create must succeed while another shard is write-locked");
+            done_tx.send(()).expect("signal create finished");
+        });
+
+        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Release the held guard regardless of outcome so threads can join.
+        let _ = release_tx.send(());
+        holder.join().expect("holder thread panicked");
+        creator.join().expect("creator thread panicked");
+
+        finished.expect(
+            "a create routed to a different shard must complete without blocking on the held \
+             shard's write guard (cross-shard serialization detected)",
+        );
+
+        // The created record is present in its own shard.
+        assert!(
+            engine.lookup(&create_key).is_some(),
+            "created record must be registered in its shard",
+        );
+    }
+
+    /// Degenerate equivalence: at `index_shards = 1` the sharded index is a
+    /// single-lock pass-through, and basic create / lookup / spend must work
+    /// exactly as the single-index baseline.
+    #[test]
+    fn single_shard_create_lookup_spend_equivalence() {
+        let engine = create_sharded_engine(1);
+        assert_eq!(
+            engine.index_shard_count(),
+            1,
+            "shard_count=1 must clamp to a single shard",
+        );
+
+        let (_hashes, req) = make_create_req(7, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create on single-shard index");
+        assert!(
+            engine.lookup(&key).is_some(),
+            "lookup must find the created record on the single shard",
+        );
+
+        let spend = SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: [0u8; 32],
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 0xAB;
+                sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                sd
+            },
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        engine
+            .spend(&spend)
+            .expect("spend on single-shard index must succeed");
     }
 
     fn create_engine_without_direct_ptr() -> Arc<Engine> {

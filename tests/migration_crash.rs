@@ -62,7 +62,7 @@ use teraslab::allocator::SlotAllocator;
 use teraslab::cluster::migration::{MigrationManager, load_inbound_state, persist_inbound_state};
 use teraslab::cluster::shards::ShardTable;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahBackend, PrimaryBackend, TxKey, UnminedBackend};
+use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -138,8 +138,11 @@ impl Node {
             self.data_dev.clone() as Arc<dyn BlockDevice>,
         )
         .expect("allocator recover/create");
-        let mut index =
-            PrimaryBackend::rebuild(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
+        let primary = PrimaryBackend::rebuild(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
+        // Recovery now operates on a `ShardedIndex` (interior RwLocks, `&self`).
+        // Wrap the rebuilt single backend as a one-shard index — identical
+        // semantics to the pre-sharding single-lock path — then replay onto it.
+        let index = ShardedIndex::from_single(primary);
         let (dah_idx, unmined_idx) =
             PrimaryBackend::rebuild_secondary(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         let mut dah = DahBackend::from(dah_idx);
@@ -149,13 +152,13 @@ impl Node {
         recover_all_with_allocator(
             &*self.data_dev as &dyn BlockDevice,
             &redo,
-            &mut index,
+            &index,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),
         )
         .expect("recovery must not fail");
-        Arc::new(Engine::new(
+        Arc::new(Engine::new_with_sharded_index(
             self.data_dev.clone() as Arc<dyn BlockDevice>,
             index,
             alloc,

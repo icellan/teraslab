@@ -1067,7 +1067,7 @@ impl ShardedIndex {
 
         // Capacity hint: at least 64 per shard so small devices don't
         // allocate tiny tables; scale proportionally for larger scans.
-        let per_shard_hint = (count / clamp_shard_count(shard_count).max(1))
+        let per_shard_hint = (count / clamp_shard_count(shard_count))
             .max(64)
             .saturating_mul(2);
 
