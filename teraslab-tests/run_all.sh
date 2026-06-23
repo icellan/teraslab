@@ -23,7 +23,10 @@ done
 # Select scenarios based on tier
 case "$TIER" in
     pr)      SCENARIOS=(01 02 03) ;;
-    nightly) SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 17) ;;
+    # 14 (split-brain) and 15 (crash recovery) guard the cardinal
+    # no-double-spend durability contract; they run nightly (not just weekly)
+    # so a regression cannot merge green and sit for up to a week.
+    nightly) SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 14 15 17) ;;
     weekly)  SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 17) ;;
     release) SCENARIOS=(01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17) ;;
     *) echo "Unknown tier: $TIER (use pr, nightly, weekly, release)"; exit 1 ;;
