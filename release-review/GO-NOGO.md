@@ -1,6 +1,29 @@
 # TeraSlab v1.0 (target 0.7.0) — Release Recommendation
 
-## Verdict: **NO-GO** — clearable with 2 small fixes
+## Remediation status (2026-06-23) — all findings addressed
+
+Both blockers and all majors/minors from this review have been implemented and
+verified. Post-remediation gate on the merged tree (branch `release-review-v0.7.0`):
+**`cargo test --all` = 2720 / 0 / 0** (70 suites), **clippy `--all --all-targets -D warnings` clean**, **`cargo fmt --all --check` clean**, Rust client tests 20+6/0, Go client `build`+`vet`+`test` clean.
+
+- **REL-001 / REL-002 (blockers): FIXED** — tombstone write now goes through `io::write_metadata_header_bytes_direct` (io_locks write + atomic store); cluster persist paths fsync the parent dir via the shared `crate::fsutil::fsync_parent_dir`. Both have new tests.
+- **All 10 majors + 45 minors: FIXED** (see FINDINGS.md statuses), except the two `dropped` items (refuted by verification).
+- **NEW — REL-145 (discovered during REL-010 remediation): FIXED.** The original REL-010 wrongly assumed the Go client authenticated correctly; in fact the server's strict_auth gate HMACs the **whole frame body**, but BOTH clients signed payload-only, so neither could authenticate `OP_GET_PARTITION_MAP` to a secure cluster. Both clients now sign the whole frame (Rust via the canonical `sign_frame`; Go mirrors it), verified against the server's `verify_frame`.
+
+### Verdict after remediation: **GO-WITH-CAVEATS**
+
+Code-level blockers are cleared and the full suite is green. Two pre-existing,
+host-bound caveats remain before tagging v1 — neither is new and neither is a
+code defect on this host:
+
+1. **Run the cluster e2e tier on real nodes before the tag.** The HMAC fix (REL-145) and the blocker fixes are unit-verified (incl. byte-exact against the server's own verify functions), but a live 3-node `strict_auth` cluster run (`scenario_03/14/15`, now promoted to nightly per REL-015) should confirm end-to-end before tagging. This host (macOS, no Docker cluster) can't run that tier.
+2. **NVMe/Linux perf numbers remain unmeasured** (`unverified-on-this-host`) — see PERF.md. The README's perf table stays labelled "design targets / MemoryDevice ceiling" until measured on Linux+NVMe. Not a code blocker.
+
+The original NO-GO verdict and blocker list below are retained for the record.
+
+---
+
+## (Original review verdict) NO-GO — clearable with 2 small fixes
 
 The engine is v1-grade. Two narrow defects on durability/correctness-critical paths must land first; both have small fixes using primitives already in the tree. This is a "fix two things and re-gate," not a "not ready" verdict.
 

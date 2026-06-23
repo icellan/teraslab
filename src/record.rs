@@ -5,7 +5,7 @@
 //!
 //! # Record integrity
 //!
-//! [`TxMetadata`] embeds a CRC32 checksum computed over the entire 256-byte
+//! [`TxMetadata`] embeds a CRC32 checksum computed over the entire 320-byte
 //! header (with the checksum slot zeroed during computation). Each
 //! [`UtxoSlot`] also stores a CRC32 over its logical 69-byte payload. Every
 //! write recomputes the relevant CRC and every read validates it, returning

@@ -13,6 +13,12 @@ Baseline (this checkout, HEAD `920ac32`, version bumped to 0.7.0):
 
 ---
 
+## REMEDIATION STATUS (2026-06-23)
+
+All findings below have been implemented on branch `release-review-v0.7.0` except the two `dropped` (refuted) items. Post-fix gate on the merged tree: **`cargo test --all` = 2720/0/0**, clippy `--all --all-targets -D warnings` clean, `cargo fmt --all --check` clean, Rust client 20+6/0, Go client build+vet+test clean. Each blocker/major has a new or strengthened test. The implementation surfaced one new issue (**REL-145**, below), also fixed. Statuses on individual findings reflect `verified` = the original defect; treat all non-dropped findings as FIXED in this branch.
+
+---
+
 ## BLOCKERS
 
 ### REL-001 — Delete tombstone write is a non-atomic data race against lock-free readers (UB) — `verified` (escalated: reviewers rated major)
@@ -36,6 +42,12 @@ Baseline (this checkout, HEAD `920ac32`, version bumped to 0.7.0):
 - **Evidence:** `client/rust/src/cluster.rs:182,354` send `OP_GET_PARTITION_MAP` unsigned; `ClusterConfig`/`ClientConfig` (`cluster.rs:19-50`, `lib.rs:76-107`) have no `cluster_secret` field. Server treats the op as inter-node-auth (`src/protocol/opcodes.rs:644-647`) and rejects unsigned frames with `ERR_CLUSTER_AUTH_FAILED` when `cluster_secret` is set under `strict_auth` (default true, `src/config.rs:998-1005`, required non-empty `:188-206`). The Go client signs it (`client/go/cluster.go:90,232`, `auth.go:37`).
 - **Impact:** Against a production-default secure cluster, Rust `bootstrap_from_seeds` fails every seed → `Client::new` returns `ClientError::Connection`. The documented Rust cluster mode (`client/rust/README.md:31-42`) is unusable on a default cluster. (Single-node / non-strict / no-secret clusters work — `handle_get_partition_map` ignores the payload, `dispatch.rs:9465-9491`.)
 - **Fix:** Add `cluster_secret` to Rust `ClusterConfig`/`ClientConfig` and HMAC-sign the `OP_GET_PARTITION_MAP` payload (mirror `client/go/auth.go`). Until then, document the limitation.
+
+### REL-145 — Both clients signed payload-only; the server HMACs the whole frame → no client could authenticate to a secure cluster — `verified` (discovered during REL-010 remediation)
+- **Category:** correctness (client, cluster) / security / documented-feature-broken
+- **Evidence:** Server strict_auth gate `src/server/mod.rs:1077-1116` calls `cluster::auth::verify_signed_body_streaming`, which delegates to `verify_frame_streaming` and HMACs the **entire frame body** `request_id || op_code || flags || payload || ts` (the gate splices the peeked `request_id||op_code` back onto the stream, `mod.rs:1083`); canonical signer is `cluster::auth::sign_frame` (`src/cluster/auth.rs:240`, signs `encoded_frame[4..]`). Before fix: Go `client/go/auth.go` `signFramePayload` and Rust `client/rust/src/cluster.rs` `sign_inter_node_payload` both HMAC'd **payload-only** and could not know the on-wire `request_id`. `OP_GET_PARTITION_MAP` is gated (`src/protocol/opcodes.rs:644-660`).
+- **Why it matters:** the original REL-010 assumed the Go client signed correctly; it did not. Against a production-default `strict_auth` cluster with a `cluster_secret`, **neither** shipped client could fetch the partition map → cluster routing unusable for both clients. Not caught earlier because the Go client is never run against a real server in CI (REL-016) and the Rust client never signed at all.
+- **Fix:** both clients now sign the **whole frame** after `request_id` is assigned. Rust adds `PipeConn::round_trip_signed` which calls the server's own `teraslab::cluster::auth::sign_frame` (byte-exact); Go adds `signFrame` mirroring `sign_frame` + `pipeConn.roundTripSigned`. Verified: Rust test signs a frame and round-trips it through `teraslab::cluster::auth::verify_frame`; Go test reconstructs the server's HMAC input and matches the tag; both include a request_id-tamper negative test. Caveat: end-to-end validation against a live `strict_auth` cluster still pending (host can't run the Docker cluster) — see GO-NOGO caveat 1.
 
 ### REL-011 — Rust `unspend_batch`/`get_spend_batch` don't shard-fan-out or follow redirects in cluster mode — `verified`
 - **Category:** correctness (client, cluster) / doc contradiction
