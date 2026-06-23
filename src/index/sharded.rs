@@ -22,13 +22,16 @@
 //! The `shard_count` is rounded up to the next power of two and clamped to
 //! `[1, 256]`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::cluster::shards::ShardTable;
 use crate::index::backend::PrimaryBackend;
 use crate::index::redb_primary::CachedFieldsUpdate;
-use crate::index::{IndexError, TxIndexEntry, TxKey};
+use crate::index::{IndexError, IndexStats, TxIndexEntry, TxKey};
+use crate::record::TxFlags;
 
 // ---------------------------------------------------------------------------
 // Process-local seed
@@ -296,9 +299,15 @@ impl ShardedIndex {
             if items.is_empty() {
                 continue;
             }
+            // Collect just the keys for this shard into a contiguous slice so
+            // we can call `unregister_batch` once per shard (mirrors how
+            // `update_cached_fields_batch` delegates in a single call per
+            // shard).
+            let shard_keys: Vec<TxKey> = items.iter().map(|&(_, k)| k).collect();
             let mut guard = self.shards[shard_idx].write();
-            for &(orig_idx, key) in items {
-                results[orig_idx] = guard.unregister(&key);
+            let shard_results = guard.unregister_batch(&shard_keys)?;
+            for (&(orig_idx, _), removed) in items.iter().zip(shard_results) {
+                results[orig_idx] = removed;
             }
         }
         Ok(results)
@@ -334,6 +343,236 @@ impl ShardedIndex {
             total += guard.update_cached_fields_batch(&shard_updates)?;
         }
         Ok(total)
+    }
+
+    // -----------------------------------------------------------------------
+    // Whole-table read fan-out — acquires each shard's read lock in turn
+    // -----------------------------------------------------------------------
+
+    /// Total number of entries across all shards.
+    ///
+    /// Acquires each shard's read lock in sequence and sums the counts.
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.read().len()).sum()
+    }
+
+    /// Whether the index contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.read().is_empty())
+    }
+
+    /// Merged statistics across all shards.
+    ///
+    /// Aggregates per-shard [`IndexStats`]:
+    /// - `entry_count`, `capacity`, and `memory_bytes` are summed.
+    /// - `load_factor` is recomputed as `total_entry_count / total_capacity`
+    ///   (avoiding the arithmetic-mean distortion that arises if shards have
+    ///   different capacities).
+    /// - `max_probe_distance` is the maximum observed across all shards.
+    /// - `hugepage_enabled` is `true` when ALL shards have hugepages (any
+    ///   shard without hugepages means the full table is not backed).
+    pub fn stats(&self) -> IndexStats {
+        let mut total_entries = 0usize;
+        let mut total_capacity = 0usize;
+        let mut total_memory = 0usize;
+        let mut max_probe = 0usize;
+        let mut all_huge = true;
+
+        for shard in &self.shards {
+            let s = shard.read().stats();
+            total_entries += s.entry_count;
+            total_capacity += s.capacity;
+            total_memory += s.memory_bytes;
+            if s.max_probe_distance > max_probe {
+                max_probe = s.max_probe_distance;
+            }
+            if !s.hugepage_enabled {
+                all_huge = false;
+            }
+        }
+
+        let load_factor = if total_capacity == 0 {
+            0.0
+        } else {
+            total_entries as f64 / total_capacity as f64
+        };
+
+        IndexStats {
+            entry_count: total_entries,
+            capacity: total_capacity,
+            load_factor,
+            hugepage_enabled: all_huge,
+            max_probe_distance: max_probe,
+            memory_bytes: total_memory,
+        }
+    }
+
+    /// The active backend name (from the first shard; all shards share the
+    /// same backend type).
+    pub fn backend_name(&self) -> &'static str {
+        self.shards[0].read().backend_name()
+    }
+
+    /// Invoke `f` for every `(key, entry)` pair across all shards.
+    ///
+    /// Each shard's read lock is acquired, iterated, and released before
+    /// moving to the next shard. This avoids the self-referential
+    /// guard+iterator lifetime problem while still being allocation-free
+    /// on the caller's side.
+    ///
+    /// The callback receives `TxKey` by value and `&TxIndexEntry` by
+    /// reference. Entry order across shards is unspecified.
+    pub fn for_each(&self, mut f: impl FnMut(TxKey, &TxIndexEntry)) {
+        for shard in &self.shards {
+            let guard = shard.read();
+            for (key, entry) in guard.iter() {
+                f(key, &entry);
+            }
+        }
+    }
+
+    /// Collect all registered keys into a `Vec`.
+    ///
+    /// Equivalent to calling `for_each` and collecting only the keys.
+    pub fn all_keys(&self) -> Vec<TxKey> {
+        let mut keys = Vec::new();
+        self.for_each(|k, _| keys.push(k));
+        keys
+    }
+
+    /// Scan for records whose preservation window has expired.
+    ///
+    /// Returns the keys of entries whose `HAS_PRESERVE_UNTIL` flag is set
+    /// and whose `dah_or_preserve` value is non-zero and `<= current_height`.
+    /// Mirrors `Engine::scan_expired_preservations` — filters the primary
+    /// index; never touches the device.
+    pub fn scan_expired_preservations(&self, current_height: u32) -> Vec<TxKey> {
+        let mut keys = Vec::new();
+        self.for_each(|k, e| {
+            let has_preserve =
+                TxFlags::from_bits_truncate(e.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
+            if has_preserve && e.dah_or_preserve != 0 && e.dah_or_preserve <= current_height {
+                keys.push(k);
+            }
+        });
+        keys
+    }
+
+    /// Return keys belonging to a specific cluster shard.
+    ///
+    /// Iterates all index shards and filters entries by
+    /// [`ShardTable::shard_for_key`]. Note: the "cluster shard" (`shard: u16`)
+    /// is the data-placement concept; it is DISTINCT from the in-process index
+    /// shard used for lock striping.
+    pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
+        let mut keys = Vec::new();
+        self.for_each(|k, _| {
+            if ShardTable::shard_for_key(&k) == shard {
+                keys.push(k);
+            }
+        });
+        keys
+    }
+
+    /// Group all keys by cluster shard in a single pass.
+    ///
+    /// Returns a `HashMap` from cluster-shard number to the list of keys
+    /// that belong to that shard. O(N) in total index entries.
+    pub fn keys_by_shard(&self) -> HashMap<u16, Vec<TxKey>> {
+        let mut result: HashMap<u16, Vec<TxKey>> = HashMap::new();
+        self.for_each(|k, _| {
+            let shard = ShardTable::shard_for_key(&k);
+            result.entry(shard).or_default().push(k);
+        });
+        result
+    }
+
+    /// Group keys by cluster shard, but only for shards in `shard_filter`.
+    ///
+    /// More memory-efficient than [`Self::keys_by_shard`] when only a subset
+    /// of cluster shards is needed (e.g. only the outbound migration shards).
+    /// Keys belonging to shards not in the filter are skipped entirely.
+    pub fn keys_by_shard_filtered(&self, shard_filter: &HashSet<u16>) -> HashMap<u16, Vec<TxKey>> {
+        let mut result: HashMap<u16, Vec<TxKey>> = HashMap::new();
+        self.for_each(|k, _| {
+            let shard = ShardTable::shard_for_key(&k);
+            if shard_filter.contains(&shard) {
+                result.entry(shard).or_default().push(k);
+            }
+        });
+        result
+    }
+
+    /// Invoke `f` for every key whose `CONFLICTING` flag is set.
+    ///
+    /// Used to rebuild the in-memory conflicting index after recovery.
+    /// Iterates the primary index; never touches the device.
+    pub fn for_each_conflicting(&self, mut f: impl FnMut(TxKey)) {
+        self.for_each(|k, e| {
+            if TxFlags::from_bits_truncate(e.tx_flags).contains(TxFlags::CONFLICTING) {
+                f(k);
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Write / flush
+    // -----------------------------------------------------------------------
+
+    /// Flush every shard durable.
+    ///
+    /// Iterates all shard locks (read is sufficient — `flush_durable` takes
+    /// `&self` on `PrimaryBackend`) and flushes each. Returns on the first
+    /// error encountered (subsequent shards are NOT flushed on error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if any shard's backend flush fails.
+    pub fn flush_durable(&self) -> Result<(), IndexError> {
+        for shard in &self.shards {
+            shard.read().flush_durable()?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-shard resize entry point
+    // -----------------------------------------------------------------------
+
+    /// Resize index shard `shard_idx` if it currently needs one.
+    ///
+    /// Checks [`PrimaryBackend::resize_target_capacity`] under the write lock.
+    /// If no resize is needed, returns `Ok(())` immediately. Otherwise builds
+    /// a resized copy under the write lock, marks the old backend defunct, and
+    /// swaps it in — exactly mirroring the engine's
+    /// `resize_primary_index_without_blocking_readers` logic but for a single
+    /// shard.
+    ///
+    /// `shard_idx` must be in `[0, shard_count())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if `shard_idx` is out of range or if the
+    /// underlying resize fails.
+    pub fn resize_shard_if_needed(&self, shard_idx: usize) -> Result<(), IndexError> {
+        if shard_idx >= self.shards.len() {
+            return Err(IndexError::FormatError {
+                detail: format!(
+                    "shard_idx {shard_idx} out of range (shard_count = {})",
+                    self.shards.len()
+                ),
+            });
+        }
+
+        let mut guard = self.shards[shard_idx].write();
+        let Some(target_capacity) = guard.resize_target_capacity() else {
+            return Ok(());
+        };
+
+        let resized = guard.resized_copy(target_capacity)?;
+        guard.mark_defunct_for_resize();
+        *guard = resized;
+        Ok(())
     }
 }
 
@@ -439,9 +678,8 @@ mod tests {
     /// Verify the core contract: a write lock on one shard does not block reads
     /// on a different shard.
     ///
-    /// Uses `std::thread::scope` so `ShardedIndex` does not need to be `Send`
-    /// (it is `!Sync` in test builds because `RedbPrimary` carries `Cell<bool>`
-    /// fault-injection fields).
+    /// Uses `std::thread::scope` so the spawned thread can borrow `idx`
+    /// directly — no `Arc` wrapper required.
     #[test]
     fn contract_read_not_blocked_by_other_shard_write() {
         use std::sync::Barrier;
@@ -601,6 +839,381 @@ mod tests {
         assert_eq!(
             sharded_batch, oracle_batch,
             "unregister_batch result mismatch",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: len_and_is_empty_match_oracle
+    // -----------------------------------------------------------------------
+
+    /// `len` and `is_empty` must equal an equivalent single-backend oracle.
+    #[test]
+    fn len_and_is_empty_match_oracle() {
+        let sharded = ShardedIndex::new_in_memory(2000, 16).unwrap();
+        let mut oracle = PrimaryBackend::new_in_memory(2000).unwrap();
+
+        assert_eq!(sharded.len(), 0);
+        assert!(sharded.is_empty());
+
+        for i in 0..500u64 {
+            let key = make_key(i);
+            let entry = make_entry(i * 64);
+            sharded.register(key, entry).unwrap();
+            oracle.register(key, entry).unwrap();
+        }
+
+        assert_eq!(sharded.len(), oracle.len(), "len must match oracle");
+        assert_eq!(sharded.len(), 500);
+        assert!(!sharded.is_empty());
+
+        // Unregister all and check empty
+        for i in 0..500u64 {
+            sharded.unregister(&make_key(i));
+        }
+        assert_eq!(sharded.len(), 0);
+        assert!(sharded.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5: stats_merged_matches_oracle
+    // -----------------------------------------------------------------------
+
+    /// Merged stats must have a sane entry_count, load_factor, and memory_bytes.
+    #[test]
+    fn stats_merged_matches_oracle() {
+        let sharded = ShardedIndex::new_in_memory(2000, 16).unwrap();
+        let mut oracle = PrimaryBackend::new_in_memory(2000).unwrap();
+
+        for i in 0..400u64 {
+            let key = make_key(i);
+            let entry = make_entry(i * 64);
+            sharded.register(key, entry).unwrap();
+            oracle.register(key, entry).unwrap();
+        }
+
+        let stats = sharded.stats();
+        let oracle_stats = oracle.stats();
+
+        assert_eq!(
+            stats.entry_count, oracle_stats.entry_count,
+            "merged entry_count must equal oracle"
+        );
+
+        // load_factor must be in (0, 1) and reflect actual utilisation
+        assert!(
+            stats.load_factor > 0.0 && stats.load_factor < 1.0,
+            "load_factor must be in (0, 1), got {}",
+            stats.load_factor
+        );
+
+        // memory_bytes must be non-zero (the index is populated)
+        assert!(
+            stats.memory_bytes > 0,
+            "memory_bytes must be > 0, got {}",
+            stats.memory_bytes
+        );
+
+        // Summed capacity must be at least as large as the total entry_count
+        assert!(
+            stats.capacity >= stats.entry_count,
+            "capacity ({}) must be >= entry_count ({})",
+            stats.capacity,
+            stats.entry_count
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: all_keys_matches_oracle
+    // -----------------------------------------------------------------------
+
+    /// `all_keys` must return exactly the same set as the oracle (order-agnostic).
+    #[test]
+    fn all_keys_matches_oracle() {
+        let sharded = ShardedIndex::new_in_memory(2000, 16).unwrap();
+        let mut oracle = PrimaryBackend::new_in_memory(2000).unwrap();
+
+        for i in 0..300u64 {
+            let key = make_key(i);
+            let entry = make_entry(i * 32);
+            sharded.register(key, entry).unwrap();
+            oracle.register(key, entry).unwrap();
+        }
+
+        let mut sharded_keys = sharded.all_keys();
+        let mut oracle_keys: Vec<TxKey> = oracle.iter().map(|(k, _)| k).collect();
+
+        // Sort by txid bytes for order-agnostic comparison
+        sharded_keys.sort_by_key(|k| k.txid);
+        oracle_keys.sort_by_key(|k| k.txid);
+
+        assert_eq!(
+            sharded_keys, oracle_keys,
+            "all_keys must return the same set as the oracle"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: for_each_visits_exactly_registered_set
+    // -----------------------------------------------------------------------
+
+    /// `for_each` must visit every registered `(key, entry)` pair exactly once.
+    #[test]
+    fn for_each_visits_exactly_registered_set() {
+        use std::collections::HashMap;
+
+        let sharded = ShardedIndex::new_in_memory(500, 16).unwrap();
+        let mut expected: HashMap<[u8; 32], TxIndexEntry> = HashMap::new();
+
+        for i in 0..200u64 {
+            let key = make_key(i);
+            let entry = make_entry(i * 16);
+            sharded.register(key, entry).unwrap();
+            expected.insert(key.txid, entry);
+        }
+
+        let mut visited: HashMap<[u8; 32], TxIndexEntry> = HashMap::new();
+        sharded.for_each(|k, e| {
+            let prev = visited.insert(k.txid, *e);
+            assert!(prev.is_none(), "for_each visited key {:?} twice", k.txid);
+        });
+
+        assert_eq!(
+            visited.len(),
+            expected.len(),
+            "for_each visited {} entries, expected {}",
+            visited.len(),
+            expected.len()
+        );
+        for (txid, entry) in &expected {
+            let got = visited
+                .get(txid)
+                .unwrap_or_else(|| panic!("for_each missed key {txid:?}"));
+            assert_eq!(got, entry, "entry mismatch for key {txid:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8: keys_by_shard_groups_correctly
+    // -----------------------------------------------------------------------
+
+    /// `keys_by_shard` must group keys by the same cluster-shard function as
+    /// a manual scan, and `keys_for_shard` must be consistent with it.
+    #[test]
+    fn keys_by_shard_groups_correctly() {
+        use crate::cluster::shards::ShardTable;
+        use std::collections::HashMap;
+
+        let sharded = ShardedIndex::new_in_memory(500, 16).unwrap();
+
+        for i in 0..200u64 {
+            let key = make_key(i);
+            sharded.register(key, make_entry(i * 8)).unwrap();
+        }
+
+        let by_shard = sharded.keys_by_shard();
+
+        // Manual oracle: group the same keys
+        let mut oracle: HashMap<u16, Vec<TxKey>> = HashMap::new();
+        for i in 0..200u64 {
+            let key = make_key(i);
+            oracle
+                .entry(ShardTable::shard_for_key(&key))
+                .or_default()
+                .push(key);
+        }
+
+        // Total entry count across all groups must match
+        let total: usize = by_shard.values().map(|v| v.len()).sum();
+        assert_eq!(total, 200, "total keys across all groups must be 200");
+
+        // Each group must match the oracle (sets, not ordered)
+        for (shard, mut keys) in by_shard {
+            let mut expected = oracle.remove(&shard).unwrap_or_default();
+            keys.sort_by_key(|k| k.txid);
+            expected.sort_by_key(|k| k.txid);
+            assert_eq!(
+                keys, expected,
+                "keys_by_shard group {shard} does not match oracle"
+            );
+
+            // Also check that keys_for_shard is consistent
+            let mut single = sharded.keys_for_shard(shard);
+            single.sort_by_key(|k| k.txid);
+            assert_eq!(
+                single, keys,
+                "keys_for_shard({shard}) inconsistent with keys_by_shard"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9: keys_by_shard_filtered_subset
+    // -----------------------------------------------------------------------
+
+    /// `keys_by_shard_filtered` must return exactly the shards in the filter.
+    #[test]
+    fn keys_by_shard_filtered_subset() {
+        use crate::cluster::shards::ShardTable;
+        use std::collections::HashSet;
+
+        let sharded = ShardedIndex::new_in_memory(500, 16).unwrap();
+        for i in 0..200u64 {
+            sharded.register(make_key(i), make_entry(i * 8)).unwrap();
+        }
+
+        // Build a filter with just 3 arbitrary cluster shards
+        let mut filter: HashSet<u16> = HashSet::new();
+        for i in 0..200u64 {
+            let k = make_key(i);
+            let s = ShardTable::shard_for_key(&k);
+            filter.insert(s);
+            if filter.len() >= 3 {
+                break;
+            }
+        }
+
+        let filtered = sharded.keys_by_shard_filtered(&filter);
+
+        // All returned shards must be in the filter
+        for shard in filtered.keys() {
+            assert!(
+                filter.contains(shard),
+                "keys_by_shard_filtered returned shard {shard} not in filter"
+            );
+        }
+
+        // Cross-check with keys_by_shard: filtered result must match the
+        // corresponding groups in the full map
+        let full = sharded.keys_by_shard();
+        for shard in &filter {
+            let mut filtered_keys = filtered.get(shard).cloned().unwrap_or_default();
+            let mut full_keys = full.get(shard).cloned().unwrap_or_default();
+            filtered_keys.sort_by_key(|k| k.txid);
+            full_keys.sort_by_key(|k| k.txid);
+            assert_eq!(
+                filtered_keys, full_keys,
+                "filtered shard {shard} does not match full map"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10: conflicting_scan_returns_correct_keys
+    // -----------------------------------------------------------------------
+
+    /// `for_each_conflicting` must return exactly the keys with CONFLICTING set.
+    #[test]
+    fn conflicting_scan_returns_correct_keys() {
+        use crate::record::TxFlags;
+        use std::collections::HashSet;
+
+        let sharded = ShardedIndex::new_in_memory(500, 16).unwrap();
+
+        // Register 100 keys; mark every third one as CONFLICTING
+        let mut expected_conflicting: HashSet<[u8; 32]> = HashSet::new();
+        for i in 0..100u64 {
+            let key = make_key(i);
+            let mut entry = make_entry(i * 16);
+            if i % 3 == 0 {
+                entry.tx_flags |= TxFlags::CONFLICTING.bits();
+                expected_conflicting.insert(key.txid);
+            }
+            sharded.register(key, entry).unwrap();
+        }
+
+        let mut got: HashSet<[u8; 32]> = HashSet::new();
+        sharded.for_each_conflicting(|k| {
+            got.insert(k.txid);
+        });
+
+        assert_eq!(
+            got, expected_conflicting,
+            "for_each_conflicting returned wrong set of keys"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11: flush_durable_ok_on_memory_backend
+    // -----------------------------------------------------------------------
+
+    /// `flush_durable` must succeed on the in-memory backend (it is a no-op).
+    #[test]
+    fn flush_durable_ok_on_memory_backend() {
+        let sharded = ShardedIndex::new_in_memory(1000, 16).unwrap();
+        for i in 0..50u64 {
+            sharded.register(make_key(i), make_entry(i * 8)).unwrap();
+        }
+        let result = sharded.flush_durable();
+        assert!(
+            result.is_ok(),
+            "flush_durable must succeed on the in-memory backend, got {result:?}"
+        );
+        // Entries survive flush
+        assert_eq!(sharded.len(), 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 12: resize_shard_survives_and_lookups_still_work
+    // -----------------------------------------------------------------------
+
+    /// After filling one shard past the resize threshold, `resize_shard_if_needed`
+    /// must succeed, entries in that shard must remain findable, and entries in
+    /// OTHER shards must be untouched.
+    ///
+    /// Strategy: use N=1 (single shard) so every key goes to shard 0, and
+    /// start with a known initial capacity of 64 (via `new_in_memory(44, 1)`
+    /// which gives capacity = ceil(44/0.7) ≈ 64 buckets). Inserting 46 entries
+    /// with `register_without_resize` pushes the load factor above 0.7 (46/64
+    /// ≈ 0.72) without overflowing the table.
+    #[test]
+    fn resize_shard_survives_and_lookups_still_work() {
+        // N=1: all keys land in shard 0.
+        // expected_records=44 → initial capacity ≈ 64 (next pow2 of ceil(44/0.7)=63).
+        let sharded = ShardedIndex::new_in_memory(44, 1).unwrap();
+
+        // Determine initial capacity so we can compute how many inserts reach >70%.
+        let initial_capacity = sharded.shards[0].read().stats().capacity;
+        // Insert 71% of the capacity without triggering an inline resize.
+        // Floating-point: threshold = 0.7 × capacity. Insert (capacity × 71 / 100) items.
+        let fill_count = (initial_capacity * 71 / 100) as u64;
+
+        for i in 0..fill_count {
+            sharded
+                .register_without_resize(make_key(i), make_entry(i * 8))
+                .unwrap();
+        }
+
+        // Shard 0 must now report a resize is needed
+        let needs_resize = sharded.shards[0].read().resize_target_capacity().is_some();
+        assert!(
+            needs_resize,
+            "shard 0 must need a resize after inserting {fill_count} entries \
+             into a {initial_capacity}-bucket table without inline resize"
+        );
+
+        // Resize must succeed
+        sharded.resize_shard_if_needed(0).unwrap();
+
+        // After resize, no further resize should be needed
+        let still_needs = sharded.shards[0].read().resize_target_capacity().is_some();
+        assert!(
+            !still_needs,
+            "shard 0 must not need a resize immediately after one was applied"
+        );
+
+        // All inserted entries must still be findable
+        for i in 0..fill_count {
+            let entry = sharded
+                .lookup(&make_key(i))
+                .unwrap_or_else(|| panic!("key {i} not found after resize"));
+            assert_eq!(entry.record_offset, i * 8, "wrong offset for key {i}");
+        }
+
+        // Out-of-range shard_idx must return an error
+        let err = sharded.resize_shard_if_needed(99);
+        assert!(
+            matches!(err, Err(IndexError::FormatError { .. })),
+            "out-of-range shard_idx must return FormatError, got {err:?}"
         );
     }
 }
