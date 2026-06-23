@@ -61,6 +61,7 @@ use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::TxKey;
 use crate::metrics::redo_metrics;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -1873,6 +1874,31 @@ impl RedoEntry {
 // RedoLog
 // ---------------------------------------------------------------------------
 
+/// Lock-free view of the redo log's space accounting. Updated under the
+/// `RedoLog` lock on every state change; read without locking by observers
+/// such as `/admin/top` so the observability read never contends with the
+/// write path.
+#[derive(Debug)]
+pub struct RedoAtomics {
+    write_pos: AtomicU64,
+    logical_start: AtomicU64,
+    entries_region_size: u64, // immutable after open
+}
+
+impl RedoAtomics {
+    /// Bytes written into the entries region (mirrors `RedoLog::write_position`).
+    pub fn write_position(&self) -> u64 {
+        self.write_pos.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Bytes available for new entries (mirrors `RedoLog::available_space`).
+    pub fn available_space(&self) -> u64 {
+        let used = self.write_pos.load(AtomicOrdering::Relaxed)
+            - self.logical_start.load(AtomicOrdering::Relaxed);
+        self.entries_region_size.saturating_sub(used)
+    }
+}
+
 /// Linear-with-reset redo log on a block device.
 ///
 /// Entries are appended to an in-memory buffer and flushed to device
@@ -1925,6 +1951,8 @@ pub struct RedoLog {
     /// failed. Poisoning the log here forces operators to restart, at
     /// which point recovery reconstructs from the on-disk state.
     poisoned: bool,
+    /// Lock-free mirror of `write_pos`/`logical_start` for observers.
+    atomics: Arc<RedoAtomics>,
 }
 
 impl RedoLog {
@@ -1997,6 +2025,11 @@ impl RedoLog {
             pending_entries: Vec::new(),
             buffered_entries: 0,
             poisoned: false,
+            atomics: Arc::new(RedoAtomics {
+                write_pos: AtomicU64::new(0),
+                logical_start: AtomicU64::new(0),
+                entries_region_size: log_size - header_block_size,
+            }),
         };
 
         // Try to read the on-disk header. If the magic is absent
@@ -2044,6 +2077,13 @@ impl RedoLog {
             log.write_header()?;
         }
 
+        // Sync recovered write_pos/logical_start into the lock-free atomics.
+        log.atomics
+            .write_pos
+            .store(log.write_pos, AtomicOrdering::Relaxed);
+        log.atomics
+            .logical_start
+            .store(log.logical_start, AtomicOrdering::Relaxed);
         Ok(log)
     }
 
@@ -2206,6 +2246,7 @@ impl RedoLog {
         // F-G4-004: bump write_pos by the aligned amount so subsequent
         // flushes always start at the next aligned offset.
         self.write_pos = (aligned_offset + aligned_total as u64) - entries_region_off;
+        self.publish_atomics();
         self.buffer.clear();
         self.entries_cache.append(&mut self.pending_entries);
         self.buffered_entries = 0;
@@ -2393,6 +2434,21 @@ impl RedoLog {
         self.entries_region_size()
     }
 
+    /// Mirror the current `write_pos`/`logical_start` into the lock-free atomics.
+    fn publish_atomics(&self) {
+        self.atomics
+            .write_pos
+            .store(self.write_pos, AtomicOrdering::Relaxed);
+        self.atomics
+            .logical_start
+            .store(self.logical_start, AtomicOrdering::Relaxed);
+    }
+
+    /// A cheap clonable handle to the lock-free space accounting.
+    pub fn atomics(&self) -> Arc<RedoAtomics> {
+        Arc::clone(&self.atomics)
+    }
+
     /// Reset the log (after checkpoint + reclaim). Dangerous — only call
     /// when all entries have been checkpointed and applied.
     ///
@@ -2426,6 +2482,7 @@ impl RedoLog {
         // B-3: a full reset reclaims the entire region; the live window
         // starts at offset 0 again.
         self.logical_start = 0;
+        self.publish_atomics();
         self.buffer.clear();
         self.entries_cache.clear();
         self.pending_entries.clear();
@@ -2565,6 +2622,7 @@ impl RedoLog {
         // copy. After this fsync the relocated copy is authoritative.
         self.logical_start = new_start;
         self.write_pos = new_start + content_aligned as u64;
+        self.publish_atomics();
         self.buffer.clear();
         self.entries_cache = retained;
         self.pending_entries.clear();
@@ -5059,5 +5117,22 @@ mod tests {
         assert_eq!(header.next_sequence, 42);
         assert_eq!(header.checkpoint_seq, 7);
         assert_eq!(header.logical_start, 0, "v1 logical_start defaults to 0");
+    }
+
+    #[test]
+    fn atomic_snapshot_tracks_append_without_lock() {
+        let (_dev, mut log) = make_log(1 << 20);
+        let atomics = log.atomics();
+        let before = atomics.write_position();
+        log.append(RedoOp::Checkpoint).unwrap();
+        log.flush().unwrap();
+        let after = atomics.write_position();
+        assert!(
+            after > before,
+            "atomic write_position must advance after a flushed append"
+        );
+        // The atomic snapshot must agree with the locked accessors.
+        assert_eq!(atomics.write_position(), log.write_position());
+        assert_eq!(atomics.available_space(), log.available_space());
     }
 }
