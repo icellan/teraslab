@@ -62,6 +62,7 @@ impl BackendCase {
             redb_tombstone_path: dir.path().join("tombstone.redb"),
             redb_cache_size: 16 * 1024 * 1024,
             file_backed_path: dir.path().join("primary.index"),
+            index_shards: 16,
         };
         Self {
             mode,

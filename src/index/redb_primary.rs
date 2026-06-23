@@ -57,16 +57,18 @@ pub struct RedbPrimary {
     #[cfg(test)]
     fail_next_write: bool,
     /// Test-only counterpart to `fail_next_write` covering the read path.
-    /// `Cell` permits the flag to be flipped/cleared through `&self`
-    /// (lookup is `fn lookup(&self, ...)`). Never set outside tests.
+    /// `AtomicBool` permits the flag to be flipped/cleared through `&self`
+    /// (lookup is `fn lookup(&self, ...)`) and is `Sync`, allowing
+    /// `PrimaryBackend` (and therefore `ShardedIndex`) to be shared across
+    /// threads in test builds. Never set outside tests.
     #[cfg(test)]
-    fail_next_read: std::cell::Cell<bool>,
+    fail_next_read: std::sync::atomic::AtomicBool,
     /// Test-only: fail the next [`Self::flush_durable`] call. Used to
     /// verify that the checkpoint aborts (no fence, no redo compaction)
-    /// when the redb durability flush fails. `Cell` for the same reason
+    /// when the redb durability flush fails. `AtomicBool` for the same reason
     /// as `fail_next_read` — `flush_durable` takes `&self`.
     #[cfg(test)]
-    fail_next_flush: std::cell::Cell<bool>,
+    fail_next_flush: std::sync::atomic::AtomicBool,
 }
 
 /// Batch update parameters for [`RedbPrimary::update_cached_fields_batch`].
@@ -135,9 +137,9 @@ impl RedbPrimary {
             #[cfg(test)]
             fail_next_write: false,
             #[cfg(test)]
-            fail_next_read: std::cell::Cell::new(false),
+            fail_next_read: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            fail_next_flush: std::cell::Cell::new(false),
+            fail_next_flush: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -159,8 +161,12 @@ impl RedbPrimary {
     /// and abort any redo reclamation.
     pub fn flush_durable(&self) -> Result<(), IndexError> {
         #[cfg(test)]
-        if self.fail_next_flush.get() {
-            self.fail_next_flush.set(false);
+        if self
+            .fail_next_flush
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.fail_next_flush
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             return Err(IndexError::FormatError {
                 detail: "redb test-injected flush failure".into(),
             });
@@ -178,7 +184,8 @@ impl RedbPrimary {
     /// written, redo not compacted) when the durability flush fails.
     #[cfg(test)]
     pub fn arm_fail_next_flush(&self) {
-        self.fail_next_flush.set(true);
+        self.fail_next_flush
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Test-only: arm a synthetic failure in the next write transaction.
@@ -203,7 +210,8 @@ impl RedbPrimary {
     /// indistinguishable from "key absent" by spend/unspend logic.
     #[cfg(test)]
     pub fn arm_fail_next_read(&self) {
-        self.fail_next_read.set(true);
+        self.fail_next_read
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns `Err` if the test-only fail flag is armed, clearing it.
@@ -227,8 +235,12 @@ impl RedbPrimary {
     #[allow(clippy::unnecessary_wraps)]
     fn check_fail_injection_read(&self) -> Result<(), IndexError> {
         #[cfg(test)]
-        if self.fail_next_read.get() {
-            self.fail_next_read.set(false);
+        if self
+            .fail_next_read
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.fail_next_read
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             return Err(IndexError::FormatError {
                 detail: "redb test-injected read failure".into(),
             });

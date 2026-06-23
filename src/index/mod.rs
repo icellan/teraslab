@@ -14,6 +14,7 @@ pub mod redb_primary;
 pub mod redb_tombstone;
 pub mod redb_unmined;
 pub mod secondary_backend;
+pub mod sharded;
 pub mod unmined_index;
 mod util;
 
@@ -23,6 +24,7 @@ pub use dah_index::{DahIndex, DahRedoEntry};
 pub use hashtable::{TxIndexEntry, TxKey};
 pub use redb_primary::CachedFieldsUpdate;
 pub use secondary_backend::{DahBackend, UnminedBackend};
+pub use sharded::ShardedIndex;
 pub use unmined_index::{UnminedIndex, UnminedRedoEntry};
 
 use crate::allocator::SlotAllocator;
