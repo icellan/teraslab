@@ -1445,10 +1445,21 @@ impl SlotAllocator {
         }
 
         // Read the full freelist and verify CRC32.
-        let total_size = FREELIST_OFFSET + count * 16;
+        //
+        // `count` is read unvalidated from the on-disk header, so bound it
+        // BEFORE doing any arithmetic on it. A crafted/corrupt header could
+        // otherwise overflow `count * 16` (panic under overflow-checks, wrap
+        // in release) — a fail-open robustness defect on a disk-controlled
+        // recovery path. Bound first, then use checked arithmetic so any
+        // residual overflow maps to a clean `CorruptedHeader` rather than a
+        // panic or silent wrap.
         if count > MAX_PERSISTED_FREE_REGIONS {
             return Err(AllocatorError::CorruptedHeader);
         }
+        let total_size = count
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(FREELIST_OFFSET))
+            .ok_or(AllocatorError::CorruptedHeader)?;
         let aligned_total = total_size.div_ceil(alignment) * alignment;
         let mut buf = AlignedBuf::new(aligned_total, alignment);
         device.pread_exact_at(&mut buf, 0)?;
@@ -1461,7 +1472,10 @@ impl SlotAllocator {
                 .try_into()
                 .map_err(|_| AllocatorError::CorruptedHeader)?,
         );
-        let covered_end = FREELIST_OFFSET + count * 16;
+        // `total_size == FREELIST_OFFSET + count * 16` was already computed
+        // (with overflow checked) above, so reuse it rather than repeating the
+        // unchecked multiply.
+        let covered_end = total_size;
         // Copy the covered header bytes so we can zero the CRC field
         // without mutating the read buffer (it's still used below to
         // decode the freelist).
@@ -2132,6 +2146,41 @@ mod tests {
             }
             Err(other) => panic!("expected HeaderCorruption, got: {other}"),
             Ok(_) => panic!("expected HeaderCorruption, but recover succeeded"),
+        }
+    }
+
+    #[test]
+    fn recover_rejects_out_of_range_count_without_panicking() {
+        // REL-107: persist a valid header (good magic + good version), then
+        // overwrite the freelist `count` field (bytes 16..24) with values
+        // larger than MAX_PERSISTED_FREE_REGIONS. recover must return
+        // CorruptedHeader — and critically must NOT panic on the
+        // `count * 16` / `covered_end` arithmetic (REL-100), even under
+        // overflow-checks (debug). The bound is checked before any CRC work,
+        // so the variant is CorruptedHeader, not HeaderCorruption.
+        for bad_count in [
+            (MAX_PERSISTED_FREE_REGIONS as u64) + 1,
+            u64::MAX, // would overflow `count * 16` if multiplied unchecked
+            (u64::MAX / 16) + 1, // smallest value whose *16 overflows usize on 64-bit
+        ] {
+            let dev = test_device(16);
+            {
+                let alloc = SlotAllocator::new(dev.clone()).unwrap();
+                alloc.persist().unwrap();
+            }
+
+            let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+            dev.pread(&mut buf, 0).unwrap();
+            buf[16..24].copy_from_slice(&bad_count.to_le_bytes());
+            dev.pwrite(&buf, 0).unwrap();
+
+            match SlotAllocator::recover(dev) {
+                Err(AllocatorError::CorruptedHeader) => {}
+                Err(other) => {
+                    panic!("count={bad_count}: expected CorruptedHeader, got: {other}")
+                }
+                Ok(_) => panic!("count={bad_count}: expected CorruptedHeader, but recover succeeded"),
+            }
         }
     }
 
