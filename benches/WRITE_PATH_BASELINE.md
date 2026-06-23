@@ -60,3 +60,19 @@ The shard_count=1 vs shard_count=16 delta at K=8 is within noise (creates −8%,
 The sharding win is expected to surface in the real BSV IBD path, where long-lived read guards held during mempool queries contend with the bulk-write path — a pattern this bench does not exercise. The correctness contract (cross-shard reads not blocked by a write to a different shard) is proved by `ShardedIndex::contract_read_not_blocked_by_other_shard_write` (src/index/sharded.rs) and the engine-level equivalent in ops/engine.rs.
 
 **Caveat:** all numbers above are in-memory DRAM measurements on a 14-core host under background load. Tail latency and fsync-bound IBD throughput on a real O_DIRECT NVMe SSD (the production bottleneck) are the owner's quickstart run to validate.
+
+---
+
+### Mixed read-under-write-storm (the read-lock win)
+
+Commit: feat/shard-primary-index (Task 8b)
+Host: Mac15,11 (Apple Silicon), 14 cores
+Setup: 50K pre-existing keys; R=4 reader threads doing 20K lookups each (80K total reads/iter); W=4 writer threads continuously creating NEW keys for the duration. Throughput = total reader lookups / reader wall-clock time.
+Measurement: `--warm-up-time 1 --measurement-time 3`, 10 samples each
+
+| shard_count | reader throughput (Melem/s) | delta vs N=1 |
+|---|---|---|
+| 1 | 3.45 | baseline |
+| 16 | 3.53 | +2% |
+
+**Interpretation:** No measurable win on this in-memory host (+2% is within noise). The in-memory `parking_lot::RwLock` write-lock hold time per insert is O(50–100 ns) — short enough that the 4 reader threads are almost never actually blocked waiting for the lock to clear. The theoretical advantage (readers on 15/16 uncontested shards) does not manifest until the per-write critical section is long enough to cause observable read starvation. On a real NVMe SSD where an index write involves O(10 µs) I/O-flush latency, the lock hold time is ~100× longer; reader starvation there would be material and the N=16 win would surface.

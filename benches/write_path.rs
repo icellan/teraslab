@@ -5,10 +5,17 @@
 //! Also benchmarks K=8 at shard_count ∈ {1, 16} to isolate the index-lock
 //! contention reduction from sharding (groups `creates_100k_shards` and
 //! `spends_100k_shards`).
+//!
+//! Group `mixed_read_under_write_storm`: measures reader throughput while 4
+//! writer threads hammer the index continuously. The sharding win is a READ
+//! win: with shard_count=1 a writer holds the single RwLock exclusively,
+//! starving all concurrent readers; with shard_count=16 a reader blocked by a
+//! write on shard S can still proceed on the other 15 shards.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Instant;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -226,11 +233,120 @@ fn bench_spends_shards(c: &mut Criterion) {
     group.finish();
 }
 
+/// Mixed read-under-write-storm benchmark.
+///
+/// Measures **reader throughput** (lookups/sec) while 4 writer threads hammer
+/// the index with continuous creates. The whole point of sharding is that a
+/// `parking_lot::RwLock` WRITER excludes ALL readers on the same lock — so
+/// under a write storm shard_count=1 starves readers, while shard_count=16
+/// means a reader only has to wait for writes to its own shard (~1/16 of
+/// writes hit any given shard).
+///
+/// Setup: 50_000 pre-existing keys are created before measurement starts.
+/// Readers: R=4 threads, each doing READS_PER_READER lookups on those keys.
+/// Writers: W=4 threads creating NEW keys continuously until readers finish.
+/// Metric: total reader lookups / elapsed reader wall-clock time.
+fn bench_mixed_read_under_write_storm(c: &mut Criterion) {
+    const PRE_POPULATE: u32 = 50_000;
+    const READS_PER_READER: u32 = 20_000;
+    const READERS: u32 = 4;
+    const WRITERS: u32 = 4;
+    // Writer keys start well above the pre-populated range so they never
+    // collide with reader keys (creates on an existing key are no-ops/errors
+    // and don't produce meaningful write pressure; we want genuine new inserts).
+    const WRITER_KEY_BASE: u32 = 1_000_000;
+
+    let mut group = c.benchmark_group("mixed_read_under_write_storm");
+    group.sample_size(10);
+    // Throughput unit = total reader lookups per iteration.
+    group.throughput(Throughput::Elements((READERS * READS_PER_READER) as u64));
+
+    for shards in [1usize, 16] {
+        group.bench_with_input(BenchmarkId::new("shards", shards), &shards, |b, &shards| {
+            b.iter_custom(|iters| {
+                let mut total = std::time::Duration::ZERO;
+
+                for iter in 0..iters {
+                    // --- Setup: build engine and pre-populate reader keys ---
+                    let engine = create_engine_sharded(shards);
+                    for i in 0..PRE_POPULATE {
+                        create_one(&engine, i);
+                    }
+
+                    // Writer key cursor: per-iteration offset avoids
+                    // hitting keys from prior iters (create is idempotent
+                    // on existing keys — won't panic — but we want real
+                    // write pressure, i.e. new inserts).
+                    let writer_cursor = Arc::new(AtomicU32::new(
+                        WRITER_KEY_BASE + iter as u32 * WRITERS * 50_000,
+                    ));
+                    let stop_writers = Arc::new(AtomicBool::new(false));
+
+                    // --- Spawn writers (they run until readers finish) ---
+                    let mut writer_handles = Vec::with_capacity(WRITERS as usize);
+                    for _ in 0..WRITERS {
+                        let eng = engine.clone();
+                        let cursor = writer_cursor.clone();
+                        let stop = stop_writers.clone();
+                        writer_handles.push(std::thread::spawn(move || {
+                            while !stop.load(Ordering::Relaxed) {
+                                let k = cursor.fetch_add(1, Ordering::Relaxed);
+                                create_one(&eng, k);
+                            }
+                        }));
+                    }
+
+                    // --- Measure reader completion time ---
+                    let t0 = Instant::now();
+
+                    // Readers: each does READS_PER_READER lookups spread
+                    // across the pre-populated key set so they hit all shards.
+                    let reader_cursor = Arc::new(AtomicU32::new(0));
+                    let total_lookups = READERS * READS_PER_READER;
+                    let mut reader_handles = Vec::with_capacity(READERS as usize);
+                    for _ in 0..READERS {
+                        let eng = engine.clone();
+                        let cursor = reader_cursor.clone();
+                        reader_handles.push(std::thread::spawn(move || {
+                            let mut done = 0u32;
+                            while done < READS_PER_READER {
+                                let i = cursor.fetch_add(1, Ordering::Relaxed) % PRE_POPULATE;
+                                let key = TxKey {
+                                    txid: make_tx_id(i),
+                                };
+                                let _ = eng.lookup_checked(&key);
+                                done += 1;
+                            }
+                        }));
+                    }
+
+                    for h in reader_handles {
+                        h.join().unwrap();
+                    }
+                    total += t0.elapsed();
+
+                    // Signal writers to stop and join them.
+                    stop_writers.store(true, Ordering::Relaxed);
+                    for h in writer_handles {
+                        h.join().unwrap();
+                    }
+
+                    let _ = total_lookups; // used above for Throughput::Elements
+                }
+
+                total
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_creates,
     bench_spends,
     bench_creates_shards,
-    bench_spends_shards
+    bench_spends_shards,
+    bench_mixed_read_under_write_storm
 );
 criterion_main!(benches);
