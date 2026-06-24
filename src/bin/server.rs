@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
-use teraslab::index::{DahBackend, PrimaryBackend, UnminedBackend};
+use teraslab::index::{DahBackend, ShardedIndex, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
     AllocatorMetrics, ClusterAuthMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
@@ -31,8 +31,8 @@ use teraslab::server::dispatch::{SecondaryStatus, set_secondary_status};
 use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
     AllocatorOrigin, SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
-    fallback_unmined_index, load_primary_index_file_backed, load_primary_index_in_memory,
-    load_primary_index_redb, open_mandatory_redo_log, open_tombstone_log,
+    fallback_unmined_index, load_primary_index_file_backed, load_primary_index_redb,
+    load_sharded_index_in_memory, open_mandatory_redo_log, open_tombstone_log,
     rebuild_in_memory_secondaries, recover_or_create_allocator, secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
@@ -589,8 +589,23 @@ fn main() {
     // The on-disk redb / file-backed primary file is preserved untouched on
     // rebuild failure so the operator can capture diagnostics and run an
     // explicit rescan before restart.
-    let load_outcome = if config.index.backend == IndexBackendMode::Redb {
+    // The configured number of index shards (rounded up to a power of two and
+    // clamped to `[1, 256]` internally by `ShardedIndex`). The in-memory backend
+    // builds a `ShardedIndex` at this count directly; the redb and file_backed
+    // backends are not yet sharded (deferred follow-up) and run at one shard,
+    // warning once if a multi-shard count is configured.
+    let index_shards = config.index.index_shards;
+    let load_outcome: (ShardedIndex, SecondaryLoadOutcome) = if config.index.backend
+        == IndexBackendMode::Redb
+    {
         // ReDB on-disk backend
+        if index_shards > 1 {
+            tracing::warn!(
+                index_shards,
+                "index_shards={index_shards} not yet supported for the redb backend; \
+                 using 1 shard (sharding is implemented for the in-memory backend)",
+            );
+        }
         let primary = match load_primary_index_redb(&config.index, &*device, &allocator) {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "redb primary index opened");
@@ -619,7 +634,7 @@ fn main() {
             Err(e) => (fallback_unmined_index("unmined", e), false),
         };
         (
-            primary,
+            ShardedIndex::from_single(primary),
             SecondaryLoadOutcome {
                 dah,
                 unmined,
@@ -628,6 +643,13 @@ fn main() {
         )
     } else if config.index.backend == IndexBackendMode::FileBacked {
         // File-backed mmap backend
+        if index_shards > 1 {
+            tracing::warn!(
+                index_shards,
+                "index_shards={index_shards} not yet supported for the file_backed backend; \
+                 using 1 shard (sharding is implemented for the in-memory backend)",
+            );
+        }
         let fb_path = &config.index.file_backed_path;
         let primary = match load_primary_index_file_backed(
             fb_path,
@@ -646,15 +668,22 @@ fn main() {
         };
         // File-backed mode: secondary indexes stay in-memory.
         let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
-        (primary, secondaries)
+        (ShardedIndex::from_single(primary), secondaries)
     } else {
-        // In-memory backend (default)
+        // In-memory backend (default). Builds a `ShardedIndex` at
+        // `index_shards` directly: the snapshot restore re-shards on a
+        // shard-count mismatch (and loads v1 single-table snapshots), and the
+        // device-scan rebuild routes every scanned entry into its target shard.
         let snap_path = config.resolved_index_snapshot_path();
         let snap_path = snap_path.as_path();
         if snap_path.exists() {
-            match PrimaryBackend::restore_all(snap_path) {
+            match ShardedIndex::restore_all(snap_path, index_shards) {
                 Ok((idx, dah, unmined, flags)) => {
-                    tracing::info!(entries = idx.len(), "index restored from snapshot");
+                    tracing::info!(
+                        entries = idx.len(),
+                        shards = idx.shard_count(),
+                        "index restored from snapshot",
+                    );
                     let secondaries = if flags.dah_needs_rebuild && flags.unmined_needs_rebuild {
                         tracing::warn!("both secondary indexes need rebuild (snapshot corrupt)");
                         rebuild_in_memory_secondaries(&*device, &allocator)
@@ -726,20 +755,21 @@ fn main() {
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
-                    let primary = match load_primary_index_in_memory(&*device, &allocator) {
-                        Ok(idx) => idx,
-                        Err(e) => {
-                            tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                            std::process::exit(1);
-                        }
-                    };
+                    let index =
+                        match load_sharded_index_in_memory(&*device, &allocator, index_shards) {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                                std::process::exit(1);
+                            }
+                        };
                     let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
-                    (primary, secondaries)
+                    (index, secondaries)
                 }
             }
         } else {
             tracing::info!("no index snapshot found, rebuilding from device");
-            let primary = match load_primary_index_in_memory(&*device, &allocator) {
+            let index = match load_sharded_index_in_memory(&*device, &allocator, index_shards) {
                 Ok(idx) => idx,
                 Err(e) => {
                     tracing::error!(err = %e, "FATAL: primary index rebuild failed");
@@ -747,10 +777,14 @@ fn main() {
                 }
             };
             let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
-            (primary, secondaries)
+            (index, secondaries)
         }
     };
-    let (mut index, secondary_outcome) = load_outcome;
+    // The in-memory backend yields a `ShardedIndex` at the configured shard
+    // count directly; the redb / file_backed backends yield a single-shard
+    // `ShardedIndex` (sharding for those backends is a deferred follow-up). Both
+    // paths converge here so recovery and the engine share the same index.
+    let (index, secondary_outcome) = load_outcome;
     let SecondaryLoadOutcome {
         dah: mut dah_index,
         unmined: mut unmined_index,
@@ -855,7 +889,7 @@ fn main() {
         match teraslab::recovery::recover_all_with_allocator_collecting_pending_conflicts_progress(
             &*device,
             redo,
-            &mut index,
+            &index,
             &mut dah_index,
             &mut unmined_index,
             Some(&mut allocator),
@@ -953,9 +987,10 @@ fn main() {
         index.set_redo_log(log.clone());
     }
 
-    // 4. Create engine
+    // 4. Create engine — index is already a ShardedIndex (from the recovery
+    // path above), so pass it directly to avoid re-wrapping in N=1.
     let locks = StripedLocks::new(config.lock_stripes);
-    let mut engine = Engine::new(
+    let mut engine = Engine::new_with_sharded_index(
         device.clone(),
         index,
         allocator,

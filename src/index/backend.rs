@@ -199,6 +199,32 @@ impl PrimaryBackend {
         }
     }
 
+    /// Resize this backend in-place if its hash table currently needs one.
+    ///
+    /// Checks [`Self::resize_target_capacity`]; returns `Ok(())` immediately if
+    /// no resize is needed. Otherwise builds a [`Self::resized_copy`], marks
+    /// `self` defunct (so its `Drop` does not write the clean-shutdown sentinel
+    /// for a path the new table now owns — G-2), and swaps the new backend into
+    /// `self`. Redb backends never need a resize, so this is a no-op for them.
+    ///
+    /// This performs the exact build-resized + mark-defunct + swap sequence the
+    /// engine previously ran via a drop-then-reacquire round-trip; callers that
+    /// already hold the shard write guard can run it inline without releasing
+    /// the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError`] if the underlying resize allocation fails.
+    pub(crate) fn resize_if_needed(&mut self) -> Result<(), IndexError> {
+        let Some(target_capacity) = self.resize_target_capacity() else {
+            return Ok(());
+        };
+        let resized = self.resized_copy(target_capacity)?;
+        self.mark_defunct_for_resize();
+        *self = resized;
+        Ok(())
+    }
+
     /// Remove a transaction from the index (on deletion/pruning).
     ///
     /// Returns the removed entry, or `None` if the key was not present.
@@ -391,6 +417,20 @@ impl PrimaryBackend {
     // -----------------------------------------------------------------------
     // Snapshot / restore
     // -----------------------------------------------------------------------
+
+    /// Borrow the inner in-memory [`Index`] if this is the `InMemory` variant.
+    ///
+    /// Returns `None` for the `OnDisk` (redb) and `FileBacked` variants, which
+    /// are self-persistent and never participate in the in-memory snapshot
+    /// path. Exposed to the crate so the v2 sharded snapshot
+    /// ([`crate::index::sharded::ShardedIndex::snapshot_all`]) can serialize
+    /// each shard's primary payload region.
+    pub(crate) fn as_in_memory_index(&self) -> Option<&Index> {
+        match self {
+            Self::InMemory(idx) => Some(idx),
+            Self::OnDisk(_) | Self::FileBacked(_) => None,
+        }
+    }
 
     /// Snapshot the primary index to a file.
     ///

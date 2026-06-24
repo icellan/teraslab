@@ -228,6 +228,83 @@ pub fn export_index(
     })
 }
 
+/// Export all index data to a portable migration file, reading from a sharded index.
+///
+/// Identical to [`export_index`] but iterates the primary data via
+/// [`crate::index::ShardedIndex::for_each`] instead of `PrimaryBackend::iter`.
+/// Used by the CLI export path when the snapshot is v2 (TSX2), which yields a
+/// [`crate::index::ShardedIndex`] from
+/// [`crate::index::ShardedIndex::restore_all`].
+pub fn export_index_sharded(
+    primary: &crate::index::ShardedIndex,
+    dah: &DahBackend,
+    unmined: &UnminedBackend,
+    path: &std::path::Path,
+) -> Result<ExportStats, IndexError> {
+    let primary_count = primary.len() as u64;
+    let declared = PortableCounts::new(primary_count, dah.len() as u64, unmined.len() as u64)?;
+    let tmp_path = path.with_extension("tmp");
+    let file = File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+    let mut hasher = crc32fast::Hasher::new();
+
+    write_portable_header(&mut writer, &mut hasher, declared)?;
+
+    let mut primary_entries = 0usize;
+    let mut io_err: Option<IndexError> = None;
+    primary.for_each(|key, entry| {
+        if io_err.is_none()
+            && let Err(e) =
+                write_tracked(&mut writer, &mut hasher, &encode_primary_entry(key, *entry))
+        {
+            io_err = Some(e);
+        }
+        primary_entries += 1;
+    });
+    if let Some(e) = io_err {
+        return Err(e);
+    }
+    ensure_export_count("primary", declared.primary_usize()?, primary_entries)?;
+
+    let mut dah_entries = 0usize;
+    for (height, key) in dah.iter() {
+        write_tracked(
+            &mut writer,
+            &mut hasher,
+            &encode_secondary_entry(height, key),
+        )?;
+        dah_entries += 1;
+    }
+    ensure_export_count("dah", declared.dah_usize()?, dah_entries)?;
+
+    let mut unmined_entries = 0usize;
+    for (height, key) in unmined.iter() {
+        write_tracked(
+            &mut writer,
+            &mut hasher,
+            &encode_secondary_entry(height, key),
+        )?;
+        unmined_entries += 1;
+    }
+    ensure_export_count("unmined", declared.unmined_usize()?, unmined_entries)?;
+
+    writer.write_all(&hasher.finalize().to_le_bytes())?;
+    writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(|e| IndexError::Io(e.into_error()))?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp_path, path)?;
+    fsync_parent_dir(path)?;
+
+    Ok(ExportStats {
+        primary_entries,
+        dah_entries,
+        unmined_entries,
+    })
+}
+
 /// Import index data from a portable snapshot file into the configured backend.
 ///
 /// Creates fresh backend instances and bulk-loads all entries.

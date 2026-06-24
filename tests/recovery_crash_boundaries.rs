@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{PrimaryBackend, TxKey};
+use teraslab::index::{PrimaryBackend, ShardedIndex, TxKey};
 use teraslab::io;
 use teraslab::record::{METADATA_SIZE, TxFlags, TxMetadata, UTXO_SLOT_SIZE, UtxoSlot};
 use teraslab::recovery::{recover, recover_all_with_allocator};
@@ -38,18 +38,18 @@ use teraslab::replication::durable::{ReplicationIntentRange, ReplicationIntentTr
 // ---------------------------------------------------------------------------
 
 /// Build a fresh scaffold of (data device, redo device, allocator,
-/// in-memory primary index, redo log).
+/// in-memory sharded index (N=1), redo log).
 fn fresh_state() -> (
     Arc<MemoryDevice>,
     Arc<MemoryDevice>,
     SlotAllocator,
-    PrimaryBackend,
+    ShardedIndex,
     RedoLog,
 ) {
     let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-    let index = PrimaryBackend::new_in_memory(1000).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let redo = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
     (data_dev, redo_dev, alloc, index, redo)
 }
@@ -101,7 +101,7 @@ fn make_record(txid_byte: u8, utxo_count: u32) -> (TxKey, TxMetadata, Vec<UtxoSl
 /// metadata change.
 #[test]
 fn boundary_before_redo_fsync_leaves_no_state() {
-    let (data_dev, _redo_dev, alloc, mut index, redo) = fresh_state();
+    let (data_dev, _redo_dev, alloc, index, redo) = fresh_state();
     let (key, meta, slots) = make_record(0xA1, 2);
     let _record_bytes = build_record_bytes(&meta, &slots);
 
@@ -115,7 +115,7 @@ fn boundary_before_redo_fsync_leaves_no_state() {
     let _ = alloc;
 
     // No replay entries to apply.
-    let stats = recover(&*data_dev as &dyn BlockDevice, &fresh_redo(), &mut index).unwrap();
+    let stats = recover(&*data_dev as &dyn BlockDevice, &fresh_redo(), &index).unwrap();
     assert_eq!(stats.entries_replayed, 0, "no replays expected");
     assert_eq!(stats.entries_skipped, 0);
     assert_eq!(stats.entries_failed, 0);
@@ -151,7 +151,7 @@ fn fresh_redo() -> RedoLog {
 /// must reconstruct the record byte-for-byte from the redo payload.
 #[test]
 fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, meta, slots) = make_record(0xB2, 4);
     let record_bytes = build_record_bytes(&meta, &slots);
     let utxo_count: u32 = slots.len() as u32;
@@ -174,7 +174,7 @@ fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
     .unwrap();
 
     // Recovery rebuilds the full record + registers the index.
-    let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+    let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
     assert_eq!(stats.entries_replayed, 1);
     assert_eq!(stats.entries_failed, 0);
 
@@ -205,7 +205,7 @@ fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
 /// regardless of whether replication subsequently fired.
 #[test]
 fn boundary_after_record_write_before_replication_local_state_consistent() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, meta, slots) = make_record(0xC3, 3);
     let record_bytes = build_record_bytes(&meta, &slots);
     let utxo_count: u32 = slots.len() as u32;
@@ -236,7 +236,7 @@ fn boundary_after_record_write_before_replication_local_state_consistent() {
     // the redo entry AND the on-device bytes; replay must observe the
     // record was already there, register the index, and converge to a
     // consistent state.
-    let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+    let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
     assert_eq!(
         stats.entries_replayed, 1,
         "CreateV2 still applies (idempotent)"
@@ -344,7 +344,7 @@ fn boundary_after_replication_before_intent_clear_is_idempotent() {
 /// bump or a duplicate entry.
 #[test]
 fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, meta, slots) = make_record(0xD4, 2);
     let record_bytes = build_record_bytes(&meta, &slots);
     let utxo_count: u32 = slots.len() as u32;
@@ -377,7 +377,7 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -398,13 +398,13 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
     // index/secondaries, same device + WAL. SetMined replay must see
     // the duplicate block_id and skip — same entry count, no further
     // generation bump.
-    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
     let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats2 = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index2,
+        &index2,
         &mut dah2,
         &mut unmined2,
         Some(&mut alloc),
@@ -432,7 +432,7 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
 /// pass a no-op.
 #[test]
 fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, meta, slots) = make_record(0xD5, 1);
     let record_bytes = build_record_bytes(&meta, &slots);
     let utxo_count: u32 = slots.len() as u32;
@@ -463,7 +463,7 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -482,13 +482,13 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
 
     // Second pass: generation 1 is at-or-ahead of the token — replay
     // must skip, leaving unmined_since/generation/secondary unchanged.
-    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
     let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats2 = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index2,
+        &index2,
         &mut dah2,
         &mut unmined2,
         Some(&mut alloc),
@@ -507,7 +507,7 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
 /// unmined secondary must drop the record; second pass is a no-op.
 #[test]
 fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, mut meta, slots) = make_record(0xD6, 1);
     // The record was off-chain at create time.
     meta.unmined_since = 850_000;
@@ -540,7 +540,7 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -556,13 +556,13 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
         "reconciled unmined secondary must drop the on-chain record"
     );
 
-    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
     let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats2 = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index2,
+        &index2,
         &mut dah2,
         &mut unmined2,
         Some(&mut alloc),
@@ -581,7 +581,7 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
 /// correctly. Belt-and-braces for the boundary 2 reconstruction.
 #[test]
 fn full_pipeline_recovery_reconstructs_create_v2() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, meta, slots) = make_record(0xE5, 2);
     let record_bytes = build_record_bytes(&meta, &slots);
     let utxo_count: u32 = slots.len() as u32;
@@ -603,7 +603,7 @@ fn full_pipeline_recovery_reconstructs_create_v2() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -699,7 +699,7 @@ fn wal_create_plus_set_mined(
 /// overflow-resident entry (no duplicate, no extra generation bump).
 #[test]
 fn boundary_set_mined_fourth_entry_replays_into_overflow() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (_key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE0, 4);
 
     let mut dah = teraslab::index::DahBackend::new_in_memory();
@@ -707,7 +707,7 @@ fn boundary_set_mined_fourth_entry_replays_into_overflow() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -731,13 +731,13 @@ fn boundary_set_mined_fourth_entry_replays_into_overflow() {
 
     // Second recovery pass: every SetMined must dedup — including the
     // overflow-resident one — leaving count and generation unchanged.
-    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
     let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats2 = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index2,
+        &index2,
         &mut dah2,
         &mut unmined2,
         Some(&mut alloc),
@@ -758,7 +758,7 @@ fn boundary_set_mined_fourth_entry_replays_into_overflow() {
 /// region (offset back to 0).
 #[test]
 fn boundary_unset_mined_removes_overflow_resident_entry() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE1, 4);
 
     let mut dah = teraslab::index::DahBackend::new_in_memory();
@@ -766,7 +766,7 @@ fn boundary_unset_mined_removes_overflow_resident_entry() {
     recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -785,13 +785,13 @@ fn boundary_unset_mined_removes_overflow_resident_entry() {
     })
     .unwrap();
 
-    let mut index2 = PrimaryBackend::new_in_memory(1000).unwrap();
+    let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
     let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index2,
+        &index2,
         &mut dah2,
         &mut unmined2,
         Some(&mut alloc),
@@ -818,7 +818,7 @@ fn boundary_unset_mined_removes_overflow_resident_entry() {
 /// semantics as live `set_mined`), and the emptied overflow freed.
 #[test]
 fn boundary_unset_mined_inline_entry_pulls_overflow_into_inline() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE2, 4);
     redo.append_and_flush(RedoOp::SetMined {
         tx_key: key,
@@ -834,7 +834,7 @@ fn boundary_unset_mined_inline_entry_pulls_overflow_into_inline() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -859,7 +859,7 @@ fn boundary_unset_mined_inline_entry_pulls_overflow_into_inline() {
 /// (matching values) is a Skipped no-op, not a duplicate append.
 #[test]
 fn boundary_compensate_unset_mined_skips_overflow_resident_duplicate() {
-    let (data_dev, _redo_dev, mut alloc, mut index, mut redo) = fresh_state();
+    let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE3, 4);
     redo.append_and_flush(RedoOp::CompensateUnsetMined {
         tx_key: key,
@@ -874,7 +874,7 @@ fn boundary_compensate_unset_mined_skips_overflow_resident_duplicate() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),
@@ -907,7 +907,7 @@ fn boundary_set_mined_overflow_realloc_does_not_clobber_neighbor() {
     let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 512).unwrap());
     let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 512).unwrap());
     let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-    let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut redo =
         RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
 
@@ -946,7 +946,7 @@ fn boundary_set_mined_overflow_realloc_does_not_clobber_neighbor() {
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
-        &mut index,
+        &index,
         &mut dah,
         &mut unmined,
         Some(&mut alloc),

@@ -6,7 +6,7 @@
 //! leak source against a real [`FileBlobStore`] and assert that the
 //! recovery-time `reconcile_blobs_after_recovery` pass deletes them.
 
-use teraslab::index::{PrimaryBackend, TxIndexEntry, TxKey};
+use teraslab::index::{PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey};
 use teraslab::record::TxFlags;
 use teraslab::recovery::reconcile_blobs_after_recovery;
 use teraslab::storage::blob_gc::{BlobGcStats, reconcile_orphan_blobs_against_index};
@@ -15,12 +15,12 @@ use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 /// Build a fresh primary index + blob store on a tempdir. The data device
 /// is irrelevant for these tests — recovery's blob-reconciliation step
 /// only needs the primary index and the blob store.
-fn fresh() -> (PrimaryBackend, FileBlobStore, tempfile::TempDir) {
+fn fresh() -> (ShardedIndex, FileBlobStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let blob_dir = dir.path().join("blobs");
     std::fs::create_dir_all(&blob_dir).unwrap();
     let store = FileBlobStore::new(&blob_dir, 2);
-    let index = PrimaryBackend::new_in_memory(1024).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1024).unwrap());
     (index, store, dir)
 }
 
@@ -35,7 +35,7 @@ fn txid(seed: u8) -> [u8; 32] {
 }
 
 /// Insert a primary-index entry whose `tx_flags` includes the given flags.
-fn register_entry(index: &mut PrimaryBackend, key: &[u8; 32], flags: TxFlags) {
+fn register_entry(index: &ShardedIndex, key: &[u8; 32], flags: TxFlags) {
     let entry = TxIndexEntry {
         device_id: 0,
         record_offset: 0,
@@ -88,11 +88,11 @@ fn failed_create_blob_garbage_collected_on_recovery() {
 /// "GC over-eagerly nukes valid blobs".
 #[test]
 fn blob_gc_keeps_blobs_referenced_by_external_flagged_records() {
-    let (mut index, store, _dir) = fresh();
+    let (index, store, _dir) = fresh();
 
     let live = txid(0x10);
     store.put(&live, b"live external payload").unwrap();
-    register_entry(&mut index, &live, TxFlags::EXTERNAL);
+    register_entry(&index, &live, TxFlags::EXTERNAL);
 
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
     assert_eq!(stats.total_blobs, 1);
@@ -138,11 +138,11 @@ fn blob_gc_skips_blobs_not_in_primary_index() {
 /// inline / separate-tier path instead. Must be reclaimed.
 #[test]
 fn blob_gc_deletes_blobs_when_index_entry_missing_external_flag() {
-    let (mut index, store, _dir) = fresh();
+    let (index, store, _dir) = fresh();
 
     let stale = txid(0x20);
     store.put(&stale, b"stale blob").unwrap();
-    register_entry(&mut index, &stale, TxFlags::IS_COINBASE);
+    register_entry(&index, &stale, TxFlags::IS_COINBASE);
 
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
     assert_eq!(stats.total_blobs, 1);
@@ -155,7 +155,7 @@ fn blob_gc_deletes_blobs_when_index_entry_missing_external_flag() {
 /// not get confused by interleaving in `BlobStore::list` order.
 #[test]
 fn blob_gc_mixed_set_recovery() {
-    let (mut index, store, _dir) = fresh();
+    let (index, store, _dir) = fresh();
 
     let keep_ext = txid(0x30);
     let orphan_no_idx = txid(0x31);
@@ -163,8 +163,8 @@ fn blob_gc_mixed_set_recovery() {
     store.put(&keep_ext, b"k").unwrap();
     store.put(&orphan_no_idx, b"o1").unwrap();
     store.put(&orphan_no_flag, b"o2").unwrap();
-    register_entry(&mut index, &keep_ext, TxFlags::EXTERNAL);
-    register_entry(&mut index, &orphan_no_flag, TxFlags::empty());
+    register_entry(&index, &keep_ext, TxFlags::EXTERNAL);
+    register_entry(&index, &orphan_no_flag, TxFlags::empty());
 
     let stats = reconcile_blobs_after_recovery(&store as &dyn BlobStore, &index).unwrap();
     assert_eq!(stats.total_blobs, 3);
@@ -183,7 +183,7 @@ fn blob_gc_mixed_set_recovery() {
 fn stale_tmp_files_swept_on_recovery() {
     use std::time::{Duration, SystemTime};
 
-    let (mut index, store, dir) = fresh();
+    let (index, store, dir) = fresh();
 
     // Anchor the prefix tree by writing a real blob — its parent dir is
     // where the stale .tmp will live. We register it as EXTERNAL so it is
@@ -191,7 +191,7 @@ fn stale_tmp_files_swept_on_recovery() {
     // .tmp sweep, not on orphan deletion).
     let anchor = txid(0x40);
     store.put(&anchor, b"anchor").unwrap();
-    register_entry(&mut index, &anchor, TxFlags::EXTERNAL);
+    register_entry(&index, &anchor, TxFlags::EXTERNAL);
 
     // Locate the parent prefix dir by walking the tempdir for the only
     // existing file whose name is exactly 64 hex chars (the anchor blob).
@@ -255,13 +255,13 @@ fn stale_tmp_files_swept_on_recovery() {
 fn reconcile_orphan_blobs_against_index_smoke() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileBlobStore::new(dir.path(), 2);
-    let mut index = PrimaryBackend::new_in_memory(16).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(16).unwrap());
 
     let keep = txid(0x50);
     let orphan = txid(0x51);
     store.put(&keep, b"keep").unwrap();
     store.put(&orphan, b"drop").unwrap();
-    register_entry(&mut index, &keep, TxFlags::EXTERNAL);
+    register_entry(&index, &keep, TxFlags::EXTERNAL);
 
     let stats =
         reconcile_orphan_blobs_against_index(&store as &dyn BlobStore, &index).expect("reconcile");

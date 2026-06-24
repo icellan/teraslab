@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use teraslab::device::{BlockDevice, DeviceError, MemoryDevice};
-use teraslab::index::{PrimaryBackend, TxIndexEntry, TxKey};
+use teraslab::index::{PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey};
 use teraslab::io;
 use teraslab::record::{TxFlags, TxMetadata, UtxoSlot};
 use teraslab::recovery::recover;
@@ -91,7 +91,7 @@ fn replay_stops_on_first_fatal_io_error() {
     let data: Arc<FailRangeDevice> = Arc::new(FailRangeDevice::new(8 * 1024 * 1024));
     let redo_dev: Arc<MemoryDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
 
-    let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(128).unwrap());
 
     // Create two on-device records (A and B) at known offsets. Register
     // their primary index entries. Then write a redo log with two
@@ -152,7 +152,7 @@ fn replay_stops_on_first_fatal_io_error() {
     // Arm the failure to cover record A only.
     data.arm_fail_range(record_a, 8 * 1024);
 
-    let stats = recover(&*data as &dyn BlockDevice, &log, &mut index).unwrap();
+    let stats = recover(&*data as &dyn BlockDevice, &log, &index).unwrap();
     assert_eq!(
         stats.entries_failed, 1,
         "F-G4-007: one fatal failure must be observed",

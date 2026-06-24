@@ -1259,10 +1259,10 @@ fn cmd_export_index(
     json: bool,
 ) -> Result<(), CliError> {
     use teraslab::config::{IndexBackendMode, ServerConfig};
-    use teraslab::index::{DahBackend, PrimaryBackend, UnminedBackend, migration};
+    use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, UnminedBackend, migration};
 
     let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
-    let (primary, dah, unmined) = match cfg.index.backend {
+    let stats = match cfg.index.backend {
         IndexBackendMode::Redb => {
             if migration::import_in_progress(&cfg.index) {
                 return Err(CliError::Other(format!(
@@ -1282,11 +1282,11 @@ fn cmd_export_index(
                     &cfg.index.redb_unmined_path,
                     cfg.index.redb_cache_size,
                 )?);
-            (primary, dah, unmined)
+            migration::export_index(&primary, &dah, &unmined, output)?
         }
         IndexBackendMode::Memory => {
-            let (primary, dah, unmined, flags) =
-                PrimaryBackend::restore_all(&cfg.index_snapshot_path)?;
+            let (sharded, dah, unmined, flags) =
+                ShardedIndex::restore_all(&cfg.index_snapshot_path, cfg.index.index_shards)?;
             if flags.dah_needs_rebuild || flags.unmined_needs_rebuild {
                 return Err(CliError::Other(
                     "the snapshot's secondary index sections need a device-scan rebuild; \
@@ -1300,11 +1300,12 @@ fn cmd_export_index(
                  before exporting",
                 cfg.index_snapshot_path.display()
             );
-            (
-                primary,
-                DahBackend::from(dah),
-                UnminedBackend::from(unmined),
-            )
+            migration::export_index_sharded(
+                &sharded,
+                &DahBackend::from(dah),
+                &UnminedBackend::from(unmined),
+                output,
+            )?
         }
         IndexBackendMode::FileBacked => {
             return Err(CliError::Other(
@@ -1314,8 +1315,6 @@ fn cmd_export_index(
             ));
         }
     };
-
-    let stats = migration::export_index(&primary, &dah, &unmined, output)?;
     if json {
         println!(
             "{}",
@@ -1402,26 +1401,26 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
     use std::sync::Arc;
     use teraslab::config::{IndexBackendMode, ServerConfig};
     use teraslab::device::{BlockDevice, DirectDevice};
-    use teraslab::index::PrimaryBackend;
+    use teraslab::index::{PrimaryBackend, ShardedIndex};
     use teraslab::redo::RedoLog;
 
     let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
 
     // Load the primary index for record-offset lookups. Secondary
     // indexes are not needed for slot repair.
-    let primary = match cfg.index.backend {
+    let index: ShardedIndex = match cfg.index.backend {
         IndexBackendMode::Redb => {
             if teraslab::index::migration::import_in_progress(&cfg.index) {
                 return Err(CliError::Other(
                     "a previous import-index was interrupted; resolve it before repair".to_string(),
                 ));
             }
-            PrimaryBackend::restore_redb(&cfg.index)?
+            ShardedIndex::from_single(PrimaryBackend::restore_redb(&cfg.index)?)
         }
         IndexBackendMode::Memory => {
-            let (primary, _dah, _unmined, _flags) =
-                PrimaryBackend::restore_all(&cfg.index_snapshot_path)?;
-            primary
+            let (sharded, _dah, _unmined, _flags) =
+                ShardedIndex::restore_all(&cfg.index_snapshot_path, cfg.index.index_shards)?;
+            sharded
         }
         IndexBackendMode::FileBacked => {
             return Err(CliError::Other(
@@ -1449,7 +1448,7 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
     let redo_log = RedoLog::open(redo_device, 0, cfg.redo_log_size)
         .map_err(|e| CliError::Other(format!("open redo log: {e}")))?;
 
-    let report = teraslab::recovery::repair_torn_slots(&*device, &redo_log, &primary)
+    let report = teraslab::recovery::repair_torn_slots(&*device, &redo_log, &index)
         .map_err(|e| CliError::Other(format!("repair pass failed: {e}")))?;
 
     if json {

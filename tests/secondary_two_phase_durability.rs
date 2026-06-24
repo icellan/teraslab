@@ -15,7 +15,9 @@ use teraslab::allocator::SlotAllocator;
 use teraslab::device::MemoryDevice;
 use teraslab::index::redb_dah::RedbDahIndex;
 use teraslab::index::redb_unmined::RedbUnminedIndex;
-use teraslab::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
+use teraslab::index::{
+    DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
+};
 use teraslab::record::{TxFlags, TxMetadata};
 use teraslab::redo::{RedoLog, RedoOp};
 
@@ -62,7 +64,7 @@ fn crash_after_unmined_redo_fsync_before_redb_commit() {
 
     // Set up primary (in-memory) with a record whose authoritative
     // unmined_since is 500.
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(1);
     primary.register(key, make_entry(4096, 500, 0)).unwrap();
 
@@ -111,7 +113,7 @@ fn crash_after_unmined_redo_fsync_before_redb_commit() {
     let stats = teraslab::recovery::recover_all(
         &data_dev,
         &redo_log_reopened,
-        &mut primary,
+        &primary,
         &mut dah_backend,
         &mut unmined_backend,
     )
@@ -135,7 +137,7 @@ fn crash_after_unmined_redo_fsync_before_redb_commit() {
 fn crash_after_dah_redo_fsync_before_redb_commit() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(2);
     // Primary's DAH = 900 (no preserve_until).
     let entry = make_entry(8192, 0, 900);
@@ -176,7 +178,7 @@ fn crash_after_dah_redo_fsync_before_redb_commit() {
     let stats = teraslab::recovery::recover_all(
         &data_dev,
         &redo_log_reopened,
-        &mut primary,
+        &primary,
         &mut dah_backend,
         &mut unmined_backend,
     )
@@ -197,7 +199,7 @@ fn crash_after_dah_redo_fsync_before_redb_commit() {
 fn crash_after_batched_redo_fsync_before_both_redb_commits() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(3);
     // Primary: unmined_since = 500, DAH = 900.
     primary.register(key, make_entry(16384, 500, 900)).unwrap();
@@ -245,7 +247,7 @@ fn crash_after_batched_redo_fsync_before_both_redb_commits() {
     let stats = teraslab::recovery::recover_all(
         &data_dev,
         &redo_log_reopened,
-        &mut primary,
+        &primary,
         &mut dah_backend,
         &mut unmined_backend,
     )
@@ -265,7 +267,7 @@ fn crash_after_batched_redo_fsync_before_both_redb_commits() {
 fn recover_skips_stale_redo_relative_to_primary() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(4);
     // Primary's authoritative unmined_since is 0 (on-chain).
     primary.register(key, make_entry(4096, 0, 0)).unwrap();
@@ -299,7 +301,7 @@ fn recover_skips_stale_redo_relative_to_primary() {
     let stats = teraslab::recovery::recover_all(
         &data_dev,
         &redo_log_reopened,
-        &mut primary,
+        &primary,
         &mut dah_backend,
         &mut unmined_backend,
     )
@@ -319,7 +321,7 @@ fn recover_skips_stale_redo_relative_to_primary() {
 fn recover_dah_respects_has_preserve_until_flag() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(5);
     // HAS_PRESERVE_UNTIL flag set; dah_or_preserve = 12345 represents a
     // preserve_until, NOT a DAH — so authoritative DAH = 0.
@@ -356,7 +358,7 @@ fn recover_dah_respects_has_preserve_until_flag() {
     let stats = teraslab::recovery::recover_all(
         &data_dev,
         &redo_log_reopened,
-        &mut primary,
+        &primary,
         &mut dah_backend,
         &mut unmined_backend,
     )
@@ -418,7 +420,7 @@ fn restart_rebuilds_primary_from_device_then_reconciles_secondaries() {
     // and the persisted allocator high-water mark survive. Reconstruct the
     // primary from a device scan, just like startup's rebuild path.
     let idx_path = dir.path().join("primary.idx");
-    let mut primary = PrimaryBackend::rebuild_file_backed(&idx_path, &*data_dev, &alloc).unwrap();
+    let primary = PrimaryBackend::rebuild_file_backed(&idx_path, &*data_dev, &alloc).unwrap();
 
     // The rebuilt primary must contain both records found on the device.
     assert!(
@@ -447,10 +449,11 @@ fn restart_rebuilds_primary_from_device_then_reconciles_secondaries() {
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
     let redo_log = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
 
+    let sharded_primary = ShardedIndex::from_single(primary);
     teraslab::recovery::recover_all(
         &*data_dev,
         &redo_log,
-        &mut primary,
+        &sharded_primary,
         &mut dah_backend,
         &mut unmined_backend,
     )

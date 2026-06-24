@@ -771,15 +771,16 @@ mod tests {
         // then redo replay (empty — the fence covers everything).
         let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
             .expect("allocator header must be durable after checkpoint");
-        let (mut index2, dah2, unmined2, _flags) =
+        let (primary2, dah2, unmined2, _flags) =
             PrimaryBackend::restore_all(&snap_path).expect("snapshot must restore");
+        let index2 = crate::index::ShardedIndex::from_single(primary2);
         let mut dah_b = DahBackend::from(dah2);
         let mut unmined_b = UnminedBackend::from(unmined2);
         let log2 = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
         recover_all_with_allocator(
             &*data_dev,
             &log2,
-            &mut index2,
+            &index2,
             &mut dah_b,
             &mut unmined_b,
             Some(&mut alloc2),
@@ -967,13 +968,14 @@ mod tests {
         );
         let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
             .expect("allocator persist (fsynced) preceded the crash point");
-        let mut index2 = PrimaryBackend::new_in_memory(128).unwrap();
+        let index2 =
+            crate::index::ShardedIndex::from_single(PrimaryBackend::new_in_memory(128).unwrap());
         let mut dah_b = DahBackend::new_in_memory();
         let mut unmined_b = UnminedBackend::new_in_memory();
         recover_all_with_allocator(
             &*data_dev,
             &log2,
-            &mut index2,
+            &index2,
             &mut dah_b,
             &mut unmined_b,
             Some(&mut alloc2),
@@ -1008,11 +1010,11 @@ mod tests {
         snap_path: &std::path::Path,
         redo_capacity: u64,
     ) -> (
-        crate::index::PrimaryBackend,
+        crate::index::ShardedIndex,
         crate::allocator::SlotAllocator,
         usize,
     ) {
-        use crate::index::{DahBackend, PrimaryBackend, UnminedBackend};
+        use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, UnminedBackend};
         use crate::recovery::recover_all_with_allocator;
 
         let mut alloc = match SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>) {
@@ -1023,7 +1025,7 @@ mod tests {
             Err(e) => panic!("allocator recover failed unexpectedly: {e:?}"),
         };
 
-        let (mut index, dah, unmined) = if snap_path.exists() {
+        let (primary, dah, unmined) = if snap_path.exists() {
             let (idx, dah, unmined, _flags) =
                 PrimaryBackend::restore_all(snap_path).expect("snapshot must restore");
             (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
@@ -1034,6 +1036,7 @@ mod tests {
                 UnminedBackend::new_in_memory(),
             )
         };
+        let index = ShardedIndex::from_single(primary);
         let mut dah_b = dah;
         let mut unmined_b = unmined;
 
@@ -1042,7 +1045,7 @@ mod tests {
         recover_all_with_allocator(
             &**data_dev,
             &log,
-            &mut index,
+            &index,
             &mut dah_b,
             &mut unmined_b,
             Some(&mut alloc),

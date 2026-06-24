@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::index::{PrimaryBackend, TxKey};
+use crate::index::{ShardedIndex, TxKey};
 use crate::ops::engine::Engine;
 use crate::record::TxFlags;
 use crate::storage::blobstore::{BlobError, BlobPinSet, BlobStore, PinSweepOutcome};
@@ -116,7 +116,7 @@ impl BlobGcStats {
 ///
 /// Returned by the lookup closure passed to [`reconcile_orphan_blobs_with`]
 /// so the caller can plug in either the runtime [`Engine`] (live operation)
-/// or a borrowed [`PrimaryBackend`] (recovery-time, before the engine has
+/// or a borrowed `PrimaryBackend` (recovery-time, before the engine has
 /// been built).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupOutcome {
@@ -131,7 +131,7 @@ pub enum LookupOutcome {
 /// entry is absent or present without [`TxFlags::EXTERNAL`].
 ///
 /// Generic over the index lookup so the same logic can run against the
-/// runtime [`Engine`] (background sweep) or a borrowed [`PrimaryBackend`]
+/// runtime [`Engine`] (background sweep) or a borrowed `PrimaryBackend`
 /// (recovery, before the engine has been constructed).
 ///
 /// Returns aggregate counters for observability. Errors from the underlying
@@ -282,15 +282,15 @@ where
     Ok(stats)
 }
 
-/// Recovery-time sweep against a borrowed [`PrimaryBackend`].
+/// Recovery-time sweep against a borrowed [`ShardedIndex`].
 ///
-/// Called from [`crate::recovery::recover_all_with_allocator`] after the redo
-/// replay has finished and the primary index reflects the committed state.
+/// Called from [`crate::recovery::reconcile_blobs_after_recovery`] after the
+/// redo replay has finished and the primary index reflects the committed state.
 /// At this point no client is connected to the server, so the concurrency
 /// race described on [`reconcile_orphan_blobs_with`] cannot occur.
 pub fn reconcile_orphan_blobs_against_index(
     blob_store: &dyn BlobStore,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
 ) -> Result<BlobGcStats, BlobError> {
     reconcile_orphan_blobs_with(blob_store, |key| match index.lookup(key) {
         Some(entry) => LookupOutcome::Found {
