@@ -172,6 +172,19 @@ pub enum ConfigError {
     )]
     NoDevicePaths,
 
+    /// `device_split` is zero, or `device_paths.len() * device_split` exceeds
+    /// 256 (the index entry's `device_id` is a `u8`).
+    #[error(
+        "invalid store layout: device_paths.len()={paths} * device_split={split} \
+         must be in 1..=256 (device_id is a u8)"
+    )]
+    InvalidStoreLayout {
+        /// Number of configured device paths.
+        paths: usize,
+        /// Configured per-device split factor.
+        split: usize,
+    },
+
     /// `advertise_addr` does not parse as `host:port` (only checked when set).
     /// See F-G10-013.
     #[error(
@@ -480,6 +493,16 @@ pub struct ServerConfig {
 
     /// Device I/O alignment in bytes (4096 for most NVMe/SSDs).
     pub device_alignment: usize,
+
+    /// Number of virtual stores to carve each physical device into
+    /// (Aerospike-style virtual devices). `1` = one store per device. Splitting
+    /// a device into K stores gives K independent allocators + index lock
+    /// domains (lock/contention parallelism) sharing one physical device's I/O
+    /// bandwidth and fsync barrier. Total stores = `device_paths.len() *
+    /// device_split`, bounded by 256 (the index entry's `device_id` is a `u8`).
+    /// Records are placed round-robin across all stores at create time; reads
+    /// route by the index entry's recorded `device_id`.
+    pub device_split: usize,
 
     /// Size of the redo log region in bytes.
     pub redo_log_size: u64,
@@ -957,6 +980,7 @@ impl Default for ServerConfig {
             device_paths: vec![PathBuf::from("teraslab-data.dat")],
             device_size: 1024 * 1024 * 1024, // 1 GiB
             device_alignment: 4096,
+            device_split: 1,
             redo_log_size: 64 * 1024 * 1024, // 64 MiB
             redo_log_path: None,
             tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
@@ -1459,6 +1483,16 @@ impl ServerConfig {
         // state path index `[0]` unconditionally). See F-G10-004.
         if self.device_paths.is_empty() {
             return Err(ConfigError::NoDevicePaths);
+        }
+
+        // Store layout: total stores = device_paths.len() * device_split, and
+        // a store index must fit the index entry's u8 device_id.
+        let num_stores = self.device_paths.len().saturating_mul(self.device_split);
+        if self.device_split == 0 || num_stores == 0 || num_stores > crate::subdevice::MAX_STORES {
+            return Err(ConfigError::InvalidStoreLayout {
+                paths: self.device_paths.len(),
+                split: self.device_split,
+            });
         }
 
         // (0b) Size sanity gates. Pre-fix `device_alignment = 0` or
