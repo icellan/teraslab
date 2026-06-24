@@ -366,7 +366,7 @@ impl Engine {
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
-        Self {
+        let engine = Self {
             device,
             device_ptr,
             // N=1 transparent pass-through over the recovered/rebuilt backend.
@@ -401,7 +401,12 @@ impl Engine {
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
-        }
+        };
+        // Eager, single-threaded shard-count init from the fully-populated
+        // index. Must run before the engine is shared so no writer can race
+        // the scan (PR#19 #1).
+        engine.compute_shard_counts();
+        engine
     }
 
     /// Create a new engine from a pre-built [`ShardedIndex`].
@@ -426,7 +431,7 @@ impl Engine {
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
-        Self {
+        let engine = Self {
             device,
             device_ptr,
             index,
@@ -451,7 +456,12 @@ impl Engine {
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
-        }
+        };
+        // Eager, single-threaded shard-count init from the fully-populated
+        // index. Must run before the engine is shared so no writer can race
+        // the scan (PR#19 #1).
+        engine.compute_shard_counts();
+        engine
     }
 
     /// Attach a redo log for secondary-index two-phase durability.
@@ -1181,35 +1191,34 @@ impl Engine {
 
     /// Get the record count for a shard.
     ///
-    /// The first call after startup lazily initializes all shard counters by
-    /// scanning the primary index once. Subsequent calls are O(1) and
-    /// lock-free.
+    /// Shard counters are populated eagerly during engine construction (see
+    /// [`Self::compute_shard_counts`]), before any concurrent access is
+    /// possible, so this is always O(1) and lock-free. After construction the
+    /// counters are maintained incrementally by the register/unregister paths
+    /// under each owning shard's write lock, so they never drift from the
+    /// primary index.
     pub fn shard_record_count(&self, shard: u16) -> u64 {
-        let counter = &self.shard_counts[shard as usize];
-        if !self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.initialize_shard_counts();
-        }
-        counter.load(std::sync::atomic::Ordering::Acquire)
+        self.shard_counts[shard as usize].load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn initialize_shard_counts(&self) {
-        if self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-
-        if self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-
+    /// Populate `shard_counts` from the fully-built primary index and mark the
+    /// counters initialized.
+    ///
+    /// Called EXACTLY ONCE from each constructor while the engine is still
+    /// single-threaded and owned by the caller — recovery/restore has fully
+    /// populated the index before construction, and no concurrent writer can
+    /// observe the engine until it is returned and shared. Computing the
+    /// counts here (rather than lazily on the first reader) eliminates the
+    /// lazy-init-vs-writer race: there is no window in which the scan can visit
+    /// and release a shard while a concurrent writer inserts into it and reads
+    /// the still-false flag, leaving the new key counted by neither path.
+    ///
+    /// Because this runs before the engine is shared, the relaxed stores need
+    /// no per-counter synchronization; the single `Release` store of
+    /// `shard_counts_initialized` (and the `Arc`/move that publishes the engine
+    /// to other threads) establishes the happens-before edge for every later
+    /// `Acquire` read.
+    fn compute_shard_counts(&self) {
         let mut counts = vec![0u64; crate::cluster::shards::NUM_SHARDS];
         self.index.for_each(|key, _| {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
@@ -16139,7 +16148,7 @@ mod tests {
     // -- H2: atomic shard-count update tests --
 
     #[test]
-    fn engine_startup_shard_counts_lazy() {
+    fn engine_startup_shard_counts_eager() {
         fn key_for_shard(shard: u16, salt: u8) -> TxKey {
             assert!(shard < crate::cluster::shards::NUM_SHARDS as u16);
             let mut txid = [0u8; 32];
@@ -16165,7 +16174,7 @@ mod tests {
 
         const EXISTING_SHARD: u16 = 1234;
         const OTHER_EXISTING_SHARD: u16 = 1235;
-        const PRE_INIT_CREATE_SHARD: u16 = 1236;
+        const PRE_READ_CREATE_SHARD: u16 = 1236;
 
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -16190,43 +16199,47 @@ mod tests {
             UnminedIndex::new(),
         ));
 
+        // PR#19 #1: counts are computed EAGERLY in the constructor from the
+        // fully-populated index, before any concurrent access is possible.
+        // The flag is true immediately and the counts are correct without any
+        // prior `shard_record_count` call forcing a scan.
         assert!(
-            !engine.shard_counts_initialized_for_test(),
-            "Engine::new must not eagerly initialize shard_counts",
+            engine.shard_counts_initialized_for_test(),
+            "Engine::new must eagerly initialize shard_counts in the constructor",
         );
-
-        let (_, mut pre_init_req) = make_create_req(71, 1);
-        pre_init_req.tx_id = key_for_shard(PRE_INIT_CREATE_SHARD, 1).txid;
-        engine
-            .create(&pre_init_req)
-            .expect("create before lazy count initialization should succeed");
-        assert!(
-            !engine.shard_counts_initialized_for_test(),
-            "create before first shard_record_count should not force a full index scan",
-        );
-
         assert_eq!(
             engine.shard_record_count(EXISTING_SHARD),
             2,
-            "first shard_record_count must not return zero for existing records",
+            "eager init must count existing records on the populated shard",
         );
-        assert!(engine.shard_counts_initialized_for_test());
         assert_eq!(engine.shard_record_count(OTHER_EXISTING_SHARD), 1);
-        assert_eq!(engine.shard_record_count(PRE_INIT_CREATE_SHARD), 1);
 
-        let (_, mut post_init_req) = make_create_req(72, 1);
-        post_init_req.tx_id = key_for_shard(EXISTING_SHARD, 3).txid;
+        // A create issued before any read still increments under the shard
+        // write lock — the flag is already true, so the fetch_add fires.
+        let (_, mut pre_read_req) = make_create_req(71, 1);
+        pre_read_req.tx_id = key_for_shard(PRE_READ_CREATE_SHARD, 1).txid;
         engine
-            .create(&post_init_req)
-            .expect("create after lazy count initialization should succeed");
+            .create(&pre_read_req)
+            .expect("create on an eager-init engine should succeed");
+        assert!(
+            engine.shard_counts_initialized_for_test(),
+            "flag stays true after a create",
+        );
+        assert_eq!(engine.shard_record_count(PRE_READ_CREATE_SHARD), 1);
+
+        let (_, mut second_req) = make_create_req(72, 1);
+        second_req.tx_id = key_for_shard(EXISTING_SHARD, 3).txid;
+        engine
+            .create(&second_req)
+            .expect("second create should succeed");
         assert_eq!(engine.shard_record_count(EXISTING_SHARD), 3);
 
         engine
             .delete(&DeleteRequest {
-                tx_key: post_init_req.tx_key(),
+                tx_key: second_req.tx_key(),
                 due_guard: None,
             })
-            .expect("delete after lazy count initialization should succeed");
+            .expect("delete should succeed");
         assert_eq!(engine.shard_record_count(EXISTING_SHARD), 2);
 
         engine
@@ -16450,6 +16463,227 @@ mod tests {
         assert!(
             total > 0,
             "expected some records to remain, got 0 (likely all deletes ran)",
+        );
+    }
+
+    /// PR#19 #4 — regression guard for the lazy-init-vs-writer race (PR#19 #1).
+    ///
+    /// At N>1 (16 index shards, built exactly as the server wires the
+    /// in-memory backend), spawn K threads that each create many distinct
+    /// records concurrently through the engine's create path (which goes
+    /// through `register_new_with_shard_count`), while other threads
+    /// interleave `shard_record_count` reads. After joining, the per-shard
+    /// counts and their total must EXACTLY match a ground-truth recount of the
+    /// primary index by `ShardTable::shard_for_key`, AND the total must equal
+    /// the number of keys actually in the index.
+    ///
+    /// With the OLD lazy init this drifts: a reader triggers the one-shot scan
+    /// while writers concurrently insert into shards the scan has already
+    /// visited+released and read the still-false flag, so those inserts skip
+    /// their `fetch_add` and are counted by neither path — `shard_counts`
+    /// permanently undercounts. With eager init in the constructor the flag is
+    /// already true before any writer runs, so every insert increments under
+    /// its shard write lock and the counts can never drift.
+    #[test]
+    fn shard_counts_no_drift_under_concurrent_registration_n16() {
+        // Distinct txid per (thread, i) using a 64-bit nonce so keys spread
+        // across all 16 index shards AND across many cluster shards (the
+        // `shard_counts` keying). A wide nonce avoids the u8 ceiling of
+        // `make_create_req`, letting each thread mint hundreds of unique keys.
+        fn nonce_for(thread: u32, i: u32) -> u64 {
+            // +1 keeps the nonce nonzero (so no txid is all-zero) without
+            // collapsing distinct i values the way a low-bit OR would.
+            (((thread as u64) << 32) | (i as u64)) + 1
+        }
+        fn txid_for(thread: u32, i: u32) -> [u8; 32] {
+            let nonce = nonce_for(thread, i);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&nonce.to_le_bytes());
+            // Mix into the cluster-shard key bytes too so cluster shards spread.
+            txid[8..16].copy_from_slice(&nonce.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
+            txid[24..32].copy_from_slice(&nonce.wrapping_mul(0xD6E8FEB86659FD93).to_le_bytes());
+            txid
+        }
+        // The create path rejects an empty UTXO set, so each request carries a
+        // single placeholder UTXO. The hash must be distinct per transaction
+        // so concurrent creates don't collide on the UTXO secondary index.
+        fn utxo_hash_for(thread: u32, i: u32) -> [u8; 32] {
+            let nonce = nonce_for(thread, i);
+            let mut h = [0u8; 32];
+            h[0..8].copy_from_slice(&nonce.wrapping_mul(0xC2B2AE3D27D4EB4F).to_le_bytes());
+            h[8..16].copy_from_slice(&nonce.wrapping_mul(0x165667B19E3779F9).to_le_bytes());
+            h
+        }
+
+        let engine = create_sharded_engine(16);
+        assert_eq!(
+            engine.index_shard_count(),
+            16,
+            "test must run at N=16 index shards to be meaningful",
+        );
+
+        const WRITER_THREADS: u32 = 8;
+        const READER_THREADS: usize = 4;
+        const RECORDS_PER_THREAD: u32 = 600;
+
+        let build_req = |t: u32, i: u32| -> CreateRequest<'static> {
+            let tx_id = txid_for(t, i);
+            // Leak a 'static single-UTXO slice for this request. Bounded by
+            // WRITER_THREADS * RECORDS_PER_THREAD — fine for a test.
+            let utxo_hashes: &'static [[u8; 32]] =
+                Box::leak(vec![utxo_hash_for(t, i)].into_boxed_slice());
+            CreateRequest {
+                tx_id,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            }
+        };
+
+        // Pre-seed a chunk of records BEFORE the concurrent phase so the
+        // reader's lazy scan (on the old code) has a non-trivial index to walk
+        // while writers concurrently insert into shards it has already passed —
+        // the exact window that made the old lazy init drop counts.
+        const WARMUP_PER_THREAD: u32 = 100;
+        for t in 0..WRITER_THREADS {
+            for i in 0..WARMUP_PER_THREAD {
+                engine
+                    .create(&build_req(t, i))
+                    .expect("warmup create should succeed");
+            }
+        }
+
+        // Barrier releases all writers AND all readers at the same instant so
+        // a reader-triggered count read overlaps live inserts.
+        let barrier = Arc::new(std::sync::Barrier::new(
+            WRITER_THREADS as usize + READER_THREADS,
+        ));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut readers = Vec::with_capacity(READER_THREADS);
+        for _ in 0..READER_THREADS {
+            let reader_engine = Arc::clone(&engine);
+            let reader_stop = Arc::clone(&stop);
+            let reader_barrier = Arc::clone(&barrier);
+            readers.push(std::thread::spawn(move || {
+                reader_barrier.wait();
+                let mut spins: u64 = 0;
+                while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut acc: u64 = 0;
+                    for s in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+                        acc = acc.wrapping_add(reader_engine.shard_record_count(s));
+                    }
+                    std::hint::black_box(acc);
+                    spins = spins.wrapping_add(1);
+                }
+                spins
+            }));
+        }
+
+        let mut handles = Vec::with_capacity(WRITER_THREADS as usize);
+        for t in 0..WRITER_THREADS {
+            let engine = Arc::clone(&engine);
+            let writer_barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                writer_barrier.wait();
+                for i in WARMUP_PER_THREAD..RECORDS_PER_THREAD {
+                    let tx_id = txid_for(t, i);
+                    let utxo_hashes: &'static [[u8; 32]] =
+                        Box::leak(vec![utxo_hash_for(t, i)].into_boxed_slice());
+                    let req = CreateRequest {
+                        tx_id,
+                        tx_version: 1,
+                        locktime: 0,
+                        fee: 500,
+                        size_in_bytes: 250,
+                        extended_size: 0,
+                        is_coinbase: false,
+                        spending_height: 0,
+                        utxo_hashes,
+                        inputs: None,
+                        outputs: None,
+                        inpoints: None,
+                        is_external: false,
+                        created_at: 1710000000000,
+                        block_height: 1000,
+                        mined_block_infos: &[],
+                        frozen: false,
+                        conflicting: false,
+                        locked: false,
+                        external_ref: None,
+                        parent_txids: &[],
+                    };
+                    engine
+                        .create(&req)
+                        .expect("concurrent create should succeed");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().expect("reader thread panicked");
+        }
+
+        // Ground truth: recount the primary index by cluster shard.
+        let keys = engine.all_keys();
+        let expected_total = keys.len() as u64;
+        assert_eq!(
+            expected_total,
+            (WRITER_THREADS * RECORDS_PER_THREAD) as u64,
+            "every (thread,i) key is distinct, so all creates must have inserted",
+        );
+
+        let mut reference: HashMap<u16, u64> = HashMap::new();
+        for k in &keys {
+            let s = crate::cluster::shards::ShardTable::shard_for_key(k);
+            *reference.entry(s).or_insert(0) += 1;
+        }
+
+        // Per-shard counts must EXACTLY match the recount — no drift.
+        for (&shard, &expected) in &reference {
+            assert_eq!(
+                engine.shard_record_count(shard),
+                expected,
+                "shard_counts drift at shard {shard}: expected {expected}",
+            );
+        }
+        // Shards with no keys must read zero.
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            if !reference.contains_key(&shard) {
+                assert_eq!(
+                    engine.shard_record_count(shard),
+                    0,
+                    "shard {shard} should be empty but shard_counts is nonzero",
+                );
+            }
+        }
+        // The sum of all shard counts must equal the number of index entries.
+        let counted_total: u64 = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .map(|s| engine.shard_record_count(s))
+            .sum();
+        assert_eq!(
+            counted_total, expected_total,
+            "sum of shard_counts ({counted_total}) drifted from index len ({expected_total})",
         );
     }
 
