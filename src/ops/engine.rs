@@ -1480,8 +1480,17 @@ impl Engine {
     /// it must surface. The record bytes at `record_offset` are unreachable
     /// (no index entry points at them), so the worst case of a failed free
     /// is the same leaked region this call is trying to reclaim.
-    fn free_create_allocation_best_effort(&self, record_offset: u64, total_size: u64) {
-        if let Err(e) = self.allocator.lock().free(record_offset, total_size) {
+    fn free_create_allocation_best_effort(
+        &self,
+        device_id: u8,
+        record_offset: u64,
+        total_size: u64,
+    ) {
+        if let Err(e) = self
+            .allocator_for(device_id)
+            .lock()
+            .free(record_offset, total_size)
+        {
             tracing::error!(
                 target: "teraslab::engine",
                 record_offset,
@@ -2106,8 +2115,11 @@ impl Engine {
                         let deleted_count = { metadata.deleted_children_count };
                         if deleted_count > 0 {
                             let deleted_offset = { metadata.deleted_children_offset };
-                            let deleted = self
-                                .read_deleted_children_at(deleted_count as usize, deleted_offset)?;
+                            let deleted = self.read_deleted_children_at(
+                                device_id,
+                                deleted_count as usize,
+                                deleted_offset,
+                            )?;
                             let mut child_txid = [0u8; 32];
                             child_txid.copy_from_slice(&item.spending_data[..32]);
                             if deleted.contains(&child_txid) {
@@ -2305,8 +2317,11 @@ impl Engine {
                     let deleted_count = { metadata.deleted_children_count };
                     if deleted_count > 0 {
                         let deleted_offset = { metadata.deleted_children_offset };
-                        let deleted =
-                            self.read_deleted_children_at(deleted_count as usize, deleted_offset)?;
+                        let deleted = self.read_deleted_children_at(
+                            device_id,
+                            deleted_count as usize,
+                            deleted_offset,
+                        )?;
                         let mut child_txid = [0u8; 32];
                         child_txid.copy_from_slice(&req.spending_data[..32]);
                         if deleted.contains(&child_txid) {
@@ -2373,13 +2388,15 @@ impl Engine {
 
         // 8. Write metadata. R-004: propagate the write error rather
         // than logging-and-continuing.
-        if !self.device_ptr.is_null() {
+        if !self.device_ptr_for(device_id).is_null() {
             // SAFETY: `device_ptr` is non-null (checked above) and live for
             // the engine's lifetime; `record_offset` is allocator-valid. The
             // caller holds this record's stripe lock, and
             // `write_metadata_direct` additionally takes the per-offset
             // `io_locks()` write side for torn-read-safe publication.
-            unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
+            unsafe {
+                io::write_metadata_direct(self.device_ptr_for(device_id), record_offset, &metadata)
+            };
         } else {
             self.write_metadata_fast(device_id, record_offset, &metadata)?;
         }
@@ -2533,13 +2550,19 @@ impl Engine {
         //    bumping the generation — keeping a pure no-op generation-stable so
         //    the dispatch layer can still classify it as idempotent.
         if caller_owns_spend || new_dah != old_dah {
-            if !self.device_ptr.is_null() {
+            if !self.device_ptr_for(device_id).is_null() {
                 // SAFETY: `device_ptr` is non-null (checked above) and live
                 // for the engine's lifetime; `record_offset` is
                 // allocator-valid. The unspend caller holds this record's
                 // stripe lock, and `write_metadata_direct` takes the
                 // per-offset `io_locks()` write side for safe publication.
-                unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
+                unsafe {
+                    io::write_metadata_direct(
+                        self.device_ptr_for(device_id),
+                        record_offset,
+                        &metadata,
+                    )
+                };
             } else {
                 self.write_metadata_fast(device_id, record_offset, &metadata)?;
             }
@@ -2609,7 +2632,7 @@ impl Engine {
         // return, DAH evaluation runs from cached index fields.
         // ---------------------------------------------------------------
         let cached_count = entry.block_entry_count;
-        if !req.unset_mined && cached_count == 0 && !self.device_ptr.is_null() {
+        if !req.unset_mined && cached_count == 0 && !self.device_ptr_for(device_id).is_null() {
             // F-G2-011 / KO-11: read the authoritative on-device metadata
             // up front and derive EVERY DAH/flag/counter input from it,
             // never from the cached `entry`. The fast path already needs
@@ -2622,17 +2645,17 @@ impl Engine {
             // so a stale-cache scenario cannot write a wrong `old_dah`,
             // mis-flagged `tf`, or wrong DAH-index delta.
             // SAFETY: `device_ptr` is non-null (the fast path is gated on
-            // `!self.device_ptr.is_null()`) and live for the engine's
+            // `!self.device_ptr_for(device_id).is_null()`) and live for the engine's
             // lifetime; `record_offset` is allocator-valid. The set_mined
             // caller holds this record's stripe lock, and
             // `read_metadata_direct` takes the per-offset `io_locks()` read
             // side, so the read is torn-read-safe.
             let mut meta = unsafe {
-                io::read_metadata_direct(self.device_ptr, record_offset).map_err(|e| {
-                    SpendError::StorageError {
+                io::read_metadata_direct(self.device_ptr_for(device_id), record_offset).map_err(
+                    |e| SpendError::StorageError {
                         detail: format!("{e}"),
-                    }
-                })?
+                    },
+                )?
             };
 
             // Fast-path eligibility is the cache's `count == 0` signal; the
@@ -2707,7 +2730,7 @@ impl Engine {
                 // lock; `write_metadata_direct` takes the per-offset
                 // `io_locks()` write side for torn-read-safe publication.
                 unsafe {
-                    io::write_metadata_direct(self.device_ptr, record_offset, &meta);
+                    io::write_metadata_direct(self.device_ptr_for(device_id), record_offset, &meta);
                 }
 
                 // Sync all cached fields to index from the post-state.
@@ -2771,10 +2794,11 @@ impl Engine {
                     // Swap with last entry (may be inline or from overflow)
                     if count > INLINE_BLOCK_ENTRIES {
                         // Last entry is in overflow — pull it into the inline slot
-                        let mut overflow = read_overflow_entries(&*self.device, &metadata)
-                            .map_err(|e| SpendError::StorageError {
-                                detail: format!("{e}"),
-                            })?;
+                        let mut overflow =
+                            read_overflow_entries(&**self.device_for(device_id), &metadata)
+                                .map_err(|e| SpendError::StorageError {
+                                    detail: format!("{e}"),
+                                })?;
                         // F-G2-004: `count > INLINE_BLOCK_ENTRIES` implies a
                         // non-empty overflow, so this pop is unreachable-None
                         // in current code. Surface as a StorageError instead
@@ -2789,9 +2813,9 @@ impl Engine {
                         })?;
                         metadata.block_entries_inline[i] = last;
                         write_overflow_entries(
-                            &*self.device,
+                            &**self.device_for(device_id),
                             record_offset,
-                            &self.allocator,
+                            self.allocator_for(device_id),
                             &mut metadata,
                             &overflow,
                         )
@@ -2818,18 +2842,16 @@ impl Engine {
 
             // Check overflow entries if not found inline
             if !found && count > INLINE_BLOCK_ENTRIES {
-                let mut overflow =
-                    read_overflow_entries(&*self.device, &metadata).map_err(|e| {
-                        SpendError::StorageError {
-                            detail: format!("{e}"),
-                        }
+                let mut overflow = read_overflow_entries(&**self.device_for(device_id), &metadata)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("{e}"),
                     })?;
                 if let Some(pos) = overflow.iter().position(|e| e.block_id == req.block_id) {
                     overflow.swap_remove(pos);
                     write_overflow_entries(
-                        &*self.device,
+                        &**self.device_for(device_id),
                         record_offset,
-                        &self.allocator,
+                        self.allocator_for(device_id),
                         &mut metadata,
                         &overflow,
                     )
@@ -2853,11 +2875,10 @@ impl Engine {
             }
 
             if !exists && count > INLINE_BLOCK_ENTRIES {
-                let overflow = read_overflow_entries(&*self.device, &metadata).map_err(|e| {
-                    SpendError::StorageError {
+                let overflow = read_overflow_entries(&**self.device_for(device_id), &metadata)
+                    .map_err(|e| SpendError::StorageError {
                         detail: format!("{e}"),
-                    }
-                })?;
+                    })?;
                 if overflow.iter().any(|e| e.block_id == req.block_id) {
                     exists = true;
                 }
@@ -2884,20 +2905,20 @@ impl Engine {
                     };
                 } else {
                     let mut overflow =
-                        read_overflow_entries(&*self.device, &metadata).map_err(|e| {
-                            SpendError::StorageError {
+                        read_overflow_entries(&**self.device_for(device_id), &metadata).map_err(
+                            |e| SpendError::StorageError {
                                 detail: format!("{e}"),
-                            }
-                        })?;
+                            },
+                        )?;
                     overflow.push(BlockEntry {
                         block_id: req.block_id,
                         block_height: req.block_height,
                         subtree_idx: req.subtree_idx,
                     });
                     write_overflow_entries(
-                        &*self.device,
+                        &**self.device_for(device_id),
                         record_offset,
-                        &self.allocator,
+                        self.allocator_for(device_id),
                         &mut metadata,
                         &overflow,
                     )
@@ -2948,7 +2969,7 @@ impl Engine {
         let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
             collect_block_ids(&metadata).to_vec()
         } else {
-            collect_all_block_ids(&*self.device, &metadata)
+            collect_all_block_ids(&**self.device_for(device_id), &metadata)
                 .unwrap_or_else(|_| collect_block_ids(&metadata).to_vec())
         };
 
@@ -3031,13 +3052,15 @@ impl Engine {
 
         // Targeted mined footer when direct, full write otherwise.
         // The on-device metadata is the primary durable source of truth.
-        if !self.device_ptr.is_null() {
+        if !self.device_ptr_for(device_id).is_null() {
             // SAFETY: `device_ptr` is non-null (checked above) and live for
             // the engine's lifetime; `record_offset` is allocator-valid. The
             // set_mined slow path holds this record's stripe lock;
             // `write_metadata_direct` takes the per-offset `io_locks()` write
             // side for torn-read-safe publication.
-            unsafe { io::write_metadata_direct(self.device_ptr, record_offset, &metadata) };
+            unsafe {
+                io::write_metadata_direct(self.device_ptr_for(device_id), record_offset, &metadata)
+            };
         } else {
             self.write_metadata_fast(device_id, record_offset, &metadata)?;
         }
@@ -3135,9 +3158,12 @@ impl Engine {
         let base_size = TxMetadata::record_size_for(utxo_count);
         let total_size = base_size + cold_size as u64;
 
-        // Allocate space
+        // Place this new record on a store (round-robin) and allocate there.
+        // The chosen store is recorded in the index entry's device_id below, so
+        // every later access routes to it via device_for(entry.device_id).
+        let device_id = self.place_new_record();
         let record_offset = self
-            .allocator
+            .allocator_for(device_id)
             .lock()
             .allocate(total_size)
             .map_err(|_| CreateError::DeviceFull)?;
@@ -3206,14 +3232,16 @@ impl Engine {
         // freshly allocated region — the bytes at `record_offset` are
         // unreachable without an index entry and would otherwise leak
         // (audit A — create leaks its allocation on post-allocation failure).
-        if let Err(e) = self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data) {
-            self.free_create_allocation_best_effort(record_offset, total_size);
+        if let Err(e) =
+            self.write_full_record_with_cold(device_id, record_offset, &meta, &slots, &cold_data)
+        {
+            self.free_create_allocation_best_effort(device_id, record_offset, total_size);
             return Err(e);
         }
 
         // Register in index
         let index_entry = TxIndexEntry {
-            device_id: 0,
+            device_id,
             record_offset,
             utxo_count,
             block_entry_count: meta.block_entry_count,
@@ -3231,7 +3259,7 @@ impl Engine {
         let inserted = match self.register_new_with_shard_count(key, index_entry) {
             Ok(inserted) => inserted,
             Err(e) => {
-                self.free_create_allocation_best_effort(record_offset, total_size);
+                self.free_create_allocation_best_effort(device_id, record_offset, total_size);
                 return Err(CreateError::StorageError {
                     detail: format!("{e}"),
                 });
@@ -3242,7 +3270,7 @@ impl Engine {
             // can have registered since the lookup above, but if it ever
             // happens, refuse to overwrite the live entry and release the
             // losing reservation instead of leaking it.
-            self.free_create_allocation_best_effort(record_offset, total_size);
+            self.free_create_allocation_best_effort(device_id, record_offset, total_size);
             return Err(CreateError::DuplicateTxId);
         }
 
@@ -3287,7 +3315,7 @@ impl Engine {
     /// the returned `record_offset` to finalize the create.
     ///
     /// If the caller decides not to finalize (e.g., redo flush fails), it
-    /// must free the allocated space via `self.allocator.lock().free(offset, size)`.
+    /// must free the allocated space via `self.allocator_for(device_id).lock().free(offset, size)`.
     pub fn pre_allocate_create(&self, req: &CreateRequest) -> Result<(u64, u32, u64), CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
@@ -3502,10 +3530,14 @@ impl Engine {
             })
             .collect();
 
-        self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+        // The pre-allocated path's offset comes from pre_allocate_create, which
+        // allocates on store 0; record placement across stores for this batch
+        // path is wired in a later stage. Reads route by this device_id.
+        let device_id = 0u8;
+        self.write_full_record_with_cold(device_id, record_offset, &meta, &slots, &cold_data)?;
 
         let index_entry = TxIndexEntry {
-            device_id: 0,
+            device_id,
             record_offset,
             utxo_count,
             block_entry_count: meta.block_entry_count,
@@ -3689,12 +3721,13 @@ impl Engine {
     /// Write a complete record including optional cold data.
     fn write_full_record_with_cold(
         &self,
+        device_id: u8,
         record_offset: u64,
         metadata: &TxMetadata,
         slots: &[UtxoSlot],
         cold_data: &[u8],
     ) -> Result<(), CreateError> {
-        let align = self.device.alignment();
+        let align = self.device_for(device_id).alignment();
         let data_len = METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE + cold_data.len();
         let aligned_len = data_len.div_ceil(align) * align;
 
@@ -3724,11 +3757,11 @@ impl Engine {
         // can still hold this offset from the previous occupant's index
         // entry and would otherwise observe this record half-written —
         // see `io::write_record_bytes` for the full aliasing scenario.
-        io::write_record_bytes(&*self.device, record_offset, &buf).map_err(|e| {
-            CreateError::StorageError {
+        io::write_record_bytes(&**self.device_for(device_id), record_offset, &buf).map_err(
+            |e| CreateError::StorageError {
                 detail: format!("{e}"),
-            }
-        })?;
+            },
+        )?;
 
         Ok(())
     }
@@ -3826,7 +3859,8 @@ impl Engine {
         }
 
         let cold_offset = entry.record_offset + cold_intra;
-        let align = self.device.alignment();
+        let device_id = entry.device_id;
+        let align = self.device_for(device_id).alignment();
         let aligned_base = cold_offset / align as u64 * align as u64;
         let intra = (cold_offset - aligned_base) as usize;
         let read_len = (intra + cold_size as usize).div_ceil(align) * align;
@@ -4344,7 +4378,7 @@ impl Engine {
         let mut intent_logged = false;
         let mut attempt: u32 = 0;
         loop {
-            let (ro, count, offset, mut children) = {
+            let (ro, device_id, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would silently no-op the child append).
@@ -4362,12 +4396,12 @@ impl Engine {
                 let count = { meta.conflicting_children_count } as usize;
                 let offset = { meta.conflicting_children_offset };
 
-                let children = self.read_conflicting_children_at(count, offset)?;
+                let children = self.read_conflicting_children_at(device_id, count, offset)?;
                 if children.contains(&child_txid) {
                     return Ok(());
                 }
 
-                (ro, count, offset, children)
+                (ro, device_id, count, offset, children)
             };
 
             children.push(child_txid);
@@ -4405,7 +4439,7 @@ impl Engine {
             // fully-written replacement. R-143 additionally keeps allocator
             // work outside the parent stripe lock: prepare the replacement
             // unlocked, then re-lock only to validate the snapshot and commit.
-            let new_offset = self.allocate_conflicting_children_block(&children)?;
+            let new_offset = self.allocate_conflicting_children_block(device_id, &children)?;
 
             let mut parent_gone = false;
             let committed = {
@@ -4444,7 +4478,7 @@ impl Engine {
             };
 
             if parent_gone {
-                self.free_conflicting_children_block(new_offset, children.len())?;
+                self.free_conflicting_children_block(device_id, new_offset, children.len())?;
                 return Ok(());
             }
 
@@ -4457,7 +4491,8 @@ impl Engine {
                     // the leak via a high-cardinality tracing event so
                     // operators can correlate and reclaim manually (see
                     // R-049 orphan-blob GC for the periodic sweep).
-                    if let Err(err) = self.free_conflicting_children_block(offset, count) {
+                    if let Err(err) = self.free_conflicting_children_block(device_id, offset, count)
+                    {
                         tracing::error!(
                             target: "teraslab::engine::orphan",
                             orphan = true,
@@ -4472,7 +4507,7 @@ impl Engine {
                 return Ok(());
             }
 
-            self.free_conflicting_children_block(new_offset, children.len())?;
+            self.free_conflicting_children_block(device_id, new_offset, children.len())?;
 
             attempt += 1;
             if attempt >= MAX_RETRIES {
@@ -4513,7 +4548,7 @@ impl Engine {
         let mut intent_logged = false;
         let mut attempt: u32 = 0;
         loop {
-            let (ro, count, offset, mut children) = {
+            let (ro, device_id, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent absent".
                 let entry = match self.index.lookup_checked(parent_key).map_err(|e| {
@@ -4530,14 +4565,14 @@ impl Engine {
                 let count = { meta.conflicting_children_count } as usize;
                 let offset = { meta.conflicting_children_offset };
 
-                let children = self.read_conflicting_children_at(count, offset)?;
+                let children = self.read_conflicting_children_at(device_id, count, offset)?;
                 // Inverse of append's dedup: if the child isn't present (which
                 // includes the empty-list case), there is nothing to remove.
                 if !children.contains(&child_txid) {
                     return Ok(());
                 }
 
-                (ro, count, offset, children)
+                (ro, device_id, count, offset, children)
             };
 
             children.retain(|c| c != &child_txid);
@@ -4568,7 +4603,7 @@ impl Engine {
             let new_offset = if new_len == 0 {
                 0
             } else {
-                self.allocate_conflicting_children_block(&children)?
+                self.allocate_conflicting_children_block(device_id, &children)?
             };
 
             let mut parent_gone = false;
@@ -4607,7 +4642,7 @@ impl Engine {
             if parent_gone {
                 // The replacement block (if any) is now orphaned.
                 if new_offset != 0 {
-                    self.free_conflicting_children_block(new_offset, new_len)?;
+                    self.free_conflicting_children_block(device_id, new_offset, new_len)?;
                 }
                 return Ok(());
             }
@@ -4617,7 +4652,8 @@ impl Engine {
                     // Post-commit cleanup of the OLD block (sized by the OLD
                     // count). A free failure cannot propagate — the remove
                     // already SUCCEEDED — so surface the leak via tracing.
-                    if let Err(err) = self.free_conflicting_children_block(offset, count) {
+                    if let Err(err) = self.free_conflicting_children_block(device_id, offset, count)
+                    {
                         tracing::error!(
                             target: "teraslab::engine::orphan",
                             orphan = true,
@@ -4635,7 +4671,7 @@ impl Engine {
             // CAS lost / record moved: free the speculative new block (if any)
             // and retry.
             if new_offset != 0 {
-                self.free_conflicting_children_block(new_offset, new_len)?;
+                self.free_conflicting_children_block(device_id, new_offset, new_len)?;
             }
 
             attempt += 1;
@@ -4655,6 +4691,7 @@ impl Engine {
 
     fn read_conflicting_children_at(
         &self,
+        device_id: u8,
         count: usize,
         offset: u64,
     ) -> Result<Vec<[u8; 32]>, SpendError> {
@@ -4663,7 +4700,7 @@ impl Engine {
             return Ok(children);
         }
 
-        let align = self.device.alignment();
+        let align = self.device_for(device_id).alignment();
         let aligned_base = offset / align as u64 * align as u64;
         let intra = (offset - aligned_base) as usize;
         let read_len = (intra + count * 32).div_ceil(align) * align;
@@ -4684,18 +4721,19 @@ impl Engine {
 
     fn allocate_conflicting_children_block(
         &self,
+        device_id: u8,
         children: &[[u8; 32]],
     ) -> Result<u64, SpendError> {
         let new_size = (children.len() * 32) as u64;
-        let new_offset =
-            self.allocator
-                .lock()
-                .allocate(new_size)
-                .map_err(|_| SpendError::StorageError {
-                    detail: "device full for conflicting children".into(),
-                })?;
+        let new_offset = self
+            .allocator_for(device_id)
+            .lock()
+            .allocate(new_size)
+            .map_err(|_| SpendError::StorageError {
+                detail: "device full for conflicting children".into(),
+            })?;
 
-        let align = self.device.alignment();
+        let align = self.device_for(device_id).alignment();
         let aligned_base = new_offset / align as u64 * align as u64;
         let intra = (new_offset - aligned_base) as usize;
         let write_len = (intra + children.len() * 32).div_ceil(align) * align;
@@ -4703,13 +4741,17 @@ impl Engine {
         for (i, child) in children.iter().enumerate() {
             wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
         }
-        if let Err(err) = self.device.pwrite_all_at(&wbuf, aligned_base) {
+        if let Err(err) = self
+            .device_for(device_id)
+            .pwrite_all_at(&wbuf, aligned_base)
+        {
             // pwrite failed — roll back the freshly-allocated extent so
             // we don't leak it. If the rollback itself fails, surface
             // the leak via tracing (we still need to return the
             // original pwrite error to the caller) so operators can
             // correlate against the R-049 orphan-blob sweep.
-            if let Err(free_err) = self.free_conflicting_children_block(new_offset, children.len())
+            if let Err(free_err) =
+                self.free_conflicting_children_block(device_id, new_offset, children.len())
             {
                 tracing::error!(
                     target: "teraslab::engine::orphan",
@@ -4730,8 +4772,13 @@ impl Engine {
         Ok(new_offset)
     }
 
-    fn free_conflicting_children_block(&self, offset: u64, count: usize) -> Result<(), SpendError> {
-        self.allocator
+    fn free_conflicting_children_block(
+        &self,
+        device_id: u8,
+        offset: u64,
+        count: usize,
+    ) -> Result<(), SpendError> {
+        self.allocator_for(device_id)
             .lock()
             .free(offset, (count * 32) as u64)
             .map_err(|e| SpendError::StorageError {
@@ -4765,7 +4812,7 @@ impl Engine {
 
         let count = { meta.conflicting_children_count } as usize;
         let offset = { meta.conflicting_children_offset };
-        self.read_conflicting_children_at(count, offset)
+        self.read_conflicting_children_at(device_id, count, offset)
     }
 
     fn append_conflicting_child_best_effort(
@@ -4857,7 +4904,7 @@ impl Engine {
         let mut intent_logged = false;
         let mut attempt: u32 = 0;
         loop {
-            let (ro, count, offset, mut children) = {
+            let (ro, device_id, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would silently no-op the child append).
@@ -4875,12 +4922,12 @@ impl Engine {
                 let count = { meta.deleted_children_count } as usize;
                 let offset = { meta.deleted_children_offset };
 
-                let children = self.read_deleted_children_at(count, offset)?;
+                let children = self.read_deleted_children_at(device_id, count, offset)?;
                 if children.contains(&child_txid) {
                     return Ok(());
                 }
 
-                (ro, count, offset, children)
+                (ro, device_id, count, offset, children)
             };
 
             children.push(child_txid);
@@ -4910,7 +4957,7 @@ impl Engine {
                 intent_logged = true;
             }
 
-            let new_offset = self.allocate_deleted_children_block(&children)?;
+            let new_offset = self.allocate_deleted_children_block(device_id, &children)?;
 
             let mut parent_gone = false;
             let committed = {
@@ -4949,14 +4996,14 @@ impl Engine {
             };
 
             if parent_gone {
-                self.free_deleted_children_block(new_offset, children.len())?;
+                self.free_deleted_children_block(device_id, new_offset, children.len())?;
                 return Ok(());
             }
 
             if committed {
                 if count > 0
                     && offset != 0
-                    && let Err(err) = self.free_deleted_children_block(offset, count)
+                    && let Err(err) = self.free_deleted_children_block(device_id, offset, count)
                 {
                     tracing::error!(
                         target: "teraslab::engine::orphan",
@@ -4971,7 +5018,7 @@ impl Engine {
                 return Ok(());
             }
 
-            self.free_deleted_children_block(new_offset, children.len())?;
+            self.free_deleted_children_block(device_id, new_offset, children.len())?;
 
             attempt += 1;
             if attempt >= MAX_RETRIES {
@@ -4990,6 +5037,7 @@ impl Engine {
 
     fn read_deleted_children_at(
         &self,
+        device_id: u8,
         count: usize,
         offset: u64,
     ) -> Result<Vec<[u8; 32]>, SpendError> {
@@ -4998,7 +5046,7 @@ impl Engine {
             return Ok(children);
         }
 
-        let align = self.device.alignment();
+        let align = self.device_for(device_id).alignment();
         let aligned_base = offset / align as u64 * align as u64;
         let intra = (offset - aligned_base) as usize;
         let read_len = (intra + count * 32).div_ceil(align) * align;
@@ -5017,17 +5065,21 @@ impl Engine {
         Ok(children)
     }
 
-    fn allocate_deleted_children_block(&self, children: &[[u8; 32]]) -> Result<u64, SpendError> {
+    fn allocate_deleted_children_block(
+        &self,
+        device_id: u8,
+        children: &[[u8; 32]],
+    ) -> Result<u64, SpendError> {
         let new_size = (children.len() * 32) as u64;
-        let new_offset =
-            self.allocator
-                .lock()
-                .allocate(new_size)
-                .map_err(|_| SpendError::StorageError {
-                    detail: "device full for deleted children".into(),
-                })?;
+        let new_offset = self
+            .allocator_for(device_id)
+            .lock()
+            .allocate(new_size)
+            .map_err(|_| SpendError::StorageError {
+                detail: "device full for deleted children".into(),
+            })?;
 
-        let align = self.device.alignment();
+        let align = self.device_for(device_id).alignment();
         let aligned_base = new_offset / align as u64 * align as u64;
         let intra = (new_offset - aligned_base) as usize;
         let write_len = (intra + children.len() * 32).div_ceil(align) * align;
@@ -5035,8 +5087,13 @@ impl Engine {
         for (i, child) in children.iter().enumerate() {
             wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
         }
-        if let Err(err) = self.device.pwrite_all_at(&wbuf, aligned_base) {
-            if let Err(free_err) = self.free_deleted_children_block(new_offset, children.len()) {
+        if let Err(err) = self
+            .device_for(device_id)
+            .pwrite_all_at(&wbuf, aligned_base)
+        {
+            if let Err(free_err) =
+                self.free_deleted_children_block(device_id, new_offset, children.len())
+            {
                 tracing::error!(
                     target: "teraslab::engine::orphan",
                     orphan = true,
@@ -5056,8 +5113,13 @@ impl Engine {
         Ok(new_offset)
     }
 
-    fn free_deleted_children_block(&self, offset: u64, count: usize) -> Result<(), SpendError> {
-        self.allocator
+    fn free_deleted_children_block(
+        &self,
+        device_id: u8,
+        offset: u64,
+        count: usize,
+    ) -> Result<(), SpendError> {
+        self.allocator_for(device_id)
             .lock()
             .free(offset, (count * 32) as u64)
             .map_err(|e| SpendError::StorageError {
@@ -5091,7 +5153,7 @@ impl Engine {
 
         let count = { meta.deleted_children_count } as usize;
         let offset = { meta.deleted_children_offset };
-        self.read_deleted_children_at(count, offset)
+        self.read_deleted_children_at(device_id, count, offset)
     }
 
     fn append_deleted_child_best_effort(
@@ -5172,7 +5234,7 @@ impl Engine {
         // wrong DAH-index delta and stamp a mis-flagged post-state. F-G2-011
         // had fixed only `generation` in the set_mined path; this brings the
         // set_conflicting path fully onto fresh `meta`.
-        let response = if !self.device_ptr.is_null() {
+        let response = if !self.device_ptr_for(device_id).is_null() {
             // SAFETY: `device_ptr` is non-null (fast-path gate) and live for
             // the engine's lifetime; `ro` is the allocator-valid record
             // offset from the index entry. The set_conflicting caller holds
@@ -5180,7 +5242,7 @@ impl Engine {
             // per-offset `io_locks()` read side, so the read is
             // torn-read-safe.
             let mut meta = unsafe {
-                io::read_metadata_direct(self.device_ptr, ro).map_err(|e| {
+                io::read_metadata_direct(self.device_ptr_for(device_id), ro).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("{e}"),
                     }
@@ -5236,7 +5298,7 @@ impl Engine {
             // the per-offset `io_locks()` write side for torn-read-safe
             // publication.
             unsafe {
-                io::write_metadata_direct(self.device_ptr, ro, &meta);
+                io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
             }
 
             // Sync index cache from the post-state.
@@ -5394,7 +5456,7 @@ impl Engine {
         let device_id = entry.device_id;
 
         // Fast path: all needed state is in the index cache + 4-byte generation read.
-        if !self.device_ptr.is_null() {
+        if !self.device_ptr_for(device_id).is_null() {
             let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
             let prior_locked = tf.contains(TxFlags::LOCKED);
             let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
@@ -5427,16 +5489,15 @@ impl Engine {
             // per-offset `io_locks()` read/write side, so the RMW is
             // torn-read-safe against concurrent direct accessors.
             unsafe {
-                let mut meta = io::read_metadata_direct(self.device_ptr, ro).map_err(|e| {
-                    SpendError::StorageError {
+                let mut meta = io::read_metadata_direct(self.device_ptr_for(device_id), ro)
+                    .map_err(|e| SpendError::StorageError {
                         detail: format!("{e}"),
-                    }
-                })?;
+                    })?;
                 meta.flags = tf;
                 meta.generation = generation;
                 meta.updated_at = updated_at;
                 meta.delete_at_height = new_dah;
-                io::write_metadata_direct(self.device_ptr, ro, &meta);
+                io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
             }
 
             // Sync index cache
@@ -5872,9 +5933,11 @@ impl Engine {
         // just its first alignment block (multi-block boot-loop fix).
         self.write_zeroed_metadata_header(entry.device_id, entry.record_offset, record_size)?;
         // Step 3: Sync so the zeroed header is durable before any reuse.
-        self.device.sync().map_err(|e| SpendError::StorageError {
-            detail: format!("delete tombstone sync failed: {e}"),
-        })?;
+        self.device_for(entry.device_id)
+            .sync()
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("delete tombstone sync failed: {e}"),
+            })?;
 
         // Step 4: Remove from primary index AND decrement shard_counts in
         // the same critical section so the two can never drift (H2
@@ -5921,7 +5984,7 @@ impl Engine {
         // propagates any allocator error: a double-free there is a genuine bug
         // that must never be hidden.
         {
-            let mut alloc = self.allocator.lock();
+            let mut alloc = self.allocator_for(entry.device_id).lock();
             if tolerate_already_free && !alloc.is_allocated_range(entry.record_offset, record_size)
             {
                 // Region is not fully allocated. Only tolerate the fully
@@ -6617,12 +6680,14 @@ impl Engine {
         // Identity + slot read as ONE snapshot under a single offset guard: no
         // concurrent `write_record_bytes` can change the record's identity
         // between the header read and the slot read.
-        let (identity, slot) =
-            io::read_record_identity_and_slot(&*self.device, entry.record_offset, offset).map_err(
-                |e| SpendError::StorageError {
-                    detail: format!("{e}"),
-                },
-            )?;
+        let (identity, slot) = io::read_record_identity_and_slot(
+            &**self.device_for(entry.device_id),
+            entry.record_offset,
+            offset,
+        )
+        .map_err(|e| SpendError::StorageError {
+            detail: format!("{e}"),
+        })?;
         if identity.tx_id != key.txid {
             return Err(SpendError::TxNotFound);
         }
@@ -6655,12 +6720,13 @@ impl Engine {
                 detail: format!("index lookup failed: {e}"),
             })?
             .ok_or(SpendError::TxNotFound)?;
-        let (identity, slots) =
-            io::read_record_identity_and_slots(&*self.device, entry.record_offset).map_err(
-                |e| SpendError::StorageError {
-                    detail: format!("{e}"),
-                },
-            )?;
+        let (identity, slots) = io::read_record_identity_and_slots(
+            &**self.device_for(entry.device_id),
+            entry.record_offset,
+        )
+        .map_err(|e| SpendError::StorageError {
+            detail: format!("{e}"),
+        })?;
         if identity.tx_id != key.txid {
             return Err(SpendError::TxNotFound);
         }
@@ -6705,10 +6771,14 @@ impl Engine {
             })?
             .ok_or(SpendError::TxNotFound)?;
         let meta = self.read_metadata_for_key(entry.device_id, key, entry.record_offset)?;
-        let slots = io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
+        let slots = io::read_all_utxo_slots(
+            &**self.device_for(entry.device_id),
+            entry.record_offset,
+            meta.utxo_count,
+        )
+        .map_err(|e| SpendError::StorageError {
+            detail: format!("{e}"),
+        })?;
         Ok((meta, slots))
     }
 
@@ -6875,7 +6945,12 @@ impl Engine {
     ///
     /// Returns [`crate::allocator::AllocatorError`] on device I/O failure.
     pub fn persist_allocator(&self) -> crate::allocator::Result<()> {
-        self.allocator.lock().persist()
+        // Persist every store's allocator (one per device).
+        self.allocator.lock().persist()?;
+        for store in &self.aux_stores {
+            store.allocator.lock().persist()?;
+        }
+        Ok(())
     }
 
     /// Force the primary, DAH, and unmined index backends durable on
@@ -10598,7 +10673,7 @@ mod tests {
 
     /// rust-engineer P0: a failed `free_conflicting_children_block` must be
     /// SURFACED as a typed `SpendError::StorageError`, never silently
-    /// dropped. The pre-fix code did `let _ = self.free_conflicting_children_block(...)`
+    /// dropped. The pre-fix code did `let _ = self.free_conflicting_children_block(device_id, ...)`
     /// at two sites, leaking device space permanently. The fix makes the
     /// method return a meaningful `Result` that the call sites act on — two
     /// propagate it with `?` (parent-gone rollback, CAS-retry rollback) and
@@ -10612,7 +10687,7 @@ mod tests {
         let h = TestHarness::new(3, TxFlags::empty());
         let err = h
             .engine
-            .free_conflicting_children_block(u64::MAX, 1)
+            .free_conflicting_children_block(0, u64::MAX, 1)
             .expect_err("freeing an out-of-range offset must error, not swallow");
         assert!(
             matches!(err, SpendError::StorageError { .. }),
