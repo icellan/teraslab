@@ -77,6 +77,20 @@ mime_guess = "2"
 # build.
 mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
+# Work-stealing thread pool for intra-batch read fan-out. A single fat
+# GetRecordBatch (teranode parent decoration, ~826 items) was walked in one
+# serial loop on the connection thread, pinning the read/serving path to a
+# single core. The decoration read path fans the per-item lookups across a
+# dedicated rayon pool (src/server/dispatch.rs), order-preserving, under the
+# already-held shared dispatch_visibility_barrier read guard.
+rayon = "1"
+# In-process CPU sampling profiler for the admin-gated `/debug/pprof/profile`
+# endpoint (src/server/http.rs). Samples the whole process via SIGPROF +
+# ITIMER_PROF and renders either an inferno flamegraph SVG or a pprof
+# protobuf. Admin-gated and single-flight, so it is inert unless an operator
+# deliberately requests a profile. The device pread/pwrite loops already
+# retry EINTR (src/device.rs), so SIGPROF sampling does not perturb live I/O.
+pprof = { version = "0.14", features = ["flamegraph", "protobuf-codec"] }
 redb = "2"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }

@@ -16,9 +16,11 @@ use teraslab::index::{DahIndex, Index, UnminedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
-use teraslab::protocol::codec::{WireCreateItem, encode_create_batch};
+use teraslab::protocol::codec::{
+    FieldMask, WireCreateItem, decode_get_response_checked, encode_create_batch, encode_get_batch,
+};
 use teraslab::protocol::frame::{RequestFrame, ResponseFrame};
-use teraslab::protocol::opcodes::{OP_CREATE_BATCH, STATUS_OK, STATUS_PARTIAL_ERROR};
+use teraslab::protocol::opcodes::{OP_CREATE_BATCH, OP_GET_BATCH, STATUS_OK, STATUS_PARTIAL_ERROR};
 use teraslab::redo::RedoLog;
 use teraslab::server::Server;
 use teraslab::server::dispatch::init_dispatch_metrics;
@@ -223,6 +225,166 @@ pub fn run_clients(tcp_port: u16, clients: u32, per_client: u32) -> (u64, Durati
 
 pub fn ops_per_sec(acked: u64, elapsed: Duration) -> f64 {
     acked as f64 / elapsed.as_secs_f64()
+}
+
+// ============================================================================
+// READ / decoration-heavy profiling harness
+//
+// Mirrors teranode's parent-decoration access pattern: one connection issuing
+// fat `OP_GET_BATCH` requests with `FieldMask::COLD_DATA` set, which forces the
+// slow device-read path (`read_metadata` + `read_cold_data` per item) — the
+// exact loop that pegs a single core in `handle_get_batch`. COLD_DATA is not in
+// `FieldMask::INDEX_CACHED`, so `fully_cached()` is false and the request never
+// short-circuits to the zero-I/O fast path.
+// ============================================================================
+
+/// The decoration field mask: cold data only. Not index-cached, so it drives
+/// the per-item device-read path that the single-core bottleneck lives on.
+pub const DECORATION_FIELD_MASK: u32 = FieldMask::COLD_DATA;
+
+/// Build a parent-tx cold-data blob in the 3-section wire format
+/// `[inputs_len:4 LE][inputs][outputs_len:4 LE][outputs][inpoints_len:4 LE][inpoints]`
+/// (see `parse_cold_data_fields` in dispatch). `outputs_bytes` sizes the
+/// outputs section — the part parent decoration actually consumes — while
+/// inputs/inpoints stay small, mirroring a real parent tx where outputs
+/// dominate. Phase D (outputs-only cold read) reuses this layout.
+pub fn make_cold_data(outputs_bytes: usize) -> Vec<u8> {
+    let inputs = [0xA1u8; 32];
+    let inpoints = [0xC3u8; 16];
+    let mut blob = Vec::with_capacity(12 + inputs.len() + outputs_bytes + inpoints.len());
+    blob.extend_from_slice(&(inputs.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&inputs);
+    blob.extend_from_slice(&(outputs_bytes as u32).to_le_bytes());
+    blob.extend((0..outputs_bytes).map(|i| (i & 0xff) as u8));
+    blob.extend_from_slice(&(inpoints.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&inpoints);
+    blob
+}
+
+/// txid for a seeded decoration-parent record. Distinct namespace from
+/// [`make_tx_id`] (write harness) so the two never collide in one process, and
+/// — critically — varies bytes `[24..32]`, which is what `index_shard_for_key`
+/// hashes. The write harness leaves those zero, pinning every key to one shard;
+/// read-scaling needs keys spread across all shards so parallel readers hit
+/// independent shard locks.
+pub fn make_read_tx_id(n: u32) -> [u8; 32] {
+    let mut t = [0u8; 32];
+    t[0..4].copy_from_slice(&n.to_le_bytes());
+    let mix = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    t[24..32].copy_from_slice(&mix.to_le_bytes());
+    t
+}
+
+/// Seed `count` decoration-parent records, each carrying `cold_bytes` of
+/// outputs cold data, created in frames of 128 via `OP_CREATE_BATCH`. Returns
+/// the seeded txids in order. Panics on any non-OK create — a seed failure
+/// would silently turn the read profile into a not-found benchmark.
+pub fn seed_cold_records(tcp_port: u16, count: u32, cold_bytes: usize) -> Vec<[u8; 32]> {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let cold = make_cold_data(cold_bytes);
+    let mut txids = Vec::with_capacity(count as usize);
+    const PER_FRAME: u32 = 128;
+    let mut i = 0u32;
+    let mut req_id = 0u64;
+    while i < count {
+        let n = PER_FRAME.min(count - i);
+        let items: Vec<WireCreateItem> = (0..n)
+            .map(|k| {
+                let txid = make_read_tx_id(i + k);
+                txids.push(txid);
+                let mut item = make_create_item(txid);
+                item.cold_data = cold.clone();
+                item
+            })
+            .collect();
+        let payload = encode_create_batch(&items);
+        let resp = send_frame(
+            &mut stream,
+            &RequestFrame {
+                request_id: req_id,
+                op_code: OP_CREATE_BATCH,
+                flags: 0,
+                payload: payload.into(),
+            },
+        );
+        assert!(
+            resp.status == STATUS_OK || resp.status == STATUS_PARTIAL_ERROR,
+            "seed create frame {req_id} failed: status={}",
+            resp.status
+        );
+        req_id += 1;
+        i += n;
+    }
+    txids
+}
+
+/// One connection issuing `batches` `OP_GET_BATCH` requests of `batch_size`
+/// txids each (cycling through `txids`) with the decoration field mask — the
+/// fat-batch-on-one-conn shape teranode uses. Returns (items decorated OK,
+/// elapsed). Asserts every batch comes back fully decorated so a regression
+/// that drops items can't masquerade as throughput.
+pub fn drive_decoration_reads(
+    tcp_port: u16,
+    txids: &[[u8; 32]],
+    batch_size: usize,
+    batches: u32,
+) -> (u64, Duration) {
+    assert!(!txids.is_empty(), "no seeded txids to read");
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut ok = 0u64;
+    let mut cursor = 0usize;
+    let start = Instant::now();
+    for b in 0..batches {
+        let batch: Vec<[u8; 32]> = (0..batch_size)
+            .map(|_| {
+                let t = txids[cursor % txids.len()];
+                cursor += 1;
+                t
+            })
+            .collect();
+        let payload = encode_get_batch(DECORATION_FIELD_MASK, &batch);
+        let resp = send_frame(
+            &mut stream,
+            &RequestFrame {
+                request_id: b as u64,
+                op_code: OP_GET_BATCH,
+                flags: 0,
+                payload: payload.into(),
+            },
+        );
+        let items = decode_get_response_checked(&resp.payload, batch_size as u32 + 1)
+            .expect("decode get response");
+        ok += items.iter().filter(|r| r.status == STATUS_OK).count() as u64;
+    }
+    (ok, start.elapsed())
+}
+
+/// Run `clients` connections concurrently, each issuing `batches_per_client`
+/// decoration reads of `batch_size`. Returns (total items decorated, wall
+/// elapsed). With `clients == 1` this is the single-connection fat-batch
+/// profile whose CPU/wall ratio exposes the intra-batch serialization.
+pub fn run_read_clients(
+    tcp_port: u16,
+    txids: &[[u8; 32]],
+    clients: u32,
+    batch_size: usize,
+    batches_per_client: u32,
+) -> (u64, Duration) {
+    let start = Instant::now();
+    let mut totals = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..clients)
+            .map(|_| {
+                s.spawn(|| drive_decoration_reads(tcp_port, txids, batch_size, batches_per_client))
+            })
+            .collect();
+        for h in handles {
+            totals.push(h.join().unwrap().0);
+        }
+    });
+    (totals.iter().sum(), start.elapsed())
 }
 
 /// Total process CPU time (user+sys, all threads) via getrusage(RUSAGE_SELF).
