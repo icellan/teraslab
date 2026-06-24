@@ -116,7 +116,7 @@ impl BlobGcStats {
 ///
 /// Returned by the lookup closure passed to [`reconcile_orphan_blobs_with`]
 /// so the caller can plug in either the runtime [`Engine`] (live operation)
-/// or a borrowed [`PrimaryBackend`] (recovery-time, before the engine has
+/// or a borrowed `PrimaryBackend` (recovery-time, before the engine has
 /// been built).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupOutcome {
@@ -131,7 +131,7 @@ pub enum LookupOutcome {
 /// entry is absent or present without [`TxFlags::EXTERNAL`].
 ///
 /// Generic over the index lookup so the same logic can run against the
-/// runtime [`Engine`] (background sweep) or a borrowed [`PrimaryBackend`]
+/// runtime [`Engine`] (background sweep) or a borrowed `PrimaryBackend`
 /// (recovery, before the engine has been constructed).
 ///
 /// Returns aggregate counters for observability. Errors from the underlying

@@ -1197,7 +1197,7 @@ impl Engine {
     /// Get the record count for a shard.
     ///
     /// Shard counters are populated eagerly during engine construction (see
-    /// [`Self::compute_shard_counts`]), before any concurrent access is
+    /// `Self::compute_shard_counts`), before any concurrent access is
     /// possible, so this is always O(1) and lock-free. After construction the
     /// counters are maintained incrementally by the register/unregister paths
     /// under each owning shard's write lock, so they never drift from the
@@ -1247,7 +1247,7 @@ impl Engine {
     /// this is a new key.
     ///
     /// Shard counters are eagerly initialized in the constructor
-    /// ([`Self::compute_shard_counts`]), so by the time any request is
+    /// (`Self::compute_shard_counts`), so by the time any request is
     /// dispatched the counters always track the primary index: if the backend
     /// `register` fails, no count mutation is observed; if it succeeds with a
     /// newly inserted key, the matching `fetch_add` executes under the same
@@ -1416,7 +1416,7 @@ impl Engine {
     /// Returns the removed entry (or `None` if the key was not present), or
     /// an `IndexError` if the (redb) backend's write transaction fails.
     /// Shard counters are eagerly initialized in the constructor
-    /// ([`Self::compute_shard_counts`]), so the count is decremented (under the
+    /// (`Self::compute_shard_counts`), so the count is decremented (under the
     /// shard write guard) whenever an entry is actually removed — `shard_counts`
     /// tracks the primary index continuously, no deferred scan is ever needed.
     ///
@@ -6664,7 +6664,7 @@ impl Engine {
     ///
     /// This method's order (dah → unmined → shard.read) is the REVERSE of the
     /// write path (shard.write → dah → unmined, see
-    /// [`Engine::sync_primary_and_both_secondary_atomic`]). The two are
+    /// `Engine::sync_primary_and_both_secondary_atomic`). The two are
     /// deadlock-free ONLY because this method is called exclusively by the
     /// checkpoint task while it holds `dispatch_visibility_barrier.write()`,
     /// which excludes every write-path caller from holding any index or

@@ -2,7 +2,7 @@
 //!
 //! Three hot-path routers in this crate share the same SplitMix64 finalizer
 //! (constants `0xbf58476d1ce4e5b9`, `0x94d049bb133111eb`):
-//! - [`crate::index::hashtable::bucket_index`] — uses txid bytes `[0..8]`
+//! - `crate::index::hashtable::bucket_index` — uses txid bytes `[0..8]`
 //! - [`crate::locks::StripedLocks::stripe_index`] — uses txid bytes `[16..24]`
 //! - [`crate::index::sharded::ShardedIndex::index_shard_for_key`] — uses txid bytes `[24..32]`
 //!

@@ -125,7 +125,7 @@ fn arr8(s: &[u8]) -> [u8; 8] {
 /// # Shard count
 ///
 /// `shard_count` is rounded up to the next power of two and clamped to `[1, 256]`
-/// by [`clamp_shard_count`]. A power-of-two count allows the shard selection to
+/// by `clamp_shard_count`. A power-of-two count allows the shard selection to
 /// use a bitmask instead of a modulo.
 pub struct ShardedIndex {
     shards: Vec<RwLock<PrimaryBackend>>,
@@ -278,7 +278,7 @@ impl ShardedIndex {
     /// Register or update an entry without performing the mmap hash-table
     /// resize inline.
     ///
-    /// See [`PrimaryBackend::register_without_resize`] for the contract.
+    /// See `PrimaryBackend::register_without_resize` for the contract.
     /// Acquires an exclusive write lock on the owning shard.
     pub fn register_without_resize(
         &self,
@@ -735,7 +735,7 @@ impl ShardedIndex {
     /// # Cross-shard atomicity
     ///
     /// The FILE write is atomic, but at N>1 shards the per-shard read locks are
-    /// taken serially (one region at a time in [`Self::serialize_v2`]), so the
+    /// taken serially (one region at a time in `Self::serialize_v2`), so the
     /// snapshot is NOT a single point-in-time view across shards: region `i+1`
     /// may include mutations that landed after region `i` was serialized. A
     /// caller that needs a consistent cross-shard snapshot MUST quiesce writes
@@ -873,7 +873,7 @@ impl ShardedIndex {
     ///
     /// The dah/unmined secondary indexes are returned unsharded, restored
     /// exactly as the v1 path does (independent-section recovery via
-    /// [`crate::index::parse_secondary_sections`]).
+    /// `crate::index::parse_secondary_sections`).
     ///
     /// # Errors
     ///
@@ -1093,7 +1093,7 @@ impl ShardedIndex {
     /// - `allocator`: the slot allocator whose freelist is used to skip free
     ///   holes during the scan (passed unchanged to `PrimaryBackend::rebuild`).
     /// - `shard_count`: the target number of index shards. Rounded up to the
-    ///   next power of two and clamped to `[1, 256]` by [`clamp_shard_count`].
+    ///   next power of two and clamped to `[1, 256]` by `clamp_shard_count`.
     ///   Use `1` for the N=1 degenerate case (single-lock pass-through).
     ///
     /// # Errors
@@ -1134,8 +1134,8 @@ impl ShardedIndex {
     /// Resize index shard `shard_idx` if it currently needs one.
     ///
     /// Acquires the shard's write lock and delegates to
-    /// [`PrimaryBackend::resize_if_needed`], which checks
-    /// [`PrimaryBackend::resize_target_capacity`], and (if a resize is needed)
+    /// `PrimaryBackend::resize_if_needed`, which checks
+    /// `PrimaryBackend::resize_target_capacity`, and (if a resize is needed)
     /// builds a resized copy, marks the old backend defunct, and swaps it in.
     /// Retained for callers that do not already hold the shard guard; the engine
     /// register paths now resize directly on their held guard.
