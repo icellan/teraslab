@@ -935,30 +935,63 @@ pub fn recover_all_multi_store(
     let mut total = RecoveryStats::default();
     let mut pending_cc = Vec::new();
     let mut pending_dc = Vec::new();
-    // Replay each store independently against its own device + allocator. The
-    // secondary indexes are SHARED and span all stores, so per-store reconcile
-    // would read other stores' records from the wrong device — skip it here and
-    // reconcile once, store-routed, after every store has replayed.
-    for (store_id, part) in partitions.into_iter().enumerate() {
-        let (stats, cc, dc) = recover_entries_with_allocator_collecting_pending_conflicts(
-            &*devices[store_id],
-            part,
-            index,
-            dah,
-            unmined,
-            Some(&mut allocators[store_id]),
-            None,
-            SecondaryReconcile::Skip,
-        )?;
+
+    // Replay every store IN PARALLEL — one scoped thread per store. Stores are
+    // independent (each owns its device + allocator); the primary index is
+    // shared and concurrency-safe (PR#19 per-shard RwLocks), and a record's
+    // ops all live in one store's partition, so no two threads touch the same
+    // key/offset. The only otherwise-shared `&mut` is the secondary indexes:
+    // each thread replays its SecondaryDahUpdate/Unmined ops into a THROWAWAY
+    // backend (discarded) — the authoritative DAH/unmined are rebuilt once,
+    // store-routed, by the reconcile after all replays. So nothing real is
+    // shared mutably across threads.
+    type StoreResult = Result<
+        (
+            RecoveryStats,
+            Vec<PendingAppendConflictingChild>,
+            Vec<PendingAppendDeletedChild>,
+        ),
+        RecoveryError,
+    >;
+    let results: Vec<StoreResult> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(devices.len());
+        for ((part, device), alloc) in partitions
+            .into_iter()
+            .zip(devices.iter())
+            .zip(allocators.iter_mut())
+        {
+            handles.push(scope.spawn(move || {
+                let mut throwaway_dah = DahBackend::new_in_memory();
+                let mut throwaway_unmined = UnminedBackend::new_in_memory();
+                recover_entries_with_allocator_collecting_pending_conflicts(
+                    &**device,
+                    part,
+                    index,
+                    &mut throwaway_dah,
+                    &mut throwaway_unmined,
+                    Some(alloc),
+                    None,
+                    SecondaryReconcile::Skip,
+                )
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("recovery store thread panicked"))
+            .collect()
+    });
+    for r in results {
+        let (stats, cc, dc) = r?;
         total.merge(stats);
         pending_cc.extend(cc);
         pending_dc.extend(dc);
     }
-    // One store-routed secondary reconcile across the now-complete index. A
-    // full re-derive is correct for every backend (it rebuilds DAH/unmined from
-    // each record's metadata, read from its own store); `full_secondary_rebuild`
-    // is informational here since the per-store SecondaryDahUpdate/Unmined redo
-    // ops were already replayed above.
+
+    // One store-routed secondary reconcile across the now-complete index: it
+    // rebuilds DAH/unmined from each record's metadata read from its own store
+    // (the throwaway per-thread secondaries above are discarded). A full
+    // re-derive is correct for every backend, so `full_secondary_rebuild` is
+    // informational here.
     let _ = full_secondary_rebuild;
     reconcile_secondary_indexes_from_metadata_multi(devices, index, dah, unmined)?;
     Ok((total, pending_cc, pending_dc))
@@ -4963,6 +4996,123 @@ mod tests {
             io::read_metadata(&*dev0, off_b).map(|m| m.tx_id).ok(),
             Some(key_b.txid),
             "B must not have been written to store 0"
+        );
+    }
+
+    /// Stress the PARALLEL multi-store recovery: 8 stores, many records each
+    /// (with DAH/unmined heights to exercise the store-routed secondary
+    /// reconcile), one shared interleaved redo log. Verifies concurrent replay
+    /// rebuilds the full index with correct per-store routing and secondaries —
+    /// no index/allocator races, no cross-store contamination.
+    #[test]
+    fn parallel_multi_store_recovery_many_records() {
+        const STORES: usize = 8;
+        const PER_STORE: u32 = 40;
+
+        let mut devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
+        let mut allocators: Vec<SlotAllocator> = Vec::new();
+        for _ in 0..STORES {
+            let dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            allocators.push(SlotAllocator::new(dev.clone()).unwrap());
+            devices.push(dev);
+        }
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(8192).unwrap());
+
+        let redo_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut redo = RedoLog::open(redo_dev, 0, 64 * 1024 * 1024).unwrap();
+
+        // Track expected per-key (store, has_dah) for verification.
+        let mut expected: Vec<(TxKey, u8, bool)> = Vec::new();
+        for r in 0..PER_STORE {
+            // Interleave stores so the shared log mixes ops from all stores.
+            for s in 0..STORES {
+                let utxo_count: u32 = 2;
+                let mut txid = [0u8; 32];
+                txid[0] = s as u8;
+                txid[1..5].copy_from_slice(&r.to_le_bytes());
+                // Spread across index shards (bytes [24..32]).
+                txid[24..32].copy_from_slice(&((r as u64) << 8 | s as u64).to_le_bytes());
+                let has_dah = (r % 3) == 0;
+                let mut meta = TxMetadata::new(utxo_count);
+                meta.tx_id = txid;
+                let base = TxMetadata::record_size_for(utxo_count);
+                meta.record_size = base as u32;
+                if has_dah {
+                    meta.delete_at_height = 1000 + r;
+                }
+                let slots: Vec<UtxoSlot> = (0..utxo_count)
+                    .map(|i| {
+                        let mut h = [0u8; 32];
+                        h[0] = s as u8;
+                        h[1] = i as u8;
+                        UtxoSlot::new_unspent(h)
+                    })
+                    .collect();
+                let offset = allocators[s].allocate(base).unwrap();
+                let mut rb = Vec::with_capacity(METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE);
+                let mut mb = [0u8; METADATA_SIZE];
+                meta.to_bytes(&mut mb);
+                rb.extend_from_slice(&mb);
+                for slot in &slots {
+                    let mut sb = [0u8; UTXO_SLOT_SIZE];
+                    slot.to_bytes(&mut sb);
+                    rb.extend_from_slice(&sb);
+                }
+                redo.append_and_flush(RedoOp::Create {
+                    tx_key: TxKey { txid },
+                    device_id: s as u8,
+                    record_offset: offset,
+                    utxo_count,
+                    is_conflicting: false,
+                    record_bytes: rb,
+                    parent_txids: Vec::new(),
+                })
+                .unwrap();
+                expected.push((TxKey { txid }, s as u8, has_dah));
+            }
+        }
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let (stats, _, _) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo,
+            &index,
+            &mut dah,
+            &mut unmined,
+            true,
+        )
+        .unwrap();
+
+        let total = STORES as u64 * PER_STORE as u64;
+        assert_eq!(stats.entries_replayed, total, "every create must replay");
+        assert_eq!(stats.entries_failed, 0);
+        assert_eq!(index.len() as u64, total, "index must hold all records");
+
+        let mut expected_dah = 0usize;
+        for (key, store, has_dah) in &expected {
+            let e = index
+                .lookup(key)
+                .unwrap_or_else(|| panic!("missing key on store {store}"));
+            assert_eq!(e.device_id, *store, "record routed to the wrong store");
+            // Read back from the record's OWN store and verify identity.
+            let meta = io::read_metadata(&*devices[*store as usize], e.record_offset)
+                .expect("record readable from its store");
+            assert_eq!(
+                meta.tx_id, key.txid,
+                "record content mismatch (wrong store?)"
+            );
+            if *has_dah {
+                expected_dah += 1;
+            }
+        }
+        // The store-routed secondary reconcile rebuilt DAH across all stores.
+        assert_eq!(
+            dah.len(),
+            expected_dah,
+            "DAH must hold every delete-at-height record across all stores"
         );
     }
 
