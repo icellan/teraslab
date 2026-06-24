@@ -266,11 +266,9 @@ impl Bucket {
 #[inline(always)]
 fn bucket_index(key: &TxKey, seed: u64, mask: usize) -> usize {
     let h = u64::from_le_bytes(key.txid[0..8].try_into().unwrap());
-    let mut x = h ^ seed;
-    // SplitMix64 finalizer — 2 multiplies + 2 xorshifts, ~2 ns.
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^= x >> 31;
+    // SplitMix64 finalizer over (raw XOR seed) — shared impl in
+    // `crate::index::hashmix` so the three per-txid routers cannot drift.
+    let x = crate::index::hashmix::splitmix64_finalize(h ^ seed);
     (x as usize) & mask
 }
 

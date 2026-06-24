@@ -79,17 +79,7 @@ const V2_MAX_SHARD_COUNT: usize = 256;
 /// syscall is unavailable (e.g. restricted sandboxes).
 fn index_shard_seed() -> u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
-    *SEED.get_or_init(|| {
-        let mut buf = [0u8; 8];
-        if getrandom::getrandom(&mut buf).is_ok() {
-            return u64::from_le_bytes(buf);
-        }
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let mut h = RandomState::new().build_hasher();
-        h.write_u64(0x9e37_79b9_7f4a_7c15);
-        h.finish()
-    })
+    *SEED.get_or_init(crate::index::hashmix::init_process_seed)
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +129,6 @@ fn arr8(s: &[u8]) -> [u8; 8] {
 /// use a bitmask instead of a modulo.
 pub struct ShardedIndex {
     shards: Vec<RwLock<PrimaryBackend>>,
-    shard_mask: usize,
     seed: u64,
 }
 
@@ -161,22 +150,18 @@ impl ShardedIndex {
         for _ in 0..count {
             shards.push(RwLock::new(PrimaryBackend::new_in_memory(per_shard)?));
         }
-        Ok(Self {
-            shards,
-            shard_mask: count - 1,
-            seed,
-        })
+        Ok(Self { shards, seed })
     }
 
     /// Wrap an existing [`PrimaryBackend`] as a single-shard `ShardedIndex`.
     ///
     /// This is the transparent pass-through used by the engine migration: a
-    /// `ShardedIndex` with `shard_count == 1` and `shard_mask == 0` routes every
-    /// key to the one shard, so its behaviour is byte-for-byte identical to the
-    /// wrapped backend behind a plain `RwLock`. A fresh process-local seed is
-    /// installed; at one shard the seed never affects routing (the mask is `0`),
-    /// so its only role is to keep the type uniform with the multi-shard
-    /// constructors.
+    /// `ShardedIndex` with `shard_count == 1` routes every key to the one shard
+    /// (the inline mask `shards.len() - 1` is `0`), so its behaviour is
+    /// byte-for-byte identical to the wrapped backend behind a plain `RwLock`. A
+    /// fresh process-local seed is installed; at one shard the seed never
+    /// affects routing (the mask is `0`), so its only role is to keep the type
+    /// uniform with the multi-shard constructors.
     ///
     /// Used to migrate `Engine.index` to `ShardedIndex` without changing the
     /// `PrimaryBackend` semantics or the recovery/snapshot on-disk formats —
@@ -184,7 +169,6 @@ impl ShardedIndex {
     pub fn from_single(backend: PrimaryBackend) -> Self {
         Self {
             shards: vec![RwLock::new(backend)],
-            shard_mask: 0,
             seed: index_shard_seed(),
         }
     }
@@ -202,12 +186,7 @@ impl ShardedIndex {
     /// than their region, breaking the direct (matching-count) restore.
     fn from_backends_with_seed(backends: Vec<PrimaryBackend>, seed: u64) -> Self {
         let shards: Vec<RwLock<PrimaryBackend>> = backends.into_iter().map(RwLock::new).collect();
-        let mask = shards.len().saturating_sub(1);
-        Self {
-            shards,
-            shard_mask: mask,
-            seed,
-        }
+        Self { shards, seed }
     }
 
     /// Number of shards in this index.
@@ -225,11 +204,13 @@ impl ShardedIndex {
         // cannot fail; `unwrap_or` maps the impossible error to 0 (panic-free
         // library code per project rules, mirroring `locks.rs`).
         let raw = u64::from_le_bytes(key.txid[24..32].try_into().unwrap_or([0u8; 8]));
-        let mut x = raw ^ self.seed;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^= x >> 31;
-        (x as usize) & self.shard_mask
+        // SplitMix64 finalizer over (raw XOR seed) — shared impl in
+        // `crate::index::hashmix`.
+        let x = crate::index::hashmix::splitmix64_finalize(raw ^ self.seed);
+        // `shards.len()` is always a clamped power-of-two ≥ 1 (every constructor
+        // routes through `clamp_shard_count`), so `len - 1` is always the
+        // correct bitmask — no separate `shard_mask` field needed.
+        (x as usize) & (self.shards.len() - 1)
     }
 
     /// Acquire a read lock on the shard that owns `key`.
@@ -240,6 +221,26 @@ impl ShardedIndex {
     /// Acquire a write lock on the shard that owns `key`.
     pub fn write_shard(&self, key: &TxKey) -> RwLockWriteGuard<'_, PrimaryBackend> {
         self.shards[self.index_shard_for_key(key)].write()
+    }
+
+    /// Acquire a write lock on shard `index_shard` directly (no routing).
+    ///
+    /// For callers that have already computed the owning shard via
+    /// [`Self::index_shard_for_key`] and want to avoid recomputing it inside
+    /// [`Self::write_shard`]. `index_shard` MUST be in `[0, shard_count())` —
+    /// guaranteed when it comes from `index_shard_for_key` on the same
+    /// `ShardedIndex` instance (the mask bounds it to a valid shard).
+    #[inline]
+    pub fn write_shard_at(&self, index_shard: usize) -> RwLockWriteGuard<'_, PrimaryBackend> {
+        self.shards[index_shard].write()
+    }
+
+    /// Acquire a read lock on shard `index_shard` directly (no routing).
+    ///
+    /// See [`Self::write_shard_at`] for the index contract.
+    #[inline]
+    pub fn read_shard_at(&self, index_shard: usize) -> RwLockReadGuard<'_, PrimaryBackend> {
+        self.shards[index_shard].read()
     }
 
     // -----------------------------------------------------------------------
@@ -506,6 +507,10 @@ impl ShardedIndex {
     /// blocking — the observability/admin path (`/admin/top`) must never stall
     /// behind the write path. When all shards are readable, returns the same
     /// merged [`IndexStats`] as [`Self::stats`].
+    ///
+    /// All-or-nothing: returns `None` if **any** shard's `try_read` is
+    /// contended, so at N>1 shards a contended sample yields a momentarily
+    /// absent snapshot rather than a partial/skewed one.
     pub fn try_stats(&self) -> Option<IndexStats> {
         let mut total_entries = 0usize;
         let mut total_capacity = 0usize;
@@ -676,17 +681,28 @@ impl ShardedIndex {
     /// Flush every shard durable.
     ///
     /// Iterates all shard locks (read is sufficient — `flush_durable` takes
-    /// `&self` on `PrimaryBackend`) and flushes each. Returns on the first
-    /// error encountered (subsequent shards are NOT flushed on error).
+    /// `&self` on `PrimaryBackend`) and attempts to flush EVERY shard, then
+    /// returns the FIRST error encountered (if any). Continuing past an early
+    /// failure ensures a durability flush is never silently partial: an error
+    /// from shard `i` no longer leaves shards `i+1..N` unflushed.
     ///
     /// # Errors
     ///
-    /// Returns [`IndexError`] if any shard's backend flush fails.
+    /// Returns the first [`IndexError`] encountered across all shards, after
+    /// every shard's flush has been attempted.
     pub fn flush_durable(&self) -> Result<(), IndexError> {
+        let mut first_err: Option<IndexError> = None;
         for shard in &self.shards {
-            shard.read().flush_durable()?;
+            if let Err(e) = shard.read().flush_durable() {
+                // Keep only the FIRST error; still attempt the remaining shards
+                // so the durability flush is never silently partial.
+                first_err.get_or_insert(e);
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Snapshot the primary index and both secondary indexes to `path`.
@@ -713,8 +729,18 @@ impl ShardedIndex {
     /// (mirroring [`PrimaryBackend::snapshot_all`], which is a no-op for those
     /// variants — a sharded multi-region file would be meaningless for them).
     ///
-    /// The snapshot is written atomically via a temp file + rename + parent
-    /// directory fsync.
+    /// The snapshot file is written atomically via a temp file + rename +
+    /// parent directory fsync.
+    ///
+    /// # Cross-shard atomicity
+    ///
+    /// The FILE write is atomic, but at N>1 shards the per-shard read locks are
+    /// taken serially (one region at a time in [`Self::serialize_v2`]), so the
+    /// snapshot is NOT a single point-in-time view across shards: region `i+1`
+    /// may include mutations that landed after region `i` was serialized. A
+    /// caller that needs a consistent cross-shard snapshot MUST quiesce writes
+    /// first — the checkpoint path does this by holding
+    /// `dispatch_visibility_barrier.write()`.
     ///
     /// # Errors
     ///
@@ -764,6 +790,12 @@ impl ShardedIndex {
     }
 
     /// Serialize this index into the v2 N-shard manifest byte layout.
+    ///
+    /// Each shard's read lock is taken serially (one region at a time), so the
+    /// resulting bytes are NOT atomic across shards at N>1: later regions may
+    /// reflect mutations that occurred after earlier regions were read. The
+    /// caller ([`Self::snapshot_all`]) must quiesce writes via the visibility
+    /// barrier when a consistent cross-shard snapshot is required.
     ///
     /// Returns [`IndexError::FormatError`] if any shard is not an in-memory
     /// backend (the only variant that participates in the in-memory snapshot).
@@ -993,9 +1025,22 @@ impl ShardedIndex {
         } else {
             // Mismatched count: re-shard every entry into the target layout
             // under a fresh process seed.
-            let sharded = Self::new_in_memory(0, target)?;
+            //
+            // Deserialize every region first and sum their entry counts so the
+            // fresh index is sized for the actual total. Passing `0` here (the
+            // old behaviour) hinted 1 entry per shard and triggered a rehash
+            // storm on a large snapshot — each shard resized O(log N) times as
+            // entries streamed in. The sibling matching-count path and
+            // `reshard_from_index` already size from the real count.
+            let mut regions: Vec<Index> = Vec::with_capacity(region_bounds.len());
+            let mut total_entries = 0usize;
             for &(off, end) in &region_bounds {
                 let (idx, _consumed) = Index::deserialize_primary_with_offset(&data[off..end])?;
+                total_entries += idx.len();
+                regions.push(idx);
+            }
+            let sharded = Self::new_in_memory(total_entries.max(1), target)?;
+            for idx in &regions {
                 for (key, entry) in idx.iter() {
                     sharded.register(key, entry)?;
                 }
@@ -1088,12 +1133,12 @@ impl ShardedIndex {
 
     /// Resize index shard `shard_idx` if it currently needs one.
     ///
-    /// Checks [`PrimaryBackend::resize_target_capacity`] under the write lock.
-    /// If no resize is needed, returns `Ok(())` immediately. Otherwise builds
-    /// a resized copy under the write lock, marks the old backend defunct, and
-    /// swaps it in — exactly mirroring the engine's
-    /// `resize_primary_index_without_blocking_readers` logic but for a single
-    /// shard.
+    /// Acquires the shard's write lock and delegates to
+    /// [`PrimaryBackend::resize_if_needed`], which checks
+    /// [`PrimaryBackend::resize_target_capacity`], and (if a resize is needed)
+    /// builds a resized copy, marks the old backend defunct, and swaps it in.
+    /// Retained for callers that do not already hold the shard guard; the engine
+    /// register paths now resize directly on their held guard.
     ///
     /// `shard_idx` must be in `[0, shard_count())`.
     ///
@@ -1110,16 +1155,7 @@ impl ShardedIndex {
                 ),
             });
         }
-
-        let mut guard = self.shards[shard_idx].write();
-        let Some(target_capacity) = guard.resize_target_capacity() else {
-            return Ok(());
-        };
-
-        let resized = guard.resized_copy(target_capacity)?;
-        guard.mark_defunct_for_resize();
-        *guard = resized;
-        Ok(())
+        self.shards[shard_idx].write().resize_if_needed()
     }
 }
 

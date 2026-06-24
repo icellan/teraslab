@@ -7,6 +7,7 @@
 pub mod backend;
 pub mod conflicting_index;
 pub mod dah_index;
+pub mod hashmix;
 pub mod hashtable;
 pub mod migration;
 pub mod redb_dah;

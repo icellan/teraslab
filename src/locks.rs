@@ -33,25 +33,15 @@ use std::sync::OnceLock;
 /// on-disk layout implications: lock striping is purely in-memory, so a
 /// fresh random seed every process start is free of compatibility concerns.
 fn stripe_seed() -> u64 {
+    // Prefer the OS CSPRNG. Unlike the index hashtable — where a non-random
+    // seed would silently re-enable a DoS and therefore justifies a panic — a
+    // lock stripe collision only costs contention, never correctness. So on the
+    // (essentially impossible) `getrandom` failure the shared initializer
+    // (`crate::index::hashmix::init_process_seed`) falls back to a still
+    // process-unpredictable `RandomState`-derived seed rather than aborting the
+    // process. No `expect()` in library code.
     static SEED: OnceLock<u64> = OnceLock::new();
-    *SEED.get_or_init(|| {
-        // Prefer the OS CSPRNG. Unlike the index hashtable — where a
-        // non-random seed would silently re-enable a DoS and therefore
-        // justifies a panic — a lock stripe collision only costs
-        // contention, never correctness. So on the (essentially
-        // impossible) `getrandom` failure we fall back to a still
-        // process-unpredictable seed derived from `RandomState` rather
-        // than aborting the process. No `expect()` in library code.
-        let mut buf = [0u8; 8];
-        if getrandom::getrandom(&mut buf).is_ok() {
-            return u64::from_le_bytes(buf);
-        }
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let mut h = RandomState::new().build_hasher();
-        h.write_u64(0x9e37_79b9_7f4a_7c15);
-        h.finish()
-    })
+    *SEED.get_or_init(crate::index::hashmix::init_process_seed)
 }
 
 // ---------------------------------------------------------------------------
@@ -189,12 +179,9 @@ impl StripedLocks {
         // the impossible error to a 0 fallback rather than `expect` to keep
         // library code panic-free — a 0 here would still be deterministic.
         let raw = u64::from_le_bytes(key.txid[16..24].try_into().unwrap_or([0u8; 8]));
-        // SplitMix64 finalizer over (raw XOR seed): 2 multiplies + 2
-        // xorshifts, ~2 ns, mirroring `hashtable::bucket_index`.
-        let mut x = raw ^ self.seed;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^= x >> 31;
+        // SplitMix64 finalizer over (raw XOR seed): shared impl in
+        // `crate::index::hashmix`, mirroring `hashtable::bucket_index`.
+        let x = crate::index::hashmix::splitmix64_finalize(raw ^ self.seed);
         (x as usize) & self.mask
     }
 

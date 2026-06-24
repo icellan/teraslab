@@ -908,11 +908,15 @@ impl Engine {
     /// `delete_at_height` simultaneously). Ordering:
     ///
     /// 1. Redo log: append DAH + unmined intents in one batch, single fsync.
-    /// 2. Acquire the primary index write lock, then DAH, then unmined.
-    ///    This matches the project-wide acquisition order used by
-    ///    [`Engine::snapshot_index`] and the set_mined fast path
-    ///    (index → dah → unmined), so the three operations can never
-    ///    deadlock against each other.
+    /// 2. Acquire the primary index (shard) write lock, then DAH, then unmined
+    ///    (shard.write → dah → unmined). NOTE: this order is INVERTED relative
+    ///    to [`Engine::snapshot_index`], which takes the shard lock LAST
+    ///    (dah → unmined → shard.read). The two paths are nonetheless
+    ///    deadlock-free because every write-path caller and the checkpoint
+    ///    (which is the sole caller of `snapshot_index`) are mutually excluded
+    ///    by `dispatch_visibility_barrier`: the write side acquires it before
+    ///    any index/secondary lock, so a writer and the inverted-order
+    ///    checkpoint can never hold one of these locks at the same time.
     /// 3. Apply the primary in-memory cache update
     ///    (`update_cached_fields`) while both secondary mutexes are also
     ///    held, so any reader that consults a secondary index and then
@@ -1237,17 +1241,17 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Register a primary-index entry and, if shard counters have been
-    /// initialized, increment the matching shard count atomically within the
-    /// same index write-lock critical section only when this is a new key.
+    /// Register a primary-index entry and increment the matching shard count
+    /// atomically within the same index write-lock critical section, only when
+    /// this is a new key.
     ///
-    /// Before lazy initialization, count mutations are intentionally skipped:
-    /// the first `shard_record_count` call will scan the primary index after
-    /// any active writer drops this lock. After initialization, this guarantees
-    /// `shard_counts` never drifts from the primary index: if backend
+    /// Shard counters are eagerly initialized in the constructor
+    /// ([`Self::compute_shard_counts`]), so by the time any request is
+    /// dispatched the counters always track the primary index: if the backend
     /// `register` fails, no count mutation is observed; if it succeeds with a
-    /// newly inserted key, the matching `fetch_add` executes before the write
-    /// lock is released.
+    /// newly inserted key, the matching `fetch_add` executes under the same
+    /// shard write guard before that guard is released. `shard_counts`
+    /// therefore never drifts from the primary index.
     ///
     /// # Errors
     /// Returns `IndexError`(crate::index::IndexError) from the underlying
@@ -1272,33 +1276,33 @@ impl Engine {
             }
         }
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
-        // Route to the index shard owning `key` and hold ONE shard write guard
-        // across the register + count mutation, exactly as the single global
-        // write lock did before sharding. The shard counter mutation still
-        // commits before the guard drops.
+        // Route to the index shard owning `key` exactly ONCE, then hold a single
+        // shard write guard across register + count mutation + resize, exactly
+        // as the single global write lock did before sharding. `write_shard_at`
+        // takes the precomputed shard index so there is no second routing call
+        // inside `write_shard`.
         let index_shard = self.index.index_shard_for_key(&key);
-        let needs_resize = {
-            let mut guard = self.index.write_shard(&key);
-            let len_before = guard.len();
-            guard.register_without_resize(key, entry)?;
-            let inserted = guard.len() > len_before;
-            // Commit the count mutation BEFORE releasing the write lock once
-            // counters have been lazily initialized. Before that point, the first
-            // reader will scan the primary index after this write lock releases.
-            let counts_initialized = self
-                .shard_counts_initialized
-                .load(std::sync::atomic::Ordering::Acquire);
-            if inserted && counts_initialized {
-                self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
-            guard.resize_target_capacity().is_some()
-        };
-        if needs_resize {
-            // Per-shard resize: rehashes only this shard's ~count/N entries,
-            // holding only this shard's write lock (leaving other shards
-            // readable). At one shard this is the whole-table resize as before.
-            self.index.resize_shard_if_needed(index_shard)?;
+        let mut guard = self.index.write_shard_at(index_shard);
+        let len_before = guard.len();
+        guard.register_without_resize(key, entry)?;
+        let inserted = guard.len() > len_before;
+        // Commit the count mutation under the still-held write guard. Counts are
+        // eagerly initialized at construction (`shard_counts_initialized` is
+        // true by the time any request is dispatched), so for an inserted key
+        // the `fetch_add` always runs before the guard drops — preserving the
+        // insert-then-count atomicity (fix #1). The check guards only the very
+        // first registers before initialization completes.
+        let counts_initialized = self
+            .shard_counts_initialized
+            .load(std::sync::atomic::Ordering::Acquire);
+        if inserted && counts_initialized {
+            self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
         }
+        // Per-shard resize UNDER the held guard: rehashes only this shard's
+        // ~count/N entries without dropping and re-acquiring the lock (leaving
+        // other shards readable throughout). At one shard this is the
+        // whole-table resize as before.
+        guard.resize_if_needed()?;
         Ok(())
     }
 
@@ -1346,33 +1350,33 @@ impl Engine {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
         // The existence check and insert must run under the SAME shard write
         // guard so check-then-insert cannot interleave with another writer on
-        // that shard. Route to the owning index shard and hold its guard.
+        // that shard. Route to the owning index shard exactly ONCE, then hold
+        // its guard across check + insert + count mutation + resize.
         let index_shard = self.index.index_shard_for_key(&key);
-        let needs_resize = {
-            let mut guard = self.index.write_shard(&key);
-            // Reject-not-overwrite: the only safe insert-if-absent is a
-            // check under the same write lock that performs the insert.
-            if guard.lookup_checked(&key)?.is_some() {
-                return Ok(false);
-            }
-            let len_before = guard.len();
-            guard.register_without_resize(key, entry)?;
-            debug_assert!(
-                guard.len() > len_before,
-                "register_new_with_shard_count: insert did not grow the index \
-                 despite the key being absent under the same write lock"
-            );
-            let counts_initialized = self
-                .shard_counts_initialized
-                .load(std::sync::atomic::Ordering::Acquire);
-            if counts_initialized {
-                self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
-            guard.resize_target_capacity().is_some()
-        };
-        if needs_resize {
-            self.index.resize_shard_if_needed(index_shard)?;
+        let mut guard = self.index.write_shard_at(index_shard);
+        // Reject-not-overwrite: the only safe insert-if-absent is a
+        // check under the same write lock that performs the insert.
+        if guard.lookup_checked(&key)?.is_some() {
+            return Ok(false);
         }
+        let len_before = guard.len();
+        guard.register_without_resize(key, entry)?;
+        debug_assert!(
+            guard.len() > len_before,
+            "register_new_with_shard_count: insert did not grow the index \
+             despite the key being absent under the same write lock"
+        );
+        // Counts are eagerly initialized at construction, so this `fetch_add`
+        // runs under the still-held write guard for the newly inserted key,
+        // preserving the insert-then-count atomicity (fix #1).
+        let counts_initialized = self
+            .shard_counts_initialized
+            .load(std::sync::atomic::Ordering::Acquire);
+        if counts_initialized {
+            self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        // Resize UNDER the held guard (no drop-then-reacquire).
+        guard.resize_if_needed()?;
         Ok(true)
     }
 
@@ -1396,23 +1400,24 @@ impl Engine {
         }
     }
 
-    // Primary-index resize is now per-shard via
-    // [`ShardedIndex::resize_shard_if_needed`], which holds only the affected
-    // shard's write lock and rehashes only that shard's entries (and performs
-    // the same `mark_defunct_for_resize` swap as the previous whole-table
-    // helper). The old `resize_primary_index_without_blocking_readers` is gone:
-    // the register paths call `resize_shard_if_needed(index_shard)` directly.
+    // Primary-index resize is now per-shard, rehashing only the affected
+    // shard's entries (and performing the same `mark_defunct_for_resize` swap as
+    // the previous whole-table helper). The old
+    // `resize_primary_index_without_blocking_readers` is gone: the register
+    // paths call `guard.resize_if_needed()` on the shard write guard they
+    // already hold, so the resize never drops and re-acquires the lock.
+    // [`ShardedIndex::resize_shard_if_needed`] is retained for any caller that
+    // does not already hold the guard.
 
-    /// Unregister a primary-index entry and, if shard counters have been
-    /// initialized, decrement the matching shard count atomically within the
-    /// same index write-lock critical section.
+    /// Unregister a primary-index entry and decrement the matching shard count
+    /// atomically within the same index write-lock critical section.
     ///
     /// Returns the removed entry (or `None` if the key was not present), or
     /// an `IndexError` if the (redb) backend's write transaction fails.
-    /// After lazy initialization, the shard count is only decremented when an
-    /// entry was actually removed. Before initialization, the first
-    /// `shard_record_count` call will scan the primary index after any active
-    /// writer drops this lock.
+    /// Shard counters are eagerly initialized in the constructor
+    /// ([`Self::compute_shard_counts`]), so the count is decremented (under the
+    /// shard write guard) whenever an entry is actually removed — `shard_counts`
+    /// tracks the primary index continuously, no deferred scan is ever needed.
     ///
     /// G-4: propagates the backend error instead of collapsing it to `None`.
     /// A collapsed `unregister` failure would leave the row in redb while the
@@ -6649,26 +6654,44 @@ impl Engine {
 
     /// Snapshot the primary index and both secondary indexes to a file.
     ///
-    /// Acquires read locks on the primary index and short-lived locks on the
-    /// secondary indexes, then writes a consistent snapshot to `path` via an
-    /// atomic rename. Called during graceful shutdown so the next startup can
-    /// restore from snapshot instead of scanning the device.
+    /// Acquires the secondary locks first (dah → unmined), then the primary
+    /// index shard read locks, and writes the snapshot to `path` via an atomic
+    /// rename. Called during graceful shutdown / checkpoint so the next startup
+    /// can restore from snapshot instead of scanning the device.
+    ///
+    /// # Lock order — inverted vs the write path
+    ///
+    /// This method's order (dah → unmined → shard.read) is the REVERSE of the
+    /// write path (shard.write → dah → unmined, see
+    /// [`Engine::sync_primary_and_both_secondary_atomic`]). The two are
+    /// deadlock-free ONLY because this method is called exclusively by the
+    /// checkpoint task while it holds `dispatch_visibility_barrier.write()`,
+    /// which excludes every write-path caller from holding any index or
+    /// secondary lock concurrently.
+    ///
+    /// **CALLER CONTRACT:** the caller MUST hold
+    /// `dispatch_visibility_barrier.write()` before calling this method.
+    /// Calling it without that guard while a write-path op is in flight can
+    /// deadlock (the inverted lock order has no other protection).
     ///
     /// # Errors
     ///
     /// Returns [`crate::index::IndexError`] on I/O failure or if the snapshot
     /// directory is not writable.
     pub fn snapshot_index(&self, path: &std::path::Path) -> crate::index::Result<()> {
-        // lock order: dah -> unmined -> shard.read, inverted vs set_cached_fields;
-        // safe only because checkpoint holds dispatch_visibility_barrier.write()
+        // Lock order: dah -> unmined -> shard.read, inverted vs the write path
+        // (sync_primary_and_both_secondary_atomic). Safe only because the
+        // checkpoint caller holds dispatch_visibility_barrier.write() — see the
+        // caller contract in this method's doc comment.
         let dah = self.dah_index.lock();
         let unmined = self.unmined_index.lock();
-        // `ShardedIndex::snapshot_all` writes the v1 (`TSIX`) format at one
-        // shard — byte-for-byte identical to the pre-sharding engine, so the
-        // existing `PrimaryBackend::restore_all` checkpoint path keeps reading
-        // it — and the v2 N-shard manifest at more than one shard. The engine
-        // currently runs at one shard, so this stays on the v1 path until the
-        // shard count is wired through config in a later task.
+        // `ShardedIndex::snapshot_all` writes the v1 (`TSIX`) format when the
+        // engine runs at shard_count == 1 — byte-for-byte identical to the
+        // pre-sharding engine, so the existing `PrimaryBackend::restore_all`
+        // checkpoint path keeps reading it — and the v2 (`TSX2`) N-shard
+        // manifest when shard_count > 1. The engine runs at the configured
+        // shard count (default index_shards = 16), so production checkpoints
+        // write the v2 manifest; only a single-shard deployment stays on v1.
         self.index.snapshot_all(&dah, &unmined, path)
     }
 
