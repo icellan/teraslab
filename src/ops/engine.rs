@@ -7919,6 +7919,27 @@ mod tests {
         assert_eq!(g1, g0 + 1);
     }
 
+    /// Assert `updated_at` was stamped to ~now, tolerating wall-clock jitter.
+    ///
+    /// `updated_at` and `sys_millis` both read the wall clock
+    /// (`SystemTime::now`), which is non-monotonic — NTP can step it
+    /// backward/forward, and the engine's cached clock is sampled at a
+    /// slightly different instant than the test's `before`/`after`. The
+    /// original tight `[before, after + 1]` 1 ms window flaked under CI load.
+    /// The property under test is that the mutation stamps `updated_at` to
+    /// ~now (not left at 0 / a stale value), so assert it is set and within a
+    /// generous slack of the call window.
+    fn assert_updated_at_recent(updated: u64, before: u64, after: u64) {
+        const SLACK_MS: u64 = 1_000;
+        assert_ne!(updated, 0, "mutation must set updated_at");
+        let lo = before.saturating_sub(SLACK_MS);
+        let hi = after + SLACK_MS;
+        assert!(
+            updated >= lo && updated <= hi,
+            "updated_at {updated} not within [{lo}, {hi}] (before={before}, after={after})",
+        );
+    }
+
     #[test]
     fn spend_updated_at_set() {
         let h = TestHarness::new(10, TxFlags::empty());
@@ -7927,8 +7948,7 @@ mod tests {
         let after = sys_millis();
 
         let meta = h.engine.read_metadata(&h.key).unwrap();
-        let updated = { meta.updated_at };
-        assert!(updated >= before && updated <= after + 1);
+        assert_updated_at_recent(meta.updated_at, before, after);
     }
 
     // -- SpendMulti tests --
@@ -10611,7 +10631,7 @@ mod tests {
         h.engine.spend(&h.spend_req(0)).unwrap();
         let after = sys_millis();
         let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert!({ meta.updated_at } >= before && { meta.updated_at } <= after + 1);
+        assert_updated_at_recent(meta.updated_at, before, after);
 
         // Unspend
         h.engine.refresh_clock();
@@ -10627,7 +10647,7 @@ mod tests {
         h.engine.unspend(&req).unwrap();
         let after = sys_millis();
         let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert!({ meta.updated_at } >= before && { meta.updated_at } <= after + 1);
+        assert_updated_at_recent(meta.updated_at, before, after);
     }
 
     // -- Secondary index integration tests --
