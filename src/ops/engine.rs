@@ -162,9 +162,10 @@ pub struct Engine {
     device_ptr: *mut u8,
     /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
     /// behind its own `RwLock`, so a write to one shard does not block
-    /// reads/writes on other shards. Constructed at `shard_count = 1`
-    /// (a transparent pass-through over the recovered/rebuilt backend) — the
-    /// multi-shard default lands in a later task.
+    /// reads/writes on other shards. Constructed at the configured
+    /// `index_shards` count: the in-memory backend defaults to 16; redb /
+    /// file-backed and most tests run at 1 (a transparent pass-through over a
+    /// single recovered/rebuilt backend via [`ShardedIndex::from_single`]).
     index: ShardedIndex,
     allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
