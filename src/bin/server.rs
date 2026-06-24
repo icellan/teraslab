@@ -908,31 +908,59 @@ fn main() {
     // ack a lie (the bytes are in volatile memory and disappear at
     // shutdown). On open or create failure we fail closed so the operator
     // can fix permissions / disk / path and try again.
+    // Per-store redo: one redo log per store so writes get N parallel fsync
+    // streams instead of serializing on a single redo mutex. Store 0 uses the
+    // configured path; store i (i >= 1) uses a `.<i>` suffix sibling. All logs
+    // share ONE global sequence counter so the redo sequence — the replication
+    // contract — stays globally ordered across stores.
     let redo_log_path = config.resolved_redo_log_path();
-    let (redo_log_device, redo_log) = match open_mandatory_redo_log(
-        &redo_log_path,
-        config.redo_log_size,
-        config.device_alignment,
-    ) {
-        Ok(parts) => parts,
-        Err(e) => {
-            tracing::error!(
-                path = %redo_log_path.display(),
-                err = %e,
-                "FATAL: redo log unavailable — cannot start with mandatory WAL disabled",
-            );
-            std::process::exit(1);
+    let mut redo_log_devices: Vec<Arc<dyn BlockDevice>> = Vec::with_capacity(num_stores);
+    let mut redo_logs_owned: Vec<RedoLog> = Vec::with_capacity(num_stores);
+    for store_idx in 0..num_stores {
+        let path = if store_idx == 0 {
+            redo_log_path.clone()
+        } else {
+            let mut os = redo_log_path.clone().into_os_string();
+            os.push(format!(".{store_idx}"));
+            std::path::PathBuf::from(os)
+        };
+        match open_mandatory_redo_log(&path, config.redo_log_size, config.device_alignment) {
+            Ok((dev, log)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    store = store_idx,
+                    size_mib = config.redo_log_size / (1024 * 1024),
+                    "redo log opened (mandatory, per-store)",
+                );
+                redo_log_devices.push(dev);
+                redo_logs_owned.push(log);
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    store = store_idx,
+                    err = %e,
+                    "FATAL: redo log unavailable — cannot start with mandatory WAL disabled",
+                );
+                std::process::exit(1);
+            }
         }
-    };
-    tracing::info!(
-        path = %redo_log_path.display(),
-        size_mib = config.redo_log_size / (1024 * 1024),
-        "redo log opened (mandatory)",
-    );
-    // Keep the device handle alive for the lifetime of the process so
-    // any future redo-log replay/extension paths share the same fd.
-    let _redo_log_device: Arc<dyn BlockDevice> = redo_log_device;
-    let mut redo_log: Option<RedoLog> = Some(redo_log);
+    }
+
+    // Seed and attach the shared global sequence counter from the max
+    // local high-water mark across all stores' logs, so a restart never reuses
+    // a sequence number that landed in any store's log before the crash.
+    let shared_seq_floor =
+        teraslab::redo::RedoLog::shared_sequence_floor(&redo_logs_owned.iter().collect::<Vec<_>>());
+    let shared_seq = Arc::new(std::sync::atomic::AtomicU64::new(shared_seq_floor));
+    for log in &mut redo_logs_owned {
+        log.attach_shared_sequence(shared_seq.clone());
+    }
+
+    // Keep the device handles alive for the lifetime of the process so any
+    // future redo-log replay/extension paths share the same fds.
+    let _redo_log_devices: Vec<Arc<dyn BlockDevice>> = redo_log_devices;
+    let mut redo_logs: Option<Vec<RedoLog>> = Some(redo_logs_owned);
 
     // Construct the blob store up front so recovery can reconcile orphan
     // blobs against the freshly-replayed primary index (R-049). The store is
@@ -954,7 +982,7 @@ fn main() {
     // into the last-durable-height floor below so a lost/corrupt `.height` file
     // cannot regress the node to height 0. Independent of `tombstones_enabled`.
     let mut recovery_height_floor: u32 = 0;
-    if let Some(ref mut redo) = redo_log {
+    if let Some(ref mut redo) = redo_logs {
         // B-7: only the redb backend has crash-durable secondaries that
         // already reflect committed state; when it loaded both cleanly,
         // reconcile just the redo-touched keys (O(redo)) instead of
@@ -969,7 +997,7 @@ fn main() {
         match teraslab::recovery::recover_all_multi_store(
             &store_devices,
             &mut store_allocators,
-            redo,
+            redo.as_mut_slice(),
             &index,
             &mut dah_index,
             &mut unmined_index,
@@ -1048,24 +1076,30 @@ fn main() {
         }
     }
 
-    // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
-    let redo_log: Option<Arc<Mutex<RedoLog>>> = redo_log.map(|log| Arc::new(Mutex::new(log)));
+    // Wrap each store's redo log in Arc<Mutex> for shared access from dispatch
+    // threads. `redo_logs_arc[i]` is store i's log; `redo_log` is store 0's,
+    // kept as the single representative handle the index / engine
+    // representative slot / replication receiver fall back to.
+    let redo_logs_arc: Option<Vec<Arc<Mutex<RedoLog>>>> =
+        redo_logs.map(|logs| logs.into_iter().map(|l| Arc::new(Mutex::new(l))).collect());
+    let redo_log: Option<Arc<Mutex<RedoLog>>> =
+        redo_logs_arc.as_ref().and_then(|v| v.first().cloned());
 
-    // Attach the redo log to EVERY store's allocator BEFORE moving them into
-    // the engine, so all subsequent allocate/free operations are journaled and
-    // fsynced before the caller observes their effect. This closes the crash
-    // window between `persist()` snapshots. The single shared log records each
-    // store's region ops tagged with that store's redo_device_id.
-    if let Some(ref log) = redo_log {
-        for alloc in &mut store_allocators {
+    // Attach EACH store's redo log to ITS OWN allocator BEFORE moving them into
+    // the engine, so every allocate/free is journaled and fsynced to that
+    // store's log before the caller observes its effect. This closes the crash
+    // window between `persist()` snapshots. Each allocator already carries its
+    // store's `redo_device_id`.
+    if let Some(ref logs) = redo_logs_arc {
+        for (alloc, log) in store_allocators.iter_mut().zip(logs.iter()) {
             alloc.set_redo_log(log.clone());
         }
     }
 
-    // Attach the redo log to the primary index so file-backed hash table
-    // resizes are crash-atomic (Begin/Commit journaling + parent-dir fsync).
-    // The FileBacked variant actually uses the redo log; InMemory / OnDisk
-    // accept the attachment but treat it as a no-op.
+    // Attach the representative (store 0) redo log to the primary index so
+    // file-backed hash table resizes are crash-atomic (Begin/Commit journaling
+    // + parent-dir fsync). The FileBacked variant actually uses the redo log;
+    // InMemory / OnDisk accept the attachment but treat it as a no-op.
     if let Some(ref log) = redo_log {
         index.set_redo_log(log.clone());
     }
@@ -1161,10 +1195,17 @@ fn main() {
     // re-derived here from each record's authoritative CONFLICTING flag.
     engine.rebuild_conflicting_index();
 
-    // Attach the redo log so the engine performs two-phase durability for
-    // secondary index updates (redo fsync BEFORE redb commit).
+    // Attach the redo logs so the engine performs two-phase durability for
+    // secondary index updates (redo fsync BEFORE redb commit), routing each
+    // intent to the owning store's log. `set_redo_log` installs the
+    // representative (store 0) handle used by the replication receiver and
+    // migration suppression; `set_redo_logs` installs the full per-store set
+    // used by the dispatch write path and secondary-index routing.
     if let Some(ref log) = redo_log {
         engine.set_redo_log(log.clone());
+    }
+    if let Some(ref logs) = redo_logs_arc {
+        engine.set_redo_logs(logs.clone());
     }
 
     // 4b. Attach the (already-constructed) blobstore to the engine. The

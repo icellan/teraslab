@@ -1960,6 +1960,21 @@ pub struct RedoLog {
     poisoned: bool,
     /// Lock-free mirror of `write_pos`/`logical_start` for observers.
     atomics: Arc<RedoAtomics>,
+    /// Per-store redo: when several `RedoLog`s back one node's stores, they
+    /// share ONE global sequence counter so every redo entry — regardless of
+    /// which store's log it lands in — receives a globally-unique,
+    /// monotonically-increasing sequence. The replication contract
+    /// (`write_redo_ops` seq-range, `begin_replication_intent`, catch-up
+    /// `read_from_sequence`) depends on this global ordering.
+    ///
+    /// `None` (the default) preserves the historical single-log behaviour
+    /// exactly: sequences come from this log's own `next_sequence`, so the
+    /// `N == 1` case is byte-identical. When `Some`, `append` draws the next
+    /// sequence from the shared atomic and folds it into `next_sequence` so
+    /// the on-disk header still records this log's high-water mark for
+    /// restart (the shared counter is restored as the max over all logs'
+    /// headers at boot — see [`RedoLog::shared_sequence_floor`]).
+    shared_seq: Option<Arc<AtomicU64>>,
 }
 
 impl RedoLog {
@@ -2037,6 +2052,7 @@ impl RedoLog {
                 logical_start: AtomicU64::new(0),
                 entries_region_size: log_size - header_block_size,
             }),
+            shared_seq: None,
         };
 
         // Try to read the on-disk header. If the magic is absent
@@ -2092,6 +2108,45 @@ impl RedoLog {
             .logical_start
             .store(log.logical_start, AtomicOrdering::Relaxed);
         Ok(log)
+    }
+
+    /// Attach a shared global sequence counter for per-store redo.
+    ///
+    /// When several `RedoLog`s back one node's stores, every entry must draw
+    /// its sequence from ONE counter so the global ordering the replication
+    /// contract relies on holds across all logs. Call this on each store's log
+    /// at boot with the same `Arc<AtomicU64>`. The shared counter must already
+    /// be seeded to at least `max(next_sequence)` over all logs — see
+    /// [`RedoLog::local_high_water`] and [`RedoLog::shared_sequence_floor`].
+    ///
+    /// Attaching to a log that already has entries is supported: subsequent
+    /// appends use the shared counter while the on-disk header continues to
+    /// record this log's own high-water mark.
+    pub fn attach_shared_sequence(&mut self, shared: Arc<AtomicU64>) {
+        self.shared_seq = Some(shared);
+    }
+
+    /// This log's own next-sequence high-water mark (the value persisted in
+    /// the on-disk header), independent of any attached shared counter.
+    ///
+    /// Used at boot to seed the shared global counter to the maximum across
+    /// all stores' logs so restart never reuses a sequence number.
+    pub fn local_high_water(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Compute the shared-counter seed (the first globally-unique sequence to
+    /// hand out) from a set of per-store logs: the max of every log's local
+    /// high-water mark, floored at 1.
+    ///
+    /// Returned value is suitable to construct the shared `AtomicU64` passed
+    /// to [`RedoLog::attach_shared_sequence`] on every log.
+    pub fn shared_sequence_floor(logs: &[&RedoLog]) -> u64 {
+        logs.iter()
+            .map(|l| l.next_sequence)
+            .max()
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Device byte offset of the first entry byte (header block end).
@@ -2150,8 +2205,15 @@ impl RedoLog {
         if self.poisoned {
             return Err(RedoError::Poisoned);
         }
-        let seq = self.next_sequence;
-        let entry = RedoEntry { sequence: seq, op };
+
+        // Serialize against a placeholder sequence so the capacity check can
+        // run BEFORE any sequence number is committed. The on-disk length is
+        // independent of the sequence value (always a fixed 8-byte field), so
+        // the byte count is identical to the final entry's. This ordering
+        // matters for the shared global counter: a `LogFull` must NOT burn a
+        // global sequence, which would punch a gap into a replication
+        // seq-range that ack-tracking expects to be contiguous.
+        let mut entry = RedoEntry { sequence: 0, op };
         let bytes = entry.serialize();
 
         let entries_capacity = self.entries_region_size();
@@ -2162,9 +2224,30 @@ impl RedoLog {
             });
         }
 
+        // Capacity is assured — now commit the sequence. With a shared global
+        // counter attached, draw from it and fold the value into this log's
+        // `next_sequence` so the on-disk header still records this log's
+        // high-water mark for restart. Without it, the local `next_sequence`
+        // is the sole source (single-log behaviour, byte-identical).
+        let seq = match &self.shared_seq {
+            Some(shared) => {
+                let s = shared.fetch_add(1, AtomicOrdering::SeqCst);
+                if s + 1 > self.next_sequence {
+                    self.next_sequence = s + 1;
+                }
+                s
+            }
+            None => {
+                let s = self.next_sequence;
+                self.next_sequence += 1;
+                s
+            }
+        };
+        entry.sequence = seq;
+        let bytes = entry.serialize();
+
         self.buffer.extend_from_slice(&bytes);
         self.pending_entries.push(entry);
-        self.next_sequence += 1;
         if let Some(m) = redo_metrics() {
             m.redo_append_total.inc();
             self.buffered_entries += 1;
@@ -2307,9 +2390,13 @@ impl RedoLog {
         if ops.is_empty() {
             return Ok((0, 0));
         }
-        let first_seq = self.next_sequence;
+        // Capture the first sequence from the actual `append` (works for both
+        // the local and shared-global counters) rather than reading
+        // `next_sequence` up front, which under a shared counter is not the
+        // value the next `append` will assign.
+        let first_seq = self.append(ops[0].clone())?;
         let mut last_seq = first_seq;
-        for op in ops {
+        for op in &ops[1..] {
             last_seq = self.append(op.clone())?;
         }
         self.flush()?;
@@ -2387,8 +2474,18 @@ impl RedoLog {
     }
 
     /// The next sequence number that will be assigned.
+    ///
+    /// With a shared global counter attached (per-store redo), this reflects
+    /// the global next sequence across every store's log — the value the next
+    /// `append` on ANY of the sibling logs will consume — so replication
+    /// snapshots (`current_sequence()` watermarks) stay consistent regardless
+    /// of which store's log is queried. Without it, this is this log's local
+    /// `next_sequence`.
     pub fn current_sequence(&self) -> u64 {
-        self.next_sequence
+        match &self.shared_seq {
+            Some(shared) => shared.load(AtomicOrdering::SeqCst),
+            None => self.next_sequence,
+        }
     }
 
     /// The sequence number of the earliest available entry in the log.
@@ -2730,18 +2827,30 @@ impl RedoLog {
             loop {
                 match RedoEntry::deserialize(&combined[local_pos..]) {
                     Some((entry, consumed_entry)) => {
+                        // Sequences within a single log must be strictly
+                        // increasing. Under per-store redo a node's stores
+                        // each have their own log but draw sequences from one
+                        // shared global counter, so a single log's own entries
+                        // are monotonic-with-gaps (the gaps are sequences that
+                        // landed in sibling logs) — NOT contiguous. The check
+                        // is therefore "strictly greater than the previous"
+                        // rather than "exactly previous + 1": that still
+                        // catches a regressed or duplicated sequence (the real
+                        // corruption signals) while admitting the legitimate
+                        // cross-store gaps. In the single-log case this is
+                        // equivalent to the old contiguity invariant because
+                        // every sequence lands in the one log.
                         if let Some(prev) = prev_seq
-                            && prev.checked_add(1) != Some(entry.sequence)
+                            && entry.sequence <= prev
                         {
                             if just_skipped_pad {
-                                // Non-consecutive sequence past a pad
-                                // skip: this is stale data beyond a
-                                // legitimate end-of-flush boundary
-                                // (e.g. left over from before
-                                // `compact_prefix_through` zeroed the
-                                // sentinel block). Stop here; the tail
-                                // position already points at this stale
-                                // block so future appends overwrite it.
+                                // A non-increasing sequence past a pad skip is
+                                // stale data beyond a legitimate end-of-flush
+                                // boundary (e.g. left over from before
+                                // `compact_prefix_through` zeroed the sentinel
+                                // block). Stop here; the tail position already
+                                // points at this stale block so future appends
+                                // overwrite it.
                                 stop_scan = true;
                                 break;
                             }
@@ -3101,17 +3210,22 @@ mod tests {
         log.append(second_op.clone()).unwrap();
         log.flush().unwrap();
 
-        // Rewrite the second entry's sequence number to 99 so the
-        // monotonicity scan rejects it. The first alignment unit of
-        // the redo region is the F-G4-001 header block; the entries
-        // region starts at offset = device alignment.
+        // Rewrite the second entry's sequence number so the monotonicity
+        // scan rejects it. Under per-store redo a single log's sequences are
+        // strictly-increasing-with-gaps (sibling logs consume the in-between
+        // values), so a FORWARD jump is legitimate. The corruption signal is
+        // a sequence that is NOT strictly greater than the previous — here we
+        // rewrite the second entry to sequence 1 (a duplicate / regression of
+        // the first), which must still be rejected. The first alignment unit
+        // of the redo region is the F-G4-001 header block; the entries region
+        // starts at offset = device alignment.
         let first_entry = RedoEntry {
             sequence: 1,
             op: first_op,
         }
         .serialize();
         let rewritten_second = RedoEntry {
-            sequence: 99,
+            sequence: 1,
             op: second_op,
         }
         .serialize();
@@ -3129,11 +3243,58 @@ mod tests {
                 previous, current, ..
             }) => {
                 assert_eq!(previous, 1);
-                assert_eq!(current, 99);
+                assert_eq!(current, 1);
             }
             Ok(_) => panic!("expected SequenceOutOfOrder, got Ok"),
             Err(other) => panic!("expected SequenceOutOfOrder, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn redo_sequence_forward_gap_is_accepted() {
+        // Per-store redo: a single log's sequences are strictly increasing but
+        // not contiguous (sibling logs take the in-between values). A forward
+        // gap on disk must therefore open cleanly rather than raising
+        // SequenceOutOfOrder.
+        let (dev, mut log) = make_log(1024 * 1024);
+        let first_op = RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        };
+        let second_op = RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        };
+        log.append(first_op.clone()).unwrap();
+        log.append(second_op.clone()).unwrap();
+        log.flush().unwrap();
+
+        // Rewrite the second entry's sequence to 99 (forward jump). The first
+        // entry keeps sequence 1.
+        let first_entry = RedoEntry {
+            sequence: 1,
+            op: first_op,
+        }
+        .serialize();
+        let rewritten_second = RedoEntry {
+            sequence: 99,
+            op: second_op.clone(),
+        }
+        .serialize();
+        let align = dev.alignment();
+        let entries_region_offset = align as u64;
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread(&mut buf, entries_region_offset).unwrap();
+        let second_offset = first_entry.len();
+        buf[second_offset..second_offset + rewritten_second.len()]
+            .copy_from_slice(&rewritten_second);
+        dev.pwrite(&buf, entries_region_offset).unwrap();
+
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).expect("forward gap must open cleanly");
+        let entries = log2.recover().unwrap();
+        assert_eq!(entries.len(), 2, "both entries must survive the scan");
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 99);
     }
 
     // -- Serialization round-trip tests --
@@ -4334,6 +4495,115 @@ mod tests {
             prior_locked: false,
             prior_delete_at_height: u32::MAX,
         });
+    }
+
+    #[test]
+    fn shared_sequence_is_globally_unique_and_monotonic_across_logs() {
+        // Two independent logs (two stores) sharing ONE global counter must
+        // never assign the same sequence and must hand them out strictly
+        // increasing in fetch order.
+        let (_d0, mut log0) = make_log(1024 * 1024);
+        let (_d1, mut log1) = make_log(1024 * 1024);
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+
+        let mut seqs = Vec::new();
+        for i in 0..6u8 {
+            // Interleave appends across the two logs.
+            let target = if i % 2 == 0 { &mut log0 } else { &mut log1 };
+            let s = target
+                .append(RedoOp::Freeze {
+                    tx_key: test_key(i),
+                    offset: 0,
+                })
+                .unwrap();
+            seqs.push(s);
+        }
+        // Fresh logs start at floor 1; six appends => sequences 1..=6 with no
+        // duplicate and strict monotonicity even though they straddle stores.
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
+        // Both logs report the SAME global current_sequence (next to assign).
+        assert_eq!(log0.current_sequence(), 7);
+        assert_eq!(log1.current_sequence(), 7);
+    }
+
+    #[test]
+    fn shared_sequence_floor_restored_across_reopen() {
+        // After a restart, the shared counter is seeded from the max local
+        // high-water across all logs' headers so sequences never get reused.
+        let dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        {
+            let mut log0 = RedoLog::open(dev0.clone(), 0, 1024 * 1024).unwrap();
+            let mut log1 = RedoLog::open(dev1.clone(), 0, 1024 * 1024).unwrap();
+            let shared = Arc::new(AtomicU64::new(1));
+            log0.attach_shared_sequence(shared.clone());
+            log1.attach_shared_sequence(shared.clone());
+            // Put two entries on log0, one on log1 (seqs 1,2 on log0; 3 on log1).
+            log0.append(RedoOp::Freeze {
+                tx_key: test_key(1),
+                offset: 0,
+            })
+            .unwrap();
+            log1.append(RedoOp::Freeze {
+                tx_key: test_key(2),
+                offset: 0,
+            })
+            .unwrap();
+            log0.append(RedoOp::Freeze {
+                tx_key: test_key(3),
+                offset: 0,
+            })
+            .unwrap();
+            log0.flush().unwrap();
+            log1.flush().unwrap();
+        }
+        // Reopen and recompute the floor: log0 saw seq 3 (next=4), log1 saw
+        // seq 2 (next=3), so the global floor is 4.
+        let log0 = RedoLog::open(dev0, 0, 1024 * 1024).unwrap();
+        let log1 = RedoLog::open(dev1, 0, 1024 * 1024).unwrap();
+        assert_eq!(RedoLog::shared_sequence_floor(&[&log0, &log1]), 4);
+    }
+
+    #[test]
+    fn shared_sequence_not_burned_on_log_full() {
+        // A `LogFull` must not consume a global sequence; otherwise the next
+        // successful append on a sibling log would leave a hole in a
+        // replication seq-range that ack tracking treats as contiguous.
+        let (_d0, mut log0) = make_log(8192);
+        let (_d1, mut log1) = make_log(1024 * 1024);
+        let shared = Arc::new(AtomicU64::new(1));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+
+        // Fill log0 until it returns LogFull.
+        let mut last_ok_seq = 0u64;
+        loop {
+            match log0.append(RedoOp::Freeze {
+                tx_key: test_key(7),
+                offset: 0,
+            }) {
+                Ok(s) => last_ok_seq = s,
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        // The next successful append on log1 must be exactly last_ok_seq + 1 —
+        // no gap from the failed LogFull attempts.
+        let s = log1
+            .append(RedoOp::Freeze {
+                tx_key: test_key(8),
+                offset: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            s,
+            last_ok_seq + 1,
+            "LogFull burned a global sequence (gap detected)"
+        );
     }
 
     #[test]

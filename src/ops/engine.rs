@@ -228,6 +228,18 @@ pub struct Engine {
     /// the primary index. In-memory secondary indexes ignore the log — they
     /// are rebuilt on startup from the primary redo replay + device scan.
     redo_log: std::sync::OnceLock<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>,
+    /// Per-store redo logs, one per store (index = `device_id`). Populated by
+    /// [`Self::set_redo_logs`] at boot. Each store's log has its own backing
+    /// region so writes get N parallel fsync streams instead of serializing on
+    /// one mutex; all logs share a single global sequence counter so the redo
+    /// sequence (the replication contract) stays globally ordered.
+    ///
+    /// When only one store exists this holds exactly the same single handle as
+    /// [`Self::redo_log`], so the `N == 1` path is byte-identical. Empty in
+    /// test / unconfigured paths, where [`Self::set_redo_log`] alone may still
+    /// attach a single representative handle; the per-store routing helpers
+    /// fall back to [`Self::redo_log_handle`] in that case.
+    redo_logs: std::sync::OnceLock<Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>>,
     /// Append-only on-device deletion-tombstone log (deletion-tombstone
     /// Phase 3). When attached AND [`Self::tombstones_enabled`] is true, the
     /// physical-delete path appends a [`crate::tombstone::Tombstone`] here
@@ -500,6 +512,7 @@ impl Engine {
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_log: std::sync::OnceLock::new(),
+            redo_logs: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
             // Default ON (design §11.5). A delete still writes no tombstone
@@ -541,29 +554,6 @@ impl Engine {
         }
     }
 
-    /// Clone the engine's redo log handle for use as an `Option<&Mutex<_>>`
-    /// in secondary index calls / two-phase durable mutation journalling.
-    ///
-    /// Returns `None` while a [`MigrationJournalGuard`] is active on the
-    /// current thread, which suppresses ALL engine-internal redo
-    /// journalling (secondary-index intents, create's unmined insert,
-    /// etc.) for the duration of a migration-baseline apply. Migrated
-    /// baseline data is idempotently re-drivable from the source under the
-    /// persisted inbound fence (the source never commits the handoff until
-    /// `OP_MIGRATION_COMPLETE`), so a receiver that crashes mid-baseline
-    /// re-acquires the fence and the source re-runs a fresh full baseline.
-    /// Baseline records therefore need NO receiver redo entries for
-    /// crash-safety, and journalling them would fill the single 64 MiB redo
-    /// log during a large migration (`redo log full`). The data writes
-    /// themselves (device footer, in-memory/redb secondary indexes,
-    /// primary cache) are NOT suppressed — only the redo journalling is.
-    fn redo_log_handle(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
-        if migration_journal_suppressed() {
-            return None;
-        }
-        self.redo_log.get().cloned()
-    }
-
     /// Public accessor for the engine's redo log handle.
     ///
     /// Used by the replication receiver (R-034) so replica-applied
@@ -581,6 +571,357 @@ impl Engine {
     /// unconfigured deployments).
     pub fn redo_log(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
         self.redo_log.get().cloned()
+    }
+
+    /// Attach the per-store redo logs (one per store, indexed by `device_id`).
+    ///
+    /// Call once at boot after recovery, alongside [`Self::set_redo_log`]
+    /// (which should be passed store 0's log as the representative handle).
+    /// Each store's log must already share the global sequence counter (see
+    /// [`crate::redo::RedoLog::attach_shared_sequence`]). The per-store
+    /// secondary-index two-phase durability path and the dispatch write path
+    /// route each redo entry to the owning store's log via
+    /// [`Self::redo_log_for_device`].
+    pub fn set_redo_logs(&self, logs: Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>) {
+        if self.redo_logs.set(logs).is_err() {
+            tracing::warn!("engine per-store redo logs already attached; ignoring replacement");
+        }
+    }
+
+    /// The redo log owning store `device_id`, for secondary-index two-phase
+    /// durability journalling.
+    ///
+    /// Returns `None` while a [`MigrationJournalGuard`] is active on the
+    /// current thread, which suppresses ALL engine-internal redo journalling
+    /// (secondary-index intents, create's unmined insert, etc.) for the
+    /// duration of a migration-baseline apply. Migrated baseline data is
+    /// idempotently re-drivable from the source under the persisted inbound
+    /// fence (the source never commits the handoff until
+    /// `OP_MIGRATION_COMPLETE`), so a receiver that crashes mid-baseline
+    /// re-acquires the fence and the source re-runs a fresh full baseline.
+    /// Baseline records therefore need NO receiver redo entries for
+    /// crash-safety, and journalling them would fill the redo log during a
+    /// large migration (`redo log full`). The data writes themselves are NOT
+    /// suppressed — only the redo journalling is.
+    ///
+    /// When per-store logs are attached, returns that store's log; otherwise
+    /// falls back to the single representative handle (test /
+    /// single-store-unconfigured paths). Out-of-range `device_id` clamps to
+    /// store 0 — a defensive choice that keeps a stray routing input from
+    /// dropping a durable intent.
+    fn redo_log_for_device(
+        &self,
+        device_id: u8,
+    ) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
+        if migration_journal_suppressed() {
+            return None;
+        }
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => {
+                let idx = (device_id as usize).min(logs.len() - 1);
+                Some(logs[idx].clone())
+            }
+            _ => self.redo_log.get().cloned(),
+        }
+    }
+
+    /// The redo log owning the store that holds `key`, by primary-index
+    /// lookup. Falls back to store 0's log when the key is not (yet) in the
+    /// index — e.g. a secondary-intent for a key whose primary entry is being
+    /// created in the same operation. Honors migration suppression.
+    fn redo_log_for_key(
+        &self,
+        key: &TxKey,
+    ) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
+        let device_id = self.index.lookup(key).map(|e| e.device_id).unwrap_or(0);
+        self.redo_log_for_device(device_id)
+    }
+
+    /// Whether per-store redo logs are attached (the dispatch write path
+    /// should route through [`Self::append_redo_ops_routed`]). False in test /
+    /// single-handle paths that journal through a directly-passed
+    /// `Option<&Mutex<RedoLog>>` instead.
+    pub fn has_per_store_redo(&self) -> bool {
+        self.redo_logs.get().is_some_and(|l| !l.is_empty())
+    }
+
+    /// The store (`device_id`) that owns a redo op for per-store routing.
+    ///
+    /// `Create` / `AllocateRegion` / `FreeRegion` carry an explicit
+    /// `device_id`. Every other op is keyed by a `TxKey`; its store is the
+    /// owning record's `device_id` from the primary index, defaulting to store
+    /// 0 when the key is not present (e.g. a not-yet-applied create whose op is
+    /// being journaled in the same batch — its sibling `Create` op already
+    /// routes to the correct store, and store 0 is the safe default for the
+    /// keyed op since recovery re-derives ownership from the record itself).
+    fn redo_store_for_op(&self, op: &crate::redo::RedoOp) -> u8 {
+        use crate::redo::RedoOp;
+        match op {
+            RedoOp::Create { device_id, .. }
+            | RedoOp::AllocateRegion { device_id, .. }
+            | RedoOp::FreeRegion { device_id, .. } => *device_id,
+            other => match other.tx_key() {
+                Some(k) => self.index.lookup(k).map(|e| e.device_id).unwrap_or(0),
+                None => 0,
+            },
+        }
+    }
+
+    /// Append a batch of redo ops, routing each to the log owning its store,
+    /// then flush every touched store's log. Returns the global
+    /// `(first_sequence, last_sequence)` assigned across the whole batch.
+    ///
+    /// This is the per-store replacement for the old single-log
+    /// "append all then one flush": writes fan out to N logs so the fsyncs run
+    /// as N parallel streams, while the shared global sequence counter keeps
+    /// the returned range valid as the replication contract (the range is the
+    /// min/max of the globally-unique sequences assigned this call).
+    ///
+    /// Honors migration-baseline journal suppression: when suppressed, returns
+    /// `Ok((0, 0))` without writing, exactly as the secondary-index path does.
+    /// Returns `Ok((0, 0))` when `ops` is empty or no redo log is attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message on the first append/flush failure; the
+    /// underlying redo error (which may carry device paths) is logged at
+    /// `error!` and a sanitized message returned, matching the dispatch path.
+    pub fn append_redo_ops_routed(
+        &self,
+        ops: &[crate::redo::RedoOp],
+    ) -> std::result::Result<(u64, u64), String> {
+        if ops.is_empty() {
+            return Ok((0, 0));
+        }
+        if migration_journal_suppressed() {
+            return Ok((0, 0));
+        }
+        // Group op indices by destination store so each store's log is locked
+        // once and flushed once. Preserve per-store op order (the order ops
+        // appear in `ops`) — within a store, sequence order must match append
+        // order for the scan's strict-increasing check.
+        let store_count = self.store_count();
+        let mut per_store: Vec<Vec<&crate::redo::RedoOp>> =
+            (0..store_count).map(|_| Vec::new()).collect();
+        let mut any = false;
+        for op in ops {
+            let store = (self.redo_store_for_op(op) as usize).min(store_count - 1);
+            // Only route to a store that actually has a log attached; if none
+            // is attached (test / unconfigured), fall through to the
+            // representative-handle path below.
+            per_store[store].push(op);
+            any = true;
+        }
+        if !any {
+            return Ok((0, 0));
+        }
+
+        // Resolve each store's log handle once. If per-store logs are not
+        // attached, fall back to routing everything to the single
+        // representative handle (single-store / test paths) so behaviour is
+        // byte-identical to the pre-per-store path.
+        let mut first_seq = u64::MAX;
+        let mut last_seq = 0u64;
+        let mut wrote = false;
+
+        let route_to = |store: usize| -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
+            self.redo_log_for_device(store as u8)
+        };
+
+        for (store, store_ops) in per_store.iter().enumerate() {
+            if store_ops.is_empty() {
+                continue;
+            }
+            let Some(log) = route_to(store) else {
+                // No log attached at all → nothing to journal.
+                continue;
+            };
+            let mut guard = log.lock();
+            for op in store_ops {
+                let seq = guard.append((*op).clone()).map_err(|e| {
+                    tracing::error!(err = %e, "redo log append failed");
+                    "redo log append failed".to_string()
+                })?;
+                first_seq = first_seq.min(seq);
+                last_seq = last_seq.max(seq);
+                wrote = true;
+            }
+            guard.flush().map_err(|e| {
+                tracing::error!(err = %e, "redo log flush failed");
+                "redo log flush failed".to_string()
+            })?;
+        }
+
+        if !wrote {
+            return Ok((0, 0));
+        }
+        Ok((first_seq, last_seq))
+    }
+
+    /// The maximum `usage_fraction` across every attached redo log.
+    ///
+    /// The checkpoint trigger uses this so a checkpoint fires when ANY store's
+    /// log is filling (each store's log fills independently under per-store
+    /// redo). Returns 0.0 when no log is attached.
+    pub fn max_redo_usage_fraction(&self) -> f64 {
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => logs
+                .iter()
+                .map(|l| l.lock().usage_fraction())
+                .fold(0.0_f64, f64::max),
+            _ => self
+                .redo_log
+                .get()
+                .map(|l| l.lock().usage_fraction())
+                .unwrap_or(0.0),
+        }
+    }
+
+    /// Compact EVERY attached redo log's prefix through `fence`, reclaiming the
+    /// covered bytes. The compaction fence is a GLOBAL sequence, so it applies
+    /// uniformly to each store's log (each log's entries carry global
+    /// sequences). Used by the checkpoint after the snapshot + durability
+    /// barrier is durable.
+    ///
+    /// Does nothing for logs with no entries past the fence. When only the
+    /// representative single handle is attached (no per-store logs), compacts
+    /// just that one.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first per-log compaction error.
+    pub fn compact_all_redo_through(
+        &self,
+        fence: u64,
+    ) -> std::result::Result<(), crate::redo::RedoError> {
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => {
+                for log in logs {
+                    log.lock().compact_prefix_through(fence)?;
+                }
+            }
+            _ => {
+                if let Some(log) = self.redo_log.get() {
+                    log.lock().compact_prefix_through(fence)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write a recovery-progress fence marker to EVERY attached redo log so a
+    /// crash after the snapshot but before compaction replays no entry the
+    /// snapshot already covers. Mirrors [`Self::compact_all_redo_through`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first per-log marker write error.
+    pub fn mark_recovery_progress_all(
+        &self,
+        through_sequence: u64,
+    ) -> std::result::Result<(), crate::redo::RedoError> {
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => {
+                for log in logs {
+                    log.lock().mark_recovery_progress(through_sequence)?;
+                }
+            }
+            _ => {
+                if let Some(log) = self.redo_log.get() {
+                    log.lock().mark_recovery_progress(through_sequence)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Append a single replica-applied redo op to the log owning its store,
+    /// WITHOUT flushing (the batch flushes once via [`Self::flush_all_redo_logs`]).
+    ///
+    /// Per-store replacement for the receiver's "append to the single engine
+    /// redo handle" — routes by the op's store so a replica's local redo splits
+    /// across the same N logs the master uses, preserving the global sequence
+    /// ordering. When per-store logs are not attached, falls back to the single
+    /// representative handle. A no-op (returns `Ok(())`) when no log is
+    /// attached at all.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the redo append error as a human-readable message.
+    pub fn append_replica_redo_entry(
+        &self,
+        op: &crate::redo::RedoOp,
+    ) -> std::result::Result<(), String> {
+        let store = self.redo_store_for_op(op);
+        let Some(log) = self.redo_log_for_device(store) else {
+            return Ok(());
+        };
+        log.lock()
+            .append(op.clone())
+            .map_err(|e| format!("replica redo append: {e}"))?;
+        Ok(())
+    }
+
+    /// Flush every attached redo log (per-store, or the single representative
+    /// handle). Called once at the end of a replica apply batch so each
+    /// touched store's log is made durable with one fsync per store. A flush of
+    /// a log with an empty buffer is a no-op, so flushing untouched logs is
+    /// cheap and correct.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first per-log flush error as a human-readable message.
+    pub fn flush_all_redo_logs(&self) -> std::result::Result<(), String> {
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => {
+                for log in logs {
+                    log.lock()
+                        .flush()
+                        .map_err(|e| format!("replica redo flush: {e}"))?;
+                }
+            }
+            _ => {
+                if let Some(log) = self.redo_log.get() {
+                    log.lock()
+                        .flush()
+                        .map_err(|e| format!("replica redo flush: {e}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read all redo entries with sequence >= `from_seq`, merged across every
+    /// store's log and sorted by global sequence.
+    ///
+    /// Per-store redo splits one logical stream across N physical logs; this
+    /// helper reassembles the single sequence-ordered view that replication
+    /// catch-up and migration-delta collection expect. When only one log is
+    /// attached this is exactly that log's `read_from_sequence`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first per-log read error.
+    pub fn read_redo_from_sequence_merged(
+        &self,
+        from_seq: u64,
+    ) -> std::result::Result<Vec<crate::redo::RedoEntry>, crate::redo::RedoError> {
+        let mut merged: Vec<crate::redo::RedoEntry> = Vec::new();
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => {
+                for log in logs {
+                    let part = log.lock().read_from_sequence(from_seq)?;
+                    merged.extend(part);
+                }
+            }
+            _ => {
+                if let Some(log) = self.redo_log.get() {
+                    merged = log.lock().read_from_sequence(from_seq)?;
+                }
+            }
+        }
+        merged.sort_by_key(|e| e.sequence);
+        Ok(merged)
     }
 
     /// Attach the on-device deletion-tombstone log (deletion-tombstone
@@ -829,7 +1170,9 @@ impl Engine {
         if old_height == new_height {
             return Ok(());
         }
-        let log_arc = self.redo_log_handle();
+        // Per-store redo: route the secondary-index intent to the log owning
+        // the key's store.
+        let log_arc = self.redo_log_for_key(key);
         let log_ref = log_arc.as_deref();
         let mut dah = self.dah_index.lock();
         let _writer_gauge = crate::metrics::writer_enter();
@@ -858,7 +1201,9 @@ impl Engine {
         if old_height == new_height {
             return Ok(());
         }
-        let log_arc = self.redo_log_handle();
+        // Per-store redo: route the secondary-index intent to the log owning
+        // the key's store.
+        let log_arc = self.redo_log_for_key(key);
         let log_ref = log_arc.as_deref();
         let mut unmined = self.unmined_index.lock();
         let _writer_gauge = crate::metrics::writer_enter();
@@ -899,7 +1244,9 @@ impl Engine {
             return Ok(());
         }
 
-        let log_arc = self.redo_log_handle();
+        // Per-store redo: route the secondary-index intent to the log owning
+        // the key's store.
+        let log_arc = self.redo_log_for_key(key);
 
         // Phase 1: one fsync covering both secondary intents (if both change).
         if let Some(ref log) = log_arc {
@@ -1009,7 +1356,9 @@ impl Engine {
         let unmined_changed = old_unmined != new_unmined;
 
         // Phase 1: one fsync covering both secondary intents (if any change).
-        let log_arc = self.redo_log_handle();
+        // Per-store redo: route the secondary-index intent to the log owning
+        // the key's store.
+        let log_arc = self.redo_log_for_key(key);
         if (dah_changed || unmined_changed) && log_arc.is_some() {
             let mut ops = Vec::with_capacity(2);
             if dah_changed {
@@ -4422,7 +4771,9 @@ impl Engine {
             // recovered by replaying this idempotent append after engine
             // construction.
             if !intent_logged {
-                if let Some(log) = self.redo_log_handle() {
+                // Per-store redo: route the intent to the parent record's
+                // store (its `device_id`, resolved above).
+                if let Some(log) = self.redo_log_for_device(device_id) {
                     log.lock()
                         .append_and_flush(crate::redo::RedoOp::AppendConflictingChild {
                             parent_key: *parent_key,
@@ -4583,7 +4934,9 @@ impl Engine {
             // write but before the metadata write can be recovered by replaying
             // this idempotent remove after engine construction.
             if !intent_logged {
-                if let Some(log) = self.redo_log_handle() {
+                // Per-store redo: route the intent to the parent record's
+                // store (its `device_id`, resolved above).
+                if let Some(log) = self.redo_log_for_device(device_id) {
                     log.lock()
                         .append_and_flush(crate::redo::RedoOp::RemoveConflictingChild {
                             parent_key: *parent_key,
@@ -4944,7 +5297,9 @@ impl Engine {
             // emitted AFTER the prune entry (the prune is logically
             // primary — UTXO_PRUNED remains the primary defense).
             if !intent_logged {
-                if let Some(log) = self.redo_log_handle() {
+                // Per-store redo: route the intent to the parent record's
+                // store (its `device_id`, resolved above).
+                if let Some(log) = self.redo_log_for_device(device_id) {
                     log.lock()
                         .append_and_flush(crate::redo::RedoOp::AppendDeletedChild {
                             parent_key: *parent_key,

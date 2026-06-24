@@ -2326,15 +2326,9 @@ fn write_replica_redo_entry(
     engine: &Engine,
     op: &crate::redo::RedoOp,
 ) -> std::result::Result<(), String> {
-    let log_arc = match engine.redo_log() {
-        Some(l) => l,
-        None => return Ok(()),
-    };
-    let mut guard = log_arc.lock();
-    guard
-        .append(op.clone())
-        .map_err(|e| format!("replica redo append: {e}"))?;
-    Ok(())
+    // Per-store redo: route the entry to the log owning the op's store. The
+    // batch-level flush makes them durable. No-op when no log is attached.
+    engine.append_replica_redo_entry(op)
 }
 
 /// Flush the replica redo log to durable storage.
@@ -2344,15 +2338,8 @@ fn write_replica_redo_entry(
 /// and after the data device fsync. The "apply, fsync data, then flush
 /// redo log, then ACK" discipline is preserved at the batch level.
 fn flush_replica_redo_log(engine: &Engine) -> std::result::Result<(), String> {
-    let log_arc = match engine.redo_log() {
-        Some(l) => l,
-        None => return Ok(()),
-    };
-    let mut guard = log_arc.lock();
-    guard
-        .flush()
-        .map_err(|e| format!("replica redo flush: {e}"))?;
-    Ok(())
+    // Per-store redo: flush every touched store's log (one fsync per store).
+    engine.flush_all_redo_logs()
 }
 
 #[cfg(test)]

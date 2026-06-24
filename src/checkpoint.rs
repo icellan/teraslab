@@ -200,7 +200,14 @@ fn run_checkpoint_loop(
             break;
         }
 
-        let usage = redo_log.lock().usage_fraction();
+        // Per-store redo: trigger on the BUSIEST store's log so a checkpoint
+        // fires when any store fills. Falls back to the single handle when no
+        // per-store logs are attached.
+        let usage = if engine.has_per_store_redo() {
+            engine.max_redo_usage_fraction()
+        } else {
+            redo_log.lock().usage_fraction()
+        };
 
         // Hysteresis: re-arm when usage drops below low water.
         if !armed && usage <= config.low_water {
@@ -428,9 +435,24 @@ where
     //    a Checkpoint marker: recovery must still replay post-fence entries
     //    that can exist when non-dispatch redo producers append while the
     //    snapshot is being written.
-    let mut log = redo_log.lock();
-    log.mark_recovery_progress(snapshot_fence_sequence)
-        .map_err(|e| format!("redo checkpoint fence: {e}"))?;
+    //
+    //    Per-store redo: the fence is a GLOBAL sequence, so it must be written
+    //    to (and compaction applied across) EVERY store's log. The engine
+    //    helpers lock each store's log individually; do NOT also hold the
+    //    representative `redo_log` lock here, since store 0's log is the same
+    //    Mutex and that would deadlock. When no per-store logs are attached
+    //    (tests / single handle), fall back to the passed `redo_log` directly.
+    let per_store = engine.has_per_store_redo();
+    if per_store {
+        engine
+            .mark_recovery_progress_all(snapshot_fence_sequence)
+            .map_err(|e| format!("redo checkpoint fence: {e}"))?;
+    } else {
+        redo_log
+            .lock()
+            .mark_recovery_progress(snapshot_fence_sequence)
+            .map_err(|e| format!("redo checkpoint fence: {e}"))?;
+    }
 
     // Fault-injection point (test-only, inert without the
     // `fault-injection` feature): the snapshot is durable, the
@@ -442,11 +464,19 @@ where
         crate::fault_injection::SyncPoint::AfterSnapshotRenameBeforeReclaim,
     );
 
-    // 5. Reclaim only the covered prefix. Sequence numbers continue
-    //    monotonically, and entries after the fence remain available.
+    // 5. Reclaim only the covered prefix on every store's log. Sequence numbers
+    //    continue monotonically, and entries after the fence remain available.
     let reset_performed = if can_reset(snapshot_fence_sequence) {
-        log.compact_prefix_through(snapshot_fence_sequence)
-            .map_err(|e| format!("redo compact: {e}"))?;
+        if per_store {
+            engine
+                .compact_all_redo_through(snapshot_fence_sequence)
+                .map_err(|e| format!("redo compact: {e}"))?;
+        } else {
+            redo_log
+                .lock()
+                .compact_prefix_through(snapshot_fence_sequence)
+                .map_err(|e| format!("redo compact: {e}"))?;
+        }
         true
     } else {
         tracing::warn!(
@@ -456,7 +486,11 @@ where
         false
     };
 
-    let usage_after = log.usage_fraction();
+    let usage_after = if per_store {
+        engine.max_redo_usage_fraction()
+    } else {
+        redo_log.lock().usage_fraction()
+    };
     let checkpoint_duration_ms = started_at.elapsed().as_millis() as u64;
     Ok(CheckpointStats {
         entries_before,

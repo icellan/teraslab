@@ -2223,37 +2223,59 @@ const REDO_GROUP_COMMIT_WINDOW: Duration = Duration::ZERO;
 /// appended entries. These are the authoritative sequence numbers used by
 /// replica catch-up and ACK tracking.
 fn write_redo_ops(
+    engine: &Engine,
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
 ) -> std::result::Result<(u64, u64), String> {
-    write_redo_ops_with_group_window(redo_log, ops, REDO_GROUP_COMMIT_WINDOW)
+    write_redo_ops_with_group_window(engine, redo_log, ops, REDO_GROUP_COMMIT_WINDOW)
 }
 
 fn write_redo_ops_with_group_window(
+    engine: &Engine,
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
     group_window: Duration,
 ) -> std::result::Result<(u64, u64), String> {
-    let redo = match redo_log {
-        Some(r) => r,
-        None => return Ok((0, 0)),
-    };
     if ops.is_empty() {
         return Ok((0, 0));
     }
 
+    // Per-store redo: when per-store logs are attached, fan each op out to the
+    // log owning its store and flush each touched store's log. The N fsyncs
+    // run as parallel streams instead of serializing on one mutex; the shared
+    // global sequence counter keeps the returned (first,last) range a valid
+    // replication contract. The group-commit window is meaningless here (real
+    // group commit happens at the per-physical-device barrier), so the routed
+    // path ignores it.
+    if engine.has_per_store_redo() {
+        return engine.append_redo_ops_routed(ops);
+    }
+
+    // Single-handle path (tests / single-store-unconfigured): journal through
+    // the directly-passed handle exactly as before. `None` means no journal.
+    let redo = match redo_log {
+        Some(r) => r,
+        None => return Ok((0, 0)),
+    };
+
     let (first_seq, last_seq) = {
         let mut log = redo.lock();
-        let first_seq = log.current_sequence();
+        // First sequence is the value the first append assigns; capture it
+        // from the append itself so it is correct under both the local and
+        // shared-global counters.
+        let first_seq = log.append(ops[0].clone()).map_err(|e| {
+            // F-G5-008: log the underlying I/O error (which may
+            // contain file paths or kernel diagnostic strings) at
+            // `error!` level for operator triage, but return a
+            // sanitized message to the client so internal
+            // deployment topology is not leaked through ERR_INTERNAL
+            // payloads. Same treatment for `redo log flush` below.
+            tracing::error!(err = %e, "redo log append failed");
+            "redo log append failed".to_string()
+        })?;
         let mut last_seq = first_seq;
-        for op in ops {
+        for op in &ops[1..] {
             last_seq = log.append(op.clone()).map_err(|e| {
-                // F-G5-008: log the underlying I/O error (which may
-                // contain file paths or kernel diagnostic strings) at
-                // `error!` level for operator triage, but return a
-                // sanitized message to the client so internal
-                // deployment topology is not leaked through ERR_INTERNAL
-                // payloads. Same treatment for `redo log flush` below.
                 tracing::error!(err = %e, "redo log append failed");
                 "redo log append failed".to_string()
             })?;
@@ -2344,11 +2366,13 @@ fn begin_replication_intent_with_tracker(
 }
 
 fn write_replicated_redo_ops(
+    engine: &Engine,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
 ) -> std::result::Result<(u64, u64), String> {
     write_replicated_redo_ops_with_tracker(
+        engine,
         cluster.is_some(),
         redo_log,
         ops,
@@ -2357,12 +2381,13 @@ fn write_replicated_redo_ops(
 }
 
 fn write_replicated_redo_ops_with_tracker(
+    engine: &Engine,
     replication_applicable: bool,
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
     tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
 ) -> std::result::Result<(u64, u64), String> {
-    let range = write_redo_ops(redo_log, ops)?;
+    let range = write_redo_ops(engine, redo_log, ops)?;
     if replication_applicable && !ops.is_empty() {
         // R-036: the master-side intent is the durable bridge between
         // "redo fsynced" and "replica ACK policy satisfied". It must be
@@ -3861,7 +3886,7 @@ fn compensate_replication_failure(
         None
     } else {
         Some(
-            write_redo_ops(redo_log, &comp_redo)
+            write_redo_ops(engine, redo_log, &comp_redo)
                 .map_err(|e| format!("replication compensation redo write failed: {e}"))?,
         )
     };
@@ -4901,7 +4926,7 @@ fn handle_spend_batch(
         // Lock is still held via ValidatedSpend, so no concurrent
         // mutation can interleave.
         if !redo_ops.is_empty() {
-            match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+            match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
                 Ok(range) => {
                     if valid_redo_range(range) {
                         spend_intent_ranges.push(range);
@@ -5188,7 +5213,7 @@ fn handle_unspend_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: `attempted` already ticked; nothing has applied yet, so
@@ -5338,7 +5363,7 @@ fn handle_set_mined_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: `attempted` already ticked; nothing has applied yet, so
@@ -6009,7 +6034,7 @@ fn handle_create_batch(
 
     // Phase 2: WAL-first — write [AllocateRegion… + Create…] as ONE atomic
     // batch (a single fsync, all-or-nothing).
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => {
             // The AllocateRegion entries are now durable alongside their
             // Create — finalize the in-memory reservations.
@@ -6269,7 +6294,7 @@ fn handle_freeze_batch(
     let total_items = items.len() as u64;
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -6390,7 +6415,7 @@ fn handle_unfreeze_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -6520,7 +6545,7 @@ fn handle_reassign_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -6678,7 +6703,7 @@ fn handle_set_conflicting_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -6817,7 +6842,7 @@ fn handle_remove_conflicting_child_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
@@ -6922,7 +6947,7 @@ fn handle_set_locked_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -7055,7 +7080,7 @@ fn handle_preserve_until_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -7471,7 +7496,7 @@ fn handle_delete_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -7674,6 +7699,7 @@ fn handle_delete_batch(
                     }
                 };
                 if let Err(e) = write_redo_ops(
+                    engine,
                     redo_log,
                     &[RedoOp::ReplicaCreate {
                         tx_key: *key,
@@ -7810,7 +7836,7 @@ fn handle_mark_longest_chain_batch(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => {
             // M-01: nothing has applied yet — classify every non-redirected
@@ -8510,7 +8536,7 @@ fn handle_preserve_transactions(
     }
 
     // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
+    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
         Err(e) => return error_response(req.request_id, ERR_STORAGE_IO, &e),
     };
@@ -9776,6 +9802,26 @@ mod tests {
     use crate::ops::engine::Engine;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// A bare engine with no per-store redo attached, for tests that drive
+    /// `write_redo_ops*` against a single directly-passed redo handle. The
+    /// engine takes the single-handle path (`has_per_store_redo()` is false),
+    /// so it only supplies the routing-fallback context the API now requires.
+    fn bare_engine_for_redo_tests() -> Engine {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10000).unwrap();
+        let locks = StripedLocks::new(1024);
+        Engine::new(
+            dev,
+            index,
+            alloc,
+            locks,
+            DahIndex::new(),
+            UnminedIndex::new(),
+        )
+    }
 
     #[test]
     fn dispatch_parsers_use_take_helper() {
@@ -12441,14 +12487,19 @@ mod tests {
         // accounting under test.
         let baseline_syncs = redo_dev.sync_count();
         let barrier = Arc::new(std::sync::Barrier::new(3));
+        // Bare engine with no per-store redo so the writers take the
+        // single-handle group-commit path under test.
+        let engine = Arc::new(bare_engine_for_redo_tests());
 
         let spawn_writer = |byte: u8| {
             let redo_log = Arc::clone(&redo_log);
             let barrier = Arc::clone(&barrier);
+            let engine = Arc::clone(&engine);
             std::thread::spawn(move || {
                 let tx_key = TxKey { txid: [byte; 32] };
                 barrier.wait();
                 write_redo_ops_with_group_window(
+                    &engine,
                     Some(redo_log.as_ref()),
                     &[RedoOp::Delete {
                         tx_key,
@@ -14380,6 +14431,7 @@ mod tests {
             txid: txid_for_shard(40, 9),
         };
         let range = write_redo_ops(
+            &h.engine,
             Some(&redo_log),
             &[RedoOp::Delete {
                 tx_key,
@@ -14426,7 +14478,9 @@ mod tests {
             txid: txid_for_shard(42, 9),
         };
 
+        let engine = bare_engine_for_redo_tests();
         let range = write_replicated_redo_ops_with_tracker(
+            &engine,
             true,
             Some(&redo_log),
             &[RedoOp::Delete {
@@ -14525,6 +14579,7 @@ mod tests {
             txid: txid_for_shard(41, 9),
         };
         let range = write_redo_ops(
+            &h.engine,
             Some(&redo_log),
             &[RedoOp::Delete {
                 tx_key,
@@ -15437,7 +15492,9 @@ mod tests {
         let tx_key = TxKey {
             txid: txid_for_shard(shard, 88),
         };
+        let h = DispatchTestHarness::new();
         let range = write_redo_ops(
+            &h.engine,
             Some(&redo_log),
             &[RedoOp::Delete {
                 tx_key,
@@ -15448,7 +15505,6 @@ mod tests {
         .expect("redo write succeeds");
         tracker.begin(range.0, range.1).unwrap();
 
-        let h = DispatchTestHarness::new();
         // Drive the EXACT body of `recover_pending_replication_intents`: the
         // production `replicate_all_ops` fan-out against the live cluster.
         let result = recover_pending_replication_intents_from_tracker(
@@ -20052,6 +20108,7 @@ mod tests {
     fn fill_redo_log(h: &RedoDispatchHarness) {
         for i in 0..2048u64 {
             let r = write_redo_ops(
+                &h.engine,
                 Some(&h.redo_log),
                 &[RedoOp::Delete {
                     tx_key: TxKey { txid: [0xFE; 32] },
@@ -21558,6 +21615,7 @@ mod tests {
             assert!(resp.is_ok(), "seed spend must apply: {resp:?}");
             // WAL the spend so it is replayable on recovery.
             write_redo_ops(
+                &self.engine,
                 Some(self.redo_log.as_ref()),
                 &[RedoOp::SpendV2 {
                     tx_key: key,

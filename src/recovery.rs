@@ -846,73 +846,21 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     )
 }
 
-/// Determine which store a redo entry belongs to.
+/// Multi-store recovery: replay each store's OWN redo log against that store.
 ///
-/// - Create / AllocateRegion / FreeRegion carry their own `device_id`.
-/// - Ops keyed by a txid route to the store recorded for that key — first from
-///   `owner` (records created in THIS log, pre-replay) then the loaded index
-///   (records created before the snapshot). Defaults to store 0 (also the
-///   single-store and legacy `ReplicaCreate` case).
-fn entry_store_id(
-    op: &RedoOp,
-    owner: &std::collections::HashMap<TxKey, u8>,
-    index: &ShardedIndex,
-) -> u8 {
-    match op {
-        RedoOp::Create { device_id, .. }
-        | RedoOp::AllocateRegion { device_id, .. }
-        | RedoOp::FreeRegion { device_id, .. } => *device_id,
-        other => match other.tx_key() {
-            Some(k) => owner
-                .get(k)
-                .copied()
-                .or_else(|| index.lookup(k).map(|e| e.device_id))
-                .unwrap_or(0),
-            None => 0,
-        },
-    }
-}
-
-/// Partition a single shared redo log's entries by owning store, preserving
-/// per-store log order. Each store's slice is then recovered independently by
-/// the existing single-store replay (the durability-critical path is unchanged;
-/// stores are independent because a record lives entirely on one store).
-fn partition_entries_by_store(
-    entries: Vec<RedoEntry>,
-    num_stores: usize,
-    index: &ShardedIndex,
-) -> Vec<Vec<RedoEntry>> {
-    // Pass 1: key -> device_id for records created within this log.
-    let mut owner: std::collections::HashMap<TxKey, u8> = std::collections::HashMap::new();
-    for e in &entries {
-        if let RedoOp::Create {
-            tx_key, device_id, ..
-        } = &e.op
-        {
-            owner.insert(*tx_key, *device_id);
-        }
-    }
-    // Pass 2: route each entry to its store (clamped defensively in range).
-    let mut parts: Vec<Vec<RedoEntry>> = (0..num_stores).map(|_| Vec::new()).collect();
-    for e in entries {
-        let store = (entry_store_id(&e.op, &owner, index) as usize).min(num_stores - 1);
-        parts[store].push(e);
-    }
-    parts
-}
-
-/// Multi-store recovery: replay one shared redo log across N stores.
-///
-/// Partitions the log by owning store (see [`partition_entries_by_store`]) and
-/// runs the existing single-store replay once per store with that store's
-/// device + allocator, sharing the index / DAH / unmined backends. Per-store
-/// pending conflicting/deleted-child drains and stats are merged. The
-/// single-store path (`num_stores == 1`) is exactly the prior behaviour.
+/// Per-store redo: every store has its own redo log (its own backing region),
+/// so there is no shared log to partition — each log already contains exactly
+/// its store's entries (the dispatch write path routed each op to its store's
+/// log). Each store's log is replayed in parallel against that store's device +
+/// allocator, sharing the index / DAH / unmined backends. Per-store pending
+/// conflicting/deleted-child drains and stats are merged. The single-store path
+/// (`num_stores == 1`) is exactly the prior behaviour because the one store's
+/// log holds every entry.
 #[allow(clippy::too_many_arguments)]
 pub fn recover_all_multi_store(
     devices: &[std::sync::Arc<dyn BlockDevice>],
     allocators: &mut [SlotAllocator],
-    redo_log: &mut RedoLog,
+    redo_logs: &mut [RedoLog],
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
@@ -930,21 +878,30 @@ pub fn recover_all_multi_store(
         allocators.len(),
         "devices and allocators must be 1:1 per store"
     );
-    let entries = redo_log.recover()?;
-    let partitions = partition_entries_by_store(entries, devices.len(), index);
+    assert_eq!(
+        devices.len(),
+        redo_logs.len(),
+        "devices and redo logs must be 1:1 per store"
+    );
+    // Recover each store's own log into its entry list up front (the scan is
+    // cheap relative to replay). Each log already holds only its store's ops.
+    let mut partitions: Vec<Vec<RedoEntry>> = Vec::with_capacity(redo_logs.len());
+    for log in redo_logs.iter() {
+        partitions.push(log.recover()?);
+    }
     let mut total = RecoveryStats::default();
     let mut pending_cc = Vec::new();
     let mut pending_dc = Vec::new();
 
     // Replay every store IN PARALLEL — one scoped thread per store. Stores are
-    // independent (each owns its device + allocator); the primary index is
-    // shared and concurrency-safe (PR#19 per-shard RwLocks), and a record's
-    // ops all live in one store's partition, so no two threads touch the same
-    // key/offset. The only otherwise-shared `&mut` is the secondary indexes:
-    // each thread replays its SecondaryDahUpdate/Unmined ops into a THROWAWAY
-    // backend (discarded) — the authoritative DAH/unmined are rebuilt once,
-    // store-routed, by the reconcile after all replays. So nothing real is
-    // shared mutably across threads.
+    // independent (each owns its device + allocator + redo log); the primary
+    // index is shared and concurrency-safe (PR#19 per-shard RwLocks), and a
+    // record's ops all live in its own store's log, so no two threads touch the
+    // same key/offset. The only otherwise-shared `&mut` is the secondary
+    // indexes: each thread replays its SecondaryDahUpdate/Unmined ops into a
+    // THROWAWAY backend (discarded) — the authoritative DAH/unmined are rebuilt
+    // once, store-routed, by the reconcile after all replays. So nothing real
+    // is shared mutably across threads.
     type StoreResult = Result<
         (
             RecoveryStats,
@@ -4892,7 +4849,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let dev1: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        // Per-store redo: one log per store, each on its own device, sharing
+        // one global sequence counter (as boot wires it).
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
         let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
@@ -4931,37 +4891,46 @@ mod tests {
         let (key_a, off_a, rb_a) = build(0xA0, &mut alloc0); // store 0
         let (key_b, off_b, rb_b) = build(0xB0, &mut alloc1); // store 1
 
-        // One shared redo log carries both creates (interleaved by store).
-        let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::Create {
-            tx_key: key_a,
-            device_id: 0,
-            record_offset: off_a,
-            utxo_count: 3,
-            is_conflicting: false,
-            record_bytes: rb_a.clone(),
-            parent_txids: Vec::new(),
-        })
-        .unwrap();
-        redo.append_and_flush(RedoOp::Create {
-            tx_key: key_b,
-            device_id: 1,
-            record_offset: off_b,
-            utxo_count: 3,
-            is_conflicting: false,
-            record_bytes: rb_b.clone(),
-            parent_txids: Vec::new(),
-        })
-        .unwrap();
+        // Each store's create lands in ITS OWN log, sharing a global counter.
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let mut redo1 = RedoLog::open(redo_dev1.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0, &redo1]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo1.attach_shared_sequence(shared.clone());
+        redo0
+            .append_and_flush(RedoOp::Create {
+                tx_key: key_a,
+                device_id: 0,
+                record_offset: off_a,
+                utxo_count: 3,
+                is_conflicting: false,
+                record_bytes: rb_a.clone(),
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo1
+            .append_and_flush(RedoOp::Create {
+                tx_key: key_b,
+                device_id: 1,
+                record_offset: off_b,
+                utxo_count: 3,
+                is_conflicting: false,
+                record_bytes: rb_b.clone(),
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
+        let mut redo_logs = [redo0, redo1];
         let (stats, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
-            &mut redo,
+            &mut redo_logs,
             &index,
             &mut dah,
             &mut unmined,
@@ -5019,8 +4988,19 @@ mod tests {
         }
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(8192).unwrap());
 
-        let redo_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut redo = RedoLog::open(redo_dev, 0, 64 * 1024 * 1024).unwrap();
+        // Per-store redo: one log per store on its own device, all sharing a
+        // global sequence counter (as boot wires it).
+        let mut redo_logs: Vec<RedoLog> = Vec::with_capacity(STORES);
+        for _ in 0..STORES {
+            let redo_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            redo_logs.push(RedoLog::open(redo_dev, 0, 64 * 1024 * 1024).unwrap());
+        }
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&redo_logs.iter().collect::<Vec<_>>()),
+        ));
+        for log in &mut redo_logs {
+            log.attach_shared_sequence(shared.clone());
+        }
 
         // Track expected per-key (store, has_dah) for verification.
         let mut expected: Vec<(TxKey, u8, bool)> = Vec::new();
@@ -5059,16 +5039,17 @@ mod tests {
                     slot.to_bytes(&mut sb);
                     rb.extend_from_slice(&sb);
                 }
-                redo.append_and_flush(RedoOp::Create {
-                    tx_key: TxKey { txid },
-                    device_id: s as u8,
-                    record_offset: offset,
-                    utxo_count,
-                    is_conflicting: false,
-                    record_bytes: rb,
-                    parent_txids: Vec::new(),
-                })
-                .unwrap();
+                redo_logs[s]
+                    .append_and_flush(RedoOp::Create {
+                        tx_key: TxKey { txid },
+                        device_id: s as u8,
+                        record_offset: offset,
+                        utxo_count,
+                        is_conflicting: false,
+                        record_bytes: rb,
+                        parent_txids: Vec::new(),
+                    })
+                    .unwrap();
                 expected.push((TxKey { txid }, s as u8, has_dah));
             }
         }
@@ -5078,7 +5059,7 @@ mod tests {
         let (stats, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
-            &mut redo,
+            &mut redo_logs,
             &index,
             &mut dah,
             &mut unmined,
