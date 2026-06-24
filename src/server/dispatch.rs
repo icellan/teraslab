@@ -7936,6 +7936,244 @@ fn handle_mark_longest_chain_batch(
 // GetBatch
 // ---------------------------------------------------------------------------
 
+/// `Send`-able handle that lets a borrowed `&Engine` be moved into the
+/// `'static` closures `tokio::task::spawn_blocking` requires.
+///
+/// SAFETY CONTRACT: the only constructor captures a `&'a Engine` and the only
+/// use site ([`handle_get_batch`]'s phase-2 fan-out) drives every spawned task
+/// to completion via `REPL_RUNTIME.block_on(...)` BEFORE returning — so the
+/// borrow provably outlives every task that recovers the reference. `Engine`
+/// is `Send + Sync` (declared in `ops/engine.rs`), so sharing `&Engine` across
+/// blocking threads is sound; this wrapper only erases the lifetime, which the
+/// join barrier re-establishes. Do not store an `EngineRef` past the
+/// `block_on` join, and never return one from this module.
+#[derive(Clone, Copy)]
+struct EngineRef(*const Engine);
+
+// SAFETY: `Engine: Sync` (see `ops/engine.rs`), so `&Engine` is `Send`; the
+// raw pointer carries the same reference and is only dereferenced as a shared
+// reference within the join-bounded fan-out described above.
+unsafe impl Send for EngineRef {}
+
+impl EngineRef {
+    /// Recover the shared reference. SAFETY: caller must guarantee the original
+    /// borrow is still live — upheld by the `block_on` join barrier in
+    /// [`handle_get_batch`].
+    unsafe fn get(self) -> &'static Engine {
+        // SAFETY: pointer came from a live `&Engine`; lifetime erasure is
+        // sound under the join-barrier contract documented on `EngineRef`.
+        unsafe { &*self.0 }
+    }
+}
+
+/// Perform the full per-item device read for one transaction and serialize the
+/// requested fields into a [`WireGetResult`].
+///
+/// This is the slow-path read logic shared by [`handle_get_batch`]'s sequential
+/// fallback and its parallel per-store fan-out tasks. Behavior is identical to
+/// the original in-loop code: metadata is read via [`Engine::read_metadata`],
+/// and the optional UTXO-slot / cold-data / block-entry / conflicting-children
+/// sub-reads are appended per `field_mask`, with inner sub-read failures
+/// surfaced as `ERR_STORAGE_IO` (or `ERR_BLOB_NOT_FOUND` for a missing external
+/// blob) on the item status. A missing record yields `ERR_TX_NOT_FOUND`; a
+/// non-`TxNotFound` metadata error yields `ERR_STORAGE_IO`.
+fn read_get_item_from_device(engine: &Engine, field_mask: FieldMask, key: &TxKey) -> WireGetResult {
+    match engine.read_metadata(key) {
+        Ok(meta) => {
+            let mut data = Vec::new();
+            if field_mask.has(FieldMask::RAW_METADATA) {
+                // Raw debug mode: dump the full on-disk struct as-is.
+                let mut buf = vec![0u8; METADATA_SIZE];
+                meta.to_bytes(&mut buf);
+                data.extend_from_slice(&buf);
+            } else {
+                // Per-field metadata serialization.
+                if field_mask.has(FieldMask::TX_VERSION) {
+                    data.extend_from_slice(&{ meta.tx_version }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::LOCKTIME) {
+                    data.extend_from_slice(&{ meta.locktime }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::FEE) {
+                    data.extend_from_slice(&{ meta.fee }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::SIZE_IN_BYTES) {
+                    data.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::EXTENDED_SIZE) {
+                    data.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::FLAGS) {
+                    data.push({ meta.flags }.bits());
+                }
+                if field_mask.has(FieldMask::SPENDING_HEIGHT) {
+                    data.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::CREATED_AT) {
+                    data.extend_from_slice(&{ meta.created_at }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::SPENT_UTXOS) {
+                    data.extend_from_slice(&{ meta.spent_utxos }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::PRUNED_UTXOS) {
+                    data.extend_from_slice(&{ meta.pruned_utxos }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UTXO_COUNT) {
+                    data.extend_from_slice(&{ meta.utxo_count }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::GENERATION) {
+                    data.extend_from_slice(&{ meta.generation }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UPDATED_AT) {
+                    data.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UNMINED_SINCE) {
+                    data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
+                    data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::PRESERVE_UNTIL) {
+                    data.extend_from_slice(&{ meta.preserve_until }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::EXTERNAL_REF) {
+                    let ext = { meta.external_ref };
+                    data.push(ext.store_type);
+                    data.extend_from_slice(&ext.content_hash);
+                    data.extend_from_slice(&ext.total_size.to_le_bytes());
+                    data.extend_from_slice(&ext.input_count.to_le_bytes());
+                    data.extend_from_slice(&ext.output_count.to_le_bytes());
+                    data.extend_from_slice(&ext.inputs_offset.to_le_bytes());
+                    data.extend_from_slice(&ext.outputs_offset.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::REASSIGNMENT_COUNT) {
+                    data.push(meta.reassignment_count);
+                }
+                if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
+                    data.push(meta.block_entry_count);
+                }
+            }
+            // R-045 (Codex F4): track whether any inner sub-read
+            // (slot / cold-data / conflicting-children) failed.
+            // Pre-fix the failures were silently filled with
+            // zeros / length-0 / count-0, so storage corruption
+            // was indistinguishable from a clean read of an
+            // empty record. Now we surface inner failures as
+            // ERR_STORAGE_IO on the result item — clients can
+            // retry instead of trusting the synthesized bytes.
+            // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
+            let mut inner_read_failed = false;
+            // F-IJ-001: track a missing external cold-data blob distinctly
+            // from generic sub-read corruption. A record that exists but
+            // whose blob is gone must surface ERR_BLOB_NOT_FOUND (17), not
+            // ERR_TX_NOT_FOUND (which would say the tx never existed) nor
+            // ERR_STORAGE_IO (a transient I/O fault the client would
+            // retry).
+            let mut blob_not_found = false;
+            if field_mask.has(FieldMask::UTXO_SLOTS) {
+                let utxo_count = { meta.utxo_count };
+                data.extend_from_slice(&utxo_count.to_le_bytes());
+                match engine.read_slots(key) {
+                    Ok(slots) if slots.len() == utxo_count as usize => {
+                        for slot in slots {
+                            data.extend_from_slice(&slot.hash);
+                            data.push(slot.status);
+                            data.extend_from_slice(&slot.spending_data);
+                        }
+                    }
+                    _ => {
+                        inner_read_failed = true;
+                        // Still emit padding bytes so the length declared
+                        // in `utxo_count` matches the data length; the
+                        // per-item ERR_STORAGE_IO status tells the client
+                        // these bytes are unreliable.
+                        for _ in 0..utxo_count {
+                            data.extend_from_slice(&[0u8; 69]);
+                        }
+                    }
+                }
+            }
+            if field_mask.has(FieldMask::COLD_DATA) {
+                match engine.read_cold_data(key) {
+                    Ok(cold) => {
+                        data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
+                        data.extend_from_slice(&cold);
+                    }
+                    // F-IJ-001: missing external blob → ERR_BLOB_NOT_FOUND,
+                    // not the generic ERR_STORAGE_IO path below.
+                    Err(SpendError::BlobNotFound { .. }) => {
+                        blob_not_found = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    Err(_) => {
+                        inner_read_failed = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                }
+            }
+            if field_mask.has(FieldMask::BLOCK_ENTRIES) {
+                let count = { meta.block_entry_count };
+                data.push(count);
+                let inline_count = count.min(3);
+                for i in 0..inline_count as usize {
+                    let be = { meta.block_entries_inline[i] };
+                    data.extend_from_slice(&{ be.block_id }.to_le_bytes());
+                    data.extend_from_slice(&{ be.block_height }.to_le_bytes());
+                    data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
+                }
+            }
+            if field_mask.has(FieldMask::CONFLICTING_CHILDREN) {
+                match engine.read_conflicting_children(key) {
+                    Ok(children) => {
+                        data.push(children.len() as u8);
+                        for child in &children {
+                            data.extend_from_slice(child);
+                        }
+                    }
+                    Err(_) => {
+                        inner_read_failed = true;
+                        data.push(0u8);
+                    }
+                }
+            }
+            let status = if blob_not_found {
+                // F-IJ-001: existing record, missing external cold-data
+                // blob. Takes precedence over ERR_STORAGE_IO: it is the
+                // specific, actionable failure (the bytes are gone, not a
+                // transient device fault).
+                ERR_BLOB_NOT_FOUND as u8
+            } else if inner_read_failed {
+                // ERR_STORAGE_IO on the wire — distinguishes sub-read
+                // corruption from a clean `Ok(0)` case. (P3.10 /
+                // F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
+                ERR_STORAGE_IO as u8
+            } else {
+                0
+            };
+            WireGetResult { status, data }
+        }
+        Err(SpendError::TxNotFound) => WireGetResult {
+            status: ERR_TX_NOT_FOUND as u8,
+            data: vec![],
+        },
+        Err(_) => {
+            // R-045 (Codex F4): a non-`TxNotFound` metadata read
+            // error is storage corruption / I/O failure, not a
+            // missing record. Pre-fix this returned status=1
+            // (ERR_TX_NOT_FOUND on the wire), so a client could
+            // not distinguish "tx really doesn't exist" from
+            // "tx exists but the device returned bad bytes" —
+            // the natural retry behaviour for the latter never
+            // fired. Surface as ERR_STORAGE_IO so the client
+            // retries. (P3.10 / F-G5-017; pre-P3.10 ERR_INTERNAL.)
+            WireGetResult {
+                status: ERR_STORAGE_IO as u8,
+                data: vec![],
+            }
+        }
+    }
+}
+
 fn handle_get_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -7949,13 +8187,16 @@ fn handle_get_batch(
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
-    let mut results = Vec::with_capacity(txids.len());
-    // Track per-item outcomes: STATUS_OK => succeeded, ERR_TX_NOT_FOUND =>
-    // not_found, anything else => failed.
-    let mut ok_count: u64 = 0;
-    let mut not_found_count: u64 = 0;
-    let mut failed_count: u64 = 0;
-    for txid in &txids {
+    // Results are addressed by ORIGINAL request position so the response order
+    // is independent of the order in which items are resolved. Phase 1 fills
+    // the cheap cases (redirect / migration / error / index-cached) in place;
+    // phase 2 fans the remaining device reads out across stores and writes each
+    // result back at its original index. The final response is assembled by
+    // walking this vector front-to-back, so item i is always for txid i.
+    let mut results: Vec<Option<WireGetResult>> = vec![None; txids.len()];
+    // Items that still need a DEVICE read after phase 1: (original_index, key).
+    let mut pending: Vec<(usize, TxKey)> = Vec::new();
+    for (idx, txid) in txids.iter().enumerate() {
         let key = TxKey { txid: *txid };
 
         // In cluster mode, serve reads if we're master OR if the record is
@@ -7978,7 +8219,7 @@ fn handle_get_batch(
                         last_known_term,
                         "dispatch: get deferring — topology in transition"
                     );
-                    results.push(WireGetResult {
+                    results[idx] = Some(WireGetResult {
                         status: ERR_MIGRATION_IN_PROGRESS as u8,
                         data: vec![],
                     });
@@ -8013,7 +8254,7 @@ fn handle_get_batch(
                             if let Some(m) = DISPATCH_METRICS.get() {
                                 m.stale_routing_request_total.inc();
                             }
-                            results.push(WireGetResult {
+                            results[idx] = Some(WireGetResult {
                                 status: ERR_REDIRECT as u8,
                                 data,
                             });
@@ -8029,7 +8270,7 @@ fn handle_get_batch(
                                 node = ?node,
                                 "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
                             );
-                            results.push(WireGetResult {
+                            results[idx] = Some(WireGetResult {
                                 status: ERR_NO_QUORUM as u8,
                                 data: vec![],
                             });
@@ -8039,7 +8280,7 @@ fn handle_get_batch(
                         if let Some(m) = DISPATCH_METRICS.get() {
                             m.stale_routing_request_total.inc();
                         }
-                        results.push(WireGetResult {
+                        results[idx] = Some(WireGetResult {
                             status: ERR_REDIRECT as u8,
                             data: vec![ERR_REDIRECT as u8],
                         });
@@ -8055,7 +8296,7 @@ fn handle_get_batch(
             {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
                 tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
-                results.push(WireGetResult {
+                results[idx] = Some(WireGetResult {
                     status: ERR_MIGRATION_IN_PROGRESS as u8,
                     data: vec![],
                 });
@@ -8072,7 +8313,7 @@ fn handle_get_batch(
             let cached = match engine.lookup_cached_checked(&key) {
                 Ok(found) => found,
                 Err(e) => {
-                    results.push(WireGetResult {
+                    results[idx] = Some(WireGetResult {
                         status: ERR_STORAGE_IO as u8,
                         data: format!("index lookup failed: {e}").into_bytes(),
                     });
@@ -8115,218 +8356,126 @@ fn handle_get_batch(
                 if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
                     data.push(entry.block_entry_count);
                 }
-                results.push(WireGetResult {
+                results[idx] = Some(WireGetResult {
                     status: STATUS_OK,
                     data,
                 });
                 continue;
             }
-            // Not in index — fall through to TxNotFound below
-            results.push(WireGetResult {
+            // Not in index — TxNotFound; no device read needed.
+            results[idx] = Some(WireGetResult {
                 status: ERR_TX_NOT_FOUND as u8,
                 data: vec![],
             });
             continue;
         }
 
-        // Slow path: read full metadata from device for non-cached fields.
-        match engine.read_metadata(&key) {
-            Ok(meta) => {
-                let mut data = Vec::new();
-                if field_mask.has(FieldMask::RAW_METADATA) {
-                    // Raw debug mode: dump the full on-disk struct as-is.
-                    let mut buf = vec![0u8; METADATA_SIZE];
-                    meta.to_bytes(&mut buf);
-                    data.extend_from_slice(&buf);
-                } else {
-                    // Per-field metadata serialization.
-                    if field_mask.has(FieldMask::TX_VERSION) {
-                        data.extend_from_slice(&{ meta.tx_version }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::LOCKTIME) {
-                        data.extend_from_slice(&{ meta.locktime }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::FEE) {
-                        data.extend_from_slice(&{ meta.fee }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::SIZE_IN_BYTES) {
-                        data.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::EXTENDED_SIZE) {
-                        data.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::FLAGS) {
-                        data.push({ meta.flags }.bits());
-                    }
-                    if field_mask.has(FieldMask::SPENDING_HEIGHT) {
-                        data.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::CREATED_AT) {
-                        data.extend_from_slice(&{ meta.created_at }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::SPENT_UTXOS) {
-                        data.extend_from_slice(&{ meta.spent_utxos }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::PRUNED_UTXOS) {
-                        data.extend_from_slice(&{ meta.pruned_utxos }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::UTXO_COUNT) {
-                        data.extend_from_slice(&{ meta.utxo_count }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::GENERATION) {
-                        data.extend_from_slice(&{ meta.generation }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::UPDATED_AT) {
-                        data.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::UNMINED_SINCE) {
-                        data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
-                        data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::PRESERVE_UNTIL) {
-                        data.extend_from_slice(&{ meta.preserve_until }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::EXTERNAL_REF) {
-                        let ext = { meta.external_ref };
-                        data.push(ext.store_type);
-                        data.extend_from_slice(&ext.content_hash);
-                        data.extend_from_slice(&ext.total_size.to_le_bytes());
-                        data.extend_from_slice(&ext.input_count.to_le_bytes());
-                        data.extend_from_slice(&ext.output_count.to_le_bytes());
-                        data.extend_from_slice(&ext.inputs_offset.to_le_bytes());
-                        data.extend_from_slice(&ext.outputs_offset.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::REASSIGNMENT_COUNT) {
-                        data.push(meta.reassignment_count);
-                    }
-                    if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
-                        data.push(meta.block_entry_count);
-                    }
+        // Slow path: this item needs a DEVICE read. Defer it to phase 2 so all
+        // pending reads can be grouped by store and fanned out in parallel.
+        pending.push((idx, key));
+    }
+
+    // -----------------------------------------------------------------------
+    // PHASE 2: parallel per-store device reads.
+    //
+    // Each pending item lives on exactly one store (its index entry's
+    // `device_id`). Items with no index entry are resolved here without a
+    // device read (TxNotFound, or ERR_STORAGE_IO on a backend lookup fault).
+    // The remaining reads are grouped by `device_id` — records on different
+    // stores are on different physical devices, so their reads run
+    // concurrently — and each group is executed on a `spawn_blocking` task on
+    // the shared `REPL_RUNTIME`. `block_on` joins ALL tasks before returning,
+    // which is what makes sharing `&Engine` across the tasks sound (see the
+    // `EngineRef` safety contract). Results are written back at their original
+    // index, so the merge cannot reorder items.
+    // -----------------------------------------------------------------------
+    if !pending.is_empty() {
+        // Group pending items by store. `lookup_checked` distinguishes a
+        // genuine absent record (None → TxNotFound) from a backend read error
+        // (Err → ERR_STORAGE_IO); collapsing the latter to TxNotFound would
+        // tell the client a present transaction does not exist (G-4).
+        let mut by_store: std::collections::HashMap<u8, Vec<(usize, TxKey)>> =
+            std::collections::HashMap::new();
+        for (idx, key) in pending {
+            match engine.lookup_checked(&key) {
+                Ok(Some(entry)) => {
+                    by_store
+                        .entry(entry.device_id)
+                        .or_default()
+                        .push((idx, key));
                 }
-                // R-045 (Codex F4): track whether any inner sub-read
-                // (slot / cold-data / conflicting-children) failed.
-                // Pre-fix the failures were silently filled with
-                // zeros / length-0 / count-0, so storage corruption
-                // was indistinguishable from a clean read of an
-                // empty record. Now we surface inner failures as
-                // ERR_STORAGE_IO on the result item — clients can
-                // retry instead of trusting the synthesized bytes.
-                // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
-                let mut inner_read_failed = false;
-                // F-IJ-001: track a missing external cold-data blob distinctly
-                // from generic sub-read corruption. A record that exists but
-                // whose blob is gone must surface ERR_BLOB_NOT_FOUND (17), not
-                // ERR_TX_NOT_FOUND (which would say the tx never existed) nor
-                // ERR_STORAGE_IO (a transient I/O fault the client would
-                // retry).
-                let mut blob_not_found = false;
-                if field_mask.has(FieldMask::UTXO_SLOTS) {
-                    let utxo_count = { meta.utxo_count };
-                    data.extend_from_slice(&utxo_count.to_le_bytes());
-                    match engine.read_slots(&key) {
-                        Ok(slots) if slots.len() == utxo_count as usize => {
-                            for slot in slots {
-                                data.extend_from_slice(&slot.hash);
-                                data.push(slot.status);
-                                data.extend_from_slice(&slot.spending_data);
-                            }
-                        }
-                        _ => {
-                            inner_read_failed = true;
-                            // Still emit padding bytes so the length declared
-                            // in `utxo_count` matches the data length; the
-                            // per-item ERR_STORAGE_IO status tells the client
-                            // these bytes are unreliable.
-                            for _ in 0..utxo_count {
-                                data.extend_from_slice(&[0u8; 69]);
-                            }
-                        }
-                    }
+                Ok(None) => {
+                    results[idx] = Some(WireGetResult {
+                        status: ERR_TX_NOT_FOUND as u8,
+                        data: vec![],
+                    });
                 }
-                if field_mask.has(FieldMask::COLD_DATA) {
-                    match engine.read_cold_data(&key) {
-                        Ok(cold) => {
-                            data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
-                            data.extend_from_slice(&cold);
-                        }
-                        // F-IJ-001: missing external blob → ERR_BLOB_NOT_FOUND,
-                        // not the generic ERR_STORAGE_IO path below.
-                        Err(SpendError::BlobNotFound { .. }) => {
-                            blob_not_found = true;
-                            data.extend_from_slice(&0u32.to_le_bytes());
-                        }
-                        Err(_) => {
-                            inner_read_failed = true;
-                            data.extend_from_slice(&0u32.to_le_bytes());
-                        }
-                    }
+                Err(e) => {
+                    results[idx] = Some(WireGetResult {
+                        status: ERR_STORAGE_IO as u8,
+                        data: format!("index lookup failed: {e}").into_bytes(),
+                    });
                 }
-                if field_mask.has(FieldMask::BLOCK_ENTRIES) {
-                    let count = { meta.block_entry_count };
-                    data.push(count);
-                    let inline_count = count.min(3);
-                    for i in 0..inline_count as usize {
-                        let be = { meta.block_entries_inline[i] };
-                        data.extend_from_slice(&{ be.block_id }.to_le_bytes());
-                        data.extend_from_slice(&{ be.block_height }.to_le_bytes());
-                        data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
-                    }
-                }
-                if field_mask.has(FieldMask::CONFLICTING_CHILDREN) {
-                    match engine.read_conflicting_children(&key) {
-                        Ok(children) => {
-                            data.push(children.len() as u8);
-                            for child in &children {
-                                data.extend_from_slice(child);
-                            }
-                        }
-                        Err(_) => {
-                            inner_read_failed = true;
-                            data.push(0u8);
-                        }
-                    }
-                }
-                let status = if blob_not_found {
-                    // F-IJ-001: existing record, missing external cold-data
-                    // blob. Takes precedence over ERR_STORAGE_IO: it is the
-                    // specific, actionable failure (the bytes are gone, not a
-                    // transient device fault).
-                    ERR_BLOB_NOT_FOUND as u8
-                } else if inner_read_failed {
-                    // ERR_STORAGE_IO on the wire — distinguishes sub-read
-                    // corruption from a clean `Ok(0)` case. (P3.10 /
-                    // F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
-                    ERR_STORAGE_IO as u8
-                } else {
-                    0
-                };
-                results.push(WireGetResult { status, data });
             }
-            Err(SpendError::TxNotFound) => {
-                results.push(WireGetResult {
-                    status: ERR_TX_NOT_FOUND as u8,
-                    data: vec![],
-                });
-            }
-            Err(_) => {
-                // R-045 (Codex F4): a non-`TxNotFound` metadata read
-                // error is storage corruption / I/O failure, not a
-                // missing record. Pre-fix this returned status=1
-                // (ERR_TX_NOT_FOUND on the wire), so a client could
-                // not distinguish "tx really doesn't exist" from
-                // "tx exists but the device returned bad bytes" —
-                // the natural retry behaviour for the latter never
-                // fired. Surface as ERR_STORAGE_IO so the client
-                // retries. (P3.10 / F-G5-017; pre-P3.10 ERR_INTERNAL.)
-                results.push(WireGetResult {
-                    status: ERR_STORAGE_IO as u8,
-                    data: vec![],
-                });
+        }
+
+        if !by_store.is_empty() {
+            let engine_ref = EngineRef(engine as *const Engine);
+            let group_results: Vec<(usize, WireGetResult)> = REPL_RUNTIME.block_on(async {
+                let mut handles = Vec::with_capacity(by_store.len());
+                for (_device_id, items) in by_store {
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        // SAFETY: `engine_ref` is dereferenced only here, and
+                        // every spawned task is awaited below before
+                        // `block_on` (and thus `handle_get_batch`) returns, so
+                        // the borrowed `&Engine` provably outlives this task.
+                        let engine = unsafe { engine_ref.get() };
+                        let mut out = Vec::with_capacity(items.len());
+                        for (idx, key) in items {
+                            out.push((idx, read_get_item_from_device(engine, field_mask, &key)));
+                        }
+                        out
+                    }));
+                }
+                let mut merged = Vec::new();
+                for handle in handles {
+                    match handle.await {
+                        Ok(group) => merged.extend(group),
+                        // A blocking task only panics if `read_get_item_from_device`
+                        // panics; the engine read paths return `Result`, so this
+                        // is not expected. Surface affected items as
+                        // ERR_STORAGE_IO rather than dropping them (which would
+                        // desync the response item count from the request).
+                        Err(e) => {
+                            tracing::error!(err = %e, "get_batch: device-read task panicked");
+                        }
+                    }
+                }
+                merged
+            });
+            for (idx, result) in group_results {
+                results[idx] = Some(result);
             }
         }
     }
+
+    // Any slot still unfilled means its device-read task panicked (see above);
+    // surface ERR_STORAGE_IO so the response item count matches the request.
+    let results: Vec<WireGetResult> = results
+        .into_iter()
+        .map(|r| {
+            r.unwrap_or_else(|| WireGetResult {
+                status: ERR_STORAGE_IO as u8,
+                data: vec![],
+            })
+        })
+        .collect();
+
+    // Track per-item outcomes: STATUS_OK => succeeded, ERR_TX_NOT_FOUND =>
+    // not_found, anything else => failed.
+    let mut ok_count: u64 = 0;
+    let mut not_found_count: u64 = 0;
+    let mut failed_count: u64 = 0;
 
     // Classify per-item outcome.
     for r in &results {
@@ -10079,6 +10228,40 @@ mod tests {
             }
         }
 
+        /// Create a harness whose engine spans `1 + aux` stores, each on its
+        /// own in-memory device. Records are placed round-robin across stores
+        /// (store 0, store 1, ... store N, store 0, ...), so consecutive
+        /// `create_tx` calls land on different physical devices — exercising
+        /// the GetBatch per-store parallel fan-out.
+        fn with_stores(aux: usize) -> Self {
+            let dev0: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+            let aux_stores: Vec<(Arc<dyn BlockDevice>, SlotAllocator)> = (0..aux)
+                .map(|_| {
+                    let dev: Arc<dyn BlockDevice> =
+                        Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+                    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+                    (dev, alloc)
+                })
+                .collect();
+            let index = crate::index::ShardedIndex::from_single(Index::new(10000).unwrap().into());
+            let engine = Engine::new_multi_store(
+                dev0,
+                alloc0,
+                aux_stores,
+                index,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            Self {
+                engine,
+                _metrics_guard: metrics_test_lock(),
+                _index_dir: None,
+            }
+        }
+
         /// Create a harness whose engine runs over the given index backend.
         ///
         /// For [`IndexBackendMode::Redb`] / [`IndexBackendMode::FileBacked`]
@@ -11163,6 +11346,154 @@ mod tests {
             results[0].data.is_empty(),
             "metadata read failures must not synthesize a zero-filled record"
         );
+    }
+
+    /// GetBatch phase-2 parallel fan-out across stores must preserve request
+    /// order and per-item correctness. With round-robin placement, consecutive
+    /// transactions land on alternating stores, so a multi-txid batch fans out
+    /// across both devices. The response must be item-i-for-txid-i regardless
+    /// of which store resolved each item, and must interleave found / not-found
+    /// items at the correct positions.
+    #[test]
+    fn get_batch_parallel_fanout_preserves_order_across_stores() {
+        let h = DispatchTestHarness::with_stores(1);
+        assert_eq!(h.engine.store_count(), 2, "expected a 2-store engine");
+
+        // Seed 6 txns via Engine::create (which performs round-robin store
+        // placement) so records actually land on both physical devices. The
+        // dispatch batch-create path currently pins to store 0, so we go
+        // through the engine directly to exercise cross-store reads. Each gets
+        // a distinct utxo_count so we can verify the response item at position
+        // i carries txid i's data and not some neighbour's.
+        let txids: Vec<[u8; 32]> = (0..6).map(DispatchTestHarness::make_txid).collect();
+        for (i, txid) in txids.iter().enumerate() {
+            let utxo_count = (i as u32) + 1;
+            let hashes: Vec<[u8; 32]> = (0..utxo_count)
+                .map(|j| {
+                    let mut hsh = [0u8; 32];
+                    hsh[0] = (j & 0xFF) as u8;
+                    hsh[1] = ((j >> 8) & 0xFF) as u8;
+                    hsh
+                })
+                .collect();
+            let req = CreateRequest {
+                tx_id: *txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1700000000000,
+                block_height: 0,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            };
+            h.engine.create(&req).expect("engine create succeeds");
+        }
+        // Confirm placement actually spread across both devices, otherwise the
+        // test would not exercise the multi-store fan-out it claims to.
+        let devices: Vec<u8> = txids
+            .iter()
+            .map(|t| h.engine.lookup(&TxKey { txid: *t }).unwrap().device_id)
+            .collect();
+        assert!(
+            devices.contains(&0) && devices.contains(&1),
+            "expected records on both stores, got device_ids {devices:?}"
+        );
+
+        // Build a request whose order INTERLEAVES present txns with an absent
+        // one and shuffles store membership: [t4, t1, MISSING, t0, t5, t2].
+        // ALL_METADATA includes non-cached fields, forcing the device path
+        // (phase 2) for every present item.
+        let missing = DispatchTestHarness::make_txid(200);
+        let request_order = [txids[4], txids[1], missing, txids[0], txids[5], txids[2]];
+        let expected_utxo = [5u32, 2, 0, 1, 6, 3]; // 0 == not-found slot
+        let expected_status = [
+            STATUS_OK,
+            STATUS_OK,
+            ERR_TX_NOT_FOUND as u8,
+            STATUS_OK,
+            STATUS_OK,
+            STATUS_OK,
+        ];
+
+        let payload = encode_get_batch(FieldMask::ALL_METADATA, &request_order);
+        let resp = h.request(OP_GET_BATCH, payload);
+        assert_eq!(resp.status, STATUS_OK);
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(
+            results.len(),
+            request_order.len(),
+            "one response item per request item"
+        );
+
+        // utxo_count sits at a fixed offset in the ALL_METADATA layout:
+        // tx_version(4)+locktime(4)+fee(8)+size(8)+ext_size(8)+flags(1)
+        // +spending_height(4)+created_at(8)+spent_utxos(4)+pruned_utxos(4) = 53.
+        const UTXO_COUNT_OFFSET: usize = 4 + 4 + 8 + 8 + 8 + 1 + 4 + 8 + 4 + 4;
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(
+                r.status, expected_status[i],
+                "status mismatch at response position {i}"
+            );
+            if r.status == STATUS_OK {
+                let got = u32::from_le_bytes(
+                    r.data[UTXO_COUNT_OFFSET..UTXO_COUNT_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                assert_eq!(
+                    got, expected_utxo[i],
+                    "response position {i} carries the wrong txn's data — ordering violated"
+                );
+            }
+        }
+    }
+
+    /// N=1 (single store) must behave identically: the fan-out degenerates to a
+    /// single per-store group, and order/correctness are preserved.
+    #[test]
+    fn get_batch_single_store_fanout_matches_sequential() {
+        let h = DispatchTestHarness::new();
+        let txids: Vec<[u8; 32]> = (10..14).map(DispatchTestHarness::make_txid).collect();
+        for (i, txid) in txids.iter().enumerate() {
+            assert_eq!(h.create_tx(*txid, (i as u32) + 1).status, STATUS_OK);
+        }
+        let missing = DispatchTestHarness::make_txid(199);
+        let request_order = [txids[2], missing, txids[0], txids[3], txids[1]];
+        let expected_utxo = [3u32, 0, 1, 4, 2];
+
+        let payload = encode_get_batch(FieldMask::ALL_METADATA, &request_order);
+        let resp = h.request(OP_GET_BATCH, payload);
+        assert_eq!(resp.status, STATUS_OK);
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), request_order.len());
+
+        const UTXO_COUNT_OFFSET: usize = 4 + 4 + 8 + 8 + 8 + 1 + 4 + 8 + 4 + 4;
+        for (i, r) in results.iter().enumerate() {
+            if request_order[i] == missing {
+                assert_eq!(r.status, ERR_TX_NOT_FOUND as u8, "missing item at {i}");
+            } else {
+                assert_eq!(r.status, STATUS_OK, "present item at {i}");
+                let got = u32::from_le_bytes(
+                    r.data[UTXO_COUNT_OFFSET..UTXO_COUNT_OFFSET + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                assert_eq!(got, expected_utxo[i], "wrong data at response position {i}");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -5006,7 +5006,7 @@ mod tests {
         let mut expected: Vec<(TxKey, u8, bool)> = Vec::new();
         for r in 0..PER_STORE {
             // Interleave stores so the shared log mixes ops from all stores.
-            for s in 0..STORES {
+            for (s, allocator) in allocators.iter_mut().enumerate() {
                 let utxo_count: u32 = 2;
                 let mut txid = [0u8; 32];
                 txid[0] = s as u8;
@@ -5029,7 +5029,7 @@ mod tests {
                         UtxoSlot::new_unspent(h)
                     })
                     .collect();
-                let offset = allocators[s].allocate(base).unwrap();
+                let offset = allocator.allocate(base).unwrap();
                 let mut rb = Vec::with_capacity(METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE);
                 let mut mb = [0u8; METADATA_SIZE];
                 meta.to_bytes(&mut mb);
