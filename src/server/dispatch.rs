@@ -7936,36 +7936,6 @@ fn handle_mark_longest_chain_batch(
 // GetBatch
 // ---------------------------------------------------------------------------
 
-/// `Send`-able handle that lets a borrowed `&Engine` be moved into the
-/// `'static` closures `tokio::task::spawn_blocking` requires.
-///
-/// SAFETY CONTRACT: the only constructor captures a `&'a Engine` and the only
-/// use site ([`handle_get_batch`]'s phase-2 fan-out) drives every spawned task
-/// to completion via `REPL_RUNTIME.block_on(...)` BEFORE returning — so the
-/// borrow provably outlives every task that recovers the reference. `Engine`
-/// is `Send + Sync` (declared in `ops/engine.rs`), so sharing `&Engine` across
-/// blocking threads is sound; this wrapper only erases the lifetime, which the
-/// join barrier re-establishes. Do not store an `EngineRef` past the
-/// `block_on` join, and never return one from this module.
-#[derive(Clone, Copy)]
-struct EngineRef(*const Engine);
-
-// SAFETY: `Engine: Sync` (see `ops/engine.rs`), so `&Engine` is `Send`; the
-// raw pointer carries the same reference and is only dereferenced as a shared
-// reference within the join-bounded fan-out described above.
-unsafe impl Send for EngineRef {}
-
-impl EngineRef {
-    /// Recover the shared reference. SAFETY: caller must guarantee the original
-    /// borrow is still live — upheld by the `block_on` join barrier in
-    /// [`handle_get_batch`].
-    unsafe fn get(self) -> &'static Engine {
-        // SAFETY: pointer came from a live `&Engine`; lifetime erasure is
-        // sound under the join-barrier contract documented on `EngineRef`.
-        unsafe { &*self.0 }
-    }
-}
-
 /// Perform the full per-item device read for one transaction and serialize the
 /// requested fields into a [`WireGetResult`].
 ///
@@ -8420,16 +8390,17 @@ fn handle_get_batch(
         }
 
         if !by_store.is_empty() {
-            let engine_ref = EngineRef(engine as *const Engine);
-            let group_results: Vec<(usize, WireGetResult)> = REPL_RUNTIME.block_on(async {
+            // Fan the per-store device reads out across scoped threads — one per
+            // store group, so reads on different physical devices proceed in
+            // parallel. `std::thread::scope` lets each closure borrow `&Engine`
+            // (Sync) directly and JOINS every thread before returning, so no
+            // lifetime erasure / `unsafe` is needed; threads are spawned only on
+            // this non-cached multi-store path. Results carry their original
+            // index, so completion order cannot reorder the response.
+            let group_results: Vec<(usize, WireGetResult)> = std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(by_store.len());
                 for (_device_id, items) in by_store {
-                    handles.push(tokio::task::spawn_blocking(move || {
-                        // SAFETY: `engine_ref` is dereferenced only here, and
-                        // every spawned task is awaited below before
-                        // `block_on` (and thus `handle_get_batch`) returns, so
-                        // the borrowed `&Engine` provably outlives this task.
-                        let engine = unsafe { engine_ref.get() };
+                    handles.push(scope.spawn(move || {
                         let mut out = Vec::with_capacity(items.len());
                         for (idx, key) in items {
                             out.push((idx, read_get_item_from_device(engine, field_mask, &key)));
@@ -8439,15 +8410,15 @@ fn handle_get_batch(
                 }
                 let mut merged = Vec::new();
                 for handle in handles {
-                    match handle.await {
+                    match handle.join() {
                         Ok(group) => merged.extend(group),
-                        // A blocking task only panics if `read_get_item_from_device`
+                        // A thread only panics if `read_get_item_from_device`
                         // panics; the engine read paths return `Result`, so this
-                        // is not expected. Surface affected items as
-                        // ERR_STORAGE_IO rather than dropping them (which would
-                        // desync the response item count from the request).
-                        Err(e) => {
-                            tracing::error!(err = %e, "get_batch: device-read task panicked");
+                        // is not expected. Affected slots stay `None` and become
+                        // ERR_STORAGE_IO below, keeping the response item count
+                        // aligned with the request rather than dropping items.
+                        Err(_) => {
+                            tracing::error!("get_batch: device-read thread panicked");
                         }
                     }
                 }
