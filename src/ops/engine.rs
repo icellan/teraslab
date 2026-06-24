@@ -1470,38 +1470,6 @@ impl Engine {
         Ok(meta)
     }
 
-    /// Read just the immutable identity prefix of a record from device.
-    ///
-    /// Hot-path counterpart to [`Self::read_metadata_fast`]: copies and
-    /// validates only the first cache line of the header
-    /// ([`crate::record::IDENTITY_READ_LEN`] bytes) and returns the record's
-    /// `tx_id`, `utxo_count`, and `locktime` — all write-once fields. Used by
-    /// `get_spend`, which needs nothing else from the header. A CRC failure
-    /// here (corruption, or the header overwritten by a delete marker / a
-    /// reused offset) surfaces as a `StorageError`, matching the behavior of
-    /// `read_metadata_fast` on a non-`TxMetadata` header.
-    #[inline(always)]
-    fn read_identity_fast(
-        &self,
-        record_offset: u64,
-    ) -> std::result::Result<crate::record::TxIdentity, SpendError> {
-        if !self.device_ptr.is_null() {
-            // SAFETY: identical contract to `read_metadata_fast` —
-            // `device_ptr` is the live device base and `record_offset` is an
-            // allocator-issued, in-bounds offset. `read_identity_direct`
-            // takes the per-offset `io_locks()` read side internally.
-            unsafe { io::read_identity_direct(self.device_ptr, record_offset) }.map_err(|e| {
-                SpendError::StorageError {
-                    detail: format!("{e}"),
-                }
-            })
-        } else {
-            io::read_identity(&*self.device, record_offset).map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })
-        }
-    }
-
     /// Write metadata to device, using direct memory access when available.
     #[inline(always)]
     fn write_metadata_fast(
@@ -2677,6 +2645,7 @@ impl Engine {
                         metadata.block_entries_inline[i] = last;
                         write_overflow_entries(
                             &*self.device,
+                            record_offset,
                             &self.allocator,
                             &mut metadata,
                             &overflow,
@@ -2714,6 +2683,7 @@ impl Engine {
                     overflow.swap_remove(pos);
                     write_overflow_entries(
                         &*self.device,
+                        record_offset,
                         &self.allocator,
                         &mut metadata,
                         &overflow,
@@ -2781,6 +2751,7 @@ impl Engine {
                     });
                     write_overflow_entries(
                         &*self.device,
+                        record_offset,
                         &self.allocator,
                         &mut metadata,
                         &overflow,
@@ -6282,37 +6253,39 @@ impl Engine {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
         }
 
-        let slot = self.read_slot_fast(ro, req.offset)?;
-        if slot.hash != req.utxo_hash {
-            return Err(SpendError::UtxoHashMismatch { offset: req.offset });
-        }
-
-        // F-G2-001 (re-verify) + locktime, in ONE cache-line read.
-        //
-        // Read the immutable identity prefix AFTER the slot read so a
-        // `delete + create_at_offset` race that landed between the index
-        // lookup and `read_slot_fast` is caught here rather than returning
-        // another transaction's data under `key`. The prefix lives in the
-        // record *header*, which a delete overwrites with a `DeletedRecordMarker`
-        // and a create-at-offset overwrites with the new owner's identity —
-        // so it always reflects the CURRENT owner of the offset. (A per-slot
-        // identity cannot do this: a shrinking offset-reuse leaves lingering,
-        // CRC-valid slots carrying the OLD tx_id.)
+        // F-G2-001: read the identity prefix AND the slot as ONE coherent
+        // snapshot under a single offset guard (see
+        // `io::read_record_identity_and_slot`). The earlier sequence —
+        // `read_slot_fast` under one guard, then `read_identity_fast` under a
+        // separate guard, then a value-equality `tx_id` re-check — was the
+        // offset-keyed-guard + ABA pattern the g2 follow-up closed for
+        // `read_slot`/`read_slots`: a `delete(A) → create(B)@off → delete(B)
+        // → recreate-A@off` cycle could hand back B's slot bytes while A's
+        // identity was ABA-restored, passing both checks. Holding one guard
+        // across both reads excludes the slot writer for the whole snapshot,
+        // so identity and slot always belong to the same record instance.
         //
         // Two checks make the read sound:
         //   1. `id.tx_id != key.txid` ⇒ the offset was reused (or the header
         //      was tombstoned, failing the prefix CRC → StorageError) ⇒
-        //      `TxNotFound`. This subsumes the old per-accident slot-hash
-        //      collision concern.
-        //   2. `req.offset >= id.utxo_count` ⇒ the (possibly same-key)
-        //      record was re-created smaller and `req.offset` now addresses a
+        //      `TxNotFound`.
+        //   2. `req.offset >= id.utxo_count` ⇒ the (possibly same-key) record
+        //      was re-created smaller and `req.offset` now addresses a
         //      lingering slot beyond the live record ⇒ `UtxoNotFound`.
-        let id = self.read_identity_fast(ro)?;
+        let (id, slot) =
+            io::read_record_identity_and_slot(&*self.device, ro, req.offset).map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("{e}"),
+                }
+            })?;
         if id.tx_id != req.tx_key.txid {
             return Err(SpendError::TxNotFound);
         }
         if req.offset >= id.utxo_count {
             return Err(SpendError::UtxoNotFound { offset: req.offset });
+        }
+        if slot.hash != req.utxo_hash {
+            return Err(SpendError::UtxoHashMismatch { offset: req.offset });
         }
 
         let spending_data = match slot.status {
@@ -6454,6 +6427,12 @@ impl Engine {
         if identity.tx_id != key.txid {
             return Err(SpendError::TxNotFound);
         }
+        // Symmetric with `get_spend`: an offset within the cached `utxo_count`
+        // but beyond the live (possibly re-created smaller) record addresses a
+        // lingering slot — surface as `UtxoNotFound` rather than returning it.
+        if offset >= identity.utxo_count {
+            return Err(SpendError::UtxoNotFound { offset });
+        }
         Ok(slot)
     }
 
@@ -6552,7 +6531,28 @@ impl Engine {
                 detail: format!("index lookup failed: {e}"),
             })?
             .ok_or(SpendError::TxNotFound)?;
-        let metadata = self.read_metadata_for_key(key, entry.record_offset)?;
+        let record_offset = entry.record_offset;
+        let dev = &*self.device;
+        // F-G2-001: hold ONE record-level read guard across the metadata read
+        // AND the overflow-block read so a `delete + create_at_offset` cannot
+        // change the record's identity (or free/reuse the overflow region)
+        // between them. The prior code took a separate guard for the metadata,
+        // released it, read the overflow unguarded, then re-checked the
+        // metadata under a third guard — the offset-keyed-guard + ABA pattern
+        // (a recreate-same-txid cycle could return another tx's block entries
+        // under `key`), and the overflow read was torn-read-unsafe against the
+        // now-guarded `write_overflow_entries`. `io::read_metadata` and
+        // `read_overflow_entries` are both UNGUARDED device reads, so they run
+        // under the single held guard without re-entering the lock; the guard
+        // pairs (same key) with `write_overflow_entries`' write guard.
+        let _g = io::record_read_guard(record_offset);
+        let metadata =
+            io::read_metadata(dev, record_offset).map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })?;
+        if metadata.tx_id != key.txid {
+            return Err(SpendError::TxNotFound);
+        }
         let count = metadata.block_entry_count as usize;
         let inline = count.min(INLINE_BLOCK_ENTRIES);
         for i in 0..inline {
@@ -6563,16 +6563,10 @@ impl Engine {
         if count <= INLINE_BLOCK_ENTRIES {
             return Ok(None);
         }
-        let overflow = read_overflow_entries(&*self.device, &metadata).map_err(|e| {
-            SpendError::StorageError {
+        let overflow =
+            read_overflow_entries(dev, &metadata).map_err(|e| SpendError::StorageError {
                 detail: format!("{e}"),
-            }
-        })?;
-        // F-G2-001 (re-verify): the overflow read is unlocked; a delete +
-        // create_at_offset race between the metadata read and the
-        // overflow read can give us entries from an unrelated record.
-        // Re-check tx_id ownership.
-        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
+            })?;
         Ok(overflow
             .into_iter()
             .find(|entry| entry.block_id == block_id))
@@ -7076,10 +7070,21 @@ fn overflow_block_size(metadata: &TxMetadata, alignment: usize) -> usize {
 /// instead of being silently swallowed via `let _ = ...`.
 fn write_overflow_entries(
     device: &dyn BlockDevice,
+    record_offset: u64,
     allocator: &parking_lot::Mutex<SlotAllocator>,
     metadata: &mut TxMetadata,
     entries: &[BlockEntry],
 ) -> Result<(), crate::device::DeviceError> {
+    // F-G2-001: hold the record-level write guard (keyed by `record_offset`,
+    // the SAME key the lock-free `read_block_entry` reader takes via
+    // `io::record_read_guard`) across the whole free/alloc/pwrite/pointer
+    // update, so a reader cannot observe a torn overflow block or read a
+    // just-freed overflow region. The overflow `pwrite` targets a separate
+    // offset, but mutual exclusion is by the guard KEY. Lock order is
+    // io_locks().write -> allocator.lock(); there is no allocator-then-io_locks
+    // path (the allocator is never held across a device write — reserve/commit
+    // and the record I/O are separate phases), so no inversion.
+    let _w = io::record_write_guard(record_offset);
     let alignment = device.alignment();
     let old_offset = { metadata.block_overflow_offset };
     let old_block_size = overflow_block_size(metadata, alignment);
@@ -7948,8 +7953,11 @@ mod tests {
     #[test]
     fn spend_updated_at_set() {
         let h = TestHarness::new(10, TxFlags::empty());
-        h.engine.refresh_clock();
+        // Capture `before` BEFORE `refresh_clock()` so the cached clock the
+        // spend stamps is >= before (the assertion pins the lower bound to
+        // `before`). The reverse order let a clock tick make updated < before.
         let before = sys_millis();
+        h.engine.refresh_clock();
         h.engine.spend(&h.spend_req(0)).unwrap();
         let after = sys_millis();
 

@@ -72,6 +72,31 @@ fn io_locks() -> &'static StripedRwLocks {
     LOCKS.get_or_init(|| StripedRwLocks::new(65_536))
 }
 
+/// Acquire the record-level READ guard for `record_offset` and return it, so a
+/// lock-free reader can hold ONE guard across several UNGUARDED record reads
+/// (e.g. `read_metadata` + an overflow-block `pread`) — making them a coherent
+/// single-instance snapshot. This is the F-G2-001 ABA fix applied to the
+/// multi-read `read_block_entry` path, where a combined primitive would drag
+/// engine-side `BlockEntry`/overflow logic into this module.
+///
+/// MISUSE WARNING: while holding this guard, call ONLY unguarded reads
+/// (`read_metadata`, raw `device.pread_*`). Do NOT call a guarded io fn
+/// (`read_all_utxo_slots`, `read_record_identity_and_slots`, …) or a writer
+/// keyed by the same `record_offset` — re-entrant acquisition of the same
+/// striped `RwLock` can deadlock.
+pub fn record_read_guard(record_offset: u64) -> parking_lot::RwLockReadGuard<'static, ()> {
+    io_locks().read(record_offset)
+}
+
+/// Write counterpart of [`record_read_guard`] (same misuse warning). Held by
+/// the overflow-block writer so it excludes the lock-free `read_block_entry`
+/// reader keyed by the same `record_offset` (the overflow `pwrite` itself
+/// targets a different offset, but mutual exclusion is by the guard KEY, not
+/// the byte location).
+pub fn record_write_guard(record_offset: u64) -> parking_lot::RwLockWriteGuard<'static, ()> {
+    io_locks().write(record_offset)
+}
+
 /// F-G1-005: convert a `u64` device record offset to `usize` with a
 /// debug-assertion that the value fits. On 64-bit targets (the only
 /// currently-supported ones) this is unconditionally true; on a future
@@ -1209,6 +1234,16 @@ pub fn write_utxo_slot(
     let aligned_base = slot_offset / align as u64 * align as u64;
     let intra_offset = (slot_offset - aligned_base) as usize;
     let total_size = align_up(intra_offset + UTXO_SLOT_SIZE, align);
+
+    // F-X-007 (BC-02): record-level write guard, keyed by the record base
+    // offset — the SAME key the lock-free readers (`read_all_utxo_slots`,
+    // `read_record_identity_and_slots`/`_and_slot`) take. This is the
+    // block-device spend slot-write path used on the production O_DIRECT
+    // device (where `device_ptr` is null, so `write_slot_fast` routes here
+    // instead of the guarded `write_utxo_slot_direct`). Without it the
+    // readers' coherent-snapshot guard excluded nothing on production and a
+    // concurrent spend could tear a slot read (g2 follow-up).
+    let _w = io_locks().write(record_offset);
 
     let mut buf = AlignedBuf::new(total_size, align);
     // Read-modify-write: one slot is always less than a 4096 block.
