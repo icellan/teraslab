@@ -154,12 +154,36 @@ pub struct DeleteTombstoneInfo {
     pub cause: crate::tombstone::TombstoneCause,
 }
 
-pub struct Engine {
+/// An additional storage domain beyond store 0: a device (whole physical
+/// device or a [`SubDevice`](crate::subdevice::SubDevice) carved from one) plus
+/// its own allocator. A node runs N stores; store 0's device/allocator live
+/// inline on [`Engine`] and stores 1..N live in [`Engine::aux_stores`]. A
+/// record's owning store is chosen at create time (round-robin) and recorded in
+/// the index entry's `device_id`, so every later access routes by that field —
+/// never by any function of the key (which would collide with cluster sharding).
+pub(crate) struct Store {
     device: Arc<dyn BlockDevice>,
-    /// Raw pointer to device memory for zero-copy I/O on the hot path.
-    /// `null_mut()` when the device does not support direct access (falls
+    /// Raw pointer to this store's device memory for zero-copy I/O on the hot
+    /// path. `null_mut()` when the device does not support direct access (file /
+    /// raw O_DIRECT), in which case I/O falls back to `pread`/`pwrite`.
+    device_ptr: *mut u8,
+    allocator: parking_lot::Mutex<SlotAllocator>,
+}
+
+pub struct Engine {
+    /// Store 0's device. Records placed on store 0 (`device_id == 0`), and the
+    /// single-device configuration, use this directly; stores 1..N live in
+    /// [`Self::aux_stores`]. Use [`Self::device_for`] to route by `device_id`.
+    device: Arc<dyn BlockDevice>,
+    /// Raw pointer to store 0's device memory for zero-copy I/O on the hot
+    /// path. `null_mut()` when the device does not support direct access (falls
     /// back to `pread`/`pwrite` with `AlignedBuf`).
     device_ptr: *mut u8,
+    /// Stores 1..N (empty in the single-device configuration). Indexed as
+    /// `aux_stores[device_id - 1]`. See [`Self::device_for`].
+    aux_stores: Vec<Store>,
+    /// Round-robin placement of new records across all stores.
+    placer: crate::subdevice::RoundRobinPlacer,
     /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
     /// behind its own `RwLock`, so a write to one shard does not block
     /// reads/writes on other shards. Constructed at the configured
@@ -167,6 +191,7 @@ pub struct Engine {
     /// file-backed and most tests run at 1 (a transparent pass-through over a
     /// single recovered/rebuilt backend via [`ShardedIndex::from_single`]).
     index: ShardedIndex,
+    /// Store 0's allocator. Route by `device_id` via [`Self::allocator_for`].
     allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
@@ -400,6 +425,45 @@ impl Engine {
         )
     }
 
+    /// Construct a multi-store engine: store 0 (`primary_*`) plus one extra
+    /// store per entry in `aux`. The index, locks, and secondary indexes are
+    /// shared (single); each store owns its device + allocator. Records are
+    /// placed across stores round-robin at create time and routed back by the
+    /// index entry's `device_id`. Single-device callers use [`Engine::new`].
+    pub fn new_multi_store(
+        primary_device: Arc<dyn BlockDevice>,
+        primary_allocator: SlotAllocator,
+        aux: Vec<(Arc<dyn BlockDevice>, SlotAllocator)>,
+        index: ShardedIndex,
+        locks: StripedLocks,
+        dah_index: impl Into<DahBackend>,
+        unmined_index: impl Into<UnminedBackend>,
+    ) -> Self {
+        let mut engine = Self::new_inner(
+            primary_device,
+            index,
+            primary_allocator,
+            locks,
+            dah_index.into(),
+            unmined_index.into(),
+        );
+        let aux_stores: Vec<Store> = aux
+            .into_iter()
+            .map(|(device, allocator)| {
+                let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
+                Store {
+                    device,
+                    device_ptr,
+                    allocator: parking_lot::Mutex::new(allocator),
+                }
+            })
+            .collect();
+        let total = 1 + aux_stores.len();
+        engine.aux_stores = aux_stores;
+        engine.placer = crate::subdevice::RoundRobinPlacer::new(total);
+        engine
+    }
+
     /// Single private construction path that builds the struct literal and
     /// eagerly seeds `shard_counts` from the fully-populated index.
     ///
@@ -416,6 +480,9 @@ impl Engine {
         unmined_index: UnminedBackend,
     ) -> Self {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
+        // Single-device construction: store 0 only, no aux stores. The
+        // multi-store boot path uses `new_multi_store`.
+        let placer = crate::subdevice::RoundRobinPlacer::new(1);
         let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -423,6 +490,8 @@ impl Engine {
         let engine = Self {
             device,
             device_ptr,
+            aux_stores: Vec::new(),
+            placer,
             index,
             allocator: parking_lot::Mutex::new(allocator),
             locks,
@@ -1170,6 +1239,55 @@ impl Engine {
     /// flush fails after [`Self::pre_allocate_create`] succeeded.
     pub fn allocator(&self) -> &parking_lot::Mutex<SlotAllocator> {
         &self.allocator
+    }
+
+    /// Number of storage domains (stores) backing this engine. `1` in the
+    /// single-device configuration; `device_paths.len() * device_split` when
+    /// multiple stores are configured.
+    #[inline]
+    pub fn store_count(&self) -> usize {
+        1 + self.aux_stores.len()
+    }
+
+    /// The device backing records placed on `device_id` (the index entry's
+    /// `device_id` field). Store 0 lives inline; stores 1..N in `aux_stores`.
+    #[inline]
+    pub fn device_for(&self, device_id: u8) -> &Arc<dyn BlockDevice> {
+        if device_id == 0 {
+            &self.device
+        } else {
+            &self.aux_stores[device_id as usize - 1].device
+        }
+    }
+
+    /// Raw device pointer for store `device_id` (null when the store's device
+    /// is not memory-backed; callers fall back to `pread`/`pwrite`).
+    #[inline]
+    pub fn device_ptr_for(&self, device_id: u8) -> *mut u8 {
+        if device_id == 0 {
+            self.device_ptr
+        } else {
+            self.aux_stores[device_id as usize - 1].device_ptr
+        }
+    }
+
+    /// The allocator for store `device_id`.
+    #[inline]
+    pub fn allocator_for(&self, device_id: u8) -> &parking_lot::Mutex<SlotAllocator> {
+        if device_id == 0 {
+            &self.allocator
+        } else {
+            &self.aux_stores[device_id as usize - 1].allocator
+        }
+    }
+
+    /// Choose the store for a NEW record (round-robin across all stores) and
+    /// return the `device_id` to stamp into its index entry. Placement is a
+    /// free local choice recorded in the index; reads route by the stored
+    /// `device_id`, never by a function of the key.
+    #[inline]
+    pub fn place_new_record(&self) -> u8 {
+        self.placer.pick() as u8
     }
 
     /// Get a reference to the blobstore, if configured.
@@ -7550,6 +7668,40 @@ mod tests {
     /// returned `Ok` and left the slot UNSPENT on disk while the
     /// metadata's `spent_utxos` was incremented — a follow-up spend
     /// with different `spending_data` would then succeed (double-spend).
+    #[test]
+    fn multi_store_engine_routes_helpers_by_device_id() {
+        // Build a 2-store engine: store 0 inline + one aux store, each on its
+        // own MemoryDevice. Verifies the multi-store scaffolding: store_count,
+        // device_for/allocator_for routing, and round-robin placement.
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let engine = Engine::new_multi_store(
+            dev0.clone(),
+            alloc0,
+            vec![(dev1.clone(), alloc1)],
+            ShardedIndex::from_single(Index::new(100).unwrap().into()),
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        assert_eq!(engine.store_count(), 2);
+        // device_for routes to the correct underlying device (identity match).
+        assert!(Arc::ptr_eq(engine.device_for(0), &dev0));
+        assert!(Arc::ptr_eq(engine.device_for(1), &dev1));
+        // Each store has a distinct allocator mutex.
+        let a0 = engine.allocator_for(0) as *const _;
+        let a1 = engine.allocator_for(1) as *const _;
+        assert_ne!(a0, a1);
+        // Round-robin placement cycles across both stores and stays in range.
+        let picks: Vec<u8> = (0..4).map(|_| engine.place_new_record()).collect();
+        assert_eq!(picks, vec![0, 1, 0, 1]);
+    }
+
     #[test]
     fn spend_propagates_slot_write_failure() {
         let (engine, key, fail) = make_engine_with_failable_device(4);
