@@ -1631,6 +1631,18 @@ impl ServerConfig {
 
         pow2("device_alignment", self.device_alignment)?;
         pow2("lock_stripes", self.lock_stripes)?;
+        // index_shards is silently clamped by ShardedIndex constructors but a
+        // non-power-of-two or out-of-range value in the config file is almost
+        // certainly an operator mistake; reject it here so the error surfaces at
+        // startup rather than silently running with a different shard count.
+        {
+            let s = self.index.index_shards;
+            if s == 0 || !s.is_power_of_two() || s > 256 {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "index.index_shards = {s} must be a non-zero power of two in [1, 256]"
+                )));
+            }
+        }
         nonzero_u64("device_size", self.device_size)?;
         nonzero_u64("redo_log_size", self.redo_log_size)?;
         nonzero_u64("tombstone_region_size", self.tombstone_region_size)?;
@@ -2994,6 +3006,60 @@ listen_addr = "not-a-socket-addr"
 
         unsafe {
             std::env::remove_var(ServerConfig::ENV_ADMIN_TOKEN);
+        }
+    }
+
+    #[test]
+    fn index_shards_non_power_of_two_rejected() {
+        let cfg = ServerConfig {
+            index: crate::config::IndexConfig {
+                index_shards: 100,
+                ..Default::default()
+            },
+            ..ServerConfig::default()
+        };
+        let err = cfg.validate_sizes().unwrap_err();
+        assert!(err.to_string().contains("index.index_shards"));
+    }
+
+    #[test]
+    fn index_shards_zero_rejected() {
+        let cfg = ServerConfig {
+            index: crate::config::IndexConfig {
+                index_shards: 0,
+                ..Default::default()
+            },
+            ..ServerConfig::default()
+        };
+        let err = cfg.validate_sizes().unwrap_err();
+        assert!(err.to_string().contains("index.index_shards"));
+    }
+
+    #[test]
+    fn index_shards_too_large_rejected() {
+        let cfg = ServerConfig {
+            index: crate::config::IndexConfig {
+                index_shards: 512,
+                ..Default::default()
+            },
+            ..ServerConfig::default()
+        };
+        let err = cfg.validate_sizes().unwrap_err();
+        assert!(err.to_string().contains("index.index_shards"));
+    }
+
+    #[test]
+    fn index_shards_valid_values_pass() {
+        for &n in &[1usize, 2, 4, 16, 128, 256] {
+            let cfg = ServerConfig {
+                index: crate::config::IndexConfig {
+                    index_shards: n,
+                    ..Default::default()
+                },
+                ..ServerConfig::default()
+            };
+            cfg.validate_sizes()
+                .unwrap_or_else(|e| panic!("index_shards={n} should be valid: {e}"));
         }
     }
 }

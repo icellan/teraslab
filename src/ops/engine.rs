@@ -6603,10 +6603,10 @@ impl Engine {
         self.index.stats()
     }
 
-    /// Non-blocking primary-index stats for observability (see `allocator_stats_try`).
+    /// Non-blocking primary-index stats for observability.
     /// Returns `None` if ANY shard's read lock is momentarily held by a writer
-    /// (e.g. the create path), so `/admin/top` never stalls behind the write
-    /// path.
+    /// (e.g. the create path); the http layer then serves the last consistent
+    /// snapshot stored in `TOP_STATS_CACHE` rather than blocking or returning zeros.
     pub fn index_stats_try(&self) -> Option<crate::index::IndexStats> {
         self.index.try_stats()
     }
@@ -7938,17 +7938,17 @@ mod tests {
     fn assert_updated_at_recent(updated: u64, before: u64, after: u64) {
         const SLACK_MS: u64 = 1_000;
         assert_ne!(updated, 0, "mutation must set updated_at");
-        let lo = before.saturating_sub(SLACK_MS);
         let hi = after + SLACK_MS;
         assert!(
-            updated >= lo && updated <= hi,
-            "updated_at {updated} not within [{lo}, {hi}] (before={before}, after={after})",
+            updated >= before && updated <= hi,
+            "updated_at {updated} not within [{before}, {hi}] (before={before}, after={after})",
         );
     }
 
     #[test]
     fn spend_updated_at_set() {
         let h = TestHarness::new(10, TxFlags::empty());
+        h.engine.refresh_clock();
         let before = sys_millis();
         h.engine.spend(&h.spend_req(0)).unwrap();
         let after = sys_millis();
@@ -10632,16 +10632,16 @@ mod tests {
         // once per batch; calling it explicitly here lets the direct-engine
         // test compare against a fresh wall-clock reading instead of the
         // stale cached value from `Engine::new`.
-        h.engine.refresh_clock();
         let before = sys_millis();
+        h.engine.refresh_clock();
         h.engine.spend(&h.spend_req(0)).unwrap();
         let after = sys_millis();
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert_updated_at_recent(meta.updated_at, before, after);
 
         // Unspend
-        h.engine.refresh_clock();
         let before = sys_millis();
+        h.engine.refresh_clock();
         let req = UnspendRequest {
             tx_key: h.key,
             offset: 0,

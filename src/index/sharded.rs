@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::allocator::SlotAllocator;
 use crate::cluster::shards::ShardTable;
@@ -130,11 +130,6 @@ fn arr8(s: &[u8]) -> [u8; 8] {
 pub struct ShardedIndex {
     shards: Vec<RwLock<PrimaryBackend>>,
     seed: u64,
-    /// Per-shard last-known stats cache. One entry per shard, each a
-    /// `Mutex<Option<IndexStats>>`. `None` means the shard has never been
-    /// successfully read for stats yet (unseeded); once seeded, the cached
-    /// value is used by `try_stats` when the shard's RwLock is contended.
-    stats_cache: Vec<Mutex<Option<IndexStats>>>,
 }
 
 impl ShardedIndex {
@@ -155,12 +150,7 @@ impl ShardedIndex {
         for _ in 0..count {
             shards.push(RwLock::new(PrimaryBackend::new_in_memory(per_shard)?));
         }
-        let stats_cache = (0..count).map(|_| Mutex::new(None)).collect();
-        Ok(Self {
-            shards,
-            seed,
-            stats_cache,
-        })
+        Ok(Self { shards, seed })
     }
 
     /// Wrap an existing [`PrimaryBackend`] as a single-shard `ShardedIndex`.
@@ -180,7 +170,6 @@ impl ShardedIndex {
         Self {
             shards: vec![RwLock::new(backend)],
             seed: index_shard_seed(),
-            stats_cache: vec![Mutex::new(None)],
         }
     }
 
@@ -196,14 +185,8 @@ impl ShardedIndex {
     /// without it a fresh process seed would scatter keys to different shards
     /// than their region, breaking the direct (matching-count) restore.
     fn from_backends_with_seed(backends: Vec<PrimaryBackend>, seed: u64) -> Self {
-        let count = backends.len();
         let shards: Vec<RwLock<PrimaryBackend>> = backends.into_iter().map(RwLock::new).collect();
-        let stats_cache = (0..count).map(|_| Mutex::new(None)).collect();
-        Self {
-            shards,
-            seed,
-            stats_cache,
-        }
+        Self { shards, seed }
     }
 
     /// Number of shards in this index.
@@ -488,12 +471,8 @@ impl ShardedIndex {
         let mut max_probe = 0usize;
         let mut all_huge = true;
 
-        for (i, shard) in self.shards.iter().enumerate() {
+        for shard in &self.shards {
             let s = shard.read().stats();
-            // Update the per-shard cache so try_stats can use it when contended.
-            if let Some(cache) = self.stats_cache.get(i) {
-                *cache.lock() = Some(s.clone());
-            }
             total_entries += s.entry_count;
             total_capacity += s.capacity;
             total_memory += s.memory_bytes;
@@ -521,21 +500,16 @@ impl ShardedIndex {
         }
     }
 
-    /// Non-blocking merged statistics — per-shard best-effort with a cache.
+    /// Non-blocking merged statistics — all-or-nothing.
     ///
-    /// For each shard, attempts a `try_read`. If the shard's read lock is
-    /// momentarily held by a writer:
-    /// - uses the shard's last-known cached [`IndexStats`] (if the cache has
-    ///   been seeded by a prior `stats()` or `try_stats()` call), or
-    /// - treats that shard as contributing zeros (unseeded, no data yet).
+    /// Attempts a [`try_read`](parking_lot::RwLock::try_read) on every shard.
+    /// Returns `Some(merged)` only when ALL shard reads succeed (no shard is
+    /// contended by a writer); returns `None` if ANY shard's read lock is
+    /// momentarily held by a writer.
     ///
-    /// Successful `try_read`s update the per-shard cache entry for future
-    /// contended calls. Returns `Some(merged)` whenever all shard caches are
-    /// seeded (even if some shards are currently write-contended); returns
-    /// `None` only when at least one shard's cache is still unseeded AND its
-    /// `try_read` is also contended. Once every shard has been read at least
-    /// once (via `stats()` or a fully-uncontended `try_stats()`), this method
-    /// always returns `Some`.
+    /// When `None` is returned, the `/admin/top` HTTP layer serves the last
+    /// consistent snapshot stored in `TOP_STATS_CACHE` (seeded on cold start
+    /// and refreshed on every `Some` result).
     ///
     /// The merged result follows the same aggregation rules as [`Self::stats`]:
     /// `entry_count`, `capacity`, and `memory_bytes` are summed; `load_factor`
@@ -543,37 +517,22 @@ impl ShardedIndex {
     /// maximum across shards; `hugepage_enabled` is `true` only when ALL shards
     /// report it.
     pub fn try_stats(&self) -> Option<IndexStats> {
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            match shard.try_read() {
+                Some(g) => guards.push(g),
+                None => return None,
+            }
+        }
+
         let mut total_entries = 0usize;
         let mut total_capacity = 0usize;
         let mut total_memory = 0usize;
         let mut max_probe = 0usize;
         let mut all_huge = true;
-        let mut all_seeded = true;
 
-        for (i, shard) in self.shards.iter().enumerate() {
-            // Try a non-blocking read of this shard's stats.
-            let s = match shard.try_read() {
-                Some(guard) => {
-                    let fresh = guard.stats();
-                    // Seed/update the cache with the fresh value.
-                    if let Some(cache) = self.stats_cache.get(i) {
-                        *cache.lock() = Some(fresh.clone());
-                    }
-                    fresh
-                }
-                None => {
-                    // Shard is write-contended. Fall back to cached value.
-                    match self.stats_cache.get(i).and_then(|c| c.lock().clone()) {
-                        Some(cached) => cached,
-                        None => {
-                            // Cache not yet seeded; can't produce a result.
-                            all_seeded = false;
-                            continue;
-                        }
-                    }
-                }
-            };
-
+        for guard in &guards {
+            let s = guard.stats();
             total_entries += s.entry_count;
             total_capacity += s.capacity;
             total_memory += s.memory_bytes;
@@ -583,10 +542,6 @@ impl ShardedIndex {
             if !s.hugepage_enabled {
                 all_huge = false;
             }
-        }
-
-        if !all_seeded {
-            return None;
         }
 
         let load_factor = if total_capacity == 0 {
