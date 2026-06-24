@@ -2197,7 +2197,15 @@ pub(crate) fn handle_request(
 // Redo log helper
 // ---------------------------------------------------------------------------
 
-const REDO_GROUP_COMMIT_WINDOW: Duration = Duration::from_micros(200);
+// Production redo group-commit window. ZERO: the previous 200µs
+// `thread::sleep` before every flush imposed a hard ~5k ops/s/connection
+// latency floor (measured 6-163x throughput loss on a cheap-fsync device)
+// while coalescing almost nothing (≈1.5 entries/flush in practice). Real
+// group commit is now done at fsync time by the per-physical-device
+// `PhysicalBarrier` (src/subdevice.rs), which collapses concurrent flushes
+// into one barrier with no artificial latency. The `_with_group_window`
+// seam below is retained for tests that drive flush timing explicitly.
+const REDO_GROUP_COMMIT_WINDOW: Duration = Duration::ZERO;
 
 /// Append redo ops to the log and flush.
 ///
@@ -22305,6 +22313,18 @@ mod tests {
     // AllocateRegion is now journaled atomically with CreateV2 and a Phase-2
     // failure rolls the reservation back IN MEMORY (infallible, no journal). The
     // new behavior is covered by `create_redo_full_rolls_back_reservation_no_orphan`.)
+
+    #[test]
+    fn production_redo_group_commit_window_is_zero() {
+        // Regression guard: the production redo path must not impose a fixed
+        // per-flush `thread::sleep`. The 200µs window was a ~5k ops/s/conn
+        // latency floor; group commit is now done by the per-physical-device
+        // PhysicalBarrier at fsync time. Do not reintroduce a non-zero window.
+        assert!(
+            REDO_GROUP_COMMIT_WINDOW.is_zero(),
+            "REDO_GROUP_COMMIT_WINDOW must stay ZERO; sleeping per flush caps throughput"
+        );
+    }
 
     #[test]
     fn create_batch_fsync_count_optimized() {

@@ -46,3 +46,6 @@ dist/
 *.snap
 teraslab-data*
 teraslab-tombstone*
+
+# Local agent/dev worktrees (not tracked)
+.worktrees/
