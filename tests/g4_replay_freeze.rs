@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{PrimaryBackend, TxIndexEntry, TxKey};
+use teraslab::index::{PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey};
 use teraslab::io;
 use teraslab::record::{TxFlags, TxMetadata, UTXO_FROZEN, UTXO_SPENT, UTXO_UNSPENT, UtxoSlot};
 use teraslab::recovery::recover;
@@ -24,7 +24,7 @@ fn legacy_freeze_replay_skips_already_spent_slot() {
     let data: Arc<MemoryDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
     let redo_dev: Arc<MemoryDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
     let mut alloc = SlotAllocator::new(data.clone()).unwrap();
-    let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(128).unwrap());
 
     // Allocate a record region for one tx with one UTXO.
     let utxo_count = 1u32;
@@ -71,7 +71,7 @@ fn legacy_freeze_replay_skips_already_spent_slot() {
     .unwrap();
 
     // Replay.
-    let stats = recover(&*data as &dyn BlockDevice, &log, &mut index).unwrap();
+    let stats = recover(&*data as &dyn BlockDevice, &log, &index).unwrap();
     assert_eq!(
         stats.entries_replayed, 0,
         "F-G4-005: legacy Freeze must NOT replay over a SPENT slot",
@@ -97,7 +97,7 @@ fn legacy_freeze_replay_applies_on_unspent_slot() {
     let data: Arc<MemoryDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
     let redo_dev: Arc<MemoryDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
     let mut alloc = SlotAllocator::new(data.clone()).unwrap();
-    let mut index = PrimaryBackend::new_in_memory(128).unwrap();
+    let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(128).unwrap());
 
     let utxo_count = 1u32;
     let record_size = TxMetadata::record_size_for(utxo_count);
@@ -137,7 +137,7 @@ fn legacy_freeze_replay_applies_on_unspent_slot() {
     })
     .unwrap();
 
-    let stats = recover(&*data as &dyn BlockDevice, &log, &mut index).unwrap();
+    let stats = recover(&*data as &dyn BlockDevice, &log, &index).unwrap();
     assert_eq!(stats.entries_replayed, 1);
 
     let read_back = io::read_utxo_slot(&*data as &dyn BlockDevice, record_offset, 0).unwrap();

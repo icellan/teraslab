@@ -5,7 +5,7 @@
 
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
+use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend};
 use crate::io;
 use crate::locks::StripedLocks;
 use crate::ops::create::*;
@@ -160,7 +160,13 @@ pub struct Engine {
     /// `null_mut()` when the device does not support direct access (falls
     /// back to `pread`/`pwrite` with `AlignedBuf`).
     device_ptr: *mut u8,
-    index: parking_lot::RwLock<PrimaryBackend>,
+    /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
+    /// behind its own `RwLock`, so a write to one shard does not block
+    /// reads/writes on other shards. Constructed at the configured
+    /// `index_shards` count: the in-memory backend defaults to 16; redb /
+    /// file-backed and most tests run at 1 (a transparent pass-through over a
+    /// single recovered/rebuilt backend via [`ShardedIndex::from_single`]).
+    index: ShardedIndex,
     allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
@@ -272,13 +278,11 @@ pub struct Engine {
     blob_pins: crate::storage::blobstore::BlobPinSet,
     /// Per-shard record counts for migration verification.
     ///
-    /// Startup leaves these counters uninitialized so `Engine::new` does not
-    /// scan the full primary index. The first `shard_record_count` call scans
-    /// the primary index once and publishes all counters; create/delete then
-    /// maintain them atomically while holding the primary index write lock.
+    /// Seeded eagerly in the single private constructor (`new_inner`) from the
+    /// fully-populated index before the engine is shared. Create/delete then
+    /// maintain them atomically while holding the primary-index shard write
+    /// lock — counts never drift from the primary index.
     shard_counts: Vec<std::sync::atomic::AtomicU64>,
-    /// True once `shard_counts` has been populated from the primary index.
-    shard_counts_initialized: std::sync::atomic::AtomicBool,
     /// Cached wall-clock time in milliseconds since Unix epoch.
     ///
     /// Avoids a `clock_gettime` syscall on every mutation. The dispatch
@@ -355,20 +359,75 @@ impl Engine {
         dah_index: impl Into<DahBackend>,
         unmined_index: impl Into<UnminedBackend>,
     ) -> Self {
+        // N=1 transparent pass-through over the recovered/rebuilt backend.
+        // Behaviour is identical to the previous `RwLock<PrimaryBackend>`:
+        // every key routes to the single shard. Multi-shard fan-out is a
+        // later task.
+        Self::new_with_sharded_index(
+            device,
+            ShardedIndex::from_single(index.into()),
+            allocator,
+            locks,
+            dah_index,
+            unmined_index,
+        )
+    }
+
+    /// Create a new engine from a pre-built [`ShardedIndex`].
+    ///
+    /// Use this when recovery has already wrapped the primary backend into a
+    /// `ShardedIndex` (e.g. via [`ShardedIndex::from_single`] or
+    /// [`ShardedIndex::new_in_memory`]) and you want the engine to share that
+    /// exact shard layout rather than re-wrapping it.
+    ///
+    /// Identical to [`Engine::new`] except the index parameter is already a
+    /// `ShardedIndex` and is not re-wrapped.
+    pub fn new_with_sharded_index(
+        device: Arc<dyn BlockDevice>,
+        index: ShardedIndex,
+        allocator: SlotAllocator,
+        locks: StripedLocks,
+        dah_index: impl Into<DahBackend>,
+        unmined_index: impl Into<UnminedBackend>,
+    ) -> Self {
+        Self::new_inner(
+            device,
+            index,
+            allocator,
+            locks,
+            dah_index.into(),
+            unmined_index.into(),
+        )
+    }
+
+    /// Single private construction path that builds the struct literal and
+    /// eagerly seeds `shard_counts` from the fully-populated index.
+    ///
+    /// Both public constructors route here so there is exactly one place where
+    /// the struct is assembled and one place where `compute_shard_counts` is
+    /// called — a future constructor that forgets to seed the counts cannot
+    /// exist.
+    fn new_inner(
+        device: Arc<dyn BlockDevice>,
+        index: ShardedIndex,
+        allocator: SlotAllocator,
+        locks: StripedLocks,
+        dah_index: DahBackend,
+        unmined_index: UnminedBackend,
+    ) -> Self {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
-        let index = index.into();
         let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
-        Self {
+        let engine = Self {
             device,
             device_ptr,
-            index: parking_lot::RwLock::new(index),
+            index,
             allocator: parking_lot::Mutex::new(allocator),
             locks,
-            dah_index: parking_lot::Mutex::new(dah_index.into()),
-            unmined_index: parking_lot::Mutex::new(unmined_index.into()),
+            dah_index: parking_lot::Mutex::new(dah_index),
+            unmined_index: parking_lot::Mutex::new(unmined_index),
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_log: std::sync::OnceLock::new(),
@@ -387,12 +446,16 @@ impl Engine {
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
-            shard_counts_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
-        }
+        };
+        // Eager, single-threaded shard-count init from the fully-populated
+        // index. Must run before the engine is shared so no writer can race
+        // the scan (PR#19 #1).
+        engine.compute_shard_counts();
+        engine
     }
 
     /// Attach a redo log for secondary-index two-phase durability.
@@ -839,11 +902,15 @@ impl Engine {
     /// `delete_at_height` simultaneously). Ordering:
     ///
     /// 1. Redo log: append DAH + unmined intents in one batch, single fsync.
-    /// 2. Acquire the primary index write lock, then DAH, then unmined.
-    ///    This matches the project-wide acquisition order used by
-    ///    [`Engine::snapshot_index`] and the set_mined fast path
-    ///    (index → dah → unmined), so the three operations can never
-    ///    deadlock against each other.
+    /// 2. Acquire the primary index (shard) write lock, then DAH, then unmined
+    ///    (shard.write → dah → unmined). NOTE: this order is INVERTED relative
+    ///    to [`Engine::snapshot_index`], which takes the shard lock LAST
+    ///    (dah → unmined → shard.read). The two paths are nonetheless
+    ///    deadlock-free because every write-path caller and the checkpoint
+    ///    (which is the sole caller of `snapshot_index`) are mutually excluded
+    ///    by `dispatch_visibility_barrier`: the write side acquires it before
+    ///    any index/secondary lock, so a writer and the inverted-order
+    ///    checkpoint can never hold one of these locks at the same time.
     /// 3. Apply the primary in-memory cache update
     ///    (`update_cached_fields`) while both secondary mutexes are also
     ///    held, so any reader that consults a secondary index and then
@@ -918,7 +985,12 @@ impl Engine {
         } else {
             tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
         }
-        let mut primary_guard = self.index.write();
+        // Hold a single shard write guard across the primary cache update AND
+        // the dah/unmined mutations below — preserving the original atomicity
+        // where a secondary reader cross-checking the primary must wait for
+        // this write to drop. At one shard this is the whole index, exactly as
+        // before; at N shards it is the shard owning `key`.
+        let mut primary_guard = self.index.write_shard(key);
         primary_guard
             .update_cached_fields(
                 key,
@@ -1022,7 +1094,6 @@ impl Engine {
         let _guard = self.locks.lock(key);
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -1118,65 +1189,53 @@ impl Engine {
 
     /// Get the record count for a shard.
     ///
-    /// The first call after startup lazily initializes all shard counters by
-    /// scanning the primary index once. Subsequent calls are O(1) and
-    /// lock-free.
+    /// Shard counters are populated eagerly during engine construction (see
+    /// `Self::compute_shard_counts`), before any concurrent access is
+    /// possible, so this is always O(1) and lock-free. After construction the
+    /// counters are maintained incrementally by the register/unregister paths
+    /// under each owning shard's write lock, so they never drift from the
+    /// primary index.
     pub fn shard_record_count(&self, shard: u16) -> u64 {
-        let counter = &self.shard_counts[shard as usize];
-        if !self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            self.initialize_shard_counts();
-        }
-        counter.load(std::sync::atomic::Ordering::Acquire)
+        self.shard_counts[shard as usize].load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn initialize_shard_counts(&self) {
-        if self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-
-        let guard = self.index.read();
-        if self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-
+    /// Populate `shard_counts` from the fully-built primary index.
+    ///
+    /// Called EXACTLY ONCE from `new_inner` while the engine is still
+    /// single-threaded and owned by the caller — recovery/restore has fully
+    /// populated the index before construction, and no concurrent writer can
+    /// observe the engine until it is returned and shared. Computing the
+    /// counts here (rather than lazily on the first reader) eliminates the
+    /// lazy-init-vs-writer race: there is no window in which the scan can visit
+    /// and release a shard while a concurrent writer inserts into it and reads
+    /// an uninitialized counter, leaving the new key counted by neither path.
+    ///
+    /// Because this runs before the engine is shared, the relaxed stores need
+    /// no per-counter synchronization; the `Arc`/move that publishes the engine
+    /// to other threads establishes the happens-before edge for every later
+    /// `Acquire` read.
+    fn compute_shard_counts(&self) {
         let mut counts = vec![0u64; crate::cluster::shards::NUM_SHARDS];
-        for (key, _) in guard.iter() {
+        self.index.for_each(|key, _| {
             let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
             counts[shard] += 1;
-        }
+        });
         for (counter, count) in self.shard_counts.iter().zip(counts) {
             counter.store(count, std::sync::atomic::Ordering::Relaxed);
         }
-        self.shard_counts_initialized
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    #[cfg(test)]
-    fn shard_counts_initialized_for_test(&self) -> bool {
-        self.shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Register a primary-index entry and, if shard counters have been
-    /// initialized, increment the matching shard count atomically within the
-    /// same index write-lock critical section only when this is a new key.
+    /// Register a primary-index entry and increment the matching shard count
+    /// atomically within the same index write-lock critical section, only when
+    /// this is a new key.
     ///
-    /// Before lazy initialization, count mutations are intentionally skipped:
-    /// the first `shard_record_count` call will scan the primary index after
-    /// any active writer drops this lock. After initialization, this guarantees
-    /// `shard_counts` never drifts from the primary index: if backend
-    /// `register` fails, no count mutation is observed; if it succeeds with a
-    /// newly inserted key, the matching `fetch_add` executes before the write
-    /// lock is released.
+    /// Shard counters are seeded eagerly in `new_inner` (the single constructor)
+    /// before the engine is shared. By the time any request is dispatched the
+    /// counters always track the primary index: if the backend `register` fails,
+    /// no count mutation is observed; if it succeeds with a newly inserted key,
+    /// the matching `fetch_add` executes under the same shard write guard before
+    /// that guard is released. `shard_counts` therefore never drifts from the
+    /// primary index.
     ///
     /// # Errors
     /// Returns `IndexError`(crate::index::IndexError) from the underlying
@@ -1201,25 +1260,28 @@ impl Engine {
             }
         }
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
-        let resize_target = {
-            let mut guard = self.index.write();
-            let len_before = guard.len();
-            guard.register_without_resize(key, entry)?;
-            let inserted = guard.len() > len_before;
-            // Commit the count mutation BEFORE releasing the write lock once
-            // counters have been lazily initialized. Before that point, the first
-            // reader will scan the primary index after this write lock releases.
-            let counts_initialized = self
-                .shard_counts_initialized
-                .load(std::sync::atomic::Ordering::Acquire);
-            if inserted && counts_initialized {
-                self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
-            guard.resize_target_capacity()
-        };
-        if let Some(target_capacity) = resize_target {
-            self.resize_primary_index_without_blocking_readers(target_capacity)?;
+        // Route to the index shard owning `key` exactly ONCE, then hold a single
+        // shard write guard across register + count mutation + resize, exactly
+        // as the single global write lock did before sharding. `write_shard_at`
+        // takes the precomputed shard index so there is no second routing call
+        // inside `write_shard`.
+        let index_shard = self.index.index_shard_for_key(&key);
+        let mut guard = self.index.write_shard_at(index_shard);
+        let len_before = guard.len();
+        guard.register_without_resize(key, entry)?;
+        let inserted = guard.len() > len_before;
+        // Commit the count mutation unconditionally under the still-held write
+        // guard. Counts are seeded eagerly at construction so the `fetch_add`
+        // always runs before the guard drops — preserving insert-then-count
+        // atomicity (fix #1).
+        if inserted {
+            self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
         }
+        // Per-shard resize UNDER the held guard: rehashes only this shard's
+        // ~count/N entries without dropping and re-acquiring the lock (leaving
+        // other shards readable throughout). At one shard this is the
+        // whole-table resize as before.
+        guard.resize_if_needed()?;
         Ok(())
     }
 
@@ -1265,31 +1327,30 @@ impl Engine {
             }
         }
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&key) as usize;
-        let resize_target = {
-            let mut guard = self.index.write();
-            // Reject-not-overwrite: the only safe insert-if-absent is a
-            // check under the same write lock that performs the insert.
-            if guard.lookup_checked(&key)?.is_some() {
-                return Ok(false);
-            }
-            let len_before = guard.len();
-            guard.register_without_resize(key, entry)?;
-            debug_assert!(
-                guard.len() > len_before,
-                "register_new_with_shard_count: insert did not grow the index \
-                 despite the key being absent under the same write lock"
-            );
-            let counts_initialized = self
-                .shard_counts_initialized
-                .load(std::sync::atomic::Ordering::Acquire);
-            if counts_initialized {
-                self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
-            guard.resize_target_capacity()
-        };
-        if let Some(target_capacity) = resize_target {
-            self.resize_primary_index_without_blocking_readers(target_capacity)?;
+        // The existence check and insert must run under the SAME shard write
+        // guard so check-then-insert cannot interleave with another writer on
+        // that shard. Route to the owning index shard exactly ONCE, then hold
+        // its guard across check + insert + count mutation + resize.
+        let index_shard = self.index.index_shard_for_key(&key);
+        let mut guard = self.index.write_shard_at(index_shard);
+        // Reject-not-overwrite: the only safe insert-if-absent is a
+        // check under the same write lock that performs the insert.
+        if guard.lookup_checked(&key)?.is_some() {
+            return Ok(false);
         }
+        let len_before = guard.len();
+        guard.register_without_resize(key, entry)?;
+        debug_assert!(
+            guard.len() > len_before,
+            "register_new_with_shard_count: insert did not grow the index \
+             despite the key being absent under the same write lock"
+        );
+        // Counts are seeded eagerly at construction so this `fetch_add` runs
+        // unconditionally under the still-held write guard for the newly
+        // inserted key, preserving insert-then-count atomicity (fix #1).
+        self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
+        // Resize UNDER the held guard (no drop-then-reacquire).
+        guard.resize_if_needed()?;
         Ok(true)
     }
 
@@ -1313,40 +1374,25 @@ impl Engine {
         }
     }
 
-    fn resize_primary_index_without_blocking_readers(
-        &self,
-        requested_capacity: usize,
-    ) -> Result<(), crate::index::IndexError> {
-        let guard = self.index.upgradable_read();
-        let Some(target_capacity) = guard
-            .resize_target_capacity()
-            .map(|target| target.max(requested_capacity))
-        else {
-            return Ok(());
-        };
+    // Primary-index resize is now per-shard, rehashing only the affected
+    // shard's entries (and performing the same `mark_defunct_for_resize` swap as
+    // the previous whole-table helper). The old
+    // `resize_primary_index_without_blocking_readers` is gone: the register
+    // paths call `guard.resize_if_needed()` on the shard write guard they
+    // already hold, so the resize never drops and re-acquires the lock.
+    // [`ShardedIndex::resize_shard_if_needed`] is retained for any caller that
+    // does not already hold the guard.
 
-        let resized = guard.resized_copy(target_capacity)?;
-        let mut write_guard = parking_lot::RwLockUpgradableReadGuard::upgrade(guard);
-        // G-2: the resized copy renamed a fresh file over the backing path
-        // and now owns it. Mark the displaced index defunct before the swap
-        // so its `Drop` does not write the clean-shutdown sentinel for a
-        // path it no longer owns (which would disable torn-write detection
-        // for the rest of uptime).
-        write_guard.mark_defunct_for_resize();
-        *write_guard = resized;
-        Ok(())
-    }
-
-    /// Unregister a primary-index entry and, if shard counters have been
-    /// initialized, decrement the matching shard count atomically within the
-    /// same index write-lock critical section.
+    /// Unregister a primary-index entry and decrement the matching shard count
+    /// atomically within the same index write-lock critical section.
     ///
     /// Returns the removed entry (or `None` if the key was not present), or
     /// an `IndexError` if the (redb) backend's write transaction fails.
-    /// After lazy initialization, the shard count is only decremented when an
-    /// entry was actually removed. Before initialization, the first
-    /// `shard_record_count` call will scan the primary index after any active
-    /// writer drops this lock.
+    /// Shard counters are seeded eagerly in `new_inner` (the single constructor)
+    /// before the engine is shared, so the count is decremented unconditionally
+    /// (under the shard write guard) whenever an entry is actually removed —
+    /// `shard_counts` tracks the primary index continuously, no deferred scan
+    /// is ever needed.
     ///
     /// G-4: propagates the backend error instead of collapsing it to `None`.
     /// A collapsed `unregister` failure would leave the row in redb while the
@@ -1357,13 +1403,9 @@ impl Engine {
         key: &TxKey,
     ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
-        let mut guard = self.index.write();
+        let mut guard = self.index.write_shard(key);
         let removed = guard.unregister_checked(key)?;
-        if removed.is_some()
-            && self
-                .shard_counts_initialized
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if removed.is_some() {
             self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
         drop(guard);
@@ -1633,7 +1675,6 @@ impl Engine {
             tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
         }
         self.index
-            .write()
             .update_cached_fields(
                 key,
                 tf,
@@ -1673,7 +1714,7 @@ impl Engine {
         &self,
         key: &TxKey,
     ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
-        self.index.read().lookup_checked(key)
+        self.index.lookup_checked(key)
     }
 
     /// Look up a transaction in the index (infallible convenience).
@@ -1685,7 +1726,7 @@ impl Engine {
     /// I/O failure to `None` here would tell a client a present
     /// transaction does not exist.
     pub fn lookup(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        match self.index.read().lookup_checked(key) {
+        match self.index.lookup_checked(key) {
             Ok(found) => found,
             Err(e) => {
                 tracing::error!(
@@ -1703,7 +1744,7 @@ impl Engine {
     /// Returns a snapshot of all keys currently in the index. This acquires
     /// a read lock briefly and collects all keys into a Vec.
     pub fn all_keys(&self) -> Vec<TxKey> {
-        self.index.read().iter().map(|(k, _)| k).collect()
+        self.index.all_keys()
     }
 
     /// Scan the primary index for records whose preservation has expired.
@@ -1721,19 +1762,7 @@ impl Engine {
     /// lock, so a `preserve_until` cleared or pushed forward after this scan
     /// is handled correctly there.
     pub fn scan_expired_preservations(&self, current_height: u32) -> Vec<TxKey> {
-        self.index
-            .read()
-            .iter()
-            .filter_map(|(k, e)| {
-                let has_preserve =
-                    TxFlags::from_bits_truncate(e.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
-                if has_preserve && e.dah_or_preserve != 0 && e.dah_or_preserve <= current_height {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.index.scan_expired_preservations(current_height)
     }
 
     /// Return keys belonging to a specific shard.
@@ -1742,17 +1771,7 @@ impl Engine {
     /// a subset of shards is needed. Acquires the index read lock once
     /// and filters inline, avoiding a full clone + filter pass.
     pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
-        self.index
-            .read()
-            .iter()
-            .filter_map(|(k, _)| {
-                if crate::cluster::shards::ShardTable::shard_for_key(&k) == shard {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.index.keys_for_shard(shard)
     }
 
     /// All tombstoned keys for `shard`, as `(TxKey, deletion-generation)` pairs.
@@ -1779,13 +1798,7 @@ impl Engine {
     /// where N is the total number of index entries, compared to O(N * S)
     /// if calling `keys_for_shard` for each shard S.
     pub fn keys_by_shard(&self) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        let mut result: std::collections::HashMap<u16, Vec<TxKey>> =
-            std::collections::HashMap::new();
-        for (k, _) in self.index.read().iter() {
-            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
-            result.entry(shard).or_default().push(k);
-        }
-        result
+        self.index.keys_by_shard()
     }
 
     /// Group keys by shard, but only for a specified set of shards.
@@ -1797,15 +1810,7 @@ impl Engine {
         &self,
         shard_filter: &std::collections::HashSet<u16>,
     ) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        let mut result: std::collections::HashMap<u16, Vec<TxKey>> =
-            std::collections::HashMap::new();
-        for (k, _) in self.index.read().iter() {
-            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
-            if shard_filter.contains(&shard) {
-                result.entry(shard).or_default().push(k);
-            }
-        }
-        result
+        self.index.keys_by_shard_filtered(shard_filter)
     }
 
     /// Execute a batch of spends on a single transaction.
@@ -1846,7 +1851,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2097,7 +2101,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2314,7 +2317,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2479,7 +2481,6 @@ impl Engine {
         // 1. Index lookup
         let entry = self
             .index
-            .read()
             .lookup_checked(tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2603,7 +2604,6 @@ impl Engine {
                     sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
                 }
                 self.index
-                    .write()
                     .update_cached_fields(
                         tx_key,
                         sync_tf.bits(),
@@ -2880,7 +2880,6 @@ impl Engine {
 
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -2995,7 +2994,6 @@ impl Engine {
         // duplicate record over an existing txid.
         if self
             .index
-            .read()
             .lookup_checked(&key)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("duplicate-check index lookup failed: {e}"),
@@ -3195,7 +3193,6 @@ impl Engine {
         // read error does not collapse to "absent" and pass the guard.
         if self
             .index
-            .read()
             .lookup_checked(&key)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("duplicate-check index lookup failed: {e}"),
@@ -3291,7 +3288,6 @@ impl Engine {
         // error does not collapse to "absent" and pass the guard.
         if self
             .index
-            .read()
             .lookup_checked(&key)
             .map_err(|e| CreateError::StorageError {
                 detail: format!("duplicate-check index lookup failed: {e}"),
@@ -3632,7 +3628,6 @@ impl Engine {
     pub fn read_cold_data(&self, key: &TxKey) -> Result<Vec<u8>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -3736,14 +3731,16 @@ impl Engine {
         let _guard = self.locks.lock(parent_key);
         // G-4: a backend read error must not collapse to "parent absent"
         // (which would silently report no spent slots).
-        let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(entry) => entry,
-            None => return Ok(Vec::new()),
-        };
+        let entry =
+            match self
+                .index
+                .lookup_checked(parent_key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(entry) => entry,
+                None => return Ok(Vec::new()),
+            };
         let meta = self.read_metadata_fast(entry.record_offset)?;
         let mut offsets = Vec::new();
         let utxo_count = { meta.utxo_count };
@@ -3770,14 +3767,16 @@ impl Engine {
         let _guard = self.locks.lock(parent_key);
         // G-4: a backend read error must not collapse to "parent absent"
         // (which would silently report the slot was not pruned).
-        let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(entry) => entry,
-            None => return Ok(false),
-        };
+        let entry =
+            match self
+                .index
+                .lookup_checked(parent_key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(entry) => entry,
+                None => return Ok(false),
+            };
         let mut meta = self.read_metadata_fast(entry.record_offset)?;
         if offset >= { meta.utxo_count } {
             return Ok(false);
@@ -3902,17 +3901,15 @@ impl Engine {
     /// failure.
     pub fn prune_slot(&self, key: &TxKey, offset: u32) -> Result<bool, SpendError> {
         let _guard = self.locks.lock(key);
-        let entry =
-            match self
-                .index
-                .read()
-                .lookup_checked(key)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index lookup failed: {e}"),
-                })? {
-                Some(entry) => entry,
-                None => return Ok(false),
-            };
+        let entry = match self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })? {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
         let meta = self.read_metadata_fast(entry.record_offset)?;
         if offset >= { meta.utxo_count } {
             return Ok(false);
@@ -3948,17 +3945,15 @@ impl Engine {
     /// failure.
     pub fn set_record_generation(&self, key: &TxKey, generation: u32) -> Result<bool, SpendError> {
         let _guard = self.locks.lock(key);
-        let entry =
-            match self
-                .index
-                .read()
-                .lookup_checked(key)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index lookup failed: {e}"),
-                })? {
-                Some(entry) => entry,
-                None => return Ok(false),
-            };
+        let entry = match self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })? {
+            Some(entry) => entry,
+            None => return Ok(false),
+        };
         let mut meta = self.read_metadata_fast(entry.record_offset)?;
         meta.generation = generation;
         self.write_metadata_fast(entry.record_offset, &meta)?;
@@ -3985,7 +3980,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4056,7 +4050,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4106,7 +4099,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4218,7 +4210,7 @@ impl Engine {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would silently no-op the child append).
-                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let entry = match self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4282,7 +4274,7 @@ impl Engine {
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would free the freshly-allocated block as
                 // if the parent vanished). Surface it as a storage error.
-                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let looked_up = self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4384,7 +4376,7 @@ impl Engine {
             let (ro, count, offset, mut children) = {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent absent".
-                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let entry = match self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4441,7 +4433,7 @@ impl Engine {
             let mut parent_gone = false;
             let committed = {
                 let _guard = self.locks.lock(parent_key);
-                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let looked_up = self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4609,7 +4601,6 @@ impl Engine {
     pub fn read_conflicting_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4716,7 +4707,7 @@ impl Engine {
                 let _guard = self.locks.lock(parent_key);
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would silently no-op the child append).
-                let entry = match self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let entry = match self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4772,7 +4763,7 @@ impl Engine {
                 // G-4: a backend read error must not collapse to "parent
                 // absent" (which would free the freshly-allocated block as
                 // if the parent vanished). Surface it as a storage error.
-                let looked_up = self.index.read().lookup_checked(parent_key).map_err(|e| {
+                let looked_up = self.index.lookup_checked(parent_key).map_err(|e| {
                     SpendError::StorageError {
                         detail: format!("index lookup failed: {e}"),
                     }
@@ -4925,7 +4916,6 @@ impl Engine {
     pub fn read_deleted_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -4997,7 +4987,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5091,7 +5080,6 @@ impl Engine {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
             }
             self.index
-                .write()
                 .update_cached_fields(
                     &req.tx_key,
                     sync_tf.bits(),
@@ -5231,7 +5219,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5296,7 +5283,6 @@ impl Engine {
                 sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
             }
             self.index
-                .write()
                 .update_cached_fields(
                     &req.tx_key,
                     sync_tf.bits(),
@@ -5364,7 +5350,6 @@ impl Engine {
         let _guard = self.locks.lock(key);
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5400,7 +5385,6 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -5506,7 +5490,7 @@ impl Engine {
         // `due_guard`. We therefore treat a backend read error the same as
         // a missing record (and the same as the existing metadata-read
         // error below), logging it so the operator still sees the fault.
-        let entry = match self.index.read().lookup_checked(key) {
+        let entry = match self.index.lookup_checked(key) {
             Ok(Some(e)) => e,
             Ok(None) => return false,
             Err(e) => {
@@ -5642,14 +5626,16 @@ impl Engine {
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
-        let entry = match self.index.read().lookup_checked(&req.tx_key).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            }
-        })? {
-            Some(e) => e,
-            None => return Err(SpendError::TxNotFound),
-        };
+        let entry =
+            match self
+                .index
+                .lookup_checked(&req.tx_key)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("index lookup failed: {e}"),
+                })? {
+                Some(e) => e,
+                None => return Err(SpendError::TxNotFound),
+            };
 
         // KO-3: when invoked by the DAH sweep (`due_guard == Some(height)`),
         // re-validate the delete predicate against fresh metadata *under this
@@ -6228,17 +6214,15 @@ impl Engine {
         }
         let _guard = self.locks.lock(key);
         // G-4: a backend read error must not collapse to "absent".
-        let entry =
-            match self
-                .index
-                .read()
-                .lookup_checked(key)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index lookup failed: {e}"),
-                })? {
-                Some(e) => e,
-                None => return Ok(false),
-            };
+        let entry = match self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })? {
+            Some(e) => e,
+            None => return Ok(false),
+        };
         let ro = entry.record_offset;
 
         let mut meta = self.read_metadata_for_key(key, ro)?;
@@ -6283,7 +6267,6 @@ impl Engine {
     pub fn get_spend(&self, req: &GetSpendRequest) -> Result<GetSpendResponse, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6366,12 +6349,9 @@ impl Engine {
     pub fn rebuild_conflicting_index(&self) {
         let mut conflicting = self.conflicting_index.lock();
         conflicting.clear();
-        let index = self.index.read();
-        for (key, entry) in index.iter() {
-            if TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::CONFLICTING) {
-                conflicting.insert(key);
-            }
-        }
+        self.index.for_each_conflicting(|key| {
+            conflicting.insert(key);
+        });
     }
 
     /// Read on-device metadata for a transaction.
@@ -6392,7 +6372,6 @@ impl Engine {
     pub fn read_metadata(&self, key: &TxKey) -> Result<TxMetadata, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6419,7 +6398,7 @@ impl Engine {
         &self,
         key: &TxKey,
     ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
-        self.index.read().lookup_checked(key)
+        self.index.lookup_checked(key)
     }
 
     /// Infallible convenience variant of [`Self::lookup_cached_checked`].
@@ -6428,7 +6407,7 @@ impl Engine {
     /// For tests / internal diagnostics only; client-visible read paths
     /// MUST use [`Self::lookup_cached_checked`].
     pub fn lookup_cached(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        match self.index.read().lookup_checked(key) {
+        match self.index.lookup_checked(key) {
             Ok(found) => found,
             Err(e) => {
                 tracing::error!(
@@ -6456,7 +6435,6 @@ impl Engine {
     pub fn read_slot(&self, key: &TxKey, offset: u32) -> Result<UtxoSlot, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6484,7 +6462,6 @@ impl Engine {
     pub fn read_slots(&self, key: &TxKey) -> Result<Vec<UtxoSlot>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6538,7 +6515,6 @@ impl Engine {
         let _stripe_guard = self.locks.lock(key);
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6565,7 +6541,6 @@ impl Engine {
     ) -> Result<Option<BlockEntry>, SpendError> {
         let entry = self
             .index
-            .read()
             .lookup_checked(key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index lookup failed: {e}"),
@@ -6604,18 +6579,30 @@ impl Engine {
 
     /// Number of entries in the primary index.
     pub fn index_len(&self) -> usize {
-        self.index.read().len()
+        self.index.len()
+    }
+
+    /// Number of independent index shards backing the primary index.
+    ///
+    /// Each shard is a complete [`crate::index::PrimaryBackend`] behind its own
+    /// `RwLock`; a write to one shard never blocks reads or writes on the other
+    /// shards. The count is the configured `index_shards` rounded up to a power
+    /// of two and clamped to `[1, 256]` (see [`crate::index::ShardedIndex`]).
+    pub fn index_shard_count(&self) -> usize {
+        self.index.shard_count()
     }
 
     /// Primary index statistics for monitoring.
     pub fn index_stats(&self) -> crate::index::IndexStats {
-        self.index.read().stats()
+        self.index.stats()
     }
 
     /// Non-blocking primary-index stats for observability (see `allocator_stats_try`).
-    /// Returns `None` if the index write lock is momentarily held by the create path.
+    /// Returns `None` if ANY shard's read lock is momentarily held by a writer
+    /// (e.g. the create path), so `/admin/top` never stalls behind the write
+    /// path.
     pub fn index_stats_try(&self) -> Option<crate::index::IndexStats> {
-        self.index.try_read().map(|g| g.stats())
+        self.index.try_stats()
     }
 
     /// Test-only: arm a synthetic failure in the next primary-index read so
@@ -6625,7 +6612,7 @@ impl Engine {
     /// collapsing to "transaction not found".
     #[cfg(test)]
     pub fn arm_fail_next_index_read(&self) {
-        self.index.read().arm_fail_next_read();
+        self.index.arm_fail_next_read();
     }
 
     /// Access the underlying block device.
@@ -6638,20 +6625,45 @@ impl Engine {
 
     /// Snapshot the primary index and both secondary indexes to a file.
     ///
-    /// Acquires read locks on the primary index and short-lived locks on the
-    /// secondary indexes, then writes a consistent snapshot to `path` via an
-    /// atomic rename. Called during graceful shutdown so the next startup can
-    /// restore from snapshot instead of scanning the device.
+    /// Acquires the secondary locks first (dah → unmined), then the primary
+    /// index shard read locks, and writes the snapshot to `path` via an atomic
+    /// rename. Called during graceful shutdown / checkpoint so the next startup
+    /// can restore from snapshot instead of scanning the device.
+    ///
+    /// # Lock order — inverted vs the write path
+    ///
+    /// This method's order (dah → unmined → shard.read) is the REVERSE of the
+    /// write path (shard.write → dah → unmined, see
+    /// `Engine::sync_primary_and_both_secondary_atomic`). The two are
+    /// deadlock-free ONLY because this method is called exclusively by the
+    /// checkpoint task while it holds `dispatch_visibility_barrier.write()`,
+    /// which excludes every write-path caller from holding any index or
+    /// secondary lock concurrently.
+    ///
+    /// **CALLER CONTRACT:** the caller MUST hold
+    /// `dispatch_visibility_barrier.write()` before calling this method.
+    /// Calling it without that guard while a write-path op is in flight can
+    /// deadlock (the inverted lock order has no other protection).
     ///
     /// # Errors
     ///
     /// Returns [`crate::index::IndexError`] on I/O failure or if the snapshot
     /// directory is not writable.
     pub fn snapshot_index(&self, path: &std::path::Path) -> crate::index::Result<()> {
-        let index = self.index.read();
+        // Lock order: dah -> unmined -> shard.read, inverted vs the write path
+        // (sync_primary_and_both_secondary_atomic). Safe only because the
+        // checkpoint caller holds dispatch_visibility_barrier.write() — see the
+        // caller contract in this method's doc comment.
         let dah = self.dah_index.lock();
         let unmined = self.unmined_index.lock();
-        index.snapshot_all(&dah, &unmined, path)
+        // `ShardedIndex::snapshot_all` writes the v1 (`TSIX`) format when the
+        // engine runs at shard_count == 1 — byte-for-byte identical to the
+        // pre-sharding engine, so the existing `PrimaryBackend::restore_all`
+        // checkpoint path keeps reading it — and the v2 (`TSX2`) N-shard
+        // manifest when shard_count > 1. The engine runs at the configured
+        // shard count (default index_shards = 16), so production checkpoints
+        // write the v2 manifest; only a single-shard deployment stays on v1.
+        self.index.snapshot_all(&dah, &unmined, path)
     }
 
     /// Persist the allocator's freelist and high-water mark to the device header.
@@ -6682,7 +6694,7 @@ impl Engine {
     /// Returns [`crate::index::IndexError`] if any backend's durability
     /// flush fails; the caller must treat all index state as NOT durable.
     pub fn flush_index_durable(&self) -> crate::index::Result<()> {
-        self.index.read().flush_durable()?;
+        self.index.flush_durable()?;
         self.dah_index.lock().flush_durable()?;
         self.unmined_index.lock().flush_durable()
     }
@@ -9602,8 +9614,9 @@ mod tests {
         // stale DAH (1288) with NO preserve discriminant, while the device
         // sits at preserve_until=5000.
         {
-            let mut idx = h.engine.index.write();
-            let updated = idx
+            let updated = h
+                .engine
+                .index
                 .update_cached_fields(
                     &h.key,
                     TxFlags::empty().bits(), // no HAS_PRESERVE_UNTIL
@@ -9636,7 +9649,7 @@ mod tests {
 
         // Cache must now reflect the device truth: preserve discriminant set,
         // dah_or_preserve == preserve_until (5000) — NOT the stale 1288.
-        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        let entry = h.engine.index.lookup(&h.key).unwrap();
         assert_eq!(
             entry.dah_or_preserve, 5000,
             "cache must resync to preserve_until from fresh meta, not the stale DAH",
@@ -9668,11 +9681,10 @@ mod tests {
         });
 
         // Poison cache: stale DAH 1288, no preserve discriminant.
-        {
-            let mut idx = h.engine.index.write();
-            idx.update_cached_fields(&h.key, TxFlags::empty().bits(), 0, 0, 1288, 0, 0)
-                .unwrap();
-        }
+        h.engine
+            .index
+            .update_cached_fields(&h.key, TxFlags::empty().bits(), 0, 0, 1288, 0, 0)
+            .unwrap();
 
         let req = SetMinedRequest {
             tx_key: h.key,
@@ -9701,7 +9713,7 @@ mod tests {
             "block entry must be recorded"
         );
 
-        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        let entry = h.engine.index.lookup(&h.key).unwrap();
         assert_eq!(
             entry.dah_or_preserve, 5000,
             "cache must resync to preserve_until from fresh meta, not the stale DAH",
@@ -10462,7 +10474,7 @@ mod tests {
         // the unusual code path where the slot was reverted after the
         // prune. The deleted-children list is the only thing standing
         // between this re-spend and an accidental accept.
-        let entry = h.engine.index.read().lookup(&h.key).unwrap();
+        let entry = h.engine.index.lookup(&h.key).unwrap();
         let mut slot = h.engine.read_slot_fast(entry.record_offset, 1).unwrap();
         slot.status = UTXO_SPENT;
         slot.spending_data = h.make_spending_data(0xAB);
@@ -12251,6 +12263,170 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         )
+    }
+
+    /// Build an engine whose primary index is a multi-shard `ShardedIndex`
+    /// constructed exactly as the server startup path builds it for the
+    /// in-memory backend: `ShardedIndex::new_in_memory(cap, shard_count)` then
+    /// `Engine::new_with_sharded_index`. Lets the wiring tests exercise the
+    /// real N>1 routing rather than the N=1 `Engine::new` pass-through.
+    fn create_sharded_engine(shard_count: usize) -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = ShardedIndex::new_in_memory(10_000, shard_count).unwrap();
+        Arc::new(Engine::new_with_sharded_index(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    }
+
+    /// Find a `tx_id` (varying only the index-shard bytes `[24..32]`) whose
+    /// `index_shard_for_key` differs from `avoid_shard`. Returns the chosen
+    /// txid. Panics only if no differing shard is found in a large search
+    /// (impossible for shard_count > 1 given the SplitMix64 spread).
+    fn txid_in_other_shard(engine: &Engine, avoid_shard: usize) -> [u8; 32] {
+        for nonce in 0u64..100_000 {
+            let mut txid = [0u8; 32];
+            txid[24..32].copy_from_slice(&nonce.to_le_bytes());
+            let key = TxKey { txid };
+            if engine.index.index_shard_for_key(&key) != avoid_shard {
+                return txid;
+            }
+        }
+        panic!("could not find a txid routing to a shard other than {avoid_shard}");
+    }
+
+    /// The default `IndexConfig` (and therefore the default server wiring)
+    /// builds the in-memory index at 16 shards. The engine must expose that
+    /// count through `index_shard_count()`, proving the config flows end to
+    /// end into the live index layout.
+    #[test]
+    fn default_config_wires_sixteen_index_shards() {
+        let default_shards = crate::config::IndexConfig::default().index_shards;
+        assert_eq!(default_shards, 16, "default index_shards must be 16");
+
+        let engine = create_sharded_engine(default_shards);
+        assert_eq!(
+            engine.index_shard_count(),
+            16,
+            "engine built from default config must expose 16 index shards",
+        );
+    }
+
+    /// Concurrency wiring: a write lock held on one key's shard must NOT block
+    /// a create routed to a different shard. Proves the multi-shard layout
+    /// delivers parallelism through the engine — the create completes well
+    /// within a tight timeout while a foreign shard's write guard is parked.
+    #[test]
+    fn create_on_other_shard_not_blocked_by_held_shard_write() {
+        use std::sync::mpsc;
+
+        let engine = create_sharded_engine(16);
+        assert!(
+            engine.index_shard_count() > 1,
+            "test requires N>1 to be meaningful",
+        );
+
+        // Pick a key (shard A) to hold a write guard on, and a create key that
+        // routes to a different shard (shard B != A).
+        let held_key = TxKey { txid: [0u8; 32] };
+        let held_shard = engine.index.index_shard_for_key(&held_key);
+        let create_txid = txid_in_other_shard(&engine, held_shard);
+        let create_key = TxKey { txid: create_txid };
+        assert_ne!(
+            engine.index.index_shard_for_key(&create_key),
+            held_shard,
+            "create key must route to a different shard than the held write guard",
+        );
+
+        // Park a thread holding shard A's write guard until told to release.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let engine_for_holder = Arc::clone(&engine);
+        let holder = std::thread::spawn(move || {
+            let _guard = engine_for_holder.index.write_shard(&held_key);
+            held_tx.send(()).expect("signal guard acquired");
+            // Hold the guard until the main thread proves the create finished.
+            let _ = release_rx.recv();
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("holder thread should acquire the shard write guard");
+
+        // Run the foreign-shard create on another thread and assert it finishes
+        // promptly even though shard A's write guard is still held.
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let engine_for_create = Arc::clone(&engine);
+        let creator = std::thread::spawn(move || {
+            let (_hashes, mut req) = make_create_req(99, 2);
+            req.tx_id = create_txid;
+            engine_for_create
+                .create(&req)
+                .expect("foreign-shard create must succeed while another shard is write-locked");
+            done_tx.send(()).expect("signal create finished");
+        });
+
+        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Release the held guard regardless of outcome so threads can join.
+        let _ = release_tx.send(());
+        holder.join().expect("holder thread panicked");
+        creator.join().expect("creator thread panicked");
+
+        finished.expect(
+            "a create routed to a different shard must complete without blocking on the held \
+             shard's write guard (cross-shard serialization detected)",
+        );
+
+        // The created record is present in its own shard.
+        assert!(
+            engine.lookup(&create_key).is_some(),
+            "created record must be registered in its shard",
+        );
+    }
+
+    /// Degenerate equivalence: at `index_shards = 1` the sharded index is a
+    /// single-lock pass-through, and basic create / lookup / spend must work
+    /// exactly as the single-index baseline.
+    #[test]
+    fn single_shard_create_lookup_spend_equivalence() {
+        let engine = create_sharded_engine(1);
+        assert_eq!(
+            engine.index_shard_count(),
+            1,
+            "shard_count=1 must clamp to a single shard",
+        );
+
+        let (_hashes, req) = make_create_req(7, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create on single-shard index");
+        assert!(
+            engine.lookup(&key).is_some(),
+            "lookup must find the created record on the single shard",
+        );
+
+        let spend = SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: [0u8; 32],
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 0xAB;
+                sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                sd
+            },
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        engine
+            .spend(&spend)
+            .expect("spend on single-shard index must succeed");
     }
 
     fn create_engine_without_direct_ptr() -> Arc<Engine> {
@@ -14122,7 +14298,7 @@ mod tests {
                 })
                 .unwrap();
             let after_conflict = engine.read_metadata(&key).unwrap();
-            let conflict_entry = engine.index.read().lookup(&key).unwrap();
+            let conflict_entry = engine.index.lookup(&key).unwrap();
             assert_eq!(conflicting.generation, { after_conflict.generation });
             assert_eq!(conflict_entry.generation, { after_conflict.generation });
             assert_eq!(conflict_entry.tx_flags, after_conflict.flags.bits());
@@ -14135,7 +14311,7 @@ mod tests {
                 })
                 .unwrap();
             let after_locked = engine.read_metadata(&key).unwrap();
-            let locked_entry = engine.index.read().lookup(&key).unwrap();
+            let locked_entry = engine.index.lookup(&key).unwrap();
             assert_eq!(locked_generation, { after_locked.generation });
             assert_eq!(locked_entry.generation, { after_locked.generation });
             assert_eq!(locked_entry.tx_flags, after_locked.flags.bits());
@@ -15966,7 +16142,7 @@ mod tests {
     // -- H2: atomic shard-count update tests --
 
     #[test]
-    fn engine_startup_shard_counts_lazy() {
+    fn engine_startup_shard_counts_eager() {
         fn key_for_shard(shard: u16, salt: u8) -> TxKey {
             assert!(shard < crate::cluster::shards::NUM_SHARDS as u16);
             let mut txid = [0u8; 32];
@@ -15992,7 +16168,7 @@ mod tests {
 
         const EXISTING_SHARD: u16 = 1234;
         const OTHER_EXISTING_SHARD: u16 = 1235;
-        const PRE_INIT_CREATE_SHARD: u16 = 1236;
+        const PRE_READ_CREATE_SHARD: u16 = 1236;
 
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -16017,43 +16193,39 @@ mod tests {
             UnminedIndex::new(),
         ));
 
-        assert!(
-            !engine.shard_counts_initialized_for_test(),
-            "Engine::new must not eagerly initialize shard_counts",
-        );
-
-        let (_, mut pre_init_req) = make_create_req(71, 1);
-        pre_init_req.tx_id = key_for_shard(PRE_INIT_CREATE_SHARD, 1).txid;
-        engine
-            .create(&pre_init_req)
-            .expect("create before lazy count initialization should succeed");
-        assert!(
-            !engine.shard_counts_initialized_for_test(),
-            "create before first shard_record_count should not force a full index scan",
-        );
-
+        // PR#19 #1: counts are seeded EAGERLY in new_inner from the
+        // fully-populated index, before any concurrent access is possible.
+        // Counts are correct immediately — no prior `shard_record_count` call
+        // required to trigger a scan.
         assert_eq!(
             engine.shard_record_count(EXISTING_SHARD),
             2,
-            "first shard_record_count must not return zero for existing records",
+            "eager init must count existing records on the populated shard",
         );
-        assert!(engine.shard_counts_initialized_for_test());
         assert_eq!(engine.shard_record_count(OTHER_EXISTING_SHARD), 1);
-        assert_eq!(engine.shard_record_count(PRE_INIT_CREATE_SHARD), 1);
 
-        let (_, mut post_init_req) = make_create_req(72, 1);
-        post_init_req.tx_id = key_for_shard(EXISTING_SHARD, 3).txid;
+        // A create issued before any read still increments the count
+        // unconditionally under the shard write lock.
+        let (_, mut pre_read_req) = make_create_req(71, 1);
+        pre_read_req.tx_id = key_for_shard(PRE_READ_CREATE_SHARD, 1).txid;
         engine
-            .create(&post_init_req)
-            .expect("create after lazy count initialization should succeed");
+            .create(&pre_read_req)
+            .expect("create on an eager-init engine should succeed");
+        assert_eq!(engine.shard_record_count(PRE_READ_CREATE_SHARD), 1);
+
+        let (_, mut second_req) = make_create_req(72, 1);
+        second_req.tx_id = key_for_shard(EXISTING_SHARD, 3).txid;
+        engine
+            .create(&second_req)
+            .expect("second create should succeed");
         assert_eq!(engine.shard_record_count(EXISTING_SHARD), 3);
 
         engine
             .delete(&DeleteRequest {
-                tx_key: post_init_req.tx_key(),
+                tx_key: second_req.tx_key(),
                 due_guard: None,
             })
-            .expect("delete after lazy count initialization should succeed");
+            .expect("delete should succeed");
         assert_eq!(engine.shard_record_count(EXISTING_SHARD), 2);
 
         engine
@@ -16101,14 +16273,14 @@ mod tests {
             UnminedIndex::new(),
         );
 
-        let initial_capacity = engine.index.read().stats().capacity;
+        let initial_capacity = engine.index.stats().capacity;
         for i in 0..20 {
             engine
                 .register_with_shard_count(key(i), entry(i))
                 .expect("register should resize without losing entries");
         }
 
-        let resized_capacity = engine.index.read().stats().capacity;
+        let resized_capacity = engine.index.stats().capacity;
         assert!(
             resized_capacity > initial_capacity,
             "test must cross the resize threshold"
@@ -16122,13 +16294,25 @@ mod tests {
         }
     }
 
+    /// A read guard held on the index shard owning `key` does not block a
+    /// concurrent lookup of that same key — shared reads are compatible.
+    ///
+    /// Pre-sharding this exercised the resize helper's `upgradable_read` lock
+    /// mode (now removed: per-shard resize takes the shard write lock for the
+    /// copy+swap). The migration-faithful property that remains true at any
+    /// shard count is: a shared read guard never excludes other readers. The
+    /// stronger "a write on one shard does not block reads on another shard"
+    /// property is proved by `ShardedIndex::contract_read_not_blocked_by_other_shard_write`
+    /// and is exercised at the engine level once the default rises above one
+    /// shard.
     #[test]
-    fn primary_resize_lock_mode_allows_concurrent_lookups() {
+    fn primary_index_read_guard_allows_concurrent_lookups() {
         let h = TestHarness::new(1, TxFlags::empty());
         let engine = h.engine.clone();
         let key = h.key;
 
-        let resize_like_guard = engine.index.upgradable_read();
+        // Hold a shared read guard on the shard that owns `key`.
+        let read_guard = engine.index.read_shard(&key);
         let (tx, rx) = std::sync::mpsc::channel();
         let reader_engine = engine.clone();
         std::thread::spawn(move || {
@@ -16137,10 +16321,10 @@ mod tests {
 
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(1))
-                .expect("lookup must not block behind an upgradable resize guard"),
-            "lookup should find the existing key while resize copy lock is held"
+                .expect("a shared read must not block behind another shared read guard"),
+            "lookup should find the existing key while a read guard is held"
         );
-        drop(resize_like_guard);
+        drop(read_guard);
     }
 
     /// Sum of per-shard counts observed on `engine`, computed from the
@@ -16265,6 +16449,227 @@ mod tests {
         assert!(
             total > 0,
             "expected some records to remain, got 0 (likely all deletes ran)",
+        );
+    }
+
+    /// PR#19 #4 — regression guard for the lazy-init-vs-writer race (PR#19 #1).
+    ///
+    /// At N>1 (16 index shards, built exactly as the server wires the
+    /// in-memory backend), spawn K threads that each create many distinct
+    /// records concurrently through the engine's create path (which goes
+    /// through `register_new_with_shard_count`), while other threads
+    /// interleave `shard_record_count` reads. After joining, the per-shard
+    /// counts and their total must EXACTLY match a ground-truth recount of the
+    /// primary index by `ShardTable::shard_for_key`, AND the total must equal
+    /// the number of keys actually in the index.
+    ///
+    /// With the OLD lazy init this drifts: a reader triggers the one-shot scan
+    /// while writers concurrently insert into shards the scan has already
+    /// visited+released and read the still-false flag, so those inserts skip
+    /// their `fetch_add` and are counted by neither path — `shard_counts`
+    /// permanently undercounts. With eager init in the constructor the flag is
+    /// already true before any writer runs, so every insert increments under
+    /// its shard write lock and the counts can never drift.
+    #[test]
+    fn shard_counts_no_drift_under_concurrent_registration_n16() {
+        // Distinct txid per (thread, i) using a 64-bit nonce so keys spread
+        // across all 16 index shards AND across many cluster shards (the
+        // `shard_counts` keying). A wide nonce avoids the u8 ceiling of
+        // `make_create_req`, letting each thread mint hundreds of unique keys.
+        fn nonce_for(thread: u32, i: u32) -> u64 {
+            // +1 keeps the nonce nonzero (so no txid is all-zero) without
+            // collapsing distinct i values the way a low-bit OR would.
+            (((thread as u64) << 32) | (i as u64)) + 1
+        }
+        fn txid_for(thread: u32, i: u32) -> [u8; 32] {
+            let nonce = nonce_for(thread, i);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&nonce.to_le_bytes());
+            // Mix into the cluster-shard key bytes too so cluster shards spread.
+            txid[8..16].copy_from_slice(&nonce.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
+            txid[24..32].copy_from_slice(&nonce.wrapping_mul(0xD6E8FEB86659FD93).to_le_bytes());
+            txid
+        }
+        // The create path rejects an empty UTXO set, so each request carries a
+        // single placeholder UTXO. The hash must be distinct per transaction
+        // so concurrent creates don't collide on the UTXO secondary index.
+        fn utxo_hash_for(thread: u32, i: u32) -> [u8; 32] {
+            let nonce = nonce_for(thread, i);
+            let mut h = [0u8; 32];
+            h[0..8].copy_from_slice(&nonce.wrapping_mul(0xC2B2AE3D27D4EB4F).to_le_bytes());
+            h[8..16].copy_from_slice(&nonce.wrapping_mul(0x165667B19E3779F9).to_le_bytes());
+            h
+        }
+
+        let engine = create_sharded_engine(16);
+        assert_eq!(
+            engine.index_shard_count(),
+            16,
+            "test must run at N=16 index shards to be meaningful",
+        );
+
+        const WRITER_THREADS: u32 = 8;
+        const READER_THREADS: usize = 4;
+        const RECORDS_PER_THREAD: u32 = 600;
+
+        let build_req = |t: u32, i: u32| -> CreateRequest<'static> {
+            let tx_id = txid_for(t, i);
+            // Leak a 'static single-UTXO slice for this request. Bounded by
+            // WRITER_THREADS * RECORDS_PER_THREAD — fine for a test.
+            let utxo_hashes: &'static [[u8; 32]] =
+                Box::leak(vec![utxo_hash_for(t, i)].into_boxed_slice());
+            CreateRequest {
+                tx_id,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 1710000000000,
+                block_height: 1000,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            }
+        };
+
+        // Pre-seed a chunk of records BEFORE the concurrent phase so the
+        // reader's lazy scan (on the old code) has a non-trivial index to walk
+        // while writers concurrently insert into shards it has already passed —
+        // the exact window that made the old lazy init drop counts.
+        const WARMUP_PER_THREAD: u32 = 100;
+        for t in 0..WRITER_THREADS {
+            for i in 0..WARMUP_PER_THREAD {
+                engine
+                    .create(&build_req(t, i))
+                    .expect("warmup create should succeed");
+            }
+        }
+
+        // Barrier releases all writers AND all readers at the same instant so
+        // a reader-triggered count read overlaps live inserts.
+        let barrier = Arc::new(std::sync::Barrier::new(
+            WRITER_THREADS as usize + READER_THREADS,
+        ));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut readers = Vec::with_capacity(READER_THREADS);
+        for _ in 0..READER_THREADS {
+            let reader_engine = Arc::clone(&engine);
+            let reader_stop = Arc::clone(&stop);
+            let reader_barrier = Arc::clone(&barrier);
+            readers.push(std::thread::spawn(move || {
+                reader_barrier.wait();
+                let mut spins: u64 = 0;
+                while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut acc: u64 = 0;
+                    for s in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+                        acc = acc.wrapping_add(reader_engine.shard_record_count(s));
+                    }
+                    std::hint::black_box(acc);
+                    spins = spins.wrapping_add(1);
+                }
+                spins
+            }));
+        }
+
+        let mut handles = Vec::with_capacity(WRITER_THREADS as usize);
+        for t in 0..WRITER_THREADS {
+            let engine = Arc::clone(&engine);
+            let writer_barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                writer_barrier.wait();
+                for i in WARMUP_PER_THREAD..RECORDS_PER_THREAD {
+                    let tx_id = txid_for(t, i);
+                    let utxo_hashes: &'static [[u8; 32]] =
+                        Box::leak(vec![utxo_hash_for(t, i)].into_boxed_slice());
+                    let req = CreateRequest {
+                        tx_id,
+                        tx_version: 1,
+                        locktime: 0,
+                        fee: 500,
+                        size_in_bytes: 250,
+                        extended_size: 0,
+                        is_coinbase: false,
+                        spending_height: 0,
+                        utxo_hashes,
+                        inputs: None,
+                        outputs: None,
+                        inpoints: None,
+                        is_external: false,
+                        created_at: 1710000000000,
+                        block_height: 1000,
+                        mined_block_infos: &[],
+                        frozen: false,
+                        conflicting: false,
+                        locked: false,
+                        external_ref: None,
+                        parent_txids: &[],
+                    };
+                    engine
+                        .create(&req)
+                        .expect("concurrent create should succeed");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().expect("reader thread panicked");
+        }
+
+        // Ground truth: recount the primary index by cluster shard.
+        let keys = engine.all_keys();
+        let expected_total = keys.len() as u64;
+        assert_eq!(
+            expected_total,
+            (WRITER_THREADS * RECORDS_PER_THREAD) as u64,
+            "every (thread,i) key is distinct, so all creates must have inserted",
+        );
+
+        let mut reference: HashMap<u16, u64> = HashMap::new();
+        for k in &keys {
+            let s = crate::cluster::shards::ShardTable::shard_for_key(k);
+            *reference.entry(s).or_insert(0) += 1;
+        }
+
+        // Per-shard counts must EXACTLY match the recount — no drift.
+        for (&shard, &expected) in &reference {
+            assert_eq!(
+                engine.shard_record_count(shard),
+                expected,
+                "shard_counts drift at shard {shard}: expected {expected}",
+            );
+        }
+        // Shards with no keys must read zero.
+        for shard in 0..crate::cluster::shards::NUM_SHARDS as u16 {
+            if !reference.contains_key(&shard) {
+                assert_eq!(
+                    engine.shard_record_count(shard),
+                    0,
+                    "shard {shard} should be empty but shard_counts is nonzero",
+                );
+            }
+        }
+        // The sum of all shard counts must equal the number of index entries.
+        let counted_total: u64 = (0..crate::cluster::shards::NUM_SHARDS as u16)
+            .map(|s| engine.shard_record_count(s))
+            .sum();
+        assert_eq!(
+            counted_total, expected_total,
+            "sum of shard_counts ({counted_total}) drifted from index len ({expected_total})",
         );
     }
 

@@ -36,7 +36,7 @@ use crate::allocator::{AllocatorError, SlotAllocator};
 use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::{
-    DahBackend, DahIndex, IndexError, PrimaryBackend, UnminedBackend, UnminedIndex,
+    DahBackend, DahIndex, IndexError, PrimaryBackend, ShardedIndex, UnminedBackend, UnminedIndex,
 };
 use crate::recovery::{RecoveryStats, ReplayCause};
 
@@ -442,6 +442,37 @@ pub fn load_primary_index_in_memory(
 ) -> Result<PrimaryBackend, RebuildError> {
     PrimaryBackend::rebuild(device, allocator).map_err(|e| RebuildError::InMemoryPrimary {
         rebuild_err: format!("{e}"),
+    })
+}
+
+/// Rebuild the in-memory sharded primary index from the device.
+///
+/// Delegates to [`ShardedIndex::rebuild_in_memory`], which internally calls
+/// the proven [`PrimaryBackend::rebuild`] device scan and re-routes every
+/// entry into the correct shard. Fail closed on any rebuild error — starting
+/// with an empty or partial sharded index is not an option.
+///
+/// # Parameters
+///
+/// - `device`: block device to scan.
+/// - `allocator`: slot allocator whose freelist is used to skip free holes.
+/// - `shard_count`: number of index shards to create (rounded up to the next
+///   power of two, clamped to `[1, 256]`).
+///
+/// # Errors
+///
+/// Returns [`RebuildError::InMemoryPrimary`] if the device scan or shard
+/// routing fails, carrying a `Display`-formatted description of the
+/// underlying [`IndexError`].
+pub fn load_sharded_index_in_memory(
+    device: &dyn BlockDevice,
+    allocator: &SlotAllocator,
+    shard_count: usize,
+) -> Result<ShardedIndex, RebuildError> {
+    ShardedIndex::rebuild_in_memory(device, allocator, shard_count).map_err(|e| {
+        RebuildError::InMemoryPrimary {
+            rebuild_err: format!("{e}"),
+        }
     })
 }
 
@@ -1434,6 +1465,70 @@ mod tests {
             super::RedoOpenError::Log { .. } => {
                 panic!("a directory path should surface as Device error, not Log error");
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 6 test: load_sharded_index_in_memory
+    // -----------------------------------------------------------------------
+
+    /// Test 3 (Task 6): `load_sharded_index_in_memory` scans the device and
+    /// returns a populated N=16 `ShardedIndex`. All written records must be
+    /// findable and their `record_offset` values must match.
+    #[test]
+    fn load_sharded_index_in_memory_returns_populated_n16_index() {
+        use crate::index::TxKey;
+        use crate::io::write_full_record;
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+
+        // Write 30 records with keys that spread across shards ([24..32] varied)
+        let mut expected: Vec<(TxKey, u64)> = Vec::new();
+        for i in 0u64..30 {
+            let mut meta = TxMetadata::new(5);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            txid[8..16].copy_from_slice(&i.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
+            txid[24..32].copy_from_slice(&i.wrapping_mul(0x517C_C1B7_2722_0A95).to_le_bytes());
+            meta.tx_id = txid;
+
+            let record_size = TxMetadata::record_size_for(5);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slots: Vec<UtxoSlot> = (0..5)
+                .map(|s| {
+                    let mut h = [0u8; 32];
+                    h[0] = s;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+            write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            expected.push((TxKey { txid }, offset));
+        }
+
+        let sharded = super::load_sharded_index_in_memory(&*dev, &alloc, 16)
+            .expect("load_sharded_index_in_memory must succeed with populated device");
+
+        assert_eq!(sharded.shard_count(), 16, "must produce 16 shards");
+        assert_eq!(
+            sharded.len(),
+            expected.len(),
+            "rebuilt index must contain all written records"
+        );
+
+        for (key, expected_offset) in &expected {
+            let entry = sharded.lookup(key).unwrap_or_else(|| {
+                panic!(
+                    "key {:?} not found after load_sharded_index_in_memory",
+                    key.txid
+                )
+            });
+            assert_eq!(
+                entry.record_offset, *expected_offset,
+                "record_offset mismatch for key {:?}",
+                key.txid
+            );
         }
     }
 }

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::Mutex;
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, DeviceError, MemoryDevice};
-use teraslab::index::{DahBackend, PrimaryBackend, TxKey, UnminedBackend};
+use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey, UnminedBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
@@ -305,7 +305,7 @@ impl SimulatedNode {
             SIM_REDO_LOG_SIZE,
         )
         .unwrap();
-        let mut primary = PrimaryBackend::new_in_memory(100_000).unwrap();
+        let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100_000).unwrap());
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
         let mut alloc = SlotAllocator::new(self.device.clone()).unwrap();
@@ -313,7 +313,7 @@ impl SimulatedNode {
         let stats = recover_all_with_allocator(
             &*self.device,
             &redo,
-            &mut primary,
+            &primary,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),
@@ -329,7 +329,7 @@ impl SimulatedNode {
 
         let redo_arc = Arc::new(Mutex::new(redo));
         alloc.set_redo_log(redo_arc.clone());
-        let engine = Arc::new(Engine::new(
+        let engine = Arc::new(Engine::new_with_sharded_index(
             self.device.clone(),
             primary,
             alloc,

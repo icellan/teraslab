@@ -1402,7 +1402,7 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
     use std::sync::Arc;
     use teraslab::config::{IndexBackendMode, ServerConfig};
     use teraslab::device::{BlockDevice, DirectDevice};
-    use teraslab::index::PrimaryBackend;
+    use teraslab::index::{PrimaryBackend, ShardedIndex};
     use teraslab::redo::RedoLog;
 
     let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
@@ -1449,7 +1449,8 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
     let redo_log = RedoLog::open(redo_device, 0, cfg.redo_log_size)
         .map_err(|e| CliError::Other(format!("open redo log: {e}")))?;
 
-    let report = teraslab::recovery::repair_torn_slots(&*device, &redo_log, &primary)
+    let index = ShardedIndex::from_single(primary);
+    let report = teraslab::recovery::repair_torn_slots(&*device, &redo_log, &index)
         .map_err(|e| CliError::Other(format!("repair pass failed: {e}")))?;
 
     if json {

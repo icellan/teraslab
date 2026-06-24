@@ -30,7 +30,9 @@ use teraslab::fault_injection::{FaultMode, SyncPoint, arm, current, disarm};
 use teraslab::index::hashtable::HashTable;
 use teraslab::index::redb_dah::RedbDahIndex;
 use teraslab::index::redb_unmined::RedbUnminedIndex;
-use teraslab::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
+use teraslab::index::{
+    DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
+};
 use teraslab::redo::{RedoLog, RedoOp};
 
 // ---------------------------------------------------------------------------
@@ -90,7 +92,7 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
     // with a valid slot 0 we intend to spend.
     let data_dev: Arc<dyn teraslab::device::BlockDevice> =
         Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(7);
 
     // Allocate a record and write an initial unspent slot + metadata.
@@ -157,7 +159,7 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
     let stats = teraslab::recovery::recover_all(
         &*data_dev,
         &redo_reopened,
-        &mut primary,
+        &primary,
         &mut dah,
         &mut unmined,
     )
@@ -181,7 +183,7 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
     let stats2 = teraslab::recovery::recover_all(
         &*data_dev,
         &redo_reopened,
-        &mut primary,
+        &primary,
         &mut dah,
         &mut unmined,
     )
@@ -255,14 +257,14 @@ fn kill_between_rename_and_dir_fsync_recovers_hashtable() {
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let mut alloc_recov = SlotAllocator::new(data_dev.clone()).unwrap();
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let mut dah = DahBackend::new_in_memory();
     let mut unmined = UnminedBackend::new_in_memory();
 
     let stats = teraslab::recovery::recover_all_with_allocator(
         &*data_dev,
         &redo_reopened,
-        &mut primary,
+        &primary,
         &mut dah,
         &mut unmined,
         Some(&mut alloc_recov),
@@ -360,13 +362,13 @@ fn kill_after_free_redo_fsync_before_freelist_mutation_reconstructs_freelist() {
 
     let pre_freelist_largest = recovered_alloc.stats().largest_free_region;
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
-    let mut primary = PrimaryBackend::new_in_memory(16).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(16).unwrap());
     let mut dah = DahBackend::new_in_memory();
     let mut unmined = UnminedBackend::new_in_memory();
     let stats = teraslab::recovery::recover_all_with_allocator(
         &*data_dev,
         &redo_reopened,
-        &mut primary,
+        &primary,
         &mut dah,
         &mut unmined,
         Some(&mut recovered_alloc),
@@ -429,7 +431,7 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     // entry's metadata and fails recovery if a read fails), so the data
     // device must actually contain the record the index points at.
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
-    let mut primary = PrimaryBackend::new_in_memory(100).unwrap();
+    let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(3);
     let record_offset = 4096u64;
     let mut meta = teraslab::record::TxMetadata::new(1);
@@ -480,7 +482,7 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     let stats = teraslab::recovery::recover_all(
         &data_dev,
         &redo_reopened,
-        &mut primary,
+        &primary,
         &mut dah_backend,
         &mut unmined_backend,
     )

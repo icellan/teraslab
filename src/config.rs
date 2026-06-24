@@ -418,6 +418,11 @@ pub struct IndexConfig {
     /// Path for the file-backed mmap primary index.
     /// Only used when `backend = "file_backed"`.
     pub file_backed_path: PathBuf,
+
+    /// Number of independent index shards. Each shard is a complete
+    /// `PrimaryBackend` behind its own `RwLock`. Default 16, rounded up
+    /// to the next power of two, clamped to [1, 256].
+    pub index_shards: usize,
 }
 
 impl Default for IndexConfig {
@@ -430,6 +435,7 @@ impl Default for IndexConfig {
             redb_tombstone_path: PathBuf::from("teraslab-tombstone.redb"),
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
             file_backed_path: PathBuf::from("teraslab-index.dat"),
+            index_shards: 16,
         }
     }
 }

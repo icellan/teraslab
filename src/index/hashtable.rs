@@ -266,11 +266,9 @@ impl Bucket {
 #[inline(always)]
 fn bucket_index(key: &TxKey, seed: u64, mask: usize) -> usize {
     let h = u64::from_le_bytes(key.txid[0..8].try_into().unwrap());
-    let mut x = h ^ seed;
-    // SplitMix64 finalizer — 2 multiplies + 2 xorshifts, ~2 ns.
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^= x >> 31;
+    // SplitMix64 finalizer over (raw XOR seed) — shared impl in
+    // `crate::index::hashmix` so the three per-txid routers cannot drift.
+    let x = crate::index::hashmix::splitmix64_finalize(h ^ seed);
     (x as usize) & mask
 }
 
@@ -2634,7 +2632,9 @@ mod tests {
         let data_dev =
             std::sync::Arc::new(crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let mut alloc = crate::allocator::SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = crate::index::PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = crate::index::ShardedIndex::from_single(
+            crate::index::PrimaryBackend::new_in_memory(1000).unwrap(),
+        );
         let mut dah = crate::index::DahBackend::new_in_memory();
         let mut unmined = crate::index::UnminedBackend::new_in_memory();
 
@@ -2642,7 +2642,7 @@ mod tests {
         let stats = crate::recovery::recover_all_with_allocator(
             &*data_dev,
             &redo_log,
-            &mut index,
+            &index,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),

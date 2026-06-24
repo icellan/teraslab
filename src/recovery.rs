@@ -38,7 +38,7 @@
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::index::{
-    DahBackend, DahRedoEntry, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
+    DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
 };
 use crate::io;
 use crate::ops::delete_eval::{DahPatch, evaluate_delete_at_height};
@@ -302,10 +302,12 @@ fn mark_recovery_progress_non_fatal(
 ///
 /// For each entry, checks whether the operation has already been applied
 /// (idempotent check) and re-executes it if not.
+///
+/// `index` uses interior locking (`&ShardedIndex`), so no `&mut` is required.
 pub fn recover(
     device: &dyn BlockDevice,
     redo_log: &RedoLog,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
 ) -> Result<RecoveryStats, RecoveryError> {
     let entries = redo_log.recover()?;
     let mut stats = RecoveryStats::default();
@@ -600,7 +602,7 @@ pub struct RepairReport {
 pub fn repair_torn_slots(
     device: &dyn BlockDevice,
     redo_log: &RedoLog,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
 ) -> Result<RepairReport, RecoveryError> {
     let entries = redo_log.recover()?;
     let mut report = RepairReport::default();
@@ -705,7 +707,7 @@ pub fn repair_torn_slots(
 pub fn recover_all(
     device: &dyn BlockDevice,
     redo_log: &RedoLog,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
 ) -> Result<RecoveryStats, RecoveryError> {
@@ -730,7 +732,7 @@ pub fn recover_all(
 pub fn recover_all_with_allocator(
     device: &dyn BlockDevice,
     redo_log: &RedoLog,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
@@ -747,7 +749,7 @@ pub fn recover_all_with_allocator(
 pub fn recover_all_with_allocator_collecting_pending_conflicts(
     device: &dyn BlockDevice,
     redo_log: &RedoLog,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
@@ -788,7 +790,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
 pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     device: &dyn BlockDevice,
     redo_log: &mut RedoLog,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     allocator: Option<&mut SlotAllocator>,
@@ -827,7 +829,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
 fn recover_entries_with_allocator_collecting_pending_conflicts(
     device: &dyn BlockDevice,
     entries: Vec<RedoEntry>,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     mut allocator: Option<&mut SlotAllocator>,
@@ -1164,7 +1166,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
 
 fn reconcile_secondary_indexes_from_metadata(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
 ) -> Result<(), RecoveryError> {
@@ -1173,11 +1175,30 @@ fn reconcile_secondary_indexes_from_metadata(
     // disagrees with the on-disk rows.
     dah.clear().map_err(RecoveryError::Index)?;
     unmined.clear().map_err(RecoveryError::Index)?;
-    for (key, entry) in index.iter() {
-        let meta = match io::read_metadata(device, entry.record_offset) {
-            Ok(meta) => meta,
+
+    // Collect results from the for_each pass — for_each takes a FnMut closure
+    // that cannot return errors, so we accumulate failures and surface the first.
+    let mut first_error: Option<RecoveryError> = None;
+    let mut dah_pairs: Vec<(u32, TxKey)> = Vec::new();
+    let mut unmined_pairs: Vec<(u32, TxKey)> = Vec::new();
+
+    index.for_each(|key, entry| {
+        if first_error.is_some() {
+            return;
+        }
+        match io::read_metadata(device, entry.record_offset) {
+            Ok(meta) => {
+                let dah_height = { meta.delete_at_height };
+                if dah_height != 0 {
+                    dah_pairs.push((dah_height, key));
+                }
+                let unmined_height = { meta.unmined_since };
+                if unmined_height != 0 {
+                    unmined_pairs.push((unmined_height, key));
+                }
+            }
             Err(_) => {
-                return Err(RecoveryError::Index(
+                first_error = Some(RecoveryError::Index(
                     crate::index::IndexError::FormatError {
                         detail: format!(
                             "secondary reconcile failed to read metadata for {:?}",
@@ -1186,15 +1207,18 @@ fn reconcile_secondary_indexes_from_metadata(
                     },
                 ));
             }
-        };
-        let dah_height = { meta.delete_at_height };
-        if dah_height != 0 {
-            dah.insert(dah_height, key, None)?;
         }
-        let unmined_height = { meta.unmined_since };
-        if unmined_height != 0 {
-            unmined.insert(unmined_height, key, None)?;
-        }
+    });
+
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+
+    for (height, key) in dah_pairs {
+        dah.insert(height, key, None)?;
+    }
+    for (height, key) in unmined_pairs {
+        unmined.insert(height, key, None)?;
     }
     Ok(())
 }
@@ -1216,7 +1240,7 @@ fn reconcile_secondary_indexes_from_metadata(
 /// stale entry under the old height bucket).
 fn reconcile_secondary_indexes_for_keys(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     keys: &std::collections::HashSet<TxKey>,
@@ -1280,7 +1304,7 @@ fn reconcile_secondary_indexes_for_keys(
 /// failures are logged at warn and counted in `delete_failed`.
 pub fn reconcile_blobs_after_recovery(
     blob_store: &dyn BlobStore,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
 ) -> Result<BlobGcStats, BlobError> {
     let started = std::time::Instant::now();
     let stats = blob_gc::reconcile_orphan_blobs_against_index(blob_store, index)?;
@@ -1323,7 +1347,7 @@ fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
 /// skip the secondary update entirely.
 fn replay_secondary_unmined(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     unmined: &mut UnminedBackend,
     tx_key: &TxKey,
     _old_height: u32,
@@ -1363,7 +1387,7 @@ fn replay_secondary_unmined(
 
 fn replay_secondary_dah(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     dah: &mut DahBackend,
     tx_key: &TxKey,
     old_height: u32,
@@ -1454,7 +1478,7 @@ fn apply_replay_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
 
 fn replay_entry(
     device: &dyn BlockDevice,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
     entry: &RedoEntry,
 ) -> ReplayResult {
@@ -1688,7 +1712,7 @@ fn replay_entry(
 #[allow(clippy::too_many_arguments)]
 fn replay_spend(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     offset: u32,
     spending_data: &[u8; 36],
@@ -1798,7 +1822,7 @@ fn replay_spend(
 #[allow(clippy::too_many_arguments)]
 fn replay_unspend(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     offset: u32,
     expected_spending_data: Option<&[u8; 36]>,
@@ -1895,7 +1919,7 @@ fn replay_unspend(
 
 fn replay_set_mined(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -1936,7 +1960,7 @@ fn replay_set_mined(
 #[allow(clippy::too_many_arguments)]
 fn replay_set_mined_with_allocator(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     mut allocator: Option<&mut SlotAllocator>,
     tx_key: &TxKey,
     block_id: u32,
@@ -2108,7 +2132,7 @@ fn replay_set_mined_with_allocator(
 
 fn replay_freeze(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     offset: u32,
     expected_hash: Option<&[u8; 32]>,
@@ -2177,7 +2201,7 @@ fn replay_freeze(
 
 fn replay_unfreeze(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     offset: u32,
     expected_hash: Option<&[u8; 32]>,
@@ -2277,11 +2301,15 @@ type OffsetOwners = std::collections::HashMap<u64, TxKey>;
 /// the first legitimate create replayed against that offset will still
 /// evict whichever stale key the map records, and any remaining alias is
 /// caught by the R2 tx_id-mismatch purge.
-fn build_offset_owners(index: &PrimaryBackend) -> OffsetOwners {
+/// Build the [`OffsetOwners`] reverse map from the loaded primary index in a
+/// single O(N) pass, fanning out across all shards via [`ShardedIndex::for_each`].
+///
+/// Called ONCE per recovery run, before the replay loop.
+fn build_offset_owners(index: &ShardedIndex) -> OffsetOwners {
     let mut owners = OffsetOwners::new();
-    for (key, entry) in index.iter() {
+    index.for_each(|key, entry| {
         owners.insert(entry.record_offset, key);
-    }
+    });
     owners
 }
 
@@ -2301,7 +2329,7 @@ fn build_offset_owners(index: &PrimaryBackend) -> OffsetOwners {
 /// previously aliased it has been `unregister`ed. `offset_owners` is kept
 /// in sync so subsequent creates see the new owner.
 fn register_unique_offset(
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
     key: TxKey,
     entry: TxIndexEntry,
@@ -2357,7 +2385,7 @@ fn register_unique_offset(
 /// state (not zeros).
 fn replay_create(
     device: &dyn BlockDevice,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
     tx_key: &TxKey,
     record_offset: u64,
@@ -2481,7 +2509,7 @@ fn write_zeroed_metadata_header(
 
 fn replay_delete(
     device: &dyn BlockDevice,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     record_offset: u64,
     record_size: u64,
@@ -2536,7 +2564,7 @@ fn replay_delete(
 #[allow(clippy::too_many_arguments)]
 fn replay_create_v2(
     device: &dyn BlockDevice,
-    index: &mut PrimaryBackend,
+    index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
     tx_key: &TxKey,
     record_offset: u64,
@@ -2633,7 +2661,7 @@ fn replay_create_v2(
 
 fn replay_metadata_op(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     entry: &RedoEntry,
 ) -> ReplayResult {
     match &entry.op {
@@ -2907,7 +2935,7 @@ fn replay_metadata_op(
 /// the call is a no-op.
 fn replay_compensate_unset_mined(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -2926,7 +2954,7 @@ fn replay_compensate_unset_mined(
 
 fn replay_compensate_unset_mined_with_allocator(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     allocator: Option<&mut SlotAllocator>,
     tx_key: &TxKey,
     block_id: u32,
@@ -3206,7 +3234,7 @@ fn read_recovery_overflow_entries(
 /// has the prior hash and is UNSPENT, skip.
 fn replay_compensate_reassign(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     offset: u32,
     prior_utxo_hash: &[u8; 32],
@@ -3243,7 +3271,7 @@ fn replay_compensate_reassign(
 /// skip.
 fn replay_compensate_prune(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     offset: u32,
     prior_status: u8,
@@ -3276,7 +3304,7 @@ fn replay_compensate_prune(
 /// match, replay skips.
 fn replay_compensate_set_locked(
     device: &dyn BlockDevice,
-    index: &PrimaryBackend,
+    index: &ShardedIndex,
     tx_key: &TxKey,
     prior_locked: bool,
     prior_delete_at_height: u32,
@@ -3319,16 +3347,20 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::MemoryDevice;
+    use crate::index::PrimaryBackend;
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
     use crate::redo::RedoLog;
     use std::sync::Arc;
 
-    /// Setup: device with data region + separate redo log device
+    /// Setup: device with data region + separate redo log device.
+    ///
+    /// The `index` field is a [`ShardedIndex`] (N=1 in-memory shard) so
+    /// all recovery functions can be called directly without wrapping.
     struct RecoveryTestHarness {
         data_dev: Arc<MemoryDevice>,
         redo_dev: Arc<MemoryDevice>,
-        index: PrimaryBackend,
+        index: ShardedIndex,
         alloc: SlotAllocator,
     }
 
@@ -3337,7 +3369,8 @@ mod tests {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
             let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-            let index = PrimaryBackend::new_in_memory(1000).unwrap();
+            let primary = PrimaryBackend::new_in_memory(1000).unwrap();
+            let index = ShardedIndex::from_single(primary);
             Self {
                 data_dev,
                 redo_dev,
@@ -3394,7 +3427,7 @@ mod tests {
         /// Overwrite a record's primary-index `generation` (keeping its
         /// offset and other fields), so a test can stage a live record whose
         /// generation is higher than a tombstone's (the §8.4 keep case).
-        fn set_index_generation(&mut self, key: &TxKey, generation: u32) {
+        fn set_index_generation(&self, key: &TxKey, generation: u32) {
             let mut ie = self.index.lookup(key).unwrap();
             ie.generation = generation;
             self.index.register(*key, ie).unwrap();
@@ -3475,7 +3508,7 @@ mod tests {
         h.corrupt_slot(&key, 0);
 
         let redo = h.redo_log();
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(
             stats.failed_io, 1,
             "legacy V2 entry over a torn slot must fail closed (boot-loop)",
@@ -3509,7 +3542,7 @@ mod tests {
         h.corrupt_slot(&key, 0);
 
         let redo = h.redo_log();
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.failed_io, 0, "V3 entry must not fail closed");
         assert_eq!(stats.entries_replayed, 1, "torn slot rebuilt and applied");
 
@@ -3563,7 +3596,7 @@ mod tests {
         recover_entries_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             entries.clone(),
-            &mut h.index,
+            &h.index,
             &mut dah_full,
             &mut unmined_full,
             None,
@@ -3588,7 +3621,7 @@ mod tests {
         recover_entries_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             entries.clone(),
-            &mut h.index,
+            &h.index,
             &mut dah_touch,
             &mut unmined_touch,
             None,
@@ -3695,7 +3728,7 @@ mod tests {
         let result = recover_all_with_allocator_collecting_pending_conflicts_progress(
             &*h.data_dev,
             &mut log,
-            &mut h.index,
+            &h.index,
             &mut dah,
             &mut unmined,
             Some(&mut h.alloc),
@@ -3849,7 +3882,7 @@ mod tests {
         h.corrupt_slot(&key, 0);
 
         let redo = h.redo_log();
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.failed_io, 0);
         assert_eq!(stats.entries_replayed, 1);
 
@@ -3877,7 +3910,7 @@ mod tests {
         let (stats, pending, _deleted) = recover_all_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah,
             &mut unmined,
             Some(&mut h.alloc),
@@ -3896,7 +3929,7 @@ mod tests {
         );
 
         let data_dev = h.data_dev.clone();
-        let engine = Engine::new(
+        let engine = Engine::new_with_sharded_index(
             data_dev,
             h.index,
             h.alloc,
@@ -3949,7 +3982,7 @@ mod tests {
         let (stats, _pending, deleted) = recover_all_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah,
             &mut unmined,
             Some(&mut h.alloc),
@@ -3969,7 +4002,7 @@ mod tests {
         );
 
         let data_dev = h.data_dev.clone();
-        let engine = Engine::new(
+        let engine = Engine::new_with_sharded_index(
             data_dev,
             h.index,
             h.alloc,
@@ -4041,7 +4074,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -4086,7 +4119,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -4146,7 +4179,7 @@ mod tests {
         })
         .unwrap();
 
-        recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        recover(&*h.data_dev, &redo, &h.index).unwrap();
 
         let post_meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!(
@@ -4229,13 +4262,13 @@ mod tests {
         };
 
         // Pass 1: replay once.
-        let (mut h, key) = build();
+        let (h, key) = build();
         let ie = h.index.lookup(&key).unwrap();
         let offset = ie.record_offset;
         let redo = make_log(&h, key);
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+        recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
         let after_one = io::read_metadata(&*h.data_dev, offset).unwrap();
 
         // Pass 2: replay the same full log AGAIN on top of the post-pass-1
@@ -4243,7 +4276,7 @@ mod tests {
         let redo2 = make_log(&h, key);
         let mut dah2 = DahBackend::new_in_memory();
         let mut unmined2 = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo2, &mut h.index, &mut dah2, &mut unmined2).unwrap();
+        recover_all(&*h.data_dev, &redo2, &h.index, &mut dah2, &mut unmined2).unwrap();
         let after_two = io::read_metadata(&*h.data_dev, offset).unwrap();
 
         assert_eq!(
@@ -4310,7 +4343,7 @@ mod tests {
 
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+        recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
 
         let post = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!(
@@ -4355,7 +4388,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_skipped, 1);
 
         let post_slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
@@ -4403,7 +4436,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_skipped, 1);
 
         // Slot remains SPENT with its real hash and spending data; counter unchanged.
@@ -4436,7 +4469,7 @@ mod tests {
         assert!(slot.is_unspent());
 
         // Recovery replays the spend
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
         assert_eq!(stats.entries_skipped, 0);
 
@@ -4467,7 +4500,7 @@ mod tests {
         assert_eq!(meta.block_entry_count, 0);
 
         // Recovery replays
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -4497,7 +4530,7 @@ mod tests {
         .unwrap();
 
         // Recovery sees it's already applied
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 0);
         assert_eq!(stats.entries_skipped, 1);
     }
@@ -4524,7 +4557,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         // First is applied, second is skipped (idempotent)
         assert_eq!(stats.entries_replayed, 1);
         assert_eq!(stats.entries_skipped, 1);
@@ -4557,7 +4590,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
         assert_eq!(stats.entries_skipped, 1);
 
@@ -4580,7 +4613,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_skipped, 1); // Already in index
     }
 
@@ -4600,7 +4633,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
             let mut t = [0u8; 32];
@@ -4664,7 +4697,7 @@ mod tests {
         let _ = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset);
 
         // Recover.
-        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
         assert_eq!(stats.entries_replayed, 1, "CreateV2 must be applied");
         assert_eq!(stats.entries_skipped, 0);
         assert_eq!(stats.entries_failed, 0);
@@ -4715,7 +4748,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
@@ -4751,7 +4784,7 @@ mod tests {
         let stats = recover_all_with_allocator(
             &*data_dev,
             &redo,
-            &mut index,
+            &index,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),
@@ -4806,7 +4839,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
@@ -4834,7 +4867,7 @@ mod tests {
         let stats = recover_all_with_allocator(
             &*data_dev,
             &redo,
-            &mut index,
+            &index,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),
@@ -4862,7 +4895,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
@@ -4901,7 +4934,7 @@ mod tests {
         let stats = recover_all_with_allocator(
             &*data_dev,
             &redo,
-            &mut index,
+            &index,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),
@@ -4930,7 +4963,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
@@ -4991,7 +5024,7 @@ mod tests {
         let stats = recover_all_with_allocator(
             &*data_dev,
             &redo,
-            &mut index,
+            &index,
             &mut dah,
             &mut unmined,
             Some(&mut alloc),
@@ -5018,11 +5051,12 @@ mod tests {
         );
 
         // Exactly one key maps to X across the WHOLE index (the invariant).
-        let owners_of_x: Vec<TxKey> = index
-            .iter()
-            .filter(|(_, e)| e.record_offset == offset)
-            .map(|(k, _)| k)
-            .collect();
+        let mut owners_of_x: Vec<TxKey> = Vec::new();
+        index.for_each(|k, e| {
+            if e.record_offset == offset {
+                owners_of_x.push(k);
+            }
+        });
         assert_eq!(
             owners_of_x,
             vec![key_b],
@@ -5097,7 +5131,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
             let mut t = [0u8; 32];
@@ -5141,12 +5175,12 @@ mod tests {
         .unwrap();
 
         // First recovery: applies.
-        let stats1 = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+        let stats1 = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
         assert_eq!(stats1.entries_replayed, 1);
         assert_eq!(stats1.entries_skipped, 0);
 
         // Second recovery: skipped (index already has the entry).
-        let stats2 = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+        let stats2 = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
         assert_eq!(stats2.entries_replayed, 0);
         assert_eq!(stats2.entries_skipped, 1);
     }
@@ -5164,7 +5198,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
             let mut t = [0u8; 32];
@@ -5204,7 +5238,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
         assert_eq!(stats.entries_failed, 0);
 
@@ -5245,7 +5279,7 @@ mod tests {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
-        let mut index = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
             let mut t = [0u8; 32];
@@ -5267,7 +5301,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &mut index).unwrap();
+        let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
         assert_eq!(stats.entries_replayed, 0);
         assert_eq!(
             stats.failed_replica_record_absent, 1,
@@ -5337,7 +5371,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
         assert_eq!(stats.entries_skipped, 1);
     }
@@ -5366,7 +5400,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let meta = io::read_metadata(&*h.data_dev, record_offset).unwrap();
@@ -5395,7 +5429,7 @@ mod tests {
         h.corrupt_slot(&key, 0);
 
         let redo = h.redo_log();
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.failed_io, 0, "FreezeV2 entry must not fail closed");
         assert_eq!(stats.entries_replayed, 1, "torn slot rebuilt and frozen");
 
@@ -5425,7 +5459,7 @@ mod tests {
         h.corrupt_slot(&key, 0);
 
         let redo = h.redo_log();
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.failed_io, 0, "UnfreezeV2 entry must not fail closed");
         assert_eq!(stats.entries_replayed, 1, "torn slot rebuilt and unspent");
 
@@ -5454,7 +5488,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 0);
         assert_eq!(stats.entries_skipped, 1);
 
@@ -5481,7 +5515,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 0);
         assert_eq!(stats.entries_skipped, 1);
 
@@ -5514,7 +5548,7 @@ mod tests {
         }
         redo.flush().unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 5);
 
         // All 5 slots should be spent
@@ -5540,7 +5574,7 @@ mod tests {
         })
         .unwrap();
 
-        recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        recover(&*h.data_dev, &redo, &h.index).unwrap();
 
         // Verify index still points to valid record
         let ie2 = h.index.lookup(&key).unwrap();
@@ -5566,7 +5600,7 @@ mod tests {
         // Index entry still exists (crash before index removal)
         assert!(h.index.lookup(&key).is_some());
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
         assert!(h.index.lookup(&key).is_none());
     }
@@ -5593,7 +5627,7 @@ mod tests {
         let stats = recover_all_with_allocator(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah_backend,
             &mut unmined_backend,
             Some(&mut h.alloc),
@@ -5627,7 +5661,7 @@ mod tests {
         .unwrap();
 
         // Slot is already unspent
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_skipped, 1);
     }
 
@@ -5662,7 +5696,7 @@ mod tests {
 
         assert!(h.index.lookup(&key).is_none()); // Not in index yet
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
         assert!(h.index.lookup(&key).is_some()); // Now in index
     }
@@ -5683,7 +5717,7 @@ mod tests {
         .unwrap();
 
         // Recovery applies it
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         // Now try to re-spend with same data via another recovery
@@ -5697,7 +5731,7 @@ mod tests {
             })
             .unwrap();
 
-        let stats2 = recover(&*h.data_dev, &redo2, &mut h.index).unwrap();
+        let stats2 = recover(&*h.data_dev, &redo2, &h.index).unwrap();
         // Already applied — skipped (idempotent). The reopened redo log
         // contains both the first spend entry and the newly appended retry,
         // so both are observed and skipped.
@@ -5732,7 +5766,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
@@ -5766,7 +5800,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
@@ -5803,7 +5837,7 @@ mod tests {
         })
         .unwrap();
 
-        recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        recover(&*h.data_dev, &redo, &h.index).unwrap();
 
         // Slot is untouched: still FROZEN with the real hash, NOT reassigned.
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
@@ -5837,7 +5871,7 @@ mod tests {
         })
         .unwrap();
 
-        recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        recover(&*h.data_dev, &redo, &h.index).unwrap();
 
         // Untouched: still the original UNSPENT slot, not re-stamped to new_hash.
         let slot = io::read_utxo_slot(&*h.data_dev, ie.record_offset, 0).unwrap();
@@ -5861,7 +5895,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -5881,7 +5915,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -5907,7 +5941,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -5928,7 +5962,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -5952,7 +5986,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -5997,7 +6031,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1, "{stats:?}");
         assert_eq!(stats.entries_skipped, 1, "{stats:?}");
         assert_eq!(stats.entries_failed, 0, "{stats:?}");
@@ -6050,7 +6084,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 1, "first entry must apply");
         assert_eq!(stats.entries_skipped, 1, "second entry must be skipped");
         assert_eq!(stats.entries_failed, 0);
@@ -6094,7 +6128,7 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_replayed, 2, "{stats:?}");
         assert_eq!(stats.entries_skipped, 0);
 
@@ -6146,7 +6180,7 @@ mod tests {
         let stats = recover_all(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah_backend,
             &mut unmined_backend,
         )
@@ -6186,7 +6220,7 @@ mod tests {
         let stats = recover_all(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah_backend,
             &mut unmined_backend,
         )
@@ -6234,7 +6268,7 @@ mod tests {
         let stats = recover_all(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah_backend,
             &mut unmined_backend,
         )
@@ -6292,7 +6326,7 @@ mod tests {
         let stats = recover_all(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah_backend,
             &mut unmined_backend,
         )
@@ -6306,7 +6340,7 @@ mod tests {
 
     #[test]
     fn recover_all_skips_missing_primary_record() {
-        let mut h = RecoveryTestHarness::new();
+        let h = RecoveryTestHarness::new();
 
         // Fabricate a key that is NOT in the primary index (as if the record
         // was already deleted).
@@ -6328,7 +6362,7 @@ mod tests {
         let stats = recover_all(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah_backend,
             &mut unmined_backend,
         )
@@ -6369,7 +6403,7 @@ mod tests {
         let stats = recover_all_with_allocator(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah,
             &mut unmined,
             Some(&mut h.alloc),
@@ -6428,7 +6462,7 @@ mod tests {
         let stats = recover_all_with_allocator(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah,
             &mut unmined,
             Some(&mut recovered),
@@ -6448,7 +6482,7 @@ mod tests {
 
     #[test]
     fn recover_all_replays_allocator_allocate_region() {
-        let mut h = RecoveryTestHarness::new();
+        let h = RecoveryTestHarness::new();
         h.alloc.persist().unwrap();
 
         // A redo log containing an allocate that was never snapshotted.
@@ -6469,7 +6503,7 @@ mod tests {
         recover_all_with_allocator(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah,
             &mut unmined,
             Some(&mut recovered),
@@ -6487,7 +6521,7 @@ mod tests {
     fn recover_all_is_idempotent_for_allocator_ops() {
         // Replaying the same allocator redo stream twice must yield the
         // same allocator state.
-        let mut h = RecoveryTestHarness::new();
+        let h = RecoveryTestHarness::new();
         h.alloc.persist().unwrap();
 
         let mut redo = h.redo_log();
@@ -6518,7 +6552,7 @@ mod tests {
         recover_all_with_allocator(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah,
             &mut unmined,
             Some(&mut once),
@@ -6530,7 +6564,7 @@ mod tests {
             recover_all_with_allocator(
                 &*h.data_dev,
                 &redo,
-                &mut h.index,
+                &h.index,
                 &mut dah,
                 &mut unmined,
                 Some(&mut twice),
@@ -6601,7 +6635,7 @@ mod tests {
         let stats = recover_all(
             &*h.data_dev,
             &redo,
-            &mut h.index,
+            &h.index,
             &mut dah_backend,
             &mut unmined_backend,
         )
@@ -6645,7 +6679,7 @@ mod tests {
 
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
-        let stats = recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+        let stats = recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
         assert_eq!(stats.entries_replayed, 1, "{stats:?}");
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -6672,7 +6706,7 @@ mod tests {
         let redo = h.redo_log();
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo, &mut h.index, &mut dah, &mut unmined).unwrap();
+        recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
 
         assert_eq!(dah.range_query(900), vec![key]);
         assert_eq!(unmined.range_query(500), vec![key]);
@@ -6691,7 +6725,7 @@ mod tests {
     /// and the recovery call itself must succeed.
     #[test]
     fn replay_classifies_missing_primary_for_unknown_keys() {
-        let mut h = RecoveryTestHarness::new();
+        let h = RecoveryTestHarness::new();
         let mut redo = h.redo_log();
 
         // Append 100 spend ops referencing keys that are not in the index.
@@ -6709,7 +6743,7 @@ mod tests {
             .unwrap();
         }
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_failed, n as u64);
         assert_eq!(stats.failed_missing_primary, n as u64);
         assert_eq!(stats.failed_io, 0);
@@ -6720,7 +6754,7 @@ mod tests {
     /// `MissingPrimary` accumulated below the cap passes the tolerance check.
     #[test]
     fn replay_tolerance_passes_high_missing_primary_count() {
-        let mut h = RecoveryTestHarness::new();
+        let h = RecoveryTestHarness::new();
         let mut redo = h.redo_log();
 
         // 100 missing-primary entries — well below
@@ -6737,7 +6771,7 @@ mod tests {
             .unwrap();
         }
 
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         crate::server::startup::check_replay_tolerance(&stats)
             .expect("100 missing-primary failures must be tolerated");
     }
@@ -6796,7 +6830,7 @@ mod tests {
     /// Consume the harness into an engine (so R2 can route record removal
     /// through `delete_for_purge`).
     fn engine_from_harness(h: RecoveryTestHarness) -> Arc<Engine> {
-        Arc::new(Engine::new(
+        Arc::new(Engine::new_with_sharded_index(
             h.data_dev.clone(),
             h.index,
             h.alloc,
@@ -7188,7 +7222,7 @@ mod tests {
         drop(redo);
 
         let redo = h.redo_log();
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(
             stats.max_observed_block_height, 800_123,
             "floor must be the MAX height across height-bearing entries",
@@ -7208,8 +7242,248 @@ mod tests {
         .unwrap();
         drop(redo);
         let redo = h.redo_log();
-        let stats = recover(&*h.data_dev, &redo, &mut h.index).unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.max_observed_block_height, 0);
+    }
+
+    /// Sharding task 5 — N=16 replay path.
+    ///
+    /// A 16-shard index receives 64 records spread across diverse txids. A
+    /// `Freeze` redo entry is written for each record, then `recover` is called.
+    /// All 64 entries must remain in the index (recovery is idempotent on
+    /// already-applied operations), and the stats counter must show the correct
+    /// number of entries visited.
+    #[test]
+    fn replay_into_n16() {
+        const N: usize = 64;
+
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+
+        // 16-shard in-memory index. Enough capacity to avoid resizes.
+        let index = ShardedIndex::new_in_memory(1024, 16).unwrap();
+
+        let record_size = TxMetadata::record_size_for(1);
+
+        // Seed N records. Each txid varies in bytes [0..4] so the SplitMix64
+        // routing on [24..32] spreads keys across shards when N >= shard_count.
+        let mut keys = Vec::with_capacity(N);
+        for i in 0..N {
+            let mut txid = [0u8; 32];
+            // Vary bytes 0..4 for uniqueness and bytes 24..28 to exercise shard routing.
+            let i_u32 = i as u32;
+            txid[0] = (i_u32 & 0xFF) as u8;
+            txid[1] = ((i_u32 >> 8) & 0xFF) as u8;
+            txid[24] = (i_u32 & 0xFF) as u8;
+            txid[25] = ((i_u32 >> 8) & 0xFF) as u8;
+            let key = TxKey { txid };
+
+            let offset = alloc.allocate(record_size).unwrap();
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            let slot = UtxoSlot::new_unspent({
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h
+            });
+            io::write_full_record(&*data_dev, offset, &meta, &[slot]).unwrap();
+
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        utxo_count: 1,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+            keys.push(key);
+        }
+
+        // Append a Freeze redo entry for every record. Since the slots are
+        // UNSPENT and the operation is per-slot, replay will attempt to freeze
+        // each one (transitioning UNSPENT → FROZEN on the device). Stats will
+        // count each as replayed or skipped depending on current state.
+        let mut redo = RedoLog::open(redo_dev.clone(), 0, 4 * 1024 * 1024).unwrap();
+        for &key in &keys {
+            redo.append_and_flush(RedoOp::Freeze {
+                tx_key: key,
+                offset: 0,
+            })
+            .unwrap();
+        }
+        drop(redo);
+
+        let redo = RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).unwrap();
+        let stats = recover(&*data_dev, &redo, &index).unwrap();
+
+        // All N entries must be applied (none were frozen before recovery).
+        assert_eq!(
+            stats.entries_replayed, N as u64,
+            "all {N} Freeze entries must replay across the 16-shard index"
+        );
+        assert_eq!(stats.failed_io, 0);
+        assert_eq!(stats.failed_corrupt, 0);
+
+        // All N keys are still registered (recovery is non-destructive for
+        // keys that were not evicted by the BUG-1 alias fix).
+        let mut count = 0usize;
+        index.for_each(|_key, _entry| {
+            count += 1;
+        });
+        assert_eq!(
+            count, N,
+            "all {N} records must remain in the 16-shard index after recovery"
+        );
+    }
+
+    /// Sharding task 5 — BUG-1 offset-alias eviction across shards.
+    ///
+    /// Two distinct keys (`key_a`, `key_b`) may route to different shards. If
+    /// both once pointed to the same `record_offset` (offset aliasing), a
+    /// `CreateV2` redo entry for `key_b` must cause `register_unique_offset` to
+    /// evict `key_a` (the stale alias) even when the two keys live in different
+    /// shards. After recovery `key_a` must be absent and `key_b` present at the
+    /// offset.
+    #[test]
+    fn offset_alias_eviction_across_shards() {
+        use crate::record::{METADATA_SIZE, UTXO_SLOT_SIZE};
+
+        let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+
+        // Two-shard index: every shard selection is a single bit flip under the
+        // runtime seed, so there are exactly two shards.
+        let index = ShardedIndex::new_in_memory(64, 2).unwrap();
+
+        // Find two keys that are DETERMINISTICALLY in different shards by
+        // iterating over candidate pairs until we find one. This mirrors the
+        // `find_different_shard_keys` helper pattern from the sharded.rs tests
+        // and eliminates any reliance on a random seed producing a specific
+        // split for hard-coded txid bytes.
+        let (key_a, key_b) = {
+            let mut found: Option<(TxKey, TxKey)> = None;
+            'outer: for a in 0u64..100_000 {
+                let mut txid_a = [0u8; 32];
+                txid_a[0] = 0xAA;
+                txid_a[1..9].copy_from_slice(&a.to_le_bytes());
+                txid_a[24..32].copy_from_slice(&a.to_le_bytes());
+                let ka = TxKey { txid: txid_a };
+                let shard_a = index.index_shard_for_key(&ka);
+
+                for b in (a + 1)..(a + 100).min(100_000) {
+                    let mut txid_b = [0u8; 32];
+                    txid_b[0] = 0xBB;
+                    txid_b[1..9].copy_from_slice(&b.to_le_bytes());
+                    txid_b[24..32].copy_from_slice(&b.to_le_bytes());
+                    let kb = TxKey { txid: txid_b };
+                    if index.index_shard_for_key(&kb) != shard_a {
+                        found = Some((ka, kb));
+                        break 'outer;
+                    }
+                }
+            }
+            found.expect("must find two keys in different shards within 100k candidates")
+        };
+
+        let (txid_a, txid_b) = (key_a.txid, key_b.txid);
+
+        // Allocate two adjacent regions. key_a occupies region 1 (offset_a).
+        // key_b will claim region 1 via its CreateV2 (the alias scenario).
+        let utxo_count: u32 = 1;
+        let record_size = TxMetadata::record_size_for(utxo_count);
+
+        let offset_a = alloc.allocate(record_size).unwrap();
+        // Allocate a second region so the allocator high-water mark advances
+        // (key_b's CreateV2 will replay at offset_a, claiming it back).
+        let _offset_b_unused = alloc.allocate(record_size).unwrap();
+
+        // Write key_a's record bytes at offset_a (the "old" record being aliased).
+        let mut meta_a = TxMetadata::new(utxo_count);
+        meta_a.tx_id = txid_a;
+        let slot_a = UtxoSlot::new_unspent([0xAA; 32]);
+        io::write_full_record(&*data_dev, offset_a, &meta_a, &[slot_a]).unwrap();
+
+        // Pre-register key_a → offset_a in the index. This is the stale alias
+        // entry that recovery must evict when key_b's Create replays.
+        index
+            .register(
+                key_a,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset_a,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+
+        // Build key_b's record bytes. meta.tx_id must match key_b's txid for
+        // the BUG-1 tx_id identity check inside replay_create_v2 to pass.
+        let mut meta_b = TxMetadata::new(utxo_count);
+        meta_b.tx_id = txid_b;
+        meta_b.record_size = record_size as u32;
+        let slot_b = UtxoSlot::new_unspent([0xBB; 32]);
+
+        let mut record_bytes = Vec::with_capacity(METADATA_SIZE + UTXO_SLOT_SIZE);
+        let mut mb = [0u8; METADATA_SIZE];
+        meta_b.to_bytes(&mut mb);
+        record_bytes.extend_from_slice(&mb);
+        let mut sb = [0u8; UTXO_SLOT_SIZE];
+        slot_b.to_bytes(&mut sb);
+        record_bytes.extend_from_slice(&sb);
+
+        // Append a CreateV2 for key_b at offset_a. This is the redo entry that
+        // survived the crash; the primary-index update for key_b did not.
+        let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key_b,
+            record_offset: offset_a,
+            utxo_count,
+            is_conflicting: false,
+            record_bytes,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+        drop(redo);
+
+        // Run recovery. `build_offset_owners` maps offset_a → key_a.
+        // `register_unique_offset` for key_b at offset_a evicts key_a first.
+        let redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
+        let stats = recover(&*data_dev, &redo, &index).unwrap();
+
+        assert_eq!(stats.entries_replayed, 1, "CreateV2 for key_b must replay");
+        assert_eq!(stats.failed_io, 0);
+        assert_eq!(stats.failed_corrupt, 0);
+
+        // key_a must be evicted (no longer in any shard).
+        assert!(
+            index.lookup(&key_a).is_none(),
+            "stale alias key_a must be evicted from the index after key_b's Create replays"
+        );
+
+        // key_b must be present at offset_a.
+        let entry_b = index
+            .lookup(&key_b)
+            .expect("key_b must be registered after CreateV2 replay");
+        assert_eq!(
+            entry_b.record_offset, offset_a,
+            "key_b must point to offset_a after evicting the alias"
+        );
     }
 
     #[test]
