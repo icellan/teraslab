@@ -8047,6 +8047,422 @@ fn handle_mark_longest_chain_batch(
 // GetBatch
 // ---------------------------------------------------------------------------
 
+/// Batch sizes at or above this fan out across the read pool; smaller batches
+/// stay serial to avoid pool-dispatch overhead dominating a trivial lookup.
+const READ_FANOUT_THRESHOLD: usize = 16;
+
+/// Dedicated work-stealing pool for intra-batch read fan-out. `None` if the
+/// pool failed to build (then reads serve serially — correct, just single-core
+/// for that path). Sized to the host's parallelism; isolated from any other
+/// rayon use so read fan-out never contends with an unrelated global pool.
+static READ_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+
+/// Lazily build (once) and return the read fan-out pool, or `None` if it could
+/// not be constructed.
+fn read_pool() -> Option<&'static rayon::ThreadPool> {
+    READ_POOL
+        .get_or_init(|| {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("teraslab-read-{i}"))
+                .build()
+                .map_err(|e| {
+                    tracing::error!(err = %e, "read fan-out pool build failed; GET batches serve serially");
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Decorate a single GET-batch item into its wire result. Pure with respect to
+/// shared mutable state — it only reads the engine/cluster (both `Sync`) and
+/// bumps atomic metric counters — so it is safe to call concurrently across the
+/// read pool. Every control path returns exactly one [`WireGetResult`], which
+/// is what lets the caller build the result vector with an order-preserving
+/// parallel map.
+fn decorate_get_item(
+    txid: &[u8; 32],
+    engine: &Engine,
+    field_mask: FieldMask,
+    local_read: bool,
+    cluster: Option<&RunningCluster>,
+) -> WireGetResult {
+    let key = TxKey { txid: *txid };
+
+    // In cluster mode, serve reads if we're master OR if the record is
+    // available locally (handles the migration window where shard tables
+    // may be inconsistent across nodes).
+    if !local_read && let Some(cluster) = cluster {
+        let mastership = cluster.is_master(&key);
+        let is_migrating_out = cluster.is_migrating_outbound(&key);
+
+        // Distinguish three cases explicitly:
+        //   - Yes        → serve locally (subject to inbound-migration check below)
+        //   - No         → REDIRECT (or serve during outbound migration)
+        //   - Transitioning → MIGRATION_IN_PROGRESS (retryable)
+        let is_master = match mastership {
+            crate::cluster::coordinator::MasterQueryResult::Yes => true,
+            crate::cluster::coordinator::MasterQueryResult::Transitioning { last_known_term } => {
+                tracing::debug!(
+                    last_known_term,
+                    "dispatch: get deferring — topology in transition"
+                );
+                return WireGetResult {
+                    status: ERR_MIGRATION_IN_PROGRESS as u8,
+                    data: vec![],
+                };
+            }
+            crate::cluster::coordinator::MasterQueryResult::No => false,
+        };
+
+        if !is_master && !is_migrating_out {
+            let route = cluster.route(&key);
+            // R-041: GetBatch per-item REDIRECT data layout is now
+            // `[ERR_REDIRECT_byte:1][addr_len:2][addr][shard_table_version:8]`
+            // — the trailing version lets the client detect a stale-route
+            // loop (server's view <= client's known view → stop following).
+            // The legacy form `[ERR_REDIRECT_byte:1][addr_bytes:N]` had no
+            // length prefix and no version, so any cluster-mid-topology-
+            // change cycle (A→B→C→A) was unobservable client-side.
+            match route {
+                crate::cluster::shards::RouteDecision::RedirectTo {
+                    node,
+                    shard_table_version,
+                } => match cluster.node_addr(&node) {
+                    Some(addr) => {
+                        let payload = crate::protocol::codec::encode_redirect_with_version(
+                            &addr.to_string(),
+                            shard_table_version,
+                        );
+                        let mut data = Vec::with_capacity(1 + payload.len());
+                        data.push(ERR_REDIRECT as u8);
+                        data.extend_from_slice(&payload);
+                        // M10: count the stale-routed read.
+                        if let Some(m) = DISPATCH_METRICS.get() {
+                            m.stale_routing_request_total.inc();
+                        }
+                        return WireGetResult {
+                            status: ERR_REDIRECT as u8,
+                            data,
+                        };
+                    }
+                    // F-4: routing names a master we have no address for.
+                    // An empty-address redirect is useless to the client;
+                    // return a retryable ERR_NO_QUORUM ("master unknown,
+                    // retry") so it backs off until membership converges.
+                    None => {
+                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                        tracing::debug!(
+                            shard,
+                            node = ?node,
+                            "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
+                        );
+                        return WireGetResult {
+                            status: ERR_NO_QUORUM as u8,
+                            data: vec![],
+                        };
+                    }
+                },
+                _ => {
+                    if let Some(m) = DISPATCH_METRICS.get() {
+                        m.stale_routing_request_total.inc();
+                    }
+                    return WireGetResult {
+                        status: ERR_REDIRECT as u8,
+                        data: vec![ERR_REDIRECT as u8],
+                    };
+                }
+            }
+        }
+
+        // If we're master but don't have the data and inbound migration
+        // is still pending, return a retry signal immediately instead of
+        // parking a request thread behind migration progress.
+        if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
+            return WireGetResult {
+                status: ERR_MIGRATION_IN_PROGRESS as u8,
+                data: vec![],
+            };
+        }
+    }
+    // Fast path: if ALL requested fields are cached in the primary index,
+    // serve directly without reading device metadata (zero I/O).
+    if field_mask.fully_cached() {
+        // G-4: use the checked lookup so a transient backend read error
+        // is surfaced as ERR_STORAGE_IO rather than collapsing to
+        // ERR_TX_NOT_FOUND (which would tell the client a present
+        // transaction does not exist).
+        let cached = match engine.lookup_cached_checked(&key) {
+            Ok(found) => found,
+            Err(e) => {
+                return WireGetResult {
+                    status: ERR_STORAGE_IO as u8,
+                    data: format!("index lookup failed: {e}").into_bytes(),
+                };
+            }
+        };
+        if let Some(entry) = cached {
+            let mut data = Vec::new();
+            let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
+            // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
+            let wire_flags = entry.tx_flags & !TxFlags::HAS_PRESERVE_UNTIL.bits();
+            if field_mask.has(FieldMask::FLAGS) {
+                data.push(wire_flags);
+            }
+            if field_mask.has(FieldMask::SPENT_UTXOS) {
+                data.extend_from_slice(&entry.spent_utxos.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::UTXO_COUNT) {
+                data.extend_from_slice(&entry.utxo_count.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::UNMINED_SINCE) {
+                data.extend_from_slice(&entry.unmined_since.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
+                let dah = if has_preserve {
+                    0u32
+                } else {
+                    entry.dah_or_preserve
+                };
+                data.extend_from_slice(&dah.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::PRESERVE_UNTIL) {
+                let pu = if has_preserve {
+                    entry.dah_or_preserve
+                } else {
+                    0u32
+                };
+                data.extend_from_slice(&pu.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
+                data.push(entry.block_entry_count);
+            }
+            return WireGetResult {
+                status: STATUS_OK,
+                data,
+            };
+        }
+        // Not in index — fall through to TxNotFound below
+        return WireGetResult {
+            status: ERR_TX_NOT_FOUND as u8,
+            data: vec![],
+        };
+    }
+
+    // Slow path: read full metadata from device for non-cached fields.
+    match engine.read_metadata(&key) {
+        Ok(meta) => {
+            let mut data = Vec::new();
+            if field_mask.has(FieldMask::RAW_METADATA) {
+                // Raw debug mode: dump the full on-disk struct as-is.
+                let mut buf = vec![0u8; METADATA_SIZE];
+                meta.to_bytes(&mut buf);
+                data.extend_from_slice(&buf);
+            } else {
+                // Per-field metadata serialization.
+                if field_mask.has(FieldMask::TX_VERSION) {
+                    data.extend_from_slice(&{ meta.tx_version }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::LOCKTIME) {
+                    data.extend_from_slice(&{ meta.locktime }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::FEE) {
+                    data.extend_from_slice(&{ meta.fee }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::SIZE_IN_BYTES) {
+                    data.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::EXTENDED_SIZE) {
+                    data.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::FLAGS) {
+                    data.push({ meta.flags }.bits());
+                }
+                if field_mask.has(FieldMask::SPENDING_HEIGHT) {
+                    data.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::CREATED_AT) {
+                    data.extend_from_slice(&{ meta.created_at }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::SPENT_UTXOS) {
+                    data.extend_from_slice(&{ meta.spent_utxos }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::PRUNED_UTXOS) {
+                    data.extend_from_slice(&{ meta.pruned_utxos }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UTXO_COUNT) {
+                    data.extend_from_slice(&{ meta.utxo_count }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::GENERATION) {
+                    data.extend_from_slice(&{ meta.generation }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UPDATED_AT) {
+                    data.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::UNMINED_SINCE) {
+                    data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
+                    data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::PRESERVE_UNTIL) {
+                    data.extend_from_slice(&{ meta.preserve_until }.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::EXTERNAL_REF) {
+                    let ext = { meta.external_ref };
+                    data.push(ext.store_type);
+                    data.extend_from_slice(&ext.content_hash);
+                    data.extend_from_slice(&ext.total_size.to_le_bytes());
+                    data.extend_from_slice(&ext.input_count.to_le_bytes());
+                    data.extend_from_slice(&ext.output_count.to_le_bytes());
+                    data.extend_from_slice(&ext.inputs_offset.to_le_bytes());
+                    data.extend_from_slice(&ext.outputs_offset.to_le_bytes());
+                }
+                if field_mask.has(FieldMask::REASSIGNMENT_COUNT) {
+                    data.push(meta.reassignment_count);
+                }
+                if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
+                    data.push(meta.block_entry_count);
+                }
+            }
+            // R-045 (Codex F4): track whether any inner sub-read
+            // (slot / cold-data / conflicting-children) failed.
+            // Pre-fix the failures were silently filled with
+            // zeros / length-0 / count-0, so storage corruption
+            // was indistinguishable from a clean read of an
+            // empty record. Now we surface inner failures as
+            // ERR_STORAGE_IO on the result item — clients can
+            // retry instead of trusting the synthesized bytes.
+            // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
+            let mut inner_read_failed = false;
+            // F-IJ-001: track a missing external cold-data blob distinctly
+            // from generic sub-read corruption. A record that exists but
+            // whose blob is gone must surface ERR_BLOB_NOT_FOUND (17), not
+            // ERR_TX_NOT_FOUND (which would say the tx never existed) nor
+            // ERR_STORAGE_IO (a transient I/O fault the client would
+            // retry).
+            let mut blob_not_found = false;
+            if field_mask.has(FieldMask::UTXO_SLOTS) {
+                let utxo_count = { meta.utxo_count };
+                data.extend_from_slice(&utxo_count.to_le_bytes());
+                match engine.read_slots(&key) {
+                    Ok(slots) if slots.len() == utxo_count as usize => {
+                        for slot in slots {
+                            data.extend_from_slice(&slot.hash);
+                            data.push(slot.status);
+                            data.extend_from_slice(&slot.spending_data);
+                        }
+                    }
+                    _ => {
+                        inner_read_failed = true;
+                        // Still emit padding bytes so the length declared
+                        // in `utxo_count` matches the data length; the
+                        // per-item ERR_STORAGE_IO status tells the client
+                        // these bytes are unreliable.
+                        for _ in 0..utxo_count {
+                            data.extend_from_slice(&[0u8; 69]);
+                        }
+                    }
+                }
+            }
+            if field_mask.has(FieldMask::COLD_DATA) {
+                match engine.read_cold_data(&key) {
+                    Ok(cold) => {
+                        data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
+                        data.extend_from_slice(&cold);
+                    }
+                    // F-IJ-001: missing external blob → ERR_BLOB_NOT_FOUND,
+                    // not the generic ERR_STORAGE_IO path below.
+                    Err(SpendError::BlobNotFound { .. }) => {
+                        blob_not_found = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    Err(_) => {
+                        inner_read_failed = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                }
+            }
+            if field_mask.has(FieldMask::BLOCK_ENTRIES) {
+                let count = { meta.block_entry_count };
+                data.push(count);
+                let inline_count = count.min(3);
+                for i in 0..inline_count as usize {
+                    let be = { meta.block_entries_inline[i] };
+                    data.extend_from_slice(&{ be.block_id }.to_le_bytes());
+                    data.extend_from_slice(&{ be.block_height }.to_le_bytes());
+                    data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
+                }
+            }
+            if field_mask.has(FieldMask::CONFLICTING_CHILDREN) {
+                match engine.read_conflicting_children(&key) {
+                    Ok(children) => {
+                        data.push(children.len() as u8);
+                        for child in &children {
+                            data.extend_from_slice(child);
+                        }
+                    }
+                    Err(_) => {
+                        inner_read_failed = true;
+                        data.push(0u8);
+                    }
+                }
+            }
+            let status = if blob_not_found {
+                // F-IJ-001: existing record, missing external cold-data
+                // blob. Takes precedence over ERR_STORAGE_IO: it is the
+                // specific, actionable failure (the bytes are gone, not a
+                // transient device fault).
+                ERR_BLOB_NOT_FOUND as u8
+            } else if inner_read_failed {
+                // ERR_STORAGE_IO on the wire — distinguishes sub-read
+                // corruption from a clean `Ok(0)` case. (P3.10 /
+                // F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
+                ERR_STORAGE_IO as u8
+            } else {
+                0
+            };
+            WireGetResult { status, data }
+        }
+        Err(SpendError::TxNotFound) => WireGetResult {
+            status: ERR_TX_NOT_FOUND as u8,
+            data: vec![],
+        },
+        Err(_) => {
+            // R-045 (Codex F4): a non-`TxNotFound` metadata read
+            // error is storage corruption / I/O failure, not a
+            // missing record. Pre-fix this returned status=1
+            // (ERR_TX_NOT_FOUND on the wire), so a client could
+            // not distinguish "tx really doesn't exist" from
+            // "tx exists but the device returned bad bytes" —
+            // the natural retry behaviour for the latter never
+            // fired. Surface as ERR_STORAGE_IO so the client
+            // retries. (P3.10 / F-G5-017; pre-P3.10 ERR_INTERNAL.)
+            WireGetResult {
+                status: ERR_STORAGE_IO as u8,
+                data: vec![],
+            }
+        }
+    }
+}
+
+/// Handle an `OP_GET_BATCH` request: decode the field mask + txids, decorate
+/// every item, and assemble the batched response.
+///
+/// The per-item decoration is fanned across the read pool for batches at or
+/// above [`READ_FANOUT_THRESHOLD`]; smaller batches stay serial. teranode's
+/// parent decoration sends one fat batch (~826 items) per connection, so
+/// without fan-out a single connection pins one core regardless of how many
+/// are free. The fan-out is order-preserving (parallel `collect` keeps input
+/// order) and runs entirely inside the caller-held shared
+/// `dispatch_visibility_barrier` read guard (see `handle_request`), so every
+/// fanned read is fenced against the checkpoint/mutation write side exactly as
+/// the old serial loop was.
 fn handle_get_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -8060,384 +8476,30 @@ fn handle_get_batch(
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
-    let mut results = Vec::with_capacity(txids.len());
+    let results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                txids
+                    .par_iter()
+                    .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+                    .collect()
+            })
+        }
+        None => txids
+            .iter()
+            .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+            .collect(),
+    };
+
     // Track per-item outcomes: STATUS_OK => succeeded, ERR_TX_NOT_FOUND =>
     // not_found, anything else => failed.
     let mut ok_count: u64 = 0;
     let mut not_found_count: u64 = 0;
     let mut failed_count: u64 = 0;
-    for txid in &txids {
-        let key = TxKey { txid: *txid };
-
-        // In cluster mode, serve reads if we're master OR if the record is
-        // available locally (handles the migration window where shard tables
-        // may be inconsistent across nodes).
-        if !local_read && let Some(cluster) = cluster {
-            let mastership = cluster.is_master(&key);
-            let is_migrating_out = cluster.is_migrating_outbound(&key);
-
-            // Distinguish three cases explicitly:
-            //   - Yes        → serve locally (subject to inbound-migration check below)
-            //   - No         → REDIRECT (or serve during outbound migration)
-            //   - Transitioning → MIGRATION_IN_PROGRESS (retryable)
-            let is_master = match mastership {
-                crate::cluster::coordinator::MasterQueryResult::Yes => true,
-                crate::cluster::coordinator::MasterQueryResult::Transitioning {
-                    last_known_term,
-                } => {
-                    tracing::debug!(
-                        last_known_term,
-                        "dispatch: get deferring — topology in transition"
-                    );
-                    results.push(WireGetResult {
-                        status: ERR_MIGRATION_IN_PROGRESS as u8,
-                        data: vec![],
-                    });
-                    continue;
-                }
-                crate::cluster::coordinator::MasterQueryResult::No => false,
-            };
-
-            if !is_master && !is_migrating_out {
-                let route = cluster.route(&key);
-                // R-041: GetBatch per-item REDIRECT data layout is now
-                // `[ERR_REDIRECT_byte:1][addr_len:2][addr][shard_table_version:8]`
-                // — the trailing version lets the client detect a stale-route
-                // loop (server's view <= client's known view → stop following).
-                // The legacy form `[ERR_REDIRECT_byte:1][addr_bytes:N]` had no
-                // length prefix and no version, so any cluster-mid-topology-
-                // change cycle (A→B→C→A) was unobservable client-side.
-                match route {
-                    crate::cluster::shards::RouteDecision::RedirectTo {
-                        node,
-                        shard_table_version,
-                    } => match cluster.node_addr(&node) {
-                        Some(addr) => {
-                            let payload = crate::protocol::codec::encode_redirect_with_version(
-                                &addr.to_string(),
-                                shard_table_version,
-                            );
-                            let mut data = Vec::with_capacity(1 + payload.len());
-                            data.push(ERR_REDIRECT as u8);
-                            data.extend_from_slice(&payload);
-                            // M10: count the stale-routed read.
-                            if let Some(m) = DISPATCH_METRICS.get() {
-                                m.stale_routing_request_total.inc();
-                            }
-                            results.push(WireGetResult {
-                                status: ERR_REDIRECT as u8,
-                                data,
-                            });
-                        }
-                        // F-4: routing names a master we have no address for.
-                        // An empty-address redirect is useless to the client;
-                        // return a retryable ERR_NO_QUORUM ("master unknown,
-                        // retry") so it backs off until membership converges.
-                        None => {
-                            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                            tracing::debug!(
-                                shard,
-                                node = ?node,
-                                "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
-                            );
-                            results.push(WireGetResult {
-                                status: ERR_NO_QUORUM as u8,
-                                data: vec![],
-                            });
-                        }
-                    },
-                    _ => {
-                        if let Some(m) = DISPATCH_METRICS.get() {
-                            m.stale_routing_request_total.inc();
-                        }
-                        results.push(WireGetResult {
-                            status: ERR_REDIRECT as u8,
-                            data: vec![ERR_REDIRECT as u8],
-                        });
-                    }
-                }
-                continue;
-            }
-
-            // If we're master but don't have the data and inbound migration
-            // is still pending, return a retry signal immediately instead of
-            // parking a request thread behind migration progress.
-            if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key)
-            {
-                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
-                results.push(WireGetResult {
-                    status: ERR_MIGRATION_IN_PROGRESS as u8,
-                    data: vec![],
-                });
-                continue;
-            }
-        }
-        // Fast path: if ALL requested fields are cached in the primary index,
-        // serve directly without reading device metadata (zero I/O).
-        if field_mask.fully_cached() {
-            // G-4: use the checked lookup so a transient backend read error
-            // is surfaced as ERR_STORAGE_IO rather than collapsing to
-            // ERR_TX_NOT_FOUND (which would tell the client a present
-            // transaction does not exist).
-            let cached = match engine.lookup_cached_checked(&key) {
-                Ok(found) => found,
-                Err(e) => {
-                    results.push(WireGetResult {
-                        status: ERR_STORAGE_IO as u8,
-                        data: format!("index lookup failed: {e}").into_bytes(),
-                    });
-                    continue;
-                }
-            };
-            if let Some(entry) = cached {
-                let mut data = Vec::new();
-                let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
-                // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
-                let wire_flags = entry.tx_flags & !TxFlags::HAS_PRESERVE_UNTIL.bits();
-                if field_mask.has(FieldMask::FLAGS) {
-                    data.push(wire_flags);
-                }
-                if field_mask.has(FieldMask::SPENT_UTXOS) {
-                    data.extend_from_slice(&entry.spent_utxos.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::UTXO_COUNT) {
-                    data.extend_from_slice(&entry.utxo_count.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::UNMINED_SINCE) {
-                    data.extend_from_slice(&entry.unmined_since.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
-                    let dah = if has_preserve {
-                        0u32
-                    } else {
-                        entry.dah_or_preserve
-                    };
-                    data.extend_from_slice(&dah.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::PRESERVE_UNTIL) {
-                    let pu = if has_preserve {
-                        entry.dah_or_preserve
-                    } else {
-                        0u32
-                    };
-                    data.extend_from_slice(&pu.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
-                    data.push(entry.block_entry_count);
-                }
-                results.push(WireGetResult {
-                    status: STATUS_OK,
-                    data,
-                });
-                continue;
-            }
-            // Not in index — fall through to TxNotFound below
-            results.push(WireGetResult {
-                status: ERR_TX_NOT_FOUND as u8,
-                data: vec![],
-            });
-            continue;
-        }
-
-        // Slow path: read full metadata from device for non-cached fields.
-        match engine.read_metadata(&key) {
-            Ok(meta) => {
-                let mut data = Vec::new();
-                if field_mask.has(FieldMask::RAW_METADATA) {
-                    // Raw debug mode: dump the full on-disk struct as-is.
-                    let mut buf = vec![0u8; METADATA_SIZE];
-                    meta.to_bytes(&mut buf);
-                    data.extend_from_slice(&buf);
-                } else {
-                    // Per-field metadata serialization.
-                    if field_mask.has(FieldMask::TX_VERSION) {
-                        data.extend_from_slice(&{ meta.tx_version }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::LOCKTIME) {
-                        data.extend_from_slice(&{ meta.locktime }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::FEE) {
-                        data.extend_from_slice(&{ meta.fee }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::SIZE_IN_BYTES) {
-                        data.extend_from_slice(&{ meta.size_in_bytes }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::EXTENDED_SIZE) {
-                        data.extend_from_slice(&{ meta.extended_size }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::FLAGS) {
-                        data.push({ meta.flags }.bits());
-                    }
-                    if field_mask.has(FieldMask::SPENDING_HEIGHT) {
-                        data.extend_from_slice(&{ meta.spending_height }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::CREATED_AT) {
-                        data.extend_from_slice(&{ meta.created_at }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::SPENT_UTXOS) {
-                        data.extend_from_slice(&{ meta.spent_utxos }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::PRUNED_UTXOS) {
-                        data.extend_from_slice(&{ meta.pruned_utxos }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::UTXO_COUNT) {
-                        data.extend_from_slice(&{ meta.utxo_count }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::GENERATION) {
-                        data.extend_from_slice(&{ meta.generation }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::UPDATED_AT) {
-                        data.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::UNMINED_SINCE) {
-                        data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
-                        data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::PRESERVE_UNTIL) {
-                        data.extend_from_slice(&{ meta.preserve_until }.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::EXTERNAL_REF) {
-                        let ext = { meta.external_ref };
-                        data.push(ext.store_type);
-                        data.extend_from_slice(&ext.content_hash);
-                        data.extend_from_slice(&ext.total_size.to_le_bytes());
-                        data.extend_from_slice(&ext.input_count.to_le_bytes());
-                        data.extend_from_slice(&ext.output_count.to_le_bytes());
-                        data.extend_from_slice(&ext.inputs_offset.to_le_bytes());
-                        data.extend_from_slice(&ext.outputs_offset.to_le_bytes());
-                    }
-                    if field_mask.has(FieldMask::REASSIGNMENT_COUNT) {
-                        data.push(meta.reassignment_count);
-                    }
-                    if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
-                        data.push(meta.block_entry_count);
-                    }
-                }
-                // R-045 (Codex F4): track whether any inner sub-read
-                // (slot / cold-data / conflicting-children) failed.
-                // Pre-fix the failures were silently filled with
-                // zeros / length-0 / count-0, so storage corruption
-                // was indistinguishable from a clean read of an
-                // empty record. Now we surface inner failures as
-                // ERR_STORAGE_IO on the result item — clients can
-                // retry instead of trusting the synthesized bytes.
-                // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
-                let mut inner_read_failed = false;
-                // F-IJ-001: track a missing external cold-data blob distinctly
-                // from generic sub-read corruption. A record that exists but
-                // whose blob is gone must surface ERR_BLOB_NOT_FOUND (17), not
-                // ERR_TX_NOT_FOUND (which would say the tx never existed) nor
-                // ERR_STORAGE_IO (a transient I/O fault the client would
-                // retry).
-                let mut blob_not_found = false;
-                if field_mask.has(FieldMask::UTXO_SLOTS) {
-                    let utxo_count = { meta.utxo_count };
-                    data.extend_from_slice(&utxo_count.to_le_bytes());
-                    match engine.read_slots(&key) {
-                        Ok(slots) if slots.len() == utxo_count as usize => {
-                            for slot in slots {
-                                data.extend_from_slice(&slot.hash);
-                                data.push(slot.status);
-                                data.extend_from_slice(&slot.spending_data);
-                            }
-                        }
-                        _ => {
-                            inner_read_failed = true;
-                            // Still emit padding bytes so the length declared
-                            // in `utxo_count` matches the data length; the
-                            // per-item ERR_STORAGE_IO status tells the client
-                            // these bytes are unreliable.
-                            for _ in 0..utxo_count {
-                                data.extend_from_slice(&[0u8; 69]);
-                            }
-                        }
-                    }
-                }
-                if field_mask.has(FieldMask::COLD_DATA) {
-                    match engine.read_cold_data(&key) {
-                        Ok(cold) => {
-                            data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
-                            data.extend_from_slice(&cold);
-                        }
-                        // F-IJ-001: missing external blob → ERR_BLOB_NOT_FOUND,
-                        // not the generic ERR_STORAGE_IO path below.
-                        Err(SpendError::BlobNotFound { .. }) => {
-                            blob_not_found = true;
-                            data.extend_from_slice(&0u32.to_le_bytes());
-                        }
-                        Err(_) => {
-                            inner_read_failed = true;
-                            data.extend_from_slice(&0u32.to_le_bytes());
-                        }
-                    }
-                }
-                if field_mask.has(FieldMask::BLOCK_ENTRIES) {
-                    let count = { meta.block_entry_count };
-                    data.push(count);
-                    let inline_count = count.min(3);
-                    for i in 0..inline_count as usize {
-                        let be = { meta.block_entries_inline[i] };
-                        data.extend_from_slice(&{ be.block_id }.to_le_bytes());
-                        data.extend_from_slice(&{ be.block_height }.to_le_bytes());
-                        data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
-                    }
-                }
-                if field_mask.has(FieldMask::CONFLICTING_CHILDREN) {
-                    match engine.read_conflicting_children(&key) {
-                        Ok(children) => {
-                            data.push(children.len() as u8);
-                            for child in &children {
-                                data.extend_from_slice(child);
-                            }
-                        }
-                        Err(_) => {
-                            inner_read_failed = true;
-                            data.push(0u8);
-                        }
-                    }
-                }
-                let status = if blob_not_found {
-                    // F-IJ-001: existing record, missing external cold-data
-                    // blob. Takes precedence over ERR_STORAGE_IO: it is the
-                    // specific, actionable failure (the bytes are gone, not a
-                    // transient device fault).
-                    ERR_BLOB_NOT_FOUND as u8
-                } else if inner_read_failed {
-                    // ERR_STORAGE_IO on the wire — distinguishes sub-read
-                    // corruption from a clean `Ok(0)` case. (P3.10 /
-                    // F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
-                    ERR_STORAGE_IO as u8
-                } else {
-                    0
-                };
-                results.push(WireGetResult { status, data });
-            }
-            Err(SpendError::TxNotFound) => {
-                results.push(WireGetResult {
-                    status: ERR_TX_NOT_FOUND as u8,
-                    data: vec![],
-                });
-            }
-            Err(_) => {
-                // R-045 (Codex F4): a non-`TxNotFound` metadata read
-                // error is storage corruption / I/O failure, not a
-                // missing record. Pre-fix this returned status=1
-                // (ERR_TX_NOT_FOUND on the wire), so a client could
-                // not distinguish "tx really doesn't exist" from
-                // "tx exists but the device returned bad bytes" —
-                // the natural retry behaviour for the latter never
-                // fired. Surface as ERR_STORAGE_IO so the client
-                // retries. (P3.10 / F-G5-017; pre-P3.10 ERR_INTERNAL.)
-                results.push(WireGetResult {
-                    status: ERR_STORAGE_IO as u8,
-                    data: vec![],
-                });
-            }
-        }
-    }
 
     // Classify per-item outcome.
     for r in &results {
@@ -8947,6 +9009,116 @@ fn handle_process_expired(
 // GetSpend
 // ---------------------------------------------------------------------------
 
+/// Decorate a single GetSpend item into its wire result. Reads only the
+/// engine/cluster (both `Sync`) and bumps atomic counters, so it is safe to
+/// call concurrently across the read pool; every control path returns exactly
+/// one [`WireGetSpendResult`].
+fn decorate_get_spend_item(
+    item: &WireGetSpendItem,
+    engine: &Engine,
+    local_read: bool,
+    cluster: Option<&RunningCluster>,
+) -> WireGetSpendResult {
+    // Check shard ownership — reads are allowed during outbound migration
+    // because this node still holds the data until migration completes.
+    // FLAG_LOCAL_READ bypasses this check for replication verification.
+    if !local_read && let Some(cluster) = cluster {
+        let key = TxKey { txid: item.txid };
+        match cluster.is_master(&key) {
+            crate::cluster::coordinator::MasterQueryResult::Yes => {
+                // F-F1: mirror GET_BATCH's inbound fence. If we're the
+                // committed master but the data hasn't migrated in yet,
+                // return a retryable MIGRATION_IN_PROGRESS instead of
+                // letting `get_spend` below report ERR_TX_NOT_FOUND
+                // (terminal) for a tx that is present-but-not-yet-migrated.
+                if engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+                    let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                    tracing::debug!(
+                        shard,
+                        "dispatch: get_spend still waiting for inbound migration"
+                    );
+                    return WireGetSpendResult {
+                        status: 1,
+                        error_code: ERR_MIGRATION_IN_PROGRESS,
+                        slot_status: 0,
+                        spending_data: [0; 36],
+                    };
+                }
+            }
+            crate::cluster::coordinator::MasterQueryResult::Transitioning { last_known_term } => {
+                tracing::debug!(
+                    last_known_term,
+                    "dispatch: get_spend deferring — topology in transition"
+                );
+                return WireGetSpendResult {
+                    status: 1,
+                    error_code: ERR_MIGRATION_IN_PROGRESS,
+                    slot_status: 0,
+                    spending_data: [0; 36],
+                };
+            }
+            crate::cluster::coordinator::MasterQueryResult::No => {
+                if cluster.is_migrating_outbound(&key) {
+                    // Outbound migration: data still present locally.
+                } else {
+                    // M10: count the stale-routed GetSpend.
+                    if let Some(m) = DISPATCH_METRICS.get() {
+                        m.stale_routing_request_total.inc();
+                    }
+                    return WireGetSpendResult {
+                        status: 1,
+                        error_code: ERR_REDIRECT,
+                        slot_status: 0,
+                        spending_data: [0; 36],
+                    };
+                }
+            }
+        }
+    }
+
+    let key = TxKey { txid: item.txid };
+    match engine.get_spend(&GetSpendRequest {
+        tx_key: key,
+        offset: item.vout,
+        utxo_hash: item.utxo_hash,
+    }) {
+        Ok(spend) => WireGetSpendResult {
+            status: 0,
+            error_code: ERR_OK,
+            slot_status: spend.status,
+            spending_data: spend.spending_data.unwrap_or([0; 36]),
+        },
+        Err(SpendError::TxNotFound) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_TX_NOT_FOUND,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+        Err(SpendError::UtxoNotFound { .. }) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_VOUT_OUT_OF_RANGE,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+        Err(SpendError::UtxoHashMismatch { .. }) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_UTXO_HASH_MISMATCH,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+        Err(_) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_STORAGE_IO,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+    }
+}
+
+/// Handle an `OP_GET_SPEND_BATCH` request. Like [`handle_get_batch`], the
+/// per-item lookups fan across the read pool for batches at or above
+/// [`READ_FANOUT_THRESHOLD`] (order-preserving), under the caller-held shared
+/// `dispatch_visibility_barrier` read guard.
 fn handle_get_spend_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -8960,118 +9132,24 @@ fn handle_get_spend_batch(
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
-    let mut results = Vec::with_capacity(items.len());
-    for item in &items {
-        // Check shard ownership — reads are allowed during outbound migration
-        // because this node still holds the data until migration completes.
-        // FLAG_LOCAL_READ bypasses this check for replication verification.
-        if !local_read && let Some(cluster) = cluster {
-            let key = TxKey { txid: item.txid };
-            match cluster.is_master(&key) {
-                crate::cluster::coordinator::MasterQueryResult::Yes => {
-                    // F-F1: mirror GET_BATCH's inbound fence. If we're the
-                    // committed master but the data hasn't migrated in yet,
-                    // return a retryable MIGRATION_IN_PROGRESS instead of
-                    // letting `get_spend` below report ERR_TX_NOT_FOUND
-                    // (terminal) for a tx that is present-but-not-yet-migrated.
-                    if engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
-                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                        tracing::debug!(
-                            shard,
-                            "dispatch: get_spend still waiting for inbound migration"
-                        );
-                        results.push(WireGetSpendResult {
-                            status: 1,
-                            error_code: ERR_MIGRATION_IN_PROGRESS,
-                            slot_status: 0,
-                            spending_data: [0; 36],
-                        });
-                        continue;
-                    }
-                }
-                crate::cluster::coordinator::MasterQueryResult::Transitioning {
-                    last_known_term,
-                } => {
-                    tracing::debug!(
-                        last_known_term,
-                        "dispatch: get_spend deferring — topology in transition"
-                    );
-                    results.push(WireGetSpendResult {
-                        status: 1,
-                        error_code: ERR_MIGRATION_IN_PROGRESS,
-                        slot_status: 0,
-                        spending_data: [0; 36],
-                    });
-                    continue;
-                }
-                crate::cluster::coordinator::MasterQueryResult::No => {
-                    if cluster.is_migrating_outbound(&key) {
-                        // Outbound migration: data still present locally.
-                    } else {
-                        // M10: count the stale-routed GetSpend.
-                        if let Some(m) = DISPATCH_METRICS.get() {
-                            m.stale_routing_request_total.inc();
-                        }
-                        results.push(WireGetSpendResult {
-                            status: 1,
-                            error_code: ERR_REDIRECT,
-                            slot_status: 0,
-                            spending_data: [0; 36],
-                        });
-                        continue;
-                    }
-                }
-            }
+    let results: Vec<WireGetSpendResult> = match (items.len() >= READ_FANOUT_THRESHOLD)
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                items
+                    .par_iter()
+                    .map(|item| decorate_get_spend_item(item, engine, local_read, cluster))
+                    .collect()
+            })
         }
-
-        let key = TxKey { txid: item.txid };
-        match engine.get_spend(&GetSpendRequest {
-            tx_key: key,
-            offset: item.vout,
-            utxo_hash: item.utxo_hash,
-        }) {
-            Ok(spend) => {
-                results.push(WireGetSpendResult {
-                    status: 0,
-                    error_code: ERR_OK,
-                    slot_status: spend.status,
-                    spending_data: spend.spending_data.unwrap_or([0; 36]),
-                });
-            }
-            Err(SpendError::TxNotFound) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_TX_NOT_FOUND,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-            Err(SpendError::UtxoNotFound { .. }) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_VOUT_OUT_OF_RANGE,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-            Err(SpendError::UtxoHashMismatch { .. }) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_UTXO_HASH_MISMATCH,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-            Err(_) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_STORAGE_IO,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-        }
-    }
+        None => items
+            .iter()
+            .map(|item| decorate_get_spend_item(item, engine, local_read, cluster))
+            .collect(),
+    };
 
     // Dual-write: labeled operations table for GetSpend. Classify by the
     // result's `error_code` (already a u16) so the mapping is exact.
