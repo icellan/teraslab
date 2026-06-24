@@ -3276,7 +3276,40 @@ impl Engine {
         req: &CreateRequest,
         record_offset: u64,
     ) -> Result<CreateResponse, CreateError> {
-        self.create_at_offset_inner(req, record_offset, None)
+        self.create_at_offset_inner(req, record_offset, None, false)
+    }
+
+    /// Variant of [`Self::create_at_offset`] that registers the index entry and
+    /// secondary state for a record whose bytes are ALREADY on device, skipping
+    /// the per-record device write.
+    ///
+    /// PERF #9: the batched create dispatch path writes every record's bytes in
+    /// one coalesced pwrite per contiguous run (`io::write_records_coalesced`)
+    /// AFTER the redo flush, then calls this per item to register. The bytes it
+    /// would have written here are byte-identical to that bulk write (both come
+    /// from the same `build_create_record_bytes` layout), so recovery and the
+    /// CreateV2 redo replay are unchanged. The caller MUST have completed the
+    /// bulk device write before calling this.
+    pub fn register_create_at_offset(
+        &self,
+        req: &CreateRequest,
+        record_offset: u64,
+    ) -> Result<CreateResponse, CreateError> {
+        self.create_at_offset_inner(req, record_offset, None, true)
+    }
+
+    /// PERF #9: write a batch of pre-built record byte images to device,
+    /// coalescing physically contiguous reservation slots into one aligned
+    /// pwrite per run. `records` is `(record_offset, slot_size, record_bytes)`.
+    /// Holds the per-record torn-read write guards across each run (see
+    /// [`crate::io::write_records_coalesced`]). The caller must invoke this
+    /// AFTER the redo flush and BEFORE registering the index entries.
+    pub fn write_records_bulk(&self, records: &[(u64, u64, &[u8])]) -> Result<(), CreateError> {
+        crate::io::write_records_coalesced(&*self.device, records).map_err(|e| {
+            CreateError::StorageError {
+                detail: format!("bulk record write: {e}"),
+            }
+        })
     }
 
     /// Variant of [`Self::create_at_offset`] that verifies the caller's
@@ -3293,7 +3326,7 @@ impl Engine {
         record_offset: u64,
         expected_total_size: u64,
     ) -> Result<CreateResponse, CreateError> {
-        self.create_at_offset_inner(req, record_offset, Some(expected_total_size))
+        self.create_at_offset_inner(req, record_offset, Some(expected_total_size), false)
     }
 
     fn create_at_offset_inner(
@@ -3301,6 +3334,10 @@ impl Engine {
         req: &CreateRequest,
         record_offset: u64,
         expected_total_size: Option<u64>,
+        // PERF #9: when true the record bytes were already written to device by
+        // a coalesced bulk write, so skip the per-record device write here and
+        // only register the index entry + secondary state.
+        skip_device_write: bool,
     ) -> Result<CreateResponse, CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
@@ -3419,7 +3456,14 @@ impl Engine {
             })
             .collect();
 
-        self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+        // PERF #9: skip the per-record device write when the caller already
+        // wrote the bytes in a coalesced bulk write. `cold_data`/`meta`/`slots`
+        // are still built above because the index entry below is derived from
+        // `meta`; the bytes the bulk write put on device are byte-identical to
+        // what this call would have written (same build path).
+        if !skip_device_write {
+            self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+        }
 
         let index_entry = TxIndexEntry {
             device_id: 0,

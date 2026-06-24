@@ -117,6 +117,20 @@ impl StripedRwLocks {
         self.locks[idx].write()
     }
 
+    /// Acquire an exclusive (write) guard for a specific stripe index.
+    ///
+    /// Used by a coalesced multi-record write that must hold the write guard
+    /// for EVERY record offset it covers (torn-read safety vs a stale reader
+    /// of a reused offset — F-X-007 / g2). The caller maps each offset to its
+    /// stripe via [`Self::stripe_index`], deduplicates, sorts the indices, and
+    /// acquires each unique stripe ONCE through this method — dedup is
+    /// mandatory (the `RwLock` write side is not reentrant) and the sort gives
+    /// a global order so concurrent multi-offset acquirers cannot deadlock.
+    #[inline]
+    pub fn write_index(&self, idx: usize) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.locks[idx].write()
+    }
+
     /// Number of stripes in the lock table.
     pub fn stripe_count(&self) -> usize {
         self.locks.len()

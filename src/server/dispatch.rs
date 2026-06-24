@@ -5811,6 +5811,11 @@ fn handle_create_batch(
         create_req: CreateRequest<'a>,
         record_offset: u64,
         reservation_size: u64,
+        /// PERF #9: the exact on-device record image (== the CreateV2 redo
+        /// bytes). Written to device in one coalesced bulk pwrite per
+        /// contiguous run (Phase 2b) after the redo flush; Phase 3 then only
+        /// registers the index entry.
+        record_bytes: Vec<u8>,
         /// See [`PendingCreate::blob_pin`]; held until after
         /// `create_at_offset` registers the index entry. Never read —
         /// exists purely for its `Drop` (un-pin).
@@ -6017,7 +6022,11 @@ fn handle_create_batch(
             record_offset: region.offset,
             utxo_count: pending.utxo_count,
             is_conflicting: pending.create_req.conflicting,
-            record_bytes: pending.record_bytes,
+            // PERF #9: clone the record image — the original is retained on
+            // ValidCreate for the coalesced bulk device write (Phase 2b). The
+            // redo append serializes its own copy regardless, so this is one
+            // memcpy, not an extra serialize.
+            record_bytes: pending.record_bytes.clone(),
             parent_txids,
         });
         valid_items.push(ValidCreate {
@@ -6025,6 +6034,7 @@ fn handle_create_batch(
             create_req: pending.create_req,
             record_offset: region.offset,
             reservation_size: region.size,
+            record_bytes: pending.record_bytes,
             _blob_pin: pending.blob_pin,
         });
     }
@@ -6056,11 +6066,41 @@ fn handle_create_batch(
         }
     };
 
-    // Phase 3: Apply engine mutations at pre-allocated offsets.
+    // Phase 2b (PERF #9): write every record's bytes to device in ONE coalesced
+    // pwrite per contiguous reservation run, replacing the per-record device
+    // write create_at_offset used to do. WAL-first: this runs AFTER the redo
+    // flush above, so every record's CreateV2 entry is durable first. The bytes
+    // are byte-identical to what create_at_offset would have written, so Phase 3
+    // only has to register the index entries (register_create_at_offset).
+    let bulk_records: Vec<(u64, u64, &[u8])> = valid_items
+        .iter()
+        .map(|v| {
+            (
+                v.record_offset,
+                v.reservation_size,
+                v.record_bytes.as_slice(),
+            )
+        })
+        .collect();
+    if let Err(e) = engine.write_records_bulk(&bulk_records) {
+        // Catastrophic device write failure. The CreateV2 redo entries are
+        // already durable, so startup recovery replays them (writing AND
+        // registering the records); nothing is registered here. Classify every
+        // not-yet-errored item as ErrStorage-failed and fail the request.
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
+            m.creates_failed.inc_by(failed);
+        }
+        return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
+    }
+    drop(bulk_records);
+
+    // Phase 3: register the index entries (records already on device, Phase 2b).
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     for v in &valid_items {
         let item = &items[v.idx];
-        match engine.create_at_offset(&v.create_req, v.record_offset) {
+        match engine.register_create_at_offset(&v.create_req, v.record_offset) {
             Ok(_) => {
                 let key = TxKey { txid: item.txid };
                 // Serialize full metadata for the replica so a promoted replica
