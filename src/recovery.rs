@@ -186,6 +186,26 @@ pub struct RecoveryStats {
     pub max_observed_block_height: u32,
 }
 
+impl RecoveryStats {
+    /// Accumulate another pass's stats into this one (counters summed,
+    /// `max_observed_block_height` maxed). Used by multi-store recovery, which
+    /// replays one store at a time and merges the per-store results.
+    fn merge(&mut self, other: RecoveryStats) {
+        self.entries_replayed += other.entries_replayed;
+        self.entries_skipped += other.entries_skipped;
+        self.entries_failed += other.entries_failed;
+        self.failed_missing_primary += other.failed_missing_primary;
+        self.failed_io += other.failed_io;
+        self.failed_corrupt += other.failed_corrupt;
+        self.failed_logic += other.failed_logic;
+        self.failed_missing_record_bytes += other.failed_missing_record_bytes;
+        self.failed_replica_record_absent += other.failed_replica_record_absent;
+        self.max_observed_block_height = self
+            .max_observed_block_height
+            .max(other.max_observed_block_height);
+    }
+}
+
 /// B-7: how recovery reconciles the DAH / unmined secondary indexes
 /// after replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -821,6 +841,118 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     )
 }
 
+/// Determine which store a redo entry belongs to.
+///
+/// - Create / AllocateRegion / FreeRegion carry their own `device_id`.
+/// - Ops keyed by a txid route to the store recorded for that key — first from
+///   `owner` (records created in THIS log, pre-replay) then the loaded index
+///   (records created before the snapshot). Defaults to store 0 (also the
+///   single-store and legacy `ReplicaCreate` case).
+fn entry_store_id(
+    op: &RedoOp,
+    owner: &std::collections::HashMap<TxKey, u8>,
+    index: &ShardedIndex,
+) -> u8 {
+    match op {
+        RedoOp::Create { device_id, .. }
+        | RedoOp::AllocateRegion { device_id, .. }
+        | RedoOp::FreeRegion { device_id, .. } => *device_id,
+        other => match other.tx_key() {
+            Some(k) => owner
+                .get(k)
+                .copied()
+                .or_else(|| index.lookup(k).map(|e| e.device_id))
+                .unwrap_or(0),
+            None => 0,
+        },
+    }
+}
+
+/// Partition a single shared redo log's entries by owning store, preserving
+/// per-store log order. Each store's slice is then recovered independently by
+/// the existing single-store replay (the durability-critical path is unchanged;
+/// stores are independent because a record lives entirely on one store).
+fn partition_entries_by_store(
+    entries: Vec<RedoEntry>,
+    num_stores: usize,
+    index: &ShardedIndex,
+) -> Vec<Vec<RedoEntry>> {
+    // Pass 1: key -> device_id for records created within this log.
+    let mut owner: std::collections::HashMap<TxKey, u8> = std::collections::HashMap::new();
+    for e in &entries {
+        if let RedoOp::Create {
+            tx_key, device_id, ..
+        } = &e.op
+        {
+            owner.insert(*tx_key, *device_id);
+        }
+    }
+    // Pass 2: route each entry to its store (clamped defensively in range).
+    let mut parts: Vec<Vec<RedoEntry>> = (0..num_stores).map(|_| Vec::new()).collect();
+    for e in entries {
+        let store = (entry_store_id(&e.op, &owner, index) as usize).min(num_stores - 1);
+        parts[store].push(e);
+    }
+    parts
+}
+
+/// Multi-store recovery: replay one shared redo log across N stores.
+///
+/// Partitions the log by owning store (see [`partition_entries_by_store`]) and
+/// runs the existing single-store replay once per store with that store's
+/// device + allocator, sharing the index / DAH / unmined backends. Per-store
+/// pending conflicting/deleted-child drains and stats are merged. The
+/// single-store path (`num_stores == 1`) is exactly the prior behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_all_multi_store(
+    devices: &[std::sync::Arc<dyn BlockDevice>],
+    allocators: &mut [SlotAllocator],
+    redo_log: &mut RedoLog,
+    index: &ShardedIndex,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    full_secondary_rebuild: bool,
+) -> Result<
+    (
+        RecoveryStats,
+        Vec<PendingAppendConflictingChild>,
+        Vec<PendingAppendDeletedChild>,
+    ),
+    RecoveryError,
+> {
+    assert_eq!(
+        devices.len(),
+        allocators.len(),
+        "devices and allocators must be 1:1 per store"
+    );
+    let entries = redo_log.recover()?;
+    let partitions = partition_entries_by_store(entries, devices.len(), index);
+    let reconcile = if full_secondary_rebuild {
+        SecondaryReconcile::FullScan
+    } else {
+        SecondaryReconcile::TouchedOnly
+    };
+    let mut total = RecoveryStats::default();
+    let mut pending_cc = Vec::new();
+    let mut pending_dc = Vec::new();
+    for (store_id, part) in partitions.into_iter().enumerate() {
+        let (stats, cc, dc) = recover_entries_with_allocator_collecting_pending_conflicts(
+            &*devices[store_id],
+            part,
+            index,
+            dah,
+            unmined,
+            Some(&mut allocators[store_id]),
+            None,
+            reconcile,
+        )?;
+        total.merge(stats);
+        pending_cc.extend(cc);
+        pending_dc.extend(dc);
+    }
+    Ok((total, pending_cc, pending_dc))
+}
+
 // Each argument is a distinct recovery input (device, the three index
 // backends, optional allocator, optional redo-progress fence, and the
 // secondary-reconcile mode); they have independent lifetimes/mutability and do
@@ -1016,7 +1148,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 {
                     ReplayResult::Failed(ReplayCause::LogicError)
                 } else {
-                    replay_create(
+                    replay_replica_create(
                         device,
                         index,
                         &mut offset_owners,
@@ -1596,7 +1728,7 @@ fn replay_entry(
             tx_key,
             record_offset,
             utxo_count,
-        } => replay_create(
+        } => replay_replica_create(
             device,
             index,
             offset_owners,
@@ -1606,17 +1738,19 @@ fn replay_entry(
         ),
         RedoOp::Create {
             tx_key,
-            // device_id routes to the record's store once recovery is
-            // multi-store (boot flip). Single-store recovery uses its one
-            // device (device_id is always 0).
-            device_id: _,
+            // The new record's store: replay reconstructs it on this store's
+            // device (the `device` passed here is already that store's, routed
+            // by partition_entries_by_store) and stamps the index entry's
+            // device_id so reads route back correctly. 0 in single-store.
+            device_id,
             record_offset,
             utxo_count,
             is_conflicting,
             record_bytes,
             parent_txids,
-        } => replay_create_v2(
+        } => replay_create(
             device,
+            *device_id,
             index,
             offset_owners,
             tx_key,
@@ -2289,7 +2423,11 @@ fn replay_unfreeze(
 /// pairs ≈ 40 bytes/entry of payload (~400 MB transient, plus `HashMap`
 /// bucket overhead). It lives only for the duration of recovery and is
 /// dropped immediately after, so the peak is a startup-only cost.
-type OffsetOwners = std::collections::HashMap<u64, TxKey>;
+// Keyed by (device_id, record_offset): record offsets are store-LOCAL, so two
+// records on different stores can legitimately share the same offset value.
+// Keying on offset alone would make a create on store 1 evict the same-offset
+// record on store 0 (multi-store aliasing false-positive).
+type OffsetOwners = std::collections::HashMap<(u8, u64), TxKey>;
 
 /// Build the [`OffsetOwners`] reverse map from the loaded primary index in a
 /// single O(N) pass.
@@ -2312,7 +2450,7 @@ type OffsetOwners = std::collections::HashMap<u64, TxKey>;
 fn build_offset_owners(index: &ShardedIndex) -> OffsetOwners {
     let mut owners = OffsetOwners::new();
     index.for_each(|key, entry| {
-        owners.insert(entry.record_offset, key);
+        owners.insert((entry.device_id, entry.record_offset), key);
     });
     owners
 }
@@ -2339,9 +2477,10 @@ fn register_unique_offset(
     entry: TxIndexEntry,
 ) -> Result<(), crate::index::IndexError> {
     let record_offset = entry.record_offset;
+    let owner_key = (entry.device_id, record_offset);
 
-    // O(1) lookup of any DIFFERENT key already aliasing this offset.
-    if let Some(&stale) = offset_owners.get(&record_offset)
+    // O(1) lookup of any DIFFERENT key already aliasing this (store, offset).
+    if let Some(&stale) = offset_owners.get(&owner_key)
         && stale != key
     {
         // The rightful owner is `key` (its txid matches the on-device
@@ -2358,9 +2497,9 @@ fn register_unique_offset(
     }
 
     index.register(key, entry)?;
-    // Record the rightful owner so a later create for the same offset (or a
-    // re-replay of this one) sees `key`, not a stale snapshot alias.
-    offset_owners.insert(record_offset, key);
+    // Record the rightful owner so a later create for the same (store, offset)
+    // (or a re-replay of this one) sees `key`, not a stale snapshot alias.
+    offset_owners.insert(owner_key, key);
     Ok(())
 }
 
@@ -2381,13 +2520,13 @@ fn register_unique_offset(
 /// was correct; but if the device write was incomplete or torn, the
 /// recovery would still register a perfectly-cached zero-state index
 /// entry pointing at unreadable bytes, then start serving reads from
-/// it. Aligning with `replay_create_v2`'s validate-then-register
+/// it. Aligning with `replay_create`'s validate-then-register
 /// pattern: read the metadata header, fail closed on I/O / corruption,
 /// require the redo entry's `utxo_count` to match the on-device
 /// `utxo_count`, and seed the index entry's cached fields from the
 /// validated metadata so subsequent reads reflect the actual record
 /// state (not zeros).
-fn replay_create(
+fn replay_replica_create(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
@@ -2409,7 +2548,7 @@ fn replay_create(
                 actual_record_offset = existing.record_offset,
                 expected_utxo_count = utxo_count,
                 actual_utxo_count = existing.utxo_count,
-                "F-G4-014: replay_create skipped — existing index entry diverges from redo entry; \
+                "F-G4-014: replay_replica_create skipped — existing index entry diverges from redo entry; \
                  likely a delete+recreate that crossed the redo log",
             );
         }
@@ -2422,7 +2561,7 @@ fn replay_create(
     // replication / migration receiver for a SECONDARY copy whose
     // authoritative record lives on the master, so the bytes being absent
     // is a recoverable replica condition (the master resyncs the key on
-    // rejoin), NOT the device-fault that `replay_create_v2`'s identical
+    // rejoin), NOT the device-fault that `replay_create`'s identical
     // read-back guards against. We still fail-closed for THIS entry (skip
     // the index registration so no entry points at unreadable bytes), but
     // classify it as the tolerable `ReplicaRecordAbsent` so the node boots
@@ -2566,8 +2705,9 @@ fn replay_delete(
 // plus the device, index, and offset-owner map they act on. Independent inputs,
 // no cohesive grouping, so the count is warranted.
 #[allow(clippy::too_many_arguments)]
-fn replay_create_v2(
+fn replay_create(
     device: &dyn BlockDevice,
+    device_id: u8,
     index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
     tx_key: &TxKey,
@@ -2635,7 +2775,7 @@ fn replay_create_v2(
     }
 
     let entry = TxIndexEntry {
-        device_id: 0,
+        device_id,
         record_offset,
         utxo_count,
         block_entry_count: meta.block_entry_count,
@@ -4628,10 +4768,128 @@ mod tests {
     /// `redo-fsynced-but-engine-write-lost` boundary by writing the
     /// Create entry to the log, leaving the device area untouched
     /// (zeroed), and asserting that recovery writes the full record
+    /// PROOF: multi-store recovery routes each Create to its own store.
+    /// Two stores, two records (device_id 0 and 1, each with a store-local
+    /// offset). A single shared redo log holds both Creates. Recovery must
+    /// reconstruct each record on the RIGHT store's device and register the
+    /// correct device_id — the gate single-store recovery cannot exercise.
+    #[test]
+    fn multi_store_recovery_routes_creates_to_their_store() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        // Build a record's bytes + allocate its region on the given store.
+        let build = |txid_byte: u8, alloc: &mut SlotAllocator| -> (TxKey, u64, Vec<u8>) {
+            let utxo_count: u32 = 3;
+            let mut txid = [0u8; 32];
+            txid[0] = txid_byte;
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.tx_version = 7;
+            let base = TxMetadata::record_size_for(utxo_count);
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = txid_byte;
+                    h[1] = (i + 1) as u8;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+            let offset = alloc.allocate(base).unwrap();
+            let mut rb = Vec::with_capacity(METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE);
+            let mut mb = [0u8; METADATA_SIZE];
+            meta.to_bytes(&mut mb);
+            rb.extend_from_slice(&mb);
+            for s in &slots {
+                let mut sb = [0u8; UTXO_SLOT_SIZE];
+                s.to_bytes(&mut sb);
+                rb.extend_from_slice(&sb);
+            }
+            (TxKey { txid }, offset, rb)
+        };
+
+        let (key_a, off_a, rb_a) = build(0xA0, &mut alloc0); // store 0
+        let (key_b, off_b, rb_b) = build(0xB0, &mut alloc1); // store 1
+
+        // One shared redo log carries both creates (interleaved by store).
+        let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key_a,
+            device_id: 0,
+            record_offset: off_a,
+            utxo_count: 3,
+            is_conflicting: false,
+            record_bytes: rb_a.clone(),
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key_b,
+            device_id: 1,
+            record_offset: off_b,
+            utxo_count: 3,
+            is_conflicting: false,
+            record_bytes: rb_b.clone(),
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let devices = [dev0.clone(), dev1.clone()];
+        let mut allocators = [alloc0, alloc1];
+        let (stats, _, _) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo,
+            &index,
+            &mut dah,
+            &mut unmined,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stats.entries_replayed, 2, "both creates must replay");
+        assert_eq!(stats.entries_failed, 0);
+
+        // Index records the correct store + offset for each key.
+        let ea = index.lookup(&key_a).expect("A registered");
+        let eb = index.lookup(&key_b).expect("B registered");
+        assert_eq!(ea.device_id, 0, "A must be on store 0");
+        assert_eq!(eb.device_id, 1, "B must be on store 1");
+        assert_eq!(ea.record_offset, off_a);
+        assert_eq!(eb.record_offset, off_b);
+
+        // Each record was reconstructed on its OWN store's device, and NOT on
+        // the other store — this is the routing proof.
+        let meta_a = io::read_metadata(&*dev0, off_a).expect("A on dev0");
+        let meta_b = io::read_metadata(&*dev1, off_b).expect("B on dev1");
+        assert_eq!(meta_a.tx_id, key_a.txid, "A must read back from store 0");
+        assert_eq!(meta_b.tx_id, key_b.txid, "B must read back from store 1");
+        // Cross-store: B's bytes must NOT be on store 0 at B's offset, and
+        // A's must NOT be on store 1 at A's offset.
+        assert_ne!(
+            io::read_metadata(&*dev1, off_a).map(|m| m.tx_id).ok(),
+            Some(key_a.txid),
+            "A must not have been written to store 1"
+        );
+        assert_ne!(
+            io::read_metadata(&*dev0, off_b).map(|m| m.tx_id).ok(),
+            Some(key_b.txid),
+            "B must not have been written to store 0"
+        );
+    }
+
     /// bytes and registers the index with cached fields populated from
     /// the reconstructed metadata header (not zeros).
     #[test]
-    fn replay_create_v2_reconstructs_full_record() {
+    fn replay_create_reconstructs_full_record() {
         // Fresh harness — DO NOT pre-create the record. We will only
         // append a Create redo entry and recover.
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -4672,7 +4930,7 @@ mod tests {
         let record_offset = alloc.allocate(base_size).unwrap();
 
         // Build the captured record bytes (no alignment padding — that's
-        // added by the device write path inside replay_create_v2).
+        // added by the device write path inside replay_create).
         let mut record_bytes = Vec::with_capacity(METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE);
         let mut meta_bytes = [0u8; METADATA_SIZE];
         meta.to_bytes(&mut meta_bytes);
@@ -4749,7 +5007,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_all_rejects_create_v2_offset_not_owned_by_allocator() {
+    fn recover_all_rejects_create_offset_not_owned_by_allocator() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
@@ -5133,7 +5391,7 @@ mod tests {
     /// the same redo log produces the same final state. Verifies the
     /// "primary already registered → skip" path.
     #[test]
-    fn replay_create_v2_idempotent_on_double_recovery() {
+    fn replay_create_idempotent_on_double_recovery() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
@@ -7440,7 +7698,7 @@ mod tests {
             .unwrap();
 
         // Build key_b's record bytes. meta.tx_id must match key_b's txid for
-        // the BUG-1 tx_id identity check inside replay_create_v2 to pass.
+        // the BUG-1 tx_id identity check inside replay_create to pass.
         let mut meta_b = TxMetadata::new(utxo_count);
         meta_b.tx_id = txid_b;
         meta_b.record_size = record_size as u32;
