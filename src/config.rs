@@ -420,8 +420,10 @@ pub struct IndexConfig {
     pub file_backed_path: PathBuf,
 
     /// Number of independent index shards. Each shard is a complete
-    /// `PrimaryBackend` behind its own `RwLock`. Default 16, rounded up
-    /// to the next power of two, clamped to [1, 256].
+    /// `PrimaryBackend` behind its own `RwLock`. Rounded up to the next
+    /// power of two, clamped to `[1, 256]`. Default `256`: N must be
+    /// much greater than the number of concurrent writers for good read
+    /// isolation; write-lock collision probability ≈ writers / N.
     pub index_shards: usize,
 }
 
@@ -435,7 +437,7 @@ impl Default for IndexConfig {
             redb_tombstone_path: PathBuf::from("teraslab-tombstone.redb"),
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
             file_backed_path: PathBuf::from("teraslab-index.dat"),
-            index_shards: 16,
+            index_shards: 256,
         }
     }
 }

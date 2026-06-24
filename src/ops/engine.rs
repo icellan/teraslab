@@ -163,7 +163,7 @@ pub struct Engine {
     /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
     /// behind its own `RwLock`, so a write to one shard does not block
     /// reads/writes on other shards. Constructed at the configured
-    /// `index_shards` count: the in-memory backend defaults to 16; redb /
+    /// `index_shards` count: the in-memory backend defaults to 256; redb /
     /// file-backed and most tests run at 1 (a transparent pass-through over a
     /// single recovered/rebuilt backend via [`ShardedIndex::from_single`]).
     index: ShardedIndex,
@@ -6661,7 +6661,7 @@ impl Engine {
         // pre-sharding engine, so the existing `PrimaryBackend::restore_all`
         // checkpoint path keeps reading it — and the v2 (`TSX2`) N-shard
         // manifest when shard_count > 1. The engine runs at the configured
-        // shard count (default index_shards = 16), so production checkpoints
+        // shard count (default index_shards = 256), so production checkpoints
         // write the v2 manifest; only a single-shard deployment stays on v1.
         self.index.snapshot_all(&dah, &unmined, path)
     }
@@ -12302,19 +12302,19 @@ mod tests {
     }
 
     /// The default `IndexConfig` (and therefore the default server wiring)
-    /// builds the in-memory index at 16 shards. The engine must expose that
+    /// builds the in-memory index at 256 shards. The engine must expose that
     /// count through `index_shard_count()`, proving the config flows end to
     /// end into the live index layout.
     #[test]
-    fn default_config_wires_sixteen_index_shards() {
+    fn default_config_wires_index_shards() {
         let default_shards = crate::config::IndexConfig::default().index_shards;
-        assert_eq!(default_shards, 16, "default index_shards must be 16");
+        assert_eq!(default_shards, 256, "default index_shards must be 256");
 
         let engine = create_sharded_engine(default_shards);
         assert_eq!(
             engine.index_shard_count(),
-            16,
-            "engine built from default config must expose 16 index shards",
+            256,
+            "engine built from default config must expose 256 index shards",
         );
     }
 
