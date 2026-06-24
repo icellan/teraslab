@@ -278,13 +278,11 @@ pub struct Engine {
     blob_pins: crate::storage::blobstore::BlobPinSet,
     /// Per-shard record counts for migration verification.
     ///
-    /// Startup leaves these counters uninitialized so `Engine::new` does not
-    /// scan the full primary index. The first `shard_record_count` call scans
-    /// the primary index once and publishes all counters; create/delete then
-    /// maintain them atomically while holding the primary index write lock.
+    /// Seeded eagerly in the single private constructor (`new_inner`) from the
+    /// fully-populated index before the engine is shared. Create/delete then
+    /// maintain them atomically while holding the primary-index shard write
+    /// lock — counts never drift from the primary index.
     shard_counts: Vec<std::sync::atomic::AtomicU64>,
-    /// True once `shard_counts` has been populated from the primary index.
-    shard_counts_initialized: std::sync::atomic::AtomicBool,
     /// Cached wall-clock time in milliseconds since Unix epoch.
     ///
     /// Avoids a `clock_gettime` syscall on every mutation. The dispatch
@@ -361,53 +359,18 @@ impl Engine {
         dah_index: impl Into<DahBackend>,
         unmined_index: impl Into<UnminedBackend>,
     ) -> Self {
-        let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
-        let index = index.into();
-        let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
-        let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
-            .map(|_| std::sync::atomic::AtomicU64::new(0))
-            .collect();
-        let engine = Self {
+        // N=1 transparent pass-through over the recovered/rebuilt backend.
+        // Behaviour is identical to the previous `RwLock<PrimaryBackend>`:
+        // every key routes to the single shard. Multi-shard fan-out is a
+        // later task.
+        Self::new_with_sharded_index(
             device,
-            device_ptr,
-            // N=1 transparent pass-through over the recovered/rebuilt backend.
-            // Behaviour is identical to the previous `RwLock<PrimaryBackend>`:
-            // every key routes to the single shard. Multi-shard fan-out is a
-            // later task.
-            index: ShardedIndex::from_single(index),
-            allocator: parking_lot::Mutex::new(allocator),
+            ShardedIndex::from_single(index.into()),
+            allocator,
             locks,
-            dah_index: parking_lot::Mutex::new(dah_index.into()),
-            unmined_index: parking_lot::Mutex::new(unmined_index.into()),
-            conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
-            dispatch_visibility_barrier: parking_lot::RwLock::new(()),
-            redo_log: std::sync::OnceLock::new(),
-            tombstone_log: std::sync::OnceLock::new(),
-            tombstone_index: std::sync::OnceLock::new(),
-            // Default ON (design §11.5). A delete still writes no tombstone
-            // until a log + index are attached, so this is inert until the
-            // server wires the storage in.
-            tombstones_enabled: std::sync::atomic::AtomicBool::new(true),
-            // Default OFF (design §11.5, Phase 8). The enabled path awaits CI
-            // soak; until set true by config the migration reconciliation is
-            // byte-identical to the pre-Phase-8 Fix-B/#29 behavior.
-            tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool::new(false),
-            last_durable_height: std::sync::atomic::AtomicU32::new(0),
-            last_durable_height_path: std::sync::OnceLock::new(),
-            blob_store: None,
-            blob_pins: crate::storage::blobstore::BlobPinSet::new(),
-            shard_counts,
-            shard_counts_initialized: std::sync::atomic::AtomicBool::new(false),
-            cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
-            conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            fail_next_register: std::sync::atomic::AtomicBool::new(false),
-        };
-        // Eager, single-threaded shard-count init from the fully-populated
-        // index. Must run before the engine is shared so no writer can race
-        // the scan (PR#19 #1).
-        engine.compute_shard_counts();
-        engine
+            dah_index,
+            unmined_index,
+        )
     }
 
     /// Create a new engine from a pre-built [`ShardedIndex`].
@@ -427,6 +390,31 @@ impl Engine {
         dah_index: impl Into<DahBackend>,
         unmined_index: impl Into<UnminedBackend>,
     ) -> Self {
+        Self::new_inner(
+            device,
+            index,
+            allocator,
+            locks,
+            dah_index.into(),
+            unmined_index.into(),
+        )
+    }
+
+    /// Single private construction path that builds the struct literal and
+    /// eagerly seeds `shard_counts` from the fully-populated index.
+    ///
+    /// Both public constructors route here so there is exactly one place where
+    /// the struct is assembled and one place where `compute_shard_counts` is
+    /// called — a future constructor that forgets to seed the counts cannot
+    /// exist.
+    fn new_inner(
+        device: Arc<dyn BlockDevice>,
+        index: ShardedIndex,
+        allocator: SlotAllocator,
+        locks: StripedLocks,
+        dah_index: DahBackend,
+        unmined_index: UnminedBackend,
+    ) -> Self {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
         let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
@@ -438,21 +426,26 @@ impl Engine {
             index,
             allocator: parking_lot::Mutex::new(allocator),
             locks,
-            dah_index: parking_lot::Mutex::new(dah_index.into()),
-            unmined_index: parking_lot::Mutex::new(unmined_index.into()),
+            dah_index: parking_lot::Mutex::new(dah_index),
+            unmined_index: parking_lot::Mutex::new(unmined_index),
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_log: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
+            // Default ON (design §11.5). A delete still writes no tombstone
+            // until a log + index are attached, so this is inert until the
+            // server wires the storage in.
             tombstones_enabled: std::sync::atomic::AtomicBool::new(true),
+            // Default OFF (design §11.5, Phase 8). The enabled path awaits CI
+            // soak; until set true by config the migration reconciliation is
+            // byte-identical to the pre-Phase-8 Fix-B/#29 behavior.
             tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool::new(false),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
-            shard_counts_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -1206,22 +1199,20 @@ impl Engine {
         self.shard_counts[shard as usize].load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Populate `shard_counts` from the fully-built primary index and mark the
-    /// counters initialized.
+    /// Populate `shard_counts` from the fully-built primary index.
     ///
-    /// Called EXACTLY ONCE from each constructor while the engine is still
+    /// Called EXACTLY ONCE from `new_inner` while the engine is still
     /// single-threaded and owned by the caller — recovery/restore has fully
     /// populated the index before construction, and no concurrent writer can
     /// observe the engine until it is returned and shared. Computing the
     /// counts here (rather than lazily on the first reader) eliminates the
     /// lazy-init-vs-writer race: there is no window in which the scan can visit
     /// and release a shard while a concurrent writer inserts into it and reads
-    /// the still-false flag, leaving the new key counted by neither path.
+    /// an uninitialized counter, leaving the new key counted by neither path.
     ///
     /// Because this runs before the engine is shared, the relaxed stores need
-    /// no per-counter synchronization; the single `Release` store of
-    /// `shard_counts_initialized` (and the `Arc`/move that publishes the engine
-    /// to other threads) establishes the happens-before edge for every later
+    /// no per-counter synchronization; the `Arc`/move that publishes the engine
+    /// to other threads establishes the happens-before edge for every later
     /// `Acquire` read.
     fn compute_shard_counts(&self) {
         let mut counts = vec![0u64; crate::cluster::shards::NUM_SHARDS];
@@ -1232,27 +1223,19 @@ impl Engine {
         for (counter, count) in self.shard_counts.iter().zip(counts) {
             counter.store(count, std::sync::atomic::Ordering::Relaxed);
         }
-        self.shard_counts_initialized
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    #[cfg(test)]
-    fn shard_counts_initialized_for_test(&self) -> bool {
-        self.shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Register a primary-index entry and increment the matching shard count
     /// atomically within the same index write-lock critical section, only when
     /// this is a new key.
     ///
-    /// Shard counters are eagerly initialized in the constructor
-    /// (`Self::compute_shard_counts`), so by the time any request is
-    /// dispatched the counters always track the primary index: if the backend
-    /// `register` fails, no count mutation is observed; if it succeeds with a
-    /// newly inserted key, the matching `fetch_add` executes under the same
-    /// shard write guard before that guard is released. `shard_counts`
-    /// therefore never drifts from the primary index.
+    /// Shard counters are seeded eagerly in `new_inner` (the single constructor)
+    /// before the engine is shared. By the time any request is dispatched the
+    /// counters always track the primary index: if the backend `register` fails,
+    /// no count mutation is observed; if it succeeds with a newly inserted key,
+    /// the matching `fetch_add` executes under the same shard write guard before
+    /// that guard is released. `shard_counts` therefore never drifts from the
+    /// primary index.
     ///
     /// # Errors
     /// Returns `IndexError`(crate::index::IndexError) from the underlying
@@ -1287,16 +1270,11 @@ impl Engine {
         let len_before = guard.len();
         guard.register_without_resize(key, entry)?;
         let inserted = guard.len() > len_before;
-        // Commit the count mutation under the still-held write guard. Counts are
-        // eagerly initialized at construction (`shard_counts_initialized` is
-        // true by the time any request is dispatched), so for an inserted key
-        // the `fetch_add` always runs before the guard drops — preserving the
-        // insert-then-count atomicity (fix #1). The check guards only the very
-        // first registers before initialization completes.
-        let counts_initialized = self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire);
-        if inserted && counts_initialized {
+        // Commit the count mutation unconditionally under the still-held write
+        // guard. Counts are seeded eagerly at construction so the `fetch_add`
+        // always runs before the guard drops — preserving insert-then-count
+        // atomicity (fix #1).
+        if inserted {
             self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         // Per-shard resize UNDER the held guard: rehashes only this shard's
@@ -1367,15 +1345,10 @@ impl Engine {
             "register_new_with_shard_count: insert did not grow the index \
              despite the key being absent under the same write lock"
         );
-        // Counts are eagerly initialized at construction, so this `fetch_add`
-        // runs under the still-held write guard for the newly inserted key,
-        // preserving the insert-then-count atomicity (fix #1).
-        let counts_initialized = self
-            .shard_counts_initialized
-            .load(std::sync::atomic::Ordering::Acquire);
-        if counts_initialized {
-            self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
+        // Counts are seeded eagerly at construction so this `fetch_add` runs
+        // unconditionally under the still-held write guard for the newly
+        // inserted key, preserving insert-then-count atomicity (fix #1).
+        self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
         // Resize UNDER the held guard (no drop-then-reacquire).
         guard.resize_if_needed()?;
         Ok(true)
@@ -1415,10 +1388,11 @@ impl Engine {
     ///
     /// Returns the removed entry (or `None` if the key was not present), or
     /// an `IndexError` if the (redb) backend's write transaction fails.
-    /// Shard counters are eagerly initialized in the constructor
-    /// (`Self::compute_shard_counts`), so the count is decremented (under the
-    /// shard write guard) whenever an entry is actually removed — `shard_counts`
-    /// tracks the primary index continuously, no deferred scan is ever needed.
+    /// Shard counters are seeded eagerly in `new_inner` (the single constructor)
+    /// before the engine is shared, so the count is decremented unconditionally
+    /// (under the shard write guard) whenever an entry is actually removed —
+    /// `shard_counts` tracks the primary index continuously, no deferred scan
+    /// is ever needed.
     ///
     /// G-4: propagates the backend error instead of collapsing it to `None`.
     /// A collapsed `unregister` failure would leave the row in redb while the
@@ -1431,11 +1405,7 @@ impl Engine {
         let shard = crate::cluster::shards::ShardTable::shard_for_key(key) as usize;
         let mut guard = self.index.write_shard(key);
         let removed = guard.unregister_checked(key)?;
-        if removed.is_some()
-            && self
-                .shard_counts_initialized
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if removed.is_some() {
             self.shard_counts[shard].fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
         drop(guard);
@@ -16223,14 +16193,10 @@ mod tests {
             UnminedIndex::new(),
         ));
 
-        // PR#19 #1: counts are computed EAGERLY in the constructor from the
+        // PR#19 #1: counts are seeded EAGERLY in new_inner from the
         // fully-populated index, before any concurrent access is possible.
-        // The flag is true immediately and the counts are correct without any
-        // prior `shard_record_count` call forcing a scan.
-        assert!(
-            engine.shard_counts_initialized_for_test(),
-            "Engine::new must eagerly initialize shard_counts in the constructor",
-        );
+        // Counts are correct immediately — no prior `shard_record_count` call
+        // required to trigger a scan.
         assert_eq!(
             engine.shard_record_count(EXISTING_SHARD),
             2,
@@ -16238,17 +16204,13 @@ mod tests {
         );
         assert_eq!(engine.shard_record_count(OTHER_EXISTING_SHARD), 1);
 
-        // A create issued before any read still increments under the shard
-        // write lock — the flag is already true, so the fetch_add fires.
+        // A create issued before any read still increments the count
+        // unconditionally under the shard write lock.
         let (_, mut pre_read_req) = make_create_req(71, 1);
         pre_read_req.tx_id = key_for_shard(PRE_READ_CREATE_SHARD, 1).txid;
         engine
             .create(&pre_read_req)
             .expect("create on an eager-init engine should succeed");
-        assert!(
-            engine.shard_counts_initialized_for_test(),
-            "flag stays true after a create",
-        );
         assert_eq!(engine.shard_record_count(PRE_READ_CREATE_SHARD), 1);
 
         let (_, mut second_req) = make_create_req(72, 1);
