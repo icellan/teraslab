@@ -314,7 +314,10 @@ fn bench_mixed_read_under_write_storm(c: &mut Criterion) {
                                 let key = TxKey {
                                     txid: make_tx_id(i),
                                 };
-                                let _ = eng.lookup_checked(&key);
+                                assert!(
+                                    eng.lookup_checked(&key).is_ok(),
+                                    "benchmark lookup failed"
+                                );
                                 done += 1;
                             }
                         }));

@@ -163,10 +163,8 @@ impl RedbPrimary {
         #[cfg(test)]
         if self
             .fail_next_flush
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            self.fail_next_flush
-                .store(false, std::sync::atomic::Ordering::Relaxed);
             return Err(IndexError::FormatError {
                 detail: "redb test-injected flush failure".into(),
             });
@@ -237,10 +235,8 @@ impl RedbPrimary {
         #[cfg(test)]
         if self
             .fail_next_read
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            self.fail_next_read
-                .store(false, std::sync::atomic::Ordering::Relaxed);
             return Err(IndexError::FormatError {
                 detail: "redb test-injected read failure".into(),
             });
