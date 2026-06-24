@@ -365,23 +365,38 @@ pub fn perform_checkpoint_with_reset_guard<F>(
 where
     F: Fn(u64) -> bool,
 {
-    // F-G4-016: the visibility guard is held across `snapshot_index`
-    // and `persist_allocator`, so dispatch is quiesced for the entire
-    // snapshot duration. For a primary index with millions of entries
-    // this can run into the hundreds of ms and surfaces as periodic
-    // tail-latency spikes correlated with checkpoint cadence. This is
-    // a known tradeoff vs. the simpler "stop-the-world snapshot"
-    // design; a CoW / generation-tracking refactor is deferred until
-    // checkpoint latency is observed as a production bottleneck. The
-    // `checkpoint_duration_ms` field of the returned `CheckpointStats`
-    // exposes this so operators can alert when it crosses
-    // `poll_interval`.
-    let _visibility_guard = engine.acquire_checkpoint_visibility_guard();
-    let entries_before = redo_log.lock().current_sequence();
+    // Sample the recovery fence under a BRIEF exclusive quiesce — not across
+    // the snapshot.
+    //
+    // The fence must be a sequence at which every covered redo entry has its
+    // engine effect applied. Mutations hold the EXCLUSIVE visibility barrier
+    // from before-apply through redo durability (see
+    // `Engine::acquire_mutation_visibility_guard`), so acquiring it momentarily
+    // drains every in-flight apply; the redo sequence sampled inside that
+    // window is therefore fully applied. This is O(1) — it does NOT span the
+    // O(index) snapshot.
+    //
+    // F-G4-016 (resolved): the barrier used to be held across the ENTIRE
+    // `snapshot_index`, quiescing all reads and writes for the snapshot's
+    // duration — hundreds of ms for millions of entries, growing into
+    // multi-second serving stalls at the full UTXO set, every checkpoint. Now
+    // serving stays live across the snapshot: the snapshot is "fuzzy" (it may
+    // capture mutations that landed after the fence) and recovery reconciles
+    // that post-fence tail by idempotent redo replay (see `crate::recovery`).
+    // `checkpoint_duration_ms` now measures background snapshot time, not a
+    // stall.
+    let entries_before = {
+        let _quiesce = engine.acquire_checkpoint_visibility_guard();
+        redo_log.lock().current_sequence()
+    };
     let snapshot_fence_sequence = entries_before.saturating_sub(1);
     let started_at = std::time::Instant::now();
 
-    // 1. Snapshot index + DAH + unmined to disk (tempfile + rename).
+    // 1. Snapshot index + DAH + unmined to disk (tempfile + rename). FUZZY /
+    //    non-blocking: serving is NOT quiesced across this — `snapshot_index`
+    //    serializes each shard under its own short-lived read lock in write-path
+    //    order (shard before secondaries), so it cannot deadlock the write path
+    //    and never blocks reads.
     engine
         .snapshot_index(&config.snapshot_path)
         .map_err(|e| format!("snapshot_index: {e}"))?;
@@ -552,6 +567,137 @@ mod tests {
             stats.usage_after < 0.10,
             "usage_fraction must drop sharply after reset, found {}",
             stats.usage_after
+        );
+    }
+
+    /// Isolation contract: client reads (which take the SHARED
+    /// `dispatch_visibility_barrier`) are NOT stalled by a running checkpoint.
+    ///
+    /// Pre-fix the checkpoint held the EXCLUSIVE barrier across the entire
+    /// O(index) `snapshot_index`, so a reader's `.read()` blocked for the whole
+    /// snapshot — at the full UTXO set a multi-second serving stall every
+    /// ~75 s. With the fuzzy checkpoint the barrier is held only for an O(1)
+    /// fence sample, so reads fly across the snapshot. We seed a multi-shard
+    /// index large enough that the snapshot takes real wall time, run the
+    /// checkpoint, and spin read-guard acquisitions on another thread: pre-fix
+    /// that thread would complete ~1 acquisition (blocked the whole time);
+    /// fuzzy lets thousands through.
+    #[test]
+    fn checkpoint_does_not_stall_reads() {
+        use crate::index::{ShardedIndex, TxIndexEntry, TxKey};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+
+        // Seed a 16-shard index directly (in-memory, no device I/O) with enough
+        // entries that the snapshot takes meaningful wall time — that is the
+        // window a stop-the-world checkpoint would block reads across.
+        const N: u32 = 300_000;
+        let index = ShardedIndex::new_in_memory(N as usize, 16).unwrap();
+        for i in 0..N {
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&i.to_le_bytes());
+            // Spread keys across shards (index_shard_for_key hashes [24..32]).
+            txid[24..32]
+                .copy_from_slice(&(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            index
+                .register(
+                    TxKey { txid },
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: i as u64 * 256,
+                        utxo_count: 1,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+        }
+        let engine = Arc::new(Engine::new_with_sharded_index(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap()));
+        {
+            let mut log = redo.lock();
+            for _ in 0..50 {
+                log.append(RedoOp::Checkpoint).unwrap();
+            }
+            log.flush().unwrap();
+        }
+
+        let cfg = CheckpointConfig::new(dir.path().join("isolation.snap"));
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reads_done = Arc::new(AtomicU64::new(0));
+        let max_latency_us = Arc::new(AtomicU64::new(0));
+
+        let reader = {
+            let engine = engine.clone();
+            let done = done.clone();
+            let reads_done = reads_done.clone();
+            let max_latency_us = max_latency_us.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let t = Instant::now();
+                    {
+                        let _g = engine.acquire_dispatch_visibility_guard();
+                    }
+                    let us = t.elapsed().as_micros() as u64;
+                    reads_done.fetch_add(1, Ordering::Relaxed);
+                    max_latency_us.fetch_max(us, Ordering::Relaxed);
+                }
+            })
+        };
+
+        // Let the reader warm up, then run the checkpoint to completion.
+        std::thread::sleep(Duration::from_millis(5));
+        let started = Instant::now();
+        let _stats = perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
+        let ckpt_wall = started.elapsed();
+        done.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        let reads = reads_done.load(Ordering::Relaxed);
+        let max_us = max_latency_us.load(Ordering::Relaxed);
+        let ckpt_us = ckpt_wall.as_micros();
+
+        // The snapshot must have taken real wall time, else the test proves
+        // nothing about isolation.
+        assert!(
+            ckpt_us >= 20_000,
+            "snapshot too fast ({ckpt_us}us) to be a meaningful isolation test; raise N"
+        );
+        // Reads kept flowing across the whole checkpoint. A stop-the-world
+        // checkpoint would block the reader for the full snapshot, completing
+        // ~1 acquisition; the fuzzy checkpoint lets thousands through.
+        assert!(
+            reads >= 1000,
+            "reads stalled during checkpoint: only {reads} guard acquisitions across {ckpt_us}us"
+        );
+        // Sanity: no read waited for ~the whole checkpoint (a reader blocked on
+        // a barrier held across the snapshot would show max ≈ checkpoint
+        // duration). The `reads >= 1000` count above is the definitive
+        // non-blocking signal; this bound stays loose so heavy parallel
+        // test-runner scheduling jitter cannot flake it.
+        assert!(
+            (max_us as u128) < ckpt_us,
+            "a read stalled ~the whole checkpoint ({max_us}us vs {ckpt_us}us) — \
+             is the barrier still held across the snapshot?"
         );
     }
 

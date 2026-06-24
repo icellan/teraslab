@@ -6768,47 +6768,39 @@ impl Engine {
         &*self.device
     }
 
-    /// Snapshot the primary index and both secondary indexes to a file.
+    /// Snapshot the primary index and both secondary indexes to a file,
+    /// non-blocking ("fuzzy") with respect to concurrent serving.
     ///
-    /// Acquires the secondary locks first (dah → unmined), then the primary
-    /// index shard read locks, and writes the snapshot to `path` via an atomic
-    /// rename. Called during graceful shutdown / checkpoint so the next startup
-    /// can restore from snapshot instead of scanning the device.
+    /// Delegates to [`crate::index::ShardedIndex::snapshot_all_concurrent`],
+    /// which serializes each shard region under its own short-lived read lock
+    /// (released between shards) and then locks the secondaries — never holding
+    /// a cross-subsystem lock. The acquisition order therefore matches the write
+    /// path (shard before secondaries), so this is deadlock-free WITHOUT the
+    /// caller holding `dispatch_visibility_barrier.write()`.
     ///
-    /// # Lock order — inverted vs the write path
+    /// # Fuzzy snapshot — no quiesce required
     ///
-    /// This method's order (dah → unmined → shard.read) is the REVERSE of the
-    /// write path (shard.write → dah → unmined, see
-    /// `Engine::sync_primary_and_both_secondary_atomic`). The two are
-    /// deadlock-free ONLY because this method is called exclusively by the
-    /// checkpoint task while it holds `dispatch_visibility_barrier.write()`,
-    /// which excludes every write-path caller from holding any index or
-    /// secondary lock concurrently.
+    /// The checkpoint task no longer quiesces dispatch across this O(index)
+    /// snapshot (that pinned a `.write()` barrier for the whole snapshot,
+    /// stalling every read/write for hundreds of ms → multi-second at the full
+    /// UTXO set). Instead it samples the recovery fence under a *brief*
+    /// exclusive quiesce and then calls this method with serving live. The
+    /// snapshot may capture mutations that landed after the fence; recovery
+    /// reconciles that post-fence skew via idempotent redo replay (see
+    /// `crate::recovery` and `crate::checkpoint::perform_checkpoint_with_reset_guard`).
     ///
-    /// **CALLER CONTRACT:** the caller MUST hold
-    /// `dispatch_visibility_barrier.write()` before calling this method.
-    /// Calling it without that guard while a write-path op is in flight can
-    /// deadlock (the inverted lock order has no other protection).
+    /// Writes the v1 (`TSIX`) format at `shard_count == 1` (byte-for-byte
+    /// identical to the pre-sharding engine, so `PrimaryBackend::restore_all`
+    /// keeps reading it) and the v2 (`TSX2`) N-shard manifest at
+    /// `shard_count > 1` (the default `index_shards = 256`).
     ///
     /// # Errors
     ///
     /// Returns [`crate::index::IndexError`] on I/O failure or if the snapshot
     /// directory is not writable.
     pub fn snapshot_index(&self, path: &std::path::Path) -> crate::index::Result<()> {
-        // Lock order: dah -> unmined -> shard.read, inverted vs the write path
-        // (sync_primary_and_both_secondary_atomic). Safe only because the
-        // checkpoint caller holds dispatch_visibility_barrier.write() — see the
-        // caller contract in this method's doc comment.
-        let dah = self.dah_index.lock();
-        let unmined = self.unmined_index.lock();
-        // `ShardedIndex::snapshot_all` writes the v1 (`TSIX`) format when the
-        // engine runs at shard_count == 1 — byte-for-byte identical to the
-        // pre-sharding engine, so the existing `PrimaryBackend::restore_all`
-        // checkpoint path keeps reading it — and the v2 (`TSX2`) N-shard
-        // manifest when shard_count > 1. The engine runs at the configured
-        // shard count (default index_shards = 256), so production checkpoints
-        // write the v2 manifest; only a single-shard deployment stays on v1.
-        self.index.snapshot_all(&dah, &unmined, path)
+        self.index
+            .snapshot_all_concurrent(&self.dah_index, &self.unmined_index, path)
     }
 
     /// Persist the allocator's freelist and high-water mark to the device header.

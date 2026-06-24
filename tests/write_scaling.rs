@@ -8,6 +8,7 @@
 
 mod common;
 use common::*;
+use serial_test::serial;
 use std::sync::Arc;
 
 // ---- per-PR smoke: cheap, no scaling bar; just proves the harness drives the
@@ -81,7 +82,11 @@ fn read_scaling_smoke() {
 // ---- per-PR: the pprof CPU-profile endpoint returns a real flamegraph while
 // the read path is under load. Proves the profiling gate is wired and renders
 // a non-trivial SVG, not a stub. ----
+// `#[serial(pprof)]`: pprof installs a PROCESS-GLOBAL ITIMER_PROF profiler, so
+// the two pprof tests must not run concurrently (cargo runs a binary's tests in
+// parallel by default) — one would collide with the other's in-flight profile.
 #[test]
+#[serial(pprof)]
 fn pprof_endpoint_returns_flamegraph_under_load() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -127,6 +132,7 @@ fn pprof_endpoint_returns_flamegraph_under_load() {
 // ---- per-PR: the endpoint rejects a second concurrent profile (single-flight)
 // so two operators can't fight over the one process-global profiler. ----
 #[test]
+#[serial(pprof)]
 fn pprof_endpoint_is_single_flight() {
     let srv = spawn_write_server();
     let port = srv.http_port;
