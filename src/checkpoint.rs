@@ -660,6 +660,11 @@ mod tests {
                     let us = t.elapsed().as_micros() as u64;
                     reads_done.fetch_add(1, Ordering::Relaxed);
                     max_latency_us.fetch_max(us, Ordering::Relaxed);
+                    // Cooperative, not a tight busy-spin: still completes
+                    // thousands of acquisitions across the snapshot, without
+                    // pegging a core and starving jitter-sensitive tests that
+                    // run concurrently in the same binary.
+                    std::thread::yield_now();
                 }
             })
         };
