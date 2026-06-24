@@ -670,6 +670,7 @@ mod tests {
         }
         log.append_and_flush(RedoOp::CreateV2 {
             tx_key: key,
+            device_id: 0,
             record_offset,
             utxo_count,
             is_conflicting: false,
@@ -1327,6 +1328,7 @@ mod tests {
             }
             log.append_and_flush(RedoOp::CreateV2 {
                 tx_key: key,
+                device_id: 0,
                 record_offset: region_r,
                 utxo_count,
                 is_conflicting: false,

@@ -5989,6 +5989,9 @@ fn handle_create_batch(
         };
         redo_ops.push(RedoOp::CreateV2 {
             tx_key: key,
+            // Batch path currently allocates on store 0 (pre_allocate_create);
+            // round-robin batch placement is wired with the boot flip.
+            device_id: 0,
             record_offset: region.offset,
             utxo_count: pending.utxo_count,
             is_conflicting: pending.create_req.conflicting,

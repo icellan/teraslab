@@ -557,6 +557,9 @@ pub enum RedoOp {
     CreateV2 {
         /// Primary key of the new transaction.
         tx_key: TxKey,
+        /// Store (device) the new record was placed on. Recovery reconstructs
+        /// the record on this store's device; the offset is store-local.
+        device_id: u8,
         /// Device byte offset where the record starts.
         record_offset: u64,
         /// Number of UTXO slots written immediately after the metadata.
@@ -1162,6 +1165,7 @@ impl RedoOp {
             }
             RedoOp::CreateV2 {
                 tx_key,
+                device_id,
                 record_offset,
                 utxo_count,
                 is_conflicting,
@@ -1169,6 +1173,7 @@ impl RedoOp {
                 parent_txids,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
+                buf.push(*device_id);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&utxo_count.to_le_bytes());
                 buf.push(if *is_conflicting { 1 } else { 0 });
@@ -1557,16 +1562,17 @@ impl RedoOp {
                     utxo_count: u32::from_le_bytes(data[40..44].try_into().unwrap()),
                 })
             }
-            OP_CREATE_V2 if data.len() >= 51 => {
-                // Layout: tx_key(32) + record_offset(8) + utxo_count(4)
-                //       + is_conflicting(1) + record_len(4) + record_bytes(N)
-                //       + parents_count(2) + parents(32*M)
+            OP_CREATE_V2 if data.len() >= 52 => {
+                // Layout: tx_key(32) + device_id(1) + record_offset(8)
+                //       + utxo_count(4) + is_conflicting(1) + record_len(4)
+                //       + record_bytes(N) + parents_count(2) + parents(32*M)
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
-                let record_offset = u64::from_le_bytes(data[32..40].try_into().unwrap());
-                let utxo_count = u32::from_le_bytes(data[40..44].try_into().unwrap());
-                let is_conflicting = data[44] != 0;
-                let record_len = u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
+                let device_id = data[32];
+                let record_offset = u64::from_le_bytes(data[33..41].try_into().unwrap());
+                let utxo_count = u32::from_le_bytes(data[41..45].try_into().unwrap());
+                let is_conflicting = data[45] != 0;
+                let record_len = u32::from_le_bytes(data[46..50].try_into().unwrap()) as usize;
                 // F-G4-006: cap `record_len` so a corrupt-but-CRC-valid
                 // entry cannot inflate startup memory by a fabricated value
                 // larger than any legitimate record. Real records are
@@ -1576,11 +1582,11 @@ impl RedoOp {
                 if record_len > MAX_CREATE_V2_RECORD_BYTES {
                     return None;
                 }
-                let record_end = 49usize.checked_add(record_len)?;
+                let record_end = 50usize.checked_add(record_len)?;
                 if data.len() < record_end + 2 {
                     return None;
                 }
-                let record_bytes = data[49..record_end].to_vec();
+                let record_bytes = data[50..record_end].to_vec();
                 let parents_count_raw =
                     u16::from_le_bytes(data[record_end..record_end + 2].try_into().unwrap())
                         as usize;
@@ -1607,6 +1613,7 @@ impl RedoOp {
                 }
                 Some(RedoOp::CreateV2 {
                     tx_key: TxKey { txid },
+                    device_id,
                     record_offset,
                     utxo_count,
                     is_conflicting,
@@ -4066,6 +4073,7 @@ mod tests {
     fn round_trip_create_v2_minimal() {
         assert_round_trip(RedoOp::CreateV2 {
             tx_key: make_txid(0x90),
+            device_id: 0,
             record_offset: 0x1000,
             utxo_count: 1,
             is_conflicting: false,
@@ -4079,6 +4087,7 @@ mod tests {
         let parents: Vec<[u8; 32]> = (0..5u8).map(make_txid).map(|k| k.txid).collect();
         assert_round_trip(RedoOp::CreateV2 {
             tx_key: make_txid(0x91),
+            device_id: 0,
             record_offset: 0x2000,
             utxo_count: 4,
             is_conflicting: true,
@@ -4093,6 +4102,7 @@ mod tests {
         let big = (0..10_000u32).map(|i| i as u8).collect::<Vec<u8>>();
         assert_round_trip(RedoOp::CreateV2 {
             tx_key: make_txid(0x92),
+            device_id: 0,
             record_offset: 0x3000_0000,
             utxo_count: 1024,
             is_conflicting: true,

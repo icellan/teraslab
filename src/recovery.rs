@@ -1606,6 +1606,10 @@ fn replay_entry(
         ),
         RedoOp::CreateV2 {
             tx_key,
+            // device_id routes to the record's store once recovery is
+            // multi-store (boot flip). Single-store recovery uses its one
+            // device (device_id is always 0).
+            device_id: _,
             record_offset,
             utxo_count,
             is_conflicting,
@@ -4683,6 +4687,7 @@ mod tests {
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::CreateV2 {
             tx_key: key,
+            device_id: 0,
             record_offset,
             utxo_count,
             is_conflicting: false,
@@ -4771,6 +4776,7 @@ mod tests {
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::CreateV2 {
             tx_key: key,
+            device_id: 0,
             // DATA_REGION_OFFSET is inside the data area, but this fresh
             // allocator has not replayed/observed any allocation yet.
             record_offset: crate::allocator::DATA_REGION_OFFSET,
@@ -5166,6 +5172,7 @@ mod tests {
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::CreateV2 {
             tx_key: key,
+            device_id: 0,
             record_offset,
             utxo_count,
             is_conflicting: false,
@@ -7452,6 +7459,7 @@ mod tests {
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::CreateV2 {
             tx_key: key_b,
+            device_id: 0,
             record_offset: offset_a,
             utxo_count,
             is_conflicting: false,
