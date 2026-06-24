@@ -6893,6 +6893,14 @@ impl Engine {
         &*self.device
     }
 
+    /// Access the block device backing store `device_id` (the index entry's
+    /// `device_id` field). Use this — not [`Self::device`] — for low-level slot
+    /// ops keyed off a record's `entry.device_id`, so they hit the store the
+    /// record actually lives on.
+    pub fn device_ref_for(&self, device_id: u8) -> &dyn BlockDevice {
+        &**self.device_for(device_id)
+    }
+
     /// Snapshot the primary index and both secondary indexes to a file.
     ///
     /// Acquires the secondary locks first (dah → unmined), then the primary

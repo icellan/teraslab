@@ -3627,8 +3627,11 @@ fn compensate_replication_failure(
                     // silently fail (status mismatch). Restore by writing
                     // the slot directly instead.
                     if let Some(entry) = engine.lookup(key)
-                        && let Ok(slot) =
-                            crate::io::read_utxo_slot(engine.device(), entry.record_offset, *offset)
+                        && let Ok(slot) = crate::io::read_utxo_slot(
+                            engine.device_ref_for(entry.device_id),
+                            entry.record_offset,
+                            *offset,
+                        )
                         && slot.hash == *new_hash
                     {
                         let restored = crate::record::UtxoSlot::new_unspent(restore_hash);
@@ -3638,7 +3641,7 @@ fn compensate_replication_failure(
                         // restart; we record the failure so the caller fails
                         // the op instead of reporting a clean rollback.
                         if let Err(e) = crate::io::write_utxo_slot(
-                            engine.device(),
+                            engine.device_ref_for(entry.device_id),
                             entry.record_offset,
                             *offset,
                             &restored,
@@ -3686,8 +3689,11 @@ fn compensate_replication_failure(
                     };
                     let restore_status = prior_status.unwrap_or(crate::record::UTXO_UNSPENT);
                     if let Some(entry) = engine.lookup(key)
-                        && let Ok(mut slot) =
-                            crate::io::read_utxo_slot(engine.device(), entry.record_offset, *offset)
+                        && let Ok(mut slot) = crate::io::read_utxo_slot(
+                            engine.device_ref_for(entry.device_id),
+                            entry.record_offset,
+                            *offset,
+                        )
                         && slot.status == crate::record::UTXO_PRUNED
                     {
                         slot.status = restore_status;
@@ -3696,7 +3702,7 @@ fn compensate_replication_failure(
                         // CompensatePrune redo entry below still drives a
                         // correct recovery replay.
                         if let Err(e) = crate::io::write_utxo_slot(
-                            engine.device(),
+                            engine.device_ref_for(entry.device_id),
                             entry.record_offset,
                             *offset,
                             &slot,
