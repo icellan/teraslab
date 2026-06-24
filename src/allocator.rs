@@ -553,6 +553,16 @@ impl SlotAllocator {
         self.redo_log = Some(redo_log);
     }
 
+    /// Tag this allocator's store so its `AllocateRegion`/`FreeRegion` redo
+    /// entries carry the store's `device_id`. In a multi-store node each
+    /// store's allocator is set to its store index, so recovery routes each
+    /// region op to the right store and the per-allocator replay gate
+    /// (`device_id == redo_device_id`) accepts only its own entries. Defaults
+    /// to 0 (single store). Set once at startup before any allocation.
+    pub fn set_redo_device_id(&mut self, device_id: u8) {
+        self.redo_device_id = device_id;
+    }
+
     /// Detach the redo log (mainly for tests).
     #[cfg(test)]
     fn clear_redo_log(&mut self) {

@@ -508,8 +508,9 @@ impl Simulation {
                 // WAL fsync. Failure before this point: op never happened.
                 if redo
                     .lock()
-                    .append_and_flush(RedoOp::CreateV2 {
+                    .append_and_flush(RedoOp::Create {
                         tx_key: TxKey { txid: tx_id },
+                        device_id: 0,
                         record_offset,
                         utxo_count,
                         is_conflicting: false,

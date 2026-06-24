@@ -1,4 +1,4 @@
-//! Tests for F-G4-006: CreateV2 redo entries cap `parents_count` and
+//! Tests for F-G4-006: Create redo entries cap `parents_count` and
 //! `record_bytes.len()` at decode so a corrupt-but-CRC-valid entry
 //! cannot inflate startup memory with a fabricated parents list or
 //! oversized record slab.
@@ -19,7 +19,7 @@ fn create_v2_with_too_many_parents_is_rejected_on_reopen() {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
     let mut log = RedoLog::open(dev.clone(), 0, 8 * 1024 * 1024).unwrap();
 
-    // Append a CreateV2 with parents far above the F-G4-006 cap of 64.
+    // Append a Create with parents far above the F-G4-006 cap of 64.
     // The serializer accepts arbitrary lengths (encoder-side trusts
     // callers); the decoder enforces the cap at startup scan.
     let bad_parents: Vec<[u8; 32]> = (0..200u16)
@@ -31,8 +31,9 @@ fn create_v2_with_too_many_parents_is_rejected_on_reopen() {
         })
         .collect();
 
-    log.append_and_flush(RedoOp::CreateV2 {
+    log.append_and_flush(RedoOp::Create {
         tx_key: key(0xAA),
+        device_id: 0,
         record_offset: 4096,
         utxo_count: 1,
         is_conflicting: false,
@@ -50,7 +51,7 @@ fn create_v2_with_too_many_parents_is_rejected_on_reopen() {
     let recovered = reopened.recover().unwrap();
     assert!(
         recovered.is_empty(),
-        "F-G4-006: a CreateV2 with parents_count over MAX_CREATE_V2_PARENTS \
+        "F-G4-006: a Create with parents_count over MAX_CREATE_PARENTS \
          must be skipped on reopen; got {} entries",
         recovered.len(),
     );
@@ -61,7 +62,7 @@ fn create_v2_within_caps_round_trips() {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
     let mut log = RedoLog::open(dev.clone(), 0, 8 * 1024 * 1024).unwrap();
 
-    // A CreateV2 with parents_count <= cap and small record_bytes
+    // A Create with parents_count <= cap and small record_bytes
     // must round-trip across reopen.
     let parents: Vec<[u8; 32]> = (0..8u8)
         .map(|i| {
@@ -71,8 +72,9 @@ fn create_v2_within_caps_round_trips() {
         })
         .collect();
 
-    log.append_and_flush(RedoOp::CreateV2 {
+    log.append_and_flush(RedoOp::Create {
         tx_key: key(0xBB),
+        device_id: 0,
         record_offset: 4096,
         utxo_count: 1,
         is_conflicting: false,
@@ -84,12 +86,12 @@ fn create_v2_within_caps_round_trips() {
     drop(log);
     let reopened = RedoLog::open(dev, 0, 8 * 1024 * 1024).unwrap();
     let recovered = reopened.recover().unwrap();
-    assert_eq!(recovered.len(), 1, "in-cap CreateV2 must survive reopen");
+    assert_eq!(recovered.len(), 1, "in-cap Create must survive reopen");
 
     match &recovered[0].op {
-        RedoOp::CreateV2 { parent_txids, .. } => {
+        RedoOp::Create { parent_txids, .. } => {
             assert_eq!(parent_txids.len(), 8);
         }
-        other => panic!("expected CreateV2, got {other:?}"),
+        other => panic!("expected Create, got {other:?}"),
     }
 }

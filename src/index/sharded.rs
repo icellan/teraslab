@@ -1139,6 +1139,43 @@ impl ShardedIndex {
         Ok(sharded)
     }
 
+    /// Rebuild the index by scanning EACH store's device, stamping every
+    /// scanned entry with its store's `device_id` so reads route back to the
+    /// right store. Used by the multi-store boot path when no index snapshot is
+    /// available. With one store this is equivalent to [`Self::rebuild_in_memory`]
+    /// (device_id 0). `devices` and `allocators` are 1:1 per store.
+    pub fn rebuild_in_memory_multi_store(
+        devices: &[std::sync::Arc<dyn BlockDevice>],
+        allocators: &[SlotAllocator],
+        shard_count: usize,
+    ) -> Result<Self, IndexError> {
+        assert_eq!(
+            devices.len(),
+            allocators.len(),
+            "devices and allocators must be 1:1 per store"
+        );
+        // Scan each store independently (proven single-device scan logic).
+        let mut singles = Vec::with_capacity(devices.len());
+        let mut total = 0usize;
+        for (dev, alloc) in devices.iter().zip(allocators.iter()) {
+            let single = PrimaryBackend::rebuild(&**dev, alloc)?;
+            total += single.len();
+            singles.push(single);
+        }
+        let per_shard_hint = (total / clamp_shard_count(shard_count))
+            .max(64)
+            .saturating_mul(2);
+        let sharded =
+            Self::new_in_memory(per_shard_hint * clamp_shard_count(shard_count), shard_count)?;
+        for (store_id, single) in singles.into_iter().enumerate() {
+            for (key, mut entry) in single.iter() {
+                entry.device_id = store_id as u8;
+                sharded.register(key, entry)?;
+            }
+        }
+        Ok(sharded)
+    }
+
     // -----------------------------------------------------------------------
     // Per-shard resize entry point
     // -----------------------------------------------------------------------

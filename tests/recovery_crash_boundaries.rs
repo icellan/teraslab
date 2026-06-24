@@ -10,7 +10,7 @@
 //! 1. **Before redo fsync** — kill before any WAL flush. Assert: no record
 //!    visible, no index entry, no metadata change.
 //! 2. **After redo fsync, before record write** — replay reconstructs the
-//!    full record byte-for-byte from the new `RedoOp::CreateV2` entry.
+//!    full record byte-for-byte from the new `RedoOp::Create` entry.
 //! 3. **After record write, before replication** — replication is
 //!    independent of local commit; local state is fully consistent and
 //!    survives unchanged.
@@ -147,7 +147,7 @@ fn fresh_redo() -> RedoLog {
 // ---------------------------------------------------------------------------
 
 /// After the WAL fsync but BEFORE the engine write, the redo log has the
-/// `CreateV2` entry but the device area is still untouched. Recovery
+/// `Create` entry but the device area is still untouched. Recovery
 /// must reconstruct the record byte-for-byte from the redo payload.
 #[test]
 fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
@@ -163,8 +163,9 @@ fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
 
     // Append + fsync the WAL entry. CRASH happens HERE — engine apply
     // never runs.
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key,
+        device_id: 0,
         record_offset,
         utxo_count,
         is_conflicting: false,
@@ -178,7 +179,7 @@ fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
     assert_eq!(stats.entries_replayed, 1);
     assert_eq!(stats.entries_failed, 0);
 
-    let entry = index.lookup(&key).expect("CreateV2 replay registers index");
+    let entry = index.lookup(&key).expect("Create replay registers index");
     assert_eq!(entry.record_offset, record_offset);
     assert_eq!(entry.utxo_count, utxo_count);
 
@@ -213,8 +214,9 @@ fn boundary_after_record_write_before_replication_local_state_consistent() {
     let record_offset = alloc.allocate(base_size).unwrap();
 
     // Step 1: WAL fsync.
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key,
+        device_id: 0,
         record_offset,
         utxo_count,
         is_conflicting: false,
@@ -239,7 +241,7 @@ fn boundary_after_record_write_before_replication_local_state_consistent() {
     let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
     assert_eq!(
         stats.entries_replayed, 1,
-        "CreateV2 still applies (idempotent)"
+        "Create still applies (idempotent)"
     );
     let entry = index.lookup(&key).expect("index registered");
     assert_eq!(entry.record_offset, record_offset);
@@ -354,8 +356,9 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
 
     // WAL carries the create AND the set_mined; the device has neither
     // (crash before any device write).
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key,
+        device_id: 0,
         record_offset,
         utxo_count,
         is_conflicting: false,
@@ -440,8 +443,9 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
         .allocate(TxMetadata::record_size_for(utxo_count))
         .unwrap();
 
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key,
+        device_id: 0,
         record_offset,
         utxo_count,
         is_conflicting: false,
@@ -517,8 +521,9 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
         .allocate(TxMetadata::record_size_for(utxo_count))
         .unwrap();
 
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key,
+        device_id: 0,
         record_offset,
         utxo_count,
         is_conflicting: false,
@@ -575,7 +580,7 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
     assert!(unmined2.is_empty());
 }
 
-/// A thin smoke test: drive a CreateV2 entry through
+/// A thin smoke test: drive a Create entry through
 /// `recover_all_with_allocator` to make sure the full pipeline (which is
 /// what production startup uses) still reconstructs the record
 /// correctly. Belt-and-braces for the boundary 2 reconstruction.
@@ -588,8 +593,9 @@ fn full_pipeline_recovery_reconstructs_create_v2() {
     let base_size = TxMetadata::record_size_for(utxo_count);
     let record_offset = alloc.allocate(base_size).unwrap();
 
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key,
+        device_id: 0,
         record_offset,
         utxo_count,
         is_conflicting: false,
@@ -660,7 +666,7 @@ fn inline_block_ids(meta: &TxMetadata) -> Vec<u32> {
         .collect()
 }
 
-/// Append CreateV2 for a fresh record plus `n` SetMined entries
+/// Append Create for a fresh record plus `n` SetMined entries
 /// (block_ids 1..=n) to the WAL. Returns (key, record_offset).
 fn wal_create_plus_set_mined(
     alloc: &mut SlotAllocator,
@@ -671,8 +677,9 @@ fn wal_create_plus_set_mined(
     let (key, meta, slots) = make_record(txid_byte, 1);
     let record_bytes = build_record_bytes(&meta, &slots);
     let record_offset = alloc.allocate(TxMetadata::record_size_for(1)).unwrap();
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key,
+        device_id: 0,
         record_offset,
         utxo_count: 1,
         is_conflicting: false,
@@ -920,8 +927,9 @@ fn boundary_set_mined_overflow_realloc_does_not_clobber_neighbor() {
     let (key_b, meta_b, slots_b) = make_record(0xE5, 2);
     let record_bytes_b = build_record_bytes(&meta_b, &slots_b);
     let offset_b = alloc.allocate(TxMetadata::record_size_for(2)).unwrap();
-    redo.append_and_flush(RedoOp::CreateV2 {
+    redo.append_and_flush(RedoOp::Create {
         tx_key: key_b,
+        device_id: 0,
         record_offset: offset_b,
         utxo_count: 2,
         is_conflicting: false,

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use parking_lot::Mutex;
+use teraslab::allocator::SlotAllocator;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
@@ -482,6 +483,55 @@ fn main() {
             }
         };
 
+    // 1b. Build the per-store devices. Each configured device_path is carved
+    // into `device_split` virtual stores (SubDevices). `device_split == 1` with
+    // a single path keeps the raw device untouched (byte-identical single
+    // store). Total store count was validated to 1..=256 by
+    // `validate_safe_defaults` (the index entry's device_id is a u8).
+    let num_stores = config.device_paths.len() * config.device_split;
+    let store_devices: Vec<Arc<dyn BlockDevice>> = if num_stores == 1 {
+        vec![device.clone()]
+    } else {
+        let mut devs: Vec<Arc<dyn BlockDevice>> = Vec::with_capacity(num_stores);
+        for (i, path) in config.device_paths.iter().enumerate() {
+            // device_paths[0] is already open as `device`; open the rest.
+            let phys: Arc<dyn BlockDevice> = if i == 0 {
+                device.clone()
+            } else {
+                match DirectDevice::open(path, config.device_size, config.device_alignment) {
+                    Ok(d) => Arc::new(d),
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), err = %e, "failed to open device");
+                        std::process::exit(1);
+                    }
+                }
+            };
+            if config.device_split == 1 {
+                devs.push(phys);
+            } else {
+                match teraslab::subdevice::split_device(phys, config.device_split) {
+                    Ok(subs) => devs.extend(subs.into_iter().map(|s| s as Arc<dyn BlockDevice>)),
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), err = %e, "failed to split device into virtual stores");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        devs
+    };
+    // Store 0 backs the existing single-store boot code (snapshot load, header
+    // verify); stores 1..N are wired in below for allocators/recovery/engine.
+    let device = store_devices[0].clone();
+    if num_stores > 1 {
+        tracing::info!(
+            stores = num_stores,
+            paths = config.device_paths.len(),
+            split = config.device_split,
+            "multi-store layout: records placed round-robin across stores",
+        );
+    }
+
     // Validate device_id config format before using it.
     if let Err(e) = config.validate_device_id() {
         tracing::error!(err = %e, "FATAL: invalid config");
@@ -575,6 +625,31 @@ fn main() {
         }
     }
 
+    // 2b. Per-store allocators. Store 0 is the `allocator` just recovered;
+    // stores 1..N recover their own header. Each is tagged with its store
+    // index so its AllocateRegion/FreeRegion redo entries carry that store's
+    // device_id (recovery routes region ops to the right store's allocator).
+    let mut store_allocators: Vec<SlotAllocator> = Vec::with_capacity(num_stores);
+    let mut allocator = allocator;
+    allocator.set_redo_device_id(0);
+    store_allocators.push(allocator);
+    for (i, sdev) in store_devices.iter().enumerate().skip(1) {
+        let (mut alloc, _origin) = match recover_or_create_allocator(sdev.clone()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(
+                    store = i,
+                    err = %e,
+                    "FATAL: store allocator header unusable — refusing to start (creates \
+                     could overwrite live records). Inspect/restore the store device.",
+                );
+                std::process::exit(1);
+            }
+        };
+        alloc.set_redo_device_id(i as u8);
+        store_allocators.push(alloc);
+    }
+
     // 3. Load or rebuild index (backend selected by config)
     let index_backend_name = match &config.index.backend {
         IndexBackendMode::Memory => "memory",
@@ -606,7 +681,7 @@ fn main() {
                  using 1 shard (sharding is implemented for the in-memory backend)",
             );
         }
-        let primary = match load_primary_index_redb(&config.index, &*device, &allocator) {
+        let primary = match load_primary_index_redb(&config.index, &*device, &store_allocators[0]) {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "redb primary index opened");
                 idx
@@ -655,7 +730,7 @@ fn main() {
             fb_path,
             config.expected_records,
             &*device,
-            &allocator,
+            &store_allocators[0],
         ) {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "file-backed index opened");
@@ -667,7 +742,7 @@ fn main() {
             }
         };
         // File-backed mode: secondary indexes stay in-memory.
-        let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+        let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
         (ShardedIndex::from_single(primary), secondaries)
     } else {
         // In-memory backend (default). Builds a `ShardedIndex` at
@@ -686,14 +761,15 @@ fn main() {
                     );
                     let secondaries = if flags.dah_needs_rebuild && flags.unmined_needs_rebuild {
                         tracing::warn!("both secondary indexes need rebuild (snapshot corrupt)");
-                        rebuild_in_memory_secondaries(&*device, &allocator)
+                        rebuild_in_memory_secondaries(&*device, &store_allocators[0])
                     } else if flags.dah_needs_rebuild {
                         tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
                         // Preserve the intact unmined from the snapshot;
                         // rebuild only DAH from the device scan. Failure
                         // marks DAH as degraded but keeps unmined healthy.
                         match teraslab::index::PrimaryBackend::rebuild_secondary(
-                            &*device, &allocator,
+                            &*device,
+                            &store_allocators[0],
                         ) {
                             Ok((rebuilt_dah, _)) => SecondaryLoadOutcome {
                                 dah: DahBackend::from(rebuilt_dah),
@@ -721,7 +797,8 @@ fn main() {
                     } else if flags.unmined_needs_rebuild {
                         tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
                         match teraslab::index::PrimaryBackend::rebuild_secondary(
-                            &*device, &allocator,
+                            &*device,
+                            &store_allocators[0],
                         ) {
                             Ok((_, rebuilt_unmined)) => SecondaryLoadOutcome {
                                 dah: DahBackend::from(dah),
@@ -755,28 +832,32 @@ fn main() {
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
-                    let index =
-                        match load_sharded_index_in_memory(&*device, &allocator, index_shards) {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                                std::process::exit(1);
-                            }
-                        };
-                    let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+                    let index = match load_sharded_index_in_memory(
+                        &*device,
+                        &store_allocators[0],
+                        index_shards,
+                    ) {
+                        Ok(idx) => idx,
+                        Err(e) => {
+                            tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                            std::process::exit(1);
+                        }
+                    };
+                    let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
                     (index, secondaries)
                 }
             }
         } else {
             tracing::info!("no index snapshot found, rebuilding from device");
-            let index = match load_sharded_index_in_memory(&*device, &allocator, index_shards) {
-                Ok(idx) => idx,
-                Err(e) => {
-                    tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                    std::process::exit(1);
-                }
-            };
-            let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+            let index =
+                match load_sharded_index_in_memory(&*device, &store_allocators[0], index_shards) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                        std::process::exit(1);
+                    }
+                };
+            let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
             (index, secondaries)
         }
     };
@@ -865,8 +946,7 @@ fn main() {
     // durability intent records (RedoOp::SecondaryUnminedUpdate /
     // SecondaryDahUpdate) reconcile the on-disk redb secondary indexes AND
     // RedoOp::AllocateRegion / FreeRegion entries replay into the rebuilt
-    // allocator so freelist mutations between snapshots are not lost.
-    let mut allocator = allocator;
+    // per-store allocators so freelist mutations between snapshots are not lost.
     let mut pending_conflicting_children = Vec::new();
     let mut pending_deleted_children = Vec::new();
     // Height subsystem (deletion-tombstone design §4; BUG3): the max block
@@ -886,13 +966,13 @@ fn main() {
         let full_secondary_rebuild = !(config.index.backend == IndexBackendMode::Redb
             && secondary_status.dah_ok
             && secondary_status.unmined_ok);
-        match teraslab::recovery::recover_all_with_allocator_collecting_pending_conflicts_progress(
-            &*device,
+        match teraslab::recovery::recover_all_multi_store(
+            &store_devices,
+            &mut store_allocators,
             redo,
             &index,
             &mut dah_index,
             &mut unmined_index,
-            Some(&mut allocator),
             full_secondary_rebuild,
         ) {
             Ok((stats, pending, deleted)) => {
@@ -971,12 +1051,15 @@ fn main() {
     // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
     let redo_log: Option<Arc<Mutex<RedoLog>>> = redo_log.map(|log| Arc::new(Mutex::new(log)));
 
-    // Attach the redo log to the allocator BEFORE moving it into the engine,
-    // so all subsequent allocate/free operations are journaled and fsynced
-    // before the caller observes their effect. This closes the crash window
-    // between `persist()` snapshots.
+    // Attach the redo log to EVERY store's allocator BEFORE moving them into
+    // the engine, so all subsequent allocate/free operations are journaled and
+    // fsynced before the caller observes their effect. This closes the crash
+    // window between `persist()` snapshots. The single shared log records each
+    // store's region ops tagged with that store's redo_device_id.
     if let Some(ref log) = redo_log {
-        allocator.set_redo_log(log.clone());
+        for alloc in &mut store_allocators {
+            alloc.set_redo_log(log.clone());
+        }
     }
 
     // Attach the redo log to the primary index so file-backed hash table
@@ -990,10 +1073,21 @@ fn main() {
     // 4. Create engine — index is already a ShardedIndex (from the recovery
     // path above), so pass it directly to avoid re-wrapping in N=1.
     let locks = StripedLocks::new(config.lock_stripes);
-    let mut engine = Engine::new_with_sharded_index(
-        device.clone(),
+    // Split the store allocators into store 0 (primary) + aux stores 1..N,
+    // pairing each aux allocator with its device, and construct the multi-store
+    // engine. With one store, aux is empty and this is exactly the prior
+    // single-store engine.
+    let mut alloc_iter = store_allocators.into_iter();
+    let primary_allocator = alloc_iter
+        .next()
+        .expect("at least one store allocator (validated >= 1 store)");
+    let aux_stores: Vec<(Arc<dyn BlockDevice>, SlotAllocator)> =
+        store_devices[1..].iter().cloned().zip(alloc_iter).collect();
+    let mut engine = Engine::new_multi_store(
+        store_devices[0].clone(),
+        primary_allocator,
+        aux_stores,
         index,
-        allocator,
         locks,
         dah_index,
         unmined_index,

@@ -58,7 +58,7 @@ fn replay_create_skips_when_already_indexed_with_different_offset() {
         .unwrap();
 
     let mut log = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
-    log.append_and_flush(RedoOp::Create {
+    log.append_and_flush(RedoOp::ReplicaCreate {
         tx_key: k,
         record_offset: redo_offset,
         utxo_count,
