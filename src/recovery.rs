@@ -26,7 +26,7 @@
 //! post-mutation state (step 3 ran), or torn (a write straddled the
 //! crash). Recovery replays every entry after the last checkpoint:
 //!
-//! * `RedoOp::CreateV2` carries the full record bytes (metadata header + UTXO slots + cold data) so replay can reconstruct the on-device record byte-for-byte. The legacy `RedoOp::Create` (logs predating gap #2) registers the index only — old logs continue to replay for back-compat.
+//! * `RedoOp::Create` carries the full record bytes (metadata header + UTXO slots + cold data) so replay can reconstruct the on-device record byte-for-byte. The legacy `RedoOp::ReplicaCreate` (logs predating gap #2) registers the index only — old logs continue to replay for back-compat.
 //! * `RedoOp::Spend` / `RedoOp::Unspend` carry a `new_spent_count`, but recovery does NOT trust it: the dispatcher snapshots it before taking the per-tx lock, so it can be stale, and accumulating `±1` per entry is not idempotent across spend→unspend→respend (reorg) histories. Instead, replay writes the absolute slot state and then RECOMPUTES `meta.spent_utxos` from the count of SPENT slots (B-4). This converges to the same counter no matter how much of the log was already applied before the crash, and prevents an over-counted record from satisfying the all-spent condition and getting a stale `delete_at_height` while a UTXO is still live.
 //! * Other ops carry the same per-key payload they always did and replay against the on-device metadata header.
 //!
@@ -115,19 +115,19 @@ pub enum ReplayCause {
     /// (unknown metadata version, secondary-index update returned an
     /// error after the primary lookup succeeded, etc.). NOT tolerable.
     LogicError,
-    /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a `CreateV2` redo
+    /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a `Create` redo
     /// entry referenced an on-device record area that returned fewer
     /// bytes than the entry asked for, or the device write of the
     /// record bytes returned a short count. NOT tolerable — short I/O
     /// means the device is misbehaving and continuing would silently
     /// register an index entry pointing at incomplete record bytes.
     MissingRecordBytes,
-    /// A legacy (payload-less) `RedoOp::Create` referenced an on-device
+    /// A legacy (payload-less) `RedoOp::ReplicaCreate` referenced an on-device
     /// record that is not durable on THIS node — `read_metadata` at the
     /// entry's `record_offset` failed (the record bytes were never synced
     /// before the node stopped, or the offset was later reclaimed).
     ///
-    /// Unlike [`ReplayCause::MissingRecordBytes`] (a `CreateV2` short device I/O, which
+    /// Unlike [`ReplayCause::MissingRecordBytes`] (a `Create` short device I/O, which
     /// signals a misbehaving device), a legacy `Create` carries NO captured
     /// bytes and is only ever written by the replication / migration
     /// receiver (`replication::receiver`) for a SECONDARY copy whose
@@ -164,10 +164,10 @@ pub struct RecoveryStats {
     pub failed_corrupt: u64,
     /// Failures from a logic-level inconsistency (NOT tolerable).
     pub failed_logic: u64,
-    /// Gap #2: `CreateV2` replay could not write the full record bytes
+    /// Gap #2: `Create` replay could not write the full record bytes
     /// the entry carried (short device read/write). NOT tolerable.
     pub failed_missing_record_bytes: u64,
-    /// Legacy `RedoOp::Create` (replica/migration-received copy) whose
+    /// Legacy `RedoOp::ReplicaCreate` (replica/migration-received copy) whose
     /// on-device record bytes are not durable on this node. TOLERABLE up
     /// to a cap — the master re-replicates the key on rejoin. See
     /// [`ReplayCause::ReplicaRecordAbsent`].
@@ -982,7 +982,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 pending_resizes.remove(new_capacity);
                 ReplayResult::Applied
             }
-            RedoOp::CreateV2 {
+            RedoOp::Create {
                 record_offset,
                 record_bytes,
                 ..
@@ -995,8 +995,8 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                     replay_entry(device, index, &mut offset_owners, entry)
                 }
             }
-            // BUG-1 fix #1: route the legacy `RedoOp::Create` through the
-            // SAME `is_allocated_range` gate as `CreateV2`. The legacy
+            // BUG-1 fix #1: route the legacy `RedoOp::ReplicaCreate` through the
+            // SAME `is_allocated_range` gate as `Create`. The legacy
             // create carries no payload, so the range length is derived
             // from `utxo_count` via `record_size_for`. Without this gate a
             // stale legacy Create — whose `record_offset` was since freed
@@ -1005,7 +1005,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
             // replication / migration receiver emits this legacy op for
             // every replicated create, so every replica replays through
             // this arm on recovery; it must be guarded exactly like V2.
-            RedoOp::Create {
+            RedoOp::ReplicaCreate {
                 tx_key,
                 record_offset,
                 utxo_count,
@@ -1592,7 +1592,7 @@ fn replay_entry(
             offset,
             utxo_hash,
         } => replay_unfreeze(device, index, tx_key, *offset, Some(utxo_hash)),
-        RedoOp::Create {
+        RedoOp::ReplicaCreate {
             tx_key,
             record_offset,
             utxo_count,
@@ -1604,7 +1604,7 @@ fn replay_entry(
             *record_offset,
             *utxo_count,
         ),
-        RedoOp::CreateV2 {
+        RedoOp::Create {
             tx_key,
             // device_id routes to the record's store once recovery is
             // multi-store (boot flip). Single-store recovery uses its one
@@ -2364,10 +2364,10 @@ fn register_unique_offset(
     Ok(())
 }
 
-/// Legacy (pre-`CreateV2`) create replay.
+/// Legacy (pre-`Create`) create replay.
 ///
-/// Replays a `RedoOp::Create` entry written before gap #2 added the
-/// full-payload `RedoOp::CreateV2` variant. The entry only carries
+/// Replays a `RedoOp::ReplicaCreate` entry written before gap #2 added the
+/// full-payload `RedoOp::Create` variant. The entry only carries
 /// `record_offset + utxo_count` — there are no captured record bytes —
 /// so this function can only validate that the on-device record at
 /// `record_offset` is coherent enough to register an index entry that
@@ -2656,7 +2656,7 @@ fn replay_create_v2(
     // allocator and stripe locks. R-221 covers that parent mutation with
     // a separate `RedoOp::AppendConflictingChild` intent; full startup
     // recovery collects those entries and drains them after constructing
-    // the engine. Keep these CreateV2 fields bound so old entries still
+    // the engine. Keep these Create fields bound so old entries still
     // round-trip exactly.
     let _ = (is_conflicting, parent_txids);
 
@@ -4610,7 +4610,7 @@ mod tests {
         let ie = h.index.lookup(&key).unwrap();
 
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::Create {
+        redo.append_and_flush(RedoOp::ReplicaCreate {
             tx_key: key,
             record_offset: ie.record_offset,
             utxo_count: 5,
@@ -4622,18 +4622,18 @@ mod tests {
     }
 
     /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md) part 4:
-    /// `RedoOp::CreateV2` carries the full record bytes; replay must
+    /// `RedoOp::Create` carries the full record bytes; replay must
     /// reconstruct the on-device record byte-for-byte and register a
     /// correctly-populated index entry. Simulates the
     /// `redo-fsynced-but-engine-write-lost` boundary by writing the
-    /// CreateV2 entry to the log, leaving the device area untouched
+    /// Create entry to the log, leaving the device area untouched
     /// (zeroed), and asserting that recovery writes the full record
     /// bytes and registers the index with cached fields populated from
     /// the reconstructed metadata header (not zeros).
     #[test]
     fn replay_create_v2_reconstructs_full_record() {
         // Fresh harness — DO NOT pre-create the record. We will only
-        // append a CreateV2 redo entry and recover.
+        // append a Create redo entry and recover.
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
@@ -4683,9 +4683,9 @@ mod tests {
             record_bytes.extend_from_slice(&sb);
         }
 
-        // Open the redo log and append a CreateV2 entry.
+        // Open the redo log and append a Create entry.
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::CreateV2 {
+        redo.append_and_flush(RedoOp::Create {
             tx_key: key,
             device_id: 0,
             record_offset,
@@ -4703,7 +4703,7 @@ mod tests {
 
         // Recover.
         let stats = recover(&*data_dev as &dyn BlockDevice, &redo, &index).unwrap();
-        assert_eq!(stats.entries_replayed, 1, "CreateV2 must be applied");
+        assert_eq!(stats.entries_replayed, 1, "Create must be applied");
         assert_eq!(stats.entries_skipped, 0);
         assert_eq!(stats.entries_failed, 0);
 
@@ -4711,7 +4711,7 @@ mod tests {
         // populated from the reconstructed metadata.
         let recovered = index
             .lookup(&key)
-            .expect("CreateV2 replay must register the index entry");
+            .expect("Create replay must register the index entry");
         assert_eq!(recovered.record_offset, record_offset);
         assert_eq!(recovered.utxo_count, utxo_count);
         assert_eq!(
@@ -4774,7 +4774,7 @@ mod tests {
         record_bytes.extend_from_slice(&slot_bytes);
 
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::CreateV2 {
+        redo.append_and_flush(RedoOp::Create {
             tx_key: key,
             device_id: 0,
             // DATA_REGION_OFFSET is inside the data area, but this fresh
@@ -4800,7 +4800,7 @@ mod tests {
         assert_eq!(stats.failed_logic, 1);
         assert!(
             index.lookup(&key).is_none(),
-            "invalid CreateV2 offset must not register primary index entry"
+            "invalid Create offset must not register primary index entry"
         );
     }
 
@@ -4834,10 +4834,10 @@ mod tests {
         offset
     }
 
-    /// BUG-1 fix #1: a legacy `RedoOp::Create` whose `record_offset` is NOT
+    /// BUG-1 fix #1: a legacy `RedoOp::ReplicaCreate` whose `record_offset` is NOT
     /// owned by the allocator (it was freed and the bytes there belong to a
     /// DIFFERENT record B) must be rejected by the `is_allocated_range`
-    /// gate — exactly like `CreateV2`. Pre-fix this path skipped the gate
+    /// gate — exactly like `Create`. Pre-fix this path skipped the gate
     /// and registered A → offset, aliasing B's record so `lookup(A)` read
     /// B's bytes.
     #[test]
@@ -4863,7 +4863,7 @@ mod tests {
         let key_a = TxKey { txid: a_txid };
 
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::Create {
+        redo.append_and_flush(RedoOp::ReplicaCreate {
             tx_key: key_a,
             record_offset: offset,
             utxo_count,
@@ -4930,7 +4930,7 @@ mod tests {
         let key_a = TxKey { txid: a_txid };
 
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::Create {
+        redo.append_and_flush(RedoOp::ReplicaCreate {
             tx_key: key_a,
             record_offset: offset,
             utxo_count,
@@ -5020,7 +5020,7 @@ mod tests {
 
         // Legitimate legacy Create for the rightful owner B at offset X.
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::Create {
+        redo.append_and_flush(RedoOp::ReplicaCreate {
             tx_key: key_b,
             record_offset: offset,
             utxo_count,
@@ -5170,7 +5170,7 @@ mod tests {
         }
 
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::CreateV2 {
+        redo.append_and_flush(RedoOp::Create {
             tx_key: key,
             device_id: 0,
             record_offset,
@@ -5192,14 +5192,14 @@ mod tests {
         assert_eq!(stats2.entries_skipped, 1);
     }
 
-    /// R-031 (BC-53) regression: legacy `RedoOp::Create` replay must
+    /// R-031 (BC-53) regression: legacy `RedoOp::ReplicaCreate` replay must
     /// read on-device metadata and populate cached index fields from
     /// it, NOT register a zero-filled placeholder. Pre-fix the function
     /// blindly registered an entry with all-zero `tx_flags`,
     /// `spent_utxos`, `dah_or_preserve`, `unmined_since`, `generation`,
     /// and `block_entry_count`, so subsequent fast-path reads returned
     /// stale state for any record whose redo entry was the legacy
-    /// variant (e.g. logs written before gap #2 / `CreateV2` landed).
+    /// variant (e.g. logs written before gap #2 / `Create` landed).
     #[test]
     fn legacy_replay_create_populates_cached_fields_from_metadata() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -5238,7 +5238,7 @@ mod tests {
 
         // Append a LEGACY Create entry (no record_bytes) and recover.
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::Create {
+        redo.append_and_flush(RedoOp::ReplicaCreate {
             tx_key: key,
             record_offset,
             utxo_count,
@@ -5269,7 +5269,7 @@ mod tests {
         );
     }
 
-    /// R-031 regression (negative path): legacy `RedoOp::Create` whose
+    /// R-031 regression (negative path): legacy `RedoOp::ReplicaCreate` whose
     /// `record_offset` does not point at a coherent on-device record
     /// MUST fail closed instead of registering a zero-cached entry
     /// pointing at unreadable bytes. Pre-fix the function silently
@@ -5301,7 +5301,7 @@ mod tests {
         let record_offset = alloc.allocate(base_size).unwrap();
 
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::Create {
+        redo.append_and_flush(RedoOp::ReplicaCreate {
             tx_key: key,
             record_offset,
             utxo_count,
@@ -5318,7 +5318,7 @@ mod tests {
         assert_eq!(
             stats.failed_missing_record_bytes, 0,
             "the legacy read-back path must NOT be classified as the fatal \
-             CreateV2 short-I/O cause",
+             Create short-I/O cause",
         );
         assert!(
             index.lookup(&key).is_none(),
@@ -5351,12 +5351,12 @@ mod tests {
             "ReplicaRecordAbsent must be a non-fatal (continue) replay cause",
         );
 
-        // The genuine CreateV2 device-fault class stays fatal.
+        // The genuine Create device-fault class stays fatal.
         let mut fatal = RecoveryStats::default();
         fatal.record_failure(ReplayCause::MissingRecordBytes);
         assert!(
             check_replay_tolerance(&fatal).is_err(),
-            "a CreateV2 short-I/O (MissingRecordBytes) must still abort startup",
+            "a Create short-I/O (MissingRecordBytes) must still abort startup",
         );
         assert!(is_fatal_replay_cause(ReplayCause::MissingRecordBytes));
     }
@@ -5694,7 +5694,7 @@ mod tests {
         // Record is on device but NOT in index (simulating crash before index update)
 
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::Create {
+        redo.append_and_flush(RedoOp::ReplicaCreate {
             tx_key: key,
             record_offset: offset,
             utxo_count: 5,
@@ -7356,7 +7356,7 @@ mod tests {
     ///
     /// Two distinct keys (`key_a`, `key_b`) may route to different shards. If
     /// both once pointed to the same `record_offset` (offset aliasing), a
-    /// `CreateV2` redo entry for `key_b` must cause `register_unique_offset` to
+    /// `Create` redo entry for `key_b` must cause `register_unique_offset` to
     /// evict `key_a` (the stale alias) even when the two keys live in different
     /// shards. After recovery `key_a` must be absent and `key_b` present at the
     /// offset.
@@ -7405,13 +7405,13 @@ mod tests {
         let (txid_a, txid_b) = (key_a.txid, key_b.txid);
 
         // Allocate two adjacent regions. key_a occupies region 1 (offset_a).
-        // key_b will claim region 1 via its CreateV2 (the alias scenario).
+        // key_b will claim region 1 via its Create (the alias scenario).
         let utxo_count: u32 = 1;
         let record_size = TxMetadata::record_size_for(utxo_count);
 
         let offset_a = alloc.allocate(record_size).unwrap();
         // Allocate a second region so the allocator high-water mark advances
-        // (key_b's CreateV2 will replay at offset_a, claiming it back).
+        // (key_b's Create will replay at offset_a, claiming it back).
         let _offset_b_unused = alloc.allocate(record_size).unwrap();
 
         // Write key_a's record bytes at offset_a (the "old" record being aliased).
@@ -7454,10 +7454,10 @@ mod tests {
         slot_b.to_bytes(&mut sb);
         record_bytes.extend_from_slice(&sb);
 
-        // Append a CreateV2 for key_b at offset_a. This is the redo entry that
+        // Append a Create for key_b at offset_a. This is the redo entry that
         // survived the crash; the primary-index update for key_b did not.
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
-        redo.append_and_flush(RedoOp::CreateV2 {
+        redo.append_and_flush(RedoOp::Create {
             tx_key: key_b,
             device_id: 0,
             record_offset: offset_a,
@@ -7474,7 +7474,7 @@ mod tests {
         let redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
         let stats = recover(&*data_dev, &redo, &index).unwrap();
 
-        assert_eq!(stats.entries_replayed, 1, "CreateV2 for key_b must replay");
+        assert_eq!(stats.entries_replayed, 1, "Create for key_b must replay");
         assert_eq!(stats.failed_io, 0);
         assert_eq!(stats.failed_corrupt, 0);
 
@@ -7487,7 +7487,7 @@ mod tests {
         // key_b must be present at offset_a.
         let entry_b = index
             .lookup(&key_b)
-            .expect("key_b must be registered after CreateV2 replay");
+            .expect("key_b must be registered after Create replay");
         assert_eq!(
             entry_b.record_offset, offset_a,
             "key_b must point to offset_a after evicting the alias"

@@ -313,7 +313,7 @@ const OP_FREEZE: u8 = 4;
 const OP_UNFREEZE: u8 = 5;
 const OP_REASSIGN: u8 = 6;
 const OP_PRUNE_SLOT: u8 = 7;
-const OP_CREATE: u8 = 9;
+const OP_REPLICA_CREATE: u8 = 9;
 const OP_DELETE: u8 = 10;
 const OP_CHECKPOINT: u8 = 11;
 const OP_SET_CONFLICTING: u8 = 12;
@@ -330,9 +330,9 @@ const OP_HASHTABLE_RESIZE_COMMIT: u8 = 21;
 /// wrote at `record_offset` (metadata + UTXO slots + cold data) plus
 /// the parent_txids needed to rebuild conflicting-child links. Recovery
 /// can reconstruct the on-device record bit-for-bit identical to a
-/// successful create. The legacy [`OP_CREATE`] tag is retained for
+/// successful create. The legacy [`OP_REPLICA_CREATE`] tag is retained for
 /// back-compat decoding of redo logs written before this change.
-const OP_CREATE_V2: u8 = 22;
+const OP_CREATE: u8 = 22;
 /// Gap #8: compensation intent for unset-mined. Carries the prior
 /// `block_height` + `subtree_idx` captured BEFORE the engine applied the
 /// unset, so a crash mid-rollback can restore the block entry exactly.
@@ -377,7 +377,7 @@ const OP_APPEND_DELETED_CHILD: u8 = 34;
 /// B-5: Spend redo entry that additionally carries the slot's
 /// `utxo_hash`. A `SpendV2`/`UnspendV2` (opcodes 30/31) carries only the
 /// spending data, so a CRC-failing spent slot in the WAL window cannot be
-/// rebuilt the way `CreateV2` rebuilds a whole record — recovery
+/// rebuilt the way `Create` rebuilds a whole record — recovery
 /// fail-closed-bricks the node. The V3 entries embed the 32-byte
 /// `utxo_hash` so replay can reconstruct a torn slot from the durable
 /// redo intent. Legacy V2 entries (no hash) remain decodable with
@@ -402,17 +402,17 @@ const OP_REMOVE_CONFLICTING_CHILD: u8 = 37;
 const OP_REASSIGN_V2: u8 = 38;
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
-/// `CreateV2` redo entry. Bitcoin transactions in practice rarely have
+/// `Create` redo entry. Bitcoin transactions in practice rarely have
 /// more than a handful of conflicting parents; a wire-controlled
 /// `u16::MAX` would let a corrupt-but-CRC-valid entry pin ~2 MiB at
 /// startup per offending entry, multiplied by however many such entries
 /// the redo region contains.
-const MAX_CREATE_V2_PARENTS: usize = 64;
+const MAX_CREATE_PARENTS: usize = 64;
 /// F-G4-006: hard cap on the `record_bytes` slab decoded from a single
-/// `CreateV2` redo entry. The TeraSlab record size is bounded by
+/// `Create` redo entry. The TeraSlab record size is bounded by
 /// `TxMetadata::record_size_for(utxo_count)` plus cold data, which in
 /// the worst case the engine emits is well under 1 MiB.
-const MAX_CREATE_V2_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_CREATE_RECORD_BYTES: usize = 1024 * 1024;
 
 /// A redo log operation that can be serialized and replayed.
 #[derive(Debug, Clone, PartialEq)]
@@ -521,11 +521,11 @@ pub enum RedoOp {
         offset: u32,
         child_txid: [u8; 32],
     },
-    /// Legacy create entry: only enough payload to register the index
-    /// entry on replay. Kept so logs written before gap #2 can still be
-    /// replayed (back-compat). New writes use [`RedoOp::CreateV2`] which
-    /// carries enough state to rebuild the full on-device record.
-    Create {
+    /// Index-only create entry: just enough payload to register the index
+    /// entry on replay (no record bytes). Emitted by the replication /
+    /// migration receiver for a copy whose bytes already landed via the
+    /// streaming apply; the full-record [`RedoOp::ReplicaCreate`] carries the bytes.
+    ReplicaCreate {
         tx_key: TxKey,
         record_offset: u64,
         utxo_count: u32,
@@ -554,7 +554,7 @@ pub enum RedoOp {
     /// pwrites at `record_offset` (metadata header + UTXO slots + cold
     /// data, no device-alignment padding). `parent_txids` is empty
     /// when `is_conflicting` is false.
-    CreateV2 {
+    Create {
         /// Primary key of the new transaction.
         tx_key: TxKey,
         /// Store (device) the new record was placed on. Recovery reconstructs
@@ -867,8 +867,8 @@ impl RedoOp {
             RedoOp::ReassignV2 { .. } => OP_REASSIGN_V2,
             RedoOp::PruneSlot { .. } => OP_PRUNE_SLOT,
             RedoOp::PruneSlotIfSpentBy { .. } => OP_PRUNE_SLOT_IF_SPENT_BY,
+            RedoOp::ReplicaCreate { .. } => OP_REPLICA_CREATE,
             RedoOp::Create { .. } => OP_CREATE,
-            RedoOp::CreateV2 { .. } => OP_CREATE_V2,
             RedoOp::Delete { .. } => OP_DELETE,
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
             RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
@@ -910,8 +910,8 @@ impl RedoOp {
             | RedoOp::ReassignV2 { tx_key, .. }
             | RedoOp::PruneSlot { tx_key, .. }
             | RedoOp::PruneSlotIfSpentBy { tx_key, .. }
+            | RedoOp::ReplicaCreate { tx_key, .. }
             | RedoOp::Create { tx_key, .. }
-            | RedoOp::CreateV2 { tx_key, .. }
             | RedoOp::Delete { tx_key, .. }
             | RedoOp::SetConflicting { tx_key, .. }
             | RedoOp::SetLocked { tx_key, .. }
@@ -985,8 +985,8 @@ impl RedoOp {
             | RedoOp::UnfreezeV2 { .. }
             | RedoOp::PruneSlot { .. }
             | RedoOp::PruneSlotIfSpentBy { .. }
+            | RedoOp::ReplicaCreate { .. }
             | RedoOp::Create { .. }
-            | RedoOp::CreateV2 { .. }
             | RedoOp::Delete { .. }
             | RedoOp::AppendConflictingChild { .. }
             | RedoOp::RemoveConflictingChild { .. }
@@ -1154,7 +1154,7 @@ impl RedoOp {
                 buf.extend_from_slice(&spendable_after.to_le_bytes());
                 buf.extend_from_slice(prior_utxo_hash);
             }
-            RedoOp::Create {
+            RedoOp::ReplicaCreate {
                 tx_key,
                 record_offset,
                 utxo_count,
@@ -1163,7 +1163,7 @@ impl RedoOp {
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&utxo_count.to_le_bytes());
             }
-            RedoOp::CreateV2 {
+            RedoOp::Create {
                 tx_key,
                 device_id,
                 record_offset,
@@ -1553,16 +1553,16 @@ impl RedoOp {
                     prior_utxo_hash: prior,
                 })
             }
-            OP_CREATE if data.len() >= 44 => {
+            OP_REPLICA_CREATE if data.len() >= 44 => {
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
-                Some(RedoOp::Create {
+                Some(RedoOp::ReplicaCreate {
                     tx_key: TxKey { txid },
                     record_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
                     utxo_count: u32::from_le_bytes(data[40..44].try_into().unwrap()),
                 })
             }
-            OP_CREATE_V2 if data.len() >= 52 => {
+            OP_CREATE if data.len() >= 52 => {
                 // Layout: tx_key(32) + device_id(1) + record_offset(8)
                 //       + utxo_count(4) + is_conflicting(1) + record_len(4)
                 //       + record_bytes(N) + parents_count(2) + parents(32*M)
@@ -1579,7 +1579,7 @@ impl RedoOp {
                 // bounded by `TxMetadata::record_size_for(utxo_count)`
                 // plus cold data; 1 MiB is a comfortable upper bound that
                 // exceeds anything the engine emits.
-                if record_len > MAX_CREATE_V2_RECORD_BYTES {
+                if record_len > MAX_CREATE_RECORD_BYTES {
                     return None;
                 }
                 let record_end = 50usize.checked_add(record_len)?;
@@ -1600,7 +1600,7 @@ impl RedoOp {
                 // transactions rarely have more than a few conflicting
                 // parents; cap at 64 (still well above any observed
                 // legitimate value).
-                if parents_count_raw > MAX_CREATE_V2_PARENTS {
+                if parents_count_raw > MAX_CREATE_PARENTS {
                     return None;
                 }
                 // Cap is enforced above; allocation is now bounded.
@@ -1611,7 +1611,7 @@ impl RedoOp {
                     ptx.copy_from_slice(&data[off..off + 32]);
                     parent_txids.push(ptx);
                 }
-                Some(RedoOp::CreateV2 {
+                Some(RedoOp::Create {
                     tx_key: TxKey { txid },
                     device_id,
                     record_offset,
@@ -3186,7 +3186,7 @@ mod tests {
                 tx_key: test_key(8),
                 offset: 4,
             },
-            RedoOp::Create {
+            RedoOp::ReplicaCreate {
                 tx_key: test_key(9),
                 record_offset: 4096,
                 utxo_count: 10,
@@ -4056,7 +4056,7 @@ mod tests {
 
     #[test]
     fn round_trip_create() {
-        assert_round_trip(RedoOp::Create {
+        assert_round_trip(RedoOp::ReplicaCreate {
             tx_key: make_txid(0x19),
             record_offset: 0x0000_DEAD_BEEF_0000,
             utxo_count: 250,
@@ -4071,7 +4071,7 @@ mod tests {
     /// large record (10k bytes) to exercise the length encoding.
     #[test]
     fn round_trip_create_v2_minimal() {
-        assert_round_trip(RedoOp::CreateV2 {
+        assert_round_trip(RedoOp::Create {
             tx_key: make_txid(0x90),
             device_id: 0,
             record_offset: 0x1000,
@@ -4085,7 +4085,7 @@ mod tests {
     #[test]
     fn round_trip_create_v2_with_conflicting_parents() {
         let parents: Vec<[u8; 32]> = (0..5u8).map(make_txid).map(|k| k.txid).collect();
-        assert_round_trip(RedoOp::CreateV2 {
+        assert_round_trip(RedoOp::Create {
             tx_key: make_txid(0x91),
             device_id: 0,
             record_offset: 0x2000,
@@ -4100,7 +4100,7 @@ mod tests {
     fn round_trip_create_v2_large_record() {
         // 10 kB record bytes — exercises the 4-byte record_len field.
         let big = (0..10_000u32).map(|i| i as u8).collect::<Vec<u8>>();
-        assert_round_trip(RedoOp::CreateV2 {
+        assert_round_trip(RedoOp::Create {
             tx_key: make_txid(0x92),
             device_id: 0,
             record_offset: 0x3000_0000,
@@ -4506,7 +4506,7 @@ mod tests {
                 subtree_idx: 3,
                 unset: false,
             },
-            RedoOp::Create {
+            RedoOp::ReplicaCreate {
                 tx_key: make_txid(0x03),
                 record_offset: 8192,
                 utxo_count: 5,

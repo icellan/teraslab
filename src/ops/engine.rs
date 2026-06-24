@@ -3616,7 +3616,7 @@ impl Engine {
     /// data, no device-alignment padding).
     ///
     /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): the WAL-first
-    /// dispatch path captures these bytes inside `RedoOp::CreateV2` so
+    /// dispatch path captures these bytes inside `RedoOp::Create` so
     /// crash recovery can reconstruct the on-device record byte-for-
     /// byte without re-running the engine's create logic. Mirrors
     /// `create_at_offset`'s flag/metadata derivation exactly so the

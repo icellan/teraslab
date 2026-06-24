@@ -7111,7 +7111,7 @@ pub fn redo_entry_to_replica_op(
                 child_txid: *child_txid,
             })
         }
-        RedoOp::Create { tx_key, .. } | RedoOp::CreateV2 { tx_key, .. } => {
+        RedoOp::ReplicaCreate { tx_key, .. } | RedoOp::Create { tx_key, .. } => {
             // A record created after the baseline snapshot must be sent as a
             // delta, otherwise the target never receives it. We read the full
             // current record state from the engine (metadata, UTXOs, cold data)
@@ -7348,8 +7348,8 @@ fn shard_membership_changed_in_window(
         .iter()
         .filter(|e| e.sequence < fence_seq)
         .any(|e| match &e.op {
-            RedoOp::Create { tx_key, .. }
-            | RedoOp::CreateV2 { tx_key, .. }
+            RedoOp::ReplicaCreate { tx_key, .. }
+            | RedoOp::Create { tx_key, .. }
             | RedoOp::Delete { tx_key, .. } => ShardTable::shard_for_key(tx_key) == shard,
             _ => false,
         }))
@@ -11299,7 +11299,7 @@ mod tests {
             })
             .unwrap();
         redo.lock()
-            .append_and_flush(crate::redo::RedoOp::Create {
+            .append_and_flush(crate::redo::RedoOp::ReplicaCreate {
                 tx_key: created,
                 record_offset: 0,
                 utxo_count: 1,
@@ -11338,7 +11338,7 @@ mod tests {
         // An unrelated-shard create in the window must also be ignored.
         mutate_redo
             .lock()
-            .append_and_flush(crate::redo::RedoOp::Create {
+            .append_and_flush(crate::redo::RedoOp::ReplicaCreate {
                 tx_key: other_shard_key,
                 record_offset: 0,
                 utxo_count: 1,

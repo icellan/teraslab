@@ -668,7 +668,7 @@ mod tests {
             slot.to_bytes(&mut sb);
             record_bytes.extend_from_slice(&sb);
         }
-        log.append_and_flush(RedoOp::CreateV2 {
+        log.append_and_flush(RedoOp::Create {
             tx_key: key,
             device_id: 0,
             record_offset,
@@ -1272,8 +1272,8 @@ mod tests {
 
         // Seed an acked CREATE + SPEND. We journal the redo stream in the
         // SAME order production does — `AllocateRegion` FIRST (so recovery's
-        // `is_allocated_range` gate on `CreateV2` passes during replay),
-        // then `CreateV2`, then `SpendV2` — driving the log directly through
+        // `is_allocated_range` gate on `Create` passes during replay),
+        // then `Create`, then `SpendV2` — driving the log directly through
         // a `&mut RedoLog` (matching the recovery harness's allocate-region
         // tests). We deliberately do NOT attach the log to the allocator
         // here: `alloc.allocate` would re-lock the same `Arc<Mutex<RedoLog>>`
@@ -1326,7 +1326,7 @@ mod tests {
                 slot.to_bytes(&mut sb);
                 record_bytes.extend_from_slice(&sb);
             }
-            log.append_and_flush(RedoOp::CreateV2 {
+            log.append_and_flush(RedoOp::Create {
                 tx_key: key,
                 device_id: 0,
                 record_offset: region_r,

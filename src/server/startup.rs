@@ -165,7 +165,7 @@ pub const MAX_TOLERATED_MISSING_PRIMARY: u64 = 65_536;
 /// Cap on the number of tolerable [`ReplayCause::ReplicaRecordAbsent`]
 /// failures during startup replay.
 ///
-/// `ReplicaRecordAbsent` is a legacy (payload-less) `RedoOp::Create` for a
+/// `ReplicaRecordAbsent` is a legacy (payload-less) `RedoOp::ReplicaCreate` for a
 /// replica / migration-received SECONDARY copy whose on-device record bytes
 /// were never durable on this node — the receiver's documented contract
 /// (fsync data device, then flush redo, then ACK) allows a stop between the
@@ -229,7 +229,7 @@ pub fn check_replay_tolerance_with_cap(
         ));
     }
     if stats.failed_missing_record_bytes > 0 {
-        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a CreateV2
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a Create
         // replay could not write the full record bytes captured in the
         // redo entry. Short I/O on the record area means the device is
         // misbehaving — continuing would silently register an index
@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn replay_tolerance_rejects_one_missing_record_bytes() {
-        // The CreateV2 short-I/O class stays fatal regardless of count —
+        // The Create short-I/O class stays fatal regardless of count —
         // it signals a misbehaving device, distinct from the tolerable
         // legacy replica-record-absent class.
         let stats = RecoveryStats {

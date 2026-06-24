@@ -2224,7 +2224,7 @@ fn build_post_apply_redo_op(
         } => {
             // Match the master's WAL-first contract: the replica records
             // the index registration via the legacy `Create` variant. The
-            // CreateV2 full-payload path is the master's preferred form,
+            // Create full-payload path is the master's preferred form,
             // but on the replica the on-device record is already byte-for-
             // byte populated by `engine.create()` before this entry is
             // appended; the legacy variant is sufficient for replay because
@@ -2233,7 +2233,7 @@ fn build_post_apply_redo_op(
                 Some(e) => e,
                 None => return Ok(None),
             };
-            Ok(Some(RedoOp::Create {
+            Ok(Some(RedoOp::ReplicaCreate {
                 tx_key: *tx_key,
                 record_offset: entry.record_offset,
                 utxo_count: utxo_hashes.len() as u32,

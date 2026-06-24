@@ -639,7 +639,7 @@ pub fn init_dispatch_histograms(histograms: &'static crate::metrics::ThreadHisto
 /// 1. **Validate under lock** — parse, check shard ownership, acquire
 ///    the per-record lock. For multi-spend, snapshot the metadata.
 /// 2. **Append + fsync redo entry** — every authoritative WAL-first
-///    payload (full record bytes for `CreateV2`, real `new_spent_count`
+///    payload (full record bytes for `Create`, real `new_spent_count`
 ///    for spend/unspend) is captured BEFORE any device write so
 ///    recovery can reconstruct the post-mutation state byte-for-byte.
 ///    Redo open/create failure is fatal at startup; redo flush failure
@@ -653,7 +653,7 @@ pub fn init_dispatch_histograms(histograms: &'static crate::metrics::ThreadHisto
 /// 5. **Respond** — send the success/error response to the client.
 ///
 /// Crash recovery walks the redo log after the last checkpoint and
-/// idempotently re-applies entries; CreateV2 fully reconstructs
+/// idempotently re-applies entries; Create fully reconstructs
 /// records, spend / unspend overwrite `meta.spent_utxos` with the
 /// correct value the dispatch path computed before the WAL flush.
 #[tracing::instrument(
@@ -5766,7 +5766,7 @@ fn handle_create_batch(
         .collect();
 
     // Phase 1: Validate ownership, check blobs, and build the record bytes
-    // that will be captured in CreateV2 after batch allocation assigns
+    // that will be captured in Create after batch allocation assigns
     // record offsets.
     struct PendingCreate<'a, 'p> {
         idx: usize,
@@ -5937,7 +5937,7 @@ fn handle_create_batch(
 
     // Phase 1b: reserve all successful create candidates IN MEMORY (issue #14).
     // The `AllocateRegion` entries are NOT journaled here — they are written
-    // ATOMICALLY with the `CreateV2` entries in Phase 2's single batch, so a
+    // ATOMICALLY with the `Create` entries in Phase 2's single batch, so a
     // redo-log-full create can never leave a durable allocation without its
     // record. On a Phase 2 failure the reservations are rolled back in memory
     // (no journal needed, which is essential since the log is full). This
@@ -5963,8 +5963,8 @@ fn handle_create_batch(
         }
     };
     // Seed the redo batch with the not-yet-durable AllocateRegion entries so
-    // they fsync together with the CreateV2 entries pushed in the loop below.
-    // They replay before any CreateV2 (lower sequence numbers), so every record
+    // they fsync together with the Create entries pushed in the loop below.
+    // They replay before any Create (lower sequence numbers), so every record
     // has its region allocated first. AllocateRegion has no replica op, so the
     // Phase 4 fan-out (driven by `repl_ops_by_key`) ignores them.
     redo_ops.extend_from_slice(pending_alloc.allocate_region_redo_ops());
@@ -5987,7 +5987,7 @@ fn handle_create_batch(
         } else {
             Vec::new()
         };
-        redo_ops.push(RedoOp::CreateV2 {
+        redo_ops.push(RedoOp::Create {
             tx_key: key,
             // Batch path currently allocates on store 0 (pre_allocate_create);
             // round-robin batch placement is wired with the boot flip.
@@ -6007,12 +6007,12 @@ fn handle_create_batch(
         });
     }
 
-    // Phase 2: WAL-first — write [AllocateRegion… + CreateV2…] as ONE atomic
+    // Phase 2: WAL-first — write [AllocateRegion… + Create…] as ONE atomic
     // batch (a single fsync, all-or-nothing).
     let redo_range = match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
         Ok(range) => {
             // The AllocateRegion entries are now durable alongside their
-            // CreateV2 — finalize the in-memory reservations.
+            // Create — finalize the in-memory reservations.
             engine.allocator().lock().commit_pending(pending_alloc);
             range
         }
@@ -7675,7 +7675,7 @@ fn handle_delete_batch(
                 };
                 if let Err(e) = write_redo_ops(
                     redo_log,
-                    &[RedoOp::Create {
+                    &[RedoOp::ReplicaCreate {
                         tx_key: *key,
                         record_offset: entry.record_offset,
                         utxo_count: snap.slots.len() as u32,
@@ -20235,7 +20235,7 @@ mod tests {
     /// (redo log full) returns `ERR_STORAGE_IO` and ticks `creates_failed` +
     /// `operations{create,err_storage}`.
     ///
-    /// Issue #14: with the atomic `AllocateRegion`+`CreateV2` batch, a create
+    /// Issue #14: with the atomic `AllocateRegion`+`Create` batch, a create
     /// that FITS the remaining redo space now succeeds in ONE flush (the old
     /// code did two flushes and could fail the second after durably allocating
     /// — an orphan). So with an 8 KiB log (header block + ONE entries block),
@@ -20249,7 +20249,7 @@ mod tests {
 
         let h = RedoDispatchHarness::new_with_exact_redo_log_size(8192);
 
-        // First create: the atomic [AllocateRegion + CreateV2] batch fills the
+        // First create: the atomic [AllocateRegion + Create] batch fills the
         // single entries block in one flush → succeeds (no orphan).
         let resp1 = h.create_tx(DispatchTestHarness::make_txid(194), 1);
         assert_eq!(
@@ -20273,7 +20273,7 @@ mod tests {
         assert_eq!(
             m.creates_failed.get() - before_fail,
             1,
-            "creates_failed += 1 (CreateV2 redo append failed)"
+            "creates_failed += 1 (Create redo append failed)"
         );
         assert_eq!(
             m.operations.get(OpCode::Create, Outcome::ErrStorage) - before_err_storage,
@@ -20286,7 +20286,7 @@ mod tests {
     /// must NOT durably allocate. The in-memory reservation is rolled back, so
     /// the allocator high-water mark is unchanged and recovery finds no orphan
     /// region. Pre-hardening this leaked a durable `AllocateRegion` with no
-    /// `CreateV2` (the unrecoverable-rebuild bug).
+    /// `Create` (the unrecoverable-rebuild bug).
     #[test]
     fn create_redo_full_rolls_back_reservation_no_orphan() {
         let _m = test_metrics();
@@ -20320,10 +20320,10 @@ mod tests {
 
         // REL-105: in-memory high-water-mark equality alone does not prove the
         // ABSENCE of a durable orphan — the orphan bug (issue #14) was a
-        // DURABLE `AllocateRegion` with no matching `CreateV2`, which only a
+        // DURABLE `AllocateRegion` with no matching `Create`, which only a
         // crash+recovery cycle surfaces. Reopen the redo log from its backing
         // device (simulating a restart) and replay it: every recovered
-        // `AllocateRegion` MUST be covered by a `CreateV2` for the same region
+        // `AllocateRegion` MUST be covered by a `Create` for the same region
         // offset. A surviving orphan AllocateRegion would fail this check even
         // though the in-memory `next_offset` looks clean.
         let recovered = crate::redo::RedoLog::open(
@@ -20345,13 +20345,13 @@ mod tests {
         let create_offsets: std::collections::HashSet<u64> = recovered
             .iter()
             .filter_map(|entry| match &entry.op {
-                RedoOp::CreateV2 { record_offset, .. } => Some(*record_offset),
+                RedoOp::Create { record_offset, .. } => Some(*record_offset),
                 _ => None,
             })
             .collect();
 
         // The one successful create durably wrote exactly one [AllocateRegion +
-        // CreateV2] pair; the doomed create wrote neither. So recovery sees one
+        // Create] pair; the doomed create wrote neither. So recovery sees one
         // allocate and one create, sharing the same region offset.
         assert_eq!(
             allocate_offsets.len(),
@@ -20362,7 +20362,7 @@ mod tests {
         assert_eq!(
             create_offsets.len(),
             1,
-            "exactly one CreateV2 survived recovery (the successful create)"
+            "exactly one Create survived recovery (the successful create)"
         );
         let orphans: Vec<u64> = allocate_offsets
             .difference(&create_offsets)
@@ -20370,7 +20370,7 @@ mod tests {
             .collect();
         assert!(
             orphans.is_empty(),
-            "recovery found durable AllocateRegion(s) with no matching CreateV2 \
+            "recovery found durable AllocateRegion(s) with no matching Create \
              (orphan region survived a simulated restart): offsets {orphans:?}"
         );
     }
@@ -21472,7 +21472,7 @@ mod tests {
                     .unwrap();
             let redo_log = Arc::new(Mutex::new(redo_log));
             // Attach the redo log so allocator reservations during create are
-            // journaled (recovery's CreateV2 gate requires the AllocateRegion
+            // journaled (recovery's Create gate requires the AllocateRegion
             // entry to precede the create).
             engine.allocator().lock().set_redo_log(redo_log.clone());
             Self {
@@ -22319,7 +22319,7 @@ mod tests {
     // allocator_rollback_failure` tested the OLD path where a create's redo
     // failure triggered a journaled allocator `free()` that could ALSO fail and
     // surface "allocator rollback errors". That path no longer exists — the
-    // AllocateRegion is now journaled atomically with CreateV2 and a Phase-2
+    // AllocateRegion is now journaled atomically with Create and a Phase-2
     // failure rolls the reservation back IN MEMORY (infallible, no journal). The
     // new behavior is covered by `create_redo_full_rolls_back_reservation_no_orphan`.)
 
@@ -22403,16 +22403,16 @@ mod tests {
         );
 
         assert_eq!(resp.status, STATUS_OK);
-        // Issue #14: AllocateRegion + CreateV2 are now written in ONE atomic
+        // Issue #14: AllocateRegion + Create are now written in ONE atomic
         // redo flush, so the create batch fsyncs ONCE — two device syncs (the
         // entries pwrite + the F-G4-001 persisted-header rewrite carrying the
         // new `next_sequence`). This also halves the create fsync count vs the
-        // old separate allocator-reservation + CreateV2 flushes.
+        // old separate allocator-reservation + Create flushes.
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
             2,
             "create batch should fsync ONCE (entries + F-G4-001 header) now that \
-             AllocateRegion and CreateV2 share one atomic redo batch"
+             AllocateRegion and Create share one atomic redo batch"
         );
 
         let entries = redo_log.lock().recover().unwrap();
@@ -22422,7 +22422,7 @@ mod tests {
             .count();
         let create_entries = entries
             .iter()
-            .filter(|entry| matches!(entry.op, RedoOp::CreateV2 { .. }))
+            .filter(|entry| matches!(entry.op, RedoOp::Create { .. }))
             .count();
         assert_eq!(allocate_entries, items.len());
         assert_eq!(create_entries, items.len());
