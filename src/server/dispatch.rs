@@ -12494,16 +12494,16 @@ mod tests {
         ranges.sort_by_key(|range| range.0);
 
         assert_eq!(ranges, vec![(1, 1), (2, 2)]);
-        // F-G4-001 made flush() emit two device syncs per effective
-        // flush: one for the entries pwrite and one for the persisted-
-        // header pwrite. Group commit collapses the two concurrent
-        // writers into one effective flush, so the post-open delta is
-        // exactly 2 syncs.
+        // PERF #5: flush() now folds the F-G4-001 header pwrite into the SAME
+        // fsync as the entries (one device.sync() flushes both blocks), so an
+        // effective flush is ONE sync. Group commit collapses the two
+        // concurrent writers into one effective flush, so the post-open delta
+        // is exactly 1 sync.
         assert_eq!(
             redo_dev.sync_count() - baseline_syncs,
-            2,
+            1,
             "concurrent dispatch writers should share one effective flush \
-             (one entries sync + one header sync under F-G4-001)"
+             (one fsync covering entries + folded header under PERF #5)"
         );
 
         let entries = redo_log.lock().recover().expect("recover grouped entries");
@@ -12647,12 +12647,10 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_OK, "all spends should succeed");
         assert_eq!(
-            flush_syncs,
-            2,
+            flush_syncs, 1,
             "the whole {N}-txid-group SpendBatch RPC must be ONE effective redo \
-             flush (entries sync + header sync), not one per txid-group; got \
-             {flush_syncs} syncs (= {} flushes)",
-            flush_syncs / 2
+             flush — one fsync (entries + folded header, PERF #5) — not one per \
+             txid-group; got {flush_syncs} syncs",
         );
     }
 
@@ -22556,16 +22554,17 @@ mod tests {
         );
 
         assert_eq!(resp.status, STATUS_OK);
-        // Issue #14: AllocateRegion + CreateV2 are now written in ONE atomic
-        // redo flush, so the create batch fsyncs ONCE — two device syncs (the
-        // entries pwrite + the F-G4-001 persisted-header rewrite carrying the
-        // new `next_sequence`). This also halves the create fsync count vs the
-        // old separate allocator-reservation + CreateV2 flushes.
+        // Issue #14: AllocateRegion + CreateV2 are written in ONE atomic redo
+        // flush. PERF #5: that flush now issues a SINGLE device sync — the
+        // F-G4-001 header pwrite (carrying the new `next_sequence`) is folded
+        // into the same fsync as the entries instead of a second standalone
+        // fsync. So the whole create batch costs exactly one fsync.
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
-            2,
-            "create batch should fsync ONCE (entries + F-G4-001 header) now that \
-             AllocateRegion and CreateV2 share one atomic redo batch"
+            1,
+            "create batch should fsync ONCE (single sync covering entries + \
+             folded F-G4-001 header) now that AllocateRegion and CreateV2 share \
+             one atomic redo batch"
         );
 
         let entries = redo_log.lock().recover().unwrap();
