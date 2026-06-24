@@ -160,6 +160,9 @@ pub struct ValidatedSpend<'a> {
     pub block_ids: Vec<u32>,
     /// Record offset on the block device (needed for apply).
     pub(crate) record_offset: u64,
+    /// Store (device) holding the record, from the index entry's `device_id`.
+    /// `apply` routes all device I/O through this store.
+    pub(crate) device_id: u8,
     /// Metadata read during validation (needed for apply).
     pub(crate) metadata: TxMetadata,
     /// Request params needed during apply (DAH evaluation).
