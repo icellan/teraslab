@@ -3596,6 +3596,21 @@ impl Engine {
     /// F-G2-001: metadata reads on this lock-free path go through
     /// `read_metadata_for_key` so a `delete + create_at_offset` race never
     /// returns another transaction's cold data.
+    ///
+    /// # Concurrency (g2 — barrier-dependent)
+    ///
+    /// Unlike `read_slots`/`read_block_entry` (which snapshot the record under a
+    /// single per-record `io::record_read_guard`), the trailing cold-data block
+    /// read here has NO per-record `io_locks()` coverage. It is g2-safe ONLY
+    /// because every production caller runs inside a dispatch handler holding the
+    /// SHARED side of the engine `dispatch_visibility_barrier` (see
+    /// `needs_dispatch_visibility_barrier` — `OP_GET_BATCH` etc.), mutually
+    /// exclusive with the EXCLUSIVE side every mutation takes (and thus with the
+    /// create/delete that frees and reuses this block). Do NOT call from a
+    /// non-barrier path, and do NOT move cold-data writes to a non-barrier
+    /// background task, without first adding per-record `io_locks()` coverage to
+    /// this read (mirror `read_block_entry`) — either would reopen the g2
+    /// torn/ABA aliasing race.
     pub fn read_cold_data(&self, key: &TxKey) -> Result<Vec<u8>, SpendError> {
         let entry = self
             .index
@@ -3682,6 +3697,9 @@ impl Engine {
 
     /// Return the distinct parent txids encoded in a child's cold-data
     /// input blob.
+    ///
+    /// Inherits `read_cold_data`'s g2 concurrency contract: barrier-dependent,
+    /// no per-record `io_locks()` coverage of the cold-data read.
     pub fn parent_txids_for_child(&self, child_key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let cold_bytes = self.read_cold_data(child_key)?;
         extract_parent_txids_from_cold_data(&cold_bytes).map_err(|err| SpendError::StorageError {
@@ -4569,6 +4587,17 @@ impl Engine {
     }
 
     /// Read all conflicting children txids for a transaction.
+    ///
+    /// # Concurrency (g2 — barrier-dependent)
+    ///
+    /// The children-block read on this lock-free path has NO per-record
+    /// `io_locks()` coverage; it is g2-safe ONLY because production callers run
+    /// inside a dispatch handler holding the SHARED `dispatch_visibility_barrier`
+    /// (mutually exclusive with the EXCLUSIVE side every mutation — incl. the
+    /// append/remove-child writers that free/reuse this block — takes). Do not
+    /// call from a non-barrier path or move the child writers off the barrier
+    /// without adding per-record `io_locks()` coverage here (mirror
+    /// `read_block_entry`).
     pub fn read_conflicting_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let entry = self
             .index
@@ -4884,6 +4913,14 @@ impl Engine {
     ///
     /// F-X-022: Aerospike `addDeletedChildren` parity. Returns an empty
     /// vec when the parent has never had a child pruned against it.
+    ///
+    /// # Concurrency (g2 — barrier-dependent)
+    ///
+    /// Same contract as `read_conflicting_children`: the children-block read has
+    /// NO per-record `io_locks()` coverage and is g2-safe ONLY via the shared
+    /// `dispatch_visibility_barrier` held by production read handlers. Keep it
+    /// behind the barrier (or add per-record `io_locks()` coverage) to avoid
+    /// reopening the g2 torn/ABA race.
     pub fn read_deleted_children(&self, key: &TxKey) -> Result<Vec<[u8; 32]>, SpendError> {
         let entry = self
             .index
