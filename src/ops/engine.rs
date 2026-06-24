@@ -6428,10 +6428,12 @@ impl Engine {
     /// transaction's stripe lock. Mutation handlers should not use this as a
     /// validate-then-write primitive unless they already hold that stripe.
     ///
-    /// F-G2-001: a metadata read is performed first via
-    /// `read_metadata_for_key` to verify the record at `record_offset` still
-    /// belongs to `key.txid` — closing the `delete + create_at_offset`
-    /// aliasing race for lock-free readers.
+    /// F-G2-001: the identity (`tx_id`) check and the slot read are taken as a
+    /// single coherent snapshot under ONE record-level offset guard (see
+    /// [`io::read_record_identity_and_slot`]), closing the
+    /// `delete + create_at_offset` ABA aliasing race for lock-free readers — a
+    /// reused offset that ABA-restored `key.txid` can no longer hand back a
+    /// different transaction's slot. A mismatch surfaces as `TxNotFound`.
     pub fn read_slot(&self, key: &TxKey, offset: u32) -> Result<UtxoSlot, SpendError> {
         let entry = self
             .index
@@ -6440,25 +6442,33 @@ impl Engine {
                 detail: format!("index lookup failed: {e}"),
             })?
             .ok_or(SpendError::TxNotFound)?;
-        // Verify the offset still belongs to this key before reading the slot
-        // (F-G2-001 second-line defense; subsumes F-G2-010 doc concern).
-        let _meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        let slot = self.read_slot_fast(entry.record_offset, offset)?;
-        // F-G2-001 (re-verify): a `delete + create_at_offset` race that
-        // landed between the metadata check and the slot read can give
-        // us another transaction's slot. Re-confirm tx_id ownership of
-        // the offset; a mismatch surfaces as `TxNotFound`.
-        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
+        // Identity + slot read as ONE snapshot under a single offset guard: no
+        // concurrent `write_record_bytes` can change the record's identity
+        // between the header read and the slot read.
+        let (identity, slot) =
+            io::read_record_identity_and_slot(&*self.device, entry.record_offset, offset).map_err(
+                |e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                },
+            )?;
+        if identity.tx_id != key.txid {
+            return Err(SpendError::TxNotFound);
+        }
         Ok(slot)
     }
 
     /// Read every UTXO slot for a transaction.
     ///
-    /// This resolves the primary index once, reads metadata once to get the
-    /// authoritative slot count, then performs one aligned slot-region read.
-    /// The metadata read goes through `read_metadata_for_key` so a stale
-    /// offset (post-delete + reuse) is surfaced as `TxNotFound` instead of
-    /// returning slots from an unrelated transaction (F-G2-001).
+    /// This resolves the primary index once, then reads the record identity
+    /// (for the authoritative slot count + ownership check) AND every slot as a
+    /// single coherent snapshot under ONE record-level offset guard (see
+    /// [`io::read_record_identity_and_slots`]). Holding one guard across the
+    /// header and slot reads closes the F-G2-001 ABA aliasing race: the prior
+    /// read → slots → recheck sequence released the offset guard between reads,
+    /// so a `delete → create-other → recreate-same-txid` cycle could ABA-restore
+    /// `key.txid` after the slots had been read from the intervening occupant. A
+    /// stale/reused offset (identity no longer `key.txid`) now surfaces as
+    /// `TxNotFound` instead of returning another transaction's slots.
     pub fn read_slots(&self, key: &TxKey) -> Result<Vec<UtxoSlot>, SpendError> {
         let entry = self
             .index
@@ -6467,19 +6477,15 @@ impl Engine {
                 detail: format!("index lookup failed: {e}"),
             })?
             .ok_or(SpendError::TxNotFound)?;
-        let meta = self.read_metadata_for_key(key, entry.record_offset)?;
-        let slots = io::read_all_utxo_slots(&*self.device, entry.record_offset, meta.utxo_count)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
-        // F-G2-001 (re-verify): the slot read above is not held under the
-        // stripe lock. A concurrent `delete + create_at_offset` between
-        // the metadata check and the slot read can reuse this offset for
-        // a different transaction. Re-read metadata and confirm the
-        // record at `record_offset` still belongs to `key`. A mismatch
-        // surfaces as `TxNotFound` — same outcome the caller would have
-        // seen had they observed the post-unregister state.
-        let _meta_check = self.read_metadata_for_key(key, entry.record_offset)?;
+        let (identity, slots) =
+            io::read_record_identity_and_slots(&*self.device, entry.record_offset).map_err(
+                |e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                },
+            )?;
+        if identity.tx_id != key.txid {
+            return Err(SpendError::TxNotFound);
+        }
         Ok(slots)
     }
 

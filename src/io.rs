@@ -1053,16 +1053,25 @@ pub fn read_utxo_slot(
     record_offset: u64,
     slot_index: u32,
 ) -> Result<UtxoSlot> {
+    // F-X-007 (BC-02): record-level read guard, matching `read_all_utxo_slots`
+    // — so a concurrent `write_record_bytes` (create into a reused region) or a
+    // slot write cannot be observed mid-copy. Keyed by the record base offset.
+    let _r = io_locks().read(record_offset);
+    read_utxo_slot_unguarded(device, record_offset, slot_index)
+}
+
+/// Guard-free body of [`read_utxo_slot`]. The caller MUST already hold
+/// `io_locks().read(record_offset)` (see [`read_record_identity_and_slot`]).
+fn read_utxo_slot_unguarded(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+    slot_index: u32,
+) -> Result<UtxoSlot> {
     let align = device.alignment();
     let slot_offset = record_offset + TxMetadata::utxo_slot_offset(slot_index);
     let aligned_base = slot_offset / align as u64 * align as u64;
     let intra_offset = (slot_offset - aligned_base) as usize;
     let total_read = align_up(intra_offset + UTXO_SLOT_SIZE, align);
-
-    // F-X-007 (BC-02): record-level read guard, matching `read_all_utxo_slots`
-    // — so a concurrent `write_record_bytes` (create into a reused region) or a
-    // slot write cannot be observed mid-copy. Keyed by the record base offset.
-    let _r = io_locks().read(record_offset);
 
     let mut buf = AlignedBuf::new(total_read, align);
     device.pread_exact_at(&mut buf, aligned_base)?;
@@ -1078,6 +1087,28 @@ pub fn read_utxo_slot(
 /// snapshot paths that need the full slot set. It avoids one aligned
 /// `pread` per slot while preserving the same O_DIRECT alignment rules.
 pub fn read_all_utxo_slots(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+    slot_count: u32,
+) -> Result<Vec<UtxoSlot>> {
+    // F-X-007 (BC-02): record-level read guard so a concurrent
+    // `write_record_bytes` (create into a reused region) or a slot write
+    // cannot be observed mid-copy. Keyed by the record's base offset —
+    // the same key every reader and writer of this record uses — so the
+    // guard excludes whole-record and slot writers regardless of which
+    // 4 KiB page the slot region itself lands in.
+    let _r = io_locks().read(record_offset);
+    read_all_utxo_slots_unguarded(device, record_offset, slot_count)
+}
+
+/// Guard-free body of [`read_all_utxo_slots`].
+///
+/// The caller MUST already hold `io_locks().read(record_offset)`. Used by
+/// [`read_record_identity_and_slots`], which holds ONE guard across the header
+/// and slot reads so they form a coherent single-instance snapshot (F-G2-001
+/// ABA fix). Do not call this without the guard held — a concurrent
+/// `write_record_bytes` could be observed mid-copy.
+fn read_all_utxo_slots_unguarded(
     device: &dyn BlockDevice,
     record_offset: u64,
     slot_count: u32,
@@ -1100,14 +1131,6 @@ pub fn read_all_utxo_slots(
         })?;
     let total_read = align_up(intra_offset + slot_bytes, align);
 
-    // F-X-007 (BC-02): record-level read guard so a concurrent
-    // `write_record_bytes` (create into a reused region) or a slot write
-    // cannot be observed mid-copy. Keyed by the record's base offset —
-    // the same key every reader and writer of this record uses — so the
-    // guard excludes whole-record and slot writers regardless of which
-    // 4 KiB page the slot region itself lands in.
-    let _r = io_locks().read(record_offset);
-
     let mut buf = AlignedBuf::new(total_read, align);
     device.pread_exact_at(&mut buf, aligned_base)?;
 
@@ -1117,6 +1140,58 @@ pub fn read_all_utxo_slots(
         slots.push(UtxoSlot::from_bytes(&buf[start..start + UTXO_SLOT_SIZE])?);
     }
     Ok(slots)
+}
+
+/// Read a record's immutable identity (`tx_id`, `utxo_count`, `locktime`) AND
+/// all of its UTXO slots as ONE coherent snapshot, holding a single
+/// record-level read guard across both reads.
+///
+/// # F-G2-001 ABA fix
+///
+/// The previous reader sequence — `read_metadata` → `read_all_utxo_slots` →
+/// metadata-recheck — took the offset guard separately for each read and
+/// released it between them. Because the guard is keyed by **offset, not
+/// identity**, a `delete → create-other → delete → recreate-same-txid` cycle
+/// (LIFO freelist reuse of the same offset) could restore the original `tx_id`
+/// (classic ABA) *after* the slots had already been read from the intervening
+/// occupant, so the value-equality `tx_id` recheck passed while the returned
+/// slots belonged to a different transaction. Live repro:
+/// `tests/g2_delete_race.rs::delete_does_not_alias_concurrent_create`.
+///
+/// Holding ONE `io_locks().read(record_offset)` across the header read and the
+/// slot read excludes `write_record_bytes` (`io_locks().write(record_offset)`)
+/// for the whole snapshot, so the returned identity and slots are guaranteed to
+/// be the same record instance. The caller still verifies
+/// `identity.tx_id == key.txid` and maps a mismatch to `TxNotFound` — covering
+/// the harmless residual case where the offset was reused before the guard was
+/// taken (the in-snapshot identity simply belongs to a different txid).
+pub fn read_record_identity_and_slots(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+) -> Result<(TxIdentity, Vec<UtxoSlot>)> {
+    let _r = io_locks().read(record_offset);
+    // `read_identity` is itself guard-free; both reads run under the single
+    // guard taken above, so no writer can change the record's identity between
+    // the header read and the slot read.
+    let identity = read_identity(device, record_offset)?;
+    let slots = read_all_utxo_slots_unguarded(device, record_offset, identity.utxo_count)?;
+    Ok((identity, slots))
+}
+
+/// Single-slot counterpart of [`read_record_identity_and_slots`]: reads the
+/// record identity and the slot at `slot_index` under one record-level read
+/// guard (F-G2-001 ABA fix). Matches `read_slot`'s prior behavior — the caller
+/// checks `identity.tx_id` for ownership; `slot_index` is not bounds-checked
+/// here.
+pub fn read_record_identity_and_slot(
+    device: &dyn BlockDevice,
+    record_offset: u64,
+    slot_index: u32,
+) -> Result<(TxIdentity, UtxoSlot)> {
+    let _r = io_locks().read(record_offset);
+    let identity = read_identity(device, record_offset)?;
+    let slot = read_utxo_slot_unguarded(device, record_offset, slot_index)?;
+    Ok((identity, slot))
 }
 
 /// Write a single [`UtxoSlot`] at `slot_index` within the record at `record_offset`.
