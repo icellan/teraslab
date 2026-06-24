@@ -1333,6 +1333,15 @@ impl Engine {
         // its guard across check + insert + count mutation + resize.
         let index_shard = self.index.index_shard_for_key(&key);
         let mut guard = self.index.write_shard_at(index_shard);
+        // Observability: count writers inside the sharded primary-index insert
+        // critical section. The gauge previously fired only in the secondary
+        // (DAH/unmined) commits, which are serialized by a single per-index
+        // Mutex and so never read above 1 — and create skipped them entirely
+        // when `unmined_since == 0` (block_height 0), leaving the scaling test's
+        // gauge_max stuck at 0. Held per-SHARD here, concurrent creators on
+        // different shards overlap, so the high-water mark reflects real
+        // sharded-create parallelism. Guard drops with the function scope.
+        let _writer_gauge = crate::metrics::writer_enter();
         // Reject-not-overwrite: the only safe insert-if-absent is a
         // check under the same write lock that performs the insert.
         if guard.lookup_checked(&key)?.is_some() {
