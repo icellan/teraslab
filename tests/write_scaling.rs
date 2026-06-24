@@ -153,6 +153,68 @@ fn pprof_endpoint_is_single_flight() {
     assert_eq!(s1, 200, "first profile must still succeed");
 }
 
+// ---- per-PR: COLD_DATA_OUTPUTS (#20) returns only the parent's outputs
+// section, a strictly smaller wire payload than full COLD_DATA. ----
+#[test]
+fn cold_data_outputs_ships_only_the_outputs_section() {
+    use teraslab::protocol::codec::{FieldMask, decode_get_response_checked, encode_get_batch};
+    use teraslab::protocol::frame::RequestFrame;
+    use teraslab::protocol::opcodes::{OP_GET_BATCH, STATUS_OK};
+
+    let srv = spawn_write_server();
+    let outputs_len = 128usize;
+    // One parent whose cold data is inputs(32) + outputs(`outputs_len`) + inpoints(16).
+    let txids = seed_cold_records(srv.tcp_port, 1, outputs_len);
+
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{}", srv.tcp_port)).unwrap();
+    stream.set_nodelay(true).unwrap();
+
+    let get = |stream: &mut std::net::TcpStream, mask: u32| -> Vec<u8> {
+        let payload = encode_get_batch(mask, &[txids[0]]);
+        let resp = send_frame(
+            stream,
+            &RequestFrame {
+                request_id: 1,
+                op_code: OP_GET_BATCH,
+                flags: 0,
+                payload: payload.into(),
+            },
+        );
+        let items = decode_get_response_checked(&resp.payload, 4).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, STATUS_OK, "get must succeed");
+        items[0].data.clone()
+    };
+
+    let full = get(&mut stream, FieldMask::COLD_DATA);
+    let outs = get(&mut stream, FieldMask::COLD_DATA_OUTPUTS);
+
+    // make_cold_data fills the outputs section with bytes 0..outputs_len.
+    let expected: Vec<u8> = (0..outputs_len).map(|i| (i & 0xff) as u8).collect();
+    assert!(
+        outs.len() >= 4,
+        "outputs response must carry a length prefix"
+    );
+    let out_len = u32::from_le_bytes(outs[0..4].try_into().unwrap()) as usize;
+    assert_eq!(
+        out_len, outputs_len,
+        "outputs length must match the seeded section"
+    );
+    assert_eq!(
+        &outs[4..4 + out_len],
+        &expected[..],
+        "outputs bytes must be exactly the parent's outputs section"
+    );
+    // The whole point of #20: outputs-only is a smaller wire payload than the
+    // full inputs+outputs+inpoints cold blob.
+    assert!(
+        outs.len() < full.len(),
+        "outputs-only ({}) must be smaller than full cold data ({})",
+        outs.len(),
+        full.len()
+    );
+}
+
 // ---- heavy scaling assertion: single-connection fat-batch decoration profile.
 // The CPU/wall ratio is the read-path equivalent of the write baseline's cores
 // figure. Pre-fix (serial `for txid in &txids` loop) this pinned ~1.0 core even

@@ -1103,6 +1103,21 @@ impl FieldMask {
     /// fields (magic, schema_version, device offsets, padding).
     /// Takes precedence over per-field metadata bits if both are set.
     pub const RAW_METADATA: u32 = 1 << 23;
+    /// Include ONLY the outputs section of the cold data, length-prefixed
+    /// (`[outputs_len:4 LE][outputs]`) — the same wire shape as [`Self::COLD_DATA`]
+    /// but carrying just the outputs.
+    ///
+    /// Parent decoration (teranode `FieldColdData`) reads the full cold blob
+    /// (inputs + outputs + inpoints) only to extract the parent's outputs, so
+    /// inputs + inpoints are pure wire waste. Requesting this instead of
+    /// [`Self::COLD_DATA`] ships only what decoration needs. Issue #20.
+    ///
+    /// NOTE: this trims the WIRE payload, not (yet) the device/blob read — an
+    /// EXTERNAL blob is still read and hash-verified whole, since the
+    /// `content_hash` covers the entire blob. A per-section device/blob read
+    /// needs per-section hashing (deeper #20 work). Deliberately OUTSIDE
+    /// [`Self::ALL`] (which already carries full `COLD_DATA`).
+    pub const COLD_DATA_OUTPUTS: u32 = 1 << 24;
 
     /// Convenience alias: all per-field metadata bits (bits 0-18).
     pub const ALL_METADATA: u32 = 0x0007_FFFF;

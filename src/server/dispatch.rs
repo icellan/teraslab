@@ -8388,6 +8388,29 @@ fn decorate_get_item(
                     }
                 }
             }
+            // #20: outputs-only cold data — ship just the parent's outputs
+            // section, not the full inputs+outputs+inpoints blob, for parent
+            // decoration. Same `[len:4][bytes]` wire shape as COLD_DATA. The
+            // blob is still read (and hash-verified, for EXTERNAL) whole; this
+            // trims the wire payload, which is what decoration is bound on.
+            if field_mask.has(FieldMask::COLD_DATA_OUTPUTS) {
+                match engine.read_cold_data(&key) {
+                    Ok(cold) => {
+                        let (_inputs, outputs, _inpoints) = parse_cold_data_fields(&cold);
+                        let outputs = outputs.unwrap_or(&[]);
+                        data.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
+                        data.extend_from_slice(outputs);
+                    }
+                    Err(SpendError::BlobNotFound { .. }) => {
+                        blob_not_found = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    Err(_) => {
+                        inner_read_failed = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                }
+            }
             if field_mask.has(FieldMask::BLOCK_ENTRIES) {
                 let count = { meta.block_entry_count };
                 data.push(count);
