@@ -164,6 +164,25 @@ impl StripedLocks {
         self.locks[idx].lock()
     }
 
+    /// Acquire the lock for a specific stripe index. Returns a RAII guard.
+    ///
+    /// Used by batch mutation paths (e.g. the spend-batch handler) that need
+    /// to hold the stripe locks for many keys simultaneously across a single
+    /// WAL flush. The caller first maps each key to its stripe via
+    /// [`Self::stripe_index`], deduplicates, sorts the indices, and acquires
+    /// each unique stripe ONCE through this method. Deduplication is mandatory:
+    /// the per-stripe `Mutex` is not reentrant, so two keys that hash to the
+    /// same stripe must share one guard or the second `lock_index` would
+    /// self-deadlock. Sorting the unique indices gives a global acquisition
+    /// order that prevents deadlock between concurrent batch acquirers.
+    ///
+    /// # Panics
+    /// Panics if `idx >= stripe_count()`. Callers must pass an index produced
+    /// by [`Self::stripe_index`], which is always masked into range.
+    pub fn lock_index(&self, idx: usize) -> parking_lot::MutexGuard<'_, ()> {
+        self.locks[idx].lock()
+    }
+
     /// Compute which stripe a key maps to.
     ///
     /// Uses bytes 16–23 of the txid (different from bucket index [0–7] and

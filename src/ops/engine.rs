@@ -1810,12 +1810,68 @@ impl Engine {
     ///
     /// The lock is released when the `ValidatedSpend` is dropped (without
     /// applying) or consumed by [`ValidatedSpend::apply`] (after writing).
+    ///
+    /// Thin wrapper over [`Self::prepare_spend_multi`]: acquires the stripe
+    /// lock and binds it to the returned guard. The batched spend path
+    /// (`handle_spend_batch`) holds the stripe locks for the whole RPC
+    /// externally and calls `prepare_spend_multi` directly.
     pub fn validate_spend_multi<'a>(
         &'a self,
         req: &SpendMultiRequest,
     ) -> Result<ValidatedSpend<'a>, SpendError> {
         let guard = self.locks.lock(&req.tx_key);
+        let p = self.prepare_spend_multi(req)?;
+        Ok(ValidatedSpend {
+            _guard: guard,
+            tx_key: p.tx_key,
+            valid_spends: p.valid_spends,
+            errors: p.errors,
+            spent_count: p.spent_count,
+            idempotent_count: p.idempotent_count,
+            pre_generation: p.pre_generation,
+            block_ids: p.block_ids,
+            record_offset: p.record_offset,
+            metadata: p.metadata,
+            current_block_height: p.current_block_height,
+            block_height_retention: p.block_height_retention,
+        })
+    }
 
+    /// Validate a batch of spends WITHOUT acquiring the per-transaction lock
+    /// and WITHOUT applying — returns a guard-free [`PreparedSpend`].
+    ///
+    /// # Caller contract
+    /// The caller MUST already hold the stripe lock for `req.tx_key` (via
+    /// [`crate::locks::StripedLocks::lock`] / `lock_index`) across the whole
+    /// validate → write-redo → apply window. This exists for the batched
+    /// spend path, which acquires every distinct stripe lock for the RPC ONCE
+    /// up front (deduplicated + sorted) and holds them across a single WAL
+    /// flush, then applies every group — preserving WAL-first ordering and
+    /// per-txid validate→apply atomicity with one fsync per RPC instead of one
+    /// per txid-group. The single-spend path uses [`Self::validate_spend_multi`],
+    /// which takes the lock for you.
+    /// Acquire the per-transaction stripe locks for `keys`, deduplicated and
+    /// sorted, returning the held guards.
+    ///
+    /// The batched spend path uses this to hold every distinct stripe lock for
+    /// an RPC across a single WAL flush while preserving per-txid validate→apply
+    /// atomicity. Deduplication is mandatory — distinct txids can hash to the
+    /// same stripe and the per-stripe `Mutex` is not reentrant; sorting the
+    /// unique indices gives a global acquisition order so concurrent batch
+    /// acquirers cannot deadlock. Each guard is bound to `&self`, so the
+    /// returned `Vec` must be dropped (locks released) by the caller, which it
+    /// should do before any network I/O (e.g. replication).
+    pub fn lock_unique_stripes(&self, keys: &[TxKey]) -> Vec<parking_lot::MutexGuard<'_, ()>> {
+        let mut idxs: Vec<usize> = keys.iter().map(|k| self.locks.stripe_index(k)).collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs.into_iter().map(|i| self.locks.lock_index(i)).collect()
+    }
+
+    pub fn prepare_spend_multi(
+        &self,
+        req: &SpendMultiRequest,
+    ) -> Result<PreparedSpend, SpendError> {
         // 1. Index lookup
         let entry = self
             .index
@@ -1852,8 +1908,7 @@ impl Engine {
         // Handle empty spends list
         if req.spends.is_empty() {
             let block_ids = collect_block_ids(&metadata).to_vec();
-            return Ok(ValidatedSpend {
-                _guard: guard,
+            return Ok(PreparedSpend {
                 tx_key: req.tx_key,
                 valid_spends: Vec::new(),
                 errors: BTreeMap::new(),
@@ -2030,8 +2085,7 @@ impl Engine {
 
         let block_ids = collect_block_ids(&metadata).to_vec();
 
-        Ok(ValidatedSpend {
-            _guard: guard,
+        Ok(PreparedSpend {
             tx_key: req.tx_key,
             valid_spends,
             errors,
@@ -6764,11 +6818,65 @@ impl<'a> ValidatedSpend<'a> {
     /// (WAL-first pattern), but the metadata footer update is skipped and
     /// the per-transaction lock is released on return. The operator must
     /// correct the config; the redo log will re-drive recovery.
+    // NOTE: the tracing span lives on `PreparedSpend::apply_locked` (the actual
+    // mutation), so both this wrapper and the batched dispatch path that calls
+    // `apply_locked` directly emit one consistent "apply_locked" span under the
+    // current (dispatch / spend_multi) span.
     #[must_use = "apply returns the operation response including per-item errors"]
-    #[tracing::instrument(level = "debug", skip_all)]
     pub fn apply(self, engine: &Engine) -> Result<SpendMultiResponse, SpendError> {
+        // Hand off to the guard-free core. `_guard` stays bound in this scope
+        // and is released only when it drops at the end of this function —
+        // i.e. AFTER `apply_locked` returns — preserving the original ordering
+        // (the per-transaction stripe lock is held across every device write).
         let ValidatedSpend {
             _guard,
+            tx_key,
+            valid_spends,
+            errors,
+            spent_count,
+            idempotent_count,
+            pre_generation,
+            block_ids,
+            record_offset,
+            metadata,
+            current_block_height,
+            block_height_retention,
+        } = self;
+        PreparedSpend {
+            tx_key,
+            valid_spends,
+            errors,
+            spent_count,
+            idempotent_count,
+            pre_generation,
+            block_ids,
+            record_offset,
+            metadata,
+            current_block_height,
+            block_height_retention,
+        }
+        .apply_locked(engine)
+    }
+}
+
+impl PreparedSpend {
+    /// Apply a validated spend batch whose per-transaction stripe lock the
+    /// CALLER holds — the guard-free twin of [`ValidatedSpend::apply`].
+    ///
+    /// The batched spend path acquires every distinct stripe lock for the RPC
+    /// up front (deduplicated + sorted) and holds them across a single WAL
+    /// flush, then calls this for each txid group. The caller MUST keep
+    /// `tx_key`'s stripe lock held across this call (and the preceding redo
+    /// flush) — that is the WAL-first + per-txid validate→apply atomicity
+    /// contract `ValidatedSpend` otherwise enforces via its embedded guard.
+    ///
+    /// # Errors
+    /// Same as [`ValidatedSpend::apply`]: [`SpendError::DahOverflow`] /
+    /// [`SpendError::StorageError`] on misconfiguration or device I/O failure.
+    #[must_use = "apply returns the operation response including per-item errors"]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub fn apply_locked(self, engine: &Engine) -> Result<SpendMultiResponse, SpendError> {
+        let PreparedSpend {
             tx_key,
             valid_spends,
             errors,
@@ -6789,7 +6897,6 @@ impl<'a> ValidatedSpend<'a> {
 
         if spent_count == 0 {
             let generation = { metadata.generation };
-            drop(_guard);
             return Ok(SpendMultiResponse {
                 signal: Signal::None,
                 block_ids,
@@ -6859,10 +6966,9 @@ impl<'a> ValidatedSpend<'a> {
         if !engine.device_ptr.is_null() {
             // SAFETY: `engine.device_ptr` is non-null (checked above) and
             // live for the engine's lifetime; `record_offset` is
-            // allocator-valid. This spend `apply` still holds the record's
-            // stripe lock (`_guard`, captured at prepare time);
-            // `write_metadata_direct` takes the per-offset `io_locks()` write
-            // side for torn-read-safe publication.
+            // allocator-valid. The caller holds the record's stripe lock
+            // across this guard-free apply; `write_metadata_direct` takes the
+            // per-offset `io_locks()` write side for torn-read-safe publication.
             unsafe { io::write_metadata_direct(engine.device_ptr, record_offset, &metadata) };
         } else {
             engine.write_metadata_fast(record_offset, &metadata)?;
@@ -6874,8 +6980,8 @@ impl<'a> ValidatedSpend<'a> {
         let new_dah = { metadata.delete_at_height };
         engine.update_dah_index(&tx_key, old_dah, new_dah)?;
 
-        // _guard dropped here, releasing the per-transaction stripe lock.
-        drop(_guard);
+        // The per-transaction stripe lock is the caller's (held across this
+        // guard-free apply); it is released by the caller after this returns.
 
         // Reuse block_ids from validation — block entries don't change
         // during spend (only spent_utxos, generation, updated_at, DAH).
