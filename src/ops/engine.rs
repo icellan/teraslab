@@ -12598,6 +12598,86 @@ mod tests {
         Arc::new(create_engine_inner())
     }
 
+    /// Two-store engine (store 0 inline + one aux store), each on its own
+    /// MemoryDevice. Exercises the N>1 routing that single-store tests cannot.
+    fn create_two_store_engine() -> Arc<Engine> {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        Arc::new(Engine::new_multi_store(
+            dev0,
+            alloc0,
+            vec![(dev1, alloc1)],
+            ShardedIndex::from_single(Index::new(1000).unwrap().into()),
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    }
+
+    #[test]
+    fn multi_store_create_read_spend_routes_across_stores_end_to_end() {
+        let engine = create_two_store_engine();
+        assert_eq!(engine.store_count(), 2);
+
+        // Create 4 records. create() places round-robin, so device_ids
+        // alternate 0,1,0,1 — proving records actually land on BOTH stores.
+        let mut keys = Vec::new();
+        let mut hashes_by_key = Vec::new();
+        for n in 1u8..=4 {
+            let (hashes, req) = make_create_req(n, 3);
+            engine.create(&req).expect("create");
+            keys.push(req.tx_key());
+            hashes_by_key.push(hashes);
+        }
+
+        let device_ids: Vec<u8> = keys
+            .iter()
+            .map(|k| engine.lookup(k).expect("entry").device_id)
+            .collect();
+        assert_eq!(
+            device_ids,
+            vec![0, 1, 0, 1],
+            "round-robin placement must spread records across both stores"
+        );
+
+        // Read every record back: reads route by entry.device_id, so a record
+        // on store 1 is only returned correctly if the read path routed there.
+        for (i, key) in keys.iter().enumerate() {
+            let meta = engine.read_metadata(key).expect("read_metadata");
+            assert_eq!(meta.tx_id, key.txid, "record {i} read from the wrong store");
+            let slots = engine.read_slots(key).expect("read_slots");
+            assert_eq!(
+                slots.len(),
+                hashes_by_key[i].len(),
+                "record {i} slot count mismatch (wrong store?)"
+            );
+        }
+
+        // Spend a UTXO on the store-1 record (key index 1): the mutation path
+        // must route its slot+metadata writes to store 1.
+        let store1_key = keys[1];
+        let multi = SpendMultiRequest {
+            tx_key: store1_key,
+            spends: vec![SpendItem {
+                idx: 0,
+                offset: 0,
+                utxo_hash: hashes_by_key[1][0],
+                spending_data: [9u8; 36],
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1001,
+            block_height_retention: 288,
+        };
+        engine.spend_multi(&multi).expect("spend on store 1");
+        let slot = engine.read_slot(&store1_key, 0).expect("read spent slot");
+        assert!(slot.is_spent(), "slot on store 1 must read back as spent");
+    }
+
     fn create_engine_inner() -> Engine {
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
