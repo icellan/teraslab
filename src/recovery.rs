@@ -218,6 +218,11 @@ enum SecondaryReconcile {
     /// the durable (crash-safe) secondaries. O(redo size). Used when the
     /// secondaries were loaded clean.
     TouchedOnly,
+    /// Do not reconcile in this pass. Used by multi-store recovery, which
+    /// replays each store independently (the secondary indexes are shared and
+    /// span all stores, so reconcile is done ONCE after every store's replay,
+    /// routing each metadata read to its store — see `recover_all_multi_store`).
+    Skip,
 }
 
 /// Engine-level conflicting-child append intent collected during recovery.
@@ -927,14 +932,13 @@ pub fn recover_all_multi_store(
     );
     let entries = redo_log.recover()?;
     let partitions = partition_entries_by_store(entries, devices.len(), index);
-    let reconcile = if full_secondary_rebuild {
-        SecondaryReconcile::FullScan
-    } else {
-        SecondaryReconcile::TouchedOnly
-    };
     let mut total = RecoveryStats::default();
     let mut pending_cc = Vec::new();
     let mut pending_dc = Vec::new();
+    // Replay each store independently against its own device + allocator. The
+    // secondary indexes are SHARED and span all stores, so per-store reconcile
+    // would read other stores' records from the wrong device — skip it here and
+    // reconcile once, store-routed, after every store has replayed.
     for (store_id, part) in partitions.into_iter().enumerate() {
         let (stats, cc, dc) = recover_entries_with_allocator_collecting_pending_conflicts(
             &*devices[store_id],
@@ -944,12 +948,19 @@ pub fn recover_all_multi_store(
             unmined,
             Some(&mut allocators[store_id]),
             None,
-            reconcile,
+            SecondaryReconcile::Skip,
         )?;
         total.merge(stats);
         pending_cc.extend(cc);
         pending_dc.extend(dc);
     }
+    // One store-routed secondary reconcile across the now-complete index. A
+    // full re-derive is correct for every backend (it rebuilds DAH/unmined from
+    // each record's metadata, read from its own store); `full_secondary_rebuild`
+    // is informational here since the per-store SecondaryDahUpdate/Unmined redo
+    // ops were already replayed above.
+    let _ = full_secondary_rebuild;
+    reconcile_secondary_indexes_from_metadata_multi(devices, index, dah, unmined)?;
     Ok((total, pending_cc, pending_dc))
 }
 
@@ -1243,6 +1254,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         SecondaryReconcile::TouchedOnly => {
             reconcile_secondary_indexes_for_keys(device, index, dah, unmined, &touched_keys)?;
         }
+        SecondaryReconcile::Skip => {}
     }
 
     // Clean up any orphan tmp files from resizes that started but never
@@ -1346,6 +1358,74 @@ fn reconcile_secondary_indexes_from_metadata(
         return Err(e);
     }
 
+    for (height, key) in dah_pairs {
+        dah.insert(height, key, None)?;
+    }
+    for (height, key) in unmined_pairs {
+        unmined.insert(height, key, None)?;
+    }
+    Ok(())
+}
+
+/// Multi-store full reconcile: clear the DAH / unmined secondaries and
+/// re-derive them by scanning every primary index entry, reading each record's
+/// metadata from ITS OWN store's device (`devices[entry.device_id]`). The
+/// single-device [`reconcile_secondary_indexes_from_metadata`] reads from one
+/// device, which is wrong once records span stores. Called once by
+/// `recover_all_multi_store` after every store's replay.
+fn reconcile_secondary_indexes_from_metadata_multi(
+    devices: &[std::sync::Arc<dyn BlockDevice>],
+    index: &ShardedIndex,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+) -> Result<(), RecoveryError> {
+    dah.clear().map_err(RecoveryError::Index)?;
+    unmined.clear().map_err(RecoveryError::Index)?;
+
+    let mut first_error: Option<RecoveryError> = None;
+    let mut dah_pairs: Vec<(u32, TxKey)> = Vec::new();
+    let mut unmined_pairs: Vec<(u32, TxKey)> = Vec::new();
+
+    index.for_each(|key, entry| {
+        if first_error.is_some() {
+            return;
+        }
+        let Some(dev) = devices.get(entry.device_id as usize) else {
+            first_error = Some(RecoveryError::Index(crate::index::IndexError::FormatError {
+                detail: format!(
+                    "secondary reconcile: entry {:?} references store {} but only {} stores exist",
+                    key.txid,
+                    entry.device_id,
+                    devices.len()
+                ),
+            }));
+            return;
+        };
+        match io::read_metadata(&**dev, entry.record_offset) {
+            Ok(meta) => {
+                let dah_height = { meta.delete_at_height };
+                if dah_height != 0 {
+                    dah_pairs.push((dah_height, key));
+                }
+                let unmined_height = { meta.unmined_since };
+                if unmined_height != 0 {
+                    unmined_pairs.push((unmined_height, key));
+                }
+            }
+            Err(_) => {
+                first_error = Some(RecoveryError::Index(crate::index::IndexError::FormatError {
+                    detail: format!(
+                        "secondary reconcile failed to read metadata for {:?} on store {}",
+                        key.txid, entry.device_id
+                    ),
+                }));
+            }
+        }
+    });
+
+    if let Some(e) = first_error {
+        return Err(e);
+    }
     for (height, key) in dah_pairs {
         dah.insert(height, key, None)?;
     }
