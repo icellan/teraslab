@@ -1846,19 +1846,6 @@ impl Engine {
         })
     }
 
-    /// Validate a batch of spends WITHOUT acquiring the per-transaction lock
-    /// and WITHOUT applying — returns a guard-free [`PreparedSpend`].
-    ///
-    /// # Caller contract
-    /// The caller MUST already hold the stripe lock for `req.tx_key` (via
-    /// [`crate::locks::StripedLocks::lock`] / `lock_index`) across the whole
-    /// validate → write-redo → apply window. This exists for the batched
-    /// spend path, which acquires every distinct stripe lock for the RPC ONCE
-    /// up front (deduplicated + sorted) and holds them across a single WAL
-    /// flush, then applies every group — preserving WAL-first ordering and
-    /// per-txid validate→apply atomicity with one fsync per RPC instead of one
-    /// per txid-group. The single-spend path uses [`Self::validate_spend_multi`],
-    /// which takes the lock for you.
     /// Acquire the per-transaction stripe locks for `keys`, deduplicated and
     /// sorted, returning the held guards.
     ///
@@ -1866,10 +1853,11 @@ impl Engine {
     /// an RPC across a single WAL flush while preserving per-txid validate→apply
     /// atomicity. Deduplication is mandatory — distinct txids can hash to the
     /// same stripe and the per-stripe `Mutex` is not reentrant; sorting the
-    /// unique indices gives a global acquisition order so concurrent batch
-    /// acquirers cannot deadlock. Each guard is bound to `&self`, so the
-    /// returned `Vec` must be dropped (locks released) by the caller, which it
-    /// should do before any network I/O (e.g. replication).
+    /// unique indices establishes the **global stripe-lock acquisition order**
+    /// (ascending stripe index) that makes concurrent multi-stripe acquirers
+    /// deadlock-free. Each guard is bound to `&self`, so the returned `Vec`
+    /// must be dropped (locks released) by the caller, which it should do
+    /// before any network I/O (e.g. replication).
     pub fn lock_unique_stripes(&self, keys: &[TxKey]) -> Vec<parking_lot::MutexGuard<'_, ()>> {
         let mut idxs: Vec<usize> = keys.iter().map(|k| self.locks.stripe_index(k)).collect();
         idxs.sort_unstable();
@@ -1877,6 +1865,19 @@ impl Engine {
         idxs.into_iter().map(|i| self.locks.lock_index(i)).collect()
     }
 
+    /// Validate a batch of spends WITHOUT acquiring the per-transaction lock
+    /// and WITHOUT applying — returns a guard-free [`PreparedSpend`].
+    ///
+    /// # Caller contract
+    /// The caller MUST already hold the stripe lock for `req.tx_key` (via
+    /// [`crate::locks::StripedLocks::lock`] / [`Self::lock_unique_stripes`])
+    /// across the whole validate → write-redo → apply window. This exists for
+    /// the batched spend path, which acquires every distinct stripe lock for
+    /// the RPC ONCE up front (deduplicated + sorted) and holds them across a
+    /// single WAL flush, then applies every group — preserving WAL-first
+    /// ordering and per-txid validate→apply atomicity with one fsync per RPC
+    /// instead of one per txid-group. The single-spend path uses
+    /// [`Self::validate_spend_multi`], which takes the lock for you.
     pub fn prepare_spend_multi(
         &self,
         req: &SpendMultiRequest,
@@ -6908,7 +6909,10 @@ impl<'a> ValidatedSpend<'a> {
             current_block_height,
             block_height_retention,
         }
-        .apply_locked(engine)
+        // Single-spend path: commit the DAH inline (defer_dah = false); the
+        // returned transition is always None here.
+        .apply_locked(engine, false)
+        .map(|(resp, _dah)| resp)
     }
 }
 
@@ -6923,12 +6927,26 @@ impl PreparedSpend {
     /// flush) — that is the WAL-first + per-txid validate→apply atomicity
     /// contract `ValidatedSpend` otherwise enforces via its embedded guard.
     ///
+    /// When `defer_dah` is true the DAH secondary-index update is NOT applied
+    /// here; instead the `(old_dah, new_dah)` transition (if any) is returned so
+    /// the batched caller can fold every group's `SecondaryDahUpdate` intent
+    /// into ONE `append_batch_and_flush` (via [`Engine::commit_dah_batch`]),
+    /// turning K serialized secondary fsyncs into one. The single-spend path
+    /// passes `false` and commits the DAH inline as before. Either way the
+    /// metadata's `delete_at_height` is written here, and recovery reconciles
+    /// the DAH index from the (durable) primary metadata for every touched key,
+    /// so deferring the secondary flush cannot lose a DAH-index entry.
+    ///
     /// # Errors
     /// Same as [`ValidatedSpend::apply`]: [`SpendError::DahOverflow`] /
     /// [`SpendError::StorageError`] on misconfiguration or device I/O failure.
     #[must_use = "apply returns the operation response including per-item errors"]
     #[tracing::instrument(level = "debug", skip_all)]
-    pub fn apply_locked(self, engine: &Engine) -> Result<SpendMultiResponse, SpendError> {
+    pub fn apply_locked(
+        self,
+        engine: &Engine,
+        defer_dah: bool,
+    ) -> Result<(SpendMultiResponse, Option<(u32, u32)>), SpendError> {
         let PreparedSpend {
             tx_key,
             valid_spends,
@@ -6950,13 +6968,16 @@ impl PreparedSpend {
 
         if spent_count == 0 {
             let generation = { metadata.generation };
-            return Ok(SpendMultiResponse {
-                signal: Signal::None,
-                block_ids,
-                errors,
-                spent_count,
-                generation,
-            });
+            return Ok((
+                SpendMultiResponse {
+                    signal: Signal::None,
+                    block_ids,
+                    errors,
+                    spent_count,
+                    generation,
+                },
+                None,
+            ));
         }
 
         // 6. Batch write all valid slot mutations (zero-alloc when direct).
@@ -7029,22 +7050,95 @@ impl PreparedSpend {
 
         engine.sync_index_cache(&tx_key, &metadata)?;
 
-        // 10. Update DAH secondary index (two-phase durable)
+        // 10. Update the DAH secondary index (two-phase durable). When the
+        // caller asked to defer (batched spend path), return the transition so
+        // it can fold every group's SecondaryDahUpdate intent into one fsync;
+        // otherwise commit it inline as the single-spend path always has.
         let new_dah = { metadata.delete_at_height };
-        engine.update_dah_index(&tx_key, old_dah, new_dah)?;
+        let dah_transition = if defer_dah {
+            if old_dah != new_dah {
+                Some((old_dah, new_dah))
+            } else {
+                None
+            }
+        } else {
+            engine.update_dah_index(&tx_key, old_dah, new_dah)?;
+            None
+        };
 
         // The per-transaction stripe lock is the caller's (held across this
         // guard-free apply); it is released by the caller after this returns.
 
         // Reuse block_ids from validation — block entries don't change
         // during spend (only spent_utxos, generation, updated_at, DAH).
-        Ok(SpendMultiResponse {
-            signal,
-            block_ids,
-            errors,
-            spent_count,
-            generation: { metadata.generation },
-        })
+        Ok((
+            SpendMultiResponse {
+                signal,
+                block_ids,
+                errors,
+                spent_count,
+                generation: { metadata.generation },
+            },
+            dah_transition,
+        ))
+    }
+
+    /// Fold a whole spend RPC's DAH secondary-index updates into ONE redo
+    /// fsync, then commit each redb transaction.
+    ///
+    /// `transitions` is `(tx_key, old_dah, new_dah)` for every group whose
+    /// `delete_at_height` changed (collected from [`Self::apply_locked`] with
+    /// `defer_dah = true`). Phase 1 appends every `SecondaryDahUpdate` intent
+    /// and flushes once (vs one `append_and_flush` per last-spend txid); Phase 2
+    /// commits the redb side with the intent already durable. Mirrors
+    /// [`Engine::update_both_secondary_indexes`], extended across many keys.
+    pub fn commit_dah_batch(
+        engine: &Engine,
+        transitions: &[(TxKey, u32, u32)],
+    ) -> Result<(), SpendError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let log_arc = engine.redo_log_handle();
+
+        // Phase 1: ONE fsync covering every group's SecondaryDahUpdate intent.
+        if let Some(ref log) = log_arc {
+            let ops: Vec<crate::redo::RedoOp> = transitions
+                .iter()
+                .map(
+                    |&(tx_key, old_height, new_height)| crate::redo::RedoOp::SecondaryDahUpdate {
+                        tx_key,
+                        old_height,
+                        new_height,
+                    },
+                )
+                .collect();
+            log.lock()
+                .append_batch_and_flush(&ops)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("dah batch append_and_flush: {e}"),
+                })?;
+        }
+
+        // Phase 2: commit each redb DAH transaction (intent already durable, so
+        // pass no log — recovery reconciles from primary metadata regardless).
+        let mut dah = engine.dah_index.lock();
+        let _writer_gauge = crate::metrics::writer_enter();
+        for &(tx_key, old_height, new_height) in transitions {
+            if old_height != 0 {
+                dah.remove(&tx_key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("dah secondary remove (batched): {e}"),
+                    })?;
+            }
+            if new_height != 0 {
+                dah.insert(new_height, tx_key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("dah secondary insert (batched): {e}"),
+                    })?;
+            }
+        }
+        Ok(())
     }
 }
 

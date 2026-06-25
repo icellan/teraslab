@@ -1361,6 +1361,19 @@ pub fn write_records_coalesced(
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_unstable_by_key(|&i| records[i].0);
 
+    // The caller's reservations must be disjoint: in offset order, each slot
+    // ends at or before the next begins. An overlap would mean two records were
+    // reserved the same bytes — an allocator bug this bulk write would silently
+    // corrupt by overwriting. Cheap O(n) guard.
+    debug_assert!(
+        order.windows(2).all(|w| {
+            let (a_off, a_sz, _) = records[w[0]];
+            let (b_off, _, _) = records[w[1]];
+            a_off + a_sz <= b_off
+        }),
+        "write_records_coalesced: record slots must be disjoint (no two reservations overlap)",
+    );
+
     let mut run_start = 0usize;
     while run_start < order.len() {
         // Extend the run while the next slot starts exactly where this one ends.

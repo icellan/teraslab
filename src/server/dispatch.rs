@@ -4788,6 +4788,40 @@ fn handle_spend_batch(
         m.spend_multi_items_attempted.inc_by(items.len() as u64);
     }
 
+    // P2 (PR#21 review): `DahOverflow` is the only NON-catastrophic apply-time
+    // failure, and it is deterministic from the batch params alone
+    // (`current_block_height + block_height_retention`, identical for every
+    // group). Validate it ONCE here, BEFORE any redo is written, so
+    // `apply_locked` cannot fail with `DahOverflow` mid-batch — which, now that
+    // the whole RPC shares one flush, would otherwise leave already-flushed
+    // groups durable-in-WAL but unapplied. A residual apply-time *device* error
+    // (EIO/ENOSPC) is catastrophic and intentionally still surfaces under the
+    // WAL-first contract (its redo is durable; recovery replays it on restart —
+    // see the Phase 4 note); the operator must treat a persistent apply-time
+    // device error as fatal.
+    if params.block_height_retention != 0
+        && params
+            .current_block_height
+            .checked_add(params.block_height_retention)
+            .is_none()
+    {
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(m, OpCode::Spend, items.len() as u64, 0, 0, &[]);
+            m.spends_failed.inc_by(failed);
+            m.spend_multi_items_failed.inc_by(failed);
+        }
+        // Reuse the exact SpendError::DahOverflow message the apply path
+        // produced, so the client-observable error detail (DAH_OVERFLOW…) is
+        // unchanged by moving the check earlier.
+        let detail = crate::ops::error::SpendError::DahOverflow {
+            current_height: params.current_block_height,
+            retention: params.block_height_retention,
+        }
+        .to_string();
+        return error_response(req.request_id, ERR_STORAGE_IO, &detail);
+    }
+
     // Group items by txid for efficient locking
     let mut by_txid: HashMap<[u8; 32], Vec<(usize, &WireSpendItem)>> = HashMap::new();
     for (i, item) in items.iter().enumerate() {
@@ -4971,16 +5005,27 @@ fn handle_spend_batch(
     // Phase 4: apply every staged group (stripe locks still held → WAL-first
     // and per-txid atomicity preserved: redo is already durable, and no other
     // mutation can touch these txids until the guards drop below).
+    //
+    // PR#21 review (P2): each group's DAH secondary update is DEFERRED
+    // (`apply_locked(.., true)`) and folded into one batched secondary fsync
+    // after the loop, instead of one `append_and_flush` per last-spend txid.
+    let mut dah_transitions: Vec<(TxKey, u32, u32)> = Vec::new();
     for st in staged {
         let validation_errors = st.prepared.errors.clone();
         idempotent += st.prepared.idempotent_count() as u64;
-        let resp = match st.prepared.apply_locked(engine) {
+        let (resp, dah_transition) = match st.prepared.apply_locked(engine, true) {
             Ok(r) => r,
             Err(e) => {
-                // DAH overflow (config misconfiguration) or device error. The
-                // redo for every group is already durable (WAL-first), so
-                // recovery replays it — same contract as the single-group path,
-                // just batch-wide. Classify and return; guards drop on return.
+                // PR#21 review (P2): `DahOverflow` is pre-validated before the
+                // flush above, so a failure HERE is a catastrophic device error
+                // (EIO/ENOSPC) only. The redo for every group is already durable
+                // (WAL-first), so the contract is: the unapplied groups' redo
+                // replays on restart — the operator must treat a persistent
+                // apply-time device error as fatal and restart (the disk is
+                // failing). We return ERR_STORAGE_IO; guards drop on return.
+                // (Same WAL-first contract as the pre-existing single-group
+                // path; the batched flush only widens which groups are durable-
+                // but-unapplied in this catastrophic window.)
                 for (idx, err) in &validation_errors {
                     errors.push(spend_error_to_batch_error(*idx, err));
                 }
@@ -5005,6 +5050,10 @@ fn handle_spend_batch(
             }
         };
 
+        if let Some((old_dah, new_dah)) = dah_transition {
+            dah_transitions.push((st.key, old_dah, new_dah));
+        }
+
         if !st.key_repl_ops.is_empty() {
             repl_ops_by_key.push((st.key, st.key_repl_ops));
         }
@@ -5018,6 +5067,32 @@ fn handle_spend_batch(
 
         // Use signal/block_ids from resp if needed in the future.
         let _ = resp.signal;
+    }
+
+    // Fold every group's DAH secondary-index update into ONE redo fsync (still
+    // under the stripe locks, matching the inline single-spend ordering). On
+    // failure the spends are already applied + durable and recovery reconciles
+    // the DAH index from primary metadata, but we surface ERR_STORAGE_IO to
+    // match the single-spend `update_dah_index` failure contract.
+    if let Err(e) = PreparedSpend::commit_dah_batch(engine, &dah_transitions) {
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(
+                m,
+                OpCode::Spend,
+                items.len() as u64,
+                succeeded,
+                idempotent,
+                &errors,
+            );
+            m.spends_succeeded.inc_by(succeeded);
+            m.spends_idempotent.inc_by(idempotent);
+            m.spends_failed.inc_by(failed);
+            m.spend_multi_items_succeeded.inc_by(succeeded);
+            m.spend_multi_items_idempotent.inc_by(idempotent);
+            m.spend_multi_items_failed.inc_by(failed);
+        }
+        return error_response(req.request_id, ERR_STORAGE_IO, &e.to_string());
     }
 
     // Release every stripe lock BEFORE replication (network I/O must not run
@@ -12691,6 +12766,55 @@ mod tests {
             "the whole {N}-txid-group SpendBatch RPC must be ONE effective redo \
              flush — one fsync (entries + folded header, PERF #5) — not one per \
              txid-group; got {flush_syncs} syncs",
+        );
+    }
+
+    /// PR#21 review (P2): the per-txid DAH secondary updates must be folded into
+    /// ONE batched redo flush for the whole RPC, not one `append_and_flush` per
+    /// last-spend txid. `commit_dah_batch` is the fold primitive: N transitions
+    /// → one effective flush (one device sync), independent of N.
+    #[test]
+    fn commit_dah_batch_folds_n_transitions_into_one_flush() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            Index::new(10_000).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+        engine.set_redo_log(redo_log);
+
+        // N DAH transitions (old=0 → new=100). commit_dah_batch inserts into the
+        // DAH index by key, so no on-device record is required.
+        const N: usize = 16;
+        let transitions: Vec<(TxKey, u32, u32)> = (0..N)
+            .map(|k| {
+                let mut t = [0u8; 32];
+                t[0] = 0xDA;
+                t[1] = k as u8;
+                (TxKey { txid: t }, 0u32, 100u32)
+            })
+            .collect();
+
+        let before = redo_dev.sync_count();
+        PreparedSpend::commit_dah_batch(&engine, &transitions).unwrap();
+        let syncs = redo_dev.sync_count() - before;
+        assert_eq!(
+            syncs, 1,
+            "{N} DAH transitions must fold into ONE batched secondary fsync, not {N}; got {syncs}",
         );
     }
 
