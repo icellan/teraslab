@@ -740,21 +740,6 @@ impl Engine {
         // per-store-log purity that per-store recovery relies on.
         // (AllocateRegion/FreeRegion carry a device_id but no tx_key, so they
         // cannot seed the map.)
-        let mut batch_keys: std::collections::HashMap<TxKey, u8> = std::collections::HashMap::new();
-        for op in ops {
-            match op {
-                crate::redo::RedoOp::Create {
-                    tx_key, device_id, ..
-                }
-                | crate::redo::RedoOp::ReplicaCreate {
-                    tx_key, device_id, ..
-                } => {
-                    batch_keys.insert(*tx_key, *device_id);
-                }
-                _ => {}
-            }
-        }
-
         // Group op indices by destination store so each store's log is locked
         // once and flushed once. Preserve per-store op order (the order ops
         // appear in `ops`) — within a store, sequence order must match append
@@ -762,17 +747,43 @@ impl Engine {
         let store_count = self.store_count();
         let mut per_store: Vec<Vec<&crate::redo::RedoOp>> =
             (0..store_count).map(|_| Vec::new()).collect();
-        let mut any = false;
-        for op in ops {
-            let store =
-                (self.redo_store_for_op_batch(op, &batch_keys) as usize).min(store_count - 1);
-            // Only route to a store that actually has a log attached; if none
-            // is attached (test / unconfigured), fall through to the
-            // representative-handle path below.
-            per_store[store].push(op);
-            any = true;
+        if store_count == 1 {
+            // Single-store fast path (the default deployment): every op routes to
+            // store 0, so skip the batch-local key map and the per-op
+            // `redo_store_for_op_batch` index lookup that would only ever return 0
+            // on the write hot path.
+            per_store[0].extend(ops.iter());
+        } else {
+            // Pre-scan for the batch's own device-tagged keyed ops to build a
+            // batch-local `TxKey -> device_id` map. `Create` / `ReplicaCreate`
+            // carry BOTH a tx_key and an explicit device_id, so a keyed op
+            // (Freeze/SpendV2/…) journaled in the SAME batch as the create of its
+            // key — before that key lands in the primary index — routes to the
+            // SAME store as the create rather than defaulting to store 0. This
+            // preserves per-store-log purity. (AllocateRegion/FreeRegion carry a
+            // device_id but no tx_key, so they cannot seed the map.)
+            let mut batch_keys: std::collections::HashMap<TxKey, u8> =
+                std::collections::HashMap::new();
+            for op in ops {
+                match op {
+                    crate::redo::RedoOp::Create {
+                        tx_key, device_id, ..
+                    }
+                    | crate::redo::RedoOp::ReplicaCreate {
+                        tx_key, device_id, ..
+                    } => {
+                        batch_keys.insert(*tx_key, *device_id);
+                    }
+                    _ => {}
+                }
+            }
+            for op in ops {
+                let store =
+                    (self.redo_store_for_op_batch(op, &batch_keys) as usize).min(store_count - 1);
+                per_store[store].push(op);
+            }
         }
-        if !any {
+        if ops.is_empty() {
             return Ok((0, 0));
         }
 
@@ -1880,14 +1891,40 @@ impl Engine {
     /// Iterates in `usize` and narrows per store so a 256-store layout (the
     /// `device_id: u8` maximum) does not truncate the loop bound.
     ///
+    /// The per-store syncs run CONCURRENTLY (one scoped thread per store, the
+    /// calling thread taking the first). Serial syncs defeat the
+    /// [`crate::subdevice::PhysicalBarrier`] used by `device_split` layouts: when
+    /// N virtual stores share one physical device, concurrent `sync()` calls
+    /// coalesce onto a SINGLE underlying fsync, whereas serial calls each begin a
+    /// fresh one. For separate physical devices the fsyncs simply overlap. Single
+    /// store stays inline (no thread), byte-identical to a bare `device.sync()`.
+    ///
     /// # Errors
     ///
-    /// Returns the first store's sync error.
+    /// Returns the first failing store's sync error.
     pub fn sync_all_store_devices(&self) -> crate::device::Result<()> {
-        for id in 0..self.store_count() {
-            self.device_for(id as u8).sync()?;
+        let n = self.store_count();
+        if n == 1 {
+            return self.device.sync();
         }
-        Ok(())
+        std::thread::scope(|scope| {
+            // Spawn stores 1..N; the calling thread handles store 0.
+            let handles: Vec<_> = (1..n)
+                .map(|id| scope.spawn(move || self.device_for(id as u8).sync()))
+                .collect();
+            let mut result = self.device_for(0).sync();
+            for h in handles {
+                let r = h.join().unwrap_or_else(|_| {
+                    Err(crate::device::DeviceError::Io(std::io::Error::other(
+                        "store sync thread panicked",
+                    )))
+                });
+                if result.is_ok() {
+                    result = r;
+                }
+            }
+            result
+        })
     }
 
     /// Verify every index entry's `device_id` is within the configured store
