@@ -6930,7 +6930,7 @@ impl PreparedSpend {
     /// When `defer_dah` is true the DAH secondary-index update is NOT applied
     /// here; instead the `(old_dah, new_dah)` transition (if any) is returned so
     /// the batched caller can fold every group's `SecondaryDahUpdate` intent
-    /// into ONE `append_batch_and_flush` (via [`Engine::commit_dah_batch`]),
+    /// into ONE `append_batch_and_flush` (via [`Self::commit_dah_batch`]),
     /// turning K serialized secondary fsyncs into one. The single-spend path
     /// passes `false` and commits the DAH inline as before. Either way the
     /// metadata's `delete_at_height` is written here, and recovery reconciles
@@ -7091,7 +7091,7 @@ impl PreparedSpend {
     /// `defer_dah = true`). Phase 1 appends every `SecondaryDahUpdate` intent
     /// and flushes once (vs one `append_and_flush` per last-spend txid); Phase 2
     /// commits the redb side with the intent already durable. Mirrors
-    /// [`Engine::update_both_secondary_indexes`], extended across many keys.
+    /// `update_both_secondary_indexes`, extended across many keys.
     pub fn commit_dah_batch(
         engine: &Engine,
         transitions: &[(TxKey, u32, u32)],
