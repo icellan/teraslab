@@ -1114,10 +1114,15 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 } else if *record_offset != 0 && *record_size != 0 {
                     match allocator.as_deref_mut() {
                         Some(alloc) => {
+                            // The freed region lives on THIS store, whose log we
+                            // are replaying — stamp the allocator's own store tag
+                            // so its replay gate (`device_id == redo_device_id`)
+                            // accepts the free. Hardcoding 0 made every non-zero
+                            // store reject the free and leak the region.
                             let free = RedoOp::FreeRegion {
                                 offset: *record_offset,
                                 size: *record_size,
-                                device_id: 0,
+                                device_id: alloc.redo_device_id(),
                             };
                             if alloc.replay_redo(&free)
                                 || matches!(delete_outcome, ReplayResult::Applied)
@@ -5170,6 +5175,118 @@ mod tests {
         );
         assert_eq!(recovered.record_offset, record_offset);
         assert_eq!(recovered.utxo_count, utxo_count);
+    }
+
+    /// Multi-store Delete recovery: replaying a `RedoOp::Delete` (with real
+    /// offset/size) for a record on store 1 MUST return the freed region to
+    /// store 1's allocator. Recovery synthesizes a `FreeRegion`; pre-fix it
+    /// hardcoded `device_id: 0`, but each store's allocator gates replay on
+    /// `device_id == redo_device_id`, so store 1's allocator REJECTED the free
+    /// and leaked the region permanently. The synthesized free must carry the
+    /// replaying allocator's own store tag.
+    #[test]
+    fn multi_store_delete_recovery_frees_region_on_nonzero_store() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        // Boot wiring: each store's allocator is tagged with its store index.
+        alloc0.set_redo_device_id(0);
+        alloc1.set_redo_device_id(1);
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        // Build + allocate a real record on STORE 1, then write its bytes.
+        let utxo_count: u32 = 3;
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xD1;
+            t
+        };
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let base = TxMetadata::record_size_for(utxo_count);
+        meta.record_size = base as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = 0xD1;
+                h[1] = (i + 1) as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        let record_offset = alloc1.allocate(base).unwrap();
+        let mut rb = Vec::with_capacity(METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE);
+        let mut mb = [0u8; METADATA_SIZE];
+        meta.to_bytes(&mut mb);
+        rb.extend_from_slice(&mb);
+        for s in &slots {
+            let mut sb = [0u8; UTXO_SLOT_SIZE];
+            s.to_bytes(&mut sb);
+            rb.extend_from_slice(&sb);
+        }
+        io::write_full_record(&*dev1, record_offset, &meta, &slots).unwrap();
+        assert!(
+            alloc1.is_allocated_range(record_offset, base),
+            "region must start allocated",
+        );
+
+        // Store 1's log: Create (registers index, passes the allocated-range
+        // gate) then Delete (real offset/size → recovery synthesizes FreeRegion).
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let mut redo1 = RedoLog::open(redo_dev1.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0, &redo1]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo1.attach_shared_sequence(shared.clone());
+        redo1
+            .append_and_flush(RedoOp::Create {
+                tx_key: key,
+                device_id: 1,
+                record_offset,
+                utxo_count,
+                is_conflicting: false,
+                record_bytes: rb.clone(),
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo1
+            .append_and_flush(RedoOp::Delete {
+                tx_key: key,
+                record_offset,
+                record_size: base,
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let devices = [dev0.clone(), dev1.clone()];
+        let mut allocators = [alloc0, alloc1];
+        let mut redo_logs = [redo0, redo1];
+        let (stats, _, _) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            &mut unmined,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stats.entries_failed, 0);
+
+        // The record is gone from the index AND its region was returned to
+        // store 1's allocator (not leaked).
+        assert!(index.lookup(&key).is_none(), "record must be deleted");
+        assert!(
+            !allocators[1].is_allocated_range(record_offset, base),
+            "deleted record's region must be freed on store 1, not leaked",
+        );
     }
 
     /// Stress the PARALLEL multi-store recovery: 8 stores, many records each

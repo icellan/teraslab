@@ -565,6 +565,14 @@ impl SlotAllocator {
         self.redo_device_id = device_id;
     }
 
+    /// The store tag this allocator stamps onto its `AllocateRegion`/`FreeRegion`
+    /// redo entries and requires on replay (`device_id == redo_device_id`). See
+    /// [`Self::set_redo_device_id`]. Recovery uses this to synthesize a
+    /// `FreeRegion` that THIS store's allocator will accept.
+    pub fn redo_device_id(&self) -> u8 {
+        self.redo_device_id
+    }
+
     /// Detach the redo log (mainly for tests).
     #[cfg(test)]
     fn clear_redo_log(&mut self) {

@@ -2556,6 +2556,15 @@ impl RedoLog {
     // reclamation path is `compact_prefix_through`. The dead method has
     // been removed entirely.
 
+    /// Whether this log has appended-but-not-yet-flushed entries. A `flush()`
+    /// of an empty buffer is a no-op (returns `Ok(())`), so callers that need to
+    /// distinguish "made data durable" from "nothing to flush" — e.g. the
+    /// partial-failure fencing in `Engine::flush_all_redo_logs` — must check
+    /// this BEFORE flushing.
+    pub fn has_pending(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
     /// Current write position within the entries region (bytes from
     /// start of entries region; does NOT include the header block).
     pub fn write_position(&self) -> u64 {

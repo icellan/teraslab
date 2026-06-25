@@ -990,7 +990,25 @@ impl Engine {
         op: &crate::redo::RedoOp,
     ) -> std::result::Result<(), String> {
         let store = self.redo_store_for_op(op);
-        let Some(log) = self.redo_log_for_device(store) else {
+        self.append_replica_redo_entry_to_store(op, store)
+    }
+
+    /// Append a replica redo entry to an EXPLICIT store's log, bypassing the
+    /// index-derived routing of [`Self::append_replica_redo_entry`].
+    ///
+    /// Required for a `Delete`: the receiver builds the redo entry AFTER the
+    /// index entry is removed, so `redo_store_for_op`'s index lookup would miss
+    /// and fall back to store 0. Per-store recovery replays each store's log on
+    /// its own thread, so a `Delete` landing in store 0's log while the record's
+    /// `Create` lives in store N's log can replay out of order and resurrect the
+    /// record. The caller captures the record's `device_id` BEFORE the delete and
+    /// passes it here so the `Delete` shares the record's store log.
+    pub fn append_replica_redo_entry_to_store(
+        &self,
+        op: &crate::redo::RedoOp,
+        device_id: u8,
+    ) -> std::result::Result<(), String> {
+        let Some(log) = self.redo_log_for_device(device_id) else {
             return Ok(());
         };
         log.lock()
@@ -1011,10 +1029,52 @@ impl Engine {
     pub fn flush_all_redo_logs(&self) -> std::result::Result<(), String> {
         match self.redo_logs.get() {
             Some(logs) if !logs.is_empty() => {
+                // Flush every store's log, recording for each whether it actually
+                // made data durable (had pending entries AND flushed OK) vs
+                // failed. A PARTIAL cross-store flush — one store's entries became
+                // durable while another's flush failed — cannot be undone (no
+                // cross-store commit), so the replica's per-store WAL would be
+                // asymmetric after the data device was already synced. Mirror
+                // `append_redo_ops_routed`: poison every log and return a fatal
+                // error so the node stops accepting writes; recovery reconciles
+                // the durable state on restart. A clean all-failed flush (nothing
+                // durable) stays a plain error so the master simply retries.
+                let mut durable = false;
+                let mut first_err: Option<String> = None;
                 for log in logs {
-                    log.lock()
-                        .flush()
-                        .map_err(|e| format!("replica redo flush: {e}"))?;
+                    let mut guard = log.lock();
+                    let had_pending = guard.has_pending();
+                    match guard.flush() {
+                        Ok(()) => {
+                            if had_pending {
+                                durable = true;
+                            }
+                        }
+                        Err(e) if first_err.is_none() => {
+                            first_err = Some(format!("replica redo flush: {e}"));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                match first_err {
+                    None => {}
+                    Some(detail) if durable => {
+                        for log in logs {
+                            log.lock().poison();
+                        }
+                        tracing::error!(
+                            detail = %detail,
+                            "FATAL: replica redo flush partially succeeded across stores — some \
+                             store logs are durable while another failed, with no cross-store \
+                             commit to undo it. Poisoned all store logs; restart to let recovery \
+                             reconcile the durable state."
+                        );
+                        return Err(format!(
+                            "partial cross-store replica redo flush (some stores durable, some \
+                             failed); node fenced for recovery: {detail}"
+                        ));
+                    }
+                    Some(detail) => return Err(detail),
                 }
             }
             _ => {
@@ -13943,6 +14003,116 @@ mod tests {
                 Err(crate::redo::RedoError::Poisoned)
             ),
             "store 0's (durable) log must be poisoned after a partial cross-store flush"
+        );
+        assert!(
+            matches!(
+                log1_arc.lock().append(RedoOp::AllocateRegion {
+                    device_id: 1,
+                    offset: 8192,
+                    size: 4096
+                }),
+                Err(crate::redo::RedoError::Poisoned)
+            ),
+            "store 1's (failed) log must be poisoned too"
+        );
+    }
+
+    /// Replica ACK path analog of the previous test: `flush_all_redo_logs`
+    /// (called once per replica batch after per-op appends) must apply the same
+    /// partial-failure fencing as `append_redo_ops_routed`. If store 0's log
+    /// flushes durably while store 1's flush fails, the per-store WAL is
+    /// asymmetric after the data device was already synced — poison every log and
+    /// return a fatal error so the node stops accepting writes until recovery.
+    #[test]
+    fn flush_all_redo_logs_fences_on_partial_cross_store_flush() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        struct FailSyncDevice {
+            inner: MemoryDevice,
+            fail: AtomicBool,
+        }
+        impl BlockDevice for FailSyncDevice {
+            fn pread(&self, b: &mut [u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> crate::device::Result<()> {
+                if self.fail.load(Ordering::SeqCst) {
+                    Err(DeviceError::Io(std::io::Error::other("armed sync failure")))
+                } else {
+                    self.inner.sync()
+                }
+            }
+        }
+
+        let engine = create_two_store_engine();
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let fdev = Arc::new(FailSyncDevice {
+            inner: MemoryDevice::new(1024 * 1024, 4096).unwrap(),
+            fail: AtomicBool::new(false),
+        });
+        let rdev1: Arc<dyn BlockDevice> = fdev.clone();
+        let mut log0 = RedoLog::open(rdev0, 0, 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 1024 * 1024).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        // Append (no flush) a replica entry to EACH store's log, then arm store
+        // 1's device to fail. The batch-level flush is the partial-commit point.
+        engine
+            .append_replica_redo_entry_to_store(
+                &RedoOp::AllocateRegion {
+                    device_id: 0,
+                    offset: 0,
+                    size: 4096,
+                },
+                0,
+            )
+            .unwrap();
+        engine
+            .append_replica_redo_entry_to_store(
+                &RedoOp::AllocateRegion {
+                    device_id: 1,
+                    offset: 0,
+                    size: 4096,
+                },
+                1,
+            )
+            .unwrap();
+        fdev.fail.store(true, Ordering::SeqCst);
+
+        let err = engine
+            .flush_all_redo_logs()
+            .expect_err("partial cross-store replica flush must fail closed");
+        assert!(
+            err.contains("partial cross-store replica redo flush"),
+            "expected the fenced-for-recovery error, got: {err}"
+        );
+        assert!(
+            matches!(
+                log0_arc.lock().append(RedoOp::AllocateRegion {
+                    device_id: 0,
+                    offset: 8192,
+                    size: 4096
+                }),
+                Err(crate::redo::RedoError::Poisoned)
+            ),
+            "store 0's (durable) log must be poisoned after a partial replica flush"
         );
         assert!(
             matches!(

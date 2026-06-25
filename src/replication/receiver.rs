@@ -1404,6 +1404,20 @@ pub fn apply_op_journal(
         // or was deleted. Let the match arm handle it gracefully.
     }
 
+    // A Delete removes the index entry, so the post-apply redo's owning store
+    // cannot be derived from the index afterwards. Capture the record's store
+    // NOW (before the apply below) so the post-apply `Delete` redo lands in the
+    // SAME per-store log as the record's `Create`. Per-store recovery replays
+    // each store's log on its own thread; a `Delete` stranded in store 0's log
+    // while the `Create` lives in store N's can replay out of order and
+    // resurrect the deleted record. `None` (key absent locally) routes normally.
+    let pre_delete_device_id: Option<u8> = match op {
+        ReplicaOp::Delete { tx_key } | ReplicaOp::DeleteV2 { tx_key, .. } => {
+            engine.lookup(tx_key).map(|e| e.device_id)
+        }
+        _ => None,
+    };
+
     match op {
         ReplicaOp::Spend {
             tx_key,
@@ -2040,7 +2054,12 @@ pub fn apply_op_journal(
     // is a hard batch-level error: ACKing without the local log would
     // re-introduce the same divergence R-034 was opened to fix.
     if journal && let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
-        write_replica_redo_entry(engine, &redo_op)?;
+        match pre_delete_device_id {
+            // Route the Delete redo to the record's own store log (see the
+            // capture above) so it shares the log of the record's Create.
+            Some(device_id) => engine.append_replica_redo_entry_to_store(&redo_op, device_id)?,
+            None => write_replica_redo_entry(engine, &redo_op)?,
+        }
     }
 
     Ok(())
@@ -3216,6 +3235,77 @@ mod tests {
         assert!(
             err.contains("absent after apply"),
             "expected the 'absent after apply' hard error, got: {err}"
+        );
+    }
+
+    /// #3 multi-store: a replica `Delete` redo MUST land in the record's OWN
+    /// store log, not store 0. `apply_op_journal` builds the Delete redo AFTER
+    /// the index entry is removed, so the index-derived routing falls back to
+    /// store 0; a Delete stranded in store 0's log while the record's Create
+    /// lives in store N's log can replay out of order under per-store PARALLEL
+    /// recovery and resurrect the deleted record. The fix captures the record's
+    /// device_id before the delete and routes the redo to that store.
+    #[test]
+    fn replica_delete_redo_routes_to_records_own_store_log() {
+        use std::sync::atomic::AtomicU64;
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        alloc0.set_redo_device_id(0);
+        alloc1.set_redo_device_id(1);
+        let engine = Arc::new(Engine::new_multi_store(
+            dev0,
+            alloc0,
+            vec![(dev1, alloc1)],
+            crate::index::sharded::ShardedIndex::from_single(Index::new(10_000).unwrap().into()),
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut log0 = crate::redo::RedoLog::open(rdev0, 0, 1024 * 1024).unwrap();
+        let mut log1 = crate::redo::RedoLog::open(rdev1, 0, 1024 * 1024).unwrap();
+        let shared = Arc::new(AtomicU64::new(crate::redo::RedoLog::shared_sequence_floor(
+            &[&log0, &log1],
+        )));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0 = Arc::new(parking_lot::Mutex::new(log0));
+        let log1 = Arc::new(parking_lot::Mutex::new(log1));
+        // Boot wires BOTH the per-store logs and a representative single handle
+        // (store 0's) — `build_post_apply_redo_op` gates on the latter.
+        engine.set_redo_log(log0.clone());
+        engine.set_redo_logs(vec![log0.clone(), log1.clone()]);
+
+        // Round-robin placement: first record → store 0, second → store 1.
+        let ka = key(201);
+        let kb = key(202);
+        create_record(&engine, ka, 2);
+        create_record(&engine, kb, 2);
+        assert_eq!(
+            engine.lookup(&kb).unwrap().device_id,
+            1,
+            "record B must be placed on store 1",
+        );
+
+        // Capture each store's log position, then apply the Delete of the
+        // store-1 record. The Delete redo must extend store 1's log only.
+        let p0 = log0.lock().write_position();
+        let p1 = log1.lock().write_position();
+        apply_op_journal(&engine, &ReplicaOp::Delete { tx_key: kb }, true, false).unwrap();
+
+        assert_eq!(
+            log0.lock().write_position(),
+            p0,
+            "Delete must NOT be journaled to store 0's log",
+        );
+        assert!(
+            log1.lock().write_position() > p1,
+            "Delete must be journaled to store 1 — the record's own store log",
         );
     }
 
