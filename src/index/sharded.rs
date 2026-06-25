@@ -2257,6 +2257,84 @@ mod tests {
         assert!(restored.lookup(&make_key(1)).is_some());
     }
 
+    /// A snapshot taken WHILE other threads mutate the index — the fuzzy /
+    /// non-blocking checkpoint path (`snapshot_all_concurrent`) — must
+    /// (a) not deadlock (its per-shard lock order matches the write path, so no
+    /// global barrier is needed), and (b) restore cleanly, capturing every entry
+    /// that existed before the snapshot began. Entries inserted *during* the
+    /// snapshot may or may not appear (it is deliberately fuzzy across shards);
+    /// in production the checkpoint's redo fence + idempotent replay reconcile
+    /// that tail. This is the per-PR restorability guard for the dropped-quiesce
+    /// design.
+    #[test]
+    fn concurrent_snapshot_restores_all_pre_snapshot_entries() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fuzzy.snap");
+
+        // Pre-snapshot set: every one of these must survive the snapshot.
+        const PRE: u64 = 5_000;
+        let index = Arc::new(ShardedIndex::new_in_memory(20_000, 16).unwrap());
+        let mut expected = std::collections::HashMap::new();
+        for i in 0..PRE {
+            let key = make_key(i);
+            let entry = make_entry(i * 64 + 7);
+            index.register(key, entry).unwrap();
+            expected.insert(key.txid, entry);
+        }
+
+        let dah = parking_lot::Mutex::new(crate::index::DahBackend::InMemory(DahIndex::new()));
+        let unmined =
+            parking_lot::Mutex::new(crate::index::UnminedBackend::InMemory(UnminedIndex::new()));
+
+        // Three writers register NEW entries (disjoint key ranges) concurrently
+        // with the snapshot, so each shard is mutated while it is being — or
+        // about to be — serialized.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..3u64)
+            .map(|w| {
+                let index = index.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut n = PRE + w * 1_000_000;
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = index.register(make_key(n), make_entry(n * 64 + 7));
+                        n += 1;
+                    }
+                })
+            })
+            .collect();
+
+        // The code under test: serialize each shard under its own short-lived
+        // read lock (no cross-subsystem lock), then the secondaries.
+        index
+            .snapshot_all_concurrent(&dah, &unmined, &path)
+            .expect("concurrent snapshot must succeed");
+
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let (restored, _dah, _unmined, _flags) =
+            ShardedIndex::restore_all(&path, 16).expect("fuzzy snapshot must restore");
+        for (txid, entry) in &expected {
+            let key = TxKey { txid: *txid };
+            assert_eq!(
+                restored.lookup(&key).as_ref(),
+                Some(entry),
+                "pre-snapshot entry {txid:?} lost from the concurrently-taken snapshot"
+            );
+        }
+        assert!(
+            restored.len() >= PRE as usize,
+            "restored index must hold at least the {PRE} pre-snapshot entries, got {}",
+            restored.len()
+        );
+    }
+
     /// Test 4: an unknown magic and an unsupported v2 version both fail closed
     /// with `FormatError` (never panic, never guess).
     #[test]

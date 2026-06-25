@@ -20,7 +20,7 @@ use teraslab::protocol::codec::{
     FieldMask, WireCreateItem, decode_get_response_checked, encode_create_batch, encode_get_batch,
 };
 use teraslab::protocol::frame::{RequestFrame, ResponseFrame};
-use teraslab::protocol::opcodes::{OP_CREATE_BATCH, OP_GET_BATCH, STATUS_OK, STATUS_PARTIAL_ERROR};
+use teraslab::protocol::opcodes::{OP_CREATE_BATCH, OP_GET_BATCH, STATUS_OK};
 use teraslab::redo::RedoLog;
 use teraslab::server::Server;
 use teraslab::server::dispatch::init_dispatch_metrics;
@@ -180,8 +180,9 @@ pub fn send_frame(stream: &mut TcpStream, frame: &RequestFrame) -> ResponseFrame
 }
 
 /// One client connection creating `n` records (one per CreateBatch). Returns
-/// (acked records, elapsed). Counts STATUS_OK and STATUS_PARTIAL_ERROR-with-
-/// no-error as acked.
+/// (acked records, elapsed). Counts ONLY STATUS_OK: each frame is a single-item
+/// batch, so STATUS_PARTIAL_ERROR means that one create failed — counting it as
+/// an ack would let a broken write path pass the smoke's `acked == N` assert.
 pub fn drive_creates(tcp_port: u16, client_id: u32, n: u32) -> (u64, Duration) {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{tcp_port}")).unwrap();
     stream.set_nodelay(true).unwrap();
@@ -199,7 +200,7 @@ pub fn drive_creates(tcp_port: u16, client_id: u32, n: u32) -> (u64, Duration) {
                 payload: payload.into(),
             },
         );
-        if resp.status == STATUS_OK || resp.status == STATUS_PARTIAL_ERROR {
+        if resp.status == STATUS_OK {
             acked += 1;
         }
     }

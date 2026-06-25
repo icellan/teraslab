@@ -8370,11 +8370,24 @@ fn decorate_get_item(
                     }
                 }
             }
-            if field_mask.has(FieldMask::COLD_DATA) {
-                match engine.read_cold_data(&key) {
+            // Read the cold blob at most once even when both COLD_DATA and
+            // COLD_DATA_OUTPUTS are requested — otherwise each branch would
+            // re-download and re-verify an EXTERNAL blob. They are independent
+            // wire fields.
+            let cold_result = if field_mask.has(FieldMask::COLD_DATA)
+                || field_mask.has(FieldMask::COLD_DATA_OUTPUTS)
+            {
+                Some(engine.read_cold_data(&key))
+            } else {
+                None
+            };
+            if field_mask.has(FieldMask::COLD_DATA)
+                && let Some(res) = cold_result.as_ref()
+            {
+                match res {
                     Ok(cold) => {
                         data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
-                        data.extend_from_slice(&cold);
+                        data.extend_from_slice(cold);
                     }
                     // F-IJ-001: missing external blob → ERR_BLOB_NOT_FOUND,
                     // not the generic ERR_STORAGE_IO path below.
@@ -8389,18 +8402,19 @@ fn decorate_get_item(
                 }
             }
             // #20: outputs-only cold data — ship just the parent's outputs
-            // section, not the full inputs+outputs+inpoints blob, for parent
-            // decoration. Same `[len:4][bytes]` wire shape as COLD_DATA. The
-            // blob is still read (and hash-verified, for EXTERNAL) whole; this
-            // trims the wire payload, which is what decoration is bound on.
-            if field_mask.has(FieldMask::COLD_DATA_OUTPUTS) {
-                match engine.read_cold_data(&key) {
+            // section, not the full inputs+outputs+inpoints blob. Trims the wire
+            // payload (the blob is still read + hash-verified whole, shared with
+            // the COLD_DATA read above).
+            if field_mask.has(FieldMask::COLD_DATA_OUTPUTS)
+                && let Some(res) = cold_result.as_ref()
+            {
+                match res {
                     // Empty cold data → genuinely no outputs section. Distinct
                     // from a malformed blob below.
                     Ok(cold) if cold.is_empty() => {
                         data.extend_from_slice(&0u32.to_le_bytes());
                     }
-                    Ok(cold) => match parse_cold_data_fields(&cold).1 {
+                    Ok(cold) => match parse_cold_data_fields(cold).1 {
                         Some(outputs) => {
                             data.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
                             data.extend_from_slice(outputs);

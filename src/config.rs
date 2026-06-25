@@ -822,6 +822,20 @@ pub struct ServerConfig {
     /// checkpoint (BC-01, hysteresis). Default: 0.25.
     pub checkpoint_low_water: f64,
 
+    /// Redo-log usage fraction (0.0..1.0) at or above which the background
+    /// checkpoint task forces a **blocking** (stop-the-world) checkpoint that
+    /// fully drains the redo log, instead of the normal non-blocking (fuzzy)
+    /// one. Default: 0.90. Must satisfy
+    /// `checkpoint_high_water < checkpoint_emergency_water < 1.0`.
+    ///
+    /// A fuzzy checkpoint only reclaims the prefix durable before its snapshot
+    /// began, so under sustained write load it cannot keep up; this mark is the
+    /// hard fallback that prevents the redo from filling to `LogFull`. Set it
+    /// comfortably above `checkpoint_high_water` so the fuzzy (non-blocking)
+    /// path is the common case — if it collapses onto `high_water` every
+    /// checkpoint blocks, defeating the non-blocking design.
+    pub checkpoint_emergency_water: f64,
+
     /// Cadence in milliseconds at which the background checkpoint
     /// task samples redo-log usage (BC-01). Default: 1000 ms. The
     /// sample itself is a single mutex acquire + atomic load on the
@@ -1000,6 +1014,7 @@ impl Default for ServerConfig {
             blob_gc_interval_secs: 3600,
             checkpoint_high_water: 0.75,
             checkpoint_low_water: 0.25,
+            checkpoint_emergency_water: 0.90,
             checkpoint_poll_interval_ms: 1000,
             cluster_state_path: None,
             cluster_secret: None,
@@ -1669,6 +1684,22 @@ impl ServerConfig {
             return Err(ConfigError::InvalidSizing(format!(
                 "checkpoint_low_water ({}) must be strictly less than checkpoint_high_water ({})",
                 self.checkpoint_low_water, self.checkpoint_high_water
+            )));
+        }
+        if !(0.0..1.0).contains(&self.checkpoint_emergency_water) {
+            return Err(ConfigError::InvalidSizing(format!(
+                "checkpoint_emergency_water = {} must be in [0.0, 1.0)",
+                self.checkpoint_emergency_water
+            )));
+        }
+        // The emergency (blocking-checkpoint) mark must sit strictly above
+        // high_water, else every checkpoint takes the blocking stop-the-world
+        // path and the non-blocking fuzzy checkpoint is never used.
+        if self.checkpoint_emergency_water <= self.checkpoint_high_water {
+            return Err(ConfigError::InvalidSizing(format!(
+                "checkpoint_emergency_water ({}) must be strictly greater than \
+                 checkpoint_high_water ({}) so the non-blocking checkpoint path is used",
+                self.checkpoint_emergency_water, self.checkpoint_high_water
             )));
         }
         nonzero_u64(

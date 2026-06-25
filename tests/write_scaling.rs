@@ -17,11 +17,21 @@ use std::sync::Arc;
 fn write_scaling_smoke() {
     let srv = spawn_write_server();
     let (acked, el) = run_clients(srv.tcp_port, 4, 200);
-    assert_eq!(acked, 800, "every create must be acked");
+    // drive_creates counts STATUS_OK only, so this fails if any create on the
+    // write path is broken (a STATUS_PARTIAL_ERROR drops the ack).
+    assert_eq!(acked, 800, "every create must be OK-acked");
+    // The 1-item-batch smoke does not reliably overlap writers (gauge peaks at
+    // 1), so assert only that the writers_in_flight gauge is wired and reached;
+    // the > 1 parallelism bar lives in the slow 8-client baseline below where
+    // it actually holds.
+    let gauge_max = teraslab::metrics::writers_in_flight_max();
+    assert!(
+        gauge_max >= 1,
+        "writers_in_flight gauge must register at least one writer, got {gauge_max}"
+    );
     println!(
-        "[smoke] 4 clients x 200 = {acked} acked in {el:?} -> {:.0} ops/s, gauge_max={}",
+        "[smoke] 4 clients x 200 = {acked} acked in {el:?} -> {:.0} ops/s, gauge_max={gauge_max}",
         ops_per_sec(acked, el),
-        teraslab::metrics::writers_in_flight_max()
     );
 }
 
@@ -48,7 +58,28 @@ fn write_scaling_baseline_1_vs_8() {
     println!("[baseline] 8 clients: {a8} acked, {eight:.0} ops/s, gauge_max={max8}");
     println!("[baseline] scaling ratio (8/1) = {:.2}x", eight / one);
     println!("[baseline] 8-client CPU/wall ratio = {cores:.2} cores (reported, not asserted)");
-    // PHASE 0: no assertion. See plan Task 2c.
+
+    // Write parallelism (PR#21): 8 concurrent connection threads drive the
+    // sharded write path across multiple cores. The CPU/wall ratio is the
+    // write-path analogue of the read fan-out's cores assertion — and the
+    // metric that actually reflects parallelism here: `writers_in_flight`
+    // peaks at 1 even when cores > 2, so it is reported, not asserted.
+    //
+    // NOTE: this harness runs WITHOUT a checkpoint task, so a sustained
+    // 400k-write run overflows the test redo log and the tail of creates fail
+    // with LogFull — `a8` is therefore not the full total and is not asserted
+    // equal to it. The per-PR smoke's `acked == 800` covers the all-OK path on
+    // a workload that does not overflow.
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if available >= 2 {
+        assert!(
+            cores > 1.5,
+            "8 concurrent clients must use >1.5 cores on the write path \
+             (got {cores:.2} on a {available}-core host)"
+        );
+    }
 }
 
 // ===========================================================================
