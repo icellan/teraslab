@@ -154,13 +154,13 @@ pub struct DeleteTombstoneInfo {
     pub cause: crate::tombstone::TombstoneCause,
 }
 
-/// An additional storage domain beyond store 0: a device (whole physical
-/// device or a [`SubDevice`](crate::subdevice::SubDevice) carved from one) plus
-/// its own allocator. A node runs N stores; store 0's device/allocator live
-/// inline on [`Engine`] and stores 1..N live in [`Engine::aux_stores`]. A
-/// record's owning store is chosen at create time (round-robin) and recorded in
-/// the index entry's `device_id`, so every later access routes by that field —
-/// never by any function of the key (which would collide with cluster sharding).
+/// One storage domain: a device (whole physical device or a
+/// [`SubDevice`](crate::subdevice::SubDevice) carved from one) plus its own raw
+/// device pointer and allocator. A node runs N stores, all held in
+/// `Engine::stores` indexed by `device_id` (store 0 first). A record's owning
+/// store is chosen at create time (round-robin) and recorded in the index
+/// entry's `device_id`, so every later access routes by that field — never by
+/// any function of the key (which would collide with cluster sharding).
 pub(crate) struct Store {
     device: Arc<dyn BlockDevice>,
     /// Raw pointer to this store's device memory for zero-copy I/O on the hot
@@ -171,17 +171,11 @@ pub(crate) struct Store {
 }
 
 pub struct Engine {
-    /// Store 0's device. Records placed on store 0 (`device_id == 0`), and the
-    /// single-device configuration, use this directly; stores 1..N live in
-    /// [`Self::aux_stores`]. Use [`Self::device_for`] to route by `device_id`.
-    device: Arc<dyn BlockDevice>,
-    /// Raw pointer to store 0's device memory for zero-copy I/O on the hot
-    /// path. `null_mut()` when the device does not support direct access (falls
-    /// back to `pread`/`pwrite` with `AlignedBuf`).
-    device_ptr: *mut u8,
-    /// Stores 1..N (empty in the single-device configuration). Indexed as
-    /// `aux_stores[device_id - 1]`. See [`Self::device_for`].
-    aux_stores: Vec<Store>,
+    /// Every store backing this engine, indexed by `device_id` (store 0 first).
+    /// Each holds its own device + raw device pointer + allocator. Route by
+    /// `device_id` via [`Self::device_for`] / [`Self::device_ptr_for`] /
+    /// [`Self::allocator_for`].
+    stores: Vec<Store>,
     /// Round-robin placement of new records across all stores.
     placer: crate::subdevice::RoundRobinPlacer,
     /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
@@ -191,8 +185,6 @@ pub struct Engine {
     /// file-backed and most tests run at 1 (a transparent pass-through over a
     /// single recovered/rebuilt backend via [`ShardedIndex::from_single`]).
     index: ShardedIndex,
-    /// Store 0's allocator. Route by `device_id` via [`Self::allocator_for`].
-    allocator: parking_lot::Mutex<SlotAllocator>,
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
     unmined_index: parking_lot::Mutex<UnminedBackend>,
@@ -461,7 +453,7 @@ impl Engine {
             })
             .collect();
         let total = 1 + aux_stores.len();
-        engine.aux_stores = aux_stores;
+        engine.stores.extend(aux_stores);
         engine.placer = crate::subdevice::RoundRobinPlacer::new(total);
         engine
     }
@@ -490,12 +482,13 @@ impl Engine {
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         let engine = Self {
-            device,
-            device_ptr,
-            aux_stores: Vec::new(),
+            stores: vec![Store {
+                device,
+                device_ptr,
+                allocator: parking_lot::Mutex::new(allocator),
+            }],
             placer,
             index,
-            allocator: parking_lot::Mutex::new(allocator),
             locks,
             dah_index: parking_lot::Mutex::new(dah_index),
             unmined_index: parking_lot::Mutex::new(unmined_index),
@@ -1807,14 +1800,14 @@ impl Engine {
     ///
     /// Locks the allocator briefly to compute the snapshot.
     pub fn allocator_stats(&self) -> crate::allocator::AllocatorStats {
-        self.allocator.lock().stats()
+        self.stores[0].allocator.lock().stats()
     }
 
     /// Non-blocking allocator stats for observability: returns `None` if the
     /// allocator lock is momentarily held by the write path, so `/admin/top`
     /// never stalls behind a write burst.
     pub fn allocator_stats_try(&self) -> Option<crate::allocator::AllocatorStats> {
-        self.allocator.try_lock().map(|g| g.stats())
+        self.stores[0].allocator.try_lock().map(|g| g.stats())
     }
 
     /// Get a reference to the allocator mutex.
@@ -1822,7 +1815,7 @@ impl Engine {
     /// Used by the dispatch layer to free pre-allocated space when a redo
     /// flush fails after [`Self::pre_allocate_create`] succeeded.
     pub fn allocator(&self) -> &parking_lot::Mutex<SlotAllocator> {
-        &self.allocator
+        &self.stores[0].allocator
     }
 
     /// Number of storage domains (stores) backing this engine. `1` in the
@@ -1830,18 +1823,14 @@ impl Engine {
     /// multiple stores are configured.
     #[inline]
     pub fn store_count(&self) -> usize {
-        1 + self.aux_stores.len()
+        self.stores.len()
     }
 
     /// The device backing records placed on `device_id` (the index entry's
-    /// `device_id` field). Store 0 lives inline; stores 1..N in `aux_stores`.
+    /// `device_id` field).
     #[inline]
     pub fn device_for(&self, device_id: u8) -> &Arc<dyn BlockDevice> {
-        if device_id == 0 {
-            &self.device
-        } else {
-            &self.aux_stores[device_id as usize - 1].device
-        }
+        &self.stores[device_id as usize].device
     }
 
     /// Fsync the data device of EVERY store.
@@ -1869,7 +1858,7 @@ impl Engine {
     pub fn sync_all_store_devices(&self) -> crate::device::Result<()> {
         let n = self.store_count();
         if n == 1 {
-            return self.device.sync();
+            return self.stores[0].device.sync();
         }
         std::thread::scope(|scope| {
             // Spawn stores 1..N; the calling thread handles store 0.
@@ -1926,21 +1915,13 @@ impl Engine {
     /// is not memory-backed; callers fall back to `pread`/`pwrite`).
     #[inline]
     pub fn device_ptr_for(&self, device_id: u8) -> *mut u8 {
-        if device_id == 0 {
-            self.device_ptr
-        } else {
-            self.aux_stores[device_id as usize - 1].device_ptr
-        }
+        self.stores[device_id as usize].device_ptr
     }
 
     /// The allocator for store `device_id`.
     #[inline]
     pub fn allocator_for(&self, device_id: u8) -> &parking_lot::Mutex<SlotAllocator> {
-        if device_id == 0 {
-            &self.allocator
-        } else {
-            &self.aux_stores[device_id as usize - 1].allocator
-        }
+        &self.stores[device_id as usize].allocator
     }
 
     /// Choose the store for a NEW record (round-robin across all stores) and
@@ -4086,7 +4067,7 @@ impl Engine {
         let base_size = TxMetadata::record_size_for(utxo_count);
         let total_size = base_size + cold_size as u64;
 
-        let record_offset = self
+        let record_offset = self.stores[0]
             .allocator
             .lock()
             .allocate(total_size)
@@ -7697,7 +7678,7 @@ impl Engine {
     /// Used by the replication receiver for low-level slot operations
     /// (e.g. prune) that bypass the normal engine API.
     pub fn device(&self) -> &dyn BlockDevice {
-        &*self.device
+        &*self.stores[0].device
     }
 
     /// Access the block device backing store `device_id` (the index entry's
@@ -7753,8 +7734,7 @@ impl Engine {
     /// Returns [`crate::allocator::AllocatorError`] on device I/O failure.
     pub fn persist_allocator(&self) -> crate::allocator::Result<()> {
         // Persist every store's allocator (one per device).
-        self.allocator.lock().persist()?;
-        for store in &self.aux_stores {
+        for store in &self.stores {
             store.allocator.lock().persist()?;
         }
         Ok(())
@@ -9049,7 +9029,7 @@ mod tests {
         // Manually write a frozen slot
         let entry = h.engine.lookup(&h.key).unwrap();
         let frozen = UtxoSlot::new_frozen(h.slot_hash(3));
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &frozen).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 3, &frozen).unwrap();
 
         match h.engine.spend(&h.spend_req(3)) {
             Err(SpendError::Frozen { offset: 3 }) => {}
@@ -9063,7 +9043,7 @@ mod tests {
         let entry = h.engine.lookup(&h.key).unwrap();
         let mut pruned_slot = UtxoSlot::new_spent(h.slot_hash(4), h.make_spending_data(0x11));
         pruned_slot.status = UTXO_PRUNED;
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 4, &pruned_slot).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 4, &pruned_slot).unwrap();
 
         match h.engine.spend(&h.spend_req(4)) {
             Err(SpendError::Pruned {
@@ -9081,7 +9061,7 @@ mod tests {
         // Write a slot with spendable_height = 2000
         let mut slot = UtxoSlot::new_unspent(h.slot_hash(2));
         slot.spending_data[0..4].copy_from_slice(&2000u32.to_le_bytes());
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 2, &slot).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 2, &slot).unwrap();
 
         let mut req = h.spend_req(2);
         req.current_block_height = 1000;
@@ -9104,7 +9084,7 @@ mod tests {
         let entry = h.engine.lookup(&h.key).unwrap();
         let mut slot = UtxoSlot::new_unspent(h.slot_hash(2));
         slot.spending_data[0..4].copy_from_slice(&1000u32.to_le_bytes());
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 2, &slot).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 2, &slot).unwrap();
 
         let mut req = h.spend_req(2);
         req.current_block_height = 1000;
@@ -9120,7 +9100,7 @@ mod tests {
         let entry = h.engine.lookup(&h.key).unwrap();
         let mut slot = UtxoSlot::new_unspent(h.slot_hash(2));
         slot.spending_data[0..4].copy_from_slice(&1000u32.to_le_bytes());
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 2, &slot).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 2, &slot).unwrap();
 
         let mut req = h.spend_req(2);
         req.current_block_height = 999;
@@ -9139,7 +9119,7 @@ mod tests {
         let entry = h.engine.lookup(&h.key).unwrap();
         let mut slot = UtxoSlot::new_unspent(h.slot_hash(2));
         slot.spending_data[0..4].copy_from_slice(&500u32.to_le_bytes());
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 2, &slot).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 2, &slot).unwrap();
 
         let mut req = h.spend_req(2);
         req.current_block_height = 1000;
@@ -9668,7 +9648,7 @@ mod tests {
         let h = TestHarness::new(10, TxFlags::empty());
         let entry = h.engine.lookup(&h.key).unwrap();
         let frozen = UtxoSlot::new_frozen(h.slot_hash(3));
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &frozen).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 3, &frozen).unwrap();
         let g0 = { h.engine.read_metadata(&h.key).unwrap().generation };
 
         let req = UnspendRequest {
@@ -9701,7 +9681,7 @@ mod tests {
         let h = TestHarness::new(10, TxFlags::empty());
         let entry = h.engine.lookup(&h.key).unwrap();
         let spent_frozen = UtxoSlot::new_spent(h.slot_hash(3), [FROZEN_BYTE; 36]);
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &spent_frozen).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 3, &spent_frozen).unwrap();
 
         let req = UnspendRequest {
             tx_key: h.key,
@@ -10050,7 +10030,7 @@ mod tests {
             let mut meta = h.engine.read_metadata(&h.key).unwrap();
             let old_dah = { meta.delete_at_height };
             meta.delete_at_height = 0;
-            io::write_metadata(&*h.engine.device, entry.record_offset, &meta).unwrap();
+            io::write_metadata(h.engine.device(), entry.record_offset, &meta).unwrap();
             h.engine.update_dah_index(&h.key, old_dah, 0).unwrap();
         }
         assert!(h.engine.dah_index().range_query(u32::MAX).is_empty());
@@ -10394,7 +10374,7 @@ mod tests {
 
         // Freeze slot 2
         let frozen = UtxoSlot::new_frozen(h.slot_hash(2));
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 2, &frozen).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 2, &frozen).unwrap();
 
         // Spend slot 4 with some data
         h.engine.spend(&h.spend_req(4)).unwrap();
@@ -10593,7 +10573,7 @@ mod tests {
         // hide the mismatch and make recovery/accounting impossible.
         let entry = h.engine.lookup(&h.key).unwrap();
         let spent_slot = UtxoSlot::new_spent(h.slot_hash(3), h.make_spending_data(0x11));
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &spent_slot).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 3, &spent_slot).unwrap();
 
         let req = UnspendRequest {
             tx_key: h.key,
@@ -10628,7 +10608,7 @@ mod tests {
         let entry = h.engine.lookup(&h.key).unwrap();
         let mut pruned_slot = UtxoSlot::new_spent(h.slot_hash(3), h.make_spending_data(0x11));
         pruned_slot.status = UTXO_PRUNED;
-        io::write_utxo_slot(&*h.engine.device, entry.record_offset, 3, &pruned_slot).unwrap();
+        io::write_utxo_slot(h.engine.device(), entry.record_offset, 3, &pruned_slot).unwrap();
 
         let req = UnspendRequest {
             tx_key: h.key,
@@ -11468,7 +11448,7 @@ mod tests {
 
         h.engine.append_conflicting_child(&h.key, c1).unwrap();
 
-        let allocator_guard = h.engine.allocator.lock();
+        let allocator_guard = h.engine.allocator().lock();
         let engine = h.engine.clone();
         let key = h.key;
         let append_started = Arc::new(AtomicBool::new(false));
@@ -11573,14 +11553,17 @@ mod tests {
     #[test]
     fn append_conflicting_child_no_stale_bytes_leak() {
         let h = TestHarness::new(1, TxFlags::empty());
-        let align = h.engine.device.alignment();
+        let align = h.engine.device().alignment();
 
-        let stale_offset = h.engine.allocator.lock().allocate(align as u64).unwrap();
+        let stale_offset = h.engine.allocator().lock().allocate(align as u64).unwrap();
         let mut stale = AlignedBuf::new(align, align);
         stale.fill(0xA5);
-        h.engine.device.pwrite_all_at(&stale, stale_offset).unwrap();
         h.engine
-            .allocator
+            .device()
+            .pwrite_all_at(&stale, stale_offset)
+            .unwrap();
+        h.engine
+            .allocator()
             .lock()
             .free(stale_offset, align as u64)
             .unwrap();
@@ -11597,7 +11580,7 @@ mod tests {
 
         let mut read_back = AlignedBuf::new(align, align);
         h.engine
-            .device
+            .device()
             .pread_exact_at(&mut read_back, stale_offset)
             .unwrap();
         assert_eq!(&read_back[..32], &child);
@@ -16681,7 +16664,7 @@ mod tests {
             })
             .unwrap();
 
-        let rebuilt = PrimaryBackend::rebuild(&*engine.device, &engine.allocator.lock()).unwrap();
+        let rebuilt = PrimaryBackend::rebuild(engine.device(), &engine.allocator().lock()).unwrap();
         assert!(
             rebuilt.lookup(&key).is_none(),
             "rebuild must ignore freed records whose metadata was tombstoned",
@@ -17043,10 +17026,10 @@ mod tests {
             })
             .unwrap();
 
-        let align = engine.device.alignment();
+        let align = engine.device().alignment();
         let mut buf = AlignedBuf::new(io::align_up(METADATA_SIZE, align), align);
         engine
-            .device
+            .device()
             .pread_exact_at(&mut buf, created.record_offset)
             .unwrap();
 
@@ -17373,9 +17356,9 @@ mod tests {
 
         // Manually write PRUNED status
         let entry = engine.lookup(&key).unwrap();
-        let mut slot = io::read_utxo_slot(&*engine.device, entry.record_offset, 0).unwrap();
+        let mut slot = io::read_utxo_slot(engine.device(), entry.record_offset, 0).unwrap();
         slot.status = UTXO_PRUNED;
-        io::write_utxo_slot(&*engine.device, entry.record_offset, 0, &slot).unwrap();
+        io::write_utxo_slot(engine.device(), entry.record_offset, 0, &slot).unwrap();
 
         let resp = engine
             .get_spend(&GetSpendRequest {
