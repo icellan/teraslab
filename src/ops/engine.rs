@@ -580,8 +580,8 @@ impl Engine {
     /// Each store's log must already share the global sequence counter (see
     /// [`crate::redo::RedoLog::attach_shared_sequence`]). The per-store
     /// secondary-index two-phase durability path and the dispatch write path
-    /// route each redo entry to the owning store's log via
-    /// [`Self::redo_log_for_device`].
+    /// route each redo entry to the owning store's log via the private
+    /// `redo_log_for_device` helper.
     pub fn set_redo_logs(&self, logs: Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>) {
         if self.redo_logs.set(logs).is_err() {
             tracing::warn!("engine per-store redo logs already attached; ignoring replacement");

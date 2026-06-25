@@ -10114,6 +10114,7 @@ fn handle_get_partition_map(req: &RequestFrame, cluster: Option<&RunningCluster>
             let addr = b"127.0.0.1:3300";
             payload.extend_from_slice(&(addr.len() as u16).to_le_bytes());
             payload.extend_from_slice(addr);
+            payload.push(1); // is_alive — match the clustered encoder + client decoder format
             // All 4096 shards map to node 0
             for _ in 0..4096u16 {
                 payload.extend_from_slice(&0u64.to_le_bytes());
