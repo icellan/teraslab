@@ -1218,15 +1218,11 @@ fn main() {
     // re-derived here from each record's authoritative CONFLICTING flag.
     engine.rebuild_conflicting_index();
 
-    // Attach the redo logs so the engine performs two-phase durability for
-    // secondary index updates (redo fsync BEFORE redb commit), routing each
-    // intent to the owning store's log. `set_redo_log` installs the
-    // representative (store 0) handle used by the replication receiver and
-    // migration suppression; `set_redo_logs` installs the full per-store set
-    // used by the dispatch write path and secondary-index routing.
-    if let Some(ref log) = redo_log {
-        engine.set_redo_log(log.clone());
-    }
+    // Attach the per-store redo logs so the engine performs two-phase durability
+    // for secondary index updates (redo fsync BEFORE redb commit), routing each
+    // intent to the owning store's log. This is the SOLE attach point: store 0's
+    // log is `logs[0]` (the representative handle the replication receiver and
+    // migration suppression read via `engine.redo_log()`).
     if let Some(ref logs) = redo_logs_arc {
         engine.set_redo_logs(logs.clone());
     }

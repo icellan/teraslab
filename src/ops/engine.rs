@@ -218,16 +218,6 @@ pub struct Engine {
     /// because OP_REPLICA_BATCH also acquires this guard. RwLock keeps
     /// the checkpoint guarantee while restoring per-op parallelism.
     dispatch_visibility_barrier: parking_lot::RwLock<()>,
-    /// Shared redo log used by secondary indexes for two-phase durability.
-    ///
-    /// When `Some`, the engine appends and fsyncs a
-    /// [`RedoOp::SecondaryDahUpdate`] / [`RedoOp::SecondaryUnminedUpdate`]
-    /// entry BEFORE committing the on-disk (redb) secondary index. This
-    /// closes the window where a crash between redb commit and the caller's
-    /// primary redo flush could leave the secondary index out of sync with
-    /// the primary index. In-memory secondary indexes ignore the log — they
-    /// are rebuilt on startup from the primary redo replay + device scan.
-    redo_log: std::sync::OnceLock<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>,
     /// Per-store redo logs, one per store (index = `device_id`). Populated by
     /// [`Self::set_redo_logs`] at boot. Each store's log has its own backing
     /// region so writes get N parallel fsync streams instead of serializing on
@@ -511,7 +501,6 @@ impl Engine {
             unmined_index: parking_lot::Mutex::new(unmined_index),
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
-            redo_log: std::sync::OnceLock::new(),
             redo_logs: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
@@ -549,9 +538,10 @@ impl Engine {
     /// dispatch layer for primary-op durability should be passed here so
     /// that primary and secondary entries share a single log.
     pub fn set_redo_log(&self, redo_log: Arc<parking_lot::Mutex<crate::redo::RedoLog>>) {
-        if self.redo_log.set(redo_log).is_err() {
-            tracing::warn!("engine redo log already attached; ignoring replacement");
-        }
+        // Convenience for single-store / test paths: a lone log IS store 0's.
+        // Equivalent to `set_redo_logs(vec![log])`; do NOT also call
+        // `set_redo_logs` on the same engine (the second attach is ignored).
+        self.set_redo_logs(vec![redo_log]);
     }
 
     /// Public accessor for the engine's redo log handle.
@@ -570,13 +560,13 @@ impl Engine {
     /// Returns `None` when no redo log has been attached (test paths,
     /// unconfigured deployments).
     pub fn redo_log(&self) -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
-        self.redo_log.get().cloned()
+        self.redo_logs.get().and_then(|v| v.first()).cloned()
     }
 
     /// Attach the per-store redo logs (one per store, indexed by `device_id`).
     ///
-    /// Call once at boot after recovery, alongside [`Self::set_redo_log`]
-    /// (which should be passed store 0's log as the representative handle).
+    /// Call once at boot after recovery (this is the SOLE redo-log attach point;
+    /// store 0's log is `logs[0]`, returned by [`Self::redo_log`]).
     /// Each store's log must already share the global sequence counter (see
     /// [`crate::redo::RedoLog::attach_shared_sequence`]). The per-store
     /// secondary-index two-phase durability path and the dispatch write path
@@ -621,7 +611,7 @@ impl Engine {
                 let idx = (device_id as usize).min(logs.len() - 1);
                 Some(logs[idx].clone())
             }
-            _ => self.redo_log.get().cloned(),
+            _ => None,
         }
     }
 
@@ -932,11 +922,7 @@ impl Engine {
                 .iter()
                 .map(|l| l.lock().usage_fraction())
                 .fold(0.0_f64, f64::max),
-            _ => self
-                .redo_log
-                .get()
-                .map(|l| l.lock().usage_fraction())
-                .unwrap_or(0.0),
+            _ => 0.0,
         }
     }
 
@@ -963,11 +949,7 @@ impl Engine {
                     log.lock().compact_prefix_through(fence)?;
                 }
             }
-            _ => {
-                if let Some(log) = self.redo_log.get() {
-                    log.lock().compact_prefix_through(fence)?;
-                }
-            }
+            _ => {}
         }
         Ok(())
     }
@@ -989,11 +971,7 @@ impl Engine {
                     log.lock().mark_recovery_progress(through_sequence)?;
                 }
             }
-            _ => {
-                if let Some(log) = self.redo_log.get() {
-                    log.lock().mark_recovery_progress(through_sequence)?;
-                }
-            }
+            _ => {}
         }
         Ok(())
     }
@@ -1103,13 +1081,7 @@ impl Engine {
                     Some(detail) => return Err(detail),
                 }
             }
-            _ => {
-                if let Some(log) = self.redo_log.get() {
-                    log.lock()
-                        .flush()
-                        .map_err(|e| format!("replica redo flush: {e}"))?;
-                }
-            }
+            _ => {}
         }
         Ok(())
     }
@@ -1147,11 +1119,7 @@ impl Engine {
                     merged.extend(part);
                 }
             }
-            _ => {
-                if let Some(log) = self.redo_log.get() {
-                    merged = log.lock().read_from_sequence(from_seq)?;
-                }
-            }
+            _ => {}
         }
         merged.sort_by_key(|e| e.sequence);
         Ok(merged)
@@ -1186,11 +1154,7 @@ impl Engine {
                     }
                 }
             }
-            _ => {
-                if let Some(log) = self.redo_log.get() {
-                    earliest = log.lock().earliest_sequence()?;
-                }
-            }
+            _ => {}
         }
         Ok(earliest)
     }
@@ -14196,7 +14160,6 @@ mod tests {
         let rdev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
         let log = RedoLog::open(rdev.clone(), 0, 8192).unwrap();
         let log_arc = Arc::new(parking_lot::Mutex::new(log));
-        engine.set_redo_log(log_arc.clone());
         engine.set_redo_logs(vec![log_arc.clone()]);
 
         let ops: Vec<RedoOp> = (0..2000u64)

@@ -3276,9 +3276,8 @@ mod tests {
         log1.attach_shared_sequence(shared.clone());
         let log0 = Arc::new(parking_lot::Mutex::new(log0));
         let log1 = Arc::new(parking_lot::Mutex::new(log1));
-        // Boot wires BOTH the per-store logs and a representative single handle
-        // (store 0's) — `build_post_apply_redo_op` gates on the latter.
-        engine.set_redo_log(log0.clone());
+        // Attach the per-store logs; store 0's (log0) is the representative
+        // handle `build_post_apply_redo_op` gates on via `engine.redo_log()`.
         engine.set_redo_logs(vec![log0.clone(), log1.clone()]);
 
         // Round-robin placement: first record → store 0, second → store 1.
