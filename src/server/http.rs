@@ -2721,10 +2721,6 @@ struct PprofQuery {
     /// Sampling frequency in Hz. Clamped to `[10, 1000]`.
     #[serde(default = "default_profile_frequency")]
     frequency: i32,
-    /// `flamegraph` (default, inferno SVG) or `proto`/`pb` (pprof protobuf for
-    /// `go tool pprof` / pprof.me / `samply`).
-    #[serde(default)]
-    format: Option<String>,
 }
 
 fn default_profile_seconds() -> u64 {
@@ -2739,13 +2735,17 @@ fn default_profile_frequency() -> i32 {
 /// 409 rather than failing deep inside `ProfilerGuardBuilder::build`.
 static PPROF_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-/// `GET /debug/pprof/profile?seconds=N&frequency=Hz&format=flamegraph|proto`
+/// `GET /debug/pprof/profile?seconds=N&frequency=Hz`
 ///
 /// Samples the whole process for `seconds` and returns an inferno flamegraph
-/// SVG (default) or a pprof protobuf. Admin-gated and single-flight. The
-/// blocking sample runs on a dedicated `spawn_blocking` thread so it never
-/// parks an async worker, and the `ProfilerGuard` is created and reported
-/// entirely within that thread (never held across an `.await`).
+/// SVG. Admin-gated and single-flight. The blocking sample runs on a dedicated
+/// `spawn_blocking` thread so it never parks an async worker, and the
+/// `ProfilerGuard` is created and reported entirely within that thread (never
+/// held across an `.await`).
+///
+/// pprof-protobuf output (for `go tool pprof` / pprof.me) is intentionally not
+/// served here — its codec pulls a vulnerable / duplicate dependency; use
+/// `samply` or `cargo flamegraph` for that (see PROFILING.md).
 ///
 /// SIGPROF sampling can interrupt blocking syscalls with `EINTR`; the device
 /// `pread`/`pwrite` loops (src/device.rs) and std socket reads already retry,
@@ -2753,10 +2753,6 @@ static PPROF_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 async fn handle_debug_pprof_profile(Query(q): Query<PprofQuery>) -> axum::response::Response {
     let seconds = q.seconds.clamp(1, 60);
     let frequency = q.frequency.clamp(10, 1000);
-    let want_proto = matches!(
-        q.format.as_deref(),
-        Some("proto") | Some("pb") | Some("protobuf")
-    );
 
     if PPROF_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2769,22 +2765,22 @@ async fn handle_debug_pprof_profile(Query(q): Query<PprofQuery>) -> axum::respon
         );
     }
 
-    let outcome =
-        tokio::task::spawn_blocking(move || run_cpu_profile(seconds, frequency, want_proto)).await;
+    let outcome = tokio::task::spawn_blocking(move || run_cpu_profile(seconds, frequency)).await;
 
     PPROF_IN_FLIGHT.store(false, Ordering::Release);
 
     match outcome {
-        Ok(Ok((bytes, content_type, filename))) => {
-            let mut resp = (StatusCode::OK, bytes).into_response();
+        Ok(Ok(svg)) => {
+            let mut resp = (StatusCode::OK, svg).into_response();
             let headers = resp.headers_mut();
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static(content_type),
+                HeaderValue::from_static("image/svg+xml"),
             );
-            if let Ok(v) = HeaderValue::from_str(&format!("inline; filename=\"{filename}\"")) {
-                headers.insert(axum::http::header::CONTENT_DISPOSITION, v);
-            }
+            headers.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("inline; filename=\"teraslab-cpu-flamegraph.svg\""),
+            );
             resp
         }
         Ok(Err(e)) => http_error(StatusCode::INTERNAL_SERVER_ERROR, "profile_failed", e),
@@ -2796,13 +2792,9 @@ async fn handle_debug_pprof_profile(Query(q): Query<PprofQuery>) -> axum::respon
     }
 }
 
-/// Run one blocking CPU sample and render it. Errors are returned as strings
-/// for the handler to surface as a 500.
-fn run_cpu_profile(
-    seconds: u64,
-    frequency: i32,
-    want_proto: bool,
-) -> Result<(Vec<u8>, &'static str, String), String> {
+/// Run one blocking CPU sample and render it as an inferno flamegraph SVG.
+/// Errors are returned as strings for the handler to surface as a 500.
+fn run_cpu_profile(seconds: u64, frequency: i32) -> Result<Vec<u8>, String> {
     let guard = pprof::ProfilerGuardBuilder::default()
         .frequency(frequency)
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
@@ -2813,28 +2805,11 @@ fn run_cpu_profile(
         .report()
         .build()
         .map_err(|e| format!("build report: {e}"))?;
-    if want_proto {
-        use pprof::protos::Message;
-        let profile = report.pprof().map_err(|e| format!("pprof encode: {e}"))?;
-        let bytes = profile
-            .write_to_bytes()
-            .map_err(|e| format!("protobuf serialize: {e}"))?;
-        Ok((
-            bytes,
-            "application/octet-stream",
-            "teraslab-cpu.pb".to_string(),
-        ))
-    } else {
-        let mut svg = Vec::new();
-        report
-            .flamegraph(&mut svg)
-            .map_err(|e| format!("flamegraph render: {e}"))?;
-        Ok((
-            svg,
-            "image/svg+xml",
-            "teraslab-cpu-flamegraph.svg".to_string(),
-        ))
-    }
+    let mut svg = Vec::new();
+    report
+        .flamegraph(&mut svg)
+        .map_err(|e| format!("flamegraph render: {e}"))?;
+    Ok(svg)
 }
 
 async fn handle_set_log_level(

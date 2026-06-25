@@ -90,7 +90,13 @@ rayon = "1"
 # protobuf. Admin-gated and single-flight, so it is inert unless an operator
 # deliberately requests a profile. The device pread/pwrite loops already
 # retry EINTR (src/device.rs), so SIGPROF sampling does not perturb live I/O.
-pprof = { version = "0.14", features = ["flamegraph", "protobuf-codec"] }
+# `flamegraph` only — deliberately NOT the `protobuf-codec` / `prost-codec`
+# features. `protobuf-codec` pulls the unmaintained rust-protobuf 2.x
+# (RUSTSEC-2024-0437, fails cargo-audit) and `prost-codec` pulls a second,
+# older prost (0.12) + prost-build alongside the tree's prost 0.14. The
+# endpoint serves an inferno flamegraph SVG; pprof-protobuf for `go tool
+# pprof` is covered by samply / `cargo flamegraph` (see PROFILING.md).
+pprof = { version = "0.14", features = ["flamegraph"] }
 redb = "2"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }

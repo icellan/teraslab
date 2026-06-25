@@ -9,34 +9,34 @@ reproduce the serving bottleneck.
 
 The admin HTTP server exposes a CPU sampling profiler behind the bearer-token
 gate. It samples the **whole process** via `ITIMER_PROF` + `SIGPROF` and renders
-either an [inferno](https://github.com/jonhoo/inferno) flamegraph SVG or a pprof
-protobuf. It is **single-flight** (one profile at a time → second request gets
-`409`) and runs the blocking sample on a dedicated thread, so it never parks the
-async HTTP runtime.
+an [inferno](https://github.com/jonhoo/inferno) flamegraph SVG. It is
+**single-flight** (one profile at a time → second request gets `409`) and runs
+the blocking sample on a dedicated thread, so it never parks the async HTTP
+runtime.
 
 ```
-GET /debug/pprof/profile?seconds=N&frequency=Hz&format=flamegraph|proto
+GET /debug/pprof/profile?seconds=N&frequency=Hz
 ```
 
 | param       | default      | range      | meaning                                   |
 |-------------|--------------|------------|-------------------------------------------|
 | `seconds`   | `5`          | `1..=60`   | sampling window                           |
 | `frequency` | `99`         | `10..=1000`| samples/sec (99 Hz avoids lock-step bias) |
-| `format`    | `flamegraph` | —          | `flamegraph` (SVG) or `proto`/`pb` (pprof)|
 
 Requires `enable_admin_endpoints = true` and an `Authorization: Bearer <token>`
-header. Examples:
+header. Example:
 
 ```bash
 # 15s flamegraph SVG → open in a browser
 curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
   "http://127.0.0.1:9090/debug/pprof/profile?seconds=15" > cpu.svg
-
-# pprof protobuf → analyse with go tool pprof or upload to pprof.me
-curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "http://127.0.0.1:9090/debug/pprof/profile?seconds=15&format=proto" > cpu.pb
-go tool pprof -http=: cpu.pb
 ```
+
+The endpoint serves only the SVG flamegraph: pprof's protobuf codec pulls a
+vulnerable / duplicate dependency (rust-protobuf 2.x → RUSTSEC-2024-0437, or a
+second prost), so for a `go tool pprof` / pprof.me protobuf use `samply` or
+`cargo flamegraph` below — they attach to the running process and export pprof
+format without that dependency.
 
 `SIGPROF` interrupts blocking syscalls with `EINTR`. The device `pread`/`pwrite`
 loops (`src/device.rs`) and std socket reads already retry on `EINTR`, so taking
