@@ -785,6 +785,40 @@ impl Engine {
             }),
         };
 
+        // Fail CLOSED on a PARTIAL cross-store flush: at least one store made its
+        // writes durable while another FAILED. Per-store logs have no cross-store
+        // commit, so this cannot be undone — the durable store's records survive a
+        // restart even though the caller will report the whole batch failed and
+        // roll its reservations back in memory, silently diverging acknowledged
+        // state from durable state. Poison every touched store's log so the node
+        // stops accepting writes, and return a fatal error; on restart, recovery
+        // replays the durable redo and makes it authoritative. (All-stores-failed
+        // is NOT partial — nothing is durable — and stays a clean failure below.)
+        let any_durable = ranges.iter().any(|r| matches!(r, Ok(Some(_))));
+        let any_failed = ranges.iter().any(|r| r.is_err());
+        if any_durable && any_failed {
+            let failed_detail = ranges
+                .iter()
+                .find_map(|r| r.as_ref().err().cloned())
+                .unwrap_or_else(|| "redo flush failed".to_string());
+            for &store in &touched {
+                if let Some(log) = self.redo_log_for_device(store as u8) {
+                    log.lock().poison();
+                }
+            }
+            tracing::error!(
+                detail = %failed_detail,
+                "FATAL: redo flush partially succeeded across stores — some records are \
+                 durable while others failed, with no cross-store commit to undo it. \
+                 Poisoned all store logs to stop accepting writes; restart to let \
+                 recovery reconcile the durable state."
+            );
+            return Err(format!(
+                "partial cross-store redo flush (some stores durable, some failed); \
+                 node fenced for recovery: {failed_detail}"
+            ));
+        }
+
         let mut first_seq = u64::MAX;
         let mut last_seq = 0u64;
         let mut wrote = false;
@@ -1687,6 +1721,58 @@ impl Engine {
             &self.device
         } else {
             &self.aux_stores[device_id as usize - 1].device
+        }
+    }
+
+    /// Fsync the data device of EVERY store.
+    ///
+    /// Records are round-robin placed across all stores, so a batch durability
+    /// barrier must flush every store's device — flushing only store 0
+    /// ([`Self::device`]) would ACK records written to stores 1..N without making
+    /// them durable (silent loss on crash). Used by the replica-apply batch
+    /// barrier, which round-robins replica-applied creates across stores.
+    ///
+    /// Iterates in `usize` and narrows per store so a 256-store layout (the
+    /// `device_id: u8` maximum) does not truncate the loop bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first store's sync error.
+    pub fn sync_all_store_devices(&self) -> crate::device::Result<()> {
+        for id in 0..self.store_count() {
+            self.device_for(id as u8).sync()?;
+        }
+        Ok(())
+    }
+
+    /// Verify every index entry's `device_id` is within the configured store
+    /// count.
+    ///
+    /// A `device_id >= store_count` means this node was previously run with MORE
+    /// stores than are configured now — the data placed on the removed stores is
+    /// unreachable, and routing such an entry would index out of bounds in
+    /// [`Self::device_for`] / [`Self::allocator_for`] and panic the serving
+    /// thread. Call this at boot (after recovery has populated the index) and
+    /// fail closed with a clear operator error instead of panicking on the first
+    /// request that touches the stale entry.
+    ///
+    /// O(index) — runs once at boot, alongside the existing shard-count scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(device_id)` for the first entry whose `device_id` is out of
+    /// range, else `Ok(())`.
+    pub fn validate_device_ids(&self) -> std::result::Result<(), u8> {
+        let store_count = self.store_count();
+        let mut offending: Option<u8> = None;
+        self.index.for_each(|_key, entry| {
+            if offending.is_none() && (entry.device_id as usize) >= store_count {
+                offending = Some(entry.device_id);
+            }
+        });
+        match offending {
+            Some(device_id) => Err(device_id),
+            None => Ok(()),
         }
     }
 
@@ -13231,6 +13317,210 @@ mod tests {
         let tail = engine.read_redo_from_sequence_merged(4).expect("tail read");
         let tail_seqs: Vec<u64> = tail.iter().map(|e| e.sequence).collect();
         assert_eq!(tail_seqs, vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn sync_all_store_devices_flushes_every_store() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // A BlockDevice that counts sync() calls and delegates the rest to a
+        // memory device, so we can assert EVERY store's device is fsynced.
+        struct SyncCounter {
+            inner: MemoryDevice,
+            syncs: AtomicU64,
+        }
+        impl BlockDevice for SyncCounter {
+            fn pread(&self, b: &mut [u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> crate::device::Result<()> {
+                self.syncs.fetch_add(1, Ordering::SeqCst);
+                self.inner.sync()
+            }
+        }
+
+        let d0 = Arc::new(SyncCounter {
+            inner: MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+            syncs: AtomicU64::new(0),
+        });
+        let d1 = Arc::new(SyncCounter {
+            inner: MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+            syncs: AtomicU64::new(0),
+        });
+        let dev0: Arc<dyn BlockDevice> = d0.clone();
+        let dev1: Arc<dyn BlockDevice> = d1.clone();
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let engine = Engine::new_multi_store(
+            dev0,
+            alloc0,
+            vec![(dev1, alloc1)],
+            ShardedIndex::from_single(Index::new(1000).unwrap().into()),
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert_eq!(engine.store_count(), 2);
+
+        // Count syncs from AFTER construction (the allocator format/open may sync).
+        let before0 = d0.syncs.load(Ordering::SeqCst);
+        let before1 = d1.syncs.load(Ordering::SeqCst);
+        engine
+            .sync_all_store_devices()
+            .expect("sync_all_store_devices must succeed");
+        assert_eq!(
+            d0.syncs.load(Ordering::SeqCst) - before0,
+            1,
+            "store 0's device must be synced exactly once"
+        );
+        assert_eq!(
+            d1.syncs.load(Ordering::SeqCst) - before1,
+            1,
+            "store 1's device must be synced too — not just store 0"
+        );
+    }
+
+    #[test]
+    fn partial_cross_store_redo_flush_fails_closed_and_poisons_logs() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        // Device that delegates to memory but can be armed to fail sync().
+        struct FailSyncDevice {
+            inner: MemoryDevice,
+            fail: AtomicBool,
+        }
+        impl BlockDevice for FailSyncDevice {
+            fn pread(&self, b: &mut [u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> crate::device::Result<()> {
+                if self.fail.load(Ordering::SeqCst) {
+                    Err(DeviceError::Io(std::io::Error::other("armed sync failure")))
+                } else {
+                    self.inner.sync()
+                }
+            }
+        }
+
+        let engine = create_two_store_engine();
+
+        // Store 0 redo on a normal device; store 1 redo on a fail-armable device.
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let fdev = Arc::new(FailSyncDevice {
+            inner: MemoryDevice::new(1024 * 1024, 4096).unwrap(),
+            fail: AtomicBool::new(false),
+        });
+        let rdev1: Arc<dyn BlockDevice> = fdev.clone();
+        let mut log0 = RedoLog::open(rdev0, 0, 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 1024 * 1024).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        // Arm store 1's device to fail its flush, then journal a batch spanning
+        // BOTH stores: store 0 (head, calling thread) flushes durably while
+        // store 1's flush fails — exactly the partial-commit hazard.
+        fdev.fail.store(true, Ordering::SeqCst);
+        let ops = vec![
+            RedoOp::AllocateRegion {
+                device_id: 0,
+                offset: 0,
+                size: 4096,
+            },
+            RedoOp::AllocateRegion {
+                device_id: 1,
+                offset: 0,
+                size: 4096,
+            },
+        ];
+        let err = engine
+            .append_redo_ops_routed(&ops)
+            .expect_err("partial cross-store flush must fail closed");
+        assert!(
+            err.contains("partial cross-store redo flush"),
+            "expected the fenced-for-recovery error, got: {err}"
+        );
+
+        // Both store logs must now be poisoned — the node has stopped accepting
+        // writes until a restart reconciles the durable state.
+        assert!(
+            matches!(
+                log0_arc.lock().append(RedoOp::AllocateRegion {
+                    device_id: 0,
+                    offset: 8192,
+                    size: 4096
+                }),
+                Err(crate::redo::RedoError::Poisoned)
+            ),
+            "store 0's (durable) log must be poisoned after a partial cross-store flush"
+        );
+        assert!(
+            matches!(
+                log1_arc.lock().append(RedoOp::AllocateRegion {
+                    device_id: 1,
+                    offset: 8192,
+                    size: 4096
+                }),
+                Err(crate::redo::RedoError::Poisoned)
+            ),
+            "store 1's (failed) log must be poisoned too"
+        );
+    }
+
+    #[test]
+    fn validate_device_ids_rejects_a_store_that_does_not_exist() {
+        // A single-store engine validates clean...
+        let engine = create_engine_inner();
+        assert_eq!(engine.store_count(), 1);
+        assert!(engine.validate_device_ids().is_ok());
+
+        // ...but an index entry pointing at a store that doesn't exist (e.g. a
+        // snapshot from a previous run with more stores) must fail closed at boot
+        // rather than panic `device_for(5)` on the first request.
+        let key = TxKey { txid: [7u8; 32] };
+        let entry = TxIndexEntry {
+            device_id: 5,
+            record_offset: 4096,
+            utxo_count: 1,
+            block_entry_count: 0,
+            tx_flags: 0,
+            spent_utxos: 0,
+            dah_or_preserve: 0,
+            unmined_since: 0,
+            generation: 0,
+        };
+        engine
+            .register(key, entry)
+            .expect("register injects the entry");
+        assert_eq!(
+            engine.validate_device_ids(),
+            Err(5),
+            "an out-of-range device_id must be reported, not panicked on later"
+        );
     }
 
     fn create_engine_inner() -> Engine {

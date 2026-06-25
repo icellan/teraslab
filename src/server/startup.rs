@@ -476,6 +476,31 @@ pub fn load_sharded_index_in_memory(
     })
 }
 
+/// Multi-store variant of [`load_sharded_index_in_memory`]: scan EVERY store's
+/// device, stamping each discovered record's `device_id` from the store it was
+/// found on, so a device-scan rebuild (snapshot lost/corrupt) recovers records
+/// placed across all stores — not just store 0.
+///
+/// Records are round-robin placed across the configured stores and routed by the
+/// index entry's `device_id`; a single-device scan would index only the records
+/// that happened to land on store 0 and silently lose the rest.
+///
+/// # Errors
+///
+/// Returns [`RebuildError::InMemoryPrimary`] if any store's device scan or shard
+/// routing fails.
+pub fn load_sharded_index_in_memory_multi(
+    devices: &[std::sync::Arc<dyn BlockDevice>],
+    allocators: &[SlotAllocator],
+    shard_count: usize,
+) -> Result<ShardedIndex, RebuildError> {
+    ShardedIndex::rebuild_in_memory_multi_store(devices, allocators, shard_count).map_err(|e| {
+        RebuildError::InMemoryPrimary {
+            rebuild_err: format!("{e}"),
+        }
+    })
+}
+
 /// Rebuild secondary indexes from the device, returning a
 /// [`SecondaryLoadOutcome`] that includes per-secondary readiness flags.
 ///

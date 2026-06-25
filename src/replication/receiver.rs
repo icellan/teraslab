@@ -975,7 +975,11 @@ pub fn handle_replica_batch_with_tracker(
     // device fsync and redo flush, recovery sees an apply that wasn't
     // journalled — engine.shard_record_count and idempotent apply
     // paths handle re-applying via the master's resync.
-    if let Err(e) = engine.device().sync() {
+    //
+    // Multi-store: replica-applied creates round-robin across ALL stores, so the
+    // barrier must fsync every store's device — `engine.device()` is store 0
+    // only, which would ACK aux-store records without making them durable.
+    if let Err(e) = engine.sync_all_store_devices() {
         let ack = ReplicaAck::Error {
             failed_sequence: through,
             message: format!("post-batch device sync (F-G7-016): {e}"),

@@ -33,8 +33,9 @@ use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
     AllocatorOrigin, SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
     fallback_unmined_index, load_primary_index_file_backed, load_primary_index_redb,
-    load_sharded_index_in_memory, open_mandatory_redo_log, open_tombstone_log,
-    rebuild_in_memory_secondaries, recover_or_create_allocator, secondaries_from_pair,
+    load_sharded_index_in_memory, load_sharded_index_in_memory_multi, open_mandatory_redo_log,
+    open_tombstone_log, rebuild_in_memory_secondaries, recover_or_create_allocator,
+    secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -666,6 +667,19 @@ fn main() {
     // backends are not yet sharded (deferred follow-up) and run at one shard,
     // warning once if a multi-shard count is configured.
     let index_shards = config.index.index_shards;
+    // Device-scan primary rebuild (snapshot lost/corrupt). Records are round-robin
+    // placed across all stores and routed by `entry.device_id`, so the rebuild
+    // MUST scan every store — a single-store (store-0-only) scan silently loses
+    // every record on stores 1..N. `load_sharded_index_in_memory_multi` scans all
+    // stores and stamps each entry's `device_id`. N=1 keeps the byte-identical
+    // single-device path.
+    let rebuild_primary_from_scan = |shard_count: usize| -> Result<ShardedIndex, _> {
+        if num_stores > 1 {
+            load_sharded_index_in_memory_multi(&store_devices, &store_allocators, shard_count)
+        } else {
+            load_sharded_index_in_memory(&*device, &store_allocators[0], shard_count)
+        }
+    };
     let load_outcome: (ShardedIndex, SecondaryLoadOutcome) = if config.index.backend
         == IndexBackendMode::Redb
     {
@@ -828,11 +842,7 @@ fn main() {
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
-                    let index = match load_sharded_index_in_memory(
-                        &*device,
-                        &store_allocators[0],
-                        index_shards,
-                    ) {
+                    let index = match rebuild_primary_from_scan(index_shards) {
                         Ok(idx) => idx,
                         Err(e) => {
                             tracing::error!(err = %e, "FATAL: primary index rebuild failed");
@@ -845,14 +855,13 @@ fn main() {
             }
         } else {
             tracing::info!("no index snapshot found, rebuilding from device");
-            let index =
-                match load_sharded_index_in_memory(&*device, &store_allocators[0], index_shards) {
-                    Ok(idx) => idx,
-                    Err(e) => {
-                        tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                        std::process::exit(1);
-                    }
-                };
+            let index = match rebuild_primary_from_scan(index_shards) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                    std::process::exit(1);
+                }
+            };
             let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
             (index, secondaries)
         }
@@ -1122,6 +1131,24 @@ fn main() {
         dah_index,
         unmined_index,
     );
+
+    // Fail closed if the recovered/loaded index references a store that does not
+    // exist in the current layout (a `device_id >= store_count`). That means the
+    // node was previously run with MORE stores than are configured now, so the
+    // data placed on the removed stores is unreachable; routing such an entry
+    // would index out of bounds in `device_for`/`allocator_for` and panic the
+    // first request that touches it. Surface a clear operator error at boot.
+    if let Err(device_id) = engine.validate_device_ids() {
+        tracing::error!(
+            device_id,
+            store_count = engine.store_count(),
+            "FATAL: index references device_id {device_id} but only {} store(s) are \
+             configured — this node was previously run with more stores. Restore the \
+             original device layout (device_paths × device_split) or reset the node.",
+            engine.store_count(),
+        );
+        std::process::exit(1);
+    }
 
     // Drain R-221 engine-level append intents after constructing the engine
     // but before attaching the engine redo handle. The allocator already has

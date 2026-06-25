@@ -2386,6 +2386,20 @@ impl RedoLog {
         self.buffered_entries = 0;
     }
 
+    /// Fence this log against further writes: any subsequent [`Self::append`]
+    /// returns [`RedoError::Poisoned`].
+    ///
+    /// Used to fail closed when a multi-store batch flush partially succeeds (one
+    /// store durable, another failed) and there is no cross-store commit to undo
+    /// it — poisoning every touched store's log stops the node from accepting
+    /// more writes against the now-inconsistent durable state until a restart
+    /// (where recovery replays the durable redo and makes it authoritative). The
+    /// already-flushed on-disk data is untouched; only in-memory write
+    /// acceptance is blocked.
+    pub fn poison(&mut self) {
+        self.poison_drop_buffer();
+    }
+
     /// Append and flush in one call.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn append_and_flush(&mut self, op: RedoOp) -> Result<u64> {
