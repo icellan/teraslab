@@ -186,26 +186,6 @@ pub struct RecoveryStats {
     pub max_observed_block_height: u32,
 }
 
-impl RecoveryStats {
-    /// Accumulate another pass's stats into this one (counters summed,
-    /// `max_observed_block_height` maxed). Used by multi-store recovery, which
-    /// replays one store at a time and merges the per-store results.
-    fn merge(&mut self, other: RecoveryStats) {
-        self.entries_replayed += other.entries_replayed;
-        self.entries_skipped += other.entries_skipped;
-        self.entries_failed += other.entries_failed;
-        self.failed_missing_primary += other.failed_missing_primary;
-        self.failed_io += other.failed_io;
-        self.failed_corrupt += other.failed_corrupt;
-        self.failed_logic += other.failed_logic;
-        self.failed_missing_record_bytes += other.failed_missing_record_bytes;
-        self.failed_replica_record_absent += other.failed_replica_record_absent;
-        self.max_observed_block_height = self
-            .max_observed_block_height
-            .max(other.max_observed_block_height);
-    }
-}
-
 /// B-7: how recovery reconciles the DAH / unmined secondary indexes
 /// after replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,11 +198,6 @@ enum SecondaryReconcile {
     /// the durable (crash-safe) secondaries. O(redo size). Used when the
     /// secondaries were loaded clean.
     TouchedOnly,
-    /// Do not reconcile in this pass. Used by multi-store recovery, which
-    /// replays each store independently (the secondary indexes are shared and
-    /// span all stores, so reconcile is done ONCE after every store's replay,
-    /// routing each metadata read to its store — see `recover_all_multi_store`).
-    Skip,
 }
 
 /// Engine-level conflicting-child append intent collected during recovery.
@@ -883,19 +858,15 @@ pub fn recover_all_multi_store(
         redo_logs.len(),
         "devices and redo logs must be 1:1 per store"
     );
-    // Recover each store's own log into its entry list up front (the scan is
-    // cheap relative to replay). Each log already holds only its store's ops.
+    // Recover each store's own log into its entry list (the scan is cheap
+    // relative to replay). Each log holds only its store's ops, tagged with its
+    // store index below.
     let mut partitions: Vec<Vec<RedoEntry>> = Vec::with_capacity(redo_logs.len());
     for log in redo_logs.iter() {
         partitions.push(log.recover()?);
     }
-    // B-7 (multi-store): collect the union of keys the redo logs touched across
-    // ALL stores, mirroring the single-store inner loop's per-entry
-    // `touched_keys.insert(entry.op.tx_key())` (see
-    // `recover_entries_with_allocator_collecting_pending_conflicts`). The
-    // per-store parallel replays below pass `SecondaryReconcile::Skip`, so the
-    // touched set is gathered here, once, for the post-replay reconcile when the
-    // fast path (`full_secondary_rebuild == false`) is taken.
+    // B-7 (multi-store): the union of keys the redo logs touched, used only by
+    // the TouchedOnly secondary-reconcile fast path (full_secondary_rebuild == false).
     let mut touched_keys: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
     if !full_secondary_rebuild {
         for part in &partitions {
@@ -910,55 +881,98 @@ pub fn recover_all_multi_store(
     let mut pending_cc = Vec::new();
     let mut pending_dc = Vec::new();
 
-    // Replay every store IN PARALLEL — one scoped thread per store. Stores are
-    // independent (each owns its device + allocator + redo log); the primary
-    // index is shared and concurrency-safe (PR#19 per-shard RwLocks), and a
-    // record's ops all live in its own store's log, so no two threads touch the
-    // same key/offset. The only otherwise-shared `&mut` is the secondary
-    // indexes: each thread replays its SecondaryDahUpdate/Unmined ops into a
-    // THROWAWAY backend (discarded) — the authoritative DAH/unmined are rebuilt
-    // once, store-routed, by the reconcile after all replays. So nothing real
-    // is shared mutably across threads.
-    type StoreResult = Result<
-        (
-            RecoveryStats,
-            Vec<PendingAppendConflictingChild>,
-            Vec<PendingAppendDeletedChild>,
-        ),
-        RecoveryError,
-    >;
-    let results: Vec<StoreResult> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(devices.len());
-        for ((part, device), alloc) in partitions
-            .into_iter()
-            .zip(devices.iter())
-            .zip(allocators.iter_mut())
-        {
-            handles.push(scope.spawn(move || {
-                let mut throwaway_dah = DahBackend::new_in_memory();
-                let mut throwaway_unmined = UnminedBackend::new_in_memory();
-                recover_entries_with_allocator_collecting_pending_conflicts(
-                    &**device,
-                    part,
-                    index,
-                    &mut throwaway_dah,
-                    &mut throwaway_unmined,
-                    Some(alloc),
-                    None,
-                    SecondaryReconcile::Skip,
-                )
-            }));
+    // GLOBAL-SEQUENCE-ORDER REPLAY (single-threaded). Per-store PARALLEL replay
+    // is unsound: record placement is round-robin (`place_new_record`), so a
+    // txid deleted then re-created lands on a DIFFERENT store — its stale
+    // Spend/Delete stay in the original store's log while the re-create goes to
+    // the new store's log. Concurrent per-store replay has NO cross-store
+    // ordering, so a stale Delete could unregister the live re-create (acked
+    // UTXO loss) or a stale Spend could read/write the wrong store's device at a
+    // foreign offset (corruption). Merging every log and replaying in the shared
+    // global-sequence order reconstructs the one logical mutation order, so the
+    // index is consistent at every step and each op routes to its correct
+    // (device, allocator). The write path's parallel fsync is unaffected; only
+    // boot-time replay is serialized.
+    let mut tagged: Vec<(u8, RedoEntry)> = Vec::new();
+    for (store, part) in partitions.into_iter().enumerate() {
+        for entry in part {
+            tagged.push((store as u8, entry));
         }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("recovery store thread panicked"))
-            .collect()
-    });
-    for r in results {
-        let (stats, cc, dc) = r?;
-        total.merge(stats);
-        pending_cc.extend(cc);
-        pending_dc.extend(dc);
+    }
+    // Stable sort by the global sequence. Within one store sequences are already
+    // strictly increasing; the shared counter makes them globally unique, so
+    // this reconstructs the single cross-store mutation order.
+    tagged.sort_by_key(|(_, e)| e.sequence);
+
+    // Build the offset->owner map ONCE over the shared index; each replayed
+    // create evicts a stale alias in O(1) via register_unique_offset.
+    let mut offset_owners = build_offset_owners(index);
+    let mut pending_resizes: std::collections::HashMap<u64, Vec<u8>> =
+        std::collections::HashMap::new();
+    // Secondary ops replay into throwaways; the authoritative DAH/unmined are
+    // rebuilt store-routed by the reconcile below.
+    let mut throwaway_dah = DahBackend::new_in_memory();
+    let mut throwaway_unmined = UnminedBackend::new_in_memory();
+
+    for (store, entry) in &tagged {
+        // Height subsystem: fold the max observed block height regardless of
+        // replay outcome (a skipped already-applied entry still proves it).
+        if let Some(h) = entry.op.observed_block_height() {
+            total.max_observed_block_height = total.max_observed_block_height.max(h);
+        }
+        let device: &dyn BlockDevice = &*devices[*store as usize];
+        let outcome = replay_one_recovery_entry(
+            device,
+            allocators.get_mut(*store as usize),
+            index,
+            &mut throwaway_dah,
+            &mut throwaway_unmined,
+            &mut offset_owners,
+            &mut pending_cc,
+            &mut pending_dc,
+            &mut pending_resizes,
+            entry,
+        );
+        let fatal = matches!(outcome, ReplayResult::Failed(c) if is_fatal_replay_cause(c));
+        match outcome {
+            ReplayResult::Applied => total.entries_replayed += 1,
+            ReplayResult::Skipped => total.entries_skipped += 1,
+            ReplayResult::Failed(cause) => total.record_failure(cause),
+        }
+        // F-G4-007: stop on the first non-tolerable failure so later entries
+        // cannot land partially-applied state on a broken intermediate replay.
+        if fatal {
+            break;
+        }
+    }
+
+    // Clean up orphan resize tmp files (mirrors the single-store path).
+    for (_capacity, tmp_bytes) in pending_resizes {
+        let tmp_path = path_from_bytes(&tmp_bytes);
+        if tmp_path.exists()
+            && let Err(e) = std::fs::remove_file(&tmp_path)
+        {
+            tracing::warn!(
+                tmp_path = %tmp_path.display(),
+                err = %e,
+                "recovery: failed to remove orphan resize tmp file",
+            );
+        }
+    }
+
+    // Persist EVERY store's allocator snapshot so the next boot can skip
+    // allocator redo replay. Non-fatal per store (idempotent next boot).
+    for alloc in allocators.iter_mut() {
+        if let Err(err) = alloc.persist() {
+            if let Some(m) = crate::metrics::allocator_metrics() {
+                m.snapshot_persist_failures_total.inc();
+            }
+            tracing::warn!(
+                target: "teraslab::recovery::allocator",
+                error = %err,
+                "recovery: allocator snapshot persist failed (idempotent; replayed next boot)",
+            );
+        }
     }
 
     // One store-routed secondary reconcile across the now-complete index. This
@@ -988,6 +1002,210 @@ pub fn recover_all_multi_store(
 // backends, optional allocator, optional redo-progress fence, and the
 // secondary-reconcile mode); they have independent lifetimes/mutability and do
 // not form a natural cohesive struct, so the count is warranted here.
+#[allow(clippy::too_many_arguments)]
+fn replay_one_recovery_entry(
+    device: &dyn BlockDevice,
+    mut allocator: Option<&mut SlotAllocator>,
+    index: &ShardedIndex,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    offset_owners: &mut OffsetOwners,
+    pending_conflicting_children: &mut Vec<PendingAppendConflictingChild>,
+    pending_deleted_children: &mut Vec<PendingAppendDeletedChild>,
+    pending_resizes: &mut std::collections::HashMap<u64, Vec<u8>>,
+    entry: &RedoEntry,
+) -> ReplayResult {
+    match &entry.op {
+        RedoOp::SecondaryUnminedUpdate {
+            tx_key,
+            old_height,
+            new_height,
+        } => replay_secondary_unmined(device, index, unmined, tx_key, *old_height, *new_height),
+        RedoOp::SecondaryDahUpdate {
+            tx_key,
+            old_height,
+            new_height,
+        } => replay_secondary_dah(device, index, dah, tx_key, *old_height, *new_height),
+        RedoOp::AppendConflictingChild {
+            parent_key,
+            child_txid,
+        } => {
+            pending_conflicting_children.push(PendingAppendConflictingChild {
+                parent_key: *parent_key,
+                child_txid: *child_txid,
+                is_remove: false,
+            });
+            ReplayResult::Skipped
+        }
+        RedoOp::RemoveConflictingChild {
+            parent_key,
+            child_txid,
+        } => {
+            // Same deferred-drain model as the append: the engine applies
+            // it post-construction via `remove_conflicting_child`. Order is
+            // preserved (log order), and both ops are idempotent.
+            pending_conflicting_children.push(PendingAppendConflictingChild {
+                parent_key: *parent_key,
+                child_txid: *child_txid,
+                is_remove: true,
+            });
+            ReplayResult::Skipped
+        }
+        // AUDIT M2.6 — collect deleted-child appends for the same
+        // post-engine deferred drain as conflicting children. Drained in
+        // log order via `Engine::append_deleted_child` (idempotent).
+        RedoOp::AppendDeletedChild {
+            parent_key,
+            child_txid,
+        } => {
+            pending_deleted_children.push(PendingAppendDeletedChild {
+                parent_key: *parent_key,
+                child_txid: *child_txid,
+            });
+            ReplayResult::Skipped
+        }
+        RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
+            match allocator.as_deref_mut() {
+                Some(alloc) => {
+                    if alloc.replay_redo(&entry.op) {
+                        ReplayResult::Applied
+                    } else {
+                        ReplayResult::Skipped
+                    }
+                }
+                None => ReplayResult::Skipped,
+            }
+        }
+        RedoOp::Delete {
+            tx_key,
+            record_offset,
+            record_size,
+        } => {
+            let delete_outcome = replay_delete(device, index, tx_key, *record_offset, *record_size);
+            if matches!(delete_outcome, ReplayResult::Failed(_)) {
+                delete_outcome
+            } else if *record_offset != 0 && *record_size != 0 {
+                match allocator.as_deref_mut() {
+                    Some(alloc) => {
+                        // The freed region lives on THIS store, whose log we
+                        // are replaying — stamp the allocator's own store tag
+                        // so its replay gate (`device_id == redo_device_id`)
+                        // accepts the free. Hardcoding 0 made every non-zero
+                        // store reject the free and leak the region.
+                        let free = RedoOp::FreeRegion {
+                            offset: *record_offset,
+                            size: *record_size,
+                            device_id: alloc.redo_device_id(),
+                        };
+                        if alloc.replay_redo(&free)
+                            || matches!(delete_outcome, ReplayResult::Applied)
+                        {
+                            ReplayResult::Applied
+                        } else {
+                            ReplayResult::Skipped
+                        }
+                    }
+                    None => delete_outcome,
+                }
+            } else {
+                delete_outcome
+            }
+        }
+        RedoOp::HashtableResizeBegin {
+            tmp_path_bytes,
+            new_capacity,
+        } => {
+            pending_resizes.insert(*new_capacity, tmp_path_bytes.clone());
+            ReplayResult::Applied
+        }
+        RedoOp::HashtableResizeCommit { new_capacity } => {
+            // Matching Begin → resize is durable, nothing to clean up.
+            pending_resizes.remove(new_capacity);
+            ReplayResult::Applied
+        }
+        RedoOp::Create {
+            record_offset,
+            record_bytes,
+            ..
+        } => {
+            if let Some(alloc) = allocator.as_deref()
+                && !alloc.is_allocated_range(*record_offset, record_bytes.len() as u64)
+            {
+                ReplayResult::Failed(ReplayCause::LogicError)
+            } else {
+                replay_entry(device, index, offset_owners, entry)
+            }
+        }
+        // BUG-1 fix #1: route the legacy `RedoOp::ReplicaCreate` through the
+        // SAME `is_allocated_range` gate as `Create`. The legacy
+        // create carries no payload, so the range length is derived
+        // from `utxo_count` via `record_size_for`. Without this gate a
+        // stale legacy Create — whose `record_offset` was since freed
+        // and re-handed to a DIFFERENT record — would register an index
+        // entry aliasing another key's record, corrupting reads. The
+        // replication / migration receiver emits this legacy op for
+        // every replicated create, so every replica replays through
+        // this arm on recovery; it must be guarded exactly like V2.
+        RedoOp::ReplicaCreate {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+        } => {
+            let range_len = TxMetadata::record_size_for(*utxo_count);
+            if let Some(alloc) = allocator.as_deref()
+                && !alloc.is_allocated_range(*record_offset, range_len)
+            {
+                ReplayResult::Failed(ReplayCause::LogicError)
+            } else {
+                replay_replica_create(
+                    device,
+                    *device_id,
+                    index,
+                    offset_owners,
+                    tx_key,
+                    *record_offset,
+                    *utxo_count,
+                )
+            }
+        }
+        RedoOp::CompensateUnsetMined {
+            tx_key,
+            block_id,
+            block_height,
+            subtree_idx,
+        } => replay_compensate_unset_mined_with_allocator(
+            device,
+            index,
+            allocator.as_deref_mut(),
+            tx_key,
+            *block_id,
+            *block_height,
+            *subtree_idx,
+        ),
+        // SetMined may need the overflow region (4th+ block entry,
+        // or unset of an overflow-resident entry) — route through
+        // the allocator-aware replay so it can allocate/free it.
+        RedoOp::SetMined {
+            tx_key,
+            block_id,
+            block_height,
+            subtree_idx,
+            unset,
+        } => replay_set_mined_with_allocator(
+            device,
+            index,
+            allocator,
+            tx_key,
+            *block_id,
+            *block_height,
+            *subtree_idx,
+            *unset,
+        ),
+        _ => replay_entry(device, index, offset_owners, entry),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn recover_entries_with_allocator_collecting_pending_conflicts(
     device: &dyn BlockDevice,
@@ -1041,196 +1259,18 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         if let Some(h) = entry.op.observed_block_height() {
             stats.max_observed_block_height = stats.max_observed_block_height.max(h);
         }
-        let outcome = match &entry.op {
-            RedoOp::SecondaryUnminedUpdate {
-                tx_key,
-                old_height,
-                new_height,
-            } => replay_secondary_unmined(device, index, unmined, tx_key, *old_height, *new_height),
-            RedoOp::SecondaryDahUpdate {
-                tx_key,
-                old_height,
-                new_height,
-            } => replay_secondary_dah(device, index, dah, tx_key, *old_height, *new_height),
-            RedoOp::AppendConflictingChild {
-                parent_key,
-                child_txid,
-            } => {
-                pending_conflicting_children.push(PendingAppendConflictingChild {
-                    parent_key: *parent_key,
-                    child_txid: *child_txid,
-                    is_remove: false,
-                });
-                ReplayResult::Skipped
-            }
-            RedoOp::RemoveConflictingChild {
-                parent_key,
-                child_txid,
-            } => {
-                // Same deferred-drain model as the append: the engine applies
-                // it post-construction via `remove_conflicting_child`. Order is
-                // preserved (log order), and both ops are idempotent.
-                pending_conflicting_children.push(PendingAppendConflictingChild {
-                    parent_key: *parent_key,
-                    child_txid: *child_txid,
-                    is_remove: true,
-                });
-                ReplayResult::Skipped
-            }
-            // AUDIT M2.6 — collect deleted-child appends for the same
-            // post-engine deferred drain as conflicting children. Drained in
-            // log order via `Engine::append_deleted_child` (idempotent).
-            RedoOp::AppendDeletedChild {
-                parent_key,
-                child_txid,
-            } => {
-                pending_deleted_children.push(PendingAppendDeletedChild {
-                    parent_key: *parent_key,
-                    child_txid: *child_txid,
-                });
-                ReplayResult::Skipped
-            }
-            RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => {
-                match allocator.as_deref_mut() {
-                    Some(alloc) => {
-                        if alloc.replay_redo(&entry.op) {
-                            ReplayResult::Applied
-                        } else {
-                            ReplayResult::Skipped
-                        }
-                    }
-                    None => ReplayResult::Skipped,
-                }
-            }
-            RedoOp::Delete {
-                tx_key,
-                record_offset,
-                record_size,
-            } => {
-                let delete_outcome =
-                    replay_delete(device, index, tx_key, *record_offset, *record_size);
-                if matches!(delete_outcome, ReplayResult::Failed(_)) {
-                    delete_outcome
-                } else if *record_offset != 0 && *record_size != 0 {
-                    match allocator.as_deref_mut() {
-                        Some(alloc) => {
-                            // The freed region lives on THIS store, whose log we
-                            // are replaying — stamp the allocator's own store tag
-                            // so its replay gate (`device_id == redo_device_id`)
-                            // accepts the free. Hardcoding 0 made every non-zero
-                            // store reject the free and leak the region.
-                            let free = RedoOp::FreeRegion {
-                                offset: *record_offset,
-                                size: *record_size,
-                                device_id: alloc.redo_device_id(),
-                            };
-                            if alloc.replay_redo(&free)
-                                || matches!(delete_outcome, ReplayResult::Applied)
-                            {
-                                ReplayResult::Applied
-                            } else {
-                                ReplayResult::Skipped
-                            }
-                        }
-                        None => delete_outcome,
-                    }
-                } else {
-                    delete_outcome
-                }
-            }
-            RedoOp::HashtableResizeBegin {
-                tmp_path_bytes,
-                new_capacity,
-            } => {
-                pending_resizes.insert(*new_capacity, tmp_path_bytes.clone());
-                ReplayResult::Applied
-            }
-            RedoOp::HashtableResizeCommit { new_capacity } => {
-                // Matching Begin → resize is durable, nothing to clean up.
-                pending_resizes.remove(new_capacity);
-                ReplayResult::Applied
-            }
-            RedoOp::Create {
-                record_offset,
-                record_bytes,
-                ..
-            } => {
-                if let Some(alloc) = allocator.as_deref()
-                    && !alloc.is_allocated_range(*record_offset, record_bytes.len() as u64)
-                {
-                    ReplayResult::Failed(ReplayCause::LogicError)
-                } else {
-                    replay_entry(device, index, &mut offset_owners, entry)
-                }
-            }
-            // BUG-1 fix #1: route the legacy `RedoOp::ReplicaCreate` through the
-            // SAME `is_allocated_range` gate as `Create`. The legacy
-            // create carries no payload, so the range length is derived
-            // from `utxo_count` via `record_size_for`. Without this gate a
-            // stale legacy Create — whose `record_offset` was since freed
-            // and re-handed to a DIFFERENT record — would register an index
-            // entry aliasing another key's record, corrupting reads. The
-            // replication / migration receiver emits this legacy op for
-            // every replicated create, so every replica replays through
-            // this arm on recovery; it must be guarded exactly like V2.
-            RedoOp::ReplicaCreate {
-                tx_key,
-                device_id,
-                record_offset,
-                utxo_count,
-            } => {
-                let range_len = TxMetadata::record_size_for(*utxo_count);
-                if let Some(alloc) = allocator.as_deref()
-                    && !alloc.is_allocated_range(*record_offset, range_len)
-                {
-                    ReplayResult::Failed(ReplayCause::LogicError)
-                } else {
-                    replay_replica_create(
-                        device,
-                        *device_id,
-                        index,
-                        &mut offset_owners,
-                        tx_key,
-                        *record_offset,
-                        *utxo_count,
-                    )
-                }
-            }
-            RedoOp::CompensateUnsetMined {
-                tx_key,
-                block_id,
-                block_height,
-                subtree_idx,
-            } => replay_compensate_unset_mined_with_allocator(
-                device,
-                index,
-                allocator.as_deref_mut(),
-                tx_key,
-                *block_id,
-                *block_height,
-                *subtree_idx,
-            ),
-            // SetMined may need the overflow region (4th+ block entry,
-            // or unset of an overflow-resident entry) — route through
-            // the allocator-aware replay so it can allocate/free it.
-            RedoOp::SetMined {
-                tx_key,
-                block_id,
-                block_height,
-                subtree_idx,
-                unset,
-            } => replay_set_mined_with_allocator(
-                device,
-                index,
-                allocator.as_deref_mut(),
-                tx_key,
-                *block_id,
-                *block_height,
-                *subtree_idx,
-                *unset,
-            ),
-            _ => replay_entry(device, index, &mut offset_owners, entry),
-        };
+        let outcome = replay_one_recovery_entry(
+            device,
+            allocator.as_deref_mut(),
+            index,
+            dah,
+            unmined,
+            &mut offset_owners,
+            &mut pending_conflicting_children,
+            &mut pending_deleted_children,
+            &mut pending_resizes,
+            entry,
+        );
         let progress_safe = matches!(
             outcome,
             ReplayResult::Applied
@@ -1281,7 +1321,6 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
         SecondaryReconcile::TouchedOnly => {
             reconcile_secondary_indexes_for_keys(device, index, dah, unmined, &touched_keys)?;
         }
-        SecondaryReconcile::Skip => {}
     }
 
     // Clean up any orphan tmp files from resizes that started but never
@@ -5287,6 +5326,150 @@ mod tests {
             !allocators[1].is_allocated_range(record_offset, base),
             "deleted record's region must be freed on store 1, not leaked",
         );
+    }
+
+    /// P0 (cross-store lifecycle): a txid created on store 0, spent, deleted,
+    /// then RE-CREATED round-robin onto store 1 must recover to its LAST state
+    /// (live on store 1, unspent). The stale Spend/Delete live in store 0's log
+    /// and the re-create in store 1's log; multi-store recovery MUST replay them
+    /// in global-sequence order so the Delete (seq 3) cannot clobber the
+    /// re-create (seq 4) and the Spend cannot touch store 1's bytes. Pre-fix the
+    /// per-store PARALLEL replay had no cross-store ordering: the store-0 thread's
+    /// Delete could unregister the store-1 re-create (acked UTXO lost) or its
+    /// Spend could read/write store 0's device at a store-1 offset (corruption).
+    /// Looped to make the racy pre-fix failure reliable; the fixed single-threaded
+    /// global-order replay is deterministic.
+    #[test]
+    fn multi_store_recovery_replays_cross_store_lifecycle_in_global_order() {
+        fn build_record(txid_byte: u8, utxo_count: u32) -> (TxKey, Vec<u8>) {
+            let mut txid = [0u8; 32];
+            txid[0] = txid_byte;
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.record_size = TxMetadata::record_size_for(utxo_count) as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = txid_byte;
+                    h[1] = (i + 1) as u8;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+            let mut rb = vec![0u8; METADATA_SIZE];
+            let mut mb = [0u8; METADATA_SIZE];
+            meta.to_bytes(&mut mb);
+            rb[..METADATA_SIZE].copy_from_slice(&mb);
+            for s in &slots {
+                let mut sb = [0u8; UTXO_SLOT_SIZE];
+                s.to_bytes(&mut sb);
+                rb.extend_from_slice(&sb);
+            }
+            (TxKey { txid }, rb)
+        }
+
+        let utxo_count: u32 = 2;
+        let (key, rb) = build_record(0xC5, utxo_count);
+        let base = TxMetadata::record_size_for(utxo_count);
+
+        // Repeat to make the pre-fix cross-store thread race reliable.
+        for _ in 0..64 {
+            let dev0: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let dev1: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+            let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+            let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+            let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+            alloc0.set_redo_device_id(0);
+            alloc1.set_redo_device_id(1);
+            // The original incarnation's region on store 0, the re-create's on store 1.
+            let off_a = alloc0.allocate(base).unwrap();
+            let off_b = alloc1.allocate(base).unwrap();
+            let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+            let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+            let mut redo1 = RedoLog::open(redo_dev1.clone(), 0, 1024 * 1024).unwrap();
+            let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                RedoLog::shared_sequence_floor(&[&redo0, &redo1]),
+            ));
+            redo0.attach_shared_sequence(shared.clone());
+            redo1.attach_shared_sequence(shared.clone());
+
+            // Global sequence order: Create@0(s1) -> Spend(s2) -> Delete@0(s3)
+            // -> Create@1(s4). Appending in this order across the shared counter
+            // assigns strictly increasing global sequences.
+            redo0
+                .append_and_flush(RedoOp::Create {
+                    tx_key: key,
+                    device_id: 0,
+                    record_offset: off_a,
+                    utxo_count,
+                    is_conflicting: false,
+                    record_bytes: rb.clone(),
+                    parent_txids: Vec::new(),
+                })
+                .unwrap();
+            redo0
+                .append_and_flush(RedoOp::Spend {
+                    tx_key: key,
+                    offset: 0,
+                    spending_data: [0x77; 36],
+                    new_spent_count: 1,
+                })
+                .unwrap();
+            redo0
+                .append_and_flush(RedoOp::Delete {
+                    tx_key: key,
+                    record_offset: off_a,
+                    record_size: base,
+                })
+                .unwrap();
+            redo1
+                .append_and_flush(RedoOp::Create {
+                    tx_key: key,
+                    device_id: 1,
+                    record_offset: off_b,
+                    utxo_count,
+                    is_conflicting: false,
+                    record_bytes: rb.clone(),
+                    parent_txids: Vec::new(),
+                })
+                .unwrap();
+
+            let mut dah = DahBackend::new_in_memory();
+            let mut unmined = UnminedBackend::new_in_memory();
+            let devices = [dev0.clone(), dev1.clone()];
+            let mut allocators = [alloc0, alloc1];
+            let mut redo_logs = [redo0, redo1];
+            let (stats, _, _) = recover_all_multi_store(
+                &devices,
+                &mut allocators,
+                &mut redo_logs,
+                &index,
+                &mut dah,
+                &mut unmined,
+                true,
+            )
+            .unwrap();
+            assert_eq!(stats.entries_failed, 0, "no replay may fail");
+
+            // Final state = the LAST incarnation: live on store 1, unspent.
+            let e = index.lookup(&key).expect(
+                "re-created record must survive recovery (not unregistered by the stale Delete)",
+            );
+            assert_eq!(e.device_id, 1, "record's final store is 1 (the re-create)");
+            assert_eq!(
+                e.record_offset, off_b,
+                "record's final offset is the re-create's"
+            );
+            let slot =
+                io::read_utxo_slot(&*dev1, off_b, 0).expect("re-created slot readable on store 1");
+            assert_eq!(
+                slot.status, UTXO_UNSPENT,
+                "re-created record must be UNSPENT — the stale store-0 Spend must not touch store 1",
+            );
+        }
     }
 
     /// Stress the PARALLEL multi-store recovery: 8 stores, many records each
