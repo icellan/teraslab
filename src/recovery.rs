@@ -990,10 +990,11 @@ pub fn recover_all_multi_store(
     // `entry.device_id`. The fast path's precondition (clean/durable
     // secondaries) is identical to the single-store path's — the caller asserts
     // it by passing `full_secondary_rebuild == false`.
+    let dev_refs: Vec<&dyn BlockDevice> = devices.iter().map(|d| d.as_ref()).collect();
     if full_secondary_rebuild {
-        reconcile_secondary_indexes_from_metadata_multi(devices, index, dah, unmined)?;
+        reconcile_secondary_indexes_from_metadata_multi(&dev_refs, index, dah, unmined)?;
     } else {
-        reconcile_secondary_indexes_for_keys_multi(devices, index, dah, unmined, &touched_keys)?;
+        reconcile_secondary_indexes_for_keys_multi(&dev_refs, index, dah, unmined, &touched_keys)?;
     }
     Ok((total, pending_cc, pending_dc))
 }
@@ -1316,10 +1317,16 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
 
     match secondary_reconcile {
         SecondaryReconcile::FullScan => {
-            reconcile_secondary_indexes_from_metadata(device, index, dah, unmined)?;
+            reconcile_secondary_indexes_from_metadata_multi(&[device], index, dah, unmined)?;
         }
         SecondaryReconcile::TouchedOnly => {
-            reconcile_secondary_indexes_for_keys(device, index, dah, unmined, &touched_keys)?;
+            reconcile_secondary_indexes_for_keys_multi(
+                &[device],
+                index,
+                dah,
+                unmined,
+                &touched_keys,
+            )?;
         }
     }
 
@@ -1374,73 +1381,14 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     ))
 }
 
-fn reconcile_secondary_indexes_from_metadata(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
-) -> Result<(), RecoveryError> {
-    // F-G3-002: propagate failures from the redb drop+recreate so we do not
-    // start the reconcile loop over a half-cleared table whose cached count
-    // disagrees with the on-disk rows.
-    dah.clear().map_err(RecoveryError::Index)?;
-    unmined.clear().map_err(RecoveryError::Index)?;
-
-    // Collect results from the for_each pass — for_each takes a FnMut closure
-    // that cannot return errors, so we accumulate failures and surface the first.
-    let mut first_error: Option<RecoveryError> = None;
-    let mut dah_pairs: Vec<(u32, TxKey)> = Vec::new();
-    let mut unmined_pairs: Vec<(u32, TxKey)> = Vec::new();
-
-    index.for_each(|key, entry| {
-        if first_error.is_some() {
-            return;
-        }
-        match io::read_metadata(device, entry.record_offset) {
-            Ok(meta) => {
-                let dah_height = { meta.delete_at_height };
-                if dah_height != 0 {
-                    dah_pairs.push((dah_height, key));
-                }
-                let unmined_height = { meta.unmined_since };
-                if unmined_height != 0 {
-                    unmined_pairs.push((unmined_height, key));
-                }
-            }
-            Err(_) => {
-                first_error = Some(RecoveryError::Index(
-                    crate::index::IndexError::FormatError {
-                        detail: format!(
-                            "secondary reconcile failed to read metadata for {:?}",
-                            key.txid
-                        ),
-                    },
-                ));
-            }
-        }
-    });
-
-    if let Some(e) = first_error {
-        return Err(e);
-    }
-
-    for (height, key) in dah_pairs {
-        dah.insert(height, key, None)?;
-    }
-    for (height, key) in unmined_pairs {
-        unmined.insert(height, key, None)?;
-    }
-    Ok(())
-}
-
 /// Multi-store full reconcile: clear the DAH / unmined secondaries and
 /// re-derive them by scanning every primary index entry, reading each record's
-/// metadata from ITS OWN store's device (`devices[entry.device_id]`). The
-/// single-device [`reconcile_secondary_indexes_from_metadata`] reads from one
-/// device, which is wrong once records span stores. Called once by
+/// metadata from ITS OWN store's device (`devices[entry.device_id]`). Single
+/// store is the `devices.len() == 1` case (every `entry.device_id == 0`), so the
+/// single-store recovery path calls this with a one-element slice. Called by
 /// `recover_all_multi_store` after every store's replay.
 fn reconcile_secondary_indexes_from_metadata_multi(
-    devices: &[std::sync::Arc<dyn BlockDevice>],
+    devices: &[&dyn BlockDevice],
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
@@ -1467,7 +1415,7 @@ fn reconcile_secondary_indexes_from_metadata_multi(
             }));
             return;
         };
-        match io::read_metadata(&**dev, entry.record_offset) {
+        match io::read_metadata(*dev, entry.record_offset) {
             Ok(meta) => {
                 let dah_height = { meta.delete_at_height };
                 if dah_height != 0 {
@@ -1503,11 +1451,11 @@ fn reconcile_secondary_indexes_from_metadata_multi(
 
 /// B-7 (multi-store): the O(redo) touched-only counterpart to
 /// [`reconcile_secondary_indexes_from_metadata_multi`], routing each metadata
-/// read to the record's OWN store via `entry.device_id`. It is the multi-store
-/// mirror of [`reconcile_secondary_indexes_for_keys`] and carries the SAME
-/// soundness precondition: it is correct only when the secondaries were loaded
-/// clean (they already reflect every key the redo logs did NOT touch). Called
-/// by `recover_all_multi_store` when `full_secondary_rebuild == false`.
+/// read to the record's OWN store via `entry.device_id`. Single store is the
+/// one-element-slice case. Carries the SAME soundness precondition as the full
+/// reconcile: it is correct only when the secondaries were loaded clean (they
+/// already reflect every key the redo logs did NOT touch). Called by
+/// `recover_all_multi_store` when `full_secondary_rebuild == false`.
 ///
 /// For each touched key the primary index is authoritative: if the record is
 /// gone, any secondary entry for it is removed; otherwise the secondaries are
@@ -1515,7 +1463,7 @@ fn reconcile_secondary_indexes_from_metadata_multi(
 /// `devices[entry.device_id]` (removing first so a height *change* does not
 /// leave a stale entry under the old bucket).
 fn reconcile_secondary_indexes_for_keys_multi(
-    devices: &[std::sync::Arc<dyn BlockDevice>],
+    devices: &[&dyn BlockDevice],
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
@@ -1543,7 +1491,7 @@ fn reconcile_secondary_indexes_for_keys_multi(
                 },
             ));
         };
-        let meta = match io::read_metadata(&**dev, entry.record_offset) {
+        let meta = match io::read_metadata(*dev, entry.record_offset) {
             Ok(meta) => meta,
             Err(_) => {
                 return Err(RecoveryError::Index(
@@ -1558,68 +1506,6 @@ fn reconcile_secondary_indexes_for_keys_multi(
         };
         // Remove first so a changed height does not leave a stale entry under
         // the previous bucket, then re-insert the current value.
-        dah.remove(key, None).map_err(RecoveryError::Index)?;
-        unmined.remove(key, None).map_err(RecoveryError::Index)?;
-        let dah_height = { meta.delete_at_height };
-        if dah_height != 0 {
-            dah.insert(dah_height, *key, None)?;
-        }
-        let unmined_height = { meta.unmined_since };
-        if unmined_height != 0 {
-            unmined.insert(unmined_height, *key, None)?;
-        }
-    }
-    Ok(())
-}
-
-/// B-7: reconcile the DAH / unmined secondaries for ONLY the keys the
-/// redo replay touched, against the durable (crash-safe) secondary state.
-///
-/// This is the O(redo) counterpart to
-/// [`reconcile_secondary_indexes_from_metadata`]'s O(store) full scan. It
-/// is sound only when the secondaries were loaded clean (they already
-/// reflect every key the redo log did NOT touch); the touched keys are
-/// the only ones whose secondary state may be stale w.r.t. the just
-/// replayed primary metadata.
-///
-/// For each touched key the primary index is authoritative: if the record
-/// is gone, any secondary entry for it is removed; otherwise the
-/// secondaries are set to exactly the record's `delete_at_height` /
-/// `unmined_since` (removing first so a height *change* does not leave a
-/// stale entry under the old height bucket).
-fn reconcile_secondary_indexes_for_keys(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
-    keys: &std::collections::HashSet<TxKey>,
-) -> Result<(), RecoveryError> {
-    for key in keys {
-        let entry = match index.lookup(key) {
-            Some(e) => e,
-            None => {
-                // Record no longer exists — drop any stale secondary
-                // entries keyed on it.
-                dah.remove(key, None).map_err(RecoveryError::Index)?;
-                unmined.remove(key, None).map_err(RecoveryError::Index)?;
-                continue;
-            }
-        };
-        let meta = match io::read_metadata(device, entry.record_offset) {
-            Ok(meta) => meta,
-            Err(_) => {
-                return Err(RecoveryError::Index(
-                    crate::index::IndexError::FormatError {
-                        detail: format!(
-                            "secondary reconcile failed to read metadata for {:?}",
-                            key.txid
-                        ),
-                    },
-                ));
-            }
-        };
-        // Remove first so a changed height does not leave a stale entry
-        // under the previous bucket, then re-insert the current value.
         dah.remove(key, None).map_err(RecoveryError::Index)?;
         unmined.remove(key, None).map_err(RecoveryError::Index)?;
         let dah_height = { meta.delete_at_height };
