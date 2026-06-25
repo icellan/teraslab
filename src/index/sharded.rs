@@ -829,18 +829,29 @@ impl ShardedIndex {
             regions.push(idx.serialize_primary());
         }
 
+        let secondary = crate::index::serialize_secondary_sections(dah, unmined);
+        Ok(Self::assemble_v2(self.seed, &regions, &secondary))
+    }
+
+    /// Assemble the v2 manifest bytes from pre-serialized shard regions and the
+    /// already-serialized secondary section: header, region table (absolute
+    /// offset + length per shard), the shard regions, the unsharded secondary
+    /// sections, and a trailing CRC32 over everything above. Pure — no locks —
+    /// so both the quiesced [`Self::serialize_v2`] and the fuzzy
+    /// [`Self::snapshot_all_concurrent`] share one byte layout.
+    fn assemble_v2(seed: u64, regions: &[Vec<u8>], secondary: &[u8]) -> Vec<u8> {
+        let shard_count = regions.len();
         let region_table_size = shard_count * V2_REGION_ENTRY_SIZE;
         let regions_start = V2_HEADER_SIZE + region_table_size;
 
         // Compute absolute offsets for each region.
         let mut region_offsets: Vec<u64> = Vec::with_capacity(shard_count);
         let mut cursor = regions_start as u64;
-        for region in &regions {
+        for region in regions {
             region_offsets.push(cursor);
             cursor += region.len() as u64;
         }
 
-        let secondary = crate::index::serialize_secondary_sections(dah, unmined);
         let total_body: usize =
             regions_start + regions.iter().map(|r| r.len()).sum::<usize>() + secondary.len();
 
@@ -849,22 +860,114 @@ impl ShardedIndex {
         buf.extend_from_slice(&V2_MAGIC);
         buf.extend_from_slice(&V2_VERSION.to_le_bytes());
         buf.extend_from_slice(&(shard_count as u32).to_le_bytes());
-        buf.extend_from_slice(&self.seed.to_le_bytes());
+        buf.extend_from_slice(&seed.to_le_bytes());
         // Region table.
-        for (off, region) in region_offsets.iter().zip(&regions) {
+        for (off, region) in region_offsets.iter().zip(regions) {
             buf.extend_from_slice(&off.to_le_bytes());
             buf.extend_from_slice(&(region.len() as u64).to_le_bytes());
         }
         // Shard regions.
-        for region in &regions {
+        for region in regions {
             buf.extend_from_slice(region);
         }
         // Unsharded secondary sections.
-        buf.extend_from_slice(&secondary);
+        buf.extend_from_slice(secondary);
         // Trailing CRC32 over everything above.
         let checksum = crc32fast::hash(&buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
-        Ok(buf)
+        buf
+    }
+
+    /// Fuzzy, non-blocking snapshot for the checkpoint task.
+    ///
+    /// Unlike [`Self::snapshot_all`], the caller does NOT hold the global
+    /// `dispatch_visibility_barrier`. Each shard region is serialized under its
+    /// own short-lived read lock (released before the next shard), and the
+    /// secondary backends are locked ONLY AFTER every shard lock has been
+    /// released. No cross-subsystem lock is ever held at once, so the
+    /// acquisition order matches the write path (shard before secondaries) and
+    /// cannot deadlock without the barrier holding everything still.
+    ///
+    /// The resulting snapshot is therefore *fuzzy*: different shards/secondaries
+    /// reflect slightly different instants, and a shard may include a mutation
+    /// that landed after the checkpoint fence was sampled. That is safe — the
+    /// checkpoint's recovery fence plus idempotent redo replay reconcile any
+    /// post-fence skew (every replay re-reads current state and re-applies only
+    /// if needed; see `crate::recovery`). Reads (which also take a shard *read*
+    /// lock) are never blocked; a writer to shard `i` waits only while shard `i`
+    /// itself is being serialized.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::FormatError`] if any shard or secondary backend is not the
+    /// in-memory variant; [`IndexError::Io`] on a filesystem failure; and the
+    /// v1 delegate's error at a single shard.
+    pub fn snapshot_all_concurrent(
+        &self,
+        dah: &parking_lot::Mutex<crate::index::DahBackend>,
+        unmined: &parking_lot::Mutex<crate::index::UnminedBackend>,
+        path: &std::path::Path,
+    ) -> Result<(), IndexError> {
+        // One shard: keep the v1 format. Acquire the shard read lock FIRST,
+        // then the secondaries — the write path's order — so no barrier is
+        // needed to prevent the dah/unmined→shard inversion.
+        if self.shards.len() == 1 {
+            let shard = self.shards[0].read();
+            let dah_g = dah.lock();
+            let unmined_g = unmined.lock();
+            return shard.snapshot_all(&dah_g, &unmined_g, path);
+        }
+
+        // Multi-shard v2. 1) Serialize each shard region under its own read
+        // lock, released before the next shard is touched.
+        let mut regions: Vec<Vec<u8>> = Vec::with_capacity(self.shards.len());
+        for (i, shard) in self.shards.iter().enumerate() {
+            let guard = shard.read();
+            let idx = guard
+                .as_in_memory_index()
+                .ok_or_else(|| IndexError::FormatError {
+                    detail: format!(
+                        "ShardedIndex::snapshot_all_concurrent requires in-memory shards; \
+                         shard {i} is {}",
+                        guard.backend_name()
+                    ),
+                })?;
+            regions.push(idx.serialize_primary());
+        }
+
+        // 2) Serialize the secondaries under their own locks, AFTER every shard
+        // lock above has been released (no nested lock → no write-path
+        // inversion).
+        let secondary = {
+            let dah_g = dah.lock();
+            let unmined_g = unmined.lock();
+            let (
+                crate::index::DahBackend::InMemory(dah_idx),
+                crate::index::UnminedBackend::InMemory(unmined_idx),
+            ) = (&*dah_g, &*unmined_g)
+            else {
+                return Err(IndexError::FormatError {
+                    detail:
+                        "ShardedIndex::snapshot_all_concurrent v2 requires in-memory dah/unmined \
+                         backends"
+                            .into(),
+                });
+            };
+            crate::index::serialize_secondary_sections(dah_idx, unmined_idx)
+        };
+
+        let data = Self::assemble_v2(self.seed, &regions, &secondary);
+
+        // 3) Atomic write: temp file + fsync + rename + parent dir fsync,
+        // matching `Self::snapshot_all`.
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &data)?;
+        let f = std::fs::File::open(&tmp_path)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, path)?;
+        crate::index::util::fsync_parent_dir(path)?;
+        Ok(())
     }
 
     /// Restore a sharded in-memory index from a snapshot at `path`, targeting
@@ -2152,6 +2255,84 @@ mod tests {
         let (restored, _d, _u, _f) = result.expect("v1 snapshot must be recognised, not rejected");
         assert_eq!(restored.len(), 1, "the single v1 entry must load");
         assert!(restored.lookup(&make_key(1)).is_some());
+    }
+
+    /// A snapshot taken WHILE other threads mutate the index — the fuzzy /
+    /// non-blocking checkpoint path (`snapshot_all_concurrent`) — must
+    /// (a) not deadlock (its per-shard lock order matches the write path, so no
+    /// global barrier is needed), and (b) restore cleanly, capturing every entry
+    /// that existed before the snapshot began. Entries inserted *during* the
+    /// snapshot may or may not appear (it is deliberately fuzzy across shards);
+    /// in production the checkpoint's redo fence + idempotent replay reconcile
+    /// that tail. This is the per-PR restorability guard for the dropped-quiesce
+    /// design.
+    #[test]
+    fn concurrent_snapshot_restores_all_pre_snapshot_entries() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fuzzy.snap");
+
+        // Pre-snapshot set: every one of these must survive the snapshot.
+        const PRE: u64 = 5_000;
+        let index = Arc::new(ShardedIndex::new_in_memory(20_000, 16).unwrap());
+        let mut expected = std::collections::HashMap::new();
+        for i in 0..PRE {
+            let key = make_key(i);
+            let entry = make_entry(i * 64 + 7);
+            index.register(key, entry).unwrap();
+            expected.insert(key.txid, entry);
+        }
+
+        let dah = parking_lot::Mutex::new(crate::index::DahBackend::InMemory(DahIndex::new()));
+        let unmined =
+            parking_lot::Mutex::new(crate::index::UnminedBackend::InMemory(UnminedIndex::new()));
+
+        // Three writers register NEW entries (disjoint key ranges) concurrently
+        // with the snapshot, so each shard is mutated while it is being — or
+        // about to be — serialized.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writers: Vec<_> = (0..3u64)
+            .map(|w| {
+                let index = index.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut n = PRE + w * 1_000_000;
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = index.register(make_key(n), make_entry(n * 64 + 7));
+                        n += 1;
+                    }
+                })
+            })
+            .collect();
+
+        // The code under test: serialize each shard under its own short-lived
+        // read lock (no cross-subsystem lock), then the secondaries.
+        index
+            .snapshot_all_concurrent(&dah, &unmined, &path)
+            .expect("concurrent snapshot must succeed");
+
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let (restored, _dah, _unmined, _flags) =
+            ShardedIndex::restore_all(&path, 16).expect("fuzzy snapshot must restore");
+        for (txid, entry) in &expected {
+            let key = TxKey { txid: *txid };
+            assert_eq!(
+                restored.lookup(&key).as_ref(),
+                Some(entry),
+                "pre-snapshot entry {txid:?} lost from the concurrently-taken snapshot"
+            );
+        }
+        assert!(
+            restored.len() >= PRE as usize,
+            "restored index must hold at least the {PRE} pre-snapshot entries, got {}",
+            restored.len()
+        );
     }
 
     /// Test 4: an unknown magic and an unsupported v2 version both fail closed

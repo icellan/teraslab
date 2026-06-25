@@ -423,6 +423,9 @@ pub(crate) fn build_http_router(
         // Debug mutation / sensitive read
         .route("/debug/index", get(handle_debug_index))
         .route("/debug/redo", get(handle_debug_redo))
+        // CPU profiler (pprof): admin-gated, single-flight. Returns an inferno
+        // flamegraph SVG.
+        .route("/debug/pprof/profile", get(handle_debug_pprof_profile))
         // F-X-002: `/debug/freelist` exposes allocator internals
         // (used_bytes, free_region_count, alignment) and `GET
         // /debug/log-level` exposes the live tracing level — both leak
@@ -2707,6 +2710,125 @@ async fn handle_debug_redo(State(state): State<Arc<HttpState>>) -> impl IntoResp
         serde_json::json!({ "available": false })
     };
     json_response(body)
+}
+
+/// Query parameters for the CPU profile endpoint.
+#[derive(Debug, serde::Deserialize)]
+struct PprofQuery {
+    /// Sampling window in seconds. Clamped to `[1, 60]`.
+    #[serde(default = "default_profile_seconds")]
+    seconds: u64,
+    /// Sampling frequency in Hz. Clamped to `[10, 1000]`.
+    #[serde(default = "default_profile_frequency")]
+    frequency: i32,
+}
+
+fn default_profile_seconds() -> u64 {
+    5
+}
+fn default_profile_frequency() -> i32 {
+    99
+}
+
+/// Single-flight guard: pprof installs a process-global `ITIMER_PROF` timer, so
+/// at most one profile may run at a time. A concurrent request is rejected with
+/// 409 rather than failing deep inside `ProfilerGuardBuilder::build`.
+static PPROF_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII reset for [`PPROF_IN_FLIGHT`]. Constructed INSIDE the `spawn_blocking`
+/// task so the flag clears exactly when the profile thread finishes its work.
+/// A blocking task runs to completion even if the HTTP handler future is
+/// dropped (client disconnect / shutdown), so clearing the flag in the handler
+/// after `.await` would leak it on cancellation and wedge the endpoint at 409
+/// forever. Holding it for the full profile also prevents a second profile from
+/// racing the still-running process-global `ITIMER_PROF`.
+struct PprofInFlightGuard;
+impl Drop for PprofInFlightGuard {
+    fn drop(&mut self) {
+        PPROF_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// `GET /debug/pprof/profile?seconds=N&frequency=Hz`
+///
+/// Samples the whole process for `seconds` and returns an inferno flamegraph
+/// SVG. Admin-gated and single-flight. The blocking sample runs on a dedicated
+/// `spawn_blocking` thread so it never parks an async worker, and the
+/// `ProfilerGuard` is created and reported entirely within that thread (never
+/// held across an `.await`).
+///
+/// pprof-protobuf output (for `go tool pprof` / pprof.me) is intentionally not
+/// served here — its codec pulls a vulnerable / duplicate dependency; use
+/// `samply` or `cargo flamegraph` for that (see PROFILING.md).
+///
+/// SIGPROF sampling can interrupt blocking syscalls with `EINTR`; the device
+/// `pread`/`pwrite` loops (src/device.rs) and std socket reads already retry,
+/// so a profile does not perturb in-flight serving.
+async fn handle_debug_pprof_profile(Query(q): Query<PprofQuery>) -> axum::response::Response {
+    let seconds = q.seconds.clamp(1, 60);
+    let frequency = q.frequency.clamp(10, 1000);
+
+    if PPROF_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return http_error(
+            StatusCode::CONFLICT,
+            "profile_in_progress",
+            "a CPU profile is already running; only one may run at a time",
+        );
+    }
+
+    // The guard lives inside the blocking task, so the flag is cleared when the
+    // profile actually finishes — even if this handler future is cancelled, the
+    // spawn_blocking task still runs to completion and resets it.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _in_flight = PprofInFlightGuard;
+        run_cpu_profile(seconds, frequency)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(svg)) => {
+            let mut resp = (StatusCode::OK, svg).into_response();
+            let headers = resp.headers_mut();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("image/svg+xml"),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("inline; filename=\"teraslab-cpu-flamegraph.svg\""),
+            );
+            resp
+        }
+        Ok(Err(e)) => http_error(StatusCode::INTERNAL_SERVER_ERROR, "profile_failed", e),
+        Err(e) => http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "profile_panicked",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Run one blocking CPU sample and render it as an inferno flamegraph SVG.
+/// Errors are returned as strings for the handler to surface as a 500.
+fn run_cpu_profile(seconds: u64, frequency: i32) -> Result<Vec<u8>, String> {
+    let guard = pprof::ProfilerGuardBuilder::default()
+        .frequency(frequency)
+        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+        .build()
+        .map_err(|e| format!("start profiler: {e}"))?;
+    std::thread::sleep(Duration::from_secs(seconds));
+    let report = guard
+        .report()
+        .build()
+        .map_err(|e| format!("build report: {e}"))?;
+    let mut svg = Vec::new();
+    report
+        .flamegraph(&mut svg)
+        .map_err(|e| format!("flamegraph render: {e}"))?;
+    Ok(svg)
 }
 
 async fn handle_set_log_level(
