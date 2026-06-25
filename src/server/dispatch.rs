@@ -2381,6 +2381,7 @@ fn valid_redo_range(range: (u64, u64)) -> bool {
 
 fn begin_replication_intent_with_tracker(
     range: (u64, u64),
+    keys: &[TxKey],
     tracker: Option<&crate::replication::durable::ReplicationIntentTracker>,
 ) -> std::result::Result<(), String> {
     if !valid_redo_range(range) {
@@ -2388,10 +2389,30 @@ fn begin_replication_intent_with_tracker(
     }
     if let Some(tracker) = tracker {
         tracker
-            .begin(range.0, range.1)
+            .begin(range.0, range.1, keys)
             .map_err(|e| format!("replication intent begin: {e}"))?;
     }
     Ok(())
+}
+
+/// Collect the EXACT key set of a batch of redo ops for the replication intent.
+///
+/// The intent's key set is the dedup'd union of every keyed redo op's tx_key
+/// (control entries like `Checkpoint` have no key and are skipped). This is the
+/// same key set that the corresponding `ReplicaOp`s carry, so recovery can
+/// filter the merged redo window to exactly this RPC's keys and never re-ship a
+/// foreign op whose sequence interleaved into the range.
+fn intent_keys_from_redo_ops(ops: &[RedoOp]) -> Vec<TxKey> {
+    let mut keys: Vec<TxKey> = Vec::with_capacity(ops.len());
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for op in ops {
+        if let Some(tx_key) = op.tx_key()
+            && seen.insert(tx_key.txid)
+        {
+            keys.push(*tx_key);
+        }
+    }
+    keys
 }
 
 fn write_replicated_redo_ops(
@@ -2422,7 +2443,13 @@ fn write_replicated_redo_ops_with_tracker(
         // "redo fsynced" and "replica ACK policy satisfied". It must be
         // persisted before the local engine apply; otherwise a crash in that
         // window leaves a local-only mutation with no startup barrier.
-        begin_replication_intent_with_tracker(range, tracker)?;
+        //
+        // The intent carries THIS RPC's exact key set (derived from the redo
+        // ops being written) so startup recovery replays only these keys from
+        // the merged redo window — never a foreign op whose global sequence
+        // happened to interleave into [first..last].
+        let keys = intent_keys_from_redo_ops(ops);
+        begin_replication_intent_with_tracker(range, &keys, tracker)?;
     }
     Ok(range)
 }
@@ -3030,7 +3057,7 @@ fn recover_pending_replication_intents_from_tracker<F>(
 where
     F: FnMut(&[(TxKey, Vec<ReplicaOp>)], (u64, u64)) -> std::result::Result<(), String>,
 {
-    let pending = tracker.pending();
+    let pending = tracker.pending_with_keys();
     if pending.is_empty() {
         return Ok(());
     }
@@ -3041,7 +3068,12 @@ where
         )
     })?;
 
-    for range in pending {
+    for (range, intent_keys) in pending {
+        // Membership set for this RPC's OWN keys. Recovery replays exactly
+        // these — never a foreign op whose global sequence interleaved into
+        // [first..last] under per-store redo (the latent wrong-apply vector).
+        let owned_keys: std::collections::HashSet<[u8; 32]> =
+            intent_keys.iter().map(|k| k.txid).collect();
         // The global sequence counter is shared across every store log, so any
         // log's `current_sequence` reports the global high-water.
         let current_sequence = redo_log.lock().current_sequence();
@@ -3084,70 +3116,64 @@ where
                 entry.sequence >= range.first_sequence && entry.sequence <= range.last_sequence
             })
             .collect();
-        if entries.is_empty()
-            || entries.first().map(|e| e.sequence) != Some(range.first_sequence)
-            || entries.last().map(|e| e.sequence) != Some(range.last_sequence)
-        {
-            let range_reclaimed = match earliest_sequence {
-                Some(earliest) => earliest > range.first_sequence,
-                None => current_sequence > range.last_sequence,
-            };
-            if range_reclaimed {
-                tracing::warn!(
-                    first_sequence = range.first_sequence,
-                    last_sequence = range.last_sequence,
-                    ?earliest_sequence,
-                    current_sequence,
-                    "pending replication intent refers to reclaimed redo range; clearing marker and requiring replica full resync/catch-up",
-                );
-                tracker
-                    .commit(range.first_sequence, range.last_sequence)
-                    .map_err(|e| format!("replication intent commit: {e}"))?;
-                continue;
-            }
-            return Err(format!(
-                "pending replication intent {}..{} cannot be resolved: redo entries missing",
-                range.first_sequence, range.last_sequence,
-            ));
+
+        // Reclamation is the ONLY satisfiability gate. Under per-store redo the
+        // global sequence counter is shared across logs, so this RPC's
+        // [first..last] window legitimately contains FOREIGN ops (other
+        // already-committed RPCs whose sequences interleaved) AND may be missing
+        // sequences this RPC never produced. The old boundary check (first
+        // entry == range.first && last == range.last) is therefore WRONG once we
+        // filter by key: a foreign op can occupy the boundary sequence, and this
+        // RPC's own first/last keyed op need not sit exactly on the range edge.
+        //
+        // Genuine reclamation = the redo floor (earliest available sequence) has
+        // advanced ABOVE range.first_sequence, i.e. this range was compacted
+        // away. That — and only that — means the owned ops are gone and we must
+        // fall back to a full replica resync/catch-up. "Some sequences in the
+        // range are absent because they were foreign / never produced by this
+        // RPC" is NOT reclamation.
+        let range_reclaimed = match earliest_sequence {
+            Some(earliest) => earliest > range.first_sequence,
+            // No entries remain at/after range.first at all: only treat as
+            // reclaimed if the log has genuinely advanced past the whole range
+            // (compacted/wrapped). Otherwise the range is simply empty of our
+            // keys and is satisfied by committing the no-op intent below.
+            None => entries.is_empty() && current_sequence > range.last_sequence,
+        };
+        if range_reclaimed {
+            tracing::warn!(
+                first_sequence = range.first_sequence,
+                last_sequence = range.last_sequence,
+                ?earliest_sequence,
+                current_sequence,
+                "pending replication intent refers to reclaimed redo range; clearing marker and requiring replica full resync/catch-up",
+            );
+            tracker
+                .commit(range.first_sequence, range.last_sequence)
+                .map_err(|e| format!("replication intent commit: {e}"))?;
+            continue;
         }
 
-        // P3 (review) — IDEMPOTENCY DEPENDENCY PINNED HERE. Under per-store redo
-        // logs the global sequence counter is shared across every store log, so
-        // a crashed RPC's [first_sequence..last_sequence] window can interleave
-        // with — and therefore include — entries that belong to OTHER, already-
-        // committed RPCs whose ops landed in a different store log within the
-        // same sequence span. We re-replicate EVERY in-range entry here; the
-        // foreign ones are re-shipped too. This is safe ONLY because every
-        // `ReplicaOp` apply on the receiver is idempotent (re-applying an
-        // already-applied Create/Spend/SetMined/etc. is a no-op), so the extra
-        // foreign ops cause at most redundant network traffic, never corruption.
-        //
-        // We deliberately do NOT narrow by "keys this node currently masters":
-        // `is_master` lives on `RunningCluster` (not threaded into this
-        // recovery fn), and more importantly it can return `Transitioning`/`No`
-        // during early startup (topology epoch ahead, or inbound migration
-        // pending) for a key this RPC legitimately owned at write time — using
-        // it as a filter would risk DROPPING a committed-locally op that must be
-        // re-shipped, trading harmless redundancy for a real durability hole.
-        // The complete fix is to have each replication intent carry its OWN key
-        // set so we replay exactly this RPC's keys regardless of current
-        // mastership; that requires a format change to the durable intent
-        // tracker (a different module) and is out of scope for this change.
+        // The range is satisfiable (not reclaimed). Replay EXACTLY this RPC's
+        // keys: reconstruct only entries whose key is in the intent's own key
+        // set. Foreign ops sharing the window are skipped — never re-shipped —
+        // so a non-idempotent `ReplicaOp` can never be wrong-applied to a
+        // replica from a foreign RPC's interleaved sequence.
         let mut ops_by_key = Vec::new();
         for entry in &entries {
             let Some(tx_key) = entry.op.tx_key().copied() else {
                 continue;
             };
+            if !owned_keys.contains(&tx_key.txid) {
+                // Foreign op that interleaved into this range under the shared
+                // sequence counter — belongs to a different (already-committed)
+                // RPC. Never re-ship it from this intent.
+                continue;
+            }
             let shard = ShardTable::shard_for_key(&tx_key);
             if let Some(op) =
                 crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
             {
-                // If/when intents carry their own key set, replace the blanket
-                // re-ship with a membership test against that set. Until then
-                // the idempotent receiver is the load-bearing invariant: this
-                // op may belong to a foreign already-committed RPC and is shipped
-                // anyway. Pin that the reconstructed op tracks the entry's own
-                // key and the entry is genuinely in this intent's window.
                 debug_assert_eq!(
                     op.tx_key(),
                     tx_key,
@@ -3155,8 +3181,7 @@ where
                 );
                 debug_assert!(
                     entry.sequence >= range.first_sequence && entry.sequence <= range.last_sequence,
-                    "recovery must only ship ops whose redo entry falls in the intent window; \
-                     out-of-range re-ship relies on receiver idempotency to stay safe",
+                    "recovery must only ship ops whose redo entry falls in the intent window",
                 );
                 ops_by_key.push((tx_key, vec![op]));
             }
@@ -4023,16 +4048,14 @@ where
         // (single-node / tests without a cluster) — nothing to reconcile.
         None => return Ok(()),
     };
-    // Register the compensation intent durably FIRST so a crash before the
-    // fan-out completes leaves a marker that startup recovery re-replicates.
-    begin_replication_intent_with_tracker(comp_range, Some(tracker))?;
 
     let redo_log = match redo_log {
         Some(r) => r,
         None => {
-            // Intent is durable; without a redo log here we cannot
-            // reconstruct the ops inline, but recovery will from the comp
-            // range. Leave the intent pending.
+            // Without a redo log here we cannot reconstruct the ops inline, and
+            // cannot derive the intent's key set. Recovery cannot replay a
+            // key-filtered intent it can't reconstruct either, so there is
+            // nothing durable to record — the local rollback stands on its own.
             return Ok(());
         }
     };
@@ -4040,6 +4063,8 @@ where
     // Mirror `write_redo_ops`' routing: when per-store logs are attached the
     // comp range may span multiple store logs, so read the merged, sequence-
     // ordered view via the engine. Otherwise read from the passed handle.
+    // (This read is side-effect-free; the durable intent-file write below still
+    // precedes the replication network round-trip, preserving WAL-first order.)
     let entries = if engine.has_per_store_redo() {
         engine
             .read_redo_from_sequence_merged(comp_range.0)
@@ -4065,6 +4090,12 @@ where
             ops_by_key.push((tx_key, vec![op]));
         }
     }
+
+    // Register the compensation intent durably with its EXACT key set so a
+    // crash before the fan-out completes leaves a marker that startup recovery
+    // re-replicates — filtered to exactly these compensating keys.
+    let comp_keys: Vec<TxKey> = ops_by_key.iter().map(|(k, _)| *k).collect();
+    begin_replication_intent_with_tracker(comp_range, &comp_keys, Some(tracker))?;
 
     if ops_by_key.is_empty() {
         // Nothing replicable in this range (e.g. only Compensate* markers
@@ -15679,7 +15710,7 @@ mod tests {
     #[test]
     fn pending_replication_recovery_requires_redo_log() {
         let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
-        tracker.begin(7, 7).unwrap();
+        tracker.begin(7, 7, &[]).unwrap();
         let h = DispatchTestHarness::new();
 
         let err =
@@ -15714,7 +15745,7 @@ mod tests {
             }],
         )
         .expect("redo write succeeds");
-        tracker.begin(range.0, range.1).unwrap();
+        tracker.begin(range.0, range.1, &[tx_key]).unwrap();
 
         let mut observed_range = None;
         let mut observed_ops = Vec::new();
@@ -15862,7 +15893,7 @@ mod tests {
             }],
         )
         .expect("redo write succeeds");
-        tracker.begin(range.0, range.1).unwrap();
+        tracker.begin(range.0, range.1, &[tx_key]).unwrap();
 
         {
             let mut log = redo_log.lock();
@@ -15950,7 +15981,7 @@ mod tests {
         assert!(s1 > s0, "global sequence must advance across store logs");
 
         let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
-        tracker.begin(s0, s1).unwrap();
+        tracker.begin(s0, s1, &[key0, key1]).unwrap();
 
         let mut observed: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
         recover_pending_replication_intents_from_tracker(
@@ -15975,6 +16006,160 @@ mod tests {
         assert!(
             tracker.pending().is_empty(),
             "intent must be committed after successful re-replication"
+        );
+    }
+
+    /// THE HAZARD: under per-store redo the ONE global sequence counter
+    /// interleaves sequences across stores, so a crashed RPC-A's intent range
+    /// [first..last] can CONTAIN a FOREIGN, already-committed RPC-B op whose
+    /// sequence landed inside that span. Recovery must replay EXACTLY RPC-A's
+    /// own keys (carried by the intent) and NEVER re-ship RPC-B's foreign op —
+    /// otherwise a non-idempotent `ReplicaOp` would be wrong-applied to a
+    /// replica from a foreign RPC.
+    #[test]
+    fn intent_recovery_replays_only_owned_keys_not_foreign_in_range() {
+        let h = DispatchTestHarness::with_stores(1); // 2 stores
+
+        let rdev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 4 * 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 4 * 1024 * 1024).unwrap();
+        let shared = Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&log0, &log1]),
+        ));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(Mutex::new(log0));
+        let log1_arc = Arc::new(Mutex::new(log1));
+        h.engine
+            .set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        // RPC-A owns K_A (lands in store 0's log). RPC-B owns K_B (a DIFFERENT,
+        // already-committed RPC; lands in store 1's log). The shared counter
+        // makes s_b strictly between s_a and the range end, so K_B's foreign op
+        // sits INSIDE RPC-A's [s_a..s_b] window.
+        let k_a = TxKey {
+            txid: txid_for_shard(70, 9),
+        };
+        let k_b = TxKey {
+            txid: txid_for_shard(71, 9),
+        };
+        let s_a = log0_arc
+            .lock()
+            .append(RedoOp::Delete {
+                tx_key: k_a,
+                record_offset: 4096,
+                record_size: 256,
+            })
+            .unwrap();
+        let s_b = log1_arc
+            .lock()
+            .append(RedoOp::Delete {
+                tx_key: k_b,
+                record_offset: 8192,
+                record_size: 256,
+            })
+            .unwrap();
+        log0_arc.lock().flush().unwrap();
+        log1_arc.lock().flush().unwrap();
+        assert!(s_b > s_a, "foreign op must interleave inside the range");
+
+        // Record RPC-A's intent over the FULL [s_a..s_b] span but with ONLY
+        // K_A in its key set — exactly what the fixed begin-site records.
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        tracker.begin(s_a, s_b, &[k_a]).unwrap();
+
+        let mut observed: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(log0_arc.as_ref()),
+            &h.engine,
+            |ops, _range| {
+                observed.extend_from_slice(ops);
+                Ok(())
+            },
+        )
+        .expect("recovery of a satisfiable (non-reclaimed) range must succeed");
+
+        let observed_keys: Vec<TxKey> = observed.iter().map(|(k, _)| *k).collect();
+        assert!(
+            observed_keys.contains(&k_a),
+            "recovery MUST replay RPC-A's own owned op (K_A), got {observed_keys:?}"
+        );
+        assert!(
+            !observed_keys.contains(&k_b),
+            "recovery MUST NOT re-ship the FOREIGN RPC-B op (K_B) that merely \
+             interleaved into RPC-A's sequence range, got {observed_keys:?}"
+        );
+        assert_eq!(
+            observed.len(),
+            1,
+            "exactly one op — RPC-A's K_A — must be replayed"
+        );
+        assert!(
+            tracker.pending().is_empty(),
+            "the intent must be committed after replaying its owned keys"
+        );
+    }
+
+    /// Even with a key-carrying intent, a GENUINELY reclaimed (compacted-away)
+    /// redo range cannot be replayed incrementally — recovery must clear the
+    /// marker and fall back to a full replica resync/catch-up, never silently
+    /// drop the owned op.
+    #[test]
+    fn intent_recovery_keyed_reclaimed_range_still_resyncs() {
+        let h = DispatchTestHarness::new();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        let tx_key = TxKey {
+            txid: txid_for_shard(41, 9),
+        };
+        let range = write_redo_ops(
+            &h.engine,
+            Some(&redo_log),
+            &[RedoOp::Delete {
+                tx_key,
+                record_offset: 4096,
+                record_size: 256,
+            }],
+        )
+        .expect("redo write succeeds");
+        // Intent carries its own key, yet the range is about to be compacted.
+        tracker.begin(range.0, range.1, &[tx_key]).unwrap();
+
+        {
+            let mut log = redo_log.lock();
+            log.mark_checkpoint().unwrap();
+            log.reset().unwrap();
+            assert_eq!(log.earliest_sequence().unwrap(), None);
+            assert!(log.current_sequence() > range.1);
+        }
+
+        let mut replicated = false;
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &h.engine,
+            |_ops, _range| {
+                replicated = true;
+                Ok(())
+            },
+        )
+        .expect("reclaimed keyed range should clear stale intent, not brick startup");
+
+        assert!(
+            !replicated,
+            "a reclaimed range cannot be incrementally replayed even with a key set"
+        );
+        assert!(
+            tracker.pending().is_empty(),
+            "stale pending intent must be cleared after redo reclamation (resync path)"
         );
     }
 
@@ -16861,7 +17046,7 @@ mod tests {
             }],
         )
         .expect("redo write succeeds");
-        tracker.begin(range.0, range.1).unwrap();
+        tracker.begin(range.0, range.1, &[tx_key]).unwrap();
 
         // Drive the EXACT body of `recover_pending_replication_intents`: the
         // production `replicate_all_ops` fan-out against the live cluster.

@@ -276,7 +276,7 @@ fn boundary_after_replication_before_intent_clear_is_idempotent() {
     let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
     let first_seq = 100u64;
     let last_seq = 105u64;
-    tracker.begin(first_seq, last_seq).unwrap();
+    tracker.begin(first_seq, last_seq, &[]).unwrap();
 
     // Drop the tracker to simulate a process crash WITHOUT calling
     // `commit`. The on-disk file still holds the range.
