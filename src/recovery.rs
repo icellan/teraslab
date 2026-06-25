@@ -5358,6 +5358,176 @@ mod tests {
         }
     }
 
+    /// C (review P2 → studied): multi-store recovery must HONOR the
+    /// snapshot-coupled recovery-progress fence the checkpoint writes
+    /// (`mark_recovery_progress_all(F)` after snapshotting at F, then
+    /// `compact_all_redo_through(F)`), so the post-checkpoint replay is bounded.
+    ///
+    /// This reproduces the `AfterSnapshotRenameBeforeReclaim` crash window for a
+    /// multi-store node: the snapshot at fence F is durable (modelled here by
+    /// pre-registering the pre-fence record in the index) and the fence marker is
+    /// written, but the redo prefix is NOT yet compacted — so the pre-fence
+    /// `Create` is still physically in the log. On reboot, recovery MUST skip
+    /// every entry `<= F` (the snapshot covers them) and replay only the tail.
+    ///
+    /// The pre-fence `Create` deliberately points at an UNALLOCATED offset: if
+    /// the fence were ignored and it were replayed, the `is_allocated_range` gate
+    /// would fail it (`entries_failed > 0`). Honoring the fence skips it
+    /// (`entries_failed == 0`) and the snapshot-loaded record is preserved —
+    /// proving the fence both bounds re-replay AND loses nothing.
+    ///
+    /// (This is why writing a progress marker *during* recovery replay — at a
+    /// sequence no snapshot covers — would be UNSAFE: the marked-but-not-
+    /// snapshotted records would be skipped on reboot and lost. The only sound
+    /// fence is the checkpoint's snapshot-coupled one, exercised here.)
+    #[test]
+    fn multi_store_recovery_honors_snapshot_coupled_progress_fence() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        alloc0.set_redo_device_id(0);
+        alloc1.set_redo_device_id(1);
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        let utxo_count: u32 = 2;
+        let base = TxMetadata::record_size_for(utxo_count);
+
+        // --- Pre-fence record A: "covered by the snapshot". Pre-register it in
+        // the index (as a snapshot load would) at a VALID allocated offset, and
+        // write its bytes to store 0's device.
+        let key_a = TxKey { txid: [0xA1; 32] };
+        let off_a = alloc0.allocate(base).unwrap();
+        {
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = key_a.txid;
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|_| UtxoSlot::new_unspent([0xA1; 32]))
+                .collect();
+            io::write_full_record(&*dev0, off_a, &meta, &slots).unwrap();
+            index
+                .register(
+                    key_a,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: off_a,
+                        utxo_count,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        // --- Post-fence record B: replayed from the tail. Valid offset + bytes.
+        let key_b = TxKey { txid: [0xB2; 32] };
+        let off_b = alloc0.allocate(base).unwrap();
+        let rb_b = {
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = key_b.txid;
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|_| UtxoSlot::new_unspent([0xB2; 32]))
+                .collect();
+            let mut rb = vec![0u8; METADATA_SIZE];
+            let mut mb = [0u8; METADATA_SIZE];
+            meta.to_bytes(&mut mb);
+            rb[..METADATA_SIZE].copy_from_slice(&mb);
+            for s in &slots {
+                let mut sb = [0u8; UTXO_SLOT_SIZE];
+                s.to_bytes(&mut sb);
+                rb.extend_from_slice(&sb);
+            }
+            rb
+        };
+
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let mut redo1 = RedoLog::open(redo_dev1.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0, &redo1]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo1.attach_shared_sequence(shared.clone());
+
+        // Pre-fence Create(A) at a BOGUS unallocated offset — it must be SKIPPED.
+        // Capture its sequence as the fence F.
+        let bogus_offset = 60 * 1024 * 1024; // never allocated on alloc0
+        let fence = redo0
+            .append_and_flush(RedoOp::Create {
+                tx_key: key_a,
+                device_id: 0,
+                record_offset: bogus_offset,
+                utxo_count,
+                is_conflicting: false,
+                record_bytes: vec![0u8; base as usize],
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        // The checkpoint's snapshot-coupled fence: snapshot covers `fence`, then
+        // mark the log through it. (Compaction NOT run — the crash-before-reclaim
+        // window; the pre-fence Create is still physically present.)
+        redo0.mark_recovery_progress(fence).unwrap();
+        // Post-fence Create(B) > F — must be replayed.
+        redo0
+            .append_and_flush(RedoOp::Create {
+                tx_key: key_b,
+                device_id: 0,
+                record_offset: off_b,
+                utxo_count,
+                is_conflicting: false,
+                record_bytes: rb_b.clone(),
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let devices = [dev0.clone(), dev1.clone()];
+        let mut allocators = [alloc0, alloc1];
+        let mut redo_logs = [redo0, redo1];
+        let (stats, _, _) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            &mut unmined,
+            true,
+        )
+        .unwrap();
+
+        // Fence honored: the pre-fence (bogus-offset) Create was SKIPPED, so it
+        // never hit the allocated-range gate — no failures.
+        assert_eq!(
+            stats.entries_failed, 0,
+            "pre-fence Create must be skipped, not replayed (else its bogus offset fails the gate)",
+        );
+        assert_eq!(
+            stats.entries_replayed, 1,
+            "only the post-fence tail (Create B) is replayed",
+        );
+        // No loss: the snapshot-covered record A is intact at its real offset
+        // (the skipped bogus Create did NOT overwrite it), and B is recovered.
+        let ea = index
+            .lookup(&key_a)
+            .expect("snapshot-covered record A preserved");
+        assert_eq!(
+            ea.record_offset, off_a,
+            "A keeps its real (snapshot) offset"
+        );
+        let eb = index.lookup(&key_b).expect("post-fence record B replayed");
+        assert_eq!(eb.record_offset, off_b);
+    }
+
     /// Stress the PARALLEL multi-store recovery: 8 stores, many records each
     /// (with DAH/unmined heights to exercise the store-routed secondary
     /// reconcile), one shared interleaved redo log. Verifies concurrent replay
