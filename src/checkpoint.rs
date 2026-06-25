@@ -72,11 +72,24 @@ type ResetGuard = Arc<dyn Fn(u64) -> bool + Send + Sync + 'static>;
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
     /// Usage fraction (0.0..1.0) at or above which the next tick triggers
-    /// a checkpoint. Default: 0.75.
+    /// a (fuzzy, non-blocking) checkpoint. Default: 0.75.
     pub high_water: f64,
     /// Usage fraction (0.0..1.0) at or below which the trigger re-arms
     /// after a previous checkpoint. Default: 0.25.
     pub low_water: f64,
+    /// Usage fraction (0.0..1.0) at or above which the task forces a
+    /// **blocking** checkpoint that fully drains the redo log, instead of a
+    /// fuzzy one. Default: 0.90.
+    ///
+    /// A fuzzy checkpoint only reclaims the prefix that was durable BEFORE its
+    /// snapshot began, so under sustained write load it cannot keep up — usage
+    /// climbs toward 1.0 and appends would start failing with `LogFull`. When
+    /// usage crosses this mark the task takes a blocking checkpoint (holds the
+    /// exclusive barrier across the snapshot, so no mutation appends during it,
+    /// the fence covers the whole log, and the compaction drains it to ~0). A
+    /// brief serving stall is far better than wedging the node on a full redo.
+    /// Effective value is clamped to be ≥ `high_water`.
+    pub emergency_high_water: f64,
     /// How often the task wakes to sample usage. Default: 1 second.
     pub poll_interval: Duration,
     /// Initial back-off after a failed checkpoint. Doubles each
@@ -98,6 +111,7 @@ impl CheckpointConfig {
         Self {
             high_water: 0.75,
             low_water: 0.25,
+            emergency_high_water: 0.90,
             poll_interval: Duration::from_secs(1),
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
@@ -111,6 +125,12 @@ impl CheckpointConfig {
     pub fn with_trigger_usage(mut self, trigger_usage: f64) -> Self {
         self.high_water = trigger_usage;
         self.low_water = (trigger_usage / 3.0).clamp(0.0, trigger_usage);
+        // Keep the emergency mark above the (possibly raised) high water:
+        // halfway between high water and full, but never below the default.
+        self.emergency_high_water = self
+            .emergency_high_water
+            .max((trigger_usage + 1.0) / 2.0)
+            .min(0.98);
         self
     }
 }
@@ -186,38 +206,58 @@ fn run_checkpoint_loop(
         "checkpoint task started",
     );
 
-    let mut armed = true;
+    // Effective emergency mark: at or above high_water (a misconfigured
+    // `emergency_high_water < high_water` would otherwise make every checkpoint
+    // blocking), and below full. `.max().min()` rather than `.clamp()` so a
+    // `high_water` above 0.99 cannot panic with `min > max`.
+    let emergency_water = config.emergency_high_water.max(config.high_water).min(0.99);
+    // Poll fast while the log holds meaningful content so the emergency mark is
+    // caught before the log fills; poll slowly when the log is near-empty.
+    let responsive_poll = config.poll_interval.min(Duration::from_millis(100));
+
     let mut backoff = Duration::ZERO;
+    let mut last_usage = 0.0_f64;
+    // After a FUZZY checkpoint that fails to drain below high_water — it can
+    // only reclaim the prefix that was durable before its snapshot began, so
+    // entries appended during the snapshot stay resident — escalate the NEXT
+    // checkpoint to BLOCKING instead of spinning fuzzy snapshots that cannot
+    // keep up. Reset once a checkpoint actually drains.
+    let mut escalate_blocking = false;
 
     while !shutdown.load(Ordering::Relaxed) {
-        // Wait at least poll_interval, plus any pending back-off, but
-        // check the shutdown flag in small slices so the task stops
-        // within ~poll_interval on shutdown rather than within
-        // `backoff` (which can be up to `max_backoff` = 60 s by
-        // default).
-        let wait = config.poll_interval + backoff;
-        if !sleep_with_shutdown(wait, &shutdown, config.poll_interval) {
+        // Adaptive poll: responsive while filling, lazy while idle. The
+        // shutdown check uses the responsive slice so the task still stops
+        // within ~100 ms regardless of the configured poll interval.
+        let poll = if last_usage >= config.low_water {
+            responsive_poll
+        } else {
+            config.poll_interval
+        };
+        if !sleep_with_shutdown(poll + backoff, &shutdown, responsive_poll) {
             break;
         }
 
         let usage = redo_log.lock().usage_fraction();
+        last_usage = usage;
 
-        // Hysteresis: re-arm when usage drops below low water.
-        if !armed && usage <= config.low_water {
-            tracing::debug!(
-                usage_fraction = usage,
-                low_water = config.low_water,
-                "checkpoint trigger re-armed",
-            );
-            armed = true;
-        }
-
-        if !armed || usage < config.high_water {
+        // Threshold-driven, no hysteresis latch. Single-flight is inherent
+        // because `perform_checkpoint_*` runs synchronously in this loop, and
+        // the blocking emergency path guarantees the log is drained before it
+        // can fill — so there is no "armed" flag that can get stuck and brick
+        // the log. (The prior latch disarmed after a fuzzy checkpoint that left
+        // usage above low_water and never re-armed, so checkpoints stopped and
+        // the redo grew to 100% / `LogFull` under sustained writes — the
+        // regression this loop fixes.)
+        if usage < config.high_water {
+            escalate_blocking = false;
             continue;
         }
 
-        // Trip the trigger.
-        armed = false;
+        // FUZZY by default (non-blocking serving). BLOCKING when the log has
+        // crossed the emergency mark, or when the previous fuzzy attempt could
+        // not drain it — a brief serving stall to fully reclaim, far better
+        // than letting appends fail with `LogFull`.
+        let blocking = usage >= emergency_water || escalate_blocking;
 
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_triggered_total.inc();
@@ -225,14 +265,24 @@ fn run_checkpoint_loop(
         tracing::info!(
             usage_fraction = usage,
             high_water = config.high_water,
+            emergency_high_water = emergency_water,
+            blocking,
             "redo log above high-water — checkpointing",
         );
 
         let started = std::time::Instant::now();
-        let outcome =
+        let outcome = if blocking {
+            perform_blocking_checkpoint_with_reset_guard(
+                &config,
+                &engine,
+                &redo_log,
+                |floor_sequence| reset_guard(floor_sequence),
+            )
+        } else {
             perform_checkpoint_with_reset_guard(&config, &engine, &redo_log, |floor_sequence| {
                 reset_guard(floor_sequence)
-            });
+            })
+        };
         let elapsed = started.elapsed();
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_duration_ns
@@ -242,25 +292,14 @@ fn run_checkpoint_loop(
         match outcome {
             Ok(stats) => {
                 backoff = Duration::ZERO;
-                // Latch the re-arm on the checkpoint's own measured
-                // `usage_after` instead of waiting for a later poll to
-                // observe `usage <= low_water`: under sustained fast
-                // mutation bursts, usage can drop below low water (right
-                // after the compaction) and climb back above it between
-                // two polls. The crossing is then never sampled, the
-                // trigger never re-arms, and the log eventually bricks at
-                // 100 % usage with every append returning `LogFull` —
-                // defeating the task's whole purpose (BC-01; this was the
-                // intermittent failure of
-                // `sustained_mutations_never_brick_when_task_is_running`).
-                // Debounce is preserved: re-arming requires that this
-                // checkpoint actually reclaimed to low water, so the next
-                // trip still implies a full low→high climb.
-                if stats.reset_performed && stats.usage_after <= config.low_water {
-                    armed = true;
-                }
+                last_usage = stats.usage_after;
+                // If a fuzzy checkpoint could not drain below high_water (its
+                // snapshot-window appends stayed resident), force the next one
+                // to block so the log is actually reclaimed.
+                escalate_blocking = !blocking && stats.usage_after >= config.high_water;
                 tracing::info!(
                     elapsed_ms = elapsed.as_millis() as u64,
+                    blocking,
                     entries_before = stats.entries_before,
                     usage_after = stats.usage_after,
                     reset_performed = stats.reset_performed,
@@ -273,15 +312,14 @@ fn run_checkpoint_loop(
                     m.redo_checkpoint_failed_total.inc();
                 }
                 backoff = next_backoff(backoff, &config);
+                // Retry as blocking if the log is dangerously full; a failed
+                // fuzzy attempt has not reclaimed anything.
+                escalate_blocking = last_usage >= emergency_water;
                 tracing::error!(
                     err = %e,
                     next_backoff_ms = backoff.as_millis() as u64,
                     "checkpoint failed",
                 );
-                // After a failure, leave the trigger armed so the next
-                // tick retries — usage has not actually been reclaimed
-                // and waiting for low_water would deadlock the loop.
-                armed = true;
             }
         }
     }
@@ -365,38 +403,86 @@ pub fn perform_checkpoint_with_reset_guard<F>(
 where
     F: Fn(u64) -> bool,
 {
-    // Sample the recovery fence under a BRIEF exclusive quiesce — not across
-    // the snapshot.
-    //
-    // The fence must be a sequence at which every covered redo entry has its
-    // engine effect applied. Mutations hold the EXCLUSIVE visibility barrier
-    // from before-apply through redo durability (see
-    // `Engine::acquire_mutation_visibility_guard`), so acquiring it momentarily
-    // drains every in-flight apply; the redo sequence sampled inside that
-    // window is therefore fully applied. This is O(1) — it does NOT span the
-    // O(index) snapshot.
-    //
-    // F-G4-016 (resolved): the barrier used to be held across the ENTIRE
-    // `snapshot_index`, quiescing all reads and writes for the snapshot's
-    // duration — hundreds of ms for millions of entries, growing into
-    // multi-second serving stalls at the full UTXO set, every checkpoint. Now
-    // serving stays live across the snapshot: the snapshot is "fuzzy" (it may
-    // capture mutations that landed after the fence) and recovery reconciles
-    // that post-fence tail by idempotent redo replay (see `crate::recovery`).
-    // `checkpoint_duration_ms` now measures background snapshot time, not a
-    // stall.
-    let entries_before = {
-        let _quiesce = engine.acquire_checkpoint_visibility_guard();
-        redo_log.lock().current_sequence()
-    };
+    perform_checkpoint_inner(config, engine, redo_log, can_reset, false)
+}
+
+/// Perform a **blocking** checkpoint that fully drains the redo log.
+///
+/// Holds the exclusive `dispatch_visibility_barrier` across the entire snapshot
+/// AND the compaction, so no mutation appends to the redo while it runs. The
+/// recovery fence then covers the whole log and the compaction reclaims it to
+/// ~0, restoring headroom. This is the checkpoint task's fallback when the redo
+/// crosses `emergency_high_water` faster than the non-blocking (fuzzy)
+/// checkpoint can reclaim: a brief serving stall, but it prevents `LogFull`
+/// append failures from wedging the node.
+pub fn perform_blocking_checkpoint_with_reset_guard<F>(
+    config: &CheckpointConfig,
+    engine: &Engine,
+    redo_log: &Mutex<RedoLog>,
+    can_reset: F,
+) -> Result<CheckpointStats, String>
+where
+    F: Fn(u64) -> bool,
+{
+    perform_checkpoint_inner(config, engine, redo_log, can_reset, true)
+}
+
+/// Shared body for the fuzzy and blocking checkpoint paths.
+///
+/// `blocking == false` (fuzzy): the exclusive barrier is held only long enough
+/// to sample a coherent recovery fence (O(1)); the O(index) snapshot then runs
+/// with serving live, and the compaction reclaims only the prefix that was
+/// durable BEFORE the snapshot began — entries appended DURING the snapshot
+/// stay in the log until the next checkpoint, so under sustained write load a
+/// fuzzy checkpoint alone cannot drain the log. That is why the loop escalates
+/// to the blocking path at `emergency_high_water`.
+///
+/// `blocking == true`: the exclusive barrier is held across the snapshot AND the
+/// compaction, so no mutation appends in between. The fence covers the whole
+/// log and the compaction drains it to ~0. Serving stalls for the checkpoint's
+/// duration — used only as the emergency fallback.
+fn perform_checkpoint_inner<F>(
+    config: &CheckpointConfig,
+    engine: &Engine,
+    redo_log: &Mutex<RedoLog>,
+    can_reset: F,
+    blocking: bool,
+) -> Result<CheckpointStats, String>
+where
+    F: Fn(u64) -> bool,
+{
+    // Acquire the exclusive quiesce. The fence must be a sequence at which every
+    // covered redo entry has its engine effect applied: mutations hold this
+    // barrier from before-apply through redo durability (see
+    // `Engine::acquire_mutation_visibility_guard`), so acquiring it drains every
+    // in-flight apply and the redo sequence sampled here is fully applied.
+    let guard = engine.acquire_checkpoint_visibility_guard();
+    let entries_before = redo_log.lock().current_sequence();
     let snapshot_fence_sequence = entries_before.saturating_sub(1);
+
+    // FUZZY: drop the barrier now so the O(index) snapshot runs with serving
+    // live (the snapshot is "fuzzy" — it may capture mutations after the fence;
+    // recovery reconciles the post-fence tail via idempotent redo replay, see
+    // `crate::recovery`). This removed the F-G4-016 stop-the-world stall —
+    // hundreds of ms growing to multi-second at the full UTXO set, every
+    // checkpoint.
+    //
+    // BLOCKING: keep the barrier held across the snapshot AND the compaction
+    // below (it drops at function exit). No mutation appends meanwhile, so the
+    // fence covers the whole log and the reclaim drains it to ~0.
+    let _held_barrier = if blocking {
+        Some(guard)
+    } else {
+        drop(guard);
+        None
+    };
     let started_at = std::time::Instant::now();
 
-    // 1. Snapshot index + DAH + unmined to disk (tempfile + rename). FUZZY /
-    //    non-blocking: serving is NOT quiesced across this — `snapshot_index`
-    //    serializes each shard under its own short-lived read lock in write-path
-    //    order (shard before secondaries), so it cannot deadlock the write path
-    //    and never blocks reads.
+    // 1. Snapshot index + DAH + unmined to disk (tempfile + rename).
+    //    `snapshot_index` serializes each shard under its own short-lived read
+    //    lock in write-path order (shard before secondaries), so it cannot
+    //    deadlock the write path; under a fuzzy checkpoint serving is fully live
+    //    across it.
     engine
         .snapshot_index(&config.snapshot_path)
         .map_err(|e| format!("snapshot_index: {e}"))?;
@@ -1625,6 +1711,7 @@ mod tests {
         let cfg = CheckpointConfig {
             high_water: 0.75,
             low_water: 0.25,
+            emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(10),
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(400),
@@ -1678,6 +1765,7 @@ mod tests {
         let cfg = CheckpointConfig {
             high_water: 0.50,
             low_water: 0.20,
+            emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(10),
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
@@ -1738,6 +1826,7 @@ mod tests {
         let cfg = CheckpointConfig {
             high_water: 0.95,
             low_water: 0.10,
+            emergency_high_water: 0.98,
             poll_interval: Duration::from_millis(10),
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
@@ -1792,6 +1881,7 @@ mod tests {
         let cfg = CheckpointConfig {
             high_water: 0.50,
             low_water: 0.20,
+            emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(5),
             initial_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(40),
@@ -1841,6 +1931,165 @@ mod tests {
         );
     }
 
+    /// A blocking checkpoint must reclaim the WHOLE log (usage → ~0), not just a
+    /// prefix. This is the drain mechanism the loop escalates to when a fuzzy
+    /// checkpoint cannot keep up — without it the redo monotonically fills to
+    /// `LogFull` under sustained writes (the regression this fixes).
+    #[test]
+    fn blocking_checkpoint_drains_redo_fully() {
+        let (engine, redo, dir) = make_engine_and_redo();
+        let snap_path = dir.path().join("blocking-drain.snap");
+        {
+            let mut log = redo.lock();
+            for _ in 0..2000 {
+                log.append(RedoOp::Checkpoint).unwrap();
+            }
+            log.flush().unwrap();
+            assert!(
+                log.usage_fraction() > 0.5,
+                "test setup: usage must be well above low water"
+            );
+        }
+        let cfg = CheckpointConfig::new(snap_path);
+        let stats = perform_blocking_checkpoint_with_reset_guard(&cfg, &engine, &redo, |_| true)
+            .expect("blocking checkpoint must succeed");
+        assert!(stats.reset_performed, "blocking checkpoint must reclaim");
+        assert!(
+            stats.usage_after <= cfg.low_water,
+            "blocking checkpoint must drain the log to <= low_water, got {}",
+            stats.usage_after
+        );
+    }
+
+    /// End-to-end regression guard for the fuzzy-checkpoint "non-reclaiming"
+    /// bug. A fuzzy checkpoint only reclaims the prefix that was durable BEFORE
+    /// its snapshot began; with a SLOW snapshot and sustained concurrent writes,
+    /// the during-snapshot appends keep usage above low_water, so the old
+    /// hysteresis loop disarmed forever and the redo filled to `LogFull`. (The
+    /// per-PR `sustained_mutations_never_brick_when_task_is_running` test uses a
+    /// tiny single-shard index whose snapshot is instant, so fuzzy drains fully
+    /// there and the regression hid.)
+    ///
+    /// Here the index is large (slow snapshot) and a writer appends with the
+    /// mutation visibility barrier held — exactly how the dispatch path appends,
+    /// so the blocking emergency checkpoint can pause it and drain. The loop's
+    /// emergency-blocking fallback must keep the log bounded with ZERO LogFull.
+    #[cfg(feature = "slow-tests")]
+    #[test]
+    fn sustained_writes_with_slow_snapshot_never_brick() {
+        use crate::index::{ShardedIndex, TxIndexEntry, TxKey};
+        use std::sync::atomic::AtomicU64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(256 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+
+        // Large index → each snapshot takes real wall time (tens of ms), so a
+        // fuzzy checkpoint's during-snapshot appends are substantial.
+        const N: u32 = 500_000;
+        let index = ShardedIndex::new_in_memory(N as usize, 16).unwrap();
+        for i in 0..N {
+            let mut txid = [0u8; 32];
+            txid[0..4].copy_from_slice(&i.to_le_bytes());
+            txid[24..32]
+                .copy_from_slice(&(i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            index
+                .register(
+                    TxKey { txid },
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: i as u64 * 256,
+                        utxo_count: 1,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+        }
+        let engine = Arc::new(Engine::new_with_sharded_index(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // 32 MiB redo so a single slow snapshot's worth of appends cannot fill
+        // it, but it still cycles several times across the soak.
+        let redo_bytes = 32 * 1024 * 1024;
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(redo_bytes, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, redo_bytes).unwrap()));
+
+        let cfg = CheckpointConfig {
+            high_water: 0.40,
+            low_water: 0.20,
+            emergency_high_water: 0.75,
+            poll_interval: Duration::from_millis(5),
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(40),
+            snapshot_path: dir.path().join("soak.snap"),
+        };
+        let capacity = redo.lock().capacity();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_checkpoint_task(cfg, engine.clone(), redo.clone(), shutdown.clone());
+
+        // Append > 4 redo cycles of barrier-held entries (models dispatch
+        // holding the visibility barrier across a mutation's redo append). A
+        // `RedoOp::Checkpoint` entry serialises to ~21 bytes; if it is larger
+        // the loop just runs more cycles, which only strengthens the guard.
+        let target_appends = (capacity / 21) * 4;
+
+        let log_full = Arc::new(AtomicU64::new(0));
+        let max_usage_milli = Arc::new(AtomicU64::new(0));
+        {
+            let engine = engine.clone();
+            let redo = redo.clone();
+            let log_full = log_full.clone();
+            let max_usage_milli = max_usage_milli.clone();
+            let writer = std::thread::spawn(move || {
+                for i in 0..target_appends {
+                    let result = {
+                        // Barrier held across the append, like a real mutation —
+                        // so the blocking checkpoint can pause this writer.
+                        let _g = engine.acquire_mutation_visibility_guard();
+                        let mut log = redo.lock();
+                        log.append(RedoOp::Checkpoint)
+                    };
+                    if let Err(crate::redo::RedoError::LogFull { .. }) = result {
+                        log_full.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if i % 4096 == 0 {
+                        let u = (redo.lock().usage_fraction() * 1000.0) as u64;
+                        max_usage_milli.fetch_max(u, Ordering::Relaxed);
+                    }
+                }
+            });
+            writer.join().expect("writer thread must not panic");
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().expect("checkpoint thread must not panic");
+
+        let full = log_full.load(Ordering::Relaxed);
+        let max_usage = max_usage_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+        assert_eq!(
+            full, 0,
+            "sustained writes must never observe LogFull with the checkpoint task running \
+             (max usage reached {max_usage:.3})"
+        );
+        assert!(
+            max_usage < 0.98,
+            "redo usage must stay bounded well below full, peaked at {max_usage:.3}"
+        );
+    }
+
     #[test]
     fn shutdown_joins_promptly_while_checkpoints_in_flight() {
         // B-03: the bin signals the checkpointer via the shared shutdown
@@ -1855,6 +2104,7 @@ mod tests {
         let cfg = CheckpointConfig {
             high_water: 0.30,
             low_water: 0.10,
+            emergency_high_water: 0.90,
             poll_interval: Duration::from_millis(2),
             initial_backoff: Duration::from_millis(2),
             max_backoff: Duration::from_millis(10),
@@ -1914,6 +2164,7 @@ mod tests {
         let cfg = CheckpointConfig {
             high_water: 0.99,
             low_water: 0.10,
+            emergency_high_water: 0.99,
             poll_interval: Duration::from_millis(50),
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
