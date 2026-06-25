@@ -117,6 +117,20 @@ impl StripedRwLocks {
         self.locks[idx].write()
     }
 
+    /// Acquire an exclusive (write) guard for a specific stripe index.
+    ///
+    /// Used by a coalesced multi-record write that must hold the write guard
+    /// for EVERY record offset it covers (torn-read safety vs a stale reader
+    /// of a reused offset — F-X-007 / g2). The caller maps each offset to its
+    /// stripe via [`Self::stripe_index`], deduplicates, sorts the indices, and
+    /// acquires each unique stripe ONCE through this method — dedup is
+    /// mandatory (the `RwLock` write side is not reentrant) and the sort gives
+    /// a global order so concurrent multi-offset acquirers cannot deadlock.
+    #[inline]
+    pub fn write_index(&self, idx: usize) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.locks[idx].write()
+    }
+
     /// Number of stripes in the lock table.
     pub fn stripe_count(&self) -> usize {
         self.locks.len()
@@ -161,6 +175,25 @@ impl StripedLocks {
     /// Acquire the lock for the given key. Returns a RAII guard.
     pub fn lock(&self, key: &TxKey) -> parking_lot::MutexGuard<'_, ()> {
         let idx = self.stripe_index(key);
+        self.locks[idx].lock()
+    }
+
+    /// Acquire the lock for a specific stripe index. Returns a RAII guard.
+    ///
+    /// Used by batch mutation paths (e.g. the spend-batch handler) that need
+    /// to hold the stripe locks for many keys simultaneously across a single
+    /// WAL flush. The caller first maps each key to its stripe via
+    /// [`Self::stripe_index`], deduplicates, sorts the indices, and acquires
+    /// each unique stripe ONCE through this method. Deduplication is mandatory:
+    /// the per-stripe `Mutex` is not reentrant, so two keys that hash to the
+    /// same stripe must share one guard or the second `lock_index` would
+    /// self-deadlock. Sorting the unique indices gives a global acquisition
+    /// order that prevents deadlock between concurrent batch acquirers.
+    ///
+    /// # Panics
+    /// Panics if `idx >= stripe_count()`. Callers must pass an index produced
+    /// by [`Self::stripe_index`], which is always masked into range.
+    pub fn lock_index(&self, idx: usize) -> parking_lot::MutexGuard<'_, ()> {
         self.locks[idx].lock()
     }
 

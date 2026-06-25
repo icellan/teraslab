@@ -2197,15 +2197,44 @@ pub(crate) fn handle_request(
 // Redo log helper
 // ---------------------------------------------------------------------------
 
-// Production redo group-commit window. ZERO: the previous 200µs
-// `thread::sleep` before every flush imposed a hard ~5k ops/s/connection
-// latency floor (measured 6-163x throughput loss on a cheap-fsync device)
-// while coalescing almost nothing (≈1.5 entries/flush in practice). Real
-// group commit is now done at fsync time by the per-physical-device
-// `PhysicalBarrier` (src/subdevice.rs), which collapses concurrent flushes
-// into one barrier with no artificial latency. The `_with_group_window`
-// seam below is retained for tests that drive flush timing explicitly.
+// Production redo group-commit window. ZERO: the previous 200µs `thread::sleep`
+// before every flush imposed a hard ~5k ops/s/connection latency floor (measured
+// 6-163x throughput loss on a cheap-fsync device) while coalescing almost nothing
+// (≈1.5 entries/flush). It is NOT reintroduced for any path: batched writes
+// amortize the fsync, and concurrent flushes coalesce at fsync time via per-store
+// parallel flush + the per-physical-device `PhysicalBarrier` (src/subdevice.rs) —
+// with no artificial latency. `group_commit_window` keeps #21's per-call shape as
+// a test seam, but with this constant at ZERO it returns ZERO for every input.
 const REDO_GROUP_COMMIT_WINDOW: Duration = Duration::ZERO;
+
+/// Group-commit wait applied before flushing a redo write.
+///
+/// The window exists so that, under concurrent load, a thread about to flush
+/// pauses briefly to let other connections' appends land in the shared redo
+/// buffer, coalescing them into a single fsync. That only helps when the write
+/// is small: once a write already carries multiple ops, its fsync is amortized
+/// over them and the fixed `thread::sleep` is pure added latency — the per-call
+/// 200 µs floor (~5000 calls/s/connection) flagged in profiling. Teranode
+/// traffic is always batched (≈742-item CreateBatch RPCs; whole SpendBatch
+/// RPCs after target #2), so those paths skip the wait entirely; only genuine
+/// single-op writes keep it, where coalescing with a concurrent writer is the
+/// one case it can pay off.
+///
+/// NOTE: a fixed sleep is a crude group-commit. The proper fix (no fixed floor
+/// at all, coalescing driven by an in-flight-flush condvar / leader-follower)
+/// is tracked separately; this de-floors the batched paths with zero risk to
+/// the existing single-op coalescing behaviour.
+#[inline]
+fn group_commit_window(ops_len: usize) -> Duration {
+    // Only a genuine single-op write keeps the coalescing wait. Empty writes
+    // (ops_len == 0) never reach the flush, and multi-op writes already
+    // amortize the fsync, so both skip the floor.
+    if ops_len == 1 {
+        REDO_GROUP_COMMIT_WINDOW
+    } else {
+        Duration::ZERO
+    }
+}
 
 /// Append redo ops to the log and flush.
 ///
@@ -2227,7 +2256,7 @@ fn write_redo_ops(
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
 ) -> std::result::Result<(u64, u64), String> {
-    write_redo_ops_with_group_window(engine, redo_log, ops, REDO_GROUP_COMMIT_WINDOW)
+    write_redo_ops_with_group_window(engine, redo_log, ops, group_commit_window(ops.len()))
 }
 
 fn write_redo_ops_with_group_window(
@@ -4826,6 +4855,40 @@ fn handle_spend_batch(
         m.spend_multi_items_attempted.inc_by(items.len() as u64);
     }
 
+    // P2 (PR#21 review): `DahOverflow` is the only NON-catastrophic apply-time
+    // failure, and it is deterministic from the batch params alone
+    // (`current_block_height + block_height_retention`, identical for every
+    // group). Validate it ONCE here, BEFORE any redo is written, so
+    // `apply_locked` cannot fail with `DahOverflow` mid-batch — which, now that
+    // the whole RPC shares one flush, would otherwise leave already-flushed
+    // groups durable-in-WAL but unapplied. A residual apply-time *device* error
+    // (EIO/ENOSPC) is catastrophic and intentionally still surfaces under the
+    // WAL-first contract (its redo is durable; recovery replays it on restart —
+    // see the Phase 4 note); the operator must treat a persistent apply-time
+    // device error as fatal.
+    if params.block_height_retention != 0
+        && params
+            .current_block_height
+            .checked_add(params.block_height_retention)
+            .is_none()
+    {
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(m, OpCode::Spend, items.len() as u64, 0, 0, &[]);
+            m.spends_failed.inc_by(failed);
+            m.spend_multi_items_failed.inc_by(failed);
+        }
+        // Reuse the exact SpendError::DahOverflow message the apply path
+        // produced, so the client-observable error detail (DAH_OVERFLOW…) is
+        // unchanged by moving the check earlier.
+        let detail = crate::ops::error::SpendError::DahOverflow {
+            current_height: params.current_block_height,
+            retention: params.block_height_retention,
+        }
+        .to_string();
+        return error_response(req.request_id, ERR_STORAGE_IO, &detail);
+    }
+
     // Group items by txid for efficient locking
     let mut by_txid: HashMap<[u8; 32], Vec<(usize, &WireSpendItem)>> = HashMap::new();
     for (i, item) in items.iter().enumerate() {
@@ -4843,11 +4906,35 @@ fn handle_spend_batch(
     let mut spend_redo_range: (u64, u64) = (0, 0);
     let mut spend_intent_ranges: Vec<(u64, u64)> = Vec::new();
 
-    // WAL-first ordering: for each txid group we validate under lock,
-    // write redo ops to the WAL (fsync), THEN apply the mutation.
-    // This guarantees that if the process crashes after the engine
-    // mutation, the redo log already has the entry and replicas will
-    // see it during catch-up streaming.
+    // PERF (target #2): make the WHOLE SpendBatch RPC durable with ONE redo
+    // flush — not one per txid-group. Acquire every distinct stripe lock for
+    // the RPC up front (deduplicated + sorted → deadlock-free), validate every
+    // group under those held locks, write ALL groups' redo ops in one batch
+    // (single fsync), then apply every group, then release the locks.
+    //
+    // This preserves WAL-first ordering (redo durable before any apply) and
+    // per-txid validate→apply atomicity (each stripe lock is held across the
+    // whole validate→flush→apply window) while collapsing N fsyncs/RPC to one
+    // and removing N-1 of the per-call group-commit waits. Because many stripe
+    // locks are held at once, validation/apply go through the guard-free
+    // `prepare_spend_multi` / `PreparedSpend::apply_locked`; the single-spend
+    // path's `ValidatedSpend` would re-acquire the stripe lock and self-deadlock
+    // on a stripe collision.
+    let txid_keys: Vec<TxKey> = by_txid.keys().map(|t| TxKey { txid: *t }).collect();
+    let stripe_guards = engine.lock_unique_stripes(&txid_keys);
+
+    // Per-group staged mutation carried from validate (Phase 1+2) to apply
+    // (Phase 4) so the single redo flush (Phase 3) sits between them.
+    struct StagedSpend {
+        key: TxKey,
+        prepared: PreparedSpend,
+        key_repl_ops: Vec<ReplicaOp>,
+    }
+    let mut staged: Vec<StagedSpend> = Vec::new();
+    let mut all_redo_ops: Vec<RedoOp> = Vec::new();
+
+    // Phase 1+2: validate each owned group (guard-free; this fn holds the
+    // stripe locks) and build its redo + replica ops into the shared batch.
     for (txid, group) in &by_txid {
         if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
             for &(i, _) in group {
@@ -4879,8 +4966,9 @@ fn handle_spend_batch(
             block_height_retention: params.block_height_retention,
         };
 
-        // Phase 1: Validate under lock (no disk writes yet).
-        let validated = match engine.validate_spend_multi(&multi_req) {
+        // Validate (no disk writes). Guard-free: the stripe lock for this txid
+        // is already held by `stripe_guards` above.
+        let prepared = match engine.prepare_spend_multi(&multi_req) {
             Ok(v) => v,
             Err(err) => {
                 for &(i, _) in group {
@@ -4890,34 +4978,22 @@ fn handle_spend_batch(
             }
         };
 
-        // Phase 2: Build redo ops for validated items BEFORE mutation.
-        // The post-mutation generation is pre_generation + 1.
-        let error_indices: std::collections::HashSet<u32> =
-            validated.errors.keys().copied().collect();
-        let key = TxKey { txid: *txid };
-        let post_generation = validated.pre_generation.wrapping_add(1);
-
-        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): compute the real
-        // `new_spent_count` for every Spend redo entry BEFORE the redo
-        // flush. Recovery's `replay_spend` overwrites `meta.spent_utxos`
-        // with whatever the entry carries; previously we wrote `0`, so a
-        // crash in the WAL-before-data window would leave the counter
-        // wrong even though the slot transition was correctly replayed.
+        // Build redo ops for the real UNSPENT→SPENT transitions. Semantics are
+        // identical to the original per-group logic — only accumulated across
+        // groups into one batch.
         //
-        // Each redo entry receives the cumulative count AFTER its own
-        // application, computed as `pre_spent + running_transitions`.
-        // The running counter only advances for items that the validator
-        // marked as real UNSPENT→SPENT transitions (in `transitions()`);
-        // idempotent re-spends and validation errors do not bump the
-        // counter, matching what `apply()` will write.
-        let pre_spent_count = validated.pre_spent_count();
-        let transition_offsets: std::collections::HashSet<u32> = validated
-            .transitions()
-            .iter()
-            .map(|(off, _)| *off)
-            .collect();
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): each Spend redo entry
+        // carries the cumulative `new_spent_count` AFTER its own application,
+        // computed from THIS group's pre-spent count, so recovery's
+        // `replay_spend` overwrite lands on the real post-spend count.
+        let error_indices: std::collections::HashSet<u32> =
+            prepared.errors.keys().copied().collect();
+        let key = TxKey { txid: *txid };
+        let post_generation = prepared.pre_generation.wrapping_add(1);
+        let pre_spent_count = prepared.pre_spent_count();
+        let transition_offsets: std::collections::HashSet<u32> =
+            prepared.transitions().iter().map(|(off, _)| *off).collect();
 
-        let mut redo_ops: Vec<RedoOp> = Vec::new();
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
         for &(i, item) in group {
@@ -4926,7 +5002,7 @@ fn handle_spend_batch(
                 // re-spends do not emit redo/replication or bump generation;
                 // they match the single-spend no-op contract.
                 running_count = running_count.wrapping_add(1);
-                redo_ops.push(RedoOp::SpendV2 {
+                all_redo_ops.push(RedoOp::SpendV2 {
                     tx_key: key,
                     offset: item.vout,
                     spending_data: item.spending_data,
@@ -4950,66 +5026,74 @@ fn handle_spend_batch(
             }
         }
 
-        // Phase 3: Write redo BEFORE engine mutation (WAL-first).
-        // Lock is still held via ValidatedSpend, so no concurrent
-        // mutation can interleave.
-        if !redo_ops.is_empty() {
-            match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
-                Ok(range) => {
-                    if valid_redo_range(range) {
-                        spend_intent_ranges.push(range);
-                    }
-                    if spend_redo_range.0 == 0 && spend_redo_range.1 == 0 {
-                        spend_redo_range = range;
-                    } else if range.1 > 0 {
-                        spend_redo_range.1 = range.1; // Extend the end
-                    }
+        staged.push(StagedSpend {
+            key,
+            prepared,
+            key_repl_ops,
+        });
+    }
+
+    // Phase 3: ONE redo write for the whole RPC (single fsync), WAL-first. All
+    // stripe locks are still held, so no concurrent mutation can interleave.
+    // `engine` is threaded so per-store redo routes each op to its store's log.
+    if !all_redo_ops.is_empty() {
+        match write_replicated_redo_ops(engine, cluster, redo_log, &all_redo_ops) {
+            Ok(range) => {
+                if valid_redo_range(range) {
+                    spend_intent_ranges.push(range);
                 }
-                Err(e) => {
-                    // Redo failure: don't apply, return error.
-                    // ValidatedSpend drops here, releasing the lock.
-                    // M-01: `attempted` already ticked for the whole batch;
-                    // classify every item before the early return so the
-                    // storage failure is visible in op metrics. Items from
-                    // this group and any unprocessed group count as
-                    // ErrStorage-failed; prior groups keep their tallies.
-                    if let Some(m) = DISPATCH_METRICS.get() {
-                        use crate::metrics::OpCode;
-                        let failed = tally_storage_abort(
-                            m,
-                            OpCode::Spend,
-                            items.len() as u64,
-                            succeeded,
-                            idempotent,
-                            &errors,
-                        );
-                        m.spends_succeeded.inc_by(succeeded);
-                        m.spends_idempotent.inc_by(idempotent);
-                        m.spends_failed.inc_by(failed);
-                        m.spend_multi_items_succeeded.inc_by(succeeded);
-                        m.spend_multi_items_idempotent.inc_by(idempotent);
-                        m.spend_multi_items_failed.inc_by(failed);
-                    }
-                    return error_response(req.request_id, ERR_STORAGE_IO, &e);
+                spend_redo_range = range;
+            }
+            Err(e) => {
+                // Redo failed: apply NOTHING (the stripe guards drop on
+                // return, releasing the locks). M-01: nothing applied yet, so
+                // every non-error item counts as ErrStorage-failed.
+                if let Some(m) = DISPATCH_METRICS.get() {
+                    use crate::metrics::OpCode;
+                    let failed = tally_storage_abort(
+                        m,
+                        OpCode::Spend,
+                        items.len() as u64,
+                        succeeded,
+                        idempotent,
+                        &errors,
+                    );
+                    m.spends_succeeded.inc_by(succeeded);
+                    m.spends_idempotent.inc_by(idempotent);
+                    m.spends_failed.inc_by(failed);
+                    m.spend_multi_items_succeeded.inc_by(succeeded);
+                    m.spend_multi_items_idempotent.inc_by(idempotent);
+                    m.spend_multi_items_failed.inc_by(failed);
                 }
+                return error_response(req.request_id, ERR_STORAGE_IO, &e);
             }
         }
+    }
 
-        // Phase 4: Apply the mutation (still under lock).
-        // ValidatedSpend is consumed, lock released after write.
-        let validation_errors = validated.errors.clone();
-        idempotent += validated.idempotent_count() as u64;
-        let resp = match validated.apply(engine) {
+    // Phase 4: apply every staged group (stripe locks still held → WAL-first
+    // and per-txid atomicity preserved: redo is already durable, and no other
+    // mutation can touch these txids until the guards drop below).
+    //
+    // PR#21 review (P2): each group's DAH secondary update is DEFERRED
+    // (`apply_locked(.., true)`) and folded into one batched secondary fsync
+    // after the loop, instead of one `append_and_flush` per last-spend txid.
+    let mut dah_transitions: Vec<(TxKey, u32, u32)> = Vec::new();
+    for st in staged {
+        let validation_errors = st.prepared.errors.clone();
+        idempotent += st.prepared.idempotent_count() as u64;
+        let (resp, dah_transition) = match st.prepared.apply_locked(engine, true) {
             Ok(r) => r,
             Err(e) => {
-                // DAH overflow (config misconfiguration) or similar —
-                // surface as ERR_STORAGE_IO rather than silently clamping.
-                // M-01: classify outcomes before the early return. This
-                // group's validation errors keep their real classification;
-                // its would-be transitions and all unprocessed groups count
-                // as ErrStorage-failed. Note `idempotent` already includes
-                // this group (added above) — idempotent items are no-ops,
-                // so the failed apply does not invalidate them.
+                // PR#21 review (P2): `DahOverflow` is pre-validated before the
+                // flush above, so a failure HERE is a catastrophic device error
+                // (EIO/ENOSPC) only. The redo for every group is already durable
+                // (WAL-first), so the contract is: the unapplied groups' redo
+                // replays on restart — the operator must treat a persistent
+                // apply-time device error as fatal and restart (the disk is
+                // failing). We return ERR_STORAGE_IO; guards drop on return.
+                // (Same WAL-first contract as the pre-existing single-group
+                // path; the batched flush only widens which groups are durable-
+                // but-unapplied in this catastrophic window.)
                 for (idx, err) in &validation_errors {
                     errors.push(spend_error_to_batch_error(*idx, err));
                 }
@@ -5034,16 +5118,17 @@ fn handle_spend_batch(
             }
         };
 
-        if !key_repl_ops.is_empty() {
-            repl_ops_by_key.push((key, key_repl_ops));
+        if let Some((old_dah, new_dah)) = dah_transition {
+            dah_transitions.push((st.key, old_dah, new_dah));
         }
 
-        // Tally this group's outcomes before draining the validation
-        // errors: real transitions come from resp.spent_count, and no-op
-        // successes come directly from the validator's idempotent count.
-        // Failed items come from the error map.
-        succeeded += resp.spent_count as u64;
+        if !st.key_repl_ops.is_empty() {
+            repl_ops_by_key.push((st.key, st.key_repl_ops));
+        }
 
+        // Tally this group's outcomes: real transitions from resp.spent_count,
+        // idempotent no-ops already added above, failures from the error map.
+        succeeded += resp.spent_count as u64;
         for (idx, err) in validation_errors {
             errors.push(spend_error_to_batch_error(idx, &err));
         }
@@ -5051,6 +5136,36 @@ fn handle_spend_batch(
         // Use signal/block_ids from resp if needed in the future.
         let _ = resp.signal;
     }
+
+    // Fold every group's DAH secondary-index update into ONE redo fsync (still
+    // under the stripe locks, matching the inline single-spend ordering). On
+    // failure the spends are already applied + durable and recovery reconciles
+    // the DAH index from primary metadata, but we surface ERR_STORAGE_IO to
+    // match the single-spend `update_dah_index` failure contract.
+    if let Err(e) = PreparedSpend::commit_dah_batch(engine, &dah_transitions) {
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(
+                m,
+                OpCode::Spend,
+                items.len() as u64,
+                succeeded,
+                idempotent,
+                &errors,
+            );
+            m.spends_succeeded.inc_by(succeeded);
+            m.spends_idempotent.inc_by(idempotent);
+            m.spends_failed.inc_by(failed);
+            m.spend_multi_items_succeeded.inc_by(succeeded);
+            m.spend_multi_items_idempotent.inc_by(idempotent);
+            m.spend_multi_items_failed.inc_by(failed);
+        }
+        return error_response(req.request_id, ERR_STORAGE_IO, &e.to_string());
+    }
+
+    // Release every stripe lock BEFORE replication (network I/O must not run
+    // under the locks). On the error returns above the guards drop at scope end.
+    drop(stripe_guards);
 
     // Final per-item outcome classification for this batch. `errors` holds
     // validation failures *and* redirect errors (when the txid is not owned
@@ -5843,6 +5958,11 @@ fn handle_create_batch(
         device_id: u8,
         record_offset: u64,
         reservation_size: u64,
+        /// PERF #9: the exact on-device record image (== the CreateV2 redo
+        /// bytes). Written to device in one coalesced bulk pwrite per
+        /// contiguous run (Phase 2b) after the redo flush; Phase 3 then only
+        /// registers the index entry.
+        record_bytes: Vec<u8>,
         /// See [`PendingCreate::blob_pin`]; held until after
         /// `create_at_offset` registers the index entry. Never read —
         /// exists purely for its `Drop` (un-pin).
@@ -6090,7 +6210,11 @@ fn handle_create_batch(
             record_offset: region.offset,
             utxo_count: pending.utxo_count,
             is_conflicting: pending.create_req.conflicting,
-            record_bytes: pending.record_bytes,
+            // PERF #9: clone the record image — the original is retained on
+            // ValidCreate for the coalesced bulk device write (Phase 2b). The
+            // redo append serializes its own copy regardless, so this is one
+            // memcpy, not an extra serialize.
+            record_bytes: pending.record_bytes.clone(),
             parent_txids,
         });
         valid_items.push(ValidCreate {
@@ -6099,6 +6223,7 @@ fn handle_create_batch(
             device_id,
             record_offset: region.offset,
             reservation_size: region.size,
+            record_bytes: pending.record_bytes,
             _blob_pin: pending.blob_pin,
         });
     }
@@ -6134,11 +6259,77 @@ fn handle_create_batch(
         }
     };
 
-    // Phase 3: Apply engine mutations at pre-allocated offsets.
+    // Phase 2b (PERF #9 + multi-store): write every record's bytes to device in
+    // ONE coalesced pwrite per contiguous reservation run, PER STORE. Records are
+    // round-robin placed across stores (offsets are store-local), so group by
+    // `device_id` and bulk-write each store's records to its own device. WAL-
+    // first: this runs AFTER the redo flush above, so every record's `Create`
+    // entry is durable first. The bytes are byte-identical to what
+    // create_at_offset would have written, so Phase 3 only has to register the
+    // index entries (register_create_at_offset).
+    // (record_offset, slot_size, record_bytes) for one record's coalesced write.
+    type BulkRecord<'a> = (u64, u64, &'a [u8]);
+    let mut bulk_by_store: std::collections::HashMap<u8, Vec<BulkRecord>> =
+        std::collections::HashMap::new();
+    for v in &valid_items {
+        bulk_by_store.entry(v.device_id).or_default().push((
+            v.record_offset,
+            v.reservation_size,
+            v.record_bytes.as_slice(),
+        ));
+    }
+    // Fan the per-store coalesced device writes across scoped threads so the N
+    // stores' pwrites overlap (each store has its own device) instead of running
+    // one-after-another. The calling thread handles the head store; the rest run
+    // on scoped threads. Deadlock-safe: `write_records_coalesced` acquires the
+    // io_locks stripes in globally-sorted order, so concurrent per-store calls
+    // cannot form a lock cycle even though that table is keyed by offset only
+    // (cross-store offsets can false-share a stripe).
+    let stores: Vec<(u8, &Vec<BulkRecord>)> = bulk_by_store.iter().map(|(&d, r)| (d, r)).collect();
+    let bulk_err: Option<CreateError> = match stores.split_first() {
+        None => None,
+        Some((&(head_id, head_recs), tail)) => std::thread::scope(|scope| {
+            let handles: Vec<_> = tail
+                .iter()
+                .map(|&(device_id, recs)| {
+                    scope.spawn(move || engine.write_records_bulk(device_id, recs))
+                })
+                .collect();
+            let mut err = engine.write_records_bulk(head_id, head_recs).err();
+            for h in handles {
+                let r = h.join().unwrap_or_else(|_| {
+                    Err(CreateError::StorageError {
+                        detail: "bulk record write thread panicked".to_string(),
+                    })
+                });
+                if let Err(e) = r
+                    && err.is_none()
+                {
+                    err = Some(e);
+                }
+            }
+            err
+        }),
+    };
+    if let Some(e) = bulk_err {
+        // Catastrophic device write failure. The `Create` redo entries are
+        // already durable, so startup recovery replays them (writing AND
+        // registering the records); nothing is registered here. Classify every
+        // not-yet-errored item as ErrStorage-failed and fail the request.
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
+            m.creates_failed.inc_by(failed);
+        }
+        return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
+    }
+    drop(bulk_by_store);
+
+    // Phase 3: register the index entries (records already on device, Phase 2b).
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     for v in &valid_items {
         let item = &items[v.idx];
-        match engine.create_at_offset_on(v.device_id, &v.create_req, v.record_offset) {
+        match engine.register_create_at_offset(v.device_id, &v.create_req, v.record_offset) {
             Ok(_) => {
                 let key = TxKey { txid: item.txid };
                 // Serialize full metadata for the replica so a promoted replica
@@ -8013,19 +8204,217 @@ fn handle_mark_longest_chain_batch(
 // GetBatch
 // ---------------------------------------------------------------------------
 
-/// Perform the full per-item device read for one transaction and serialize the
-/// requested fields into a [`WireGetResult`].
-///
-/// This is the slow-path read logic shared by [`handle_get_batch`]'s sequential
-/// fallback and its parallel per-store fan-out tasks. Behavior is identical to
-/// the original in-loop code: metadata is read via [`Engine::read_metadata`],
-/// and the optional UTXO-slot / cold-data / block-entry / conflicting-children
-/// sub-reads are appended per `field_mask`, with inner sub-read failures
-/// surfaced as `ERR_STORAGE_IO` (or `ERR_BLOB_NOT_FOUND` for a missing external
-/// blob) on the item status. A missing record yields `ERR_TX_NOT_FOUND`; a
-/// non-`TxNotFound` metadata error yields `ERR_STORAGE_IO`.
-fn read_get_item_from_device(engine: &Engine, field_mask: FieldMask, key: &TxKey) -> WireGetResult {
-    match engine.read_metadata(key) {
+/// Batch sizes at or above this fan out across the read pool; smaller batches
+/// stay serial to avoid pool-dispatch overhead dominating a trivial lookup.
+const READ_FANOUT_THRESHOLD: usize = 16;
+
+/// Dedicated work-stealing pool for intra-batch read fan-out. `None` if the
+/// pool failed to build (then reads serve serially — correct, just single-core
+/// for that path). Sized to the host's parallelism; isolated from any other
+/// rayon use so read fan-out never contends with an unrelated global pool.
+static READ_POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+
+/// Lazily build (once) and return the read fan-out pool, or `None` if it could
+/// not be constructed.
+fn read_pool() -> Option<&'static rayon::ThreadPool> {
+    READ_POOL
+        .get_or_init(|| {
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("teraslab-read-{i}"))
+                .build()
+                .map_err(|e| {
+                    tracing::error!(err = %e, "read fan-out pool build failed; GET batches serve serially");
+                })
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Decorate a single GET-batch item into its wire result. Pure with respect to
+/// shared mutable state — it only reads the engine/cluster (both `Sync`) and
+/// bumps atomic metric counters — so it is safe to call concurrently across the
+/// read pool. Every control path returns exactly one [`WireGetResult`], which
+/// is what lets the caller build the result vector with an order-preserving
+/// parallel map.
+fn decorate_get_item(
+    txid: &[u8; 32],
+    engine: &Engine,
+    field_mask: FieldMask,
+    local_read: bool,
+    cluster: Option<&RunningCluster>,
+) -> WireGetResult {
+    let key = TxKey { txid: *txid };
+
+    // In cluster mode, serve reads if we're master OR if the record is
+    // available locally (handles the migration window where shard tables
+    // may be inconsistent across nodes).
+    if !local_read && let Some(cluster) = cluster {
+        let mastership = cluster.is_master(&key);
+        let is_migrating_out = cluster.is_migrating_outbound(&key);
+
+        // Distinguish three cases explicitly:
+        //   - Yes        → serve locally (subject to inbound-migration check below)
+        //   - No         → REDIRECT (or serve during outbound migration)
+        //   - Transitioning → MIGRATION_IN_PROGRESS (retryable)
+        let is_master = match mastership {
+            crate::cluster::coordinator::MasterQueryResult::Yes => true,
+            crate::cluster::coordinator::MasterQueryResult::Transitioning { last_known_term } => {
+                tracing::debug!(
+                    last_known_term,
+                    "dispatch: get deferring — topology in transition"
+                );
+                return WireGetResult {
+                    status: ERR_MIGRATION_IN_PROGRESS as u8,
+                    data: vec![],
+                };
+            }
+            crate::cluster::coordinator::MasterQueryResult::No => false,
+        };
+
+        if !is_master && !is_migrating_out {
+            let route = cluster.route(&key);
+            // R-041: GetBatch per-item REDIRECT data layout is now
+            // `[ERR_REDIRECT_byte:1][addr_len:2][addr][shard_table_version:8]`
+            // — the trailing version lets the client detect a stale-route
+            // loop (server's view <= client's known view → stop following).
+            // The legacy form `[ERR_REDIRECT_byte:1][addr_bytes:N]` had no
+            // length prefix and no version, so any cluster-mid-topology-
+            // change cycle (A→B→C→A) was unobservable client-side.
+            match route {
+                crate::cluster::shards::RouteDecision::RedirectTo {
+                    node,
+                    shard_table_version,
+                } => match cluster.node_addr(&node) {
+                    Some(addr) => {
+                        let payload = crate::protocol::codec::encode_redirect_with_version(
+                            &addr.to_string(),
+                            shard_table_version,
+                        );
+                        let mut data = Vec::with_capacity(1 + payload.len());
+                        data.push(ERR_REDIRECT as u8);
+                        data.extend_from_slice(&payload);
+                        // M10: count the stale-routed read.
+                        if let Some(m) = DISPATCH_METRICS.get() {
+                            m.stale_routing_request_total.inc();
+                        }
+                        return WireGetResult {
+                            status: ERR_REDIRECT as u8,
+                            data,
+                        };
+                    }
+                    // F-4: routing names a master we have no address for.
+                    // An empty-address redirect is useless to the client;
+                    // return a retryable ERR_NO_QUORUM ("master unknown,
+                    // retry") so it backs off until membership converges.
+                    None => {
+                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                        tracing::debug!(
+                            shard,
+                            node = ?node,
+                            "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
+                        );
+                        return WireGetResult {
+                            status: ERR_NO_QUORUM as u8,
+                            data: vec![],
+                        };
+                    }
+                },
+                _ => {
+                    if let Some(m) = DISPATCH_METRICS.get() {
+                        m.stale_routing_request_total.inc();
+                    }
+                    return WireGetResult {
+                        status: ERR_REDIRECT as u8,
+                        data: vec![ERR_REDIRECT as u8],
+                    };
+                }
+            }
+        }
+
+        // If we're master but don't have the data and inbound migration
+        // is still pending, return a retry signal immediately instead of
+        // parking a request thread behind migration progress.
+        if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+            tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
+            return WireGetResult {
+                status: ERR_MIGRATION_IN_PROGRESS as u8,
+                data: vec![],
+            };
+        }
+    }
+    // Fast path: if ALL requested fields are cached in the primary index,
+    // serve directly without reading device metadata (zero I/O).
+    if field_mask.fully_cached() {
+        // G-4: use the checked lookup so a transient backend read error
+        // is surfaced as ERR_STORAGE_IO rather than collapsing to
+        // ERR_TX_NOT_FOUND (which would tell the client a present
+        // transaction does not exist).
+        let cached = match engine.lookup_cached_checked(&key) {
+            Ok(found) => found,
+            Err(e) => {
+                return WireGetResult {
+                    status: ERR_STORAGE_IO as u8,
+                    data: format!("index lookup failed: {e}").into_bytes(),
+                };
+            }
+        };
+        if let Some(entry) = cached {
+            let mut data = Vec::new();
+            let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
+            // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
+            let wire_flags = entry.tx_flags & !TxFlags::HAS_PRESERVE_UNTIL.bits();
+            if field_mask.has(FieldMask::FLAGS) {
+                data.push(wire_flags);
+            }
+            if field_mask.has(FieldMask::SPENT_UTXOS) {
+                data.extend_from_slice(&entry.spent_utxos.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::UTXO_COUNT) {
+                data.extend_from_slice(&entry.utxo_count.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::UNMINED_SINCE) {
+                data.extend_from_slice(&entry.unmined_since.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
+                let dah = if has_preserve {
+                    0u32
+                } else {
+                    entry.dah_or_preserve
+                };
+                data.extend_from_slice(&dah.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::PRESERVE_UNTIL) {
+                let pu = if has_preserve {
+                    entry.dah_or_preserve
+                } else {
+                    0u32
+                };
+                data.extend_from_slice(&pu.to_le_bytes());
+            }
+            if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
+                data.push(entry.block_entry_count);
+            }
+            return WireGetResult {
+                status: STATUS_OK,
+                data,
+            };
+        }
+        // Not in index — fall through to TxNotFound below
+        return WireGetResult {
+            status: ERR_TX_NOT_FOUND as u8,
+            data: vec![],
+        };
+    }
+
+    // Slow path: read full metadata from device for non-cached fields. The
+    // engine's read_metadata routes by the index entry's device_id, so this is
+    // multi-store-correct without any per-store work in this function.
+    match engine.read_metadata(&key) {
         Ok(meta) => {
             let mut data = Vec::new();
             if field_mask.has(FieldMask::RAW_METADATA) {
@@ -8120,7 +8509,7 @@ fn read_get_item_from_device(engine: &Engine, field_mask: FieldMask, key: &TxKey
             if field_mask.has(FieldMask::UTXO_SLOTS) {
                 let utxo_count = { meta.utxo_count };
                 data.extend_from_slice(&utxo_count.to_le_bytes());
-                match engine.read_slots(key) {
+                match engine.read_slots(&key) {
                     Ok(slots) if slots.len() == utxo_count as usize => {
                         for slot in slots {
                             data.extend_from_slice(&slot.hash);
@@ -8140,14 +8529,64 @@ fn read_get_item_from_device(engine: &Engine, field_mask: FieldMask, key: &TxKey
                     }
                 }
             }
-            if field_mask.has(FieldMask::COLD_DATA) {
-                match engine.read_cold_data(key) {
+            // Read the cold blob at most once even when both COLD_DATA and
+            // COLD_DATA_OUTPUTS are requested — otherwise each branch would
+            // re-download and re-verify an EXTERNAL blob. They are independent
+            // wire fields.
+            let cold_result = if field_mask.has(FieldMask::COLD_DATA)
+                || field_mask.has(FieldMask::COLD_DATA_OUTPUTS)
+            {
+                Some(engine.read_cold_data(&key))
+            } else {
+                None
+            };
+            if field_mask.has(FieldMask::COLD_DATA)
+                && let Some(res) = cold_result.as_ref()
+            {
+                match res {
                     Ok(cold) => {
                         data.extend_from_slice(&(cold.len() as u32).to_le_bytes());
-                        data.extend_from_slice(&cold);
+                        data.extend_from_slice(cold);
                     }
                     // F-IJ-001: missing external blob → ERR_BLOB_NOT_FOUND,
                     // not the generic ERR_STORAGE_IO path below.
+                    Err(SpendError::BlobNotFound { .. }) => {
+                        blob_not_found = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    Err(_) => {
+                        inner_read_failed = true;
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                }
+            }
+            // #20: outputs-only cold data — ship just the parent's outputs
+            // section, not the full inputs+outputs+inpoints blob. Trims the wire
+            // payload (the blob is still read + hash-verified whole, shared with
+            // the COLD_DATA read above).
+            if field_mask.has(FieldMask::COLD_DATA_OUTPUTS)
+                && let Some(res) = cold_result.as_ref()
+            {
+                match res {
+                    // Empty cold data → genuinely no outputs section. Distinct
+                    // from a malformed blob below.
+                    Ok(cold) if cold.is_empty() => {
+                        data.extend_from_slice(&0u32.to_le_bytes());
+                    }
+                    Ok(cold) => match parse_cold_data_fields(cold).1 {
+                        Some(outputs) => {
+                            data.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
+                            data.extend_from_slice(outputs);
+                        }
+                        // Non-empty cold blob with no parseable outputs section
+                        // is malformed/truncated. Surface it as a sub-read
+                        // failure (ERR_STORAGE_IO) rather than masking storage
+                        // corruption as a valid empty outputs section.
+                        None => {
+                            inner_read_failed = true;
+                            data.extend_from_slice(&0u32.to_le_bytes());
+                        }
+                    },
                     Err(SpendError::BlobNotFound { .. }) => {
                         blob_not_found = true;
                         data.extend_from_slice(&0u32.to_le_bytes());
@@ -8170,7 +8609,7 @@ fn read_get_item_from_device(engine: &Engine, field_mask: FieldMask, key: &TxKey
                 }
             }
             if field_mask.has(FieldMask::CONFLICTING_CHILDREN) {
-                match engine.read_conflicting_children(key) {
+                match engine.read_conflicting_children(&key) {
                     Ok(children) => {
                         data.push(children.len() as u8);
                         for child in &children {
@@ -8221,6 +8660,19 @@ fn read_get_item_from_device(engine: &Engine, field_mask: FieldMask, key: &TxKey
     }
 }
 
+/// Handle an `OP_GET_BATCH` request: decode the field mask + txids, decorate
+/// every item, and assemble the batched response.
+///
+/// The per-item decoration is fanned across the read pool for batches at or
+/// above [`READ_FANOUT_THRESHOLD`]; smaller batches stay serial. teranode's
+/// parent decoration sends one fat batch (~826 items) per connection, so
+/// without fan-out a single connection pins one core regardless of how many
+/// are free. The fan-out is order-preserving (parallel `collect` keeps input
+/// order) and runs entirely inside the caller-held shared
+/// `dispatch_visibility_barrier` read guard (see `handle_request`), so every
+/// fanned read is fenced against the checkpoint/mutation write side exactly as
+/// the old serial loop was. `decorate_get_item`'s device reads route by each
+/// record's `device_id`, so the fan-out is multi-store-correct as-is.
 fn handle_get_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -8234,290 +8686,24 @@ fn handle_get_batch(
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
-    // Results are addressed by ORIGINAL request position so the response order
-    // is independent of the order in which items are resolved. Phase 1 fills
-    // the cheap cases (redirect / migration / error / index-cached) in place;
-    // phase 2 fans the remaining device reads out across stores and writes each
-    // result back at its original index. The final response is assembled by
-    // walking this vector front-to-back, so item i is always for txid i.
-    let mut results: Vec<Option<WireGetResult>> = vec![None; txids.len()];
-    // Items that still need a DEVICE read after phase 1: (original_index, key).
-    let mut pending: Vec<(usize, TxKey)> = Vec::new();
-    for (idx, txid) in txids.iter().enumerate() {
-        let key = TxKey { txid: *txid };
-
-        // In cluster mode, serve reads if we're master OR if the record is
-        // available locally (handles the migration window where shard tables
-        // may be inconsistent across nodes).
-        if !local_read && let Some(cluster) = cluster {
-            let mastership = cluster.is_master(&key);
-            let is_migrating_out = cluster.is_migrating_outbound(&key);
-
-            // Distinguish three cases explicitly:
-            //   - Yes        → serve locally (subject to inbound-migration check below)
-            //   - No         → REDIRECT (or serve during outbound migration)
-            //   - Transitioning → MIGRATION_IN_PROGRESS (retryable)
-            let is_master = match mastership {
-                crate::cluster::coordinator::MasterQueryResult::Yes => true,
-                crate::cluster::coordinator::MasterQueryResult::Transitioning {
-                    last_known_term,
-                } => {
-                    tracing::debug!(
-                        last_known_term,
-                        "dispatch: get deferring — topology in transition"
-                    );
-                    results[idx] = Some(WireGetResult {
-                        status: ERR_MIGRATION_IN_PROGRESS as u8,
-                        data: vec![],
-                    });
-                    continue;
-                }
-                crate::cluster::coordinator::MasterQueryResult::No => false,
-            };
-
-            if !is_master && !is_migrating_out {
-                let route = cluster.route(&key);
-                // R-041: GetBatch per-item REDIRECT data layout is now
-                // `[ERR_REDIRECT_byte:1][addr_len:2][addr][shard_table_version:8]`
-                // — the trailing version lets the client detect a stale-route
-                // loop (server's view <= client's known view → stop following).
-                // The legacy form `[ERR_REDIRECT_byte:1][addr_bytes:N]` had no
-                // length prefix and no version, so any cluster-mid-topology-
-                // change cycle (A→B→C→A) was unobservable client-side.
-                match route {
-                    crate::cluster::shards::RouteDecision::RedirectTo {
-                        node,
-                        shard_table_version,
-                    } => match cluster.node_addr(&node) {
-                        Some(addr) => {
-                            let payload = crate::protocol::codec::encode_redirect_with_version(
-                                &addr.to_string(),
-                                shard_table_version,
-                            );
-                            let mut data = Vec::with_capacity(1 + payload.len());
-                            data.push(ERR_REDIRECT as u8);
-                            data.extend_from_slice(&payload);
-                            // M10: count the stale-routed read.
-                            if let Some(m) = DISPATCH_METRICS.get() {
-                                m.stale_routing_request_total.inc();
-                            }
-                            results[idx] = Some(WireGetResult {
-                                status: ERR_REDIRECT as u8,
-                                data,
-                            });
-                        }
-                        // F-4: routing names a master we have no address for.
-                        // An empty-address redirect is useless to the client;
-                        // return a retryable ERR_NO_QUORUM ("master unknown,
-                        // retry") so it backs off until membership converges.
-                        None => {
-                            let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                            tracing::debug!(
-                                shard,
-                                node = ?node,
-                                "dispatch: get master address unknown — returning retryable ERR_NO_QUORUM instead of empty redirect"
-                            );
-                            results[idx] = Some(WireGetResult {
-                                status: ERR_NO_QUORUM as u8,
-                                data: vec![],
-                            });
-                        }
-                    },
-                    _ => {
-                        if let Some(m) = DISPATCH_METRICS.get() {
-                            m.stale_routing_request_total.inc();
-                        }
-                        results[idx] = Some(WireGetResult {
-                            status: ERR_REDIRECT as u8,
-                            data: vec![ERR_REDIRECT as u8],
-                        });
-                    }
-                }
-                continue;
-            }
-
-            // If we're master but don't have the data and inbound migration
-            // is still pending, return a retry signal immediately instead of
-            // parking a request thread behind migration progress.
-            if is_master && engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key)
-            {
-                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                tracing::debug!(shard, "dispatch: read still waiting for inbound migration");
-                results[idx] = Some(WireGetResult {
-                    status: ERR_MIGRATION_IN_PROGRESS as u8,
-                    data: vec![],
-                });
-                continue;
-            }
-        }
-        // Fast path: if ALL requested fields are cached in the primary index,
-        // serve directly without reading device metadata (zero I/O).
-        if field_mask.fully_cached() {
-            // G-4: use the checked lookup so a transient backend read error
-            // is surfaced as ERR_STORAGE_IO rather than collapsing to
-            // ERR_TX_NOT_FOUND (which would tell the client a present
-            // transaction does not exist).
-            let cached = match engine.lookup_cached_checked(&key) {
-                Ok(found) => found,
-                Err(e) => {
-                    results[idx] = Some(WireGetResult {
-                        status: ERR_STORAGE_IO as u8,
-                        data: format!("index lookup failed: {e}").into_bytes(),
-                    });
-                    continue;
-                }
-            };
-            if let Some(entry) = cached {
-                let mut data = Vec::new();
-                let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
-                // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
-                let wire_flags = entry.tx_flags & !TxFlags::HAS_PRESERVE_UNTIL.bits();
-                if field_mask.has(FieldMask::FLAGS) {
-                    data.push(wire_flags);
-                }
-                if field_mask.has(FieldMask::SPENT_UTXOS) {
-                    data.extend_from_slice(&entry.spent_utxos.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::UTXO_COUNT) {
-                    data.extend_from_slice(&entry.utxo_count.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::UNMINED_SINCE) {
-                    data.extend_from_slice(&entry.unmined_since.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
-                    let dah = if has_preserve {
-                        0u32
-                    } else {
-                        entry.dah_or_preserve
-                    };
-                    data.extend_from_slice(&dah.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::PRESERVE_UNTIL) {
-                    let pu = if has_preserve {
-                        entry.dah_or_preserve
-                    } else {
-                        0u32
-                    };
-                    data.extend_from_slice(&pu.to_le_bytes());
-                }
-                if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
-                    data.push(entry.block_entry_count);
-                }
-                results[idx] = Some(WireGetResult {
-                    status: STATUS_OK,
-                    data,
-                });
-                continue;
-            }
-            // Not in index — TxNotFound; no device read needed.
-            results[idx] = Some(WireGetResult {
-                status: ERR_TX_NOT_FOUND as u8,
-                data: vec![],
-            });
-            continue;
-        }
-
-        // Slow path: this item needs a DEVICE read. Defer it to phase 2 so all
-        // pending reads can be grouped by store and fanned out in parallel.
-        pending.push((idx, key));
-    }
-
-    // -----------------------------------------------------------------------
-    // PHASE 2: parallel per-store device reads.
-    //
-    // Each pending item lives on exactly one store (its index entry's
-    // `device_id`). Items with no index entry are resolved here without a
-    // device read (TxNotFound, or ERR_STORAGE_IO on a backend lookup fault).
-    // The remaining reads are grouped by `device_id` — records on different
-    // stores are on different physical devices, so their reads run
-    // concurrently — and each group is executed on a `spawn_blocking` task on
-    // the shared `REPL_RUNTIME`. `block_on` joins ALL tasks before returning,
-    // which is what makes sharing `&Engine` across the tasks sound (see the
-    // `EngineRef` safety contract). Results are written back at their original
-    // index, so the merge cannot reorder items.
-    // -----------------------------------------------------------------------
-    if !pending.is_empty() {
-        // Group pending items by store. `lookup_checked` distinguishes a
-        // genuine absent record (None → TxNotFound) from a backend read error
-        // (Err → ERR_STORAGE_IO); collapsing the latter to TxNotFound would
-        // tell the client a present transaction does not exist (G-4).
-        let mut by_store: std::collections::HashMap<u8, Vec<(usize, TxKey)>> =
-            std::collections::HashMap::new();
-        for (idx, key) in pending {
-            match engine.lookup_checked(&key) {
-                Ok(Some(entry)) => {
-                    by_store
-                        .entry(entry.device_id)
-                        .or_default()
-                        .push((idx, key));
-                }
-                Ok(None) => {
-                    results[idx] = Some(WireGetResult {
-                        status: ERR_TX_NOT_FOUND as u8,
-                        data: vec![],
-                    });
-                }
-                Err(e) => {
-                    results[idx] = Some(WireGetResult {
-                        status: ERR_STORAGE_IO as u8,
-                        data: format!("index lookup failed: {e}").into_bytes(),
-                    });
-                }
-            }
-        }
-
-        if !by_store.is_empty() {
-            // Fan the per-store device reads out across scoped threads — one per
-            // store group, so reads on different physical devices proceed in
-            // parallel. `std::thread::scope` lets each closure borrow `&Engine`
-            // (Sync) directly and JOINS every thread before returning, so no
-            // lifetime erasure / `unsafe` is needed; threads are spawned only on
-            // this non-cached multi-store path. Results carry their original
-            // index, so completion order cannot reorder the response.
-            let group_results: Vec<(usize, WireGetResult)> = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(by_store.len());
-                for (_device_id, items) in by_store {
-                    handles.push(scope.spawn(move || {
-                        let mut out = Vec::with_capacity(items.len());
-                        for (idx, key) in items {
-                            out.push((idx, read_get_item_from_device(engine, field_mask, &key)));
-                        }
-                        out
-                    }));
-                }
-                let mut merged = Vec::new();
-                for handle in handles {
-                    match handle.join() {
-                        Ok(group) => merged.extend(group),
-                        // A thread only panics if `read_get_item_from_device`
-                        // panics; the engine read paths return `Result`, so this
-                        // is not expected. Affected slots stay `None` and become
-                        // ERR_STORAGE_IO below, keeping the response item count
-                        // aligned with the request rather than dropping items.
-                        Err(_) => {
-                            tracing::error!("get_batch: device-read thread panicked");
-                        }
-                    }
-                }
-                merged
-            });
-            for (idx, result) in group_results {
-                results[idx] = Some(result);
-            }
-        }
-    }
-
-    // Any slot still unfilled means its device-read task panicked (see above);
-    // surface ERR_STORAGE_IO so the response item count matches the request.
-    let results: Vec<WireGetResult> = results
-        .into_iter()
-        .map(|r| {
-            r.unwrap_or_else(|| WireGetResult {
-                status: ERR_STORAGE_IO as u8,
-                data: vec![],
+    let results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                txids
+                    .par_iter()
+                    .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+                    .collect()
             })
-        })
-        .collect();
+        }
+        None => txids
+            .iter()
+            .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
+            .collect(),
+    };
 
     // Track per-item outcomes: STATUS_OK => succeeded, ERR_TX_NOT_FOUND =>
     // not_found, anything else => failed.
@@ -9033,6 +9219,116 @@ fn handle_process_expired(
 // GetSpend
 // ---------------------------------------------------------------------------
 
+/// Decorate a single GetSpend item into its wire result. Reads only the
+/// engine/cluster (both `Sync`) and bumps atomic counters, so it is safe to
+/// call concurrently across the read pool; every control path returns exactly
+/// one [`WireGetSpendResult`].
+fn decorate_get_spend_item(
+    item: &WireGetSpendItem,
+    engine: &Engine,
+    local_read: bool,
+    cluster: Option<&RunningCluster>,
+) -> WireGetSpendResult {
+    // Check shard ownership — reads are allowed during outbound migration
+    // because this node still holds the data until migration completes.
+    // FLAG_LOCAL_READ bypasses this check for replication verification.
+    if !local_read && let Some(cluster) = cluster {
+        let key = TxKey { txid: item.txid };
+        match cluster.is_master(&key) {
+            crate::cluster::coordinator::MasterQueryResult::Yes => {
+                // F-F1: mirror GET_BATCH's inbound fence. If we're the
+                // committed master but the data hasn't migrated in yet,
+                // return a retryable MIGRATION_IN_PROGRESS instead of
+                // letting `get_spend` below report ERR_TX_NOT_FOUND
+                // (terminal) for a tx that is present-but-not-yet-migrated.
+                if engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
+                    let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                    tracing::debug!(
+                        shard,
+                        "dispatch: get_spend still waiting for inbound migration"
+                    );
+                    return WireGetSpendResult {
+                        status: 1,
+                        error_code: ERR_MIGRATION_IN_PROGRESS,
+                        slot_status: 0,
+                        spending_data: [0; 36],
+                    };
+                }
+            }
+            crate::cluster::coordinator::MasterQueryResult::Transitioning { last_known_term } => {
+                tracing::debug!(
+                    last_known_term,
+                    "dispatch: get_spend deferring — topology in transition"
+                );
+                return WireGetSpendResult {
+                    status: 1,
+                    error_code: ERR_MIGRATION_IN_PROGRESS,
+                    slot_status: 0,
+                    spending_data: [0; 36],
+                };
+            }
+            crate::cluster::coordinator::MasterQueryResult::No => {
+                if cluster.is_migrating_outbound(&key) {
+                    // Outbound migration: data still present locally.
+                } else {
+                    // M10: count the stale-routed GetSpend.
+                    if let Some(m) = DISPATCH_METRICS.get() {
+                        m.stale_routing_request_total.inc();
+                    }
+                    return WireGetSpendResult {
+                        status: 1,
+                        error_code: ERR_REDIRECT,
+                        slot_status: 0,
+                        spending_data: [0; 36],
+                    };
+                }
+            }
+        }
+    }
+
+    let key = TxKey { txid: item.txid };
+    match engine.get_spend(&GetSpendRequest {
+        tx_key: key,
+        offset: item.vout,
+        utxo_hash: item.utxo_hash,
+    }) {
+        Ok(spend) => WireGetSpendResult {
+            status: 0,
+            error_code: ERR_OK,
+            slot_status: spend.status,
+            spending_data: spend.spending_data.unwrap_or([0; 36]),
+        },
+        Err(SpendError::TxNotFound) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_TX_NOT_FOUND,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+        Err(SpendError::UtxoNotFound { .. }) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_VOUT_OUT_OF_RANGE,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+        Err(SpendError::UtxoHashMismatch { .. }) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_UTXO_HASH_MISMATCH,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+        Err(_) => WireGetSpendResult {
+            status: 1,
+            error_code: ERR_STORAGE_IO,
+            slot_status: 0,
+            spending_data: [0; 36],
+        },
+    }
+}
+
+/// Handle an `OP_GET_SPEND_BATCH` request. Like [`handle_get_batch`], the
+/// per-item lookups fan across the read pool for batches at or above
+/// [`READ_FANOUT_THRESHOLD`] (order-preserving), under the caller-held shared
+/// `dispatch_visibility_barrier` read guard.
 fn handle_get_spend_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -9046,118 +9342,24 @@ fn handle_get_spend_batch(
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
-    let mut results = Vec::with_capacity(items.len());
-    for item in &items {
-        // Check shard ownership — reads are allowed during outbound migration
-        // because this node still holds the data until migration completes.
-        // FLAG_LOCAL_READ bypasses this check for replication verification.
-        if !local_read && let Some(cluster) = cluster {
-            let key = TxKey { txid: item.txid };
-            match cluster.is_master(&key) {
-                crate::cluster::coordinator::MasterQueryResult::Yes => {
-                    // F-F1: mirror GET_BATCH's inbound fence. If we're the
-                    // committed master but the data hasn't migrated in yet,
-                    // return a retryable MIGRATION_IN_PROGRESS instead of
-                    // letting `get_spend` below report ERR_TX_NOT_FOUND
-                    // (terminal) for a tx that is present-but-not-yet-migrated.
-                    if engine.read_metadata(&key).is_err() && cluster.has_pending_inbound(&key) {
-                        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-                        tracing::debug!(
-                            shard,
-                            "dispatch: get_spend still waiting for inbound migration"
-                        );
-                        results.push(WireGetSpendResult {
-                            status: 1,
-                            error_code: ERR_MIGRATION_IN_PROGRESS,
-                            slot_status: 0,
-                            spending_data: [0; 36],
-                        });
-                        continue;
-                    }
-                }
-                crate::cluster::coordinator::MasterQueryResult::Transitioning {
-                    last_known_term,
-                } => {
-                    tracing::debug!(
-                        last_known_term,
-                        "dispatch: get_spend deferring — topology in transition"
-                    );
-                    results.push(WireGetSpendResult {
-                        status: 1,
-                        error_code: ERR_MIGRATION_IN_PROGRESS,
-                        slot_status: 0,
-                        spending_data: [0; 36],
-                    });
-                    continue;
-                }
-                crate::cluster::coordinator::MasterQueryResult::No => {
-                    if cluster.is_migrating_outbound(&key) {
-                        // Outbound migration: data still present locally.
-                    } else {
-                        // M10: count the stale-routed GetSpend.
-                        if let Some(m) = DISPATCH_METRICS.get() {
-                            m.stale_routing_request_total.inc();
-                        }
-                        results.push(WireGetSpendResult {
-                            status: 1,
-                            error_code: ERR_REDIRECT,
-                            slot_status: 0,
-                            spending_data: [0; 36],
-                        });
-                        continue;
-                    }
-                }
-            }
+    let results: Vec<WireGetSpendResult> = match (items.len() >= READ_FANOUT_THRESHOLD)
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                items
+                    .par_iter()
+                    .map(|item| decorate_get_spend_item(item, engine, local_read, cluster))
+                    .collect()
+            })
         }
-
-        let key = TxKey { txid: item.txid };
-        match engine.get_spend(&GetSpendRequest {
-            tx_key: key,
-            offset: item.vout,
-            utxo_hash: item.utxo_hash,
-        }) {
-            Ok(spend) => {
-                results.push(WireGetSpendResult {
-                    status: 0,
-                    error_code: ERR_OK,
-                    slot_status: spend.status,
-                    spending_data: spend.spending_data.unwrap_or([0; 36]),
-                });
-            }
-            Err(SpendError::TxNotFound) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_TX_NOT_FOUND,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-            Err(SpendError::UtxoNotFound { .. }) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_VOUT_OUT_OF_RANGE,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-            Err(SpendError::UtxoHashMismatch { .. }) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_UTXO_HASH_MISMATCH,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-            Err(_) => {
-                results.push(WireGetSpendResult {
-                    status: 1,
-                    error_code: ERR_STORAGE_IO,
-                    slot_status: 0,
-                    spending_data: [0; 36],
-                });
-            }
-        }
-    }
+        None => items
+            .iter()
+            .map(|item| decorate_get_spend_item(item, engine, local_read, cluster))
+            .collect(),
+    };
 
     // Dual-write: labeled operations table for GetSpend. Classify by the
     // result's `error_code` (already a u16) so the mapping is exact.
@@ -13074,22 +13276,213 @@ mod tests {
         ranges.sort_by_key(|range| range.0);
 
         assert_eq!(ranges, vec![(1, 1), (2, 2)]);
-        // Group commit collapses the two concurrent writers into one effective
-        // flush, and that flush now issues exactly ONE device sync: the entries
-        // block and the F-G4-001 persisted header are pwritten back-to-back and
-        // made durable by a single `device.sync()` (the header no longer pays a
-        // second fsync).
+        // PERF #5: flush() now folds the F-G4-001 header pwrite into the SAME
+        // fsync as the entries (one device.sync() flushes both blocks), so an
+        // effective flush is ONE sync. Group commit collapses the two
+        // concurrent writers into one effective flush, so the post-open delta
+        // is exactly 1 sync.
         assert_eq!(
             redo_dev.sync_count() - baseline_syncs,
             1,
-            "concurrent dispatch writers should share one effective flush of \
-             exactly one fsync (entries + header)"
+            "concurrent dispatch writers should share one effective flush \
+             (one fsync covering entries + folded header under PERF #5)"
         );
 
         let entries = redo_log.lock().recover().expect("recover grouped entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 1);
         assert_eq!(entries[1].sequence, 2);
+    }
+
+    /// PERF: the 200 µs group-commit window (`REDO_GROUP_COMMIT_WINDOW`) is a
+    /// `thread::sleep` before every redo flush. It only buys cross-connection
+    /// fsync coalescing for TINY concurrent writes; for a write that already
+    /// carries multiple ops the fsync is amortized over them, so the fixed
+    /// wait is pure added latency — the per-call 200 µs floor that caps
+    /// per-connection throughput (~5000 calls/s). `group_commit_window` skips
+    /// the wait for batched writes and keeps it only for single-op writes.
+    #[test]
+    fn group_commit_window_skips_sleep_for_batched_writes() {
+        // Batched writes (the real Teranode traffic: a 742-item CreateBatch
+        // RPC, or a whole SpendBatch after target #2) skip the floor entirely.
+        assert_eq!(group_commit_window(2), Duration::ZERO);
+        assert_eq!(group_commit_window(742), Duration::ZERO);
+        // A single-op write keeps the window — the only case where waiting for
+        // a concurrent writer to coalesce into the same fsync can pay off.
+        assert_eq!(group_commit_window(1), REDO_GROUP_COMMIT_WINDOW);
+        // Empty writes never flush, so the window is irrelevant; ZERO is fine.
+        assert_eq!(group_commit_window(0), Duration::ZERO);
+    }
+
+    /// PERF (target #2): a SpendBatch RPC spanning many distinct txid-groups
+    /// must be made durable with ONE redo flush for the whole RPC, not one
+    /// flush per txid-group. Pre-fix `handle_spend_batch` calls
+    /// `write_replicated_redo_ops` inside the `for (txid, group)` loop, so N
+    /// groups => N flushes (each = a 200 µs group-commit sleep + redo-lock
+    /// cycle + 2 device syncs). This counts device syncs on the redo device:
+    /// one effective flush == 2 syncs (entries + persisted header under
+    /// F-G4-001), independent of group count.
+    #[test]
+    fn spend_batch_flushes_redo_once_per_rpc_not_per_txid_group() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        // Deliberately TINY stripe count so the N txids below are guaranteed to
+        // collide on stripes (pigeonhole: N > stripe_count). The batched spend
+        // path must dedup stripe locks before holding them across the single
+        // flush — without dedup it self-deadlocks on the non-reentrant
+        // per-stripe Mutex, so a hang here is also a regression signal.
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+
+        let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &engine, 8192, None, Some(&redo_log), &mut cs, None)
+        };
+
+        // N distinct txids, each with 2 utxos. Spending only vout 0 of each
+        // leaves the tx not-last-spent => no DAH secondary flush, isolating
+        // the main spend redo flush count. N > stripe_count (16) forces
+        // stripe collisions so the dedup-lock path is exercised.
+        const N: usize = 24;
+        let mk_txid = |k: usize| {
+            let mut t = [0u8; 32];
+            t[0] = 0xC0;
+            t[1] = k as u8;
+            t
+        };
+        let mk_hash = |k: usize, vout: u8| {
+            let mut h = [0u8; 32];
+            h[0] = 0xC0;
+            h[1] = k as u8;
+            h[2] = vout;
+            h
+        };
+
+        let create_items: Vec<WireCreateItem> = (0..N)
+            .map(|k| WireCreateItem {
+                txid: mk_txid(k),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![mk_hash(k, 0), mk_hash(k, 1)],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
+        assert_eq!(
+            request(OP_CREATE_BATCH, encode_create_batch(&create_items)).status,
+            STATUS_OK,
+            "seed creates must succeed"
+        );
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 0,
+        };
+        let spend_items: Vec<WireSpendItem> = (0..N)
+            .map(|k| WireSpendItem {
+                txid: mk_txid(k),
+                vout: 0,
+                utxo_hash: mk_hash(k, 0),
+                spending_data: [0xD2; 36],
+            })
+            .collect();
+
+        let syncs_before = redo_dev.sync_count();
+        let resp = request(OP_SPEND_BATCH, encode_spend_batch(&params, &spend_items));
+        let flush_syncs = redo_dev.sync_count() - syncs_before;
+
+        assert_eq!(resp.status, STATUS_OK, "all spends should succeed");
+        assert_eq!(
+            flush_syncs, 1,
+            "the whole {N}-txid-group SpendBatch RPC must be ONE effective redo \
+             flush — one fsync (entries + folded header, PERF #5) — not one per \
+             txid-group; got {flush_syncs} syncs",
+        );
+    }
+
+    /// PR#21 review (P2): the per-txid DAH secondary updates must be folded into
+    /// ONE batched redo flush for the whole RPC, not one `append_and_flush` per
+    /// last-spend txid. `commit_dah_batch` is the fold primitive: N transitions
+    /// → one effective flush (one device sync), independent of N.
+    #[test]
+    fn commit_dah_batch_folds_n_transitions_into_one_flush() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            Index::new(10_000).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+        engine.set_redo_log(redo_log);
+
+        // N DAH transitions (old=0 → new=100). commit_dah_batch inserts into the
+        // DAH index by key, so no on-device record is required.
+        const N: usize = 16;
+        let transitions: Vec<(TxKey, u32, u32)> = (0..N)
+            .map(|k| {
+                let mut t = [0u8; 32];
+                t[0] = 0xDA;
+                t[1] = k as u8;
+                (TxKey { txid: t }, 0u32, 100u32)
+            })
+            .collect();
+
+        let before = redo_dev.sync_count();
+        PreparedSpend::commit_dah_batch(&engine, &transitions).unwrap();
+        let syncs = redo_dev.sync_count() - before;
+        assert_eq!(
+            syncs, 1,
+            "{N} DAH transitions must fold into ONE batched secondary fsync, not {N}; got {syncs}",
+        );
     }
 
     impl RedoDispatchHarness {
@@ -21722,20 +22115,19 @@ mod tests {
             .iter()
             .find(|s| s.name == "handle_request")
             .expect("no dispatch span captured");
-        // The dispatch path calls `Engine::validate_spend_multi` followed by
-        // `ValidatedSpend::apply`. `apply` is the instrumented span that
-        // runs under the dispatch span; `spend_multi` (a wrapper that calls
-        // both) is not invoked on the OP_SPEND_BATCH hot path. Either span
-        // proves the parent linkage; we assert on `apply` because it is the
-        // site reached from the dispatch wire opcode.
+        // The dispatch path (target #2) calls `Engine::prepare_spend_multi`
+        // followed by `PreparedSpend::apply_locked`. `apply_locked` carries the
+        // instrumented span that runs under the dispatch span (the thin
+        // `ValidatedSpend::apply` wrapper is no longer instrumented, so there is
+        // exactly one apply span and it sits under dispatch).
         let apply_span = spans
             .iter()
-            .find(|s| s.name == "apply")
-            .expect("no apply span captured");
+            .find(|s| s.name == "apply_locked")
+            .expect("no apply_locked span captured");
         assert_eq!(
             apply_span.parent_id,
             Some(dispatch_span.id),
-            "apply parent ({:?}) should be dispatch span ({})",
+            "apply_locked parent ({:?}) should be dispatch span ({})",
             apply_span.parent_id,
             dispatch_span.id,
         );
@@ -21766,12 +22158,12 @@ mod tests {
             .expect("no spend_multi span captured from direct call");
         let sm_apply = wrapped_spans
             .iter()
-            .find(|s| s.name == "apply")
-            .expect("no apply span captured from direct call");
+            .find(|s| s.name == "apply_locked")
+            .expect("no apply_locked span captured from direct call");
         assert_eq!(
             sm_apply.parent_id,
             Some(sm.id),
-            "direct spend_multi should parent its inner apply span",
+            "direct spend_multi should parent its inner apply_locked span",
         );
     }
 
@@ -23018,13 +23410,23 @@ mod tests {
 
     #[test]
     fn production_redo_group_commit_window_is_zero() {
-        // Regression guard: the production redo path must not impose a fixed
-        // per-flush `thread::sleep`. The 200µs window was a ~5k ops/s/conn
-        // latency floor; group commit is now done by the per-physical-device
-        // PhysicalBarrier at fsync time. Do not reintroduce a non-zero window.
+        // Regression guard (PR #23): the production redo path must not impose a
+        // fixed per-flush `thread::sleep`. The 200µs window was a ~5k ops/s/conn
+        // latency floor; coalescing is now done by per-store parallel flush + the
+        // per-physical-device PhysicalBarrier at fsync time. `group_commit_window`
+        // must therefore return ZERO for EVERY input (single-op included). Do not
+        // reintroduce a non-zero window.
         assert!(
             REDO_GROUP_COMMIT_WINDOW.is_zero(),
             "REDO_GROUP_COMMIT_WINDOW must stay ZERO; sleeping per flush caps throughput"
+        );
+        assert!(
+            group_commit_window(1).is_zero(),
+            "single-op write must not sleep"
+        );
+        assert!(
+            group_commit_window(742).is_zero(),
+            "batched write must not sleep"
         );
     }
 
@@ -23097,10 +23499,10 @@ mod tests {
 
         assert_eq!(resp.status, STATUS_OK);
         // Issue #14: AllocateRegion + Create are written in ONE atomic redo
-        // flush. That flush now issues exactly ONE device sync: the entries
-        // block and the F-G4-001 header (carrying the new `next_sequence`) are
-        // pwritten back-to-back and made durable by a single `device.sync()`
-        // (the per-flush header no longer pays its own second fsync).
+        // flush. PERF #5: that flush issues exactly ONE device sync — the
+        // entries block and the F-G4-001 header (carrying the new
+        // `next_sequence`) are pwritten back-to-back and made durable by a single
+        // `device.sync()` (the per-flush header no longer pays its own fsync).
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
             1,

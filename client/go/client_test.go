@@ -96,6 +96,7 @@ func handleClientTestConn(conn net.Conn, tracker *blobTracker) {
 			addr := "127.0.0.1:3300"
 			p = appendU16(p, uint16(len(addr)))
 			p = append(p, addr...)
+			p = append(p, 1) // is_alive — matches the server wire format
 			for range NumShards {
 				p = appendU64(p, 0)
 			}

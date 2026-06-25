@@ -118,6 +118,7 @@ func encodePartitionMapForTest(version uint64, nodes []NodeInfo, ownerID uint64)
 		buf = appendU64(buf, n.ID)
 		buf = appendU16(buf, uint16(len(n.Addr)))
 		buf = append(buf, []byte(n.Addr)...)
+		buf = append(buf, 1) // is_alive — matches the server wire format
 	}
 	for range NumShards {
 		buf = appendU64(buf, ownerID)
@@ -242,9 +243,9 @@ func TestGetSpendBatchFollowsRedirectInCluster(t *testing.T) {
 	// Build a deterministic success payload: 1 result with Status=0, SlotStatus=1.
 	var respPayload []byte
 	respPayload = appendU32(respPayload, 1)
-	respPayload = append(respPayload, 0)                // status
-	respPayload = appendU16(respPayload, 0)             // error_code
-	respPayload = append(respPayload, 1)                // slot_status
+	respPayload = append(respPayload, 0)                   // status
+	respPayload = appendU16(respPayload, 0)                // error_code
+	respPayload = append(respPayload, 1)                   // slot_status
 	respPayload = append(respPayload, make([]byte, 36)...) // spending_data zero
 
 	cli, _, target := buildRedirectingClient(t, func(req requestFrame) responseFrame {

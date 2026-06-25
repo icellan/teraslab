@@ -687,7 +687,8 @@ func TestCoinbaseImmatureErrorData(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestPartitionMapDecodeSingleNode(t *testing.T) {
-	// Build a single-node partition map as the server would.
+	// Build a single-node partition map EXACTLY as the server does, including
+	// the per-node is_alive byte: [id:8][addr_len:2][addr:N][is_alive:1].
 	var buf []byte
 	buf = appendU64(buf, 0) // version
 	buf = appendU32(buf, 1) // 1 node
@@ -695,6 +696,7 @@ func TestPartitionMapDecodeSingleNode(t *testing.T) {
 	addr := "127.0.0.1:3300"
 	buf = appendU16(buf, uint16(len(addr)))
 	buf = append(buf, addr...)
+	buf = append(buf, 1) // is_alive
 	// All 4096 shards -> node 0
 	for range NumShards {
 		buf = appendU64(buf, 0)
@@ -717,6 +719,44 @@ func TestPartitionMapDecodeSingleNode(t *testing.T) {
 		if a != 0 {
 			t.Errorf("shard %d = %d, want 0", i, a)
 			break
+		}
+	}
+}
+
+// Regression guard for the is_alive wire-format byte: a multi-node map with
+// NON-ZERO node ids and a VARIED shard→node assignment, encoded exactly as the
+// server does (per-node is_alive byte). If the decoder fails to consume is_alive,
+// every node address after the first and every shard assignment is read 1 byte
+// misaligned — which this test detects (the all-zero single-node test above
+// cannot, since shifted zeros are still zero).
+func TestPartitionMapDecodeConsumesIsAlive(t *testing.T) {
+	nodes := []NodeInfo{
+		{ID: 5, Addr: "10.0.0.5:3300"},
+		{ID: 9, Addr: "10.0.0.9:3301"},
+	}
+	// shard i -> nodes[i%2].ID (5,9,5,9,...) — a shift would scramble these.
+	pm, err := decodePartitionMap(encodePartitionMapAssign(7, nodes, func(shard int) uint64 {
+		return nodes[shard%2].ID
+	}))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if pm.Version != 7 {
+		t.Errorf("version = %d, want 7", pm.Version)
+	}
+	if len(pm.Nodes) != 2 {
+		t.Fatalf("nodes = %d, want 2", len(pm.Nodes))
+	}
+	if pm.Nodes[0].ID != 5 || pm.Nodes[0].Addr != "10.0.0.5:3300" {
+		t.Errorf("node0 = (%d,%q), want (5,10.0.0.5:3300)", pm.Nodes[0].ID, pm.Nodes[0].Addr)
+	}
+	if pm.Nodes[1].ID != 9 || pm.Nodes[1].Addr != "10.0.0.9:3301" {
+		t.Errorf("node1 = (%d,%q), want (9,10.0.0.9:3301)", pm.Nodes[1].ID, pm.Nodes[1].Addr)
+	}
+	for i, a := range pm.Assignments {
+		want := nodes[i%2].ID
+		if a != want {
+			t.Fatalf("shard %d -> %d, want %d (is_alive byte not consumed?)", i, a, want)
 		}
 	}
 }

@@ -1784,6 +1784,11 @@ fn main() {
         // in unchecked.
         cfg.high_water = config.checkpoint_high_water;
         cfg.low_water = config.checkpoint_low_water;
+        // Without this the emergency mark stays at the library default (0.90);
+        // an operator `checkpoint_high_water >= 0.90` would then collapse it
+        // onto high_water and make every checkpoint blocking. Config validation
+        // guarantees `high_water < emergency_water < 1`.
+        cfg.emergency_high_water = config.checkpoint_emergency_water;
         cfg.poll_interval = std::time::Duration::from_millis(config.checkpoint_poll_interval_ms);
         if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =

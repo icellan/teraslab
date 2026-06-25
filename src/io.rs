@@ -1324,6 +1324,97 @@ pub fn write_record_bytes(device: &dyn BlockDevice, record_offset: u64, buf: &[u
     Ok(())
 }
 
+/// Bulk-write many newly-created records, coalescing physically contiguous
+/// records into a single aligned `pwrite` per run.
+///
+/// `records` is `(record_offset, slot_size, record_bytes)` per record, where
+/// `slot_size` is the allocator's aligned reservation for the record
+/// (`== align_up(record_bytes.len())`, so the difference is zero padding) and
+/// `record_offset` is device-aligned. Records whose slots are physically
+/// back-to-back (`offset + slot_size == next offset`) are written in ONE
+/// pwrite; allocator fragmentation (a gap between slots) simply splits into
+/// separate runs. The slowest path degrades to one pwrite per record.
+///
+/// The bytes written are byte-identical to calling [`write_record_bytes`] for
+/// each record into its zero-padded aligned slot, so crash recovery and the
+/// CreateV2 redo replay observe exactly the same on-device records.
+///
+/// # Concurrency (F-X-007 / g2)
+///
+/// Holds the per-record `io_locks().write` guard for EVERY offset covered by a
+/// run across that run's pwrite — identical torn-read protection to N separate
+/// [`write_record_bytes`] calls (a stale lock-free reader of a REUSED offset
+/// cannot observe a half-written record). Guards are acquired deduplicated and
+/// sorted by stripe so concurrent multi-offset writers cannot deadlock; each
+/// run's guards are released before the next run.
+pub fn write_records_coalesced(
+    device: &dyn BlockDevice,
+    records: &[(u64, u64, &[u8])],
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let align = device.alignment();
+    let locks = io_locks();
+
+    // Process records in offset order so physically adjacent slots coalesce.
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    order.sort_unstable_by_key(|&i| records[i].0);
+
+    // The caller's reservations must be disjoint: in offset order, each slot
+    // ends at or before the next begins. An overlap would mean two records were
+    // reserved the same bytes — an allocator bug this bulk write would silently
+    // corrupt by overwriting. Cheap O(n) guard.
+    debug_assert!(
+        order.windows(2).all(|w| {
+            let (a_off, a_sz, _) = records[w[0]];
+            let (b_off, _, _) = records[w[1]];
+            a_off + a_sz <= b_off
+        }),
+        "write_records_coalesced: record slots must be disjoint (no two reservations overlap)",
+    );
+
+    let mut run_start = 0usize;
+    while run_start < order.len() {
+        // Extend the run while the next slot starts exactly where this one ends.
+        let mut run_end = run_start + 1;
+        while run_end < order.len() {
+            let (prev_off, prev_sz, _) = records[order[run_end - 1]];
+            let (cur_off, _, _) = records[order[run_end]];
+            if prev_off + prev_sz == cur_off {
+                run_end += 1;
+            } else {
+                break;
+            }
+        }
+        let run = &order[run_start..run_end];
+        let run_base = records[run[0]].0;
+        let run_total: usize = run.iter().map(|&i| records[i].1 as usize).sum();
+
+        // Hold the write guard for every covered offset (dedup + sorted).
+        let mut stripes: Vec<usize> = run
+            .iter()
+            .map(|&i| locks.stripe_index(records[i].0))
+            .collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let _guards: Vec<_> = stripes.iter().map(|&s| locks.write_index(s)).collect();
+
+        // One aligned buffer for the whole run: each record's bytes at its
+        // slot offset, padding left zero (matching the per-record write).
+        let mut buf = AlignedBuf::new(run_total, align);
+        for &i in run {
+            let (off, _sz, bytes) = records[i];
+            let rel = (off - run_base) as usize;
+            buf[rel..rel + bytes.len()].copy_from_slice(bytes);
+        }
+        device.pwrite_all_at(&buf, run_base)?;
+
+        run_start = run_end;
+    }
+    Ok(())
+}
+
 /// Read multiple UTXO slots by index from a record.
 ///
 /// Returns a vector of `(slot_index, UtxoSlot)` pairs in the order requested.
@@ -2056,5 +2147,69 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
+    }
+
+    /// PERF #9: `write_records_coalesced` writes bytes byte-identical to N
+    /// per-record `write_record_bytes` calls (record bytes then zero padding
+    /// in each aligned slot) AND collapses physically contiguous slots into a
+    /// single pwrite (a gap splits runs).
+    #[test]
+    fn write_records_coalesced_byte_identical_and_coalesces() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
+        struct CountingDev {
+            inner: MemoryDevice,
+            pwrites: AtomicUsize,
+        }
+        impl BlockDevice for CountingDev {
+            fn pread(&self, b: &mut [u8], o: u64) -> Result<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> Result<usize> {
+                self.pwrites.fetch_add(1, AOrdering::SeqCst);
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+        }
+
+        let dev = CountingDev {
+            inner: MemoryDevice::new(1 << 20, 4096).unwrap(),
+            pwrites: AtomicUsize::new(0),
+        };
+        let a = vec![0xAAu8; 100];
+        let b = vec![0xBBu8; 200];
+        let c = vec![0xCCu8; 50];
+        // A@0 and B@4096 are contiguous (slot 4096 each); C@16384 has a gap.
+        let records = [
+            (0u64, 4096u64, a.as_slice()),
+            (4096, 4096, b.as_slice()),
+            (16384, 4096, c.as_slice()),
+        ];
+        write_records_coalesced(&dev, &records).unwrap();
+
+        // A+B coalesce into one pwrite; C is a separate run -> 2 pwrites total.
+        assert_eq!(
+            dev.pwrites.load(AOrdering::SeqCst),
+            2,
+            "contiguous A+B must coalesce into one pwrite; C is a separate run",
+        );
+
+        // Byte-identity: each slot is [record bytes | zero padding].
+        for (off, _sz, bytes) in records {
+            let mut got = AlignedBuf::new(4096, 4096);
+            dev.pread(&mut got, off).unwrap();
+            assert_eq!(&got[..bytes.len()], bytes, "record bytes wrong at {off}");
+            assert!(
+                got[bytes.len()..].iter().all(|&x| x == 0),
+                "slot padding must be zero at {off}",
+            );
+        }
     }
 }
