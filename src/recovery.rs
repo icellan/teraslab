@@ -889,6 +889,23 @@ pub fn recover_all_multi_store(
     for log in redo_logs.iter() {
         partitions.push(log.recover()?);
     }
+    // B-7 (multi-store): collect the union of keys the redo logs touched across
+    // ALL stores, mirroring the single-store inner loop's per-entry
+    // `touched_keys.insert(entry.op.tx_key())` (see
+    // `recover_entries_with_allocator_collecting_pending_conflicts`). The
+    // per-store parallel replays below pass `SecondaryReconcile::Skip`, so the
+    // touched set is gathered here, once, for the post-replay reconcile when the
+    // fast path (`full_secondary_rebuild == false`) is taken.
+    let mut touched_keys: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
+    if !full_secondary_rebuild {
+        for part in &partitions {
+            for entry in part {
+                if let Some(key) = entry.op.tx_key() {
+                    touched_keys.insert(*key);
+                }
+            }
+        }
+    }
     let mut total = RecoveryStats::default();
     let mut pending_cc = Vec::new();
     let mut pending_dc = Vec::new();
@@ -944,13 +961,26 @@ pub fn recover_all_multi_store(
         pending_dc.extend(dc);
     }
 
-    // One store-routed secondary reconcile across the now-complete index: it
-    // rebuilds DAH/unmined from each record's metadata read from its own store
-    // (the throwaway per-thread secondaries above are discarded). A full
-    // re-derive is correct for every backend, so `full_secondary_rebuild` is
-    // informational here.
-    let _ = full_secondary_rebuild;
-    reconcile_secondary_indexes_from_metadata_multi(devices, index, dah, unmined)?;
+    // One store-routed secondary reconcile across the now-complete index. This
+    // honors `full_secondary_rebuild` the SAME way the single-store path does
+    // (see `recover_all_with_allocator_collecting_pending_conflicts_progress`):
+    //   full_secondary_rebuild == true  -> FullScan  (clear + re-derive every
+    //                                       primary entry; required when a
+    //                                       secondary backend was not cleanly
+    //                                       closed / its snapshot is missing).
+    //   full_secondary_rebuild == false -> TouchedOnly (reconcile only the keys
+    //                                       the redo logs touched against the
+    //                                       durable, clean secondaries — O(redo),
+    //                                       not O(store)).
+    // Both variants route each metadata read to the record's OWN store via
+    // `entry.device_id`. The fast path's precondition (clean/durable
+    // secondaries) is identical to the single-store path's — the caller asserts
+    // it by passing `full_secondary_rebuild == false`.
+    if full_secondary_rebuild {
+        reconcile_secondary_indexes_from_metadata_multi(devices, index, dah, unmined)?;
+    } else {
+        reconcile_secondary_indexes_for_keys_multi(devices, index, dah, unmined, &touched_keys)?;
+    }
     Ok((total, pending_cc, pending_dc))
 }
 
@@ -1421,6 +1451,77 @@ fn reconcile_secondary_indexes_from_metadata_multi(
     }
     for (height, key) in unmined_pairs {
         unmined.insert(height, key, None)?;
+    }
+    Ok(())
+}
+
+/// B-7 (multi-store): the O(redo) touched-only counterpart to
+/// [`reconcile_secondary_indexes_from_metadata_multi`], routing each metadata
+/// read to the record's OWN store via `entry.device_id`. It is the multi-store
+/// mirror of [`reconcile_secondary_indexes_for_keys`] and carries the SAME
+/// soundness precondition: it is correct only when the secondaries were loaded
+/// clean (they already reflect every key the redo logs did NOT touch). Called
+/// by `recover_all_multi_store` when `full_secondary_rebuild == false`.
+///
+/// For each touched key the primary index is authoritative: if the record is
+/// gone, any secondary entry for it is removed; otherwise the secondaries are
+/// set to exactly the record's `delete_at_height` / `unmined_since` read from
+/// `devices[entry.device_id]` (removing first so a height *change* does not
+/// leave a stale entry under the old bucket).
+fn reconcile_secondary_indexes_for_keys_multi(
+    devices: &[std::sync::Arc<dyn BlockDevice>],
+    index: &ShardedIndex,
+    dah: &mut DahBackend,
+    unmined: &mut UnminedBackend,
+    keys: &std::collections::HashSet<TxKey>,
+) -> Result<(), RecoveryError> {
+    for key in keys {
+        let entry = match index.lookup(key) {
+            Some(e) => e,
+            None => {
+                // Record no longer exists — drop any stale secondary entries.
+                dah.remove(key, None).map_err(RecoveryError::Index)?;
+                unmined.remove(key, None).map_err(RecoveryError::Index)?;
+                continue;
+            }
+        };
+        let Some(dev) = devices.get(entry.device_id as usize) else {
+            return Err(RecoveryError::Index(
+                crate::index::IndexError::FormatError {
+                    detail: format!(
+                        "secondary reconcile: entry {:?} references store {} but only {} stores exist",
+                        key.txid,
+                        entry.device_id,
+                        devices.len()
+                    ),
+                },
+            ));
+        };
+        let meta = match io::read_metadata(&**dev, entry.record_offset) {
+            Ok(meta) => meta,
+            Err(_) => {
+                return Err(RecoveryError::Index(
+                    crate::index::IndexError::FormatError {
+                        detail: format!(
+                            "secondary reconcile failed to read metadata for {:?} on store {}",
+                            key.txid, entry.device_id
+                        ),
+                    },
+                ));
+            }
+        };
+        // Remove first so a changed height does not leave a stale entry under
+        // the previous bucket, then re-insert the current value.
+        dah.remove(key, None).map_err(RecoveryError::Index)?;
+        unmined.remove(key, None).map_err(RecoveryError::Index)?;
+        let dah_height = { meta.delete_at_height };
+        if dah_height != 0 {
+            dah.insert(dah_height, *key, None)?;
+        }
+        let unmined_height = { meta.unmined_since };
+        if unmined_height != 0 {
+            unmined.insert(unmined_height, *key, None)?;
+        }
     }
     Ok(())
 }
@@ -5095,6 +5196,300 @@ mod tests {
             expected_dah,
             "DAH must hold every delete-at-height record across all stores"
         );
+    }
+
+    /// P2 (multi-store B-7): the multi-store reconcile honors
+    /// `full_secondary_rebuild` the same way the single-store path does.
+    ///
+    /// Mirror of `touched_only_reconcile_matches_full_scan` across TWO stores:
+    ///   * `full_secondary_rebuild == false` + clean durable secondaries → the
+    ///     touched-only fast path runs (records the redo logs did NOT touch are
+    ///     preserved WITHOUT being re-scanned), and the result equals
+    ///   * `full_secondary_rebuild == true` → the full clear + store-routed
+    ///     re-derive over every primary entry across both stores.
+    #[test]
+    fn multi_store_touched_only_reconcile_honors_flag_and_matches_full_scan() {
+        // Two stores, each with two records. Heights live on each record's OWN
+        // store; metadata reads must route by device_id.
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        // Write a record on `dev`/`alloc`, register it on store `device_id`, set
+        // its heights, and return its key.
+        let make = |txid_byte: u8,
+                    device_id: u8,
+                    dev: &Arc<dyn BlockDevice>,
+                    alloc: &mut SlotAllocator,
+                    dah_h: u32,
+                    unmined_h: u32|
+         -> TxKey {
+            let utxo_count: u32 = 2;
+            let mut txid = [0u8; 32];
+            txid[0] = txid_byte;
+            let key = TxKey { txid };
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.delete_at_height = dah_h;
+            meta.unmined_since = unmined_h;
+            let base = TxMetadata::record_size_for(utxo_count);
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = txid_byte;
+                    h[1] = (i + 1) as u8;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+            let offset = alloc.allocate(base).unwrap();
+            io::write_full_record(&**dev, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id,
+                        record_offset: offset,
+                        utxo_count,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+            key
+        };
+
+        // Store 0: A has DAH (touched), C has DAH (NOT touched).
+        // Store 1: B has unmined (touched), D has unmined (NOT touched).
+        let a = make(0xA0, 0, &dev0, &mut alloc0, 900, 0);
+        let b = make(0xB0, 1, &dev1, &mut alloc1, 0, 800);
+        let c = make(0xC0, 0, &dev0, &mut alloc0, 950, 0);
+        let d = make(0xD0, 1, &dev1, &mut alloc1, 0, 850);
+
+        // Per-store redo logs, sharing a global sequence counter (as boot wires
+        // it). Each touches only its store's "touched" key with a Freeze (which
+        // does not mutate the primary index or secondaries).
+        let build_logs = || {
+            let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+            let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+            let mut redo0 = RedoLog::open(redo_dev0, 0, 1024 * 1024).unwrap();
+            let mut redo1 = RedoLog::open(redo_dev1, 0, 1024 * 1024).unwrap();
+            let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                RedoLog::shared_sequence_floor(&[&redo0, &redo1]),
+            ));
+            redo0.attach_shared_sequence(shared.clone());
+            redo1.attach_shared_sequence(shared.clone());
+            redo0
+                .append_and_flush(RedoOp::Freeze {
+                    tx_key: a,
+                    offset: 0,
+                })
+                .unwrap();
+            redo1
+                .append_and_flush(RedoOp::Freeze {
+                    tx_key: b,
+                    offset: 0,
+                })
+                .unwrap();
+            [redo0, redo1]
+        };
+
+        let sort_keys = |v: &mut Vec<TxKey>| v.sort_by_key(|k| k.txid);
+
+        // Reference: full rebuild (flag = true). Clears + re-derives every
+        // primary entry across BOTH stores.
+        let mut dah_full = DahBackend::new_in_memory();
+        let mut unmined_full = UnminedBackend::new_in_memory();
+        {
+            let devices = [dev0.clone(), dev1.clone()];
+            let mut allocators = [
+                SlotAllocator::new(dev0.clone()).unwrap(),
+                SlotAllocator::new(dev1.clone()).unwrap(),
+            ];
+            let mut logs = build_logs();
+            recover_all_multi_store(
+                &devices,
+                &mut allocators,
+                &mut logs,
+                &index,
+                &mut dah_full,
+                &mut unmined_full,
+                true,
+            )
+            .unwrap();
+        }
+        let mut dah_full_keys = dah_full.range_query(u32::MAX);
+        sort_keys(&mut dah_full_keys);
+        let mut un_full = unmined_full.range_query(u32::MAX);
+        sort_keys(&mut un_full);
+        // Full scan finds A+C in DAH (both stores), B+D in unmined.
+        assert_eq!(dah_full_keys.len(), 2, "full scan finds A and C in DAH");
+        assert_eq!(un_full.len(), 2, "full scan finds B and D in unmined");
+
+        // Fast path: flag = false, secondaries pre-seeded clean for ALL keys (as
+        // a clean redb load would present them). Only A and B are touched; C and
+        // D must be preserved WITHOUT a re-scan.
+        let mut dah_touch = DahBackend::new_in_memory();
+        let mut unmined_touch = UnminedBackend::new_in_memory();
+        dah_touch.insert(900, a, None).unwrap();
+        dah_touch.insert(950, c, None).unwrap();
+        unmined_touch.insert(800, b, None).unwrap();
+        unmined_touch.insert(850, d, None).unwrap();
+        {
+            let devices = [dev0.clone(), dev1.clone()];
+            let mut allocators = [
+                SlotAllocator::new(dev0.clone()).unwrap(),
+                SlotAllocator::new(dev1.clone()).unwrap(),
+            ];
+            let mut logs = build_logs();
+            recover_all_multi_store(
+                &devices,
+                &mut allocators,
+                &mut logs,
+                &index,
+                &mut dah_touch,
+                &mut unmined_touch,
+                false,
+            )
+            .unwrap();
+        }
+        let mut dah_touch_keys = dah_touch.range_query(u32::MAX);
+        sort_keys(&mut dah_touch_keys);
+        let mut un_touch = unmined_touch.range_query(u32::MAX);
+        sort_keys(&mut un_touch);
+
+        // Equivalence: touched-only result equals the full scan, across stores.
+        assert_eq!(
+            dah_touch_keys.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            dah_full_keys.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            "multi-store touched-only DAH must equal full-scan DAH",
+        );
+        assert_eq!(
+            un_touch.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            un_full.iter().map(|k| k.txid).collect::<Vec<_>>(),
+            "multi-store touched-only unmined must equal full-scan unmined",
+        );
+        // Untouched C (store 0) and D (store 1) survive though never scanned —
+        // proving the fast path is O(redo), not O(store), and routes per store.
+        assert!(
+            dah_touch_keys.iter().any(|k| k.txid == c.txid),
+            "untouched C (store 0) preserved on fast path",
+        );
+        assert!(
+            un_touch.iter().any(|k| k.txid == d.txid),
+            "untouched D (store 1) preserved on fast path",
+        );
+
+        // And the fast path DID reconcile the touched keys from their OWN store:
+        // A's DAH (store 0) and B's unmined (store 1) are present.
+        assert!(
+            dah_touch_keys.iter().any(|k| k.txid == a.txid),
+            "touched A reconciled from store 0",
+        );
+        assert!(
+            un_touch.iter().any(|k| k.txid == b.txid),
+            "touched B reconciled from store 1",
+        );
+    }
+
+    /// P2 (multi-store B-7): with the fast path NOT seeded clean, the full
+    /// rebuild (flag = true) still derives correct DAH/unmined across stores
+    /// from a cold (empty) pair of secondaries — proving the full path remains
+    /// correct and store-routed.
+    #[test]
+    fn multi_store_full_rebuild_from_cold_secondaries_across_stores() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        let make = |txid_byte: u8,
+                    device_id: u8,
+                    dev: &Arc<dyn BlockDevice>,
+                    alloc: &mut SlotAllocator,
+                    dah_h: u32,
+                    unmined_h: u32|
+         -> TxKey {
+            let utxo_count: u32 = 2;
+            let mut txid = [0u8; 32];
+            txid[0] = txid_byte;
+            let key = TxKey { txid };
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.delete_at_height = dah_h;
+            meta.unmined_since = unmined_h;
+            let base = TxMetadata::record_size_for(utxo_count);
+            meta.record_size = base as u32;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| UtxoSlot::new_unspent([txid_byte ^ (i as u8); 32]))
+                .collect();
+            let offset = alloc.allocate(base).unwrap();
+            io::write_full_record(&**dev, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id,
+                        record_offset: offset,
+                        utxo_count,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+            key
+        };
+
+        let a = make(0xA0, 0, &dev0, &mut alloc0, 900, 0); // store 0, DAH
+        let b = make(0xB0, 1, &dev1, &mut alloc1, 0, 800); // store 1, unmined
+
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut redo0 = RedoLog::open(redo_dev0, 0, 1024 * 1024).unwrap();
+        let mut redo1 = RedoLog::open(redo_dev1, 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0, &redo1]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo1.attach_shared_sequence(shared.clone());
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let devices = [dev0.clone(), dev1.clone()];
+        let mut allocators = [alloc0, alloc1];
+        let mut logs = [redo0, redo1];
+        recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut logs,
+            &index,
+            &mut dah,
+            &mut unmined,
+            true,
+        )
+        .unwrap();
+
+        let dah_keys = dah.range_query(u32::MAX);
+        let un_keys = unmined.range_query(u32::MAX);
+        assert_eq!(dah_keys.len(), 1, "exactly A in DAH");
+        assert_eq!(un_keys.len(), 1, "exactly B in unmined");
+        assert_eq!(dah_keys[0].txid, a.txid, "A (store 0) derived into DAH");
+        assert_eq!(un_keys[0].txid, b.txid, "B (store 1) derived into unmined");
     }
 
     /// bytes and registers the index with cached fields populated from

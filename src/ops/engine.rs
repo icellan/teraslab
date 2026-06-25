@@ -650,10 +650,15 @@ impl Engine {
     /// `Create` / `AllocateRegion` / `FreeRegion` carry an explicit
     /// `device_id`. Every other op is keyed by a `TxKey`; its store is the
     /// owning record's `device_id` from the primary index, defaulting to store
-    /// 0 when the key is not present (e.g. a not-yet-applied create whose op is
-    /// being journaled in the same batch — its sibling `Create` op already
-    /// routes to the correct store, and store 0 is the safe default for the
-    /// keyed op since recovery re-derives ownership from the record itself).
+    /// 0 when the key is not present.
+    ///
+    /// NOTE: this single-op form has NO batch context, so a keyed op whose key
+    /// is not yet in the index falls back to store 0. Within a batch, prefer
+    /// [`Self::redo_store_for_op_batch`], which first consults a batch-local
+    /// `TxKey -> device_id` map built from the batch's own
+    /// `Create`/`AllocateRegion`/`FreeRegion` ops so a keyed op journaled in the
+    /// SAME batch as the `Create` of its key routes to the SAME store as that
+    /// create, preserving per-store-log purity for per-store recovery.
     fn redo_store_for_op(&self, op: &crate::redo::RedoOp) -> u8 {
         use crate::redo::RedoOp;
         match op {
@@ -662,6 +667,33 @@ impl Engine {
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
             other => match other.tx_key() {
                 Some(k) => self.index.lookup(k).map(|e| e.device_id).unwrap_or(0),
+                None => 0,
+            },
+        }
+    }
+
+    /// Batch-aware variant of [`Self::redo_store_for_op`]: route a keyed op by
+    /// (1) the `batch_keys` map (a `TxKey -> device_id` index of the batch's own
+    /// device-tagged ops), else (2) the primary index, else (3) store 0.
+    ///
+    /// Device-tagged ops (`Create` / `AllocateRegion` / `FreeRegion`) always
+    /// route by their explicit `device_id` and never consult the map.
+    fn redo_store_for_op_batch(
+        &self,
+        op: &crate::redo::RedoOp,
+        batch_keys: &std::collections::HashMap<TxKey, u8>,
+    ) -> u8 {
+        use crate::redo::RedoOp;
+        match op {
+            RedoOp::Create { device_id, .. }
+            | RedoOp::AllocateRegion { device_id, .. }
+            | RedoOp::FreeRegion { device_id, .. } => *device_id,
+            other => match other.tx_key() {
+                Some(k) => batch_keys
+                    .get(k)
+                    .copied()
+                    .or_else(|| self.index.lookup(k).map(|e| e.device_id))
+                    .unwrap_or(0),
                 None => 0,
             },
         }
@@ -696,6 +728,24 @@ impl Engine {
         if migration_journal_suppressed() {
             return Ok((0, 0));
         }
+        // Pre-scan for the batch's own device-tagged keyed ops to build a
+        // batch-local `TxKey -> device_id` map. `Create` carries BOTH a tx_key
+        // and an explicit device_id, so a keyed op (Freeze/SpendV2/…) journaled
+        // in the SAME batch as the `Create` of its key — before that key lands
+        // in the primary index — routes to the SAME store as the create rather
+        // than defaulting to store 0. This preserves per-store-log purity that
+        // per-store recovery relies on. (AllocateRegion/FreeRegion carry a
+        // device_id but no tx_key, so they cannot seed the map.)
+        let mut batch_keys: std::collections::HashMap<TxKey, u8> = std::collections::HashMap::new();
+        for op in ops {
+            if let crate::redo::RedoOp::Create {
+                tx_key, device_id, ..
+            } = op
+            {
+                batch_keys.insert(*tx_key, *device_id);
+            }
+        }
+
         // Group op indices by destination store so each store's log is locked
         // once and flushed once. Preserve per-store op order (the order ops
         // appear in `ops`) — within a store, sequence order must match append
@@ -705,7 +755,8 @@ impl Engine {
             (0..store_count).map(|_| Vec::new()).collect();
         let mut any = false;
         for op in ops {
-            let store = (self.redo_store_for_op(op) as usize).min(store_count - 1);
+            let store =
+                (self.redo_store_for_op_batch(op, &batch_keys) as usize).min(store_count - 1);
             // Only route to a store that actually has a log attached; if none
             // is attached (test / unconfigured), fall through to the
             // representative-handle path below.
@@ -987,7 +1038,17 @@ impl Engine {
         match self.redo_logs.get() {
             Some(logs) if !logs.is_empty() => {
                 for log in logs {
-                    let part = log.lock().read_from_sequence(from_seq)?;
+                    let guard = log.lock();
+                    // Cheap skip: `local_high_water()` is this log's own
+                    // next-sequence high-water (last seq it appended + 1), an
+                    // upper bound on every sequence present in this log. If that
+                    // bound is <= from_seq, no entry can satisfy `seq >= from_seq`,
+                    // so skip the full scan. Output is unchanged: skipped logs
+                    // contribute nothing they would have contributed anyway.
+                    if guard.local_high_water() <= from_seq {
+                        continue;
+                    }
+                    let part = guard.read_from_sequence(from_seq)?;
                     merged.extend(part);
                 }
             }
@@ -13581,6 +13642,135 @@ mod tests {
         assert_eq!(engine.earliest_redo_sequence_merged().unwrap(), Some(1));
 
         // A from_seq in the middle returns exactly the tail of the global order.
+        let tail = engine.read_redo_from_sequence_merged(4).expect("tail read");
+        let tail_seqs: Vec<u64> = tail.iter().map(|e| e.sequence).collect();
+        assert_eq!(tail_seqs, vec![4, 5, 6]);
+    }
+
+    /// Attach two empty per-store redo logs sharing ONE global counter (exactly
+    /// the boot path: `shared_sequence_floor` → `attach_shared_sequence`) and
+    /// return them so the test can read each store's log directly.
+    fn attach_two_store_redo_logs(
+        engine: &Arc<Engine>,
+    ) -> (
+        Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+        Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+    ) {
+        use crate::redo::RedoLog;
+        use std::sync::atomic::AtomicU64;
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 1024 * 1024).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared);
+        let l0 = Arc::new(parking_lot::Mutex::new(log0));
+        let l1 = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![l0.clone(), l1.clone()]);
+        assert!(engine.has_per_store_redo());
+        (l0, l1)
+    }
+
+    #[test]
+    fn routed_batch_create_and_sibling_keyed_op_land_on_same_store_log() {
+        // FIX 1: a KEYED op (here `Freeze`) journaled in the SAME batch as the
+        // `Create` of its own key — before that key is in the primary index —
+        // must route to the store its sibling `Create` is tagged with (store 1),
+        // NOT default to store 0. Otherwise the keyed op lands in store 0's log
+        // while the record + Create live on store 1, breaking per-store-log
+        // purity that per-store recovery relies on.
+        use crate::redo::RedoOp;
+
+        let engine = create_two_store_engine();
+        let (l0, l1) = attach_two_store_redo_logs(&engine);
+
+        // A key NOT present in the index (no `create()` was run for it).
+        let key = TxKey { txid: [7u8; 32] };
+        assert!(engine.lookup(&key).is_none(), "precondition: key absent");
+
+        let ops = vec![
+            RedoOp::Create {
+                tx_key: key,
+                device_id: 1,
+                record_offset: 4096,
+                utxo_count: 0,
+                is_conflicting: false,
+                record_bytes: vec![0u8; 64],
+                parent_txids: Vec::new(),
+            },
+            RedoOp::Freeze {
+                tx_key: key,
+                offset: 0,
+            },
+        ];
+        let (first, last) = engine.append_redo_ops_routed(&ops).expect("routed append");
+        assert_eq!((first, last), (1, 2), "two ops draw global sequences 1..=2");
+
+        // BOTH ops must be in store 1's log; store 0's log must be empty.
+        let s0 = l0.lock().read_from_sequence(0).expect("s0 read");
+        let s1 = l1.lock().read_from_sequence(0).expect("s1 read");
+        assert!(
+            s0.is_empty(),
+            "store 0 log must be empty — the keyed op must not default there, got {s0:?}"
+        );
+        let s1_ops: Vec<&RedoOp> = s1.iter().map(|e| &e.op).collect();
+        assert_eq!(s1.len(), 2, "both Create and Freeze must land on store 1");
+        assert!(
+            matches!(s1_ops[0], RedoOp::Create { .. }),
+            "store 1 entry 0 must be the Create"
+        );
+        assert!(
+            matches!(s1_ops[1], RedoOp::Freeze { tx_key, .. } if *tx_key == key),
+            "store 1 entry 1 must be the sibling Freeze on the same key"
+        );
+    }
+
+    #[test]
+    fn read_merged_skips_logs_below_from_seq_without_error() {
+        // FIX 2: a merged read whose `from_seq` is far ahead of every log's
+        // high-water returns empty (no error), and a normal merge is unchanged.
+        use crate::redo::RedoOp;
+
+        let engine = create_two_store_engine();
+        let _logs = attach_two_store_redo_logs(&engine);
+
+        // Six device-tagged ops across both stores → global sequences 1..=6.
+        let ops: Vec<RedoOp> = (0..6u64)
+            .map(|i| RedoOp::AllocateRegion {
+                device_id: (i % 2) as u8,
+                offset: i,
+                size: 4096,
+            })
+            .collect();
+        let (first, last) = engine.append_redo_ops_routed(&ops).expect("routed append");
+        assert_eq!((first, last), (1, 6));
+
+        // from_seq far past every log's high-water (which is 7): both logs are
+        // skipped by the high-water check, yielding an empty result with no scan
+        // error.
+        let empty = engine
+            .read_redo_from_sequence_merged(1000)
+            .expect("far-ahead read must not error");
+        assert!(
+            empty.is_empty(),
+            "far-ahead from_seq returns empty, got {empty:?}"
+        );
+
+        // Normal merge is unchanged by the skip optimization.
+        let merged = engine
+            .read_redo_from_sequence_merged(1)
+            .expect("merged read");
+        let seqs: Vec<u64> = merged.iter().map(|e| e.sequence).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5, 6],
+            "merged stream must be globally sequence-ordered with no gaps/dupes"
+        );
+
+        // A mid-range from_seq still returns exactly the tail.
         let tail = engine.read_redo_from_sequence_merged(4).expect("tail read");
         let tail_seqs: Vec<u64> = tail.iter().map(|e| e.sequence).collect();
         assert_eq!(tail_seqs, vec![4, 5, 6]);

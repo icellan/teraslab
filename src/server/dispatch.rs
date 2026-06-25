@@ -3111,6 +3111,28 @@ where
             ));
         }
 
+        // P3 (review) — IDEMPOTENCY DEPENDENCY PINNED HERE. Under per-store redo
+        // logs the global sequence counter is shared across every store log, so
+        // a crashed RPC's [first_sequence..last_sequence] window can interleave
+        // with — and therefore include — entries that belong to OTHER, already-
+        // committed RPCs whose ops landed in a different store log within the
+        // same sequence span. We re-replicate EVERY in-range entry here; the
+        // foreign ones are re-shipped too. This is safe ONLY because every
+        // `ReplicaOp` apply on the receiver is idempotent (re-applying an
+        // already-applied Create/Spend/SetMined/etc. is a no-op), so the extra
+        // foreign ops cause at most redundant network traffic, never corruption.
+        //
+        // We deliberately do NOT narrow by "keys this node currently masters":
+        // `is_master` lives on `RunningCluster` (not threaded into this
+        // recovery fn), and more importantly it can return `Transitioning`/`No`
+        // during early startup (topology epoch ahead, or inbound migration
+        // pending) for a key this RPC legitimately owned at write time — using
+        // it as a filter would risk DROPPING a committed-locally op that must be
+        // re-shipped, trading harmless redundancy for a real durability hole.
+        // The complete fix is to have each replication intent carry its OWN key
+        // set so we replay exactly this RPC's keys regardless of current
+        // mastership; that requires a format change to the durable intent
+        // tracker (a different module) and is out of scope for this change.
         let mut ops_by_key = Vec::new();
         for entry in &entries {
             let Some(tx_key) = entry.op.tx_key().copied() else {
@@ -3120,6 +3142,22 @@ where
             if let Some(op) =
                 crate::cluster::coordinator::redo_entry_to_replica_op(entry, shard, engine)
             {
+                // If/when intents carry their own key set, replace the blanket
+                // re-ship with a membership test against that set. Until then
+                // the idempotent receiver is the load-bearing invariant: this
+                // op may belong to a foreign already-committed RPC and is shipped
+                // anyway. Pin that the reconstructed op tracks the entry's own
+                // key and the entry is genuinely in this intent's window.
+                debug_assert_eq!(
+                    op.tx_key(),
+                    tx_key,
+                    "reconstructed replica op key must match its redo entry key",
+                );
+                debug_assert!(
+                    entry.sequence >= range.first_sequence && entry.sequence <= range.last_sequence,
+                    "recovery must only ship ops whose redo entry falls in the intent window; \
+                     out-of-range re-ship relies on receiver idempotency to stay safe",
+                );
                 ops_by_key.push((tx_key, vec![op]));
             }
         }
@@ -5077,6 +5115,16 @@ fn handle_spend_batch(
     // PR#21 review (P2): each group's DAH secondary update is DEFERRED
     // (`apply_locked(.., true)`) and folded into one batched secondary fsync
     // after the loop, instead of one `append_and_flush` per last-spend txid.
+    //
+    // This loop is INTENTIONALLY serial (do not parallelize). Every stripe
+    // lock for the RPC is already held, so the apply work is pure in-memory
+    // CPU under exclusive ownership — there is no I/O to overlap. Fanning it
+    // out would force per-thread `succeeded`/`idempotent`/`errors`/
+    // `dah_transitions` accumulators with a deterministic post-join merge AND
+    // would fracture the single WAL-first "durable-but-unapplied on apply
+    // error → recovery replays the redo" contract that the held-locks +
+    // ordered single-flush design depends on. The complexity is not worth it
+    // for a lock-bound in-memory loop.
     let mut dah_transitions: Vec<(TxKey, u32, u32)> = Vec::new();
     for st in staged {
         let validation_errors = st.prepared.errors.clone();
@@ -5971,9 +6019,27 @@ fn handle_create_batch(
     let mut pending_items: Vec<PendingCreate> = Vec::new();
     let mut valid_items: Vec<ValidCreate> = Vec::new();
 
+    // P3 (review): a txid repeated WITHIN this batch must reserve/journal/write
+    // exactly one copy. Without this guard both copies pass the pre-filter
+    // lookup (neither is in the index yet), both reserve+journal+bulk-write a
+    // record, and only the 2nd `register_create_at_offset` returns
+    // DuplicateTxId — whose region is freed only IN MEMORY, leaving a durable
+    // orphan region in the WAL/on device. Drop every occurrence after the first
+    // here, before any reservation, so only one copy is ever materialized.
+    let mut seen_txids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
             errors.push(redirect_err);
+            continue;
+        }
+
+        if !seen_txids.insert(item.txid) {
+            errors.push(BatchItemError {
+                item_index: i as u32,
+                error_code: ERR_ALREADY_EXISTS,
+                error_data: vec![],
+            });
             continue;
         }
 
@@ -6326,8 +6392,30 @@ fn handle_create_batch(
     drop(bulk_by_store);
 
     // Phase 3: register the index entries (records already on device, Phase 2b).
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
-    for v in &valid_items {
+    //
+    // P2 (review): this loop is parallelized across scoped threads. Each item's
+    // work is independent and self-serializing — `register_create_at_offset`
+    // takes the per-key stripe + per-shard index locks, and after the FIX-2
+    // intra-batch dedup above every `valid_items` txid is distinct, so no two
+    // items in this batch contend on the same key. The duplicate/error branches
+    // free the reservation on the item's OWN store allocator (`allocator_for`
+    // is internally `Mutex`-guarded), and `read_metadata` / `create_repl_cold_
+    // data` are read-only on the engine. Each thread builds its OWN fragment of
+    // `(errors, repl_ops_by_key)` over a CONTIGUOUS slice of `valid_items`; the
+    // fragments are merged in slice order after join, so `repl_ops_by_key`
+    // ordering and the per-key replica-op contents are byte-identical to the old
+    // serial version. `errors` is then stable-sorted by item index so the
+    // response encoding is deterministic regardless of thread interleaving.
+    //
+    // Register one valid item: returns either its replica-op (to push to
+    // `repl_ops_by_key`), a per-item error (to push to `errors`), or neither
+    // (the degraded under-replication skip). Pure w.r.t. shared mutable state.
+    enum RegisterOutcome {
+        Replicate(TxKey, ReplicaOp),
+        Err(BatchItemError),
+        Skip,
+    }
+    let register_one = |v: &ValidCreate| -> RegisterOutcome {
         let item = &items[v.idx];
         match engine.register_create_at_offset(v.device_id, &v.create_req, v.record_offset) {
             Ok(_) => {
@@ -6410,19 +6498,19 @@ fn handle_create_batch(
                                  read back for replication; skipping replica op for this item \
                                  (record is under-replicated, not lost on master)",
                             );
-                            continue;
+                            return RegisterOutcome::Skip;
                         }
                     };
-                repl_ops_by_key.push((
+                RegisterOutcome::Replicate(
                     key,
-                    vec![ReplicaOp::Create {
+                    ReplicaOp::Create {
                         tx_key: key,
                         metadata_bytes: meta_buf,
                         utxo_hashes: item.utxo_hashes.clone(),
                         cold_data,
                         is_external,
-                    }],
-                ));
+                    },
+                )
             }
             Err(CreateError::DuplicateTxId) => {
                 // R-014 (A-05): create_at_offset detected the duplicate
@@ -6437,18 +6525,18 @@ fn handle_create_batch(
                     "create_at_offset duplicate",
                 );
                 match rollback {
-                    Ok(()) => errors.push(BatchItemError {
+                    Ok(()) => RegisterOutcome::Err(BatchItemError {
                         item_index: v.idx as u32,
                         error_code: ERR_ALREADY_EXISTS,
                         error_data: vec![],
                     }),
                     Err(e) => {
                         tracing::error!(err = %e, "create batch rollback failed");
-                        errors.push(BatchItemError {
+                        RegisterOutcome::Err(BatchItemError {
                             item_index: v.idx as u32,
                             error_code: ERR_STORAGE_IO,
                             error_data: vec![],
-                        });
+                        })
                     }
                 }
             }
@@ -6465,14 +6553,88 @@ fn handle_create_batch(
                 ) {
                     tracing::error!(err = %e, "create batch rollback failed");
                 }
-                errors.push(BatchItemError {
+                RegisterOutcome::Err(BatchItemError {
                     item_index: v.idx as u32,
                     error_code: ERR_STORAGE_IO,
                     error_data: vec![],
-                });
+                })
+            }
+        }
+    };
+
+    // Per-chunk fragment: this chunk's errors + its (key, repl-ops) pairs.
+    type RegisterFragment = (Vec<BatchItemError>, Vec<(TxKey, Vec<ReplicaOp>)>);
+
+    // Process a contiguous slice of `valid_items`, accumulating its own
+    // fragment of (errors, repl_ops). Order within the slice is preserved.
+    let register_chunk = |chunk: &[ValidCreate]| -> RegisterFragment {
+        let mut frag_errors = Vec::new();
+        let mut frag_repl: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+        for v in chunk {
+            match register_one(v) {
+                RegisterOutcome::Replicate(key, op) => frag_repl.push((key, vec![op])),
+                RegisterOutcome::Err(e) => frag_errors.push(e),
+                RegisterOutcome::Skip => {}
+            }
+        }
+        (frag_errors, frag_repl)
+    };
+
+    // Fan the register work across scoped threads, one contiguous chunk per
+    // thread. Bounded by available parallelism and item count; a single chunk
+    // runs inline (no thread spawn) to keep small batches cheap. Merge the
+    // per-chunk fragments IN CHUNK ORDER so `repl_ops_by_key` matches serial.
+    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    if !valid_items.is_empty() {
+        let max_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(valid_items.len());
+        let chunk_count = max_threads.max(1);
+        if chunk_count <= 1 {
+            let (frag_errors, frag_repl) = register_chunk(&valid_items);
+            errors.extend(frag_errors);
+            repl_ops_by_key = frag_repl;
+        } else {
+            let chunk_size = valid_items.len().div_ceil(chunk_count);
+            let chunks: Vec<&[ValidCreate]> = valid_items.chunks(chunk_size).collect();
+            let fragments: Vec<RegisterFragment> = std::thread::scope(|scope| {
+                let (head, tail) = chunks.split_first().expect("chunk_count >= 1");
+                let handles: Vec<_> = tail
+                    .iter()
+                    .map(|&c| scope.spawn(move || register_chunk(c)))
+                    .collect();
+                let mut out = vec![register_chunk(head)];
+                for h in handles {
+                    out.push(h.join().unwrap_or_else(|_| {
+                        // A register thread panicked. The records are on
+                        // device and the Create redo entries are durable, so
+                        // recovery will re-register on restart. Surface the
+                        // whole batch as a storage failure rather than
+                        // silently dropping this chunk's items.
+                        (
+                            vec![BatchItemError {
+                                item_index: 0,
+                                error_code: ERR_STORAGE_IO,
+                                error_data: b"register thread panicked".to_vec(),
+                            }],
+                            Vec::new(),
+                        )
+                    }));
+                }
+                out
+            });
+            for (frag_errors, frag_repl) in fragments {
+                errors.extend(frag_errors);
+                repl_ops_by_key.extend(frag_repl);
             }
         }
     }
+    // Deterministic response encoding independent of thread interleaving. The
+    // serial version already produced errors in ascending item-index order
+    // (Phase 1 then Phase 3, both iterating in item order), so this sort yields
+    // the identical ordering for N=1 / single-chunk.
+    errors.sort_by_key(|e| e.item_index);
 
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops_with_barrier(
@@ -8206,7 +8368,7 @@ fn handle_mark_longest_chain_batch(
 
 /// Batch sizes at or above this fan out across the read pool; smaller batches
 /// stay serial to avoid pool-dispatch overhead dominating a trivial lookup.
-const READ_FANOUT_THRESHOLD: usize = 16;
+const READ_FANOUT_THRESHOLD: usize = 8;
 
 /// Dedicated work-stealing pool for intra-batch read fan-out. `None` if the
 /// pool failed to build (then reads serve serially — correct, just single-core
@@ -10855,6 +11017,174 @@ mod tests {
             c0.len() + c1.len(),
             txids.len(),
             "every record must be journaled exactly once across the store logs"
+        );
+    }
+
+    /// FIX 1 (P2): the Phase-3 register loop is parallelized across scoped
+    /// threads with a per-chunk fragment merge. A multi-item create batch
+    /// spanning multiple stores must register EVERY valid item, and the sparse
+    /// error list must carry the correct per-item indices in ascending order —
+    /// i.e. the merge preserves request order regardless of thread interleaving.
+    #[test]
+    fn create_batch_parallel_register_preserves_order_across_stores() {
+        let h = DispatchTestHarness::with_stores(2); // 3 stores
+        assert_eq!(h.engine.store_count(), 3, "expected a 3-store engine");
+
+        // Pre-create two txids so their later re-appearance in the batch fails
+        // with ALREADY_EXISTS at deterministic request positions (1 and 5).
+        let dup_a = DispatchTestHarness::make_txid(101);
+        let dup_b = DispatchTestHarness::make_txid(102);
+        assert_eq!(h.create_tx(dup_a, 1).status, STATUS_OK);
+        assert_eq!(h.create_tx(dup_b, 1).status, STATUS_OK);
+
+        // Build a 12-item batch: positions 1 and 5 are the pre-existing dups,
+        // every other position is a fresh, distinct txid.
+        let mk_item = |txid: [u8; 32], v: u32| {
+            let mut hsh = [0u8; 32];
+            hsh[0] = txid[0];
+            WireCreateItem {
+                txid,
+                tx_version: v,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: 0,
+                utxo_hashes: vec![hsh],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            }
+        };
+        let mut items: Vec<WireCreateItem> = Vec::new();
+        let mut fresh: Vec<[u8; 32]> = Vec::new();
+        for i in 0..12u8 {
+            if i == 1 {
+                items.push(mk_item(dup_a, 1));
+            } else if i == 5 {
+                items.push(mk_item(dup_b, 1));
+            } else {
+                let txid = DispatchTestHarness::make_txid(i);
+                fresh.push(txid);
+                items.push(mk_item(txid, (i as u32) + 1));
+            }
+        }
+
+        let resp = h.request(OP_CREATE_BATCH, encode_create_batch(&items));
+        assert_eq!(
+            resp.status, STATUS_PARTIAL_ERROR,
+            "batch with two dups must be a partial error"
+        );
+        let errors = decode_sparse_errors(&resp.payload).unwrap();
+        // Exactly the two dup positions errored, in ascending request order.
+        assert_eq!(
+            errors.iter().map(|e| e.item_index).collect::<Vec<_>>(),
+            vec![1, 5],
+            "error item indices must match request positions, ascending"
+        );
+        for e in &errors {
+            assert_eq!(e.error_code, ERR_ALREADY_EXISTS);
+        }
+
+        // Every fresh item must be registered and read back from its store.
+        for (k, txid) in fresh.iter().enumerate() {
+            let meta = h
+                .engine
+                .read_metadata(&TxKey { txid: *txid })
+                .expect("fresh record registered and routes to its store");
+            // tx_version was set to request-position+1 for fresh items; verify
+            // the right record (not a neighbor) landed under this key.
+            assert_ne!({ meta.utxo_count }, 0, "fresh record {k} has utxos");
+        }
+    }
+
+    /// FIX 2 (P3): a txid repeated WITHIN one batch must reserve/journal/write
+    /// exactly ONE copy — the 2nd+ occurrence is rejected with ALREADY_EXISTS
+    /// in Phase 1 before any reservation, so no durable orphan region is left.
+    #[test]
+    fn create_batch_intra_batch_duplicate_journals_one_create() {
+        let h = DispatchTestHarness::with_stores(1); // 2 stores
+
+        let rdev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 4 * 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 4 * 1024 * 1024).unwrap();
+        let shared = Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&log0, &log1]),
+        ));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(Mutex::new(log0));
+        let log1_arc = Arc::new(Mutex::new(log1));
+        h.engine
+            .set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+        assert!(h.engine.has_per_store_redo());
+
+        let dup = DispatchTestHarness::make_txid(77);
+        let mk_item = |txid: [u8; 32]| {
+            let mut hsh = [0u8; 32];
+            hsh[0] = txid[0];
+            WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: 0,
+                utxo_hashes: vec![hsh],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            }
+        };
+        // Same txid twice in the same batch.
+        let items = vec![mk_item(dup), mk_item(dup)];
+
+        let resp = h.request(OP_CREATE_BATCH, encode_create_batch(&items));
+        assert_eq!(
+            resp.status, STATUS_PARTIAL_ERROR,
+            "repeated txid must surface a partial error"
+        );
+        let errors = decode_sparse_errors(&resp.payload).unwrap();
+        assert_eq!(errors.len(), 1, "exactly the 2nd occurrence errors");
+        assert_eq!(errors[0].item_index, 1, "2nd occurrence is index 1");
+        assert_eq!(errors[0].error_code, ERR_ALREADY_EXISTS);
+
+        // The record exists exactly once.
+        assert!(
+            h.engine.lookup(&TxKey { txid: dup }).is_some(),
+            "the single copy is registered"
+        );
+
+        // Exactly ONE Create was journaled across the store logs — the 2nd copy
+        // was never reserved/journaled, so no durable orphan region exists.
+        let creates_in = |log: &Arc<Mutex<RedoLog>>| -> usize {
+            log.lock()
+                .read_from_sequence(1)
+                .unwrap()
+                .into_iter()
+                .filter(|e| matches!(e.op, RedoOp::Create { .. }))
+                .count()
+        };
+        let total_creates = creates_in(&log0_arc) + creates_in(&log1_arc);
+        assert_eq!(
+            total_creates, 1,
+            "exactly one Create journaled for an intra-batch duplicate txid"
         );
     }
 

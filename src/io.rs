@@ -67,6 +67,16 @@ pub type Result<T> = std::result::Result<T, DeviceError>;
 /// Initialized lazily on first use. Stripe count: 65_536 (matches
 /// `StripedLocks` default), giving an expected false-sharing rate
 /// below 0.002% for typical record cardinalities.
+///
+/// MULTI-STORE NOTE: this table is keyed by `record_offset` ONLY — the
+/// `_direct` helpers carry no device/store identity — so under multiple
+/// stores the SAME offset on two different stores false-shares one stripe.
+/// This is harmless: it can only cause spurious serialization of two
+/// genuinely independent records (never a wrong result, since the guard's
+/// sole job is mutual exclusion). It cannot deadlock either:
+/// `write_records_coalesced` locks the stripes it needs in globally-sorted
+/// order (see its `stripes.sort_unstable()`), so two concurrent cross-store
+/// writers always acquire shared stripes in the same total order.
 fn io_locks() -> &'static StripedRwLocks {
     static LOCKS: std::sync::OnceLock<StripedRwLocks> = std::sync::OnceLock::new();
     LOCKS.get_or_init(|| StripedRwLocks::new(65_536))
