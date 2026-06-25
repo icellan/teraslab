@@ -1333,6 +1333,15 @@ impl Engine {
         // its guard across check + insert + count mutation + resize.
         let index_shard = self.index.index_shard_for_key(&key);
         let mut guard = self.index.write_shard_at(index_shard);
+        // Observability: count writers inside the sharded primary-index insert
+        // critical section. The gauge previously fired only in the secondary
+        // (DAH/unmined) commits, which are serialized by a single per-index
+        // Mutex and so never read above 1 — and create skipped them entirely
+        // when `unmined_since == 0` (block_height 0), leaving the scaling test's
+        // gauge_max stuck at 0. Held per-SHARD here, concurrent creators on
+        // different shards overlap, so the high-water mark reflects real
+        // sharded-create parallelism. Guard drops with the function scope.
+        let _writer_gauge = crate::metrics::writer_enter();
         // Reject-not-overwrite: the only safe insert-if-absent is a
         // check under the same write lock that performs the insert.
         if guard.lookup_checked(&key)?.is_some() {
@@ -1810,12 +1819,69 @@ impl Engine {
     ///
     /// The lock is released when the `ValidatedSpend` is dropped (without
     /// applying) or consumed by [`ValidatedSpend::apply`] (after writing).
+    ///
+    /// Thin wrapper over [`Self::prepare_spend_multi`]: acquires the stripe
+    /// lock and binds it to the returned guard. The batched spend path
+    /// (`handle_spend_batch`) holds the stripe locks for the whole RPC
+    /// externally and calls `prepare_spend_multi` directly.
     pub fn validate_spend_multi<'a>(
         &'a self,
         req: &SpendMultiRequest,
     ) -> Result<ValidatedSpend<'a>, SpendError> {
         let guard = self.locks.lock(&req.tx_key);
+        let p = self.prepare_spend_multi(req)?;
+        Ok(ValidatedSpend {
+            _guard: guard,
+            tx_key: p.tx_key,
+            valid_spends: p.valid_spends,
+            errors: p.errors,
+            spent_count: p.spent_count,
+            idempotent_count: p.idempotent_count,
+            pre_generation: p.pre_generation,
+            block_ids: p.block_ids,
+            record_offset: p.record_offset,
+            metadata: p.metadata,
+            current_block_height: p.current_block_height,
+            block_height_retention: p.block_height_retention,
+        })
+    }
 
+    /// Acquire the per-transaction stripe locks for `keys`, deduplicated and
+    /// sorted, returning the held guards.
+    ///
+    /// The batched spend path uses this to hold every distinct stripe lock for
+    /// an RPC across a single WAL flush while preserving per-txid validate→apply
+    /// atomicity. Deduplication is mandatory — distinct txids can hash to the
+    /// same stripe and the per-stripe `Mutex` is not reentrant; sorting the
+    /// unique indices establishes the **global stripe-lock acquisition order**
+    /// (ascending stripe index) that makes concurrent multi-stripe acquirers
+    /// deadlock-free. Each guard is bound to `&self`, so the returned `Vec`
+    /// must be dropped (locks released) by the caller, which it should do
+    /// before any network I/O (e.g. replication).
+    pub fn lock_unique_stripes(&self, keys: &[TxKey]) -> Vec<parking_lot::MutexGuard<'_, ()>> {
+        let mut idxs: Vec<usize> = keys.iter().map(|k| self.locks.stripe_index(k)).collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        idxs.into_iter().map(|i| self.locks.lock_index(i)).collect()
+    }
+
+    /// Validate a batch of spends WITHOUT acquiring the per-transaction lock
+    /// and WITHOUT applying — returns a guard-free [`PreparedSpend`].
+    ///
+    /// # Caller contract
+    /// The caller MUST already hold the stripe lock for `req.tx_key` (via
+    /// [`crate::locks::StripedLocks::lock`] / [`Self::lock_unique_stripes`])
+    /// across the whole validate → write-redo → apply window. This exists for
+    /// the batched spend path, which acquires every distinct stripe lock for
+    /// the RPC ONCE up front (deduplicated + sorted) and holds them across a
+    /// single WAL flush, then applies every group — preserving WAL-first
+    /// ordering and per-txid validate→apply atomicity with one fsync per RPC
+    /// instead of one per txid-group. The single-spend path uses
+    /// [`Self::validate_spend_multi`], which takes the lock for you.
+    pub fn prepare_spend_multi(
+        &self,
+        req: &SpendMultiRequest,
+    ) -> Result<PreparedSpend, SpendError> {
         // 1. Index lookup
         let entry = self
             .index
@@ -1852,8 +1918,7 @@ impl Engine {
         // Handle empty spends list
         if req.spends.is_empty() {
             let block_ids = collect_block_ids(&metadata).to_vec();
-            return Ok(ValidatedSpend {
-                _guard: guard,
+            return Ok(PreparedSpend {
                 tx_key: req.tx_key,
                 valid_spends: Vec::new(),
                 errors: BTreeMap::new(),
@@ -2030,8 +2095,7 @@ impl Engine {
 
         let block_ids = collect_block_ids(&metadata).to_vec();
 
-        Ok(ValidatedSpend {
-            _guard: guard,
+        Ok(PreparedSpend {
             tx_key: req.tx_key,
             valid_spends,
             errors,
@@ -3213,7 +3277,40 @@ impl Engine {
         req: &CreateRequest,
         record_offset: u64,
     ) -> Result<CreateResponse, CreateError> {
-        self.create_at_offset_inner(req, record_offset, None)
+        self.create_at_offset_inner(req, record_offset, None, false)
+    }
+
+    /// Variant of [`Self::create_at_offset`] that registers the index entry and
+    /// secondary state for a record whose bytes are ALREADY on device, skipping
+    /// the per-record device write.
+    ///
+    /// PERF #9: the batched create dispatch path writes every record's bytes in
+    /// one coalesced pwrite per contiguous run (`io::write_records_coalesced`)
+    /// AFTER the redo flush, then calls this per item to register. The bytes it
+    /// would have written here are byte-identical to that bulk write (both come
+    /// from the same `build_create_record_bytes` layout), so recovery and the
+    /// CreateV2 redo replay are unchanged. The caller MUST have completed the
+    /// bulk device write before calling this.
+    pub fn register_create_at_offset(
+        &self,
+        req: &CreateRequest,
+        record_offset: u64,
+    ) -> Result<CreateResponse, CreateError> {
+        self.create_at_offset_inner(req, record_offset, None, true)
+    }
+
+    /// PERF #9: write a batch of pre-built record byte images to device,
+    /// coalescing physically contiguous reservation slots into one aligned
+    /// pwrite per run. `records` is `(record_offset, slot_size, record_bytes)`.
+    /// Holds the per-record torn-read write guards across each run (see
+    /// [`crate::io::write_records_coalesced`]). The caller must invoke this
+    /// AFTER the redo flush and BEFORE registering the index entries.
+    pub fn write_records_bulk(&self, records: &[(u64, u64, &[u8])]) -> Result<(), CreateError> {
+        crate::io::write_records_coalesced(&*self.device, records).map_err(|e| {
+            CreateError::StorageError {
+                detail: format!("bulk record write: {e}"),
+            }
+        })
     }
 
     /// Variant of [`Self::create_at_offset`] that verifies the caller's
@@ -3230,7 +3327,7 @@ impl Engine {
         record_offset: u64,
         expected_total_size: u64,
     ) -> Result<CreateResponse, CreateError> {
-        self.create_at_offset_inner(req, record_offset, Some(expected_total_size))
+        self.create_at_offset_inner(req, record_offset, Some(expected_total_size), false)
     }
 
     fn create_at_offset_inner(
@@ -3238,6 +3335,10 @@ impl Engine {
         req: &CreateRequest,
         record_offset: u64,
         expected_total_size: Option<u64>,
+        // PERF #9: when true the record bytes were already written to device by
+        // a coalesced bulk write, so skip the per-record device write here and
+        // only register the index entry + secondary state.
+        skip_device_write: bool,
     ) -> Result<CreateResponse, CreateError> {
         let utxo_count = req.utxo_hashes.len() as u32;
         if utxo_count == 0 {
@@ -3356,7 +3457,14 @@ impl Engine {
             })
             .collect();
 
-        self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+        // PERF #9: skip the per-record device write when the caller already
+        // wrote the bytes in a coalesced bulk write. `cold_data`/`meta`/`slots`
+        // are still built above because the index entry below is derived from
+        // `meta`; the bytes the bulk write put on device are byte-identical to
+        // what this call would have written (same build path).
+        if !skip_device_write {
+            self.write_full_record_with_cold(record_offset, &meta, &slots, &cold_data)?;
+        }
 
         let index_entry = TxIndexEntry {
             device_id: 0,
@@ -6764,11 +6872,82 @@ impl<'a> ValidatedSpend<'a> {
     /// (WAL-first pattern), but the metadata footer update is skipped and
     /// the per-transaction lock is released on return. The operator must
     /// correct the config; the redo log will re-drive recovery.
+    // NOTE: the tracing span lives on `PreparedSpend::apply_locked` (the actual
+    // mutation), so both this wrapper and the batched dispatch path that calls
+    // `apply_locked` directly emit one consistent "apply_locked" span under the
+    // current (dispatch / spend_multi) span.
     #[must_use = "apply returns the operation response including per-item errors"]
-    #[tracing::instrument(level = "debug", skip_all)]
     pub fn apply(self, engine: &Engine) -> Result<SpendMultiResponse, SpendError> {
+        // Hand off to the guard-free core. `_guard` stays bound in this scope
+        // and is released only when it drops at the end of this function —
+        // i.e. AFTER `apply_locked` returns — preserving the original ordering
+        // (the per-transaction stripe lock is held across every device write).
         let ValidatedSpend {
             _guard,
+            tx_key,
+            valid_spends,
+            errors,
+            spent_count,
+            idempotent_count,
+            pre_generation,
+            block_ids,
+            record_offset,
+            metadata,
+            current_block_height,
+            block_height_retention,
+        } = self;
+        PreparedSpend {
+            tx_key,
+            valid_spends,
+            errors,
+            spent_count,
+            idempotent_count,
+            pre_generation,
+            block_ids,
+            record_offset,
+            metadata,
+            current_block_height,
+            block_height_retention,
+        }
+        // Single-spend path: commit the DAH inline (defer_dah = false); the
+        // returned transition is always None here.
+        .apply_locked(engine, false)
+        .map(|(resp, _dah)| resp)
+    }
+}
+
+impl PreparedSpend {
+    /// Apply a validated spend batch whose per-transaction stripe lock the
+    /// CALLER holds — the guard-free twin of [`ValidatedSpend::apply`].
+    ///
+    /// The batched spend path acquires every distinct stripe lock for the RPC
+    /// up front (deduplicated + sorted) and holds them across a single WAL
+    /// flush, then calls this for each txid group. The caller MUST keep
+    /// `tx_key`'s stripe lock held across this call (and the preceding redo
+    /// flush) — that is the WAL-first + per-txid validate→apply atomicity
+    /// contract `ValidatedSpend` otherwise enforces via its embedded guard.
+    ///
+    /// When `defer_dah` is true the DAH secondary-index update is NOT applied
+    /// here; instead the `(old_dah, new_dah)` transition (if any) is returned so
+    /// the batched caller can fold every group's `SecondaryDahUpdate` intent
+    /// into ONE `append_batch_and_flush` (via [`Self::commit_dah_batch`]),
+    /// turning K serialized secondary fsyncs into one. The single-spend path
+    /// passes `false` and commits the DAH inline as before. Either way the
+    /// metadata's `delete_at_height` is written here, and recovery reconciles
+    /// the DAH index from the (durable) primary metadata for every touched key,
+    /// so deferring the secondary flush cannot lose a DAH-index entry.
+    ///
+    /// # Errors
+    /// Same as [`ValidatedSpend::apply`]: [`SpendError::DahOverflow`] /
+    /// [`SpendError::StorageError`] on misconfiguration or device I/O failure.
+    #[must_use = "apply returns the operation response including per-item errors"]
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub fn apply_locked(
+        self,
+        engine: &Engine,
+        defer_dah: bool,
+    ) -> Result<(SpendMultiResponse, Option<(u32, u32)>), SpendError> {
+        let PreparedSpend {
             tx_key,
             valid_spends,
             errors,
@@ -6789,14 +6968,16 @@ impl<'a> ValidatedSpend<'a> {
 
         if spent_count == 0 {
             let generation = { metadata.generation };
-            drop(_guard);
-            return Ok(SpendMultiResponse {
-                signal: Signal::None,
-                block_ids,
-                errors,
-                spent_count,
-                generation,
-            });
+            return Ok((
+                SpendMultiResponse {
+                    signal: Signal::None,
+                    block_ids,
+                    errors,
+                    spent_count,
+                    generation,
+                },
+                None,
+            ));
         }
 
         // 6. Batch write all valid slot mutations (zero-alloc when direct).
@@ -6859,10 +7040,9 @@ impl<'a> ValidatedSpend<'a> {
         if !engine.device_ptr.is_null() {
             // SAFETY: `engine.device_ptr` is non-null (checked above) and
             // live for the engine's lifetime; `record_offset` is
-            // allocator-valid. This spend `apply` still holds the record's
-            // stripe lock (`_guard`, captured at prepare time);
-            // `write_metadata_direct` takes the per-offset `io_locks()` write
-            // side for torn-read-safe publication.
+            // allocator-valid. The caller holds the record's stripe lock
+            // across this guard-free apply; `write_metadata_direct` takes the
+            // per-offset `io_locks()` write side for torn-read-safe publication.
             unsafe { io::write_metadata_direct(engine.device_ptr, record_offset, &metadata) };
         } else {
             engine.write_metadata_fast(record_offset, &metadata)?;
@@ -6870,22 +7050,95 @@ impl<'a> ValidatedSpend<'a> {
 
         engine.sync_index_cache(&tx_key, &metadata)?;
 
-        // 10. Update DAH secondary index (two-phase durable)
+        // 10. Update the DAH secondary index (two-phase durable). When the
+        // caller asked to defer (batched spend path), return the transition so
+        // it can fold every group's SecondaryDahUpdate intent into one fsync;
+        // otherwise commit it inline as the single-spend path always has.
         let new_dah = { metadata.delete_at_height };
-        engine.update_dah_index(&tx_key, old_dah, new_dah)?;
+        let dah_transition = if defer_dah {
+            if old_dah != new_dah {
+                Some((old_dah, new_dah))
+            } else {
+                None
+            }
+        } else {
+            engine.update_dah_index(&tx_key, old_dah, new_dah)?;
+            None
+        };
 
-        // _guard dropped here, releasing the per-transaction stripe lock.
-        drop(_guard);
+        // The per-transaction stripe lock is the caller's (held across this
+        // guard-free apply); it is released by the caller after this returns.
 
         // Reuse block_ids from validation — block entries don't change
         // during spend (only spent_utxos, generation, updated_at, DAH).
-        Ok(SpendMultiResponse {
-            signal,
-            block_ids,
-            errors,
-            spent_count,
-            generation: { metadata.generation },
-        })
+        Ok((
+            SpendMultiResponse {
+                signal,
+                block_ids,
+                errors,
+                spent_count,
+                generation: { metadata.generation },
+            },
+            dah_transition,
+        ))
+    }
+
+    /// Fold a whole spend RPC's DAH secondary-index updates into ONE redo
+    /// fsync, then commit each redb transaction.
+    ///
+    /// `transitions` is `(tx_key, old_dah, new_dah)` for every group whose
+    /// `delete_at_height` changed (collected from [`Self::apply_locked`] with
+    /// `defer_dah = true`). Phase 1 appends every `SecondaryDahUpdate` intent
+    /// and flushes once (vs one `append_and_flush` per last-spend txid); Phase 2
+    /// commits the redb side with the intent already durable. Mirrors
+    /// `update_both_secondary_indexes`, extended across many keys.
+    pub fn commit_dah_batch(
+        engine: &Engine,
+        transitions: &[(TxKey, u32, u32)],
+    ) -> Result<(), SpendError> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let log_arc = engine.redo_log_handle();
+
+        // Phase 1: ONE fsync covering every group's SecondaryDahUpdate intent.
+        if let Some(ref log) = log_arc {
+            let ops: Vec<crate::redo::RedoOp> = transitions
+                .iter()
+                .map(
+                    |&(tx_key, old_height, new_height)| crate::redo::RedoOp::SecondaryDahUpdate {
+                        tx_key,
+                        old_height,
+                        new_height,
+                    },
+                )
+                .collect();
+            log.lock()
+                .append_batch_and_flush(&ops)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("dah batch append_and_flush: {e}"),
+                })?;
+        }
+
+        // Phase 2: commit each redb DAH transaction (intent already durable, so
+        // pass no log — recovery reconciles from primary metadata regardless).
+        let mut dah = engine.dah_index.lock();
+        let _writer_gauge = crate::metrics::writer_enter();
+        for &(tx_key, old_height, new_height) in transitions {
+            if old_height != 0 {
+                dah.remove(&tx_key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("dah secondary remove (batched): {e}"),
+                    })?;
+            }
+            if new_height != 0 {
+                dah.insert(new_height, tx_key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("dah secondary insert (batched): {e}"),
+                    })?;
+            }
+        }
+        Ok(())
     }
 }
 

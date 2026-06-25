@@ -208,3 +208,65 @@ impl<'a> ValidatedSpend<'a> {
         self.idempotent_count
     }
 }
+
+/// A validated spend batch WITHOUT its per-transaction lock guard.
+///
+/// This is the guard-free twin of [`ValidatedSpend`]. The single-spend path
+/// uses `ValidatedSpend`, which owns the stripe [`parking_lot::MutexGuard`] and
+/// ties validate→apply atomicity to its own lifetime. The batched spend path
+/// (`handle_spend_batch`) instead acquires every distinct stripe lock ONCE up
+/// front (deduplicated + sorted via [`crate::locks::StripedLocks::lock_index`])
+/// and holds them across a single WAL flush for the whole RPC; it therefore
+/// validates and applies through `PreparedSpend`, whose atomicity is the
+/// caller's externally-held stripe guard rather than an embedded one.
+///
+/// Field semantics mirror [`ValidatedSpend`] exactly — only the guard is
+/// absent. Produced by [`crate::ops::engine::Engine::prepare_spend_multi`] and
+/// consumed by `PreparedSpend::apply_locked`.
+pub struct PreparedSpend {
+    /// Transaction key being spent.
+    pub tx_key: TxKey,
+    /// Validated spend operations: (slot_offset, new_slot_state).
+    pub(crate) valid_spends: Vec<(u32, UtxoSlot)>,
+    /// Per-item errors from validation (idx → error), sorted by idx.
+    pub errors: BTreeMap<u32, SpendError>,
+    /// Number of UTXOs that will actually change state.
+    pub spent_count: u32,
+    /// Number of valid items that were idempotent no-op re-spends.
+    pub idempotent_count: u32,
+    /// Record generation BEFORE this mutation.
+    pub pre_generation: u32,
+    /// Block IDs currently on the record.
+    pub block_ids: Vec<u32>,
+    /// Record offset on the block device.
+    pub(crate) record_offset: u64,
+    /// Metadata read during validation.
+    pub(crate) metadata: TxMetadata,
+    /// Request param: current block height (DAH evaluation).
+    pub(crate) current_block_height: u32,
+    /// Request param: block height retention (DAH evaluation).
+    pub(crate) block_height_retention: u32,
+}
+
+impl PreparedSpend {
+    /// Record's `spent_utxos` counter BEFORE this mutation. See
+    /// [`ValidatedSpend::pre_spent_count`].
+    pub fn pre_spent_count(&self) -> u32 {
+        #[allow(clippy::let_and_return)]
+        {
+            let count = self.metadata.spent_utxos;
+            count
+        }
+    }
+
+    /// `(slot_offset, new_slot)` transitions that passed validation. See
+    /// [`ValidatedSpend::transitions`].
+    pub fn transitions(&self) -> &[(u32, UtxoSlot)] {
+        &self.valid_spends
+    }
+
+    /// Number of no-op successes observed during validation.
+    pub fn idempotent_count(&self) -> u32 {
+        self.idempotent_count
+    }
+}

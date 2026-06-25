@@ -255,8 +255,24 @@ pub trait BlockDevice: Send + Sync {
     /// Total usable size in bytes.
     fn size(&self) -> u64;
 
-    /// Sync all pending writes to stable storage.
+    /// Sync all pending writes to stable storage (data + file metadata).
     fn sync(&self) -> Result<()>;
+
+    /// Sync pending DATA writes to stable storage, skipping a file-metadata
+    /// flush where the platform allows (Linux `fdatasync`).
+    ///
+    /// Safe to use only when the write did not change anything the next read
+    /// depends on beyond the data itself — in practice, writes into a
+    /// pre-sized region whose file length never changes. The redo log is
+    /// exactly that case (fixed-length, append-into-region), so its hot-path
+    /// flush uses this to avoid the inode-metadata flush on every fsync.
+    ///
+    /// Default: falls back to the full [`Self::sync`]. `DirectDevice`
+    /// overrides it with `File::sync_data` (fdatasync on Linux; on macOS both
+    /// map to `F_FULLFSYNC`, so there is no difference there).
+    fn sync_data(&self) -> Result<()> {
+        self.sync()
+    }
 
     /// Return a raw pointer to the device's memory region, if supported.
     ///
@@ -1118,6 +1134,14 @@ impl BlockDevice for DirectDevice {
 
     fn sync(&self) -> Result<()> {
         self.file.sync_all()?;
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        // `fdatasync` on Linux — skips the inode-metadata flush, which is
+        // unneeded for writes into a pre-sized region (the file length never
+        // changes). On macOS this maps to `F_FULLFSYNC`, same as `sync_all`.
+        self.file.sync_data()?;
         Ok(())
     }
 

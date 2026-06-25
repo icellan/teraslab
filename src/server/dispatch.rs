@@ -2199,6 +2199,35 @@ pub(crate) fn handle_request(
 
 const REDO_GROUP_COMMIT_WINDOW: Duration = Duration::from_micros(200);
 
+/// Group-commit wait applied before flushing a redo write.
+///
+/// The window exists so that, under concurrent load, a thread about to flush
+/// pauses briefly to let other connections' appends land in the shared redo
+/// buffer, coalescing them into a single fsync. That only helps when the write
+/// is small: once a write already carries multiple ops, its fsync is amortized
+/// over them and the fixed `thread::sleep` is pure added latency — the per-call
+/// 200 µs floor (~5000 calls/s/connection) flagged in profiling. Teranode
+/// traffic is always batched (≈742-item CreateBatch RPCs; whole SpendBatch
+/// RPCs after target #2), so those paths skip the wait entirely; only genuine
+/// single-op writes keep it, where coalescing with a concurrent writer is the
+/// one case it can pay off.
+///
+/// NOTE: a fixed sleep is a crude group-commit. The proper fix (no fixed floor
+/// at all, coalescing driven by an in-flight-flush condvar / leader-follower)
+/// is tracked separately; this de-floors the batched paths with zero risk to
+/// the existing single-op coalescing behaviour.
+#[inline]
+fn group_commit_window(ops_len: usize) -> Duration {
+    // Only a genuine single-op write keeps the coalescing wait. Empty writes
+    // (ops_len == 0) never reach the flush, and multi-op writes already
+    // amortize the fsync, so both skip the floor.
+    if ops_len == 1 {
+        REDO_GROUP_COMMIT_WINDOW
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// Append redo ops to the log and flush.
 ///
 /// Returns the sequence number of the last appended entry on success.
@@ -2218,7 +2247,7 @@ fn write_redo_ops(
     redo_log: Option<&Mutex<RedoLog>>,
     ops: &[RedoOp],
 ) -> std::result::Result<(u64, u64), String> {
-    write_redo_ops_with_group_window(redo_log, ops, REDO_GROUP_COMMIT_WINDOW)
+    write_redo_ops_with_group_window(redo_log, ops, group_commit_window(ops.len()))
 }
 
 fn write_redo_ops_with_group_window(
@@ -4759,6 +4788,40 @@ fn handle_spend_batch(
         m.spend_multi_items_attempted.inc_by(items.len() as u64);
     }
 
+    // P2 (PR#21 review): `DahOverflow` is the only NON-catastrophic apply-time
+    // failure, and it is deterministic from the batch params alone
+    // (`current_block_height + block_height_retention`, identical for every
+    // group). Validate it ONCE here, BEFORE any redo is written, so
+    // `apply_locked` cannot fail with `DahOverflow` mid-batch — which, now that
+    // the whole RPC shares one flush, would otherwise leave already-flushed
+    // groups durable-in-WAL but unapplied. A residual apply-time *device* error
+    // (EIO/ENOSPC) is catastrophic and intentionally still surfaces under the
+    // WAL-first contract (its redo is durable; recovery replays it on restart —
+    // see the Phase 4 note); the operator must treat a persistent apply-time
+    // device error as fatal.
+    if params.block_height_retention != 0
+        && params
+            .current_block_height
+            .checked_add(params.block_height_retention)
+            .is_none()
+    {
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(m, OpCode::Spend, items.len() as u64, 0, 0, &[]);
+            m.spends_failed.inc_by(failed);
+            m.spend_multi_items_failed.inc_by(failed);
+        }
+        // Reuse the exact SpendError::DahOverflow message the apply path
+        // produced, so the client-observable error detail (DAH_OVERFLOW…) is
+        // unchanged by moving the check earlier.
+        let detail = crate::ops::error::SpendError::DahOverflow {
+            current_height: params.current_block_height,
+            retention: params.block_height_retention,
+        }
+        .to_string();
+        return error_response(req.request_id, ERR_STORAGE_IO, &detail);
+    }
+
     // Group items by txid for efficient locking
     let mut by_txid: HashMap<[u8; 32], Vec<(usize, &WireSpendItem)>> = HashMap::new();
     for (i, item) in items.iter().enumerate() {
@@ -4776,11 +4839,35 @@ fn handle_spend_batch(
     let mut spend_redo_range: (u64, u64) = (0, 0);
     let mut spend_intent_ranges: Vec<(u64, u64)> = Vec::new();
 
-    // WAL-first ordering: for each txid group we validate under lock,
-    // write redo ops to the WAL (fsync), THEN apply the mutation.
-    // This guarantees that if the process crashes after the engine
-    // mutation, the redo log already has the entry and replicas will
-    // see it during catch-up streaming.
+    // PERF (target #2): make the WHOLE SpendBatch RPC durable with ONE redo
+    // flush — not one per txid-group. Acquire every distinct stripe lock for
+    // the RPC up front (deduplicated + sorted → deadlock-free), validate every
+    // group under those held locks, write ALL groups' redo ops in one batch
+    // (single fsync), then apply every group, then release the locks.
+    //
+    // This preserves WAL-first ordering (redo durable before any apply) and
+    // per-txid validate→apply atomicity (each stripe lock is held across the
+    // whole validate→flush→apply window) while collapsing N fsyncs/RPC to one
+    // and removing N-1 of the per-call group-commit waits. Because many stripe
+    // locks are held at once, validation/apply go through the guard-free
+    // `prepare_spend_multi` / `PreparedSpend::apply_locked`; the single-spend
+    // path's `ValidatedSpend` would re-acquire the stripe lock and self-deadlock
+    // on a stripe collision.
+    let txid_keys: Vec<TxKey> = by_txid.keys().map(|t| TxKey { txid: *t }).collect();
+    let stripe_guards = engine.lock_unique_stripes(&txid_keys);
+
+    // Per-group staged mutation carried from validate (Phase 1+2) to apply
+    // (Phase 4) so the single redo flush (Phase 3) sits between them.
+    struct StagedSpend {
+        key: TxKey,
+        prepared: PreparedSpend,
+        key_repl_ops: Vec<ReplicaOp>,
+    }
+    let mut staged: Vec<StagedSpend> = Vec::new();
+    let mut all_redo_ops: Vec<RedoOp> = Vec::new();
+
+    // Phase 1+2: validate each owned group (guard-free; this fn holds the
+    // stripe locks) and build its redo + replica ops into the shared batch.
     for (txid, group) in &by_txid {
         if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
             for &(i, _) in group {
@@ -4812,8 +4899,9 @@ fn handle_spend_batch(
             block_height_retention: params.block_height_retention,
         };
 
-        // Phase 1: Validate under lock (no disk writes yet).
-        let validated = match engine.validate_spend_multi(&multi_req) {
+        // Validate (no disk writes). Guard-free: the stripe lock for this txid
+        // is already held by `stripe_guards` above.
+        let prepared = match engine.prepare_spend_multi(&multi_req) {
             Ok(v) => v,
             Err(err) => {
                 for &(i, _) in group {
@@ -4823,34 +4911,22 @@ fn handle_spend_batch(
             }
         };
 
-        // Phase 2: Build redo ops for validated items BEFORE mutation.
-        // The post-mutation generation is pre_generation + 1.
-        let error_indices: std::collections::HashSet<u32> =
-            validated.errors.keys().copied().collect();
-        let key = TxKey { txid: *txid };
-        let post_generation = validated.pre_generation.wrapping_add(1);
-
-        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): compute the real
-        // `new_spent_count` for every Spend redo entry BEFORE the redo
-        // flush. Recovery's `replay_spend` overwrites `meta.spent_utxos`
-        // with whatever the entry carries; previously we wrote `0`, so a
-        // crash in the WAL-before-data window would leave the counter
-        // wrong even though the slot transition was correctly replayed.
+        // Build redo ops for the real UNSPENT→SPENT transitions. Semantics are
+        // identical to the original per-group logic — only accumulated across
+        // groups into one batch.
         //
-        // Each redo entry receives the cumulative count AFTER its own
-        // application, computed as `pre_spent + running_transitions`.
-        // The running counter only advances for items that the validator
-        // marked as real UNSPENT→SPENT transitions (in `transitions()`);
-        // idempotent re-spends and validation errors do not bump the
-        // counter, matching what `apply()` will write.
-        let pre_spent_count = validated.pre_spent_count();
-        let transition_offsets: std::collections::HashSet<u32> = validated
-            .transitions()
-            .iter()
-            .map(|(off, _)| *off)
-            .collect();
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): each Spend redo entry
+        // carries the cumulative `new_spent_count` AFTER its own application,
+        // computed from THIS group's pre-spent count, so recovery's
+        // `replay_spend` overwrite lands on the real post-spend count.
+        let error_indices: std::collections::HashSet<u32> =
+            prepared.errors.keys().copied().collect();
+        let key = TxKey { txid: *txid };
+        let post_generation = prepared.pre_generation.wrapping_add(1);
+        let pre_spent_count = prepared.pre_spent_count();
+        let transition_offsets: std::collections::HashSet<u32> =
+            prepared.transitions().iter().map(|(off, _)| *off).collect();
 
-        let mut redo_ops: Vec<RedoOp> = Vec::new();
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
         for &(i, item) in group {
@@ -4859,7 +4935,7 @@ fn handle_spend_batch(
                 // re-spends do not emit redo/replication or bump generation;
                 // they match the single-spend no-op contract.
                 running_count = running_count.wrapping_add(1);
-                redo_ops.push(RedoOp::SpendV2 {
+                all_redo_ops.push(RedoOp::SpendV2 {
                     tx_key: key,
                     offset: item.vout,
                     spending_data: item.spending_data,
@@ -4883,66 +4959,73 @@ fn handle_spend_batch(
             }
         }
 
-        // Phase 3: Write redo BEFORE engine mutation (WAL-first).
-        // Lock is still held via ValidatedSpend, so no concurrent
-        // mutation can interleave.
-        if !redo_ops.is_empty() {
-            match write_replicated_redo_ops(cluster, redo_log, &redo_ops) {
-                Ok(range) => {
-                    if valid_redo_range(range) {
-                        spend_intent_ranges.push(range);
-                    }
-                    if spend_redo_range.0 == 0 && spend_redo_range.1 == 0 {
-                        spend_redo_range = range;
-                    } else if range.1 > 0 {
-                        spend_redo_range.1 = range.1; // Extend the end
-                    }
+        staged.push(StagedSpend {
+            key,
+            prepared,
+            key_repl_ops,
+        });
+    }
+
+    // Phase 3: ONE redo write for the whole RPC (single fsync), WAL-first. All
+    // stripe locks are still held, so no concurrent mutation can interleave.
+    if !all_redo_ops.is_empty() {
+        match write_replicated_redo_ops(cluster, redo_log, &all_redo_ops) {
+            Ok(range) => {
+                if valid_redo_range(range) {
+                    spend_intent_ranges.push(range);
                 }
-                Err(e) => {
-                    // Redo failure: don't apply, return error.
-                    // ValidatedSpend drops here, releasing the lock.
-                    // M-01: `attempted` already ticked for the whole batch;
-                    // classify every item before the early return so the
-                    // storage failure is visible in op metrics. Items from
-                    // this group and any unprocessed group count as
-                    // ErrStorage-failed; prior groups keep their tallies.
-                    if let Some(m) = DISPATCH_METRICS.get() {
-                        use crate::metrics::OpCode;
-                        let failed = tally_storage_abort(
-                            m,
-                            OpCode::Spend,
-                            items.len() as u64,
-                            succeeded,
-                            idempotent,
-                            &errors,
-                        );
-                        m.spends_succeeded.inc_by(succeeded);
-                        m.spends_idempotent.inc_by(idempotent);
-                        m.spends_failed.inc_by(failed);
-                        m.spend_multi_items_succeeded.inc_by(succeeded);
-                        m.spend_multi_items_idempotent.inc_by(idempotent);
-                        m.spend_multi_items_failed.inc_by(failed);
-                    }
-                    return error_response(req.request_id, ERR_STORAGE_IO, &e);
+                spend_redo_range = range;
+            }
+            Err(e) => {
+                // Redo failed: apply NOTHING (the stripe guards drop on
+                // return, releasing the locks). M-01: nothing applied yet, so
+                // every non-error item counts as ErrStorage-failed.
+                if let Some(m) = DISPATCH_METRICS.get() {
+                    use crate::metrics::OpCode;
+                    let failed = tally_storage_abort(
+                        m,
+                        OpCode::Spend,
+                        items.len() as u64,
+                        succeeded,
+                        idempotent,
+                        &errors,
+                    );
+                    m.spends_succeeded.inc_by(succeeded);
+                    m.spends_idempotent.inc_by(idempotent);
+                    m.spends_failed.inc_by(failed);
+                    m.spend_multi_items_succeeded.inc_by(succeeded);
+                    m.spend_multi_items_idempotent.inc_by(idempotent);
+                    m.spend_multi_items_failed.inc_by(failed);
                 }
+                return error_response(req.request_id, ERR_STORAGE_IO, &e);
             }
         }
+    }
 
-        // Phase 4: Apply the mutation (still under lock).
-        // ValidatedSpend is consumed, lock released after write.
-        let validation_errors = validated.errors.clone();
-        idempotent += validated.idempotent_count() as u64;
-        let resp = match validated.apply(engine) {
+    // Phase 4: apply every staged group (stripe locks still held → WAL-first
+    // and per-txid atomicity preserved: redo is already durable, and no other
+    // mutation can touch these txids until the guards drop below).
+    //
+    // PR#21 review (P2): each group's DAH secondary update is DEFERRED
+    // (`apply_locked(.., true)`) and folded into one batched secondary fsync
+    // after the loop, instead of one `append_and_flush` per last-spend txid.
+    let mut dah_transitions: Vec<(TxKey, u32, u32)> = Vec::new();
+    for st in staged {
+        let validation_errors = st.prepared.errors.clone();
+        idempotent += st.prepared.idempotent_count() as u64;
+        let (resp, dah_transition) = match st.prepared.apply_locked(engine, true) {
             Ok(r) => r,
             Err(e) => {
-                // DAH overflow (config misconfiguration) or similar —
-                // surface as ERR_STORAGE_IO rather than silently clamping.
-                // M-01: classify outcomes before the early return. This
-                // group's validation errors keep their real classification;
-                // its would-be transitions and all unprocessed groups count
-                // as ErrStorage-failed. Note `idempotent` already includes
-                // this group (added above) — idempotent items are no-ops,
-                // so the failed apply does not invalidate them.
+                // PR#21 review (P2): `DahOverflow` is pre-validated before the
+                // flush above, so a failure HERE is a catastrophic device error
+                // (EIO/ENOSPC) only. The redo for every group is already durable
+                // (WAL-first), so the contract is: the unapplied groups' redo
+                // replays on restart — the operator must treat a persistent
+                // apply-time device error as fatal and restart (the disk is
+                // failing). We return ERR_STORAGE_IO; guards drop on return.
+                // (Same WAL-first contract as the pre-existing single-group
+                // path; the batched flush only widens which groups are durable-
+                // but-unapplied in this catastrophic window.)
                 for (idx, err) in &validation_errors {
                     errors.push(spend_error_to_batch_error(*idx, err));
                 }
@@ -4967,16 +5050,17 @@ fn handle_spend_batch(
             }
         };
 
-        if !key_repl_ops.is_empty() {
-            repl_ops_by_key.push((key, key_repl_ops));
+        if let Some((old_dah, new_dah)) = dah_transition {
+            dah_transitions.push((st.key, old_dah, new_dah));
         }
 
-        // Tally this group's outcomes before draining the validation
-        // errors: real transitions come from resp.spent_count, and no-op
-        // successes come directly from the validator's idempotent count.
-        // Failed items come from the error map.
-        succeeded += resp.spent_count as u64;
+        if !st.key_repl_ops.is_empty() {
+            repl_ops_by_key.push((st.key, st.key_repl_ops));
+        }
 
+        // Tally this group's outcomes: real transitions from resp.spent_count,
+        // idempotent no-ops already added above, failures from the error map.
+        succeeded += resp.spent_count as u64;
         for (idx, err) in validation_errors {
             errors.push(spend_error_to_batch_error(idx, &err));
         }
@@ -4984,6 +5068,36 @@ fn handle_spend_batch(
         // Use signal/block_ids from resp if needed in the future.
         let _ = resp.signal;
     }
+
+    // Fold every group's DAH secondary-index update into ONE redo fsync (still
+    // under the stripe locks, matching the inline single-spend ordering). On
+    // failure the spends are already applied + durable and recovery reconciles
+    // the DAH index from primary metadata, but we surface ERR_STORAGE_IO to
+    // match the single-spend `update_dah_index` failure contract.
+    if let Err(e) = PreparedSpend::commit_dah_batch(engine, &dah_transitions) {
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(
+                m,
+                OpCode::Spend,
+                items.len() as u64,
+                succeeded,
+                idempotent,
+                &errors,
+            );
+            m.spends_succeeded.inc_by(succeeded);
+            m.spends_idempotent.inc_by(idempotent);
+            m.spends_failed.inc_by(failed);
+            m.spend_multi_items_succeeded.inc_by(succeeded);
+            m.spend_multi_items_idempotent.inc_by(idempotent);
+            m.spend_multi_items_failed.inc_by(failed);
+        }
+        return error_response(req.request_id, ERR_STORAGE_IO, &e.to_string());
+    }
+
+    // Release every stripe lock BEFORE replication (network I/O must not run
+    // under the locks). On the error returns above the guards drop at scope end.
+    drop(stripe_guards);
 
     // Final per-item outcome classification for this batch. `errors` holds
     // validation failures *and* redirect errors (when the txid is not owned
@@ -5772,6 +5886,11 @@ fn handle_create_batch(
         create_req: CreateRequest<'a>,
         record_offset: u64,
         reservation_size: u64,
+        /// PERF #9: the exact on-device record image (== the CreateV2 redo
+        /// bytes). Written to device in one coalesced bulk pwrite per
+        /// contiguous run (Phase 2b) after the redo flush; Phase 3 then only
+        /// registers the index entry.
+        record_bytes: Vec<u8>,
         /// See [`PendingCreate::blob_pin`]; held until after
         /// `create_at_offset` registers the index entry. Never read —
         /// exists purely for its `Drop` (un-pin).
@@ -5978,7 +6097,11 @@ fn handle_create_batch(
             record_offset: region.offset,
             utxo_count: pending.utxo_count,
             is_conflicting: pending.create_req.conflicting,
-            record_bytes: pending.record_bytes,
+            // PERF #9: clone the record image — the original is retained on
+            // ValidCreate for the coalesced bulk device write (Phase 2b). The
+            // redo append serializes its own copy regardless, so this is one
+            // memcpy, not an extra serialize.
+            record_bytes: pending.record_bytes.clone(),
             parent_txids,
         });
         valid_items.push(ValidCreate {
@@ -5986,6 +6109,7 @@ fn handle_create_batch(
             create_req: pending.create_req,
             record_offset: region.offset,
             reservation_size: region.size,
+            record_bytes: pending.record_bytes,
             _blob_pin: pending.blob_pin,
         });
     }
@@ -6017,11 +6141,41 @@ fn handle_create_batch(
         }
     };
 
-    // Phase 3: Apply engine mutations at pre-allocated offsets.
+    // Phase 2b (PERF #9): write every record's bytes to device in ONE coalesced
+    // pwrite per contiguous reservation run, replacing the per-record device
+    // write create_at_offset used to do. WAL-first: this runs AFTER the redo
+    // flush above, so every record's CreateV2 entry is durable first. The bytes
+    // are byte-identical to what create_at_offset would have written, so Phase 3
+    // only has to register the index entries (register_create_at_offset).
+    let bulk_records: Vec<(u64, u64, &[u8])> = valid_items
+        .iter()
+        .map(|v| {
+            (
+                v.record_offset,
+                v.reservation_size,
+                v.record_bytes.as_slice(),
+            )
+        })
+        .collect();
+    if let Err(e) = engine.write_records_bulk(&bulk_records) {
+        // Catastrophic device write failure. The CreateV2 redo entries are
+        // already durable, so startup recovery replays them (writing AND
+        // registering the records); nothing is registered here. Classify every
+        // not-yet-errored item as ErrStorage-failed and fail the request.
+        if let Some(m) = DISPATCH_METRICS.get() {
+            use crate::metrics::OpCode;
+            let failed = tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
+            m.creates_failed.inc_by(failed);
+        }
+        return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
+    }
+    drop(bulk_records);
+
+    // Phase 3: register the index entries (records already on device, Phase 2b).
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     for v in &valid_items {
         let item = &items[v.idx];
-        match engine.create_at_offset(&v.create_req, v.record_offset) {
+        match engine.register_create_at_offset(&v.create_req, v.record_offset) {
             Ok(_) => {
                 let key = TxKey { txid: item.txid };
                 // Serialize full metadata for the replica so a promoted replica
@@ -12455,22 +12609,213 @@ mod tests {
         ranges.sort_by_key(|range| range.0);
 
         assert_eq!(ranges, vec![(1, 1), (2, 2)]);
-        // F-G4-001 made flush() emit two device syncs per effective
-        // flush: one for the entries pwrite and one for the persisted-
-        // header pwrite. Group commit collapses the two concurrent
-        // writers into one effective flush, so the post-open delta is
-        // exactly 2 syncs.
+        // PERF #5: flush() now folds the F-G4-001 header pwrite into the SAME
+        // fsync as the entries (one device.sync() flushes both blocks), so an
+        // effective flush is ONE sync. Group commit collapses the two
+        // concurrent writers into one effective flush, so the post-open delta
+        // is exactly 1 sync.
         assert_eq!(
             redo_dev.sync_count() - baseline_syncs,
-            2,
+            1,
             "concurrent dispatch writers should share one effective flush \
-             (one entries sync + one header sync under F-G4-001)"
+             (one fsync covering entries + folded header under PERF #5)"
         );
 
         let entries = redo_log.lock().recover().expect("recover grouped entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 1);
         assert_eq!(entries[1].sequence, 2);
+    }
+
+    /// PERF: the 200 µs group-commit window (`REDO_GROUP_COMMIT_WINDOW`) is a
+    /// `thread::sleep` before every redo flush. It only buys cross-connection
+    /// fsync coalescing for TINY concurrent writes; for a write that already
+    /// carries multiple ops the fsync is amortized over them, so the fixed
+    /// wait is pure added latency — the per-call 200 µs floor that caps
+    /// per-connection throughput (~5000 calls/s). `group_commit_window` skips
+    /// the wait for batched writes and keeps it only for single-op writes.
+    #[test]
+    fn group_commit_window_skips_sleep_for_batched_writes() {
+        // Batched writes (the real Teranode traffic: a 742-item CreateBatch
+        // RPC, or a whole SpendBatch after target #2) skip the floor entirely.
+        assert_eq!(group_commit_window(2), Duration::ZERO);
+        assert_eq!(group_commit_window(742), Duration::ZERO);
+        // A single-op write keeps the window — the only case where waiting for
+        // a concurrent writer to coalesce into the same fsync can pay off.
+        assert_eq!(group_commit_window(1), REDO_GROUP_COMMIT_WINDOW);
+        // Empty writes never flush, so the window is irrelevant; ZERO is fine.
+        assert_eq!(group_commit_window(0), Duration::ZERO);
+    }
+
+    /// PERF (target #2): a SpendBatch RPC spanning many distinct txid-groups
+    /// must be made durable with ONE redo flush for the whole RPC, not one
+    /// flush per txid-group. Pre-fix `handle_spend_batch` calls
+    /// `write_replicated_redo_ops` inside the `for (txid, group)` loop, so N
+    /// groups => N flushes (each = a 200 µs group-commit sleep + redo-lock
+    /// cycle + 2 device syncs). This counts device syncs on the redo device:
+    /// one effective flush == 2 syncs (entries + persisted header under
+    /// F-G4-001), independent of group count.
+    #[test]
+    fn spend_batch_flushes_redo_once_per_rpc_not_per_txid_group() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        // Deliberately TINY stripe count so the N txids below are guaranteed to
+        // collide on stripes (pigeonhole: N > stripe_count). The batched spend
+        // path must dedup stripe locks before holding them across the single
+        // flush — without dedup it self-deadlocks on the non-reentrant
+        // per-stripe Mutex, so a hang here is also a regression signal.
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+
+        let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &engine, 8192, None, Some(&redo_log), &mut cs, None)
+        };
+
+        // N distinct txids, each with 2 utxos. Spending only vout 0 of each
+        // leaves the tx not-last-spent => no DAH secondary flush, isolating
+        // the main spend redo flush count. N > stripe_count (16) forces
+        // stripe collisions so the dedup-lock path is exercised.
+        const N: usize = 24;
+        let mk_txid = |k: usize| {
+            let mut t = [0u8; 32];
+            t[0] = 0xC0;
+            t[1] = k as u8;
+            t
+        };
+        let mk_hash = |k: usize, vout: u8| {
+            let mut h = [0u8; 32];
+            h[0] = 0xC0;
+            h[1] = k as u8;
+            h[2] = vout;
+            h
+        };
+
+        let create_items: Vec<WireCreateItem> = (0..N)
+            .map(|k| WireCreateItem {
+                txid: mk_txid(k),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![mk_hash(k, 0), mk_hash(k, 1)],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
+        assert_eq!(
+            request(OP_CREATE_BATCH, encode_create_batch(&create_items)).status,
+            STATUS_OK,
+            "seed creates must succeed"
+        );
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 0,
+        };
+        let spend_items: Vec<WireSpendItem> = (0..N)
+            .map(|k| WireSpendItem {
+                txid: mk_txid(k),
+                vout: 0,
+                utxo_hash: mk_hash(k, 0),
+                spending_data: [0xD2; 36],
+            })
+            .collect();
+
+        let syncs_before = redo_dev.sync_count();
+        let resp = request(OP_SPEND_BATCH, encode_spend_batch(&params, &spend_items));
+        let flush_syncs = redo_dev.sync_count() - syncs_before;
+
+        assert_eq!(resp.status, STATUS_OK, "all spends should succeed");
+        assert_eq!(
+            flush_syncs, 1,
+            "the whole {N}-txid-group SpendBatch RPC must be ONE effective redo \
+             flush — one fsync (entries + folded header, PERF #5) — not one per \
+             txid-group; got {flush_syncs} syncs",
+        );
+    }
+
+    /// PR#21 review (P2): the per-txid DAH secondary updates must be folded into
+    /// ONE batched redo flush for the whole RPC, not one `append_and_flush` per
+    /// last-spend txid. `commit_dah_batch` is the fold primitive: N transitions
+    /// → one effective flush (one device sync), independent of N.
+    #[test]
+    fn commit_dah_batch_folds_n_transitions_into_one_flush() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            Index::new(10_000).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+        engine.set_redo_log(redo_log);
+
+        // N DAH transitions (old=0 → new=100). commit_dah_batch inserts into the
+        // DAH index by key, so no on-device record is required.
+        const N: usize = 16;
+        let transitions: Vec<(TxKey, u32, u32)> = (0..N)
+            .map(|k| {
+                let mut t = [0u8; 32];
+                t[0] = 0xDA;
+                t[1] = k as u8;
+                (TxKey { txid: t }, 0u32, 100u32)
+            })
+            .collect();
+
+        let before = redo_dev.sync_count();
+        PreparedSpend::commit_dah_batch(&engine, &transitions).unwrap();
+        let syncs = redo_dev.sync_count() - before;
+        assert_eq!(
+            syncs, 1,
+            "{N} DAH transitions must fold into ONE batched secondary fsync, not {N}; got {syncs}",
+        );
     }
 
     impl RedoDispatchHarness {
@@ -21013,20 +21358,19 @@ mod tests {
             .iter()
             .find(|s| s.name == "handle_request")
             .expect("no dispatch span captured");
-        // The dispatch path calls `Engine::validate_spend_multi` followed by
-        // `ValidatedSpend::apply`. `apply` is the instrumented span that
-        // runs under the dispatch span; `spend_multi` (a wrapper that calls
-        // both) is not invoked on the OP_SPEND_BATCH hot path. Either span
-        // proves the parent linkage; we assert on `apply` because it is the
-        // site reached from the dispatch wire opcode.
+        // The dispatch path (target #2) calls `Engine::prepare_spend_multi`
+        // followed by `PreparedSpend::apply_locked`. `apply_locked` carries the
+        // instrumented span that runs under the dispatch span (the thin
+        // `ValidatedSpend::apply` wrapper is no longer instrumented, so there is
+        // exactly one apply span and it sits under dispatch).
         let apply_span = spans
             .iter()
-            .find(|s| s.name == "apply")
-            .expect("no apply span captured");
+            .find(|s| s.name == "apply_locked")
+            .expect("no apply_locked span captured");
         assert_eq!(
             apply_span.parent_id,
             Some(dispatch_span.id),
-            "apply parent ({:?}) should be dispatch span ({})",
+            "apply_locked parent ({:?}) should be dispatch span ({})",
             apply_span.parent_id,
             dispatch_span.id,
         );
@@ -21057,12 +21401,12 @@ mod tests {
             .expect("no spend_multi span captured from direct call");
         let sm_apply = wrapped_spans
             .iter()
-            .find(|s| s.name == "apply")
-            .expect("no apply span captured from direct call");
+            .find(|s| s.name == "apply_locked")
+            .expect("no apply_locked span captured from direct call");
         assert_eq!(
             sm_apply.parent_id,
             Some(sm.id),
-            "direct spend_multi should parent its inner apply span",
+            "direct spend_multi should parent its inner apply_locked span",
         );
     }
 
@@ -22374,16 +22718,17 @@ mod tests {
         );
 
         assert_eq!(resp.status, STATUS_OK);
-        // Issue #14: AllocateRegion + CreateV2 are now written in ONE atomic
-        // redo flush, so the create batch fsyncs ONCE — two device syncs (the
-        // entries pwrite + the F-G4-001 persisted-header rewrite carrying the
-        // new `next_sequence`). This also halves the create fsync count vs the
-        // old separate allocator-reservation + CreateV2 flushes.
+        // Issue #14: AllocateRegion + CreateV2 are written in ONE atomic redo
+        // flush. PERF #5: that flush now issues a SINGLE device sync — the
+        // F-G4-001 header pwrite (carrying the new `next_sequence`) is folded
+        // into the same fsync as the entries instead of a second standalone
+        // fsync. So the whole create batch costs exactly one fsync.
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
-            2,
-            "create batch should fsync ONCE (entries + F-G4-001 header) now that \
-             AllocateRegion and CreateV2 share one atomic redo batch"
+            1,
+            "create batch should fsync ONCE (single sync covering entries + \
+             folded F-G4-001 header) now that AllocateRegion and CreateV2 share \
+             one atomic redo batch"
         );
 
         let entries = redo_log.lock().recover().unwrap();

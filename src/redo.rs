@@ -2120,6 +2120,23 @@ impl RedoLog {
     /// with zeros so the write covers the full reserved block atomically
     /// at the device's alignment.
     fn write_header(&self) -> Result<()> {
+        self.write_header_bytes()?;
+        self.device.sync()?;
+        Ok(())
+    }
+
+    /// Serialize and pwrite the header WITHOUT an fsync. The caller is
+    /// responsible for the device sync that makes it durable.
+    ///
+    /// The hot-path `flush` uses this to fold the header pwrite into the SAME
+    /// fsync as the entries write (one `device.sync()` flushes both the
+    /// entries block and the header block — non-overlapping regions of the
+    /// same device), halving the per-flush fsync count. `reset` /
+    /// `mark_checkpoint` / `compact_prefix_through` use [`Self::write_header`]
+    /// (pwrite + its own fsync) because they make the header durable on its
+    /// own, when the entries region is empty and cannot reconstruct
+    /// `next_sequence` on reopen.
+    fn write_header_bytes(&self) -> Result<()> {
         let header = RedoHeader {
             next_sequence: self.next_sequence,
             checkpoint_seq: self.checkpoint_seq,
@@ -2131,7 +2148,6 @@ impl RedoLog {
         buf[..bytes.len()].copy_from_slice(&bytes);
         // Trailing bytes are already zeroed by AlignedBuf::new.
         self.device.pwrite_all_at(&buf, self.log_offset)?;
-        self.device.sync()?;
         Ok(())
     }
 
@@ -2224,11 +2240,35 @@ impl RedoLog {
             self.poison_drop_buffer();
             return Err(e.into());
         }
+
+        // F-G4-001 + PERF #5: pwrite the header (new `next_sequence` high-water
+        // + checkpoint_seq + logical_start) and let the SINGLE entries fsync
+        // below make BOTH durable. A `device.sync()` flushes every dirty block
+        // of the device, so one sync covers the entries block and the
+        // (non-overlapping) header block. This halves the per-flush fsync count
+        // versus a second standalone header fsync, while still persisting
+        // `next_sequence` on every flush — the high-water mark a corrupt-tail
+        // reopen relies on to avoid reusing a sequence number.
+        if let Err(e) = self.write_header_bytes() {
+            if let Some(m) = redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            self.poison_drop_buffer();
+            return Err(e);
+        }
+
         crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
         // Scope the sync call tightly so the latency histogram reflects only
         // the fsync wall time, not the buffer-assembly / pwrite preamble.
+        //
+        // PERF #6: `sync_data` (fdatasync on Linux) — the redo log is a fixed
+        // length region (never resized), so the inode-metadata flush a full
+        // fsync would do is unnecessary; skipping it cuts redo flush cost on
+        // Linux. This one fsync covers both the entries pwrite and the folded
+        // header pwrite (PERF #5). reset/checkpoint/compaction keep the full
+        // `sync` (rare, and they rewrite the header on its own).
         let sync_start = Instant::now();
-        let sync_res = self.device.sync();
+        let sync_res = self.device.sync_data();
         if let Some(m) = redo_metrics() {
             m.redo_flush_latency_ns.record_since(sync_start);
         }
@@ -2250,16 +2290,6 @@ impl RedoLog {
         self.buffer.clear();
         self.entries_cache.append(&mut self.pending_entries);
         self.buffered_entries = 0;
-
-        // F-G4-001: persist the new `next_sequence` so it survives a
-        // restart after compaction empties the entries region.
-        if let Err(e) = self.write_header() {
-            if let Some(m) = redo_metrics() {
-                m.redo_flush_errors_total.inc();
-            }
-            self.poison_drop_buffer();
-            return Err(e);
-        }
 
         if let Some(m) = redo_metrics() {
             m.redo_bytes_per_flush.record_ns(flushed_bytes);
@@ -4997,6 +5027,91 @@ mod tests {
             reopened.current_sequence(),
             high_seq,
             "next_sequence must not roll back",
+        );
+    }
+
+    /// PERF #5: a hot-path flush issues exactly ONE device sync. The header
+    /// (next_sequence high-water) is folded into the SAME fsync as the entries
+    /// instead of a second standalone fsync — halving per-flush fsyncs while
+    /// keeping next_sequence durable on every flush (the corrupt-tail recovery
+    /// test above proves that durability is load-bearing: it is what stops a
+    /// truncated-tail reopen from reusing a sequence number).
+    #[test]
+    fn flush_folds_header_into_single_device_sync() {
+        let dev = Arc::new(CrashCowDevice::new(256 * 1024, 4096));
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+        let mut log = RedoLog::open(dyn_dev, 0, 256 * 1024).unwrap();
+        let base = dev.sync_count.load(Ordering::SeqCst);
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        })
+        .unwrap();
+        log.flush().unwrap();
+        assert_eq!(
+            dev.sync_count.load(Ordering::SeqCst) - base,
+            1,
+            "flush must issue exactly one device sync (entries + header folded into one), not two",
+        );
+    }
+
+    /// PERF #6: the redo hot-path flush issues `sync_data` (fdatasync), not the
+    /// full `sync` (fsync) — the fixed-length redo region never resizes, so the
+    /// inode-metadata flush a full fsync performs is unnecessary.
+    #[test]
+    fn flush_uses_sync_data_not_full_sync() {
+        struct SyncKindDevice {
+            inner: crate::device::MemoryDevice,
+            full: std::sync::atomic::AtomicU64,
+            data: std::sync::atomic::AtomicU64,
+        }
+        impl BlockDevice for SyncKindDevice {
+            fn pread(&self, b: &mut [u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> crate::device::Result<usize> {
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> crate::device::Result<()> {
+                self.full.fetch_add(1, Ordering::SeqCst);
+                self.inner.sync()
+            }
+            fn sync_data(&self) -> crate::device::Result<()> {
+                self.data.fetch_add(1, Ordering::SeqCst);
+                self.inner.sync()
+            }
+        }
+
+        let dev = Arc::new(SyncKindDevice {
+            inner: crate::device::MemoryDevice::new(256 * 1024, 4096).unwrap(),
+            full: std::sync::atomic::AtomicU64::new(0),
+            data: std::sync::atomic::AtomicU64::new(0),
+        });
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+        let mut log = RedoLog::open(dyn_dev, 0, 256 * 1024).unwrap();
+        let full0 = dev.full.load(Ordering::SeqCst);
+        let data0 = dev.data.load(Ordering::SeqCst);
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 0,
+        })
+        .unwrap();
+        log.flush().unwrap();
+        assert_eq!(
+            dev.data.load(Ordering::SeqCst) - data0,
+            1,
+            "redo flush must use sync_data (fdatasync) on the hot path",
+        );
+        assert_eq!(
+            dev.full.load(Ordering::SeqCst) - full0,
+            0,
+            "redo flush must NOT issue a full fsync on the hot path",
         );
     }
 

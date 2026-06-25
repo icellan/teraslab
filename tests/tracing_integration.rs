@@ -280,19 +280,21 @@ fn spend_multi_emits_debug_level_child_spans() {
         spend_multi_span.parent_id
     );
 
-    // `ValidatedSpend::apply` is the grandchild (`#[instrument]` attribute
-    // is named `apply` — tracing derives the span name from the function).
+    // `PreparedSpend::apply_locked` is the grandchild. The `#[instrument]`
+    // lives on `apply_locked` (the guard-free apply that both the single-spend
+    // wrapper `ValidatedSpend::apply` and the batched dispatch path call), so
+    // the span name is `apply_locked`; tracing derives it from the function.
     let apply_span = spans
         .iter()
-        .find(|s| s.name == "apply" && s.parent_id == Some(spend_multi_span.id))
+        .find(|s| s.name == "apply_locked" && s.parent_id == Some(spend_multi_span.id))
         .expect(
-            "apply span missing — `ValidatedSpend::apply`'s #[tracing::instrument] should \
-             fire as a child of spend_multi",
+            "apply_locked span missing — `PreparedSpend::apply_locked`'s \
+             #[tracing::instrument] should fire as a child of spend_multi",
         );
     assert_eq!(
         apply_span.parent_id,
         Some(spend_multi_span.id),
-        "apply must be a child of spend_multi"
+        "apply_locked must be a child of spend_multi"
     );
 }
 
