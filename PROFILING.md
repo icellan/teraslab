@@ -81,7 +81,7 @@ The slow-tests baseline reports the CPU/wall ratio (cores):
 
 ```bash
 cargo test --test write_scaling --features slow-tests \
-  read_scaling_baseline_single_batch_cores -- --nocapture
+  read_scaling_single_batch_uses_multiple_cores -- --nocapture
 ```
 
 A single connection sending one fat 826-item batch at a time pins **~1.0 core**

@@ -308,9 +308,11 @@ pub fn seed_cold_records(tcp_port: u16, count: u32, cold_bytes: usize) -> Vec<[u
                 payload: payload.into(),
             },
         );
-        assert!(
-            resp.status == STATUS_OK || resp.status == STATUS_PARTIAL_ERROR,
-            "seed create frame {req_id} failed: status={}",
+        // Require a fully-OK create: a STATUS_PARTIAL_ERROR frame could silently
+        // seed missing parents and skew the read/decoration profile.
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "seed create frame {req_id} must fully succeed; status={}",
             resp.status
         );
         req_id += 1;

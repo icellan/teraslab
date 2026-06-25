@@ -424,7 +424,7 @@ pub(crate) fn build_http_router(
         .route("/debug/index", get(handle_debug_index))
         .route("/debug/redo", get(handle_debug_redo))
         // CPU profiler (pprof): admin-gated, single-flight. Returns an inferno
-        // flamegraph SVG (default) or a pprof protobuf for offline analysis.
+        // flamegraph SVG.
         .route("/debug/pprof/profile", get(handle_debug_pprof_profile))
         // F-X-002: `/debug/freelist` exposes allocator internals
         // (used_bytes, free_region_count, alignment) and `GET
@@ -2735,6 +2735,20 @@ fn default_profile_frequency() -> i32 {
 /// 409 rather than failing deep inside `ProfilerGuardBuilder::build`.
 static PPROF_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// RAII reset for [`PPROF_IN_FLIGHT`]. Constructed INSIDE the `spawn_blocking`
+/// task so the flag clears exactly when the profile thread finishes its work.
+/// A blocking task runs to completion even if the HTTP handler future is
+/// dropped (client disconnect / shutdown), so clearing the flag in the handler
+/// after `.await` would leak it on cancellation and wedge the endpoint at 409
+/// forever. Holding it for the full profile also prevents a second profile from
+/// racing the still-running process-global `ITIMER_PROF`.
+struct PprofInFlightGuard;
+impl Drop for PprofInFlightGuard {
+    fn drop(&mut self) {
+        PPROF_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
 /// `GET /debug/pprof/profile?seconds=N&frequency=Hz`
 ///
 /// Samples the whole process for `seconds` and returns an inferno flamegraph
@@ -2765,9 +2779,14 @@ async fn handle_debug_pprof_profile(Query(q): Query<PprofQuery>) -> axum::respon
         );
     }
 
-    let outcome = tokio::task::spawn_blocking(move || run_cpu_profile(seconds, frequency)).await;
-
-    PPROF_IN_FLIGHT.store(false, Ordering::Release);
+    // The guard lives inside the blocking task, so the flag is cleared when the
+    // profile actually finishes — even if this handler future is cancelled, the
+    // spawn_blocking task still runs to completion and resets it.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _in_flight = PprofInFlightGuard;
+        run_cpu_profile(seconds, frequency)
+    })
+    .await;
 
     match outcome {
         Ok(Ok(svg)) => {

@@ -8395,12 +8395,25 @@ fn decorate_get_item(
             // trims the wire payload, which is what decoration is bound on.
             if field_mask.has(FieldMask::COLD_DATA_OUTPUTS) {
                 match engine.read_cold_data(&key) {
-                    Ok(cold) => {
-                        let (_inputs, outputs, _inpoints) = parse_cold_data_fields(&cold);
-                        let outputs = outputs.unwrap_or(&[]);
-                        data.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
-                        data.extend_from_slice(outputs);
+                    // Empty cold data → genuinely no outputs section. Distinct
+                    // from a malformed blob below.
+                    Ok(cold) if cold.is_empty() => {
+                        data.extend_from_slice(&0u32.to_le_bytes());
                     }
+                    Ok(cold) => match parse_cold_data_fields(&cold).1 {
+                        Some(outputs) => {
+                            data.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
+                            data.extend_from_slice(outputs);
+                        }
+                        // Non-empty cold blob with no parseable outputs section
+                        // is malformed/truncated. Surface it as a sub-read
+                        // failure (ERR_STORAGE_IO) rather than masking storage
+                        // corruption as a valid empty outputs section.
+                        None => {
+                            inner_read_failed = true;
+                            data.extend_from_slice(&0u32.to_le_bytes());
+                        }
+                    },
                     Err(SpendError::BlobNotFound { .. }) => {
                         blob_not_found = true;
                         data.extend_from_slice(&0u32.to_le_bytes());

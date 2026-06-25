@@ -49,6 +49,22 @@ allow = [
     # permissive data license; safe to allow.
     "CDLA-Permissive-2.0",
 ]
+# Per-crate license exceptions — narrower than `allow` (scoped to one crate),
+# so allowing a license here does NOT permit it for the rest of the graph.
+exceptions = [
+    # `inferno` is CDDL-1.0 — a Rust port of Brendan Gregg's FlameGraph; it
+    # renders the SVG for the admin-gated `/debug/pprof/profile` endpoint
+    # (src/server/http.rs). CDDL-1.0 is FILE-LEVEL weak copyleft, the same
+    # category as MPL-2.0 which this allow-list already permits: its copyleft is
+    # scoped to the CDDL-licensed files themselves. Distributing a binary that
+    # links inferno (we ship teraslab to node operators) only requires making
+    # inferno's own source — unmodified and publicly available on crates.io —
+    # available under CDDL; it does NOT relicense or encumber teraslab's own
+    # code the way GPL/AGPL would. We use inferno unmodified, so the obligation
+    # reduces to source-availability + attribution. Scoped to inferno alone
+    # rather than globally allowing CDDL-1.0.
+    { crate = "inferno", allow = ["CDDL-1.0"] },
+]
 # A confidence threshold below 0.8 usually means the detected license is
 # a fuzzy match — manual review recommended.
 confidence-threshold = 0.8
