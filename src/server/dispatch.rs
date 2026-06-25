@@ -8164,6 +8164,7 @@ fn handle_delete_batch(
                     redo_log,
                     &[RedoOp::ReplicaCreate {
                         tx_key: *key,
+                        device_id: entry.device_id,
                         record_offset: entry.record_offset,
                         utxo_count: snap.slots.len() as u32,
                     }],

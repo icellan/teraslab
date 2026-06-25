@@ -2239,6 +2239,7 @@ fn build_post_apply_redo_op(
             };
             Ok(Some(RedoOp::ReplicaCreate {
                 tx_key: *tx_key,
+                device_id: entry.device_id,
                 record_offset: entry.record_offset,
                 utxo_count: utxo_hashes.len() as u32,
             }))

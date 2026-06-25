@@ -663,6 +663,7 @@ impl Engine {
         use crate::redo::RedoOp;
         match op {
             RedoOp::Create { device_id, .. }
+            | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
             other => match other.tx_key() {
@@ -676,8 +677,9 @@ impl Engine {
     /// (1) the `batch_keys` map (a `TxKey -> device_id` index of the batch's own
     /// device-tagged ops), else (2) the primary index, else (3) store 0.
     ///
-    /// Device-tagged ops (`Create` / `AllocateRegion` / `FreeRegion`) always
-    /// route by their explicit `device_id` and never consult the map.
+    /// Device-tagged ops (`Create` / `ReplicaCreate` / `AllocateRegion` /
+    /// `FreeRegion`) always route by their explicit `device_id` and never
+    /// consult the map.
     fn redo_store_for_op_batch(
         &self,
         op: &crate::redo::RedoOp,
@@ -686,6 +688,7 @@ impl Engine {
         use crate::redo::RedoOp;
         match op {
             RedoOp::Create { device_id, .. }
+            | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
             other => match other.tx_key() {
@@ -729,20 +732,26 @@ impl Engine {
             return Ok((0, 0));
         }
         // Pre-scan for the batch's own device-tagged keyed ops to build a
-        // batch-local `TxKey -> device_id` map. `Create` carries BOTH a tx_key
-        // and an explicit device_id, so a keyed op (Freeze/SpendV2/…) journaled
-        // in the SAME batch as the `Create` of its key — before that key lands
-        // in the primary index — routes to the SAME store as the create rather
-        // than defaulting to store 0. This preserves per-store-log purity that
-        // per-store recovery relies on. (AllocateRegion/FreeRegion carry a
-        // device_id but no tx_key, so they cannot seed the map.)
+        // batch-local `TxKey -> device_id` map. `Create` / `ReplicaCreate` carry
+        // BOTH a tx_key and an explicit device_id, so a keyed op
+        // (Freeze/SpendV2/…) journaled in the SAME batch as the create of its key
+        // — before that key lands in the primary index — routes to the SAME store
+        // as the create rather than defaulting to store 0. This preserves
+        // per-store-log purity that per-store recovery relies on.
+        // (AllocateRegion/FreeRegion carry a device_id but no tx_key, so they
+        // cannot seed the map.)
         let mut batch_keys: std::collections::HashMap<TxKey, u8> = std::collections::HashMap::new();
         for op in ops {
-            if let crate::redo::RedoOp::Create {
-                tx_key, device_id, ..
-            } = op
-            {
-                batch_keys.insert(*tx_key, *device_id);
+            match op {
+                crate::redo::RedoOp::Create {
+                    tx_key, device_id, ..
+                }
+                | crate::redo::RedoOp::ReplicaCreate {
+                    tx_key, device_id, ..
+                } => {
+                    batch_keys.insert(*tx_key, *device_id);
+                }
+                _ => {}
             }
         }
 

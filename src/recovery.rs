@@ -1170,6 +1170,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
             // this arm on recovery; it must be guarded exactly like V2.
             RedoOp::ReplicaCreate {
                 tx_key,
+                device_id,
                 record_offset,
                 utxo_count,
             } => {
@@ -1181,6 +1182,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 } else {
                     replay_replica_create(
                         device,
+                        *device_id,
                         index,
                         &mut offset_owners,
                         tx_key,
@@ -1897,10 +1899,12 @@ fn replay_entry(
         } => replay_unfreeze(device, index, tx_key, *offset, Some(utxo_hash)),
         RedoOp::ReplicaCreate {
             tx_key,
+            device_id,
             record_offset,
             utxo_count,
         } => replay_replica_create(
             device,
+            *device_id,
             index,
             offset_owners,
             tx_key,
@@ -2697,8 +2701,15 @@ fn register_unique_offset(
 /// `utxo_count`, and seed the index entry's cached fields from the
 /// validated metadata so subsequent reads reflect the actual record
 /// state (not zeros).
+///
+/// `device_id` is the store the replicated record lives on — it comes from the
+/// `RedoOp::ReplicaCreate` entry (multi-store) and is stamped into the
+/// registered index entry so post-recovery reads/mutations route to the right
+/// store. Single-store logs carry `device_id == 0`, identical to the prior
+/// behaviour.
 fn replay_replica_create(
     device: &dyn BlockDevice,
+    device_id: u8,
     index: &ShardedIndex,
     offset_owners: &mut OffsetOwners,
     tx_key: &TxKey,
@@ -2765,7 +2776,7 @@ fn replay_replica_create(
     }
 
     let entry = TxIndexEntry {
-        device_id: 0,
+        device_id,
         record_offset,
         utxo_count,
         block_entry_count: meta.block_entry_count,
@@ -4922,6 +4933,7 @@ mod tests {
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
             tx_key: key,
             record_offset: ie.record_offset,
             utxo_count: 5,
@@ -5067,6 +5079,97 @@ mod tests {
             Some(key_b.txid),
             "B must not have been written to store 0"
         );
+    }
+
+    /// Multi-store replica recovery: a `RedoOp::ReplicaCreate` (the index-only
+    /// variant the replication receiver emits for every replicated create) for a
+    /// record living on store 1 MUST recover with `device_id == 1`. The op
+    /// carries no `device_id`, but it is routed to store 1's own log (by the
+    /// already-registered index entry), so the store whose log we replay IS the
+    /// record's store. Pre-fix `replay_replica_create` blindly stamped
+    /// `device_id: 0`, so every replicated record on a non-zero store would
+    /// misroute reads/mutations to store 0 after recovery — silent data
+    /// corruption on a multi-store replica.
+    #[test]
+    fn multi_store_replica_create_recovery_stamps_correct_device_id() {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
+
+        // Write a real on-device record on STORE 1 (as the replica's
+        // `engine.create()` would have, before journaling the ReplicaCreate).
+        let utxo_count: u32 = 3;
+        let txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xC1;
+            t
+        };
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.generation = 5;
+        let base = TxMetadata::record_size_for(utxo_count);
+        meta.record_size = base as u32;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = 0xC1;
+                h[1] = (i + 1) as u8;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        let record_offset = alloc1.allocate(base).unwrap();
+        io::write_full_record(&*dev1, record_offset, &meta, &slots).unwrap();
+
+        // The ReplicaCreate lands in STORE 1's own log (routed there in
+        // production by the already-registered index entry's device_id).
+        let mut redo0 = RedoLog::open(redo_dev0.clone(), 0, 1024 * 1024).unwrap();
+        let mut redo1 = RedoLog::open(redo_dev1.clone(), 0, 1024 * 1024).unwrap();
+        let shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&redo0, &redo1]),
+        ));
+        redo0.attach_shared_sequence(shared.clone());
+        redo1.attach_shared_sequence(shared.clone());
+        redo1
+            .append_and_flush(RedoOp::ReplicaCreate {
+                tx_key: key,
+                device_id: 1,
+                record_offset,
+                utxo_count,
+            })
+            .unwrap();
+
+        let mut dah = DahBackend::new_in_memory();
+        let mut unmined = UnminedBackend::new_in_memory();
+        let devices = [dev0.clone(), dev1.clone()];
+        let mut allocators = [alloc0, alloc1];
+        let mut redo_logs = [redo0, redo1];
+        let (stats, _, _) = recover_all_multi_store(
+            &devices,
+            &mut allocators,
+            &mut redo_logs,
+            &index,
+            &mut dah,
+            &mut unmined,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stats.entries_replayed, 1, "the replica create must replay");
+        assert_eq!(stats.entries_failed, 0);
+
+        let recovered = index.lookup(&key).expect("replica create must register");
+        assert_eq!(
+            recovered.device_id, 1,
+            "replica record lives on store 1 — recovery must stamp device_id 1, not 0",
+        );
+        assert_eq!(recovered.record_offset, record_offset);
+        assert_eq!(recovered.utxo_count, utxo_count);
     }
 
     /// Stress the PARALLEL multi-store recovery: 8 stores, many records each
@@ -5728,6 +5831,7 @@ mod tests {
 
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
             tx_key: key_a,
             record_offset: offset,
             utxo_count,
@@ -5795,6 +5899,7 @@ mod tests {
 
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
             tx_key: key_a,
             record_offset: offset,
             utxo_count,
@@ -5885,6 +5990,7 @@ mod tests {
         // Legitimate legacy Create for the rightful owner B at offset X.
         let mut redo = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
             tx_key: key_b,
             record_offset: offset,
             utxo_count,
@@ -6103,6 +6209,7 @@ mod tests {
         // Append a LEGACY Create entry (no record_bytes) and recover.
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
             tx_key: key,
             record_offset,
             utxo_count,
@@ -6166,6 +6273,7 @@ mod tests {
 
         let mut redo = RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
         redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
             tx_key: key,
             record_offset,
             utxo_count,
@@ -6559,6 +6667,7 @@ mod tests {
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::ReplicaCreate {
+            device_id: 0,
             tx_key: key,
             record_offset: offset,
             utxo_count: 5,

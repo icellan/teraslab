@@ -11310,6 +11310,7 @@ mod tests {
         redo.lock()
             .append_and_flush(crate::redo::RedoOp::ReplicaCreate {
                 tx_key: created,
+                device_id: 0,
                 record_offset: 0,
                 utxo_count: 1,
             })
@@ -11361,6 +11362,7 @@ mod tests {
             .lock()
             .append_and_flush(crate::redo::RedoOp::ReplicaCreate {
                 tx_key: other_shard_key,
+                device_id: 0,
                 record_offset: 0,
                 utxo_count: 1,
             })

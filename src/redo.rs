@@ -524,9 +524,13 @@ pub enum RedoOp {
     /// Index-only create entry: just enough payload to register the index
     /// entry on replay (no record bytes). Emitted by the replication /
     /// migration receiver for a copy whose bytes already landed via the
-    /// streaming apply; the full-record [`RedoOp::ReplicaCreate`] carries the bytes.
+    /// streaming apply; the full-record payload is carried by the separate
+    /// [`RedoOp::Create`] variant. `device_id` names the store the replicated
+    /// record lives on so multi-store replay registers the index entry on the
+    /// right store (reads/mutations route by `TxIndexEntry::device_id`).
     ReplicaCreate {
         tx_key: TxKey,
+        device_id: u8,
         record_offset: u64,
         utxo_count: u32,
     },
@@ -1157,10 +1161,12 @@ impl RedoOp {
             }
             RedoOp::ReplicaCreate {
                 tx_key,
+                device_id,
                 record_offset,
                 utxo_count,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
+                buf.push(*device_id);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&utxo_count.to_le_bytes());
             }
@@ -1554,13 +1560,15 @@ impl RedoOp {
                     prior_utxo_hash: prior,
                 })
             }
-            OP_REPLICA_CREATE if data.len() >= 44 => {
+            OP_REPLICA_CREATE if data.len() >= 45 => {
+                // Layout: tx_key(32) + device_id(1) + record_offset(8) + utxo_count(4)
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
                 Some(RedoOp::ReplicaCreate {
                     tx_key: TxKey { txid },
-                    record_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
-                    utxo_count: u32::from_le_bytes(data[40..44].try_into().unwrap()),
+                    device_id: data[32],
+                    record_offset: u64::from_le_bytes(data[33..41].try_into().unwrap()),
+                    utxo_count: u32::from_le_bytes(data[41..45].try_into().unwrap()),
                 })
             }
             OP_CREATE if data.len() >= 52 => {
@@ -3392,6 +3400,7 @@ mod tests {
             },
             RedoOp::ReplicaCreate {
                 tx_key: test_key(9),
+                device_id: 0,
                 record_offset: 4096,
                 utxo_count: 10,
             },
@@ -4262,6 +4271,7 @@ mod tests {
     fn round_trip_create() {
         assert_round_trip(RedoOp::ReplicaCreate {
             tx_key: make_txid(0x19),
+            device_id: 3,
             record_offset: 0x0000_DEAD_BEEF_0000,
             utxo_count: 250,
         });
@@ -4821,6 +4831,7 @@ mod tests {
             },
             RedoOp::ReplicaCreate {
                 tx_key: make_txid(0x03),
+                device_id: 0,
                 record_offset: 8192,
                 utxo_count: 5,
             },
