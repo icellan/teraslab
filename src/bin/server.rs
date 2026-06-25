@@ -193,11 +193,11 @@ fn run_one_catchup_pass(
         return false; // already caught up
     }
 
-    let redo_ref = ctx.redo_log.clone();
     let eng_ref = ctx.engine.clone();
-    let first_avail_seq = redo_ref
-        .as_ref()
-        .and_then(|rl| rl.lock().earliest_sequence().ok().flatten());
+    // Per-store redo splits the one logical stream across N store logs; the
+    // earliest recoverable sequence is the min across them (== global fence + 1),
+    // and catch-up must read the merged, sequence-ordered view — not a single log.
+    let first_avail_seq = eng_ref.earliest_redo_sequence_merged().ok().flatten();
     let cluster_key_handle = ctx.cluster_key_handle.clone();
     let auth_secret = ctx.auth_secret.clone();
 
@@ -208,11 +208,7 @@ fn run_one_catchup_pass(
         1000,
         max_ops_per_pass,
         &|seq| {
-            let rl = match redo_ref.as_ref() {
-                Some(rl) => rl,
-                None => return Vec::new(),
-            };
-            let entries = match rl.lock().read_from_sequence(seq) {
+            let entries = match eng_ref.read_redo_from_sequence_merged(seq) {
                 Ok(e) => e,
                 Err(_) => return Vec::new(),
             };

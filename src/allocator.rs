@@ -274,11 +274,13 @@ pub struct SlotAllocator {
     /// and frees survive a power loss between [`SlotAllocator::persist`]
     /// snapshots.
     redo_log: Option<Arc<Mutex<RedoLog>>>,
-    /// Logical device identifier written into redo entries.
+    /// Store identifier this allocator owns, written into every
+    /// `AllocateRegion`/`FreeRegion` redo entry it emits.
     ///
-    /// Currently always 0 (single-device deployment) — reserved for a
-    /// future multi-device layout where each allocator tracks a distinct
-    /// logical device so recovery can route redo entries correctly.
+    /// 0 for a single-store deployment; set per store via
+    /// [`SlotAllocator::set_redo_device_id`] at boot under `device_split` so
+    /// recovery routes each region to the owning store's allocator and the
+    /// entry to that store's redo log.
     redo_device_id: u8,
     /// Test/fault-injection only: fail the next [`SlotAllocator::persist`]
     /// call with [`AllocatorError::PersistFaultInjected`], then auto-clear.

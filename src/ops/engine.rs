@@ -716,42 +716,85 @@ impl Engine {
             return Ok((0, 0));
         }
 
-        // Resolve each store's log handle once. If per-store logs are not
-        // attached, fall back to routing everything to the single
-        // representative handle (single-store / test paths) so behaviour is
-        // byte-identical to the pre-per-store path.
-        let mut first_seq = u64::MAX;
-        let mut last_seq = 0u64;
-        let mut wrote = false;
-
-        let route_to = |store: usize| -> Option<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
-            self.redo_log_for_device(store as u8)
-        };
-
-        for (store, store_ops) in per_store.iter().enumerate() {
-            if store_ops.is_empty() {
-                continue;
-            }
-            let Some(log) = route_to(store) else {
-                // No log attached at all → nothing to journal.
-                continue;
+        // Append + flush one store's ops under that store's log lock. The
+        // expensive part is the `flush` (fsync); appends are CPU-cheap and draw
+        // globally-unique sequences from the shared atomic counter, so running
+        // these concurrently across stores is safe (within one store the ops
+        // keep their `ops`-order, so per-log sequences stay strictly increasing
+        // and an `AllocateRegion` always precedes its sibling `Create`). Returns
+        // the (min, max) sequence this store contributed, or `None` if the store
+        // has no log attached.
+        let append_flush = |store: usize,
+                            store_ops: &[&crate::redo::RedoOp]|
+         -> Result<Option<(u64, u64)>, String> {
+            let Some(log) = self.redo_log_for_device(store as u8) else {
+                return Ok(None);
             };
             let mut guard = log.lock();
+            let mut first = u64::MAX;
+            let mut last = 0u64;
+            let mut wrote = false;
             for op in store_ops {
                 let seq = guard.append((*op).clone()).map_err(|e| {
                     tracing::error!(err = %e, "redo log append failed");
                     "redo log append failed".to_string()
                 })?;
-                first_seq = first_seq.min(seq);
-                last_seq = last_seq.max(seq);
+                first = first.min(seq);
+                last = last.max(seq);
                 wrote = true;
             }
             guard.flush().map_err(|e| {
                 tracing::error!(err = %e, "redo log flush failed");
                 "redo log flush failed".to_string()
             })?;
-        }
+            Ok(wrote.then_some((first, last)))
+        };
 
+        let touched: Vec<usize> = (0..store_count)
+            .filter(|&s| !per_store[s].is_empty())
+            .collect();
+
+        // Collect each touched store's (min, max) sequence contribution.
+        let ranges: Vec<Result<Option<(u64, u64)>, String>> = match touched.split_first() {
+            None => return Ok((0, 0)),
+            // One store touched (single-store config, or a batch that landed on
+            // one store): do it inline — no thread, byte-identical to before.
+            Some((&only, [])) => vec![append_flush(only, &per_store[only])],
+            // Several stores touched: fan the fsyncs out so they overlap instead
+            // of running one-after-another. The calling thread handles `head`;
+            // the rest run on scoped threads. Wall-clock per batch drops from
+            // sum-of-fsyncs to the slowest single fsync.
+            Some((&head, tail)) => std::thread::scope(|scope| {
+                let handles: Vec<_> = tail
+                    .iter()
+                    .map(|&store| {
+                        let af = &append_flush;
+                        let store_ops = &per_store[store];
+                        scope.spawn(move || af(store, store_ops))
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(touched.len());
+                out.push(append_flush(head, &per_store[head]));
+                for h in handles {
+                    out.push(
+                        h.join()
+                            .unwrap_or_else(|_| Err("redo log flush thread panicked".to_string())),
+                    );
+                }
+                out
+            }),
+        };
+
+        let mut first_seq = u64::MAX;
+        let mut last_seq = 0u64;
+        let mut wrote = false;
+        for r in ranges {
+            if let Some((f, l)) = r? {
+                first_seq = first_seq.min(f);
+                last_seq = last_seq.max(l);
+                wrote = true;
+            }
+        }
         if !wrote {
             return Ok((0, 0));
         }
@@ -922,6 +965,44 @@ impl Engine {
         }
         merged.sort_by_key(|e| e.sequence);
         Ok(merged)
+    }
+
+    /// The earliest global sequence still recoverable from the merged redo
+    /// stream — i.e. the smallest sequence present in ANY attached store log.
+    ///
+    /// Compaction advances every store's log through the SAME global fence, and
+    /// sequences are globally dense (each sequence lives in exactly one store's
+    /// log), so the minimum per-log earliest equals `global_fence + 1`: the
+    /// lowest sequence from which a merged catch-up read is complete. Replication
+    /// catch-up compares a replica's requested `from_sequence` against this to
+    /// decide whether the needed prefix was reclaimed (→ full resync).
+    ///
+    /// Returns `Ok(None)` when every attached log is empty (nothing to catch up
+    /// from). When only the single representative handle is attached this is
+    /// exactly that log's `earliest_sequence`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the first per-log `earliest_sequence` error.
+    pub fn earliest_redo_sequence_merged(
+        &self,
+    ) -> std::result::Result<Option<u64>, crate::redo::RedoError> {
+        let mut earliest: Option<u64> = None;
+        match self.redo_logs.get() {
+            Some(logs) if !logs.is_empty() => {
+                for log in logs {
+                    if let Some(seq) = log.lock().earliest_sequence()? {
+                        earliest = Some(earliest.map_or(seq, |e| e.min(seq)));
+                    }
+                }
+            }
+            _ => {
+                if let Some(log) = self.redo_log.get() {
+                    earliest = log.lock().earliest_sequence()?;
+                }
+            }
+        }
+        Ok(earliest)
     }
 
     /// Attach the on-device deletion-tombstone log (deletion-tombstone
@@ -3736,7 +3817,21 @@ impl Engine {
         req: &CreateRequest,
         record_offset: u64,
     ) -> Result<CreateResponse, CreateError> {
-        self.create_at_offset_inner(req, record_offset, None)
+        self.create_at_offset_inner(0, req, record_offset, None)
+    }
+
+    /// Create a transaction record at a pre-allocated offset on a specific
+    /// store. Used by the batch-create dispatch path, which round-robins new
+    /// records across stores and reserves the offset on `device_id`'s
+    /// allocator. The `device_id` is stamped into the index entry so all later
+    /// reads/mutations route to the same store.
+    pub fn create_at_offset_on(
+        &self,
+        device_id: u8,
+        req: &CreateRequest,
+        record_offset: u64,
+    ) -> Result<CreateResponse, CreateError> {
+        self.create_at_offset_inner(device_id, req, record_offset, None)
     }
 
     /// Variant of [`Self::create_at_offset`] that verifies the caller's
@@ -3753,11 +3848,12 @@ impl Engine {
         record_offset: u64,
         expected_total_size: u64,
     ) -> Result<CreateResponse, CreateError> {
-        self.create_at_offset_inner(req, record_offset, Some(expected_total_size))
+        self.create_at_offset_inner(0, req, record_offset, Some(expected_total_size))
     }
 
     fn create_at_offset_inner(
         &self,
+        device_id: u8,
         req: &CreateRequest,
         record_offset: u64,
         expected_total_size: Option<u64>,
@@ -3879,10 +3975,9 @@ impl Engine {
             })
             .collect();
 
-        // The pre-allocated path's offset comes from pre_allocate_create, which
-        // allocates on store 0; record placement across stores for this batch
-        // path is wired in a later stage. Reads route by this device_id.
-        let device_id = 0u8;
+        // `device_id` identifies the store this record was reserved on (round-
+        // robin placement chosen by the dispatch batch path; 0 for the
+        // single-store `create_at_offset`). Reads route by this device_id.
         self.write_full_record_with_cold(device_id, record_offset, &meta, &slots, &cold_data)?;
 
         let index_entry = TxIndexEntry {
@@ -13039,6 +13134,103 @@ mod tests {
         engine.spend_multi(&multi).expect("spend on store 1");
         let slot = engine.read_slot(&store1_key, 0).expect("read spent slot");
         assert!(slot.is_spent(), "slot on store 1 must read back as spent");
+    }
+
+    #[test]
+    fn merged_redo_read_reassembles_global_order_across_store_logs() {
+        use crate::redo::{RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+
+        // Attach a per-store redo log to each store, sharing ONE global counter
+        // exactly as the boot path does (shared_sequence_floor → attach).
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 1024 * 1024).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        engine.set_redo_logs(vec![
+            Arc::new(parking_lot::Mutex::new(log0)),
+            Arc::new(parking_lot::Mutex::new(log1)),
+        ]);
+        assert!(engine.has_per_store_redo());
+
+        // Route a batch tagged across both stores by device_id. AllocateRegion
+        // carries an explicit device_id, so routing is by tag. The router
+        // appends + flushes each store's log CONCURRENTLY (parallel fsync), each
+        // drawing globally-unique sequences from the shared counter — so the six
+        // ops get sequences 1..=6 but the cross-store interleaving is
+        // nondeterministic. `offset` encodes the original index so we can verify
+        // per-store order is still preserved. ASCENDING offsets are used per
+        // store so we can also check intra-store ordering.
+        let ops: Vec<RedoOp> = (0..6u64)
+            .map(|i| RedoOp::AllocateRegion {
+                device_id: (i % 2) as u8,
+                offset: i,
+                size: 4096,
+            })
+            .collect();
+        let (first, last) = engine.append_redo_ops_routed(&ops).expect("routed append");
+        assert_eq!((first, last), (1, 6), "six ops draw global sequences 1..=6");
+
+        // Merged read from seq 1 must return ALL six entries in global sequence
+        // order, even though they are physically split across the two logs and
+        // appended concurrently.
+        let merged = engine
+            .read_redo_from_sequence_merged(1)
+            .expect("merged read");
+        let seqs: Vec<u64> = merged.iter().map(|e| e.sequence).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4, 5, 6],
+            "merged stream must be globally sequence-ordered with no gaps/dupes"
+        );
+        let devs: Vec<(u8, u64)> = merged
+            .iter()
+            .map(|e| match e.op {
+                RedoOp::AllocateRegion {
+                    device_id, offset, ..
+                } => (device_id, offset),
+                ref other => panic!("unexpected op {other:?}"),
+            })
+            .collect();
+        // Both stores represented, and within each store the original op order is
+        // preserved (device 0: offsets 0,2,4; device 1: offsets 1,3,5). The
+        // cross-store interleaving in the merged stream is not asserted — it
+        // depends on the concurrent fsync race — only per-store order is.
+        let dev0: Vec<u64> = devs
+            .iter()
+            .filter(|(d, _)| *d == 0)
+            .map(|(_, o)| *o)
+            .collect();
+        let dev1: Vec<u64> = devs
+            .iter()
+            .filter(|(d, _)| *d == 1)
+            .map(|(_, o)| *o)
+            .collect();
+        assert_eq!(
+            dev0,
+            vec![0, 2, 4],
+            "store 0 entries in original append order"
+        );
+        assert_eq!(
+            dev1,
+            vec![1, 3, 5],
+            "store 1 entries in original append order"
+        );
+
+        // Earliest recoverable sequence is the global floor across both logs.
+        assert_eq!(engine.earliest_redo_sequence_merged().unwrap(), Some(1));
+
+        // A from_seq in the middle returns exactly the tail of the global order.
+        let tail = engine.read_redo_from_sequence_merged(4).expect("tail read");
+        let tail_seqs: Vec<u64> = tail.iter().map(|e| e.sequence).collect();
+        assert_eq!(tail_seqs, vec![4, 5, 6]);
     }
 
     fn create_engine_inner() -> Engine {

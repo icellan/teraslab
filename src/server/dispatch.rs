@@ -3013,12 +3013,32 @@ where
     })?;
 
     for range in pending {
-        let (entries, earliest_sequence, current_sequence) = {
+        // The global sequence counter is shared across every store log, so any
+        // log's `current_sequence` reports the global high-water.
+        let current_sequence = redo_log.lock().current_sequence();
+        // Mirror `write_redo_ops`' routing: when per-store logs are attached, a
+        // pending intent's [first..last] range may span several store logs, so
+        // read the merged, sequence-ordered view (and the global earliest) via
+        // the engine. Otherwise (single-store / tests with a standalone handle)
+        // read directly from the passed redo handle, exactly as before.
+        // F-G5-008: redo I/O errors carry kernel diagnostic strings and
+        // (depending on the storage backend) file paths. Log detail for
+        // operator triage; return a sanitized message that does not leak
+        // deployment topology to clients.
+        let (entries, earliest_sequence) = if engine.has_per_store_redo() {
+            let entries = engine
+                .read_redo_from_sequence_merged(range.first_sequence)
+                .map_err(|e| {
+                    tracing::error!(err = %e, "read redo for pending replication intent failed");
+                    "read redo for pending replication intent failed".to_string()
+                })?;
+            let earliest = engine.earliest_redo_sequence_merged().map_err(|e| {
+                tracing::error!(err = %e, "read redo floor for pending replication intent failed");
+                "read redo floor for pending replication intent failed".to_string()
+            })?;
+            (entries, earliest)
+        } else {
             let log = redo_log.lock();
-            // F-G5-008: redo I/O errors carry kernel diagnostic strings
-            // and (depending on the storage backend) file paths. Log
-            // detail for operator triage; return a sanitized message
-            // that does not leak deployment topology to clients.
             let entries = log.read_from_sequence(range.first_sequence).map_err(|e| {
                 tracing::error!(err = %e, "read redo for pending replication intent failed");
                 "read redo for pending replication intent failed".to_string()
@@ -3027,7 +3047,7 @@ where
                 tracing::error!(err = %e, "read redo floor for pending replication intent failed");
                 "read redo floor for pending replication intent failed".to_string()
             })?;
-            (entries, earliest, log.current_sequence())
+            (entries, earliest)
         };
         let entries: Vec<_> = entries
             .into_iter()
@@ -3950,9 +3970,17 @@ where
         }
     };
 
-    let entries = {
-        let log = redo_log.lock();
-        log.read_from_sequence(comp_range.0)
+    // Mirror `write_redo_ops`' routing: when per-store logs are attached the
+    // comp range may span multiple store logs, so read the merged, sequence-
+    // ordered view via the engine. Otherwise read from the passed handle.
+    let entries = if engine.has_per_store_redo() {
+        engine
+            .read_redo_from_sequence_merged(comp_range.0)
+            .map_err(|e| format!("read compensation redo for replication failed: {e}"))?
+    } else {
+        redo_log
+            .lock()
+            .read_from_sequence(comp_range.0)
             .map_err(|e| format!("read compensation redo for replication failed: {e}"))?
     };
     let mut ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
@@ -5758,18 +5786,19 @@ fn handle_create_batch(
 
     fn release_create_reservation(
         engine: &Engine,
+        device_id: u8,
         record_offset: u64,
         reservation_size: u64,
         context: &str,
     ) -> std::result::Result<(), String> {
         engine
-            .allocator()
+            .allocator_for(device_id)
             .lock()
             .free(record_offset, reservation_size)
             .map_err(|e| {
                 format!(
                     "create reservation rollback failed after {context}: \
-                     offset={record_offset} size={reservation_size}: {e}"
+                     device={device_id} offset={record_offset} size={reservation_size}: {e}"
                 )
             })
     }
@@ -5809,6 +5838,9 @@ fn handle_create_batch(
     struct ValidCreate<'a, 'p> {
         idx: usize,
         create_req: CreateRequest<'a>,
+        /// Store this record was placed on (round-robin); routes the
+        /// `create_at_offset_on` device write and is stamped into the index.
+        device_id: u8,
         record_offset: u64,
         reservation_size: u64,
         /// See [`PendingCreate::blob_pin`]; held until after
@@ -5969,34 +6001,73 @@ fn handle_create_batch(
     // window is safe against a concurrent checkpoint persisting the un-journaled
     // reservation because the create holds the exclusive mutation barrier (the
     // same lock the checkpoint task takes) across Phases 1b–3.
-    let reservation_sizes: Vec<u64> = pending_items
+    // Round-robin each new record across the configured stores (placement is a
+    // free local choice recorded in the index `device_id`; reads route by it).
+    // Records destined for the same store must be reserved together on THAT
+    // store's allocator — offsets are store-local — so group positions by store
+    // and run one `reserve_batch` per store. Each store's allocator tags its
+    // own `AllocateRegion` redo ops with its `device_id` (set at boot).
+    let device_ids: Vec<u8> = pending_items
         .iter()
-        .map(|pending| pending.reservation_size)
+        .map(|_| engine.place_new_record())
         .collect();
-    let mut pending_alloc = match engine.allocator().lock().reserve_batch(&reservation_sizes) {
-        Ok(p) => p,
-        Err(e) => {
-            // M-01: `attempted` already ticked; nothing has applied yet, so
-            // every item not already in `errors` counts as ErrStorage-failed.
-            if let Some(m) = DISPATCH_METRICS.get() {
-                use crate::metrics::OpCode;
-                let failed =
-                    tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
-                m.creates_failed.inc_by(failed);
-            }
-            return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
-        }
-    };
-    // Seed the redo batch with the not-yet-durable AllocateRegion entries so
-    // they fsync together with the Create entries pushed in the loop below.
-    // They replay before any Create (lower sequence numbers), so every record
-    // has its region allocated first. AllocateRegion has no replica op, so the
-    // Phase 4 fan-out (driven by `repl_ops_by_key`) ignores them.
-    redo_ops.extend_from_slice(pending_alloc.allocate_region_redo_ops());
-    let allocated_regions = std::mem::take(&mut pending_alloc.regions);
+    let store_count = engine.store_count();
+    let mut positions_by_store: Vec<Vec<usize>> = vec![Vec::new(); store_count];
+    for (pos, &device_id) in device_ids.iter().enumerate() {
+        positions_by_store[device_id as usize].push(pos);
+    }
 
-    for (pending, allocated) in pending_items.into_iter().zip(allocated_regions) {
-        let Some(region) = allocated else {
+    // `region_by_pos[pos]` is the reserved region for `pending_items[pos]`
+    // (`None` if that store was full for this size). `pending_allocs` holds one
+    // in-memory reservation handle per store so Phase 2 can commit/rollback all.
+    let mut region_by_pos = vec![None; pending_items.len()];
+    let mut pending_allocs = Vec::new();
+    for (device_id, positions) in positions_by_store.into_iter().enumerate() {
+        if positions.is_empty() {
+            continue;
+        }
+        let device_id = device_id as u8;
+        let sizes: Vec<u64> = positions
+            .iter()
+            .map(|&pos| pending_items[pos].reservation_size)
+            .collect();
+        let mut pending_alloc = match engine.allocator_for(device_id).lock().reserve_batch(&sizes) {
+            Ok(p) => p,
+            Err(e) => {
+                // Roll back stores already reserved in this loop before aborting
+                // (nothing is journaled yet, so this is purely in-memory).
+                for (rolled_device_id, pa) in pending_allocs {
+                    engine
+                        .allocator_for(rolled_device_id)
+                        .lock()
+                        .rollback_pending(pa);
+                }
+                // M-01: `attempted` already ticked; nothing has applied yet, so
+                // every item not already in `errors` counts as ErrStorage-failed.
+                if let Some(m) = DISPATCH_METRICS.get() {
+                    use crate::metrics::OpCode;
+                    let failed =
+                        tally_storage_abort(m, OpCode::Create, items.len() as u64, 0, 0, &errors);
+                    m.creates_failed.inc_by(failed);
+                }
+                return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
+            }
+        };
+        // Seed the redo batch with the not-yet-durable AllocateRegion entries so
+        // they fsync together with the Create entries pushed in the loop below.
+        // They replay before any Create (lower sequence numbers), so every record
+        // has its region allocated first. AllocateRegion has no replica op, so the
+        // Phase 4 fan-out (driven by `repl_ops_by_key`) ignores them.
+        redo_ops.extend_from_slice(pending_alloc.allocate_region_redo_ops());
+        let regions = std::mem::take(&mut pending_alloc.regions);
+        for (&pos, region) in positions.iter().zip(regions) {
+            region_by_pos[pos] = region;
+        }
+        pending_allocs.push((device_id, pending_alloc));
+    }
+
+    for (pos, pending) in pending_items.into_iter().enumerate() {
+        let Some(region) = region_by_pos[pos].take() else {
             errors.push(BatchItemError {
                 item_index: pending.idx as u32,
                 error_code: ERR_STORAGE_IO,
@@ -6004,6 +6075,7 @@ fn handle_create_batch(
             });
             continue;
         };
+        let device_id = device_ids[pos];
         let key = TxKey {
             txid: pending.create_req.tx_id,
         };
@@ -6014,9 +6086,7 @@ fn handle_create_batch(
         };
         redo_ops.push(RedoOp::Create {
             tx_key: key,
-            // Batch path currently allocates on store 0 (pre_allocate_create);
-            // round-robin batch placement is wired with the boot flip.
-            device_id: 0,
+            device_id,
             record_offset: region.offset,
             utxo_count: pending.utxo_count,
             is_conflicting: pending.create_req.conflicting,
@@ -6026,6 +6096,7 @@ fn handle_create_batch(
         valid_items.push(ValidCreate {
             idx: pending.idx,
             create_req: pending.create_req,
+            device_id,
             record_offset: region.offset,
             reservation_size: region.size,
             _blob_pin: pending.blob_pin,
@@ -6037,16 +6108,20 @@ fn handle_create_batch(
     let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => {
             // The AllocateRegion entries are now durable alongside their
-            // Create — finalize the in-memory reservations.
-            engine.allocator().lock().commit_pending(pending_alloc);
+            // Create — finalize the in-memory reservations on every store.
+            for (device_id, pa) in pending_allocs {
+                engine.allocator_for(device_id).lock().commit_pending(pa);
+            }
             range
         }
         Err(e) => {
-            // Redo failed (e.g. LogFull): roll the reservations back IN MEMORY.
-            // Nothing was journaled, so there is no durable allocation to
-            // orphan and no compensating redo write is needed (which is the
-            // whole point — the log is full). Issue #14.
-            engine.allocator().lock().rollback_pending(pending_alloc);
+            // Redo failed (e.g. LogFull): roll the reservations back IN MEMORY
+            // on every store. Nothing was journaled, so there is no durable
+            // allocation to orphan and no compensating redo write is needed
+            // (which is the whole point — the log is full). Issue #14.
+            for (device_id, pa) in pending_allocs {
+                engine.allocator_for(device_id).lock().rollback_pending(pa);
+            }
             // M-01: `attempted` already ticked; nothing has applied yet, so
             // every item not already in `errors` counts as ErrStorage-failed.
             if let Some(m) = DISPATCH_METRICS.get() {
@@ -6063,7 +6138,7 @@ fn handle_create_batch(
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     for v in &valid_items {
         let item = &items[v.idx];
-        match engine.create_at_offset(&v.create_req, v.record_offset) {
+        match engine.create_at_offset_on(v.device_id, &v.create_req, v.record_offset) {
             Ok(_) => {
                 let key = TxKey { txid: item.txid };
                 // Serialize full metadata for the replica so a promoted replica
@@ -6165,6 +6240,7 @@ fn handle_create_batch(
                 // concurrent create races on the same txid.
                 let rollback = release_create_reservation(
                     engine,
+                    v.device_id,
                     v.record_offset,
                     v.reservation_size,
                     "create_at_offset duplicate",
@@ -6191,6 +6267,7 @@ fn handle_create_batch(
                 // the reserved region.
                 if let Err(e) = release_create_reservation(
                     engine,
+                    v.device_id,
                     v.record_offset,
                     v.reservation_size,
                     "create_at_offset failure",
@@ -10406,6 +10483,180 @@ mod tests {
     }
 
     #[test]
+    fn create_batch_round_robins_records_across_stores() {
+        // Two-store engine: the dispatch batch-create path must round-robin new
+        // records across stores (placement recorded in entry.device_id) and the
+        // records must read back from the store their device_id names.
+        let h = DispatchTestHarness::with_stores(1);
+        assert_eq!(h.engine.store_count(), 2, "expected a 2-store engine");
+
+        let txids: Vec<[u8; 32]> = (0..8).map(DispatchTestHarness::make_txid).collect();
+        let items: Vec<WireCreateItem> = txids
+            .iter()
+            .enumerate()
+            .map(|(i, txid)| {
+                let utxo_count = (i as u32) + 1;
+                let utxo_hashes: Vec<[u8; 32]> = (0..utxo_count)
+                    .map(|j| {
+                        let mut hsh = [0u8; 32];
+                        hsh[0] = (j & 0xFF) as u8;
+                        hsh
+                    })
+                    .collect();
+                WireCreateItem {
+                    txid: *txid,
+                    tx_version: (i as u32) + 1,
+                    locktime: 0,
+                    fee: 500,
+                    size_in_bytes: 250,
+                    extended_size: 250,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    created_at: 1700000000000,
+                    flags: 0,
+                    utxo_hashes,
+                    cold_data: vec![],
+                    block_height: 0,
+                    mined_block_id: None,
+                    mined_block_height: None,
+                    mined_subtree_idx: None,
+                    parent_txids: vec![],
+                }
+            })
+            .collect();
+
+        let resp = h.request(OP_CREATE_BATCH, encode_create_batch(&items));
+        assert_eq!(resp.status, STATUS_OK, "batch create should succeed");
+
+        // Placement must spread across BOTH stores (round-robin), not pin store 0.
+        let devices: Vec<u8> = txids
+            .iter()
+            .map(|t| {
+                h.engine
+                    .lookup(&TxKey { txid: *t })
+                    .expect("record present after batch create")
+                    .device_id
+            })
+            .collect();
+        assert!(
+            devices.contains(&0) && devices.contains(&1),
+            "batch create should round-robin across stores, got device_ids {devices:?}"
+        );
+
+        // Each record must read back correctly from the store its device_id
+        // names — read_metadata routes by entry.device_id, so a wrong store
+        // would surface a corrupt header / wrong field here.
+        for (i, t) in txids.iter().enumerate() {
+            let meta = h
+                .engine
+                .read_metadata(&TxKey { txid: *t })
+                .expect("read_metadata routes to the record's store");
+            assert_eq!(
+                { meta.tx_version },
+                (i as u32) + 1,
+                "record {i} round-tripped from store {}",
+                devices[i]
+            );
+            assert_eq!(
+                { meta.utxo_count },
+                (i as u32) + 1,
+                "record {i} utxo_count round-tripped from store {}",
+                devices[i]
+            );
+        }
+    }
+
+    #[test]
+    fn create_batch_journals_each_create_to_its_records_store_log() {
+        // With per-store redo attached, the batch-create path must journal each
+        // record's `Create` (and its `AllocateRegion`) to the redo log owning
+        // the store the record was placed on — so a crash replays each store's
+        // records from that store's own log.
+        let h = DispatchTestHarness::with_stores(1); // 2 stores
+
+        let rdev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 4 * 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 4 * 1024 * 1024).unwrap();
+        let shared = Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&log0, &log1]),
+        ));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(Mutex::new(log0));
+        let log1_arc = Arc::new(Mutex::new(log1));
+        h.engine
+            .set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+        assert!(h.engine.has_per_store_redo());
+
+        let txids: Vec<[u8; 32]> = (20..28).map(DispatchTestHarness::make_txid).collect();
+        let items: Vec<WireCreateItem> = txids
+            .iter()
+            .map(|txid| {
+                let mut hsh = [0u8; 32];
+                hsh[0] = txid[0];
+                WireCreateItem {
+                    txid: *txid,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 500,
+                    size_in_bytes: 250,
+                    extended_size: 250,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    created_at: 1700000000000,
+                    flags: 0,
+                    utxo_hashes: vec![hsh],
+                    cold_data: vec![],
+                    block_height: 0,
+                    mined_block_id: None,
+                    mined_block_height: None,
+                    mined_subtree_idx: None,
+                    parent_txids: vec![],
+                }
+            })
+            .collect();
+
+        let resp = h.request(OP_CREATE_BATCH, encode_create_batch(&items));
+        assert_eq!(resp.status, STATUS_OK, "batch create should succeed");
+
+        // Pull the device_id of every Create journaled in each store's log.
+        let creates_in = |log: &Arc<Mutex<RedoLog>>| -> Vec<u8> {
+            log.lock()
+                .read_from_sequence(1)
+                .unwrap()
+                .into_iter()
+                .filter_map(|e| match e.op {
+                    RedoOp::Create { device_id, .. } => Some(device_id),
+                    _ => None,
+                })
+                .collect()
+        };
+        let c0 = creates_in(&log0_arc);
+        let c1 = creates_in(&log1_arc);
+
+        assert!(
+            !c0.is_empty() && !c1.is_empty(),
+            "round-robin must journal creates to BOTH store logs (c0={c0:?}, c1={c1:?})"
+        );
+        assert!(
+            c0.iter().all(|&d| d == 0),
+            "store 0's log must hold only device_id=0 creates, got {c0:?}"
+        );
+        assert!(
+            c1.iter().all(|&d| d == 1),
+            "store 1's log must hold only device_id=1 creates, got {c1:?}"
+        );
+        assert_eq!(
+            c0.len() + c1.len(),
+            txids.len(),
+            "every record must be journaled exactly once across the store logs"
+        );
+    }
+
+    #[test]
     fn parse_cold_data_fields_rejects_truncated_large_section_length() {
         let mut cold_data = Vec::new();
         cold_data.extend_from_slice(&u32::MAX.to_le_bytes());
@@ -11331,11 +11582,9 @@ mod tests {
         assert_eq!(h.engine.store_count(), 2, "expected a 2-store engine");
 
         // Seed 6 txns via Engine::create (which performs round-robin store
-        // placement) so records actually land on both physical devices. The
-        // dispatch batch-create path currently pins to store 0, so we go
-        // through the engine directly to exercise cross-store reads. Each gets
-        // a distinct utxo_count so we can verify the response item at position
-        // i carries txid i's data and not some neighbour's.
+        // placement) so records actually land on both physical devices. Each
+        // gets a distinct utxo_count so we can verify the response item at
+        // position i carries txid i's data and not some neighbour's.
         let txids: Vec<[u8; 32]> = (0..6).map(DispatchTestHarness::make_txid).collect();
         for (i, txid) in txids.iter().enumerate() {
             let utxo_count = (i as u32) + 1;
@@ -12825,16 +13074,16 @@ mod tests {
         ranges.sort_by_key(|range| range.0);
 
         assert_eq!(ranges, vec![(1, 1), (2, 2)]);
-        // F-G4-001 made flush() emit two device syncs per effective
-        // flush: one for the entries pwrite and one for the persisted-
-        // header pwrite. Group commit collapses the two concurrent
-        // writers into one effective flush, so the post-open delta is
-        // exactly 2 syncs.
+        // Group commit collapses the two concurrent writers into one effective
+        // flush, and that flush now issues exactly ONE device sync: the entries
+        // block and the F-G4-001 persisted header are pwritten back-to-back and
+        // made durable by a single `device.sync()` (the header no longer pays a
+        // second fsync).
         assert_eq!(
             redo_dev.sync_count() - baseline_syncs,
-            2,
-            "concurrent dispatch writers should share one effective flush \
-             (one entries sync + one header sync under F-G4-001)"
+            1,
+            "concurrent dispatch writers should share one effective flush of \
+             exactly one fsync (entries + header)"
         );
 
         let entries = redo_log.lock().recover().expect("recover grouped entries");
@@ -14919,6 +15168,90 @@ mod tests {
         assert!(
             tracker.pending().is_empty(),
             "stale pending intent should be cleared after redo reclamation"
+        );
+    }
+
+    #[test]
+    fn intent_recovery_reads_redo_merged_across_per_store_logs() {
+        // A pending replication-intent range can span MULTIPLE store logs under
+        // per-store redo (each entry lands in exactly one store's log). Recovery
+        // must reconstruct the ops from the MERGED, sequence-ordered view — a
+        // single-log read would miss the entries that landed on the other store
+        // and falsely report the range unresolvable.
+        let h = DispatchTestHarness::with_stores(1); // 2 stores
+
+        // Attach a per-store redo log to each store, sharing ONE global counter
+        // (the boot wiring).
+        let rdev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 4 * 1024 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 4 * 1024 * 1024).unwrap();
+        let shared = Arc::new(std::sync::atomic::AtomicU64::new(
+            RedoLog::shared_sequence_floor(&[&log0, &log1]),
+        ));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+        let log0_arc = Arc::new(Mutex::new(log0));
+        let log1_arc = Arc::new(Mutex::new(log1));
+        h.engine
+            .set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        // Write one Delete to EACH store's log so a single intent range straddles
+        // both. The shared counter assigns globally-unique sequences, so s1 > s0.
+        let key0 = TxKey {
+            txid: txid_for_shard(70, 9),
+        };
+        let key1 = TxKey {
+            txid: txid_for_shard(71, 9),
+        };
+        let s0 = log0_arc
+            .lock()
+            .append(RedoOp::Delete {
+                tx_key: key0,
+                record_offset: 4096,
+                record_size: 256,
+            })
+            .unwrap();
+        let s1 = log1_arc
+            .lock()
+            .append(RedoOp::Delete {
+                tx_key: key1,
+                record_offset: 8192,
+                record_size: 256,
+            })
+            .unwrap();
+        log0_arc.lock().flush().unwrap();
+        log1_arc.lock().flush().unwrap();
+        assert!(s1 > s0, "global sequence must advance across store logs");
+
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+        tracker.begin(s0, s1).unwrap();
+
+        let mut observed: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(log0_arc.as_ref()),
+            &h.engine,
+            |ops, range| {
+                assert_eq!(range, (s0, s1), "the recovered range must be the full span");
+                observed.extend_from_slice(ops);
+                Ok(())
+            },
+        )
+        .expect("merged read must resolve a range spanning both store logs");
+
+        // BOTH deletes must be reconstructed — proof the merged read pulled from
+        // both logs. A single-log read would have surfaced only one.
+        let keys: Vec<TxKey> = observed.iter().map(|(k, _)| *k).collect();
+        assert!(
+            keys.contains(&key0) && keys.contains(&key1),
+            "recovery must re-emit deletes from BOTH store logs, got {keys:?}"
+        );
+        assert!(
+            tracker.pending().is_empty(),
+            "intent must be committed after successful re-replication"
         );
     }
 
@@ -22763,16 +23096,15 @@ mod tests {
         );
 
         assert_eq!(resp.status, STATUS_OK);
-        // Issue #14: AllocateRegion + Create are now written in ONE atomic
-        // redo flush, so the create batch fsyncs ONCE — two device syncs (the
-        // entries pwrite + the F-G4-001 persisted-header rewrite carrying the
-        // new `next_sequence`). This also halves the create fsync count vs the
-        // old separate allocator-reservation + Create flushes.
+        // Issue #14: AllocateRegion + Create are written in ONE atomic redo
+        // flush. That flush now issues exactly ONE device sync: the entries
+        // block and the F-G4-001 header (carrying the new `next_sequence`) are
+        // pwritten back-to-back and made durable by a single `device.sync()`
+        // (the per-flush header no longer pays its own second fsync).
         assert_eq!(
             redo_dev.sync_count() - before_syncs,
-            2,
-            "create batch should fsync ONCE (entries + F-G4-001 header) now that \
-             AllocateRegion and Create share one atomic redo batch"
+            1,
+            "create batch should issue exactly one fsync covering entries + header"
         );
 
         let entries = redo_log.lock().recover().unwrap();

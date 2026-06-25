@@ -697,8 +697,9 @@ pub enum RedoOp {
         offset: u64,
         /// Size of the allocation in bytes (already aligned).
         size: u64,
-        /// Logical device identifier — currently always 0 (single device).
-        /// Reserved for future multi-device deployments.
+        /// Store this region belongs to (0 single-store; 0..N under
+        /// `device_split`). Routes the region to the owning store's allocator on
+        /// replay and the entry to that store's redo log under per-store redo.
         device_id: u8,
     },
     /// Durability record for a device-space release by the allocator.
@@ -2181,7 +2182,11 @@ impl RedoLog {
     /// Serialize and durably write the header. Pads to `header_block_size`
     /// with zeros so the write covers the full reserved block atomically
     /// at the device's alignment.
-    fn write_header(&self) -> Result<()> {
+    /// Write the header block to the device WITHOUT an fsync. The caller is
+    /// responsible for a subsequent `device.sync()` (or for riding a later sync
+    /// of the same device) to make it durable. `flush` uses this so the header
+    /// rides the SAME fsync as the entries block instead of paying a second one.
+    fn write_header_nosync(&self) -> Result<()> {
         let header = RedoHeader {
             next_sequence: self.next_sequence,
             checkpoint_seq: self.checkpoint_seq,
@@ -2193,6 +2198,11 @@ impl RedoLog {
         buf[..bytes.len()].copy_from_slice(&bytes);
         // Trailing bytes are already zeroed by AlignedBuf::new.
         self.device.pwrite_all_at(&buf, self.log_offset)?;
+        Ok(())
+    }
+
+    fn write_header(&self) -> Result<()> {
+        self.write_header_nosync()?;
         self.device.sync()?;
         Ok(())
     }
@@ -2314,9 +2324,27 @@ impl RedoLog {
             self.poison_drop_buffer();
             return Err(e.into());
         }
+        // F-G4-001: persist the header (next_sequence / checkpoint_seq /
+        // logical_start) on every flush so a corrupted-tail recovery never
+        // reuses a sequence already handed out (replication-watermark
+        // monotonicity). PERF: write it WITHOUT its own fsync — the single
+        // `device.sync()` below flushes the device once, making BOTH the entries
+        // block and this header durable together. This halves the per-flush
+        // fsync count (was: entries sync + header sync) with identical
+        // durability semantics. `next_sequence` is already advanced (at append
+        // time) and `checkpoint_seq`/`logical_start` are unchanged by this
+        // flush, so the header reflects exactly the state these entries imply.
+        if let Err(e) = self.write_header_nosync() {
+            if let Some(m) = redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            self.poison_drop_buffer();
+            return Err(e);
+        }
         crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
         // Scope the sync call tightly so the latency histogram reflects only
-        // the fsync wall time, not the buffer-assembly / pwrite preamble.
+        // the fsync wall time, not the buffer-assembly / pwrite preamble. This
+        // ONE fsync makes both the entries block and the header durable.
         let sync_start = Instant::now();
         let sync_res = self.device.sync();
         if let Some(m) = redo_metrics() {
@@ -2340,16 +2368,6 @@ impl RedoLog {
         self.buffer.clear();
         self.entries_cache.append(&mut self.pending_entries);
         self.buffered_entries = 0;
-
-        // F-G4-001: persist the new `next_sequence` so it survives a
-        // restart after compaction empties the entries region.
-        if let Err(e) = self.write_header() {
-            if let Some(m) = redo_metrics() {
-                m.redo_flush_errors_total.inc();
-            }
-            self.poison_drop_buffer();
-            return Err(e);
-        }
 
         if let Some(m) = redo_metrics() {
             m.redo_bytes_per_flush.record_ns(flushed_bytes);
@@ -5277,6 +5295,65 @@ mod tests {
             reopened.current_sequence(),
             high_seq,
             "next_sequence must not roll back",
+        );
+    }
+
+    /// PERF: a normal flush must cost exactly ONE fsync. The header
+    /// (next_sequence/checkpoint_seq/logical_start) is still rewritten every
+    /// flush — so the corrupted-tail watermark guarantee holds — but it rides
+    /// the SAME `device.sync()` as the entries block instead of paying a second
+    /// fsync. Reopen must see a consistent next_sequence + all entries.
+    #[test]
+    fn flush_issues_a_single_fsync_covering_entries_and_header() {
+        let align = 4096usize;
+        let size = 256 * 1024usize;
+        let dev = Arc::new(CrashCowDevice::new(size, align));
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+        let mut log = RedoLog::open(dyn_dev.clone(), 0, size as u64).unwrap();
+
+        // One append + flush costs exactly ONE fsync, even though it persists
+        // BOTH the entries block and the header. The previous implementation
+        // issued two fsyncs (entries sync, then a separate header sync).
+        let before = dev.sync_count.load(Ordering::SeqCst);
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 1,
+        })
+        .unwrap();
+        log.flush().unwrap();
+        let after = dev.sync_count.load(Ordering::SeqCst);
+        assert_eq!(
+            after - before,
+            1,
+            "flush must issue exactly one fsync covering both entries and header"
+        );
+
+        for i in 2..=10u8 {
+            log.append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: i as u32,
+            })
+            .unwrap();
+        }
+        assert_eq!(log.current_sequence(), 11, "10 appends → next_sequence 11");
+        drop(log);
+
+        let reopened = RedoLog::open(dyn_dev, 0, size as u64).unwrap();
+        assert_eq!(
+            reopened.current_sequence(),
+            11,
+            "next_sequence must survive reopen (header rode the entries fsync)"
+        );
+        let seqs: Vec<u64> = reopened
+            .read_from_sequence(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(
+            seqs,
+            (1..=10).collect::<Vec<u64>>(),
+            "every flushed entry must recover after reopen"
         );
     }
 
