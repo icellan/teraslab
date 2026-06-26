@@ -477,7 +477,7 @@ Operations return signals that drive follow-up actions:
 > **Decision (LP-5 — signals and `childCount` / `block_ids` are server-internal, NOT on the wire).**
 > The legacy Lua `spend`/`spendMulti`/`setMined`/`setConflicting`/`preserveUntil` responses carry
 > `signal` (ALLSPENT/NOTALLSPENT/DAHSET/DAHUNSET/PRESERVE), `childCount`, and `block_ids` so the
-> *Aerospike Go client* can drive follow-up actions (set/clear DAH on the external `.tx` blob, fan
+> *the reference UDF Go client* can drive follow-up actions (set/clear DAH on the external `.tx` blob, fan
 > out to pagination child records, evict the tx-meta cache). In TeraSlab **every one of those
 > consumers is internalized**: pagination records do not exist (so `childCount` is meaningless — see
 > §2.2), the blob store is server-side with its own GC, and parent-prune / DAH transitions are
@@ -648,9 +648,9 @@ Operations return signals that drive follow-up actions:
 6. `pwrite` metadata (to update `reassignment_offset` if first reassign)
 7. Release lock
 
-**Note on all-spent check (LP-3 — reference parity):** A reassigned record is **never** DAH-eligible, matching the Aerospike Lua `reassign` which inflates `recordUtxos` by 1 (`teranode.lua:945`) so `spent_utxos == record_utxos` can never become true. TeraSlab cannot fabricate a phantom slot, so reassign instead sets a persisted `REASSIGNED` flag (`TxFlags` bit 6); `evaluate_delete_at_height` / `evaluate_dah_cached` / the DAH-sweep predicate all force the all-spent check false when it is set, and the CONFLICTING DAH branch is unaffected (the Lua `+1` only touches the all-spent computation, so a reassigned record later marked conflicting is still DAH'd). Rationale: a reassignment is a court-ordered / alert-system action whose old-hash → new-hash audit trail and reorg evidence the reference deliberately keeps on the store permanently. A **live** reassigned UTXO was already safe from deletion (freeze does not increment `spent_utxos`, so the all-spent check is false until the reassigned slot is itself spent); the flag additionally covers the after-final-spend window. **Limitation:** the `REASSIGNED` flag (like `reassignment_count`) is not carried by the migration `Create`-op metadata path (`create_metadata_flag_bytes`), so a record migrated between cluster nodes loses the reassignment retention guarantee — same pre-existing gap as the reassignment audit trail itself.
+**Note on all-spent check (LP-3 — reference parity):** A reassigned record is **never** DAH-eligible, matching the reference UDF Lua `reassign` which inflates `recordUtxos` by 1 (`teranode.lua:945`) so `spent_utxos == record_utxos` can never become true. TeraSlab cannot fabricate a phantom slot, so reassign instead sets a persisted `REASSIGNED` flag (`TxFlags` bit 6); `evaluate_delete_at_height` / `evaluate_dah_cached` / the DAH-sweep predicate all force the all-spent check false when it is set, and the CONFLICTING DAH branch is unaffected (the Lua `+1` only touches the all-spent computation, so a reassigned record later marked conflicting is still DAH'd). Rationale: a reassignment is a court-ordered / alert-system action whose old-hash → new-hash audit trail and reorg evidence the reference deliberately keeps on the store permanently. A **live** reassigned UTXO was already safe from deletion (freeze does not increment `spent_utxos`, so the all-spent check is false until the reassigned slot is itself spent); the flag additionally covers the after-final-spend window. **Limitation:** the `REASSIGNED` flag (like `reassignment_count`) is not carried by the migration `Create`-op metadata path (`create_metadata_flag_bytes`), so a record migrated between cluster nodes loses the reassignment retention guarantee — same pre-existing gap as the reassignment audit trail itself.
 
-**Note on spendable height (LP-4 — cooldown survives freeze/unfreeze):** The reassign cooldown lives in the unspent slot's `spending_data[0..4]` (§2.4). The Aerospike reference keeps it in a separate `utxoSpendableIn` bin that freeze/unfreeze never touch; TeraSlab stores it in the slot, so `freeze` must **preserve** the 4-byte cooldown across the all-`0xFF` frozen marker and `unfreeze` must **restore** it, rather than wiping it (pre-fix a freeze→unfreeze round-trip on a reassigned output made it immediately spendable, bypassing the safety window). A frozen reassigned slot therefore carries the cooldown in `spending_data[0..4]` (the `UTXO_FROZEN` status byte remains the authoritative frozen signal; the legacy all-`0xFF` data pattern is one representation, not a requirement). The restriction is otherwise cleared naturally when the UTXO is spent (spending_data overwritten with txid+vin) or unspent during a reorg (spending_data zeroed → spendable_height 0 = immediately spendable).
+**Note on spendable height (LP-4 — cooldown survives freeze/unfreeze):** The reassign cooldown lives in the unspent slot's `spending_data[0..4]` (§2.4). The reference UDF reference keeps it in a separate `utxoSpendableIn` bin that freeze/unfreeze never touch; TeraSlab stores it in the slot, so `freeze` must **preserve** the 4-byte cooldown across the all-`0xFF` frozen marker and `unfreeze` must **restore** it, rather than wiping it (pre-fix a freeze→unfreeze round-trip on a reassigned output made it immediately spendable, bypassing the safety window). A frozen reassigned slot therefore carries the cooldown in `spending_data[0..4]` (the `UTXO_FROZEN` status byte remains the authoritative frozen signal; the legacy all-`0xFF` data pattern is one representation, not a requirement). The restriction is otherwise cleared naturally when the UTXO is spent (spending_data overwritten with txid+vin) or unspent during a reorg (spending_data zeroed → spendable_height 0 = immediately spendable).
 
 **Atomicity**: Per-record.
 **Idempotency**: Not naturally idempotent — reassigning an already-unspent UTXO with different hash would fail hash check.
@@ -893,14 +893,14 @@ Point read of a single UTXO slot plus the record's locktime. Used for double-spe
    pre-pass inside `OP_PROCESS_EXPIRED_PRESERVATIONS`):
    - Scan for records where `preserve_until` is in `[1, current_height]`
    - For each: set `delete_at_height = current_height + BlockHeightRetention`
-     and clear `preserve_until` (unconditional, matching the Aerospike pruner
+     and clear `preserve_until` (unconditional, matching the reference UDF pruner
      `ProcessExpiredPreservations`; the elapsed preservation window is itself
      the signal that the record may be reclaimed). The record is then deleted
      `BlockHeightRetention` blocks later by the Phase 2 sweep.
    - **Wire payload:** `OP_PROCESS_EXPIRED_PRESERVATIONS` takes
      `[current_height:4]` (legacy: expiry pre-pass skipped) or
      `[current_height:4][block_height_retention:4]` (the 8-byte form supplies
-     the retention used to schedule the expired records' DAH; the Aerospike
+     the retention used to schedule the expired records' DAH; the reference UDF
      store reads it from server config, TeraSlab's pruner client supplies it
      the same way the hot-path mutations carry `block_height_retention`).
 

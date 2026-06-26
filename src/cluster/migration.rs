@@ -355,7 +355,7 @@ pub struct MigrationThrottle {
 }
 
 impl MigrationThrottle {
-    /// Default cap (32 MiB) — matches Aerospike's `MAX_BYTES_EMIGRATING`.
+    /// Default cap (32 MiB) — matches the reference UDF's `MAX_BYTES_EMIGRATING`.
     pub const DEFAULT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 
     /// Env var that overrides the cap at process startup. Empty / unset /

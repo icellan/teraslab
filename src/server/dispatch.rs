@@ -5745,7 +5745,7 @@ fn handle_set_mined_batch(
     // list per item so the Go client (`txmetacache.SetMinedMulti`) can satisfy
     // its coverage postcondition without an extra GET round-trip. LP-5: the DAH
     // `signal` is surfaced in the same per-item record. `childCount`/#1037 is
-    // intentionally NOT emitted: it existed only to let the Aerospike client
+    // intentionally NOT emitted: it existed only to let the reference UDF client
     // clear `locked` on pagination child records, which TeraSlab does not have
     // (spec §2.2 — pagination eliminated). The master record's LOCKED flag is
     // cleared server-side inside `set_mined_inner` (engine.rs), so there is
@@ -9306,8 +9306,8 @@ fn handle_preserve_transactions(
 /// Before the DAH sweep, process preservations whose window has elapsed:
 /// for each record with `preserve_until` in `[1, current_height]`, set
 /// `delete_at_height = current_height + block_height_retention` and clear
-/// `preserve_until` (mirroring the Aerospike pruner's
-/// `ProcessExpiredPreservations`, `aerospike.go:999-1100`). Without this the
+/// `preserve_until` (mirroring the reference pruner's
+/// `ProcessExpiredPreservations` in the upstream Go reference, ~lines 999-1100). Without this the
 /// preserved set grows monotonically and is never reclaimed. The expired
 /// records do NOT get deleted in this same call — their fresh DAH is
 /// `current_height + retention`, in the future — exactly as the reference
@@ -9317,7 +9317,7 @@ fn handle_preserve_transactions(
 ///
 /// `[current_height:4]` or `[current_height:4][block_height_retention:4]`.
 /// The 8-byte form supplies the retention used for expiry-phase DAH
-/// scheduling (the Aerospike store reads it from server config; TeraSlab's
+/// scheduling (the reference UDF store reads it from server config; TeraSlab's
 /// hot-path mutations already carry `block_height_retention` per request, so
 /// the sweep client supplies it the same way). The legacy 4-byte form omits
 /// retention: the expiry phase is then skipped (retention treated as 0) and
@@ -10021,7 +10021,7 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         // distinguish via the empty payload (real `InvalidSpend` carries
         // the 36-byte `spending_data`).
         SpendError::ReservedSpendingData { .. } => (ERR_INVALID_SPEND, vec![]),
-        // F-X-022: Aerospike `addDeletedChildren` parity. Distinct wire
+        // F-X-022: the reference UDF `addDeletedChildren` parity. Distinct wire
         // code (`ERR_DELETED_CHILDREN = 35`) so clients can distinguish
         // the resurrected-then-pruned rejection from the regular
         // `UTXO_PRUNED` slot-status rejection (`ERR_INVALID_SPEND`).

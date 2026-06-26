@@ -625,7 +625,7 @@ pub enum RedoOp {
         child_txid: [u8; 32],
     },
     /// F-X-022: durable intent to append a child txid to a parent's
-    /// deleted-children list. Aerospike `addDeletedChildren` parity.
+    /// deleted-children list. the reference UDF `addDeletedChildren` parity.
     ///
     /// Emitted from `Engine::append_deleted_child` after the prune-slot
     /// mutation, so the chain of redo entries is:

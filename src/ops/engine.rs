@@ -2794,7 +2794,7 @@ impl Engine {
                     let spendable_height = u32::from_le_bytes(buf);
                     // Spendable AT stop: half-open interval `[0, spendable_height)`.
                     // At `current_block_height == spendable_height` the UTXO is
-                    // unfrozen — matches Teranode PR #949 / svnode / Aerospike
+                    // unfrozen — matches Teranode PR #949 / svnode / the reference UDF
                     // post-fix. Pre-fix this used `>=` which false-rejected at
                     // the exact unlock height — i.e. accepting txs the network
                     // would reject.
@@ -3006,7 +3006,7 @@ impl Engine {
                     // no write means nothing to recover.
                     //
                     // F-X-022 — `addDeletedChildren` parity with
-                    // Aerospike. Before returning the no-op, consult
+                    // the reference UDF. Before returning the no-op, consult
                     // the parent record's `deleted_children` list. If
                     // the requesting child txid is present, the
                     // chain history has been altered ("resurrected-
@@ -4800,7 +4800,7 @@ impl Engine {
         // on-record DAH so the now-prunable-by-other-means record stops
         // being re-scanned on every sweep.
         self.update_dah_index(parent_key, old_dah, new_dah)?;
-        // F-X-022: Aerospike `addDeletedChildren` parity. The prune above
+        // F-X-022: the reference UDF `addDeletedChildren` parity. The prune above
         // is the PRIMARY defense (UTXO_PRUNED is the on-disk slot status
         // every spend path checks first). The append below is the
         // SECONDARY audit/diagnostic trail + defense-in-depth at the
@@ -5657,7 +5657,7 @@ impl Engine {
     }
 
     // -----------------------------------------------------------------------
-    // F-X-022 — Deleted children list (Aerospike `addDeletedChildren` parity)
+    // F-X-022 — Deleted children list (the reference UDF `addDeletedChildren` parity)
     //
     // The deleted-children list is a per-parent-record audit/diagnostic of
     // every child txid that has been pruned against the parent. It mirrors
@@ -5682,7 +5682,7 @@ impl Engine {
     /// Deduplicates: if the child already exists, this is a no-op.
     /// Returns Ok(()) if the parent is not found (may be on another node).
     ///
-    /// F-X-022: Aerospike `addDeletedChildren` parity. Mirrors
+    /// F-X-022: the reference UDF `addDeletedChildren` parity. Mirrors
     /// [`Self::append_conflicting_child`] — see that method for the full
     /// rationale on the CAS retry loop, the allocate-out-of-lock pattern,
     /// and the orphan-blob tracing fall-back on rollback.
@@ -5925,7 +5925,7 @@ impl Engine {
 
     /// Read all deleted children txids for a transaction.
     ///
-    /// F-X-022: Aerospike `addDeletedChildren` parity. Returns an empty
+    /// F-X-022: the reference UDF `addDeletedChildren` parity. Returns an empty
     /// vec when the parent has never had a child pruned against it.
     ///
     /// # Concurrency (g2 — barrier-dependent)
@@ -7199,8 +7199,8 @@ impl Engine {
 
     /// Expire a preservation whose `preserve_until` height has been reached.
     ///
-    /// Mirror of the Aerospike pruner's `ProcessExpiredPreservations`
-    /// (`teranode/stores/utxo/aerospike/aerospike.go:999-1100`) and spec
+    /// Mirror of the reference pruner's `ProcessExpiredPreservations`
+    /// (the upstream Teranode UTXO-store Go reference, ~lines 999-1100) and spec
     /// §3.18 Phase 3 ("Expired preservation processing"): for a record whose
     /// `preserve_until` is in `[1, current_height]`, schedule deletion by
     /// setting `delete_at_height = current_height + block_height_retention`
@@ -11599,7 +11599,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F-X-022 — Aerospike `addDeletedChildren` parity tests
+    // F-X-022 — the reference UDF `addDeletedChildren` parity tests
     // -----------------------------------------------------------------------
 
     /// F-X-022: a fresh record has no deleted children — `read_deleted_children`
@@ -16065,7 +16065,7 @@ mod tests {
     /// Boundary semantics — spendable AT stop (half-open `[start, stop)`).
     /// At `current_block_height == spendable_height` the UTXO MUST be
     /// spendable. Matches Teranode PR #949 fix to `teranode.lua:373`
-    /// and svnode/Aerospike post-fix behaviour. Pre-2026-05 this asserted
+    /// and svnode/the reference UDF post-fix behaviour. Pre-2026-05 this asserted
     /// the inverse (FrozenUntil at exact height) — that was the bug.
     #[test]
     fn reassign_spendable_height_boundary_at_exact_height() {

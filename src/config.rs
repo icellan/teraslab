@@ -557,7 +557,7 @@ pub struct ServerConfig {
     pub device_alignment: usize,
 
     /// Number of virtual stores to carve each physical device into
-    /// (Aerospike-style virtual devices). `1` = one store per device. Splitting
+    /// (reference-style virtual devices). `1` = one store per device. Splitting
     /// a device into K stores gives K independent allocators + index lock
     /// domains (lock/contention parallelism) sharing one physical device's I/O
     /// bandwidth and fsync barrier. Total stores = `device_paths.len() *

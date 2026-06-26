@@ -7687,7 +7687,7 @@ pub fn load_peak_cluster_size(path: &std::path::Path) -> usize {
     load_cluster_state(path).0
 }
 
-/// Aerospike-style scoring for master election candidates.
+/// reference-style scoring for master election candidates.
 ///
 /// Scores: full = 3, subset = 2, evicted = 0. Sticky preference for the
 /// previous master is applied as a *tie-breaker* in

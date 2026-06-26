@@ -39,7 +39,7 @@ The production write path is synchronous `O_DIRECT` I/O via `src/device.rs` (`Di
 
 **Documented design choices** (deliberate scope decisions, not bugs):
 
-- **Single-interval freeze model.** `spendable_height` is a single `u32` per output (mirrors Aerospike). svnode's `enforceAtHeight` supports a multi-interval array. If Teranode's contract evolves to require multi-interval freezes (e.g. two disjoint locked windows on the same UTXO), a new op type (`OP_FREEZE_INTERVAL_BATCH` or similar) is required; the on-disk slot layout reserves enough spending-data bytes to extend without a format break, but the engine match arms and the wire protocol need additions.
+- **Single-interval freeze model.** `spendable_height` is a single `u32` per output (mirrors the reference UDF). svnode's `enforceAtHeight` supports a multi-interval array. If Teranode's contract evolves to require multi-interval freezes (e.g. two disjoint locked windows on the same UTXO), a new op type (`OP_FREEZE_INTERVAL_BATCH` or similar) is required; the on-disk slot layout reserves enough spending-data bytes to extend without a format break, but the engine match arms and the wire protocol need additions.
 
 **Known residual coverage gaps** (tracked, low risk):
 

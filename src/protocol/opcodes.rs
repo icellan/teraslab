@@ -408,7 +408,7 @@ pub const ERR_STREAM_OFFSET_MISMATCH: u16 = 18;
 /// rejected it.
 pub const ERR_STREAM_INVARIANT: u16 = 34;
 
-/// F-X-022 — Aerospike `addDeletedChildren` parity. The idempotent
+/// F-X-022 — the reference UDF `addDeletedChildren` parity. The idempotent
 /// re-spend short-circuit consulted the parent record's
 /// `deleted_children` list and found the requested child txid present
 /// (the spending child was pruned after originally consuming this

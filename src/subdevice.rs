@@ -4,7 +4,7 @@
 //! `[base, base + len)` of a larger physical [`BlockDevice`]. Splitting a
 //! device into K sub-devices yields K independent storage domains — each gets
 //! its own allocator, redo log, and index in the layer above — that share one
-//! physical device. This is the Aerospike-style "virtual device" model: it
+//! physical device. This is the reference-style "virtual device" model: it
 //! buys lock/WAL parallelism even on a single physical device. Physical I/O
 //! bandwidth and the fsync barrier are still shared by co-located sub-devices.
 //!
