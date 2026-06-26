@@ -410,7 +410,7 @@ The key histograms in `<variant>_metrics.txt`:
 
 ### Findings (single-node, mixed workload, macOS Docker Desktop)
 
-Measured at 32 concurrent workers, single-item RPCs:
+**1. Single-item RPCs (`--batch 1`) — fsync-floor bound.** 32 workers:
 
 | | 1 store | 4 stores |
 |---|---|---|
@@ -419,26 +419,42 @@ Measured at 32 concurrent workers, single-item RPCs:
 | Redo fsync mean / p99 | 1.54 / 4.19 ms | 1.22 / 2.10 ms |
 | Read (get) p50 | 16 µs | 16 µs |
 
-What the numbers say:
-1. **Writes are fsync-bound, not CPU- or lock-bound.** `lock_wait` is empty;
-   every write op pays a redo fsync (`flush_count ≈ write_ops`,
-   `entries_per_flush ≈ 1.5`). There is **no group-commit coalescing across
-   concurrent single-item RPCs** — each item's batch fsyncs on its own, so write
-   throughput is gated by `write_concurrency / fsync_latency`.
-2. **Reads are effectively free** (~16 µs p50) — the index is in memory.
-3. **Multi-device helps**: four independent redo logs let fsyncs run in
-   parallel, cutting write p50 latency ~2× and lifting throughput ~20% **even on
-   a single shared Docker volume**. On physically separate NVMe devices the gain
-   is larger (independent IOPS, not just independent commit paths).
+`lock_wait` is empty (not lock-bound) and `flush_count ≈ write_ops`,
+`entries_per_flush ≈ 1.5` — i.e. **one fsync per op, no group-commit coalescing
+across concurrent single-item RPCs**. Write throughput is gated by
+`write_concurrency / fsync_latency`. Reads are ~free (in-memory index).
+Multi-device helps (4 independent redo logs fsync in parallel) even on one
+shared volume.
 
-> ⚠️ **Absolute throughput here is a floor, not the target.** It is gated by (a)
-> macOS Docker Desktop's virtual-disk fsync (~1–1.5 ms vs <100 µs on real NVMe)
-> and (b) the loadgen sending one item per RPC. The 10M+ ops/sec design target
-> assumes production batching (thousands of items per RPC) on bare-metal NVMe.
-> Use this harness for **relative** comparisons (config A vs B, before vs after)
-> and for **stage attribution**, not for headline numbers. To approach the
-> design target, batch many items per RPC and run on real NVMe with separate
-> `device_paths` per physical device.
+**2. Batched RPCs (`--batch 256`) — fsync floor removed, now device-I/O bound.**
+32 workers:
+
+| | 1 store | 4 stores |
+|---|---|---|
+| Throughput | ~16–17k ops/s | ~17k ops/s |
+| `entries_per_flush` | ~300 | ~87 |
+| `create` latency / batch | ~0.7 ms | — |
+| `spend` latency / 256-item batch | ~20 ms | — |
+| `set_mined` latency / 256-item batch | ~14 ms | — |
+
+Batching amortizes the fsync across ~300 entries/flush, lifting throughput ~65×
+(250 → ~17k). The bottleneck then moves to the **read-modify-write device I/O**
+on `spend`/`set_mined` (each reads the record from the device, mutates, writes
+back). At this point the server uses only **~0.75 of 8 cores** (RAM ~150 MiB,
+client ~1% CPU) — it is **I/O-wait bound, not CPU/lock/client bound**.
+
+> ⚠️ **Absolute throughput here is a floor, not the target**, and on this host
+> it is gated by the **macOS Docker Desktop virtual disk**, which behaves like an
+> effective **queue depth of ~1**: concurrent `pread`/`pwrite` do not overlap at
+> the virtualization layer (~1–1.5 ms fsync, slow random reads, vs <100 µs on
+> NVMe). The read fan-out in `handle_spend_batch`/`handle_set_mined_batch`
+> (mirroring `get_batch`) is correct and tested, but yields **no measurable gain
+> on this disk** because the device serializes the I/O it issues — CPU stays
+> pinned at ~0.75 core regardless. On bare-metal NVMe (deep queues, parallel
+> channels) that fan-out, plus separate `device_paths` per physical device and
+> large client batches, is what unlocks the design target. Use this harness for
+> **relative** comparisons and **stage attribution**, not headline numbers — and
+> to actually measure the I/O-parallel paths, run it on real NVMe.
 
 ## Wire protocol
 
