@@ -132,6 +132,11 @@ async fn main() {
     let reads = Arc::new(AtomicU64::new(0));
     let mined_count = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
+    // Actual concurrent in-flight RPCs (round-trips awaiting a reply) and its
+    // high-water mark. If this stays far below `workers`, the client is NOT
+    // offering the concurrency we think — the bottleneck is here, not the server.
+    let inflight = Arc::new(AtomicU64::new(0));
+    let inflight_hwm = Arc::new(AtomicU64::new(0));
 
     // Error categorization for debugging.
     let err_partial = Arc::new(AtomicU64::new(0));
@@ -163,6 +168,8 @@ async fn main() {
         mined_count.clone(),
         errors.clone(),
     );
+    let inflight_s = inflight.clone();
+    let inflight_hwm_s = inflight_hwm.clone();
     let stats = tokio::spawn(async move {
         let mut last = (0u64, 0u64, 0u64, 0u64);
         loop {
@@ -177,7 +184,9 @@ async fn main() {
             let e = e_s.load(Ordering::Relaxed);
             let rate = ((c - last.0) + (s - last.1) + (r - last.2) + (m - last.3)) / 2;
             eprintln!(
-                "  {rate} ops/s | creates={} spends={} reads={} mined={} errors={e} (totals: {c}/{s}/{r}/{m})",
+                "  {rate} ops/s | inflight={}/hwm={} | creates={} spends={} reads={} mined={} errors={e} (totals: {c}/{s}/{r}/{m})",
+                inflight_s.load(Ordering::Relaxed),
+                inflight_hwm_s.load(Ordering::Relaxed),
                 (c - last.0) / 2,
                 (s - last.1) / 2,
                 (r - last.2) / 2,
@@ -203,6 +212,8 @@ async fn main() {
         let err_server = err_server.clone();
         let err_other = err_other.clone();
         let err_logged = err_logged.clone();
+        let inflight = inflight.clone();
+        let inflight_hwm = inflight_hwm.clone();
 
         handles.push(tokio::spawn(async move {
             // Per-worker LOCAL queue of created (txid, first-utxo-hash) — no
@@ -331,7 +342,11 @@ async fn main() {
                 match op {
                     0..4 => {
                         let (items, firsts) = make_creates(&mut rng);
-                        match client.create_batch(&items).await {
+                        let res = {
+                            let _g = InflightGuard::new(&inflight, &inflight_hwm);
+                            client.create_batch(&items).await
+                        };
+                        match res {
                             Ok(_) => {
                                 creates.fetch_add(items.len() as u64, Ordering::Relaxed);
                                 local.extend(firsts);
@@ -344,7 +359,11 @@ async fn main() {
                         if entries.is_empty() {
                             // Nothing to spend yet — seed with a batch of creates.
                             let (items, firsts) = make_creates(&mut rng);
-                            match client.create_batch(&items).await {
+                            let res = {
+                                let _g = InflightGuard::new(&inflight, &inflight_hwm);
+                                client.create_batch(&items).await
+                            };
+                            match res {
                                 Ok(_) => {
                                     creates.fetch_add(items.len() as u64, Ordering::Relaxed);
                                     local.extend(firsts);
@@ -371,7 +390,11 @@ async fn main() {
                                     }
                                 })
                                 .collect();
-                            match client.spend_batch(&params, &items).await {
+                            let res = {
+                                let _g = InflightGuard::new(&inflight, &inflight_hwm);
+                                client.spend_batch(&params, &items).await
+                            };
+                            match res {
                                 Ok(_) => {
                                     spends.fetch_add(items.len() as u64, Ordering::Relaxed);
                                 }
@@ -389,7 +412,11 @@ async fn main() {
                         if !entries.is_empty() {
                             let txids: Vec<[u8; 32]> = entries.iter().map(|(t, _)| *t).collect();
                             let mask = teraslab::protocol::codec::FieldMask::ALL_METADATA;
-                            match client.get_batch(mask, &txids).await {
+                            let res = {
+                                let _g = InflightGuard::new(&inflight, &inflight_hwm);
+                                client.get_batch(mask, &txids).await
+                            };
+                            match res {
                                 Ok(_) => {
                                     reads.fetch_add(txids.len() as u64, Ordering::Relaxed);
                                 }
@@ -413,7 +440,11 @@ async fn main() {
                                 current_block_height: block_height,
                                 block_height_retention: 288,
                             };
-                            match client.set_mined_batch(&params, &txids).await {
+                            let res = {
+                                let _g = InflightGuard::new(&inflight, &inflight_hwm);
+                                client.set_mined_batch(&params, &txids).await
+                            };
+                            match res {
                                 Ok(_) => {
                                     mined_count.fetch_add(txids.len() as u64, Ordering::Relaxed);
                                 }
@@ -452,7 +483,11 @@ async fn main() {
         "\nDone in {:.1}s: {total} total ops ({ops:.0} ops/s)",
         elapsed.as_secs_f64()
     );
-    eprintln!("  creates={c} spends={s} reads={r} mined={m} errors={e}");
+    eprintln!(
+        "  creates={c} spends={s} reads={r} mined={m} errors={e} | peak in-flight RPCs={} (of {} workers)",
+        inflight_hwm.load(Ordering::Relaxed),
+        args.workers,
+    );
     if e > 0 {
         eprintln!(
             "  error breakdown: partial={} redirect={} connection={} server={} other={}",
@@ -462,6 +497,27 @@ async fn main() {
             err_server.load(Ordering::Relaxed),
             err_other.load(Ordering::Relaxed),
         );
+    }
+}
+
+/// RAII gauge for one in-flight round-trip. Increment (and bump the high-water
+/// mark) on creation, decrement on drop — wrap it around each `.await` so the
+/// gauge reflects true concurrent in-flight RPCs.
+struct InflightGuard<'a> {
+    inflight: &'a AtomicU64,
+}
+
+impl<'a> InflightGuard<'a> {
+    fn new(inflight: &'a AtomicU64, hwm: &AtomicU64) -> Self {
+        let cur = inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        hwm.fetch_max(cur, Ordering::Relaxed);
+        Self { inflight }
+    }
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
