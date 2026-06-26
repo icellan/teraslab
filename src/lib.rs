@@ -32,6 +32,7 @@ pub mod protocol;
 pub mod record;
 pub mod recovery;
 pub mod redo;
+pub mod redo_group;
 pub mod replication;
 pub mod server;
 pub mod storage;

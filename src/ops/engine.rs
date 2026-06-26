@@ -222,6 +222,14 @@ pub struct Engine {
     /// attach a single representative handle; the per-store routing helpers
     /// fall back to [`Self::redo_log_handle`] in that case.
     redo_logs: std::sync::OnceLock<Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>>,
+    /// Per-store group-commit coordinators, one per entry in [`Self::redo_logs`]
+    /// and wrapping the same `Arc<Mutex<RedoLog>>`. The dispatch write path
+    /// ([`Self::append_redo_ops_routed`]) routes each store's append+flush
+    /// through its coordinator so concurrent batch RPCs to the same store
+    /// coalesce their fsync (leader/follower group commit) instead of
+    /// serializing one-fsync-per-RPC on the log mutex. Built alongside
+    /// `redo_logs` in [`Self::set_redo_logs`].
+    redo_committers: std::sync::OnceLock<Vec<Arc<crate::redo_group::GroupCommit>>>,
     /// Append-only on-device deletion-tombstone log (deletion-tombstone
     /// Phase 3). When attached AND [`Self::tombstones_enabled`] is true, the
     /// physical-delete path appends a [`crate::tombstone::Tombstone`] here
@@ -495,6 +503,7 @@ impl Engine {
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_logs: std::sync::OnceLock::new(),
+            redo_committers: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
             // Default ON (design §11.5). A delete still writes no tombstone
@@ -566,9 +575,19 @@ impl Engine {
     /// route each redo entry to the owning store's log via the private
     /// `redo_log_for_device` helper.
     pub fn set_redo_logs(&self, logs: Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>) {
+        // Build a group-commit coordinator per log (wrapping the SAME Arc) before
+        // publishing, so `redo_committers` and `redo_logs` are always in lockstep:
+        // the write path coalesces via the coordinators, while checkpoint /
+        // secondary-index / recovery paths keep locking the shared logs directly.
+        let committers: Vec<Arc<crate::redo_group::GroupCommit>> = logs
+            .iter()
+            .map(|log| crate::redo_group::GroupCommit::new(log.clone()))
+            .collect();
         if self.redo_logs.set(logs).is_err() {
             tracing::warn!("engine per-store redo logs already attached; ignoring replacement");
+            return;
         }
+        let _ = self.redo_committers.set(committers);
     }
 
     /// The redo log owning store `device_id`, for secondary-index two-phase
@@ -603,6 +622,26 @@ impl Engine {
             Some(logs) if !logs.is_empty() => {
                 let idx = (device_id as usize).min(logs.len() - 1);
                 Some(logs[idx].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The group-commit coordinator owning store `device_id`, used by the
+    /// dispatch write path so concurrent batches to the same store coalesce
+    /// their fsync. Mirrors [`Self::redo_log_for_device`] exactly (migration
+    /// suppression, out-of-range clamp to store 0) so routing is identical.
+    fn redo_committer_for_device(
+        &self,
+        device_id: u8,
+    ) -> Option<Arc<crate::redo_group::GroupCommit>> {
+        if migration_journal_suppressed() {
+            return None;
+        }
+        match self.redo_committers.get() {
+            Some(committers) if !committers.is_empty() => {
+                let idx = (device_id as usize).min(committers.len() - 1);
+                Some(committers[idx].clone())
             }
             _ => None,
         }
@@ -778,45 +817,21 @@ impl Engine {
         // and an `AllocateRegion` always precedes its sibling `Create`). Returns
         // the (min, max) sequence this store contributed, or `None` if the store
         // has no log attached.
+        // Route this store's ops through its group-commit coordinator: concurrent
+        // batch RPCs to the same store stage their ops and one leader does a
+        // single append+flush covering them all, so the fsync is shared instead
+        // of serialized one-per-RPC on the log mutex. The coordinator preserves
+        // the exact semantics this closure had before: per-submission (first,last)
+        // range, fail-closed poison on a mid-batch append failure, and a flush
+        // error surfaced as Err. `None` means no log attached / migration
+        // suppression (identical to `redo_log_for_device` returning None).
         let append_flush = |store: usize,
                             store_ops: &[&crate::redo::RedoOp]|
          -> Result<Option<(u64, u64)>, String> {
-            let Some(log) = self.redo_log_for_device(store as u8) else {
+            let Some(committer) = self.redo_committer_for_device(store as u8) else {
                 return Ok(None);
             };
-            let mut guard = log.lock();
-            let mut first = u64::MAX;
-            let mut last = 0u64;
-            let mut wrote = false;
-            for op in store_ops {
-                match guard.append((*op).clone()) {
-                    Ok(seq) => {
-                        first = first.min(seq);
-                        last = last.max(seq);
-                        wrote = true;
-                    }
-                    Err(e) => {
-                        // A mid-batch append failure (e.g. LogFull) leaves the
-                        // EARLIER ops of this batch buffered with already-consumed
-                        // global sequences. If left as-is they would become
-                        // durable on the NEXT successful flush — even though the
-                        // caller treats this batch as failed and rolls its
-                        // in-memory reservations back — silently diverging durable
-                        // state from acknowledged state. Poison the log so the
-                        // residue can never flush (a poisoned `flush()` is a
-                        // no-op error) and no later write extends a partial batch.
-                        // Fail-closed, mirroring the flush-failure path below.
-                        guard.poison();
-                        tracing::error!(err = %e, "redo log append failed; log poisoned");
-                        return Err("redo log append failed".to_string());
-                    }
-                }
-            }
-            guard.flush().map_err(|e| {
-                tracing::error!(err = %e, "redo log flush failed");
-                "redo log flush failed".to_string()
-            })?;
-            Ok(wrote.then_some((first, last)))
+            committer.commit(store_ops.iter().map(|o| (*o).clone()).collect())
         };
 
         let touched: Vec<usize> = (0..store_count)
@@ -14189,6 +14204,64 @@ mod tests {
             fresh.recover().unwrap().is_empty(),
             "no residue from the failed batch may be durable"
         );
+    }
+
+    #[test]
+    fn append_redo_ops_routed_coalesces_concurrent_writers() {
+        use crate::redo::{RedoLog, RedoOp};
+
+        // Single store, per-store redo over a sync-counting device so we can see
+        // how many fsyncs N concurrent routed writers actually cost.
+        let engine = create_engine();
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let (cdev, syncs) = SyncCountingDevice::new(inner);
+        let log = RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        let baseline = syncs.load(Ordering::SeqCst);
+
+        const N: usize = 16;
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let engine = engine.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    engine
+                        .append_redo_ops_routed(&[RedoOp::Delete {
+                            tx_key: TxKey {
+                                txid: [i as u8; 32],
+                            },
+                            record_offset: i as u64 * 4096,
+                            record_size: 4096,
+                        }])
+                        .expect("routed write ok")
+                })
+            })
+            .collect();
+        let mut ranges: Vec<(u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let fsyncs = syncs.load(Ordering::SeqCst) - baseline;
+        assert!(fsyncs >= 1, "must flush at least once");
+        assert!(
+            fsyncs < N as u64,
+            "routed group commit must coalesce concurrent writers: {N} writers used \
+             {fsyncs} fsyncs (expected < {N})"
+        );
+
+        // Every writer got a distinct, contiguous single-sequence range — no
+        // lost, duplicated, or overlapping sequence under the coalescing.
+        ranges.sort();
+        assert_eq!(ranges.len(), N);
+        for i in 1..ranges.len() {
+            assert_eq!(ranges[i].0, ranges[i].1, "one op -> one sequence");
+            assert_eq!(
+                ranges[i].0,
+                ranges[i - 1].0 + 1,
+                "routed ranges must be contiguous with no gap/dup"
+            );
+        }
     }
 
     #[test]
