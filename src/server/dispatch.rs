@@ -5009,15 +5009,20 @@ fn handle_spend_batch(
     // path's `ValidatedSpend` would re-acquire the stripe lock and self-deadlock
     // on a stripe collision.
     let txid_keys: Vec<TxKey> = by_txid.keys().map(|t| TxKey { txid: *t }).collect();
-    let stripe_guards = engine.lock_unique_stripes(&txid_keys);
     // Per-key visibility: write-lock the stripes of this batch's keys (plus the
     // global SHARED side = checkpoint coordination). Excludes any client read of
     // THESE keys for the apply window (batch-atomic per key) while letting spends
     // on disjoint keys run fully concurrently — the global exclusive barrier this
-    // replaces serialized every mutation. Acquired AFTER the stripe Mutexes
-    // (consistent table order) and dropped before replication, alongside
+    // replaces serialized every mutation. Dropped before replication, alongside
     // `stripe_guards`.
+    //
+    // LOCK ORDER (deadlock-critical): visibility is acquired BEFORE the engine
+    // stripe Mutexes — the SAME order create/set_mined use (they take visibility
+    // in the handler, then the stripe lock inside the engine method). Taking the
+    // stripe lock first here would invert the order against those handlers and
+    // deadlock under same-stripe contention.
     let visibility_guard = engine.visibility().mutation(&txid_keys);
+    let stripe_guards = engine.lock_unique_stripes(&txid_keys);
 
     // Per-group staged mutation carried from validate (Phase 1+2) to apply
     // (Phase 4) so the single redo flush (Phase 3) sits between them.
@@ -14230,6 +14235,193 @@ mod tests {
                 .is_err(),
             "set_mined of a missing txid must not materialize a record"
         );
+    }
+
+    /// Deadlock regression for the per-key visibility barrier. Every mutation
+    /// handler must take visibility BEFORE the engine stripe locks; a prior
+    /// version took the stripe lock first in spend but visibility first in
+    /// create/set_mined — an inversion that deadlocked under same-stripe
+    /// contention (caught only by the load test, not the suite). A tiny stripe
+    /// count forces frequent spend×create stripe collisions; a liveness watchdog
+    /// fails fast (rather than hanging forever) if the inversion regresses.
+    #[test]
+    fn concurrent_spend_and_create_do_not_deadlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _g = metrics_test_lock();
+
+        // FEW stripes -> spend and create keys collide often, exercising the
+        // cross-table (visibility × stripe-lock) acquisition order.
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let redo = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        // Free fns (no captures) so the worker threads can use them freely.
+        fn mk_txid(w: usize, n: usize) -> [u8; 32] {
+            let mut t = [0u8; 32];
+            t[0] = w as u8;
+            t[16] = n as u8; // bytes 16..24 drive the stripe hash
+            t[17] = (n >> 8) as u8;
+            t
+        }
+        fn mk_hash(w: usize, n: usize) -> [u8; 32] {
+            let mut h = [0u8; 32];
+            h[0] = 0xC0;
+            h[1] = w as u8;
+            h[2] = n as u8;
+            h
+        }
+        fn create_item(w: usize, n: usize) -> WireCreateItem {
+            WireCreateItem {
+                txid: mk_txid(w, n),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![mk_hash(w, n)],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            }
+        }
+        let do_req = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(
+                &req,
+                &engine,
+                8192,
+                None,
+                Some(redo.as_ref()),
+                &mut cs,
+                None,
+            )
+        };
+
+        const W: usize = 8;
+        const ITERS: usize = 40;
+        // Pre-create the keys each worker will later spend (so spends are valid).
+        for w in 0..W {
+            for n in 0..ITERS {
+                assert_eq!(
+                    do_req(OP_CREATE_BATCH, encode_create_batch(&[create_item(w, n)])).status,
+                    STATUS_OK,
+                );
+            }
+        }
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(W));
+        let handles: Vec<_> = (0..W)
+            .map(|w| {
+                let engine = engine.clone();
+                let redo = redo.clone();
+                let done = done.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let do_req = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+                        let req = RequestFrame {
+                            request_id: 1,
+                            op_code: op,
+                            flags: 0,
+                            payload: payload.into(),
+                        };
+                        let mut cs = crate::server::ConnectionState::new();
+                        handle_request(
+                            &req,
+                            &engine,
+                            8192,
+                            None,
+                            Some(redo.as_ref()),
+                            &mut cs,
+                            None,
+                        )
+                    };
+                    barrier.wait();
+                    for n in 0..ITERS {
+                        // Spend a pre-created key (visibility→stripe order)...
+                        let params = SpendBatchParams {
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 1000,
+                            block_height_retention: 0,
+                        };
+                        let _ = do_req(
+                            OP_SPEND_BATCH,
+                            encode_spend_batch(
+                                &params,
+                                &[WireSpendItem {
+                                    txid: mk_txid(w, n),
+                                    vout: 0,
+                                    utxo_hash: mk_hash(w, n),
+                                    spending_data: [0xD0; 36],
+                                }],
+                            ),
+                        );
+                        // ...while another worker creates a colliding-stripe key
+                        // (also visibility→stripe). Inverted orders would deadlock.
+                        let other = (w + 1) % W;
+                        let _ = do_req(
+                            OP_CREATE_BATCH,
+                            encode_create_batch(&[create_item(other, ITERS + n)]),
+                        );
+                        let _ = do_req(
+                            OP_GET_BATCH,
+                            encode_get_batch(FieldMask::ALL_METADATA, &[mk_txid(w, n)]),
+                        );
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        // Liveness watchdog: under correct (uniform) lock order this finishes in
+        // well under a second; a deadlock would leave `done < W`.
+        let start = std::time::Instant::now();
+        while done.load(Ordering::SeqCst) < W
+            && start.elapsed() < std::time::Duration::from_secs(30)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            W,
+            "workers did not all finish within 30s — lock-order inversion (visibility \
+             vs stripe locks) has regressed into a deadlock"
+        );
+        for h in handles {
+            h.join().expect("worker joins");
+        }
     }
 
     /// PR#21 review (P2): the per-txid DAH secondary updates must be folded into
