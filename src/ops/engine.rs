@@ -7797,10 +7797,26 @@ impl Engine {
     ///
     /// Returns [`crate::allocator::AllocatorError`] on device I/O failure.
     pub fn persist_allocator(&self) -> crate::allocator::Result<()> {
-        // Persist every store's allocator (one per device).
+        // Write every store's allocator header under its lock — a cheap header
+        // pwrite, lock released immediately — WITHOUT folding in the fsync. Then
+        // fsync all store devices via `sync_all_store_devices`, which runs the
+        // per-store syncs in PARALLEL and holds NO allocator lock.
+        //
+        // Two problems with the old `for store { allocator.lock().persist() }`:
+        //   1. it held the allocator mutex across `device.sync()`, and when the
+        //      data device is a large write-back cache that sync flushes for
+        //      tens of seconds — stalling every create's `reserve_*` for the
+        //      whole flush (profiled: a 90s checkpoint that froze all writes);
+        //   2. it synced stores serially, so N stores cost the SUM of their
+        //      flushes instead of the slowest single one.
+        //
+        // The header is still durable when this returns (crash-safety
+        // unchanged): the sync below completes before the recovery fence is
+        // written and the redo prefix is reclaimed.
         for store in &self.stores {
-            store.allocator.lock().persist()?;
+            store.allocator.lock().persist_header_no_sync()?;
         }
+        self.sync_all_store_devices()?;
         Ok(())
     }
 

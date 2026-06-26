@@ -1333,6 +1333,27 @@ impl SlotAllocator {
     }
 
     pub fn persist(&self) -> Result<()> {
+        self.persist_header_no_sync()?;
+        // B-1 audit fix: barrier the header write so it is durable (not merely
+        // in the device/drive write cache) before returning — recovery and the
+        // checkpoint rely on this. See `persist_header_no_sync` for the path
+        // that intentionally defers this sync to the caller.
+        self.device.sync()?;
+        Ok(())
+    }
+
+    /// Write the allocator header to the device WITHOUT the durability fsync.
+    ///
+    /// The caller MUST sync the device afterwards to make the header durable.
+    /// This exists for the checkpoint, which writes every store's header and
+    /// then syncs all store devices ONCE — crucially, *outside* the per-store
+    /// allocator mutex. Folding the `device.sync()` into the lock (as `persist`
+    /// does) means a slow sync — e.g. flushing a large write-back data cache —
+    /// holds the allocator mutex for its whole duration, which blocks every
+    /// create's `reserve_*` and stalls all writes (profiled: a single 90s
+    /// checkpoint sync froze the server). Header writing is cheap and stays
+    /// under the lock; the expensive sync is hoisted out by the caller.
+    pub(crate) fn persist_header_no_sync(&self) -> Result<()> {
         // Test/fault-injection only: fail-once hook to drive a checkpoint
         // into the "snapshot renamed, allocator persist failed, no fence
         // written" crash window. Auto-clears so a retry succeeds. Compiled
@@ -1389,14 +1410,9 @@ impl SlotAllocator {
         buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
         self.device.pwrite_all_at(&buf, 0)?;
-        // B-1 audit fix: barrier the header write. Without this the pwrite
-        // can sit in the drive's volatile write cache; the checkpoint then
-        // compacts the AllocateRegion/FreeRegion redo entries covering the
-        // delta, and a power loss reverts the header with no replayable
-        // copy left — the next boot double-allocates live regions. The
-        // checkpoint doc has always claimed "allocator persist is fsynced
-        // before returning"; this makes that claim true.
-        self.device.sync()?;
+        // NOTE: the durability fsync is intentionally NOT here — `persist` adds
+        // it, and the checkpoint syncs all store devices once outside the
+        // allocator lock. See this method's doc comment.
         Ok(())
     }
 
