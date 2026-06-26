@@ -6109,10 +6109,15 @@ fn handle_create_batch(
     // early-release, since create's multi-path rollback makes a precise early
     // drop fragile; it only delays a checkpoint or a read of these brand-new
     // keys, never other mutations/reads (they take the global shared side).
+    let vis_start = std::time::Instant::now();
     let _visibility_guard = {
         let keys: Vec<TxKey> = items.iter().map(|it| TxKey { txid: it.txid }).collect();
         engine.visibility().mutation(&keys)
     };
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_vis_latency.record_since(vis_start);
+    }
+    let build_start = std::time::Instant::now();
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
@@ -6376,8 +6381,12 @@ fn handle_create_batch(
     // `region_by_pos[pos]` is the reserved region for `pending_items[pos]`
     // (`None` if that store was full for this size). `pending_allocs` holds one
     // in-memory reservation handle per store so Phase 2 can commit/rollback all.
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_build_latency.record_since(build_start);
+    }
     let mut region_by_pos = vec![None; pending_items.len()];
     let mut pending_allocs = Vec::new();
+    let reserve_start = std::time::Instant::now();
     for (device_id, positions) in positions_by_store.into_iter().enumerate() {
         if positions.is_empty() {
             continue;
@@ -6420,6 +6429,9 @@ fn handle_create_batch(
             region_by_pos[pos] = region;
         }
         pending_allocs.push((device_id, pending_alloc));
+    }
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_reserve_latency.record_since(reserve_start);
     }
 
     for (pos, pending) in pending_items.into_iter().enumerate() {
@@ -6466,6 +6478,7 @@ fn handle_create_batch(
 
     // Phase 2: WAL-first — write [AllocateRegion… + Create…] as ONE atomic
     // batch (a single fsync, all-or-nothing).
+    let redo_start = std::time::Instant::now();
     let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => {
             // The AllocateRegion entries are now durable alongside their
@@ -6494,6 +6507,9 @@ fn handle_create_batch(
             return error_response(req.request_id, ERR_STORAGE_IO, &e);
         }
     };
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_redo_latency.record_since(redo_start);
+    }
 
     // Phase 2b (PERF #9 + multi-store): write every record's bytes to device in
     // ONE coalesced pwrite per contiguous reservation run, PER STORE. Records are
@@ -6522,6 +6538,7 @@ fn handle_create_batch(
     // cannot form a lock cycle even though that table is keyed by offset only
     // (cross-store offsets can false-share a stripe).
     let stores: Vec<(u8, &Vec<BulkRecord>)> = bulk_by_store.iter().map(|(&d, r)| (d, r)).collect();
+    let devwrite_start = std::time::Instant::now();
     let bulk_err: Option<CreateError> = match stores.split_first() {
         None => None,
         Some((&(head_id, head_recs), tail)) => std::thread::scope(|scope| {
@@ -6558,6 +6575,9 @@ fn handle_create_batch(
             m.creates_failed.inc_by(failed);
         }
         return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
+    }
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_devwrite_latency.record_since(devwrite_start);
     }
     drop(bulk_by_store);
 
@@ -6755,6 +6775,7 @@ fn handle_create_batch(
     // runs inline (no thread spawn) to keep small batches cheap. Merge the
     // per-chunk fragments IN CHUNK ORDER so `repl_ops_by_key` matches serial.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    let index_start = std::time::Instant::now();
     if !valid_items.is_empty() {
         let max_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -6799,6 +6820,9 @@ fn handle_create_batch(
                 repl_ops_by_key.extend(frag_repl);
             }
         }
+    }
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_index_latency.record_since(index_start);
     }
     // Deterministic response encoding independent of thread interleaving. The
     // serial version already produced errors in ascending item-index order

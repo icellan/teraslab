@@ -874,6 +874,27 @@ pub struct ThreadHistograms {
     pub preserve_until_latency: LatencyHistogram,
     /// Lock acquisition wait time.
     pub lock_wait: LatencyHistogram,
+    /// Create path, Phase 1b: in-memory `reserve_batch` across all stores
+    /// (allocator reservation only — no journaling, no device I/O).
+    pub create_reserve_latency: LatencyHistogram,
+    /// Create path, Phase 2: durable redo write (`AllocateRegion` + `Create`
+    /// entries through the group-commit coalescer, including the fsync) plus
+    /// the replication-intent begin.
+    pub create_redo_latency: LatencyHistogram,
+    /// Create path, Phase 2b: coalesced record-image `pwrite`s to the data
+    /// device(s) (O_DIRECT, fanned across stores; not fsynced per-op).
+    pub create_devwrite_latency: LatencyHistogram,
+    /// Create path, Phase 3: index registration (per-key stripe + per-shard
+    /// index locks) plus per-item replica-op assembly.
+    pub create_index_latency: LatencyHistogram,
+    /// Create path: time to acquire the per-key visibility mutation guard
+    /// (global shared side + per-key write stripes). A large value here means
+    /// mutations are stalling on the global side behind a checkpoint's
+    /// exclusive `global.write()`.
+    pub create_vis_latency: LatencyHistogram,
+    /// Create path, Phase 1: building record images (validation, blob digest
+    /// check + pin, record serialization) before any reservation.
+    pub create_build_latency: LatencyHistogram,
 }
 
 impl Default for ThreadHistograms {
@@ -903,6 +924,12 @@ impl ThreadHistograms {
             set_locked_latency: LatencyHistogram::new(),
             preserve_until_latency: LatencyHistogram::new(),
             lock_wait: LatencyHistogram::new(),
+            create_reserve_latency: LatencyHistogram::new(),
+            create_redo_latency: LatencyHistogram::new(),
+            create_devwrite_latency: LatencyHistogram::new(),
+            create_index_latency: LatencyHistogram::new(),
+            create_vis_latency: LatencyHistogram::new(),
+            create_build_latency: LatencyHistogram::new(),
         }
     }
 }

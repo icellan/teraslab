@@ -1051,6 +1051,37 @@ pub(crate) fn render_metrics_text(
     prom_histogram_ns(&mut out, "teraslab_spend_latency_ns", &h.spend_latency);
     prom_histogram_ns(&mut out, "teraslab_unspend_latency_ns", &h.unspend_latency);
     prom_histogram_ns(&mut out, "teraslab_create_latency_ns", &h.create_latency);
+    // Per-stage create-path attribution (sums to ~create_latency).
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_reserve_latency_ns",
+        &h.create_reserve_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_redo_latency_ns",
+        &h.create_redo_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_devwrite_latency_ns",
+        &h.create_devwrite_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_index_latency_ns",
+        &h.create_index_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_vis_latency_ns",
+        &h.create_vis_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_build_latency_ns",
+        &h.create_build_latency,
+    );
     prom_histogram_ns(
         &mut out,
         "teraslab_set_mined_latency_ns",
@@ -3213,6 +3244,12 @@ mod tests {
         for name in [
             "teraslab_unspend_latency_ns",
             "teraslab_create_latency_ns",
+            "teraslab_create_reserve_latency_ns",
+            "teraslab_create_redo_latency_ns",
+            "teraslab_create_devwrite_latency_ns",
+            "teraslab_create_index_latency_ns",
+            "teraslab_create_vis_latency_ns",
+            "teraslab_create_build_latency_ns",
             "teraslab_set_mined_latency_ns",
             "teraslab_freeze_latency_ns",
             "teraslab_unfreeze_latency_ns",
