@@ -681,6 +681,7 @@ impl Server {
                         // is rejected with `ERR_CLUSTER_AUTH_FAILED`. Default
                         // remains `false` (trusted-overlay) per FIX_POLICY §2.
                         let strict_auth = self.config.strict_auth;
+                        let pipeline_depth = self.config.pipeline_depth.max(1);
 
                         // Move the per-IP guard into the spawned
                         // thread so its `Drop` runs exactly once when
@@ -707,6 +708,7 @@ impl Server {
                                     inflight_request_bytes,
                                     cluster_secret,
                                     strict_auth,
+                                    pipeline_depth,
                                     read_timeout: CONNECTION_READ_TIMEOUT,
                                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                                     write_timeout: CONNECTION_WRITE_TIMEOUT,
@@ -800,6 +802,11 @@ struct ConnectionOptions<'a> {
     /// Orchestrator-wired: G10 owns `ServerConfig::strict_auth` and the
     /// CLI `--strict-auth` flag; this field is the local read-site.
     strict_auth: bool,
+    /// Per-connection concurrent dispatch depth (see
+    /// [`ServerConfig::pipeline_depth`]). `1` = strictly serial (current
+    /// behavior); `> 1` dispatches up to this many requests concurrently on a
+    /// bounded worker pool, writing responses as each completes.
+    pipeline_depth: usize,
     read_timeout: Duration,
     /// L-01: whole-frame assembly deadline (see [`FRAME_ASSEMBLY_TIMEOUT`]).
     /// Injectable per-connection so tests can exercise the deadline
@@ -859,326 +866,545 @@ fn handle_connection_inner(
         .with_max_active_streams(opts.max_active_streams)
         .with_stream_idle_timeout(stream_idle_timeout);
 
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(());
-        }
+    let depth = opts.pipeline_depth.max(1);
+    // All responses — worker-dispatched, inline-barrier, and read-path error
+    // frames — serialize through this cloned write handle so bytes from
+    // concurrent writers never interleave on the socket. `stream` is used only
+    // for reads from here on. At `depth == 1` there are no workers, so the
+    // mutex is uncontended and behaviour matches the original serial path.
+    let writer: Arc<Mutex<TcpStream>> =
+        Arc::new(Mutex::new(stream.try_clone().map_err(|e| {
+            format!("clone stream for pipelined writer: {e}")
+        })?));
 
-        // Read the 4-byte length prefix
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()), // Client disconnected
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-            Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(()),
-            Err(e) => return Err(format!("read length: {e}")),
-        }
-
-        // Reject oversized frames BEFORE any per-connection buffer
-        // allocation. The advertised `total_length` is attacker-controlled
-        // up to 4 GiB; without this guard, a single hostile client could
-        // drive the per-connection `read_buf.resize(frame_len, ..)` up to
-        // multi-gigabyte allocations before any decoding occurs (gap #10
-        // in TERANODE_PRODUCTION_READINESS_GAPS.md).
-        let total_length = u32::from_le_bytes(len_buf);
-        let max_wire_frame_size = MAX_FRAME_SIZE
-            + opts
-                .cluster_secret
-                .as_ref()
-                .map(|_| crate::cluster::auth::SIGNED_SUFFIX_LEN as u32)
-                .unwrap_or(0);
-        if total_length > max_wire_frame_size {
-            // H-03: return a TYPED error payload (ERR_PAYLOAD_MALFORMED) like
-            // every other rejection on this path, not a raw text payload — a
-            // client decoding the `[code:2][msg]` layout would otherwise read
-            // the ASCII bytes "fr" as a bogus error code.
-            let resp = ResponseFrame {
-                request_id: 0,
-                status: STATUS_ERROR,
-                payload: encode_error_payload(
-                    ERR_PAYLOAD_MALFORMED,
-                    &format!("frame too large: {total_length} > {max_wire_frame_size}"),
-                ),
-            };
-            let _ = stream.write_all(&resp.encode());
-            return Err(format!(
-                "frame too large: {total_length} > MAX_FRAME_SIZE {max_wire_frame_size}"
-            ));
-        }
-
-        // REL-119: a frame whose declared `total_length` is below the fixed
-        // request-header size (`request_id(8) + op_code(2) + flags(2)` =
-        // MIN_REQUEST_BODY) can never decode into a valid request. Pre-fix
-        // these slipped through the length checks, were assembled, then
-        // failed in `RequestFrame::decode_bytes` (TooShort) and fell through
-        // to the connection loop's generic decode-error arm — a BARE socket
-        // close with no diagnostic frame. Symmetric with the oversize guard
-        // above: return a typed ERR_PAYLOAD_MALFORMED frame so the client
-        // learns WHY the connection is dropping instead of seeing an opaque
-        // disconnect. `request_id` is unknown here (it lives inside the body
-        // we are refusing to read), so 0 is used as on the oversize path.
-        if total_length < crate::protocol::frame::MIN_REQUEST_BODY {
-            let resp = ResponseFrame {
-                request_id: 0,
-                status: STATUS_ERROR,
-                payload: encode_error_payload(
-                    ERR_PAYLOAD_MALFORMED,
-                    &format!(
-                        "frame below minimum size: total_length {total_length} < {}",
-                        crate::protocol::frame::MIN_REQUEST_BODY
-                    ),
-                ),
-            };
-            let _ = stream.write_all(&resp.encode());
-            return Err(format!(
-                "frame below minimum size: total_length {total_length} < MIN_REQUEST_BODY {}",
-                crate::protocol::frame::MIN_REQUEST_BODY
-            ));
-        }
-
-        // Read the full frame. The `frame_len` is now guaranteed to be
-        // <= `MAX_FRAME_SIZE`, so the buffer growth is bounded regardless
-        // of how many concurrent connections advertise large frames.
-        let frame_len = total_length as usize;
-        let _inflight_permit = match opts.inflight_request_bytes.try_acquire(frame_len) {
-            Some(permit) => permit,
-            None => {
-                let resp = ResponseFrame {
-                    request_id: 0,
-                    status: STATUS_ERROR,
-                    payload: encode_error_payload(
-                        ERR_RATE_LIMITED,
-                        "aggregate in-flight request memory limit exceeded",
-                    ),
-                };
-                let _ = stream.write_all(&resp.encode());
-                return Err(format!(
-                    "aggregate in-flight request memory limit exceeded: requested {frame_len} bytes"
-                ));
+    std::thread::scope(|scope| -> Result<(), String> {
+        // Bounded concurrent-dispatch pool. Workers pull decoded requests,
+        // dispatch them (pipeline-eligible ops never touch `conn_state`), and
+        // write the response under the writer mutex, then release their
+        // in-flight slot. They exit when `channel.close()` runs below.
+        let channel = Arc::new(PipelineChannel::new(depth));
+        if depth > 1 {
+            for _ in 0..depth {
+                let channel = Arc::clone(&channel);
+                let writer = Arc::clone(&writer);
+                let opts = &opts;
+                scope.spawn(move || pipeline_worker(&channel, &writer, engine, opts));
             }
-        };
-        // Peek the request_id (8 bytes) and op_code (2 bytes) directly off
-        // the wire WITHOUT first buffering the entire frame body. This is
-        // the slow-loris fix (F-G5-016 / re-review P2): for inter-node
-        // signed frames we MUST be able to start streaming the body
-        // through `verify_frame_streaming_*` instead of materialising
-        // `frame_len` bytes in the connection buffer before HMAC verify.
-        // Without it, the per-IP connection cap (`max_connections_per_ip`
-        // = 64 by default) lets a malicious peer keep 64 × peak-frame
-        // bytes pinned per IP just by sending wrong-tag garbage.
-        // L-01: the rest of the frame (head peek + body) must be fully
-        // assembled within `opts.frame_deadline` of the length prefix
-        // arriving. The per-syscall `read_timeout` alone cannot enforce
-        // this — it resets on every successful read, so a slow-drip
-        // client (one byte every ~29 s) would otherwise pin this thread,
-        // its inflight permit, and a connection slot indefinitely. All
-        // post-prefix reads below go through `deadline_stream`.
-        let mut deadline_stream = DeadlineReader::new(
-            &stream,
-            Instant::now() + opts.frame_deadline,
-            opts.read_timeout,
-        );
-        let mut head_buf = [0u8; HEAD_PEEK_LEN];
-        let head_to_read = HEAD_PEEK_LEN.min(frame_len);
-        deadline_stream
-            .read_exact(&mut head_buf[..head_to_read])
-            .map_err(|e| format!("read frame head: {e}"))?;
-
-        let request_id = if head_to_read >= 8 {
-            u64::from_le_bytes(head_buf[..8].try_into().unwrap_or([0; 8]))
-        } else {
-            0
-        };
-        let peeked_op = if head_to_read >= 10 {
-            Some(u16::from_le_bytes(
-                head_buf[8..10].try_into().unwrap_or([0; 2]),
-            ))
-        } else {
-            None
-        };
-        let is_inter_node_op = peeked_op.map(is_inter_node_auth_opcode).unwrap_or(false);
-        let auth_required = is_inter_node_op && opts.cluster_secret.is_some();
-        // F-G5-001 (CRITICAL): inter-node opcode arrived with no
-        // `cluster_secret`. Default behaviour is fail-open (trusted
-        // overlay, FIX_POLICY §2); opt-in `strict_auth` rejects.
-        // Either way, surface the first unauthenticated event in logs.
-        if is_inter_node_op && opts.cluster_secret.is_none() {
-            if opts.strict_auth {
-                let op_code = peeked_op.unwrap_or(0);
-                let resp = ResponseFrame {
-                    request_id,
-                    status: STATUS_ERROR,
-                    payload: encode_error_payload(
-                        ERR_CLUSTER_AUTH_FAILED,
-                        "strict_auth: cluster_secret required for inter-node opcode",
-                    ),
-                };
-                let _ = stream.write_all(&resp.encode());
-                return Err(format!(
-                    "strict_auth: rejecting unsigned inter-node op_code={op_code}"
-                ));
-            }
-            // P2.1 (F-G7-001): bump the receiver-side counter every time
-            // we accept an inter-node opcode without an HMAC layer. Unlike
-            // the one-shot `warn!` below, the counter must tick on every
-            // such frame so dashboards can compute a *rate* — a slow drip
-            // of unauthenticated frames is the signal pattern this metric
-            // is designed to expose. The counter field is owned by G7's
-            // `ReplicationMetrics` schema (see `metrics.rs`); the bump
-            // site lives here in the G5 auth gate per the cross-cutting
-            // ownership note attached to the field.
-            if let Some(repl) = crate::metrics::replication_metrics() {
-                repl.replica_unauthenticated_accept_total.inc();
-            }
-            let op_code = peeked_op.unwrap_or(0);
-            // Per-PEER rate-limited `warn` so operators see which peers send
-            // unsigned frames, without the per-frame flood (every inter-node
-            // frame is unauthenticated in trusted-overlay mode). The counter
-            // above already exposes the per-frame rate for dashboards; the
-            // log only needs the distinct offenders, re-surfaced every
-            // `UNAUTH_WARN_PER_PEER_INTERVAL`. The legacy one-shot flag is
-            // still flipped so first-occurrence log scrapers keep working.
-            let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
-            if should_warn_unauthenticated(peer_ip) {
-                tracing::warn!(
-                    target: "teraslab::security",
-                    op_code,
-                    peer = ?peer_ip,
-                    "unauthenticated replica accept: inter-node opcode \
-                     received without cluster_secret configured — \
-                     accepting frame (trusted-overlay default). Configure \
-                     `cluster_secret` or pass `--strict-auth` to enforce. \
-                     (further frames from this peer suppressed for 5m)",
-                );
-            }
-            let _ = UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel);
         }
-        // Two body-read paths now diverge based on whether the frame
-        // must be HMAC-verified:
-        //
-        // - `auth_required` → streaming verify. The remainder of the
-        //   body is read by `verify_signed_body_streaming` in 8 KiB
-        //   chunks, never materialising the full `frame_len` bytes.
-        //   The verified payload is written into a fresh, disposable
-        //   `Vec<u8>` sink which is `drop()`ped on
-        //   `Err(PermissionDenied)` — unauthenticated partial-write
-        //   bytes NEVER leak into the persistent `read_buf` or to
-        //   dispatch. This is the slow-loris fix (F-G5-016): a 16 MiB
-        //   wrong-tag frame now rejects with ~48 KiB of total
-        //   verifier-side allocation (8 KiB chunk + 40 B tail + sink
-        //   that never exceeds ~32 KiB before HMAC reject) instead of
-        //   the previous 16 MiB connection-buffer materialisation.
-        //
-        // - non-auth (the common client-traffic case) → assemble the
-        //   full frame in the persistent `read_buf` and freeze a zero-
-        //   copy `Bytes`. The 4-byte length-prefix + 10-byte head we
-        //   already peeked off the wire are spliced back into the
-        //   buffer before reading the remainder.
-        let request_frame_bytes: Bytes = if auth_required {
-            let key = opts.cluster_secret.as_ref().expect("checked above");
-            let head_slice = &head_buf[..head_to_read];
-            // L-01: chunked verify reads also run through the deadline
-            // reader so a drip-fed signed body cannot outlive the
-            // frame-assembly deadline.
-            let mut chained = std::io::Cursor::new(head_slice).chain(&mut deadline_stream);
-            // Disposable sink: pre-seed a 4-byte length-prefix slot
-            // (overwritten with `payload_len` on success) so the
-            // returned `Bytes` matches the `[length:4][payload]` shape
-            // that `RequestFrame::decode_bytes` expects.
-            let mut sink: Vec<u8> = Vec::with_capacity(4 + frame_len);
-            sink.extend_from_slice(&[0u8; 4]);
-            let payload_len = match crate::cluster::auth::verify_signed_body_streaming(
-                key.as_slice(),
-                frame_len,
-                &mut chained,
-                &mut sink,
-            ) {
-                Ok(n) => n,
-                Err(e) => {
-                    // SECURITY: drop the sink before responding so
-                    // the partially-written unauthenticated bytes
-                    // never escape this scope.
-                    drop(sink);
+
+        // Reader loop. The body is the original serial read/decode/auth path;
+        // only the dispatch tail changed (submit pipelineable work, else drain
+        // and run inline). Wrapped in a closure so its early returns become the
+        // loop result and the channel can be closed (waking workers) before the
+        // scope joins them.
+        let loop_result = (|| -> Result<(), String> {
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+
+                // Read the 4-byte length prefix
+                let mut len_buf = [0u8; 4];
+                match stream.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()), // Client disconnected
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => return Ok(()),
+                    Err(e) => return Err(format!("read length: {e}")),
+                }
+
+                // Reject oversized frames BEFORE any per-connection buffer
+                // allocation. The advertised `total_length` is attacker-controlled
+                // up to 4 GiB; without this guard, a single hostile client could
+                // drive the per-connection `read_buf.resize(frame_len, ..)` up to
+                // multi-gigabyte allocations before any decoding occurs (gap #10
+                // in TERANODE_PRODUCTION_READINESS_GAPS.md).
+                let total_length = u32::from_le_bytes(len_buf);
+                let max_wire_frame_size = MAX_FRAME_SIZE
+                    + opts
+                        .cluster_secret
+                        .as_ref()
+                        .map(|_| crate::cluster::auth::SIGNED_SUFFIX_LEN as u32)
+                        .unwrap_or(0);
+                if total_length > max_wire_frame_size {
+                    // H-03: return a TYPED error payload (ERR_PAYLOAD_MALFORMED) like
+                    // every other rejection on this path, not a raw text payload — a
+                    // client decoding the `[code:2][msg]` layout would otherwise read
+                    // the ASCII bytes "fr" as a bogus error code.
                     let resp = ResponseFrame {
-                        request_id,
+                        request_id: 0,
                         status: STATUS_ERROR,
                         payload: encode_error_payload(
-                            ERR_CLUSTER_AUTH_FAILED,
-                            &format!("cluster frame authentication failed: {e}"),
+                            ERR_PAYLOAD_MALFORMED,
+                            &format!("frame too large: {total_length} > {max_wire_frame_size}"),
                         ),
                     };
-                    let _ = stream.write_all(&resp.encode());
-                    return Err(format!("cluster frame authentication failed: {e}"));
+                    let _ = writer.lock().write_all(&resp.encode());
+                    return Err(format!(
+                        "frame too large: {total_length} > MAX_FRAME_SIZE {max_wire_frame_size}"
+                    ));
                 }
-            };
-            sink[0..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
-            sink.truncate(4 + payload_len);
-            Bytes::from(sink)
-        } else {
-            // Assemble the full frame (length prefix + body) into the
-            // persistent `read_buf`. The 4-byte length prefix and the
-            // `head_to_read` peeked bytes are spliced in first; the
-            // remainder is read from the stream.
-            if read_buf.len() < 4 + frame_len {
-                read_buf.resize(4 + frame_len, 0);
-            }
-            read_buf[..4].copy_from_slice(&len_buf);
-            read_buf[4..4 + head_to_read].copy_from_slice(&head_buf[..head_to_read]);
-            if frame_len > head_to_read {
+
+                // REL-119: a frame whose declared `total_length` is below the fixed
+                // request-header size (`request_id(8) + op_code(2) + flags(2)` =
+                // MIN_REQUEST_BODY) can never decode into a valid request. Pre-fix
+                // these slipped through the length checks, were assembled, then
+                // failed in `RequestFrame::decode_bytes` (TooShort) and fell through
+                // to the connection loop's generic decode-error arm — a BARE socket
+                // close with no diagnostic frame. Symmetric with the oversize guard
+                // above: return a typed ERR_PAYLOAD_MALFORMED frame so the client
+                // learns WHY the connection is dropping instead of seeing an opaque
+                // disconnect. `request_id` is unknown here (it lives inside the body
+                // we are refusing to read), so 0 is used as on the oversize path.
+                if total_length < crate::protocol::frame::MIN_REQUEST_BODY {
+                    let resp = ResponseFrame {
+                        request_id: 0,
+                        status: STATUS_ERROR,
+                        payload: encode_error_payload(
+                            ERR_PAYLOAD_MALFORMED,
+                            &format!(
+                                "frame below minimum size: total_length {total_length} < {}",
+                                crate::protocol::frame::MIN_REQUEST_BODY
+                            ),
+                        ),
+                    };
+                    let _ = writer.lock().write_all(&resp.encode());
+                    return Err(format!(
+                        "frame below minimum size: total_length {total_length} < MIN_REQUEST_BODY {}",
+                        crate::protocol::frame::MIN_REQUEST_BODY
+                    ));
+                }
+
+                // Read the full frame. The `frame_len` is now guaranteed to be
+                // <= `MAX_FRAME_SIZE`, so the buffer growth is bounded regardless
+                // of how many concurrent connections advertise large frames.
+                let frame_len = total_length as usize;
+                let _inflight_permit = match opts.inflight_request_bytes.try_acquire(frame_len) {
+                    Some(permit) => permit,
+                    None => {
+                        let resp = ResponseFrame {
+                            request_id: 0,
+                            status: STATUS_ERROR,
+                            payload: encode_error_payload(
+                                ERR_RATE_LIMITED,
+                                "aggregate in-flight request memory limit exceeded",
+                            ),
+                        };
+                        let _ = writer.lock().write_all(&resp.encode());
+                        return Err(format!(
+                            "aggregate in-flight request memory limit exceeded: requested {frame_len} bytes"
+                        ));
+                    }
+                };
+                // Peek the request_id (8 bytes) and op_code (2 bytes) directly off
+                // the wire WITHOUT first buffering the entire frame body. This is
+                // the slow-loris fix (F-G5-016 / re-review P2): for inter-node
+                // signed frames we MUST be able to start streaming the body
+                // through `verify_frame_streaming_*` instead of materialising
+                // `frame_len` bytes in the connection buffer before HMAC verify.
+                // Without it, the per-IP connection cap (`max_connections_per_ip`
+                // = 64 by default) lets a malicious peer keep 64 × peak-frame
+                // bytes pinned per IP just by sending wrong-tag garbage.
+                // L-01: the rest of the frame (head peek + body) must be fully
+                // assembled within `opts.frame_deadline` of the length prefix
+                // arriving. The per-syscall `read_timeout` alone cannot enforce
+                // this — it resets on every successful read, so a slow-drip
+                // client (one byte every ~29 s) would otherwise pin this thread,
+                // its inflight permit, and a connection slot indefinitely. All
+                // post-prefix reads below go through `deadline_stream`.
+                let mut deadline_stream = DeadlineReader::new(
+                    &stream,
+                    Instant::now() + opts.frame_deadline,
+                    opts.read_timeout,
+                );
+                let mut head_buf = [0u8; HEAD_PEEK_LEN];
+                let head_to_read = HEAD_PEEK_LEN.min(frame_len);
                 deadline_stream
-                    .read_exact(&mut read_buf[4 + head_to_read..4 + frame_len])
-                    .map_err(|e| format!("read frame body: {e}"))?;
-            }
-            let frame_bytes_mut = read_buf.split_to(4 + frame_len);
-            // Shrink read_buf IMMEDIATELY after split_to so a giant
-            // frame does not pin peak-frame capacity on the connection
-            // during dispatch + response write. Under the per-IP
-            // connection cap (`max_connections_per_ip = 64` by default)
-            // a 16 MiB peak frame would otherwise hold 64 × 16 MiB
-            // = 1 GiB pinned across concurrent slow-loris-ish clients
-            // until each connection's iteration completed.
-            reset_read_buf_if_oversized(&mut read_buf);
-            if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
-                read_buf.reserve(READ_BUF_RETAINED_SIZE - read_buf.capacity());
-            }
-            if read_buf.len() < READ_BUF_RETAINED_SIZE {
-                read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
-            }
-            frame_bytes_mut.freeze()
-        };
+                    .read_exact(&mut head_buf[..head_to_read])
+                    .map_err(|e| format!("read frame head: {e}"))?;
 
-        // L-01: a deadline-capped read may have shrunk the socket read
-        // timeout below the base value. Restore it so the next
-        // iteration's length-prefix read keeps the original idle-client
-        // drop semantics (`read_timeout`, treated as a clean close).
-        if deadline_stream.timeout_shrunk {
-            stream
-                .set_read_timeout(Some(opts.read_timeout))
-                .map_err(|e| format!("restore read_timeout: {e}"))?;
+                let request_id = if head_to_read >= 8 {
+                    u64::from_le_bytes(head_buf[..8].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                };
+                let peeked_op = if head_to_read >= 10 {
+                    Some(u16::from_le_bytes(
+                        head_buf[8..10].try_into().unwrap_or([0; 2]),
+                    ))
+                } else {
+                    None
+                };
+                let is_inter_node_op = peeked_op.map(is_inter_node_auth_opcode).unwrap_or(false);
+                let auth_required = is_inter_node_op && opts.cluster_secret.is_some();
+                // F-G5-001 (CRITICAL): inter-node opcode arrived with no
+                // `cluster_secret`. Default behaviour is fail-open (trusted
+                // overlay, FIX_POLICY §2); opt-in `strict_auth` rejects.
+                // Either way, surface the first unauthenticated event in logs.
+                if is_inter_node_op && opts.cluster_secret.is_none() {
+                    if opts.strict_auth {
+                        let op_code = peeked_op.unwrap_or(0);
+                        let resp = ResponseFrame {
+                            request_id,
+                            status: STATUS_ERROR,
+                            payload: encode_error_payload(
+                                ERR_CLUSTER_AUTH_FAILED,
+                                "strict_auth: cluster_secret required for inter-node opcode",
+                            ),
+                        };
+                        let _ = writer.lock().write_all(&resp.encode());
+                        return Err(format!(
+                            "strict_auth: rejecting unsigned inter-node op_code={op_code}"
+                        ));
+                    }
+                    // P2.1 (F-G7-001): bump the receiver-side counter every time
+                    // we accept an inter-node opcode without an HMAC layer. Unlike
+                    // the one-shot `warn!` below, the counter must tick on every
+                    // such frame so dashboards can compute a *rate* — a slow drip
+                    // of unauthenticated frames is the signal pattern this metric
+                    // is designed to expose. The counter field is owned by G7's
+                    // `ReplicationMetrics` schema (see `metrics.rs`); the bump
+                    // site lives here in the G5 auth gate per the cross-cutting
+                    // ownership note attached to the field.
+                    if let Some(repl) = crate::metrics::replication_metrics() {
+                        repl.replica_unauthenticated_accept_total.inc();
+                    }
+                    let op_code = peeked_op.unwrap_or(0);
+                    // Per-PEER rate-limited `warn` so operators see which peers send
+                    // unsigned frames, without the per-frame flood (every inter-node
+                    // frame is unauthenticated in trusted-overlay mode). The counter
+                    // above already exposes the per-frame rate for dashboards; the
+                    // log only needs the distinct offenders, re-surfaced every
+                    // `UNAUTH_WARN_PER_PEER_INTERVAL`. The legacy one-shot flag is
+                    // still flipped so first-occurrence log scrapers keep working.
+                    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+                    if should_warn_unauthenticated(peer_ip) {
+                        tracing::warn!(
+                            target: "teraslab::security",
+                            op_code,
+                            peer = ?peer_ip,
+                            "unauthenticated replica accept: inter-node opcode \
+                             received without cluster_secret configured — \
+                             accepting frame (trusted-overlay default). Configure \
+                             `cluster_secret` or pass `--strict-auth` to enforce. \
+                             (further frames from this peer suppressed for 5m)",
+                        );
+                    }
+                    let _ = UNAUTHENTICATED_INTER_NODE_WARNED.swap(true, Ordering::AcqRel);
+                }
+                // Two body-read paths now diverge based on whether the frame
+                // must be HMAC-verified:
+                //
+                // - `auth_required` → streaming verify. The remainder of the
+                //   body is read by `verify_signed_body_streaming` in 8 KiB
+                //   chunks, never materialising the full `frame_len` bytes.
+                //   The verified payload is written into a fresh, disposable
+                //   `Vec<u8>` sink which is `drop()`ped on
+                //   `Err(PermissionDenied)` — unauthenticated partial-write
+                //   bytes NEVER leak into the persistent `read_buf` or to
+                //   dispatch. This is the slow-loris fix (F-G5-016): a 16 MiB
+                //   wrong-tag frame now rejects with ~48 KiB of total
+                //   verifier-side allocation (8 KiB chunk + 40 B tail + sink
+                //   that never exceeds ~32 KiB before HMAC reject) instead of
+                //   the previous 16 MiB connection-buffer materialisation.
+                //
+                // - non-auth (the common client-traffic case) → assemble the
+                //   full frame in the persistent `read_buf` and freeze a zero-
+                //   copy `Bytes`. The 4-byte length-prefix + 10-byte head we
+                //   already peeked off the wire are spliced back into the
+                //   buffer before reading the remainder.
+                let request_frame_bytes: Bytes = if auth_required {
+                    let key = opts.cluster_secret.as_ref().expect("checked above");
+                    let head_slice = &head_buf[..head_to_read];
+                    // L-01: chunked verify reads also run through the deadline
+                    // reader so a drip-fed signed body cannot outlive the
+                    // frame-assembly deadline.
+                    let mut chained = std::io::Cursor::new(head_slice).chain(&mut deadline_stream);
+                    // Disposable sink: pre-seed a 4-byte length-prefix slot
+                    // (overwritten with `payload_len` on success) so the
+                    // returned `Bytes` matches the `[length:4][payload]` shape
+                    // that `RequestFrame::decode_bytes` expects.
+                    let mut sink: Vec<u8> = Vec::with_capacity(4 + frame_len);
+                    sink.extend_from_slice(&[0u8; 4]);
+                    let payload_len = match crate::cluster::auth::verify_signed_body_streaming(
+                        key.as_slice(),
+                        frame_len,
+                        &mut chained,
+                        &mut sink,
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            // SECURITY: drop the sink before responding so
+                            // the partially-written unauthenticated bytes
+                            // never escape this scope.
+                            drop(sink);
+                            let resp = ResponseFrame {
+                                request_id,
+                                status: STATUS_ERROR,
+                                payload: encode_error_payload(
+                                    ERR_CLUSTER_AUTH_FAILED,
+                                    &format!("cluster frame authentication failed: {e}"),
+                                ),
+                            };
+                            let _ = writer.lock().write_all(&resp.encode());
+                            return Err(format!("cluster frame authentication failed: {e}"));
+                        }
+                    };
+                    sink[0..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+                    sink.truncate(4 + payload_len);
+                    Bytes::from(sink)
+                } else {
+                    // Assemble the full frame (length prefix + body) into the
+                    // persistent `read_buf`. The 4-byte length prefix and the
+                    // `head_to_read` peeked bytes are spliced in first; the
+                    // remainder is read from the stream.
+                    if read_buf.len() < 4 + frame_len {
+                        read_buf.resize(4 + frame_len, 0);
+                    }
+                    read_buf[..4].copy_from_slice(&len_buf);
+                    read_buf[4..4 + head_to_read].copy_from_slice(&head_buf[..head_to_read]);
+                    if frame_len > head_to_read {
+                        deadline_stream
+                            .read_exact(&mut read_buf[4 + head_to_read..4 + frame_len])
+                            .map_err(|e| format!("read frame body: {e}"))?;
+                    }
+                    let frame_bytes_mut = read_buf.split_to(4 + frame_len);
+                    // Shrink read_buf IMMEDIATELY after split_to so a giant
+                    // frame does not pin peak-frame capacity on the connection
+                    // during dispatch + response write. Under the per-IP
+                    // connection cap (`max_connections_per_ip = 64` by default)
+                    // a 16 MiB peak frame would otherwise hold 64 × 16 MiB
+                    // = 1 GiB pinned across concurrent slow-loris-ish clients
+                    // until each connection's iteration completed.
+                    reset_read_buf_if_oversized(&mut read_buf);
+                    if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
+                        read_buf.reserve(READ_BUF_RETAINED_SIZE - read_buf.capacity());
+                    }
+                    if read_buf.len() < READ_BUF_RETAINED_SIZE {
+                        read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
+                    }
+                    frame_bytes_mut.freeze()
+                };
+
+                // L-01: a deadline-capped read may have shrunk the socket read
+                // timeout below the base value. Restore it so the next
+                // iteration's length-prefix read keeps the original idle-client
+                // drop semantics (`read_timeout`, treated as a clean close).
+                if deadline_stream.timeout_shrunk {
+                    stream
+                        .set_read_timeout(Some(opts.read_timeout))
+                        .map_err(|e| format!("restore read_timeout: {e}"))?;
+                }
+
+                let (request, _) = RequestFrame::decode_bytes(request_frame_bytes)
+                    .map_err(|e| format!("decode frame: {e}"))?;
+
+                // H-2: reap idle streams on every request before dispatch. The
+                // server is thread-per-connection and synchronous, so this is the
+                // natural tick — a client that keeps the connection cheaply alive
+                // with periodic pings (or any other op) drives a sweep here, freeing
+                // the fd / tmp file / hasher of any stream that has received no chunk
+                // within `stream_idle_timeout`. No background thread is required and
+                // the map is per-connection, so this holds no shared lock.
+                let reaped = conn_state.reap_idle_streams(Instant::now());
+                if reaped > 0 {
+                    tracing::debug!(
+                        reaped,
+                        remaining = conn_state.streams.len(),
+                        "reaped idle blob-stream sessions",
+                    );
+                }
+
+                // Dispatch tail. Pipeline-eligible requests are handed to the
+                // concurrent worker pool: the worker dispatches and writes the
+                // response (matched by `request_id` on the client, possibly out of
+                // order), so the reader can immediately read the next frame and more
+                // mutations reach the redo group-commit at once. Stateful blob-stream
+                // ops and authenticated inter-node frames take a drain barrier and run
+                // inline against `conn_state`, so their semantics are unchanged.
+                if depth > 1 && is_pipelineable(&request, auth_required) {
+                    channel.submit(PipelineWork {
+                        request,
+                        _permit: _inflight_permit,
+                    });
+                } else {
+                    if depth > 1 {
+                        channel.drain();
+                    }
+                    let response = dispatch::handle_request(
+                        &request,
+                        engine,
+                        opts.max_batch_size,
+                        opts.cluster,
+                        opts.redo_log,
+                        &mut conn_state,
+                        opts.blob_store,
+                    );
+                    write_response(
+                        &writer,
+                        response,
+                        auth_required,
+                        opts.cluster_secret.as_ref(),
+                    )?;
+                }
+                // (The per-iteration read_buf reset has moved up to right
+                // after `split_to` so a giant frame does not pin per-IP
+                // capacity through the dispatch + response window. Reset
+                // again here is redundant.)
+            }
+        })();
+        // Wake any blocked workers so they observe the drained queue and exit;
+        // the scope then joins them before returning.
+        channel.close();
+        loop_result
+    })
+}
+
+/// One pipelined request handed to a [`pipeline_worker`].
+///
+/// `_permit` is the in-flight-bytes accounting permit for this request; it is
+/// held (not read) for the lifetime of the work item so the aggregate memory
+/// cap stays charged until the response has been written, mirroring the serial
+/// path where the permit drops at the end of the request iteration.
+struct PipelineWork {
+    request: RequestFrame,
+    _permit: InflightBytesPermit,
+}
+
+/// A request is pipeline-eligible if it neither mutates per-connection
+/// [`ConnectionState`] (the blob-stream ops) nor requires per-frame HMAC
+/// verification/signing (authenticated inter-node frames). Everything else is
+/// dispatched concurrently; these take a drain barrier and run inline.
+fn is_pipelineable(request: &RequestFrame, auth_required: bool) -> bool {
+    !auth_required && !matches!(request.op_code, OP_STREAM_CHUNK | OP_STREAM_END)
+}
+
+/// Encode, optionally sign, and write one response under the shared writer
+/// mutex so concurrent workers (and the inline barrier path) never interleave
+/// bytes on the socket.
+fn write_response(
+    writer: &Mutex<TcpStream>,
+    response: ResponseFrame,
+    auth_required: bool,
+    cluster_secret: Option<&Arc<Vec<u8>>>,
+) -> Result<(), String> {
+    let encoded = response.encode();
+    let bytes = if auth_required {
+        crate::cluster::auth::sign_frame(
+            cluster_secret
+                .expect("auth_required implies a configured cluster_secret")
+                .as_slice(),
+            &encoded,
+        )
+        .map_err(|e| format!("sign response frame: {e}"))?
+    } else {
+        encoded
+    };
+    writer
+        .lock()
+        .write_all(&bytes)
+        .map_err(|e| format!("write response: {e}"))
+}
+
+/// Bounded blocking work queue for per-connection request pipelining.
+///
+/// Decouples the connection reader from `pipeline_depth` dispatch workers:
+/// * `submit` (reader) applies backpressure — it blocks while `pipeline_depth`
+///   requests are already in flight, so the reader never races ahead of the
+///   pool's capacity.
+/// * `recv` (worker) blocks for the next item without holding any lock across
+///   the wait, so all workers can wait concurrently (a single `Mutex<Receiver>`
+///   would serialize them).
+/// * `complete` (worker) releases an in-flight slot.
+/// * `drain` (reader) blocks until every submitted request has completed — used
+///   before a barrier op so it observes a quiescent pipeline.
+/// * `close` wakes idle workers so they exit once the queue is empty.
+struct PipelineChannel {
+    queue: Mutex<std::collections::VecDeque<PipelineWork>>,
+    not_empty: parking_lot::Condvar,
+    /// Submitted-but-not-yet-completed request count, plus a condvar signalled
+    /// on every change (drives both `submit` backpressure and `drain`).
+    in_flight: Mutex<usize>,
+    progress: parking_lot::Condvar,
+    closed: AtomicBool,
+    depth: usize,
+}
+
+impl PipelineChannel {
+    fn new(depth: usize) -> Self {
+        Self {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            not_empty: parking_lot::Condvar::new(),
+            in_flight: Mutex::new(0),
+            progress: parking_lot::Condvar::new(),
+            closed: AtomicBool::new(false),
+            depth,
         }
+    }
 
-        let (request, _) = RequestFrame::decode_bytes(request_frame_bytes)
-            .map_err(|e| format!("decode frame: {e}"))?;
-
-        // H-2: reap idle streams on every request before dispatch. The
-        // server is thread-per-connection and synchronous, so this is the
-        // natural tick — a client that keeps the connection cheaply alive
-        // with periodic pings (or any other op) drives a sweep here, freeing
-        // the fd / tmp file / hasher of any stream that has received no chunk
-        // within `stream_idle_timeout`. No background thread is required and
-        // the map is per-connection, so this holds no shared lock.
-        let reaped = conn_state.reap_idle_streams(Instant::now());
-        if reaped > 0 {
-            tracing::debug!(
-                reaped,
-                remaining = conn_state.streams.len(),
-                "reaped idle blob-stream sessions",
-            );
+    /// Reader: enqueue a request, blocking while `depth` are already in flight.
+    fn submit(&self, work: PipelineWork) {
+        {
+            let mut n = self.in_flight.lock();
+            while *n >= self.depth {
+                self.progress.wait(&mut n);
+            }
+            *n += 1;
         }
+        self.queue.lock().push_back(work);
+        self.not_empty.notify_one();
+    }
 
-        // Dispatch to handler
+    /// Worker: block for the next request; `None` once closed and drained.
+    fn recv(&self) -> Option<PipelineWork> {
+        let mut q = self.queue.lock();
+        loop {
+            if let Some(work) = q.pop_front() {
+                return Some(work);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            self.not_empty.wait(&mut q);
+        }
+    }
+
+    /// Worker: mark a request finished (its response has been written).
+    fn complete(&self) {
+        let mut n = self.in_flight.lock();
+        *n -= 1;
+        self.progress.notify_all();
+    }
+
+    /// Reader: block until the pipeline is empty (no in-flight requests).
+    fn drain(&self) {
+        let mut n = self.in_flight.lock();
+        while *n > 0 {
+            self.progress.wait(&mut n);
+        }
+    }
+
+    /// Signal workers to exit once the queue drains.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.not_empty.notify_all();
+    }
+}
+
+/// One dispatch worker for a pipelined connection. Pulls requests from
+/// `channel`, dispatches each (pipeline-eligible ops never touch `conn_state`,
+/// so a private throwaway state is sufficient), writes the response under the
+/// shared writer, and releases its in-flight slot.
+fn pipeline_worker(
+    channel: &PipelineChannel,
+    writer: &Mutex<TcpStream>,
+    engine: &Engine,
+    opts: &ConnectionOptions<'_>,
+) {
+    let mut conn_state = ConnectionState::new();
+    while let Some(work) = channel.recv() {
         let response = dispatch::handle_request(
-            &request,
+            &work.request,
             engine,
             opts.max_batch_size,
             opts.cluster,
@@ -1186,28 +1412,17 @@ fn handle_connection_inner(
             &mut conn_state,
             opts.blob_store,
         );
-
-        // Write response
-        let encoded_response = response.encode();
-        let response_bytes = if auth_required {
-            crate::cluster::auth::sign_frame(
-                opts.cluster_secret
-                    .as_ref()
-                    .expect("checked above")
-                    .as_slice(),
-                &encoded_response,
-            )
-            .map_err(|e| format!("sign response frame: {e}"))?
-        } else {
-            encoded_response
-        };
-        stream
-            .write_all(&response_bytes)
-            .map_err(|e| format!("write response: {e}"))?;
-        // (The per-iteration read_buf reset has moved up to right
-        // after `split_to` so a giant frame does not pin per-IP
-        // capacity through the dispatch + response window. Reset
-        // again here is redundant.)
+        // Pipeline-eligible requests are never auth_required, so responses are
+        // written unsigned. A write failure means the peer is gone; log and
+        // keep draining so the remaining workers and the reader wind down
+        // cleanly (the broken socket surfaces as a read error on the reader).
+        if let Err(e) = write_response(writer, response, false, None) {
+            tracing::debug!(err = %e, "pipelined response write failed; connection closing");
+        }
+        // Release the in-flight-bytes permit before freeing the slot so a
+        // drain/backpressure waiter sees memory reclaimed first.
+        drop(work);
+        channel.complete();
     }
 }
 
@@ -1332,6 +1547,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_millis(50),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1384,6 +1600,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_secs(2),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1463,6 +1680,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
                     // Per-read timeout deliberately much longer than the
                     // drip interval below: every individual read makes
                     // "progress", so only the frame-assembly deadline can
@@ -1533,6 +1751,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_secs(5),
                     frame_deadline: Duration::from_secs(1),
                     write_timeout: Duration::from_secs(1),
@@ -1623,6 +1842,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: Some(Arc::new(b"cluster-secret".to_vec())),
                     strict_auth: false,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1680,6 +1900,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: Some(Arc::new(b"cluster-secret".to_vec())),
                     strict_auth: false,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1754,6 +1975,183 @@ mod tests {
         response
     }
 
+    // ---- Per-connection request pipelining ----------------------------------
+
+    fn test_pipeline_work(id: u64) -> PipelineWork {
+        let limiter = Arc::new(InflightBytesLimiter::new(0));
+        PipelineWork {
+            request: RequestFrame {
+                request_id: id,
+                op_code: OP_PING,
+                flags: 0,
+                payload: Bytes::new(),
+            },
+            _permit: limiter.try_acquire(0).expect("0-limit acquire always ok"),
+        }
+    }
+
+    #[test]
+    fn pipeline_channel_recv_returns_submitted_work_fifo() {
+        let ch = PipelineChannel::new(4);
+        ch.submit(test_pipeline_work(1));
+        ch.submit(test_pipeline_work(2));
+        assert_eq!(ch.recv().unwrap().request.request_id, 1);
+        assert_eq!(ch.recv().unwrap().request.request_id, 2);
+    }
+
+    #[test]
+    fn pipeline_channel_close_unblocks_idle_worker_with_none() {
+        let ch = Arc::new(PipelineChannel::new(4));
+        let ch2 = Arc::clone(&ch);
+        let got = Arc::new(Mutex::new(None::<bool>));
+        let got2 = Arc::clone(&got);
+        let h = std::thread::spawn(move || {
+            // Blocks until close(): an empty, not-yet-closed channel parks.
+            let r = ch2.recv();
+            *got2.lock() = Some(r.is_none());
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(got.lock().is_none(), "worker must still be parked on recv");
+        ch.close();
+        h.join().unwrap();
+        assert_eq!(*got.lock(), Some(true), "recv must return None after close");
+    }
+
+    #[test]
+    fn pipeline_channel_submit_backpressures_at_depth() {
+        // depth=1: the second submit must block until the first completes.
+        let ch = Arc::new(PipelineChannel::new(1));
+        ch.submit(test_pipeline_work(1)); // in_flight = 1 (== depth)
+        let ch2 = Arc::clone(&ch);
+        let submitted = Arc::new(AtomicBool::new(false));
+        let submitted2 = Arc::clone(&submitted);
+        let h = std::thread::spawn(move || {
+            ch2.submit(test_pipeline_work(2)); // must block: in_flight == depth
+            submitted2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !submitted.load(Ordering::SeqCst),
+            "second submit must block while the pipeline is full"
+        );
+        // Consume + complete the first → frees a slot → second submit proceeds.
+        let _ = ch.recv().unwrap();
+        ch.complete();
+        h.join().unwrap();
+        assert!(submitted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pipeline_channel_drain_waits_for_completion() {
+        let ch = Arc::new(PipelineChannel::new(4));
+        ch.submit(test_pipeline_work(1));
+        ch.submit(test_pipeline_work(2));
+        let ch2 = Arc::clone(&ch);
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained2 = Arc::clone(&drained);
+        let h = std::thread::spawn(move || {
+            ch2.drain(); // blocks until in_flight hits 0
+            drained2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drained.load(Ordering::SeqCst),
+            "drain must wait for in-flight"
+        );
+        // Process the first; drain must still wait on the second.
+        let _ = ch.recv().unwrap();
+        ch.complete();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drained.load(Ordering::SeqCst),
+            "drain must still wait while one request is in flight"
+        );
+        let _ = ch.recv().unwrap();
+        ch.complete();
+        h.join().unwrap();
+        assert!(drained.load(Ordering::SeqCst), "drain returns once empty");
+    }
+
+    /// End-to-end: a connection with `pipeline_depth > 1` must answer EVERY
+    /// concurrently-pipelined request (the client sends many frames before
+    /// reading any reply), each response matched to its `request_id`. This is
+    /// the invariant the multiplexing client relies on; responses may arrive in
+    /// any order, so the test collects by id rather than asserting sequence.
+    #[test]
+    fn pipelined_connection_answers_all_concurrent_requests() {
+        const N: u64 = 64;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 8,
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(5),
+                    write_timeout: Duration::from_secs(5),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        // Fire all N requests without reading any reply in between — the server
+        // must dispatch them concurrently and stream the replies back.
+        let mut buf = Vec::new();
+        for id in 1..=N {
+            let req = RequestFrame {
+                request_id: id,
+                op_code: OP_PING,
+                flags: 0,
+                payload: Bytes::new(),
+            };
+            buf.extend_from_slice(&req.encode());
+        }
+        client.write_all(&buf).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..N {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(resp.status, STATUS_OK, "ping {} not OK", resp.request_id);
+            assert!(
+                seen.insert(resp.request_id),
+                "duplicate response for request_id {}",
+                resp.request_id
+            );
+        }
+        let expected: std::collections::HashSet<u64> = (1..=N).collect();
+        assert_eq!(
+            seen, expected,
+            "every request_id must get exactly one reply"
+        );
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+    }
+
     /// F-G5-001 (CRITICAL): with `strict_auth = true` AND `cluster_secret =
     /// None`, an inter-node opcode must be rejected with
     /// `ERR_CLUSTER_AUTH_FAILED` rather than silently accepted.
@@ -1784,6 +2182,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: true,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1847,6 +2246,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1928,6 +2328,7 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),

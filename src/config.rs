@@ -766,6 +766,26 @@ pub struct ServerConfig {
     /// TCP connection threads. A value of 0 disables the aggregate cap.
     pub max_inflight_request_bytes: usize,
 
+    /// Per-connection request pipelining depth: the number of requests on a
+    /// single connection that may be dispatched concurrently.
+    ///
+    /// `1` (the default) preserves the strictly serial per-connection model —
+    /// each request is fully handled (including its redo fsync) before the next
+    /// on that connection is read. Values `> 1` let the connection dispatch up
+    /// to `pipeline_depth` requests at once on a bounded worker pool, with
+    /// responses written back as each completes (matched by `request_id`, so
+    /// they may return out of order). This raises the number of mutations
+    /// reaching the redo group-commit concurrently — the throughput lever for
+    /// clients that keep several requests in flight on one connection — without
+    /// needing one OS connection/thread per in-flight request.
+    ///
+    /// Ordering caveat: with `> 1`, two requests issued on the same connection
+    /// without waiting for the first's response may be applied in either order.
+    /// Stateful blob-streaming ops (`OP_STREAM_CHUNK` / `OP_STREAM_END`) and
+    /// authenticated inter-node frames always take a drain barrier and run
+    /// serially, so their semantics are unchanged.
+    pub pipeline_depth: usize,
+
     /// HTTP listen address for observability endpoints (metrics, health, debug).
     pub http_listen_addr: String,
 
@@ -1086,6 +1106,7 @@ impl Default for ServerConfig {
             max_active_streams_per_connection: Self::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
             stream_idle_timeout_secs: Self::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             max_inflight_request_bytes: 256 * 1024 * 1024,
+            pipeline_depth: 1,
             http_listen_addr: "127.0.0.1:9100".to_string(),
             enable_remote_bind: false,
             enable_admin_endpoints: false,
