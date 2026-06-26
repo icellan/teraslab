@@ -1,0 +1,34 @@
+# Single-node, single-store benchmark config (standalone, no cluster).
+# Baseline for pipeline-bottleneck profiling. Pair with bench-4store.toml to
+# measure the multi-device (parallel per-store redo fsync) throughput effect.
+node_id = 1
+listen_addr = "0.0.0.0:3300"
+http_listen_addr = "0.0.0.0:9100"
+swim_port = 3301
+seed_nodes = []
+replication_factor = 1
+
+# ONE store + 1 GiB in-RAM block cache.
+device_paths = ["/data/d0.dat"]
+device_size = 1073741824
+device_alignment = 4096
+redo_log_size = 67108864
+index_snapshot_path = "/data/index.snap"
+expected_records = 2000000
+lock_stripes = 65536
+max_batch_size = 8192
+max_connections = 1024
+block_height_retention = 288
+
+# Standalone bench: no inter-node auth. Admin/debug routes stay off (the bench
+# only needs the unauthenticated /metrics, /health, /status surface).
+strict_auth = false
+enable_remote_bind = true
+enable_admin_endpoints = false
+
+[index]
+backend = "memory"
+
+[cache]
+bytes = 1073741824   # 1 GiB (covers the 1 GiB device)
+writeback = true

@@ -456,6 +456,35 @@ client ~1% CPU) — it is **I/O-wait bound, not CPU/lock/client bound**.
 > **relative** comparisons and **stage attribution**, not headline numbers — and
 > to actually measure the I/O-parallel paths, run it on real NVMe.
 
+**3. Optional data-device cache (`[cache]`) — see `docs/WRITE_CACHE_SPEC.md`.**
+Batched (`--batch 256`), 32 workers, 1 GiB cache covering the device:
+
+| metric (server-side, per 256-item batch) | no cache | write-through | write-back |
+|---|---|---|---|
+| `spend` latency | 21.3 ms | 20.5 ms | **7.3 ms** |
+| `set_mined` latency | 13.3 ms | 12.2 ms | **6.3 ms** |
+| `get` latency | 1.54 ms | 0.71 ms | **0.56 ms** |
+| overall throughput | ~17k ops/s | ~17k ops/s | ~17k ops/s |
+
+The cache does what it should at the device layer: write-through serves the
+read-modify-write **reads** from RAM (~2–3× lower `get`); write-back also defers
+the **writes**, cutting `spend`/`set_mined` ~2–3×. But **overall throughput is
+unchanged** — once the data device is cached, the limiter moves to (a) the
+redo-log fsync, which is correctly **never** cached (durability), and (b) the
+loadgen's single shared `tokio::Mutex` work-queue (a client-side artifact). So
+the cache is a **latency** win on read-modify-write paths; raising end-to-end
+throughput needs a faster WAL path and a lock-free client.
+
+**Aerospike comparison (same Docker disk; `asbench`, harness not committed).** A
+disk-backed Aerospike CE namespace on the same virtualized disk sustains
+~200k TPS insert / ~117k TPS mixed (20% read / 80% write) — ~7× TeraSlab's ~17k
+here. The gap is **not** the data-device read cost (the cache addressed that): it
+is Aerospike acking writes from its in-RAM streaming buffers with async flush,
+plus an async-pipelined client, versus TeraSlab's WAL-fsync-before-ack durability
+and the batch loadgen's shared-mutex queue. The comparison is disk-to-disk but
+not durability-to-durability, and both are gated here by the macOS Docker virtual
+disk rather than the NVMe TeraSlab targets.
+
 ## Wire protocol
 
 TeraSlab uses a compact binary protocol over TCP. Every request and response is a length-prefixed frame:
