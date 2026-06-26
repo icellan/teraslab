@@ -51,6 +51,14 @@ struct Args {
     /// single-item fsync floor. Counters still tally individual items.
     #[arg(long, default_value = "1")]
     batch: usize,
+
+    /// Connection pool size. Defaults to the worker count so each worker holds
+    /// its own connection and all `workers` RPCs are truly in flight at once
+    /// (the single-node pool serves one round-trip per connection). Too few
+    /// connections re-serializes the workers on the pool regardless of how many
+    /// worker tasks there are.
+    #[arg(long)]
+    conns: Option<usize>,
 }
 
 #[tokio::main]
@@ -62,6 +70,8 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // One connection per worker by default so all `workers` RPCs are concurrent.
+    let conns = args.conns.unwrap_or(args.workers).max(4);
     let cfg = ClientConfig {
         addr: args.addr.clone(),
         seeds: args
@@ -70,8 +80,8 @@ async fn main() {
             .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
             .unwrap_or_default(),
         pool: PoolConfig {
-            min_conns: 4,
-            max_conns: 32,
+            min_conns: conns.min(8),
+            max_conns: conns,
             dial_timeout: Duration::from_secs(5),
             health_check: Duration::from_secs(15),
             ..Default::default()
@@ -113,19 +123,14 @@ async fn main() {
     let err_other = Arc::new(AtomicU64::new(0));
     let err_logged = Arc::new(AtomicU64::new(0)); // cap detail logging
 
-    type TxQueue = Arc<tokio::sync::Mutex<std::collections::VecDeque<([u8; 32], [u8; 32])>>>;
-    let tx_queue: TxQueue = Arc::new(tokio::sync::Mutex::new(
-        std::collections::VecDeque::with_capacity(100_000),
-    ));
-
     let interval_us = (1_000_000u64 * args.workers as u64)
         .checked_div(args.rate)
         .unwrap_or(0);
     let batch = args.batch.max(1);
 
     eprintln!(
-        "Running: {} ops/s target, {} workers, batch={}, {}s duration\n",
-        args.rate, args.workers, batch, args.duration
+        "Running: {} ops/s target, {} workers, {} conns, batch={}, {}s duration\n",
+        args.rate, args.workers, conns, batch, args.duration
     );
 
     let start = Instant::now();
@@ -180,9 +185,15 @@ async fn main() {
         let err_server = err_server.clone();
         let err_other = err_other.clone();
         let err_logged = err_logged.clone();
-        let tx_queue = tx_queue.clone();
 
         handles.push(tokio::spawn(async move {
+            // Per-worker LOCAL queue of created (txid, first-utxo-hash) — no
+            // shared mutex, so workers never serialize on each other. Each
+            // worker spends/reads/mines what it created; random 256-bit txids
+            // keep workers' key spaces effectively disjoint, so the server's
+            // per-key visibility barrier lets their mutations run concurrently.
+            let mut local: std::collections::VecDeque<([u8; 32], [u8; 32])> =
+                std::collections::VecDeque::with_capacity(8192);
             let mut block_height: u32 = 800_000 + wid as u32 * 100_000;
             let mut rng: u64 = wid as u64 ^ 0xDEAD_BEEF_CAFE_1234;
             let now_ms = || {
@@ -286,7 +297,7 @@ async fn main() {
                     (items, firsts)
                 };
 
-                // Pop up to `batch` records from the shared queue.
+                // Pop up to `batch` records from this worker's LOCAL queue.
                 let pop_batch = |q: &mut std::collections::VecDeque<([u8; 32], [u8; 32])>| {
                     let mut v = Vec::with_capacity(batch);
                     for _ in 0..batch {
@@ -305,26 +316,20 @@ async fn main() {
                         match client.create_batch(&items).await {
                             Ok(_) => {
                                 creates.fetch_add(items.len() as u64, Ordering::Relaxed);
-                                let mut q = tx_queue.lock().await;
-                                for f in firsts {
-                                    q.push_back(f);
-                                }
+                                local.extend(firsts);
                             }
                             Err(ref e) => log_err("create", e),
                         }
                     }
                     4..7 => {
-                        let entries = { pop_batch(&mut *tx_queue.lock().await) };
+                        let entries = pop_batch(&mut local);
                         if entries.is_empty() {
-                            // Queue empty — seed it with a batch of creates.
+                            // Nothing to spend yet — seed with a batch of creates.
                             let (items, firsts) = make_creates(&mut rng);
                             match client.create_batch(&items).await {
                                 Ok(_) => {
                                     creates.fetch_add(items.len() as u64, Ordering::Relaxed);
-                                    let mut q = tx_queue.lock().await;
-                                    for f in firsts {
-                                        q.push_back(f);
-                                    }
+                                    local.extend(firsts);
                                 }
                                 Err(ref e) => log_err("create", e),
                             }
@@ -354,16 +359,15 @@ async fn main() {
                                 }
                                 Err(ref e) => {
                                     log_err("spend", e);
-                                    let mut q = tx_queue.lock().await;
                                     for e in entries {
-                                        q.push_back(e);
+                                        local.push_back(e);
                                     }
                                 }
                             }
                         }
                     }
                     7..9 => {
-                        let entries = { pop_batch(&mut *tx_queue.lock().await) };
+                        let entries = pop_batch(&mut local);
                         if !entries.is_empty() {
                             let txids: Vec<[u8; 32]> = entries.iter().map(|(t, _)| *t).collect();
                             let mask = teraslab::protocol::codec::FieldMask::ALL_METADATA;
@@ -373,14 +377,13 @@ async fn main() {
                                 }
                                 Err(ref e) => log_err("get", e),
                             }
-                            let mut q = tx_queue.lock().await;
                             for e in entries {
-                                q.push_back(e);
+                                local.push_back(e);
                             }
                         }
                     }
                     _ => {
-                        let entries = { pop_batch(&mut *tx_queue.lock().await) };
+                        let entries = pop_batch(&mut local);
                         if !entries.is_empty() {
                             let txids: Vec<[u8; 32]> = entries.iter().map(|(t, _)| *t).collect();
                             let params = SetMinedBatchParams {
@@ -398,9 +401,8 @@ async fn main() {
                                 }
                                 Err(ref e) => log_err("set_mined", e),
                             }
-                            let mut q = tx_queue.lock().await;
                             for e in entries {
-                                q.push_back(e);
+                                local.push_back(e);
                             }
                         }
                     }
