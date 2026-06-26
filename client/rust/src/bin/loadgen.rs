@@ -45,6 +45,12 @@ struct Args {
     /// Number of concurrent worker tasks.
     #[arg(long, default_value = "4")]
     workers: usize,
+
+    /// Items per batched RPC. >1 amortizes the per-batch redo fsync across many
+    /// items (one group-commit per RPC), which is how production pushes past the
+    /// single-item fsync floor. Counters still tally individual items.
+    #[arg(long, default_value = "1")]
+    batch: usize,
 }
 
 #[tokio::main]
@@ -115,10 +121,11 @@ async fn main() {
     let interval_us = (1_000_000u64 * args.workers as u64)
         .checked_div(args.rate)
         .unwrap_or(0);
+    let batch = args.batch.max(1);
 
     eprintln!(
-        "Running: {} ops/s target, {} workers, {}s duration\n",
-        args.rate, args.workers, args.duration
+        "Running: {} ops/s target, {} workers, batch={}, {}s duration\n",
+        args.rate, args.workers, batch, args.duration
     );
 
     let start = Instant::now();
@@ -240,25 +247,28 @@ async fn main() {
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
 
-                let op = (rng % 10) as u8;
-                match op {
-                    0..4 => {
+                // Build `batch` fresh CreateItems and remember each one's first
+                // utxo hash for later spends. Used by the create arm and by the
+                // spend arm's seed-the-queue fallback.
+                let make_creates = |rng: &mut u64| {
+                    let mut items = Vec::with_capacity(batch);
+                    let mut firsts = Vec::with_capacity(batch);
+                    for _ in 0..batch {
                         let mut txid = [0u8; 32];
-                        fill_random(&mut txid, &mut rng);
-                        let n = 2 + (rng % 4) as usize;
+                        fill_random(&mut txid, rng);
+                        let n = 2 + (*rng % 4) as usize;
                         let mut hashes = Vec::with_capacity(n);
                         for _ in 0..n {
                             let mut h = [0u8; 32];
-                            fill_random(&mut h, &mut rng);
+                            fill_random(&mut h, rng);
                             hashes.push(h);
                         }
-                        let first = hashes[0];
-
-                        let items = [CreateItem {
+                        firsts.push((txid, hashes[0]));
+                        items.push(CreateItem {
                             txid,
                             tx_version: 2,
                             locktime: 0,
-                            fee: 1000 + rng % 5000,
+                            fee: 1000 + *rng % 5000,
                             size_in_bytes: 250,
                             extended_size: 0,
                             is_coinbase: false,
@@ -271,98 +281,108 @@ async fn main() {
                             mined_block_height: None,
                             mined_subtree_idx: None,
                             parent_txids: vec![],
-                        }];
+                        });
+                    }
+                    (items, firsts)
+                };
 
+                // Pop up to `batch` records from the shared queue.
+                let pop_batch = |q: &mut std::collections::VecDeque<([u8; 32], [u8; 32])>| {
+                    let mut v = Vec::with_capacity(batch);
+                    for _ in 0..batch {
+                        match q.pop_front() {
+                            Some(e) => v.push(e),
+                            None => break,
+                        }
+                    }
+                    v
+                };
+
+                let op = (rng % 10) as u8;
+                match op {
+                    0..4 => {
+                        let (items, firsts) = make_creates(&mut rng);
                         match client.create_batch(&items).await {
                             Ok(_) => {
-                                creates.fetch_add(1, Ordering::Relaxed);
-                                tx_queue.lock().await.push_back((txid, first));
+                                creates.fetch_add(items.len() as u64, Ordering::Relaxed);
+                                let mut q = tx_queue.lock().await;
+                                for f in firsts {
+                                    q.push_back(f);
+                                }
                             }
-                            Err(ref e) => {
-                                log_err("create", e);
-                            }
+                            Err(ref e) => log_err("create", e),
                         }
                     }
                     4..7 => {
-                        let entry = tx_queue.lock().await.pop_front();
-                        if let Some((txid, utxo_hash)) = entry {
-                            let mut sd = [0u8; 36];
-                            fill_random(&mut sd, &mut rng);
-
+                        let entries = { pop_batch(&mut *tx_queue.lock().await) };
+                        if entries.is_empty() {
+                            // Queue empty — seed it with a batch of creates.
+                            let (items, firsts) = make_creates(&mut rng);
+                            match client.create_batch(&items).await {
+                                Ok(_) => {
+                                    creates.fetch_add(items.len() as u64, Ordering::Relaxed);
+                                    let mut q = tx_queue.lock().await;
+                                    for f in firsts {
+                                        q.push_back(f);
+                                    }
+                                }
+                                Err(ref e) => log_err("create", e),
+                            }
+                        } else {
                             let params = SpendBatchParams {
                                 ignore_conflicting: false,
                                 ignore_locked: false,
                                 current_block_height: block_height,
                                 block_height_retention: 288,
                             };
-                            let items = [SpendItem {
-                                txid,
-                                vout: 0,
-                                utxo_hash,
-                                spending_data: sd,
-                            }];
-
+                            let items: Vec<SpendItem> = entries
+                                .iter()
+                                .map(|(txid, utxo_hash)| {
+                                    let mut sd = [0u8; 36];
+                                    fill_random(&mut sd, &mut rng);
+                                    SpendItem {
+                                        txid: *txid,
+                                        vout: 0,
+                                        utxo_hash: *utxo_hash,
+                                        spending_data: sd,
+                                    }
+                                })
+                                .collect();
                             match client.spend_batch(&params, &items).await {
                                 Ok(_) => {
-                                    spends.fetch_add(1, Ordering::Relaxed);
+                                    spends.fetch_add(items.len() as u64, Ordering::Relaxed);
                                 }
                                 Err(ref e) => {
                                     log_err("spend", e);
-                                    tx_queue.lock().await.push_back((txid, utxo_hash));
-                                }
-                            }
-                        } else {
-                            let mut txid = [0u8; 32];
-                            fill_random(&mut txid, &mut rng);
-                            let mut h = [0u8; 32];
-                            fill_random(&mut h, &mut rng);
-                            let items = [CreateItem {
-                                txid,
-                                tx_version: 1,
-                                locktime: 0,
-                                fee: 500,
-                                size_in_bytes: 200,
-                                extended_size: 0,
-                                is_coinbase: false,
-                                spending_height: 0,
-                                created_at: now_ms(),
-                                flags: 0,
-                                utxo_hashes: vec![h],
-                                cold_data: vec![],
-                                mined_block_id: None,
-                                mined_block_height: None,
-                                mined_subtree_idx: None,
-                                parent_txids: vec![],
-                            }];
-                            match client.create_batch(&items).await {
-                                Ok(_) => {
-                                    creates.fetch_add(1, Ordering::Relaxed);
-                                    tx_queue.lock().await.push_back((txid, h));
-                                }
-                                Err(ref e) => {
-                                    log_err("create", e);
+                                    let mut q = tx_queue.lock().await;
+                                    for e in entries {
+                                        q.push_back(e);
+                                    }
                                 }
                             }
                         }
                     }
                     7..9 => {
-                        let entry = tx_queue.lock().await.pop_front();
-                        if let Some((txid, hash)) = entry {
+                        let entries = { pop_batch(&mut *tx_queue.lock().await) };
+                        if !entries.is_empty() {
+                            let txids: Vec<[u8; 32]> = entries.iter().map(|(t, _)| *t).collect();
                             let mask = teraslab::protocol::codec::FieldMask::ALL_METADATA;
-                            match client.get_batch(mask, &[txid]).await {
+                            match client.get_batch(mask, &txids).await {
                                 Ok(_) => {
-                                    reads.fetch_add(1, Ordering::Relaxed);
+                                    reads.fetch_add(txids.len() as u64, Ordering::Relaxed);
                                 }
-                                Err(ref e) => {
-                                    log_err("get", e);
-                                }
+                                Err(ref e) => log_err("get", e),
                             }
-                            tx_queue.lock().await.push_back((txid, hash));
+                            let mut q = tx_queue.lock().await;
+                            for e in entries {
+                                q.push_back(e);
+                            }
                         }
                     }
                     _ => {
-                        let entry = tx_queue.lock().await.pop_front();
-                        if let Some((txid, hash)) = entry {
+                        let entries = { pop_batch(&mut *tx_queue.lock().await) };
+                        if !entries.is_empty() {
+                            let txids: Vec<[u8; 32]> = entries.iter().map(|(t, _)| *t).collect();
                             let params = SetMinedBatchParams {
                                 block_id: block_height,
                                 block_height,
@@ -372,15 +392,16 @@ async fn main() {
                                 current_block_height: block_height,
                                 block_height_retention: 288,
                             };
-                            match client.set_mined_batch(&params, &[txid]).await {
+                            match client.set_mined_batch(&params, &txids).await {
                                 Ok(_) => {
-                                    mined_count.fetch_add(1, Ordering::Relaxed);
+                                    mined_count.fetch_add(txids.len() as u64, Ordering::Relaxed);
                                 }
-                                Err(ref e) => {
-                                    log_err("set_mined", e);
-                                }
+                                Err(ref e) => log_err("set_mined", e),
                             }
-                            tx_queue.lock().await.push_back((txid, hash));
+                            let mut q = tx_queue.lock().await;
+                            for e in entries {
+                                q.push_back(e);
+                            }
                         }
                     }
                 }

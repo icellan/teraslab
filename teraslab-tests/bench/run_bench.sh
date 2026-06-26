@@ -31,6 +31,7 @@ IMAGE="${IMAGE:-teraslab:test}"
 DUR="${DUR:-45}"
 WORKERS="${WORKERS:-32}"
 RATE="${RATE:-100000000}"        # effectively unthrottled -> saturate the server
+BATCH="${BATCH:-1}"              # items per RPC; >1 amortizes the per-batch fsync
 VARIANTS="${VARIANTS:-1store 4store}"
 HOST_CLIENT_PORT="${HOST_CLIENT_PORT:-13300}"
 HOST_HTTP_PORT="${HOST_HTTP_PORT:-19100}"
@@ -85,9 +86,9 @@ run_variant() {
     docker rm -f "$cname" >/dev/null; return 1
   fi
 
-  echo "--- loadgen: workers=$WORKERS rate=$RATE dur=${DUR}s ---"
+  echo "--- loadgen: workers=$WORKERS rate=$RATE batch=$BATCH dur=${DUR}s ---"
   "$LOADGEN" --addr 127.0.0.1:${HOST_CLIENT_PORT} \
-    --rate "$RATE" --workers "$WORKERS" --duration "$DUR" \
+    --rate "$RATE" --workers "$WORKERS" --batch "$BATCH" --duration "$DUR" \
     2>&1 | tee "$OUT/${name}_loadgen.txt"
 
   curl -sf "http://localhost:${HOST_HTTP_PORT}/metrics" > "$OUT/${name}_metrics.txt"
