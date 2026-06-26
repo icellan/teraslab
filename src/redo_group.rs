@@ -58,10 +58,15 @@ pub struct GroupCommit {
     log: Arc<Mutex<RedoLog>>,
     inner: Mutex<Inner>,
     cv: Condvar,
+    /// Buffered (relaxed) durability: when `true`, `commit` appends and returns
+    /// WITHOUT fsync — durability is provided by a background flusher (and the
+    /// checkpoint barrier) instead of per-commit. Trades a bounded crash-loss
+    /// window (the un-flushed tail) for removing the fsync from the ack path.
+    buffered: std::sync::atomic::AtomicBool,
 }
 
 impl GroupCommit {
-    /// Wrap a redo log with a group-commit coordinator.
+    /// Wrap a redo log with a group-commit coordinator (strict durability).
     pub fn new(log: Arc<Mutex<RedoLog>>) -> Arc<Self> {
         Arc::new(Self {
             log,
@@ -72,7 +77,24 @@ impl GroupCommit {
                 next_id: 0,
             }),
             cv: Condvar::new(),
+            buffered: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Enable/disable buffered durability. Set once at startup from config.
+    pub fn set_buffered(&self, buffered: bool) {
+        self.buffered
+            .store(buffered, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Force the wrapped log durable (fsync). Used by the background flusher and
+    /// the checkpoint barrier so buffered appends become durable. Idempotent and
+    /// cheap when nothing is dirty.
+    pub fn flush(&self) -> Result<(), String> {
+        self.log
+            .lock()
+            .flush()
+            .map_err(|e| format!("redo flush failed: {e}"))
     }
 
     /// The wrapped log, for paths that must lock it directly (checkpoint,
@@ -89,6 +111,30 @@ impl GroupCommit {
     pub fn commit(&self, ops: Vec<RedoOp>) -> CommitOutcome {
         if ops.is_empty() {
             return Ok(None);
+        }
+
+        // Buffered durability: append under the log lock and return WITHOUT
+        // fsync. Appends are cheap (in-memory buffer + sequence draw), so the
+        // log mutex is held only briefly; the background flusher and checkpoint
+        // make the appended entries durable. A bounded tail may be lost on crash
+        // — the relaxed-durability contract.
+        if self.buffered.load(std::sync::atomic::Ordering::Acquire) {
+            let mut log = self.log.lock();
+            let mut first = u64::MAX;
+            let mut last = 0u64;
+            for op in &ops {
+                match log.append(op.clone()) {
+                    Ok(seq) => {
+                        first = first.min(seq);
+                        last = last.max(seq);
+                    }
+                    Err(e) => {
+                        log.poison();
+                        return Err(format!("redo log append failed: {e}"));
+                    }
+                }
+            }
+            return Ok(Some((first, last)));
         }
 
         let my_id = {
@@ -344,6 +390,41 @@ mod tests {
             .expect("range");
         assert_eq!(range.1 - range.0, 2, "3 ops -> span of 3 sequences");
         assert_eq!(gc.log().lock().recover().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn buffered_commit_does_not_fsync_until_flush() {
+        // Buffered durability: commit appends + returns its range WITHOUT an
+        // fsync, so the per-commit sync count stays flat. An explicit flush()
+        // (what the background flusher / checkpoint call) then fsyncs once and
+        // the entries become recoverable.
+        let dev = CountingDev::new();
+        let gc = GroupCommit::new(open_log(dev.clone()));
+        gc.set_buffered(true);
+        let before = dev.syncs.load(Ordering::SeqCst);
+
+        let r1 = gc.commit(vec![delete_op(1)]).unwrap().expect("range");
+        let r2 = gc.commit(vec![delete_op(2)]).unwrap().expect("range");
+        assert_eq!(
+            dev.syncs.load(Ordering::SeqCst) - before,
+            0,
+            "buffered commits must NOT fsync"
+        );
+        assert_eq!(r2.0, r1.0 + 1, "sequences still assigned, contiguous");
+
+        // Explicit flush -> exactly one fsync, both entries durable.
+        gc.flush().expect("flush ok");
+        assert_eq!(
+            dev.syncs.load(Ordering::SeqCst) - before,
+            1,
+            "flush fsyncs once for the buffered batch"
+        );
+        let entries = gc.log().lock().recover().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "both buffered entries recoverable after flush"
+        );
     }
 
     #[test]

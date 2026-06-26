@@ -786,6 +786,25 @@ pub struct ServerConfig {
     /// serially, so their semantics are unchanged.
     pub pipeline_depth: usize,
 
+    /// Buffered (relaxed) redo durability. `false` (default) = strict: every
+    /// mutation is fsynced to the redo WAL before it is acked (no acked write is
+    /// ever lost on crash). `true` = buffered: a mutation is acked after its
+    /// in-memory redo append, and a background flusher (every
+    /// [`Self::redo_flush_interval_ms`]) plus the checkpoint barrier make it
+    /// durable. This removes the fsync from the ack path — the main write-
+    /// throughput lever — at the cost of a bounded crash-loss window: on an
+    /// unclean shutdown, mutations acked since the last background flush are
+    /// lost. The store stays internally consistent (the redo is the source of
+    /// truth, so a lost entry's mutation vanishes atomically). Use only where
+    /// the client tolerates re-submitting a small recent tail after a crash.
+    pub redo_buffered: bool,
+
+    /// Background redo-flush interval in milliseconds when
+    /// [`Self::redo_buffered`] is `true`. Smaller = narrower crash-loss window
+    /// but more fsyncs; larger = better coalescing but more at-risk data.
+    /// Ignored under strict durability.
+    pub redo_flush_interval_ms: u64,
+
     /// HTTP listen address for observability endpoints (metrics, health, debug).
     pub http_listen_addr: String,
 
@@ -1107,6 +1126,8 @@ impl Default for ServerConfig {
             stream_idle_timeout_secs: Self::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             max_inflight_request_bytes: 256 * 1024 * 1024,
             pipeline_depth: 1,
+            redo_buffered: false,
+            redo_flush_interval_ms: 5,
             http_listen_addr: "127.0.0.1:9100".to_string(),
             enable_remote_bind: false,
             enable_admin_endpoints: false,

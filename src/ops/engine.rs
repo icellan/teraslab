@@ -598,6 +598,32 @@ impl Engine {
         let _ = self.redo_committers.set(committers);
     }
 
+    /// Enable buffered (relaxed) redo durability on every per-store group-commit
+    /// coordinator: mutations are acked after the in-memory redo append, and a
+    /// background flusher (plus the checkpoint barrier) makes them durable.
+    /// Trades a bounded crash-loss window for removing the fsync from the ack
+    /// path. Call once at startup after [`Self::set_redo_logs`]. No-op (strict)
+    /// when no per-store committers are attached.
+    pub fn set_buffered_durability(&self, buffered: bool) {
+        if let Some(committers) = self.redo_committers.get() {
+            for c in committers {
+                c.set_buffered(buffered);
+            }
+        }
+    }
+
+    /// Force every per-store redo log durable (fsync). Used by the background
+    /// flusher under buffered durability and by the checkpoint barrier before it
+    /// reclaims the redo prefix. Idempotent and cheap when nothing is dirty.
+    pub fn flush_all_redo(&self) -> std::result::Result<(), String> {
+        if let Some(committers) = self.redo_committers.get() {
+            for c in committers {
+                c.flush()?;
+            }
+        }
+        Ok(())
+    }
+
     /// The redo log owning store `device_id`, for secondary-index two-phase
     /// durability journalling.
     ///

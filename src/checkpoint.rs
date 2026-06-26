@@ -524,6 +524,14 @@ where
     //      compaction cannot silently revert acked mutations whose only
     //      durable copy was the just-reclaimed redo prefix.
     crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeCheckpointDataSync);
+    // Under buffered durability the redo entries covering this checkpoint's
+    // fence may have been acked but not yet fsynced. They MUST be durable before
+    // the fence is written and the prefix reclaimed, otherwise a crash after
+    // compaction would lose acked+checkpointed mutations. Forcing the redo flush
+    // here is a no-op under strict durability (already fsynced per commit).
+    engine
+        .flush_all_redo()
+        .map_err(|e| format!("redo durable flush: {e}"))?;
     engine
         .flush_index_durable()
         .map_err(|e| format!("index durable flush: {e}"))?;

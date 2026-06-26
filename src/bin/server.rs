@@ -1257,6 +1257,17 @@ fn main() {
     // migration suppression read via `engine.redo_log()`).
     if let Some(ref logs) = redo_logs_arc {
         engine.set_redo_logs(logs.clone());
+        // Apply buffered (relaxed) redo durability if configured. Must follow
+        // set_redo_logs so the per-store group-commit coordinators exist.
+        if config.redo_buffered {
+            engine.set_buffered_durability(true);
+            tracing::warn!(
+                flush_interval_ms = config.redo_flush_interval_ms,
+                "BUFFERED redo durability enabled — mutations are acked before \
+                 fsync; up to one flush interval of acked writes may be lost on \
+                 an unclean shutdown (relaxed-durability mode)"
+            );
+        }
     }
 
     // 4b. Attach the (already-constructed) blobstore to the engine. The
@@ -1851,6 +1862,30 @@ fn main() {
         }
     });
 
+    // Background redo flusher for buffered durability: periodically fsync every
+    // store's redo log so acked-but-unflushed mutations become durable, bounding
+    // the crash-loss window to ~one interval. Strict durability skips this (each
+    // commit already fsyncs). Observes the shutdown flag and exits promptly.
+    let redo_flush_handle: Option<std::thread::JoinHandle<()>> = if config.redo_buffered {
+        let engine = engine.clone();
+        let shutdown_flag = shutdown_flag.clone();
+        let interval = std::time::Duration::from_millis(config.redo_flush_interval_ms.max(1));
+        Some(std::thread::spawn(move || {
+            while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                if let Err(e) = engine.flush_all_redo() {
+                    tracing::error!(err = %e, "background redo flush failed");
+                }
+            }
+            // Final flush on shutdown so a clean stop loses nothing.
+            if let Err(e) = engine.flush_all_redo() {
+                tracing::error!(err = %e, "final redo flush on shutdown failed");
+            }
+        }))
+    } else {
+        None
+    };
+
     // R-049: spawn the periodic orphan-blob GC sweep. Recovery already
     // reconciled the blob store against the freshly-replayed primary index
     // on startup; this task takes care of orphans that accumulate during
@@ -2002,6 +2037,7 @@ fn main() {
         // while the foreground unwind raced ahead.
         checkpoint_handle: Mutex::new(checkpoint_handle),
         blob_gc_handle: Mutex::new(blob_gc_handle),
+        redo_flush_handle: Mutex::new(redo_flush_handle),
         lag_monitor_handle: Mutex::new(lag_monitor_handle),
         tombstone_gc_handle: Mutex::new(tombstone_gc_handle),
     };
@@ -2049,6 +2085,8 @@ struct ServerWithShutdown {
     checkpoint_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the periodic blob-GC sweep thread. See F-G10-022.
     blob_gc_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Join handle for the background redo flusher (buffered durability only).
+    redo_flush_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the replica-lag monitor thread. See F-G10-022.
     lag_monitor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the Phase 5 tombstone-GC daemon thread (gated off by
@@ -2080,6 +2118,11 @@ impl ServerWithShutdown {
         Self::join_with_timeout(
             "blob_gc",
             self.blob_gc_handle.lock().take(),
+            std::time::Duration::from_secs(5),
+        );
+        Self::join_with_timeout(
+            "redo_flush",
+            self.redo_flush_handle.lock().take(),
             std::time::Duration::from_secs(5),
         );
         Self::join_with_timeout(
