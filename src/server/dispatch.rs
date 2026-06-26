@@ -5710,7 +5710,34 @@ fn handle_set_mined_batch(
         unset_mined: params.unset_mined,
     };
     let keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
-    let results = engine.set_mined_batch(&engine_params, &keys);
+    // The apply is the read-modify-write hot path: each `set_mined_inner` reads
+    // the record metadata from the device, mutates, and writes it back. It
+    // self-locks on the per-key stripe lock and only touches Mutex-guarded
+    // secondary indexes, so independent keys apply concurrently safely — and
+    // the slow device I/O then overlaps instead of pinning one core. WAL-first
+    // is intact: the batch's `SetMined` redo was already flushed (Phase 2), and
+    // `set_mined_inner` writes no redo. Fan out at/above READ_FANOUT_THRESHOLD
+    // (order-preserving collect keeps results aligned with `keys`); smaller
+    // batches stay serial.
+    let results: Vec<
+        std::result::Result<crate::ops::set_mined::SetMinedResponse, crate::ops::error::SpendError>,
+    > = match (keys.len() >= READ_FANOUT_THRESHOLD)
+            .then(read_pool)
+            .flatten()
+        {
+            Some(pool) => {
+                use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+                pool.install(|| {
+                    keys.par_iter()
+                        .map(|k| engine.set_mined_inner(k, &engine_params))
+                        .collect()
+                })
+            }
+            None => keys
+                .iter()
+                .map(|k| engine.set_mined_inner(k, &engine_params))
+                .collect(),
+        };
 
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
@@ -14009,6 +14036,123 @@ mod tests {
         assert_eq!(
             flush_syncs, 1,
             "fanned spend validate must still collapse to one redo flush; got {flush_syncs}"
+        );
+    }
+
+    /// Parallel apply fan-out for set_mined must preserve exact per-item
+    /// outcomes. Drives a batch above `READ_FANOUT_THRESHOLD` (valid txids plus
+    /// a not-found txid), then asserts each valid record gained the block entry
+    /// with the right fields and the missing one was not materialized — so the
+    /// fanned `set_mined_inner` apply can't drop, misroute, or corrupt any item
+    /// versus the old serial loop.
+    #[test]
+    fn set_mined_batch_parallel_apply_preserves_per_item_outcomes() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 16 * 1024 * 1024).unwrap(),
+        ));
+
+        let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &engine, 8192, None, Some(&redo_log), &mut cs, None)
+        };
+
+        const N: usize = 10; // > READ_FANOUT_THRESHOLD (8) -> parallel apply path
+        let mk_txid = |k: usize| {
+            let mut t = [0u8; 32];
+            t[0] = 0x5E;
+            t[1] = k as u8;
+            t
+        };
+        let create_items: Vec<WireCreateItem> = (0..N)
+            .map(|k| WireCreateItem {
+                txid: mk_txid(k),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![[k as u8; 32]],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
+        assert_eq!(
+            request(OP_CREATE_BATCH, encode_create_batch(&create_items)).status,
+            STATUS_OK,
+            "seed creates must succeed"
+        );
+
+        const BLOCK_ID: u32 = 7;
+        const BLOCK_HEIGHT: u32 = 900_000;
+        const SUBTREE: u32 = 3;
+        let params = SetMinedBatchParams {
+            block_id: BLOCK_ID,
+            block_height: BLOCK_HEIGHT,
+            subtree_idx: SUBTREE,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: BLOCK_HEIGHT,
+            block_height_retention: 288,
+        };
+        // All N valid txids plus one that was never created.
+        let missing_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xCC;
+            t
+        };
+        let mut txids: Vec<[u8; 32]> = (0..N).map(mk_txid).collect();
+        txids.push(missing_txid);
+
+        let resp = request(OP_SET_MINED_BATCH, encode_set_mined_batch(&params, &txids));
+        assert_eq!(
+            resp.status, STATUS_PARTIAL_ERROR,
+            "batch with one not-found txid should report partial error"
+        );
+
+        // Every valid txid must carry the new block entry with the exact fields.
+        for k in 0..N {
+            let entry = engine
+                .read_block_entry(&TxKey { txid: mk_txid(k) }, BLOCK_ID)
+                .expect("created txid must exist")
+                .unwrap_or_else(|| panic!("txid {k} must have block entry after fanned set_mined"));
+            // Copy out of the packed struct before comparing (no unaligned refs).
+            let (bh, st) = (entry.block_height, entry.subtree_idx);
+            assert_eq!(bh, BLOCK_HEIGHT, "txid {k} block_height");
+            assert_eq!(st, SUBTREE, "txid {k} subtree_idx");
+        }
+        // The not-found txid must not have been materialized.
+        assert!(
+            engine
+                .read_block_entry(&TxKey { txid: missing_txid }, BLOCK_ID)
+                .is_err(),
+            "set_mined of a missing txid must not materialize a record"
         );
     }
 

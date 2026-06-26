@@ -3309,7 +3309,15 @@ impl Engine {
     ///
     /// Used by both [`set_mined`] (single request) and [`set_mined_batch`]
     /// (batch with shared params). Acquires the per-transaction stripe lock.
-    fn set_mined_inner(
+    /// Apply a single `set_mined` under this record's own stripe lock.
+    ///
+    /// Shared by [`Self::set_mined_batch`] and the dispatch handler's parallel
+    /// apply fan-out. Self-locking (takes the per-key stripe lock on entry) and
+    /// touching only Mutex-guarded secondary indexes and the per-offset
+    /// device locks, so independent keys are safe to apply concurrently. Writes
+    /// no redo — the caller has already made the batch's `SetMined` intents
+    /// durable (WAL-first), so a parallel apply does not affect crash recovery.
+    pub(crate) fn set_mined_inner(
         &self,
         tx_key: &TxKey,
         req: &SetMinedSharedParams,
