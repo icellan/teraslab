@@ -2415,6 +2415,27 @@ fn intent_keys_from_redo_ops(ops: &[RedoOp]) -> Vec<TxKey> {
     keys
 }
 
+/// Whether the master-side replication intent is needed for this node right now.
+///
+/// The intent is a per-mutation durable fsync that bridges "redo durable" →
+/// "replica ACK policy satisfied" so a crash in that window has a startup
+/// barrier. It is only meaningful when there are real replica targets: when
+/// `replication_factor > 1`, OR when a migration is active (the dual-write
+/// window fans writes out to a handoff destination even at RF = 1 — see
+/// `build_replication_targets`'s `dual_write_targets_for_shard`).
+///
+/// At RF <= 1 with no migration there are NO replicas to ACK, so the intent is
+/// pure overhead. The profile showed that fsync dominating write latency: it
+/// runs while the spend/set_mined handler holds its per-key visibility + engine
+/// stripe locks, serializing every stripe-overlapping mutation on it. Skipping
+/// it is safe — the Phase-4 replica fan-out is already a no-op with no targets,
+/// and the paired intent commit/clear are no-ops when no `begin` was recorded.
+fn replication_active(cluster: Option<&RunningCluster>) -> bool {
+    cluster.is_some_and(|c| {
+        c.shard_table().read().replication_factor() > 1 || c.migration_pressure_active()
+    })
+}
+
 fn write_replicated_redo_ops(
     engine: &Engine,
     cluster: Option<&RunningCluster>,
@@ -2423,7 +2444,7 @@ fn write_replicated_redo_ops(
 ) -> std::result::Result<(u64, u64), String> {
     write_replicated_redo_ops_with_tracker(
         engine,
-        cluster.is_some(),
+        replication_active(cluster),
         redo_log,
         ops,
         REPLICATION_INTENT_TRACKER.get(),
@@ -17213,6 +17234,69 @@ mod tests {
         assert_eq!(plan.addr_nodes.get(&n2_addr), Some(&n2));
         assert_eq!(plan.addr_nodes.get(&n3_addr), Some(&n3));
         assert!(!plan.addr_nodes.contains_key(&n1_addr));
+    }
+
+    /// The per-mutation replication intent (a durable fsync on the hot write
+    /// path) is gated by `replication_active`: skipped at RF<=1 with no
+    /// migration (no replicas to ACK), kept when RF>1 or a migration dual-write
+    /// window is open. This is the order-of-magnitude single-node write fix.
+    #[test]
+    fn replication_active_gates_intent_on_real_replica_targets() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        // No cluster at all -> never active.
+        assert!(!replication_active(None));
+
+        let n1 = NodeId(1);
+        let n2 = NodeId(2);
+        let n3 = NodeId(3);
+        let a1: SocketAddr = "127.0.0.1:18901".parse().unwrap();
+        let a2: SocketAddr = "127.0.0.1:18902".parse().unwrap();
+        let a3: SocketAddr = "127.0.0.1:18903".parse().unwrap();
+        let members = vec![n1, n2, n3];
+
+        // RF = 1, idle: no replicas, no migration -> intent skipped.
+        let table_rf1 = ShardTable::compute_with_epoch(&members, 1, 220, 1);
+        let rf1 = new_test_running_cluster(
+            n1,
+            table_rf1,
+            &[(n1, a1), (n2, a2), (n3, a3)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        assert!(
+            !replication_active(Some(&rf1)),
+            "RF=1 idle: no replica targets, intent must be skipped"
+        );
+
+        // RF = 2: real replica targets -> intent needed.
+        let table_rf2 = ShardTable::compute_with_epoch(&members, 2, 221, 1);
+        let rf2 = new_test_running_cluster(
+            n1,
+            table_rf2,
+            &[(n1, a1), (n2, a2), (n3, a3)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        assert!(
+            replication_active(Some(&rf2)),
+            "RF>1: real replicas, intent required"
+        );
+
+        // RF = 1 but a migration dual-write window is open -> intent needed
+        // (the dual-write destination must observe the write durably).
+        rf1.test_open_dual_write_window(0, n3);
+        assert!(
+            replication_active(Some(&rf1)),
+            "RF=1 + migration dual-write window: intent required"
+        );
     }
 
     /// Phase E: outside an active migration, the dual-write window is empty
