@@ -4531,7 +4531,10 @@ fn needs_exclusive_visibility_barrier(op: u16) -> bool {
 /// (batch-atomic per key). All OTHER mutation opcodes keep the coarse global
 /// exclusive guard for now (correct, just not yet parallelized).
 fn manages_own_visibility(op: u16) -> bool {
-    matches!(op, OP_SPEND_BATCH | OP_GET_BATCH | OP_GET_SPEND_BATCH)
+    matches!(
+        op,
+        OP_SPEND_BATCH | OP_SET_MINED_BATCH | OP_CREATE_BATCH | OP_GET_BATCH | OP_GET_SPEND_BATCH
+    )
 }
 
 /// Owns whichever side of the `dispatch_visibility_barrier` rwlock is
@@ -5667,6 +5670,12 @@ fn handle_set_mined_batch(
         valid_items.push(ValidSetMined { idx: i, key });
     }
 
+    // Per-key visibility for the apply window (released before replication).
+    // Excludes a client read of THESE keys while set_mined applies, while
+    // set_mined batches on disjoint keys run concurrently.
+    let visibility_keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
+    let visibility_guard = engine.visibility().mutation(&visibility_keys);
+
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
@@ -5847,6 +5856,9 @@ fn handle_set_mined_batch(
                 .inc(OpCode::SetMined, classify_wire_error_code(e.error_code));
         }
     }
+
+    // Release per-key visibility before replication (reads of these keys resume).
+    drop(visibility_guard);
 
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops_with_barrier(
@@ -6084,6 +6096,18 @@ fn handle_create_batch(
     if let Some(m) = DISPATCH_METRICS.get() {
         m.creates_attempted.inc_by(items.len() as u64);
     }
+
+    // Per-key visibility over this batch's (new) keys for the apply window.
+    // Creates on disjoint keys run concurrently; a client read of a key being
+    // created is excluded until it is applied. Held for the handler (incl. the
+    // replication RTT) — a deliberate simplification vs spend/set_mined's
+    // early-release, since create's multi-path rollback makes a precise early
+    // drop fragile; it only delays a checkpoint or a read of these brand-new
+    // keys, never other mutations/reads (they take the global shared side).
+    let _visibility_guard = {
+        let keys: Vec<TxKey> = items.iter().map(|it| TxKey { txid: it.txid }).collect();
+        engine.visibility().mutation(&keys)
+    };
 
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
