@@ -365,6 +365,81 @@ Ports exposed per container:
 | 3301 | UDP | SWIM membership |
 | 9100 | HTTP | Observability |
 
+## Load testing & profiling
+
+A self-contained, reusable harness lives in `teraslab-tests/bench/`. It boots a
+single node in Docker, drives a mixed over-the-wire workload, and scrapes the
+server's Prometheus `/metrics` for per-stage pipeline histograms — so you can
+attribute latency to a stage instead of guessing.
+
+```bash
+# Builds the image + loadgen if missing, runs both store-count variants.
+teraslab-tests/bench/run_bench.sh
+
+# Tunables (env): DUR (seconds), WORKERS (in-flight concurrency), RATE
+# (target ops/s; default is effectively unthrottled to saturate the server),
+# VARIANTS ("1store", "4store", or both).
+DUR=60 WORKERS=48 VARIANTS="4store" teraslab-tests/bench/run_bench.sh
+```
+
+Files:
+- `bench-1store.toml` / `bench-4store.toml` — standalone single-node configs
+  (no cluster, `strict_auth=false`, admin off). They differ only in
+  `device_paths`: one device vs four, i.e. `num_stores = 1` vs `4`. Four stores
+  means four independent redo logs that fsync in parallel.
+- `run_bench.sh` — orchestrates a clean boot per variant (fresh volume so every
+  `/metrics` counter starts at 0), runs `teraslab-loadgen`, and writes results
+  to `teraslab-tests/results/bench_<timestamp>/` (gitignored):
+  `<variant>_loadgen.txt`, `<variant>_metrics.txt`, `<variant>_status.json`,
+  `<variant>_server.log`.
+
+The load generator is `client/rust/src/bin/loadgen.rs` (`teraslab-loadgen`),
+which issues a mixed create / spend / read / set_mined workload via the Rust
+client.
+
+### Reading the pipeline metrics
+
+The key histograms in `<variant>_metrics.txt`:
+
+| Metric | What it tells you |
+|--------|-------------------|
+| `teraslab_<op>_latency_ns` | End-to-end server handler time per op (create/spend/get/set_mined) |
+| `teraslab_redo_flush_latency_ns` | The redo fsync (group-commit) cost — usually the write bottleneck |
+| `teraslab_redo_entries_per_flush` | Group-commit coalescing degree. `≈ flush_count` means one fsync per op (no coalescing) |
+| `teraslab_lock_wait_ns` | Stripe-lock contention (empty ⇒ not lock-bound) |
+
+### Findings (single-node, mixed workload, macOS Docker Desktop)
+
+Measured at 32 concurrent workers, single-item RPCs:
+
+| | 1 store | 4 stores |
+|---|---|---|
+| Throughput | 241 ops/s | **290 ops/s** (+20%) |
+| Write latency p50 (create/spend) | 4.19 ms | **2.10 ms** |
+| Redo fsync mean / p99 | 1.54 / 4.19 ms | 1.22 / 2.10 ms |
+| Read (get) p50 | 16 µs | 16 µs |
+
+What the numbers say:
+1. **Writes are fsync-bound, not CPU- or lock-bound.** `lock_wait` is empty;
+   every write op pays a redo fsync (`flush_count ≈ write_ops`,
+   `entries_per_flush ≈ 1.5`). There is **no group-commit coalescing across
+   concurrent single-item RPCs** — each item's batch fsyncs on its own, so write
+   throughput is gated by `write_concurrency / fsync_latency`.
+2. **Reads are effectively free** (~16 µs p50) — the index is in memory.
+3. **Multi-device helps**: four independent redo logs let fsyncs run in
+   parallel, cutting write p50 latency ~2× and lifting throughput ~20% **even on
+   a single shared Docker volume**. On physically separate NVMe devices the gain
+   is larger (independent IOPS, not just independent commit paths).
+
+> ⚠️ **Absolute throughput here is a floor, not the target.** It is gated by (a)
+> macOS Docker Desktop's virtual-disk fsync (~1–1.5 ms vs <100 µs on real NVMe)
+> and (b) the loadgen sending one item per RPC. The 10M+ ops/sec design target
+> assumes production batching (thousands of items per RPC) on bare-metal NVMe.
+> Use this harness for **relative** comparisons (config A vs B, before vs after)
+> and for **stage attribution**, not for headline numbers. To approach the
+> design target, batch many items per RPC and run on real NVMe with separate
+> `device_paths` per physical device.
+
 ## Wire protocol
 
 TeraSlab uses a compact binary protocol over TCP. Every request and response is a length-prefixed frame:
