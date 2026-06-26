@@ -86,9 +86,15 @@ run_variant() {
     docker rm -f "$cname" >/dev/null; return 1
   fi
 
-  echo "--- loadgen: workers=$WORKERS rate=$RATE batch=$BATCH dur=${DUR}s ---"
+  # CONNS (optional): cap the client connection pool below WORKERS to exercise
+  # per-connection request pipelining — the workers then share CONNS connections
+  # with WORKERS/CONNS requests in flight on each. Pair with a server config that
+  # sets `pipeline_depth >= WORKERS/CONNS` (see bench-pipe16.toml) so the server
+  # actually dispatches them concurrently. Unset = one connection per worker.
+  echo "--- loadgen: workers=$WORKERS conns=${CONNS:-<=workers} rate=$RATE batch=$BATCH dur=${DUR}s ---"
   "$LOADGEN" --addr 127.0.0.1:${HOST_CLIENT_PORT} \
     --rate "$RATE" --workers "$WORKERS" --batch "$BATCH" --duration "$DUR" \
+    ${CONNS:+--conns "$CONNS"} \
     2>&1 | tee "$OUT/${name}_loadgen.txt"
 
   curl -sf "http://localhost:${HOST_HTTP_PORT}/metrics" > "$OUT/${name}_metrics.txt"
