@@ -162,6 +162,16 @@ pub fn spawn_checkpoint_task_with_reset_guard(
     shutdown: Arc<AtomicBool>,
     reset_guard: ResetGuard,
 ) -> JoinHandle<()> {
+    // Arm the redo backpressure gate SYNCHRONOUSLY, before the thread starts
+    // and before the caller begins serving. Arming inside the spawned loop
+    // races: a write burst that arrives between spawn and the loop's first
+    // iteration would hit an unarmed (no-op) gate and fill a small log to
+    // `LogFull` before the drain ever runs. Arming here makes "a drain exists"
+    // observable to the gate the instant this function returns.
+    engine
+        .redo_backpressure()
+        .unwrap_or_else(|| redo_log.lock().backpressure())
+        .arm();
     std::thread::Builder::new()
         .name("teraslab-checkpoint".to_string())
         .spawn(move || run_checkpoint_loop(config, engine, redo_log, shutdown, reset_guard))
@@ -215,6 +225,17 @@ fn run_checkpoint_loop(
     // caught before the log fills; poll slowly when the log is near-empty.
     let responsive_poll = config.poll_interval.min(Duration::from_millis(100));
 
+    // Shared backpressure coordinator (one across all per-store logs), already
+    // armed synchronously by the spawn helper. A starved appender wakes this
+    // task early via `park_drainer` AND forces an immediate BLOCKING drain.
+    // Falls back to the representative handle's own coordinator when no
+    // per-store logs are attached (test paths). `arm()` is idempotent; re-arm
+    // defensively in case the loop is driven directly (tests).
+    let backpressure = engine
+        .redo_backpressure()
+        .unwrap_or_else(|| redo_log.lock().backpressure());
+    backpressure.arm();
+
     let mut backoff = Duration::ZERO;
     let mut last_usage = 0.0_f64;
     // After a FUZZY checkpoint that fails to drain below high_water — it can
@@ -233,7 +254,11 @@ fn run_checkpoint_loop(
         } else {
             config.poll_interval
         };
-        if !sleep_with_shutdown(poll + backoff, &shutdown, responsive_poll) {
+        // Park on the backpressure handle instead of a blind sleep: a starved
+        // appender wakes us immediately (and `blocked_appenders > 0` is checked
+        // inside), so a write burst that fills the log triggers a drain within
+        // ~one slice rather than waiting out the full poll interval.
+        if !backpressure.park_drainer(poll + backoff, responsive_poll, &shutdown) {
             break;
         }
 
@@ -246,6 +271,10 @@ fn run_checkpoint_loop(
             redo_log.lock().usage_fraction()
         };
         last_usage = usage;
+        // A writer blocked on a full log must be released ASAP: drain now, and
+        // make it a BLOCKING drain (fuzzy only reclaims the pre-snapshot prefix
+        // and cannot keep pace with the burst that starved the writer).
+        let starved = backpressure.blocked_appenders() > 0;
 
         // Threshold-driven, no hysteresis latch. Single-flight is inherent
         // because `perform_checkpoint_*` runs synchronously in this loop, and
@@ -255,16 +284,18 @@ fn run_checkpoint_loop(
         // usage above low_water and never re-armed, so checkpoints stopped and
         // the redo grew to 100% / `LogFull` under sustained writes — the
         // regression this loop fixes.)
-        if usage < config.high_water {
+        if usage < config.high_water && !starved {
             escalate_blocking = false;
             continue;
         }
 
         // FUZZY by default (non-blocking serving). BLOCKING when the log has
-        // crossed the emergency mark, or when the previous fuzzy attempt could
-        // not drain it — a brief serving stall to fully reclaim, far better
-        // than letting appends fail with `LogFull`.
-        let blocking = usage >= emergency_water || escalate_blocking;
+        // crossed the emergency mark, when the previous fuzzy attempt could not
+        // drain it, or when an appender is already starved on a full log — a
+        // brief serving stall to fully reclaim, far better than letting appends
+        // fail with `LogFull` (which rejects a valid block and drops the sync
+        // peer).
+        let blocking = starved || usage >= emergency_water || escalate_blocking;
 
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_triggered_total.inc();
@@ -274,6 +305,7 @@ fn run_checkpoint_loop(
             high_water = config.high_water,
             emergency_high_water = emergency_water,
             blocking,
+            starved,
             "redo log above high-water — checkpointing",
         );
 
@@ -313,6 +345,19 @@ fn run_checkpoint_loop(
                     checkpoint_duration_ms = stats.checkpoint_duration_ms,
                     "checkpoint complete",
                 );
+                // Replica-lag guard: if this drain reclaimed nothing (e.g. the
+                // reset guard is holding entries for a lagging replica) but an
+                // appender is starved, throttle. Otherwise `park_drainer`
+                // returns instantly on `blocked > 0` and we would spin full
+                // snapshots that free no space. The gate's own safety-valve
+                // timeout bounds the stall; this just caps the snapshot rate
+                // while the log genuinely cannot be reclaimed.
+                if !stats.reset_performed
+                    && backpressure.blocked_appenders() > 0
+                    && !shutdown.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(responsive_poll);
+                }
             }
             Err(e) => {
                 if let Some(m) = crate::metrics::redo_metrics() {
@@ -345,30 +390,6 @@ fn next_backoff(current: Duration, config: &CheckpointConfig) -> Duration {
     } else {
         next
     }
-}
-
-/// Sleep up to `total` in `slice`-sized chunks, returning early if
-/// `shutdown` is set. Returns `false` if shutdown was observed
-/// (caller should exit), `true` if the full duration elapsed.
-fn sleep_with_shutdown(total: Duration, shutdown: &Arc<AtomicBool>, slice: Duration) -> bool {
-    if total.is_zero() {
-        return !shutdown.load(Ordering::Relaxed);
-    }
-    let slice = if slice.is_zero() {
-        total
-    } else {
-        slice.min(total)
-    };
-    let mut remaining = total;
-    while remaining > Duration::ZERO {
-        if shutdown.load(Ordering::Relaxed) {
-            return false;
-        }
-        let step = remaining.min(slice);
-        std::thread::sleep(step);
-        remaining = remaining.saturating_sub(step);
-    }
-    !shutdown.load(Ordering::Relaxed)
 }
 
 /// Result of a successful checkpoint, returned for logging.
@@ -637,6 +658,90 @@ mod tests {
         let log = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
         let redo = Arc::new(Mutex::new(log));
         (engine, redo, dir)
+    }
+
+    /// End-to-end: a live checkpoint task must keep a write burst that exceeds
+    /// the redo capacity flowing WITHOUT a single `LogFull`. The producer gates
+    /// before each append (mirroring the dispatch pre-barrier gate) via the
+    /// engine's shared coordinator; when it starves on a full log the
+    /// checkpoint task — armed at startup, woken via `park_drainer`, forced
+    /// blocking by `blocked_appenders > 0` — drains and frees space, and the
+    /// producer proceeds. Regression for block 269's
+    /// "redo log full: 1073737727/1073737728 bytes used" cascade.
+    #[test]
+    fn checkpoint_task_keeps_burst_flowing_without_logfull() {
+        use std::sync::atomic::AtomicU64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(264 * 1024, 4096).unwrap());
+        let log = RedoLog::open(redo_dev, 0, 264 * 1024).unwrap();
+        let capacity = log.capacity();
+        let redo = Arc::new(Mutex::new(log));
+        // Attach so the engine builds + injects the shared backpressure
+        // coordinator (the gate and the checkpoint loop both read it).
+        engine.set_redo_log(redo.clone());
+        let bp = engine
+            .redo_backpressure()
+            .expect("coordinator built on attach");
+
+        let mut cfg = CheckpointConfig::new(dir.path().join("burst.snap"));
+        cfg.high_water = 0.5;
+        cfg.low_water = 0.1;
+        cfg.emergency_high_water = 0.8;
+        cfg.poll_interval = Duration::from_millis(20);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = spawn_checkpoint_task(cfg, engine.clone(), redo.clone(), shutdown.clone());
+
+        let reserve = capacity / 4;
+        let payload = 2048usize;
+        let total_appends = (capacity / payload as u64 * 4) as usize;
+        let logfull = Arc::new(AtomicU64::new(0));
+
+        for i in 0..total_appends {
+            assert!(
+                bp.wait_for_capacity(reserve, Duration::from_secs(15)),
+                "gate must obtain capacity (checkpoint task alive)"
+            );
+            let mut log = redo.lock();
+            match log.append_and_flush(RedoOp::Create {
+                tx_key: crate::index::TxKey {
+                    txid: [(i % 251) as u8 + 1; 32],
+                },
+                device_id: 0,
+                record_offset: 4096,
+                utxo_count: 1,
+                is_conflicting: false,
+                record_bytes: vec![0xAB; payload],
+                parent_txids: Vec::new(),
+            }) {
+                Ok(_) => {}
+                Err(crate::redo::RedoError::LogFull { .. }) => {
+                    logfull.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => panic!("unexpected redo error: {e}"),
+            }
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert_eq!(
+            logfull.load(Ordering::Relaxed),
+            0,
+            "a live checkpoint task must keep a capacity-exceeding burst flowing without LogFull"
+        );
     }
 
     #[test]
@@ -1766,24 +1871,64 @@ mod tests {
         assert_eq!(b3, Duration::from_millis(400), "fourth → still capped");
     }
 
+    /// `park_drainer` replaces the old blind `sleep_with_shutdown`: it must
+    /// (a) report shutdown promptly, and (b) wake the drainer early the moment
+    /// an appender is starved on a full log, so the blocking reclaim that frees
+    /// the writer fires within ~one slice rather than after the full poll.
     #[test]
-    fn sleep_with_shutdown_returns_early_on_flag() {
+    fn park_drainer_reports_shutdown_and_wakes_on_starvation() {
+        use crate::redo::RedoLog;
+        use std::time::Instant;
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let log = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
+        let capacity = log.capacity();
+        let bp = log.backpressure();
+        bp.arm();
+
+        // (a) Shutdown observed within ~slice of being set.
         let shutdown = Arc::new(AtomicBool::new(false));
         let s2 = shutdown.clone();
-        let handle = std::thread::spawn(move || {
+        let flipper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             s2.store(true, Ordering::Relaxed);
         });
-        let start = std::time::Instant::now();
-        let finished_full =
-            sleep_with_shutdown(Duration::from_secs(5), &shutdown, Duration::from_millis(5));
+        let start = Instant::now();
+        let cont = bp.park_drainer(Duration::from_secs(5), Duration::from_millis(5), &shutdown);
         let elapsed = start.elapsed();
-        handle.join().unwrap();
-        assert!(!finished_full, "must report shutdown observed");
+        flipper.join().unwrap();
+        assert!(!cont, "park_drainer must report shutdown observed");
         assert!(
             elapsed < Duration::from_millis(500),
             "must return within ~slice of shutdown, took {elapsed:?}"
         );
+
+        // (b) A starved appender wakes the drainer early. Spawn a thread that
+        // blocks for more than the whole log (no reclaim ever comes, so it
+        // gives up after its own bound); while it is blocked, `park_drainer`
+        // with a long timeout must return promptly because `blocked > 0`.
+        let no_shutdown = Arc::new(AtomicBool::new(false));
+        let bp_waiter = bp.clone();
+        let waiter = std::thread::spawn(move || {
+            bp_waiter.wait_for_capacity(capacity + 1, Duration::from_millis(800));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        let cont = bp.park_drainer(
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+            &no_shutdown,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            cont,
+            "park_drainer must return continue=true when not shut down"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a starved appender must wake the drainer well before the 30s poll, took {elapsed:?}"
+        );
+        waiter.join().unwrap();
     }
 
     #[test]

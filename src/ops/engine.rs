@@ -222,6 +222,12 @@ pub struct Engine {
     /// attach a single representative handle; the per-store routing helpers
     /// fall back to [`Self::redo_log_handle`] in that case.
     redo_logs: std::sync::OnceLock<Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>>,
+    /// One shared redo backpressure coordinator across all per-store logs,
+    /// built and injected in [`Self::set_redo_logs`]. The dispatch gate
+    /// ([`crate::redo::RedoBackpressure::wait_for_capacity`]) and the
+    /// checkpoint drainer read it; each store's log signals it on reclaim.
+    /// `None` until redo logs are attached (test / no-WAL paths).
+    redo_backpressure: std::sync::OnceLock<Arc<crate::redo::RedoBackpressure>>,
     /// Append-only on-device deletion-tombstone log (deletion-tombstone
     /// Phase 3). When attached AND [`Self::tombstones_enabled`] is true, the
     /// physical-delete path appends a [`crate::tombstone::Tombstone`] here
@@ -495,6 +501,7 @@ impl Engine {
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_logs: std::sync::OnceLock::new(),
+            redo_backpressure: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
             // Default ON (design §11.5). A delete still writes no tombstone
@@ -566,9 +573,34 @@ impl Engine {
     /// route each redo entry to the owning store's log via the private
     /// `redo_log_for_device` helper.
     pub fn set_redo_logs(&self, logs: Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>) {
+        // Build ONE backpressure coordinator over every store's space mirror,
+        // and inject it into each log so any store's reclaim wakes every gated
+        // appender. The coordinator's free signal is the MIN across stores, so
+        // the dispatch gate only admits a mutation when every store has
+        // headroom (a create batch shards across stores and the gate runs
+        // before the payload names a store). Disarmed until the checkpoint
+        // task arms it — without a drain there is nothing to reclaim a full
+        // log, so the gate must not block.
+        if !logs.is_empty() {
+            let atomics: Vec<_> = logs.iter().map(|l| l.lock().atomics()).collect();
+            let bp = crate::redo::RedoBackpressure::new(atomics);
+            for l in &logs {
+                l.lock().set_backpressure(bp.clone());
+            }
+            let _ = self.redo_backpressure.set(bp);
+        }
         if self.redo_logs.set(logs).is_err() {
             tracing::warn!("engine per-store redo logs already attached; ignoring replacement");
         }
+    }
+
+    /// The shared redo backpressure coordinator across all per-store logs.
+    ///
+    /// `None` until redo logs have been attached via [`Self::set_redo_logs`]
+    /// (test / no-WAL paths). The dispatch backpressure gate and the checkpoint
+    /// drainer use this handle.
+    pub fn redo_backpressure(&self) -> Option<Arc<crate::redo::RedoBackpressure>> {
+        self.redo_backpressure.get().cloned()
     }
 
     /// The redo log owning store `device_id`, for secondary-index two-phase
