@@ -174,7 +174,28 @@ pub fn spawn_checkpoint_task_with_reset_guard(
         .arm();
     std::thread::Builder::new()
         .name("teraslab-checkpoint".to_string())
-        .spawn(move || run_checkpoint_loop(config, engine, redo_log, shutdown, reset_guard))
+        .spawn(move || {
+            // S-P2d: supervise the drain loop. A dead checkpoint thread is a
+            // P0-class condition — the redo log can no longer be reclaimed, so
+            // under load the backpressure gate stalls every mutation for its
+            // full `max_wait` and then they all fail with `LogFull`. Silently
+            // continuing with a dead drainer is worse than crashing. If the loop
+            // panics WITHOUT shutdown being requested, log fatal and abort so an
+            // orchestrator restarts a fresh node (recovery rebuilds from the
+            // durable redo) with a working drainer.
+            let shutdown_probe = shutdown.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_checkpoint_loop(config, engine, redo_log, shutdown, reset_guard)
+            }));
+            if result.is_err() && !shutdown_probe.load(Ordering::Relaxed) {
+                tracing::error!(
+                    "FATAL: redo checkpoint thread panicked while running; the redo log can \
+                     no longer be drained and writes will wedge. Aborting so the process is \
+                     restarted with a working drainer."
+                );
+                std::process::abort();
+            }
+        })
         .expect("spawn checkpoint thread")
 }
 
@@ -244,6 +265,14 @@ fn run_checkpoint_loop(
     // checkpoint to BLOCKING instead of spinning fuzzy snapshots that cannot
     // keep up. Reset once a checkpoint actually drains.
     let mut escalate_blocking = false;
+    // S-P2c: when the previous checkpoint reclaimed NOTHING (e.g. the reset
+    // guard is holding the redo prefix for a lagging replica), a blocking
+    // checkpoint would hold the exclusive visibility barrier across an O(index)
+    // snapshot that frees zero space — freezing client reads every iteration
+    // for no gain. While reclaim is stalled, stay on the FUZZY path (it samples
+    // the fence under the barrier only briefly, so reads keep flowing) which
+    // still probes the guard and reclaims the instant the replica catches up.
+    let mut reclaim_stalled = false;
 
     while !shutdown.load(Ordering::Relaxed) {
         // Adaptive poll: responsive while filling, lazy while idle. The
@@ -294,8 +323,10 @@ fn run_checkpoint_loop(
         // drain it, or when an appender is already starved on a full log — a
         // brief serving stall to fully reclaim, far better than letting appends
         // fail with `LogFull` (which rejects a valid block and drops the sync
-        // peer).
-        let blocking = starved || usage >= emergency_water || escalate_blocking;
+        // peer). EXCEPT when reclaim is stalled (S-P2c): a blocking checkpoint
+        // that can reclaim nothing only freezes reads, so fall back to fuzzy.
+        let blocking =
+            !reclaim_stalled && (starved || usage >= emergency_water || escalate_blocking);
 
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_triggered_total.inc();
@@ -345,14 +376,18 @@ fn run_checkpoint_loop(
                     checkpoint_duration_ms = stats.checkpoint_duration_ms,
                     "checkpoint complete",
                 );
+                // S-P2c: track whether reclaim is stalled (reclaimed nothing).
+                // While stalled, the next iterations stay fuzzy (above) so a
+                // blocking O(index) snapshot can't freeze reads for zero gain.
+                reclaim_stalled = !stats.reset_performed;
                 // Replica-lag guard: if this drain reclaimed nothing (e.g. the
                 // reset guard is holding entries for a lagging replica) but an
                 // appender is starved, throttle. Otherwise `park_drainer`
-                // returns instantly on `blocked > 0` and we would spin full
+                // returns instantly on `blocked > 0` and we would spin fuzzy
                 // snapshots that free no space. The gate's own safety-valve
                 // timeout bounds the stall; this just caps the snapshot rate
                 // while the log genuinely cannot be reclaimed.
-                if !stats.reset_performed
+                if reclaim_stalled
                     && backpressure.blocked_appenders() > 0
                     && !shutdown.load(Ordering::Relaxed)
                 {
@@ -372,6 +407,18 @@ fn run_checkpoint_loop(
                     next_backoff_ms = backoff.as_millis() as u64,
                     "checkpoint failed",
                 );
+                // S-P2b: honor the exponential back-off NOW, in shutdown-aware
+                // slices. `park_drainer` short-circuits on `blocked > 0`, so a
+                // starved appender against a persistently failing snapshot
+                // device would otherwise spin a tight retry storm (back-to-back
+                // failing O(index) checkpoints). The gate's own `max_wait`
+                // safety valve still releases the appender meanwhile.
+                let mut remaining = backoff;
+                while remaining > Duration::ZERO && !shutdown.load(Ordering::Relaxed) {
+                    let step = responsive_poll.min(remaining);
+                    std::thread::sleep(step);
+                    remaining = remaining.saturating_sub(step);
+                }
             }
         }
     }

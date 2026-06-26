@@ -4536,14 +4536,21 @@ fn needs_exclusive_visibility_barrier(op: u16) -> bool {
     is_mutation_opcode(op) || matches!(op, OP_REPLICA_BATCH)
 }
 
-/// Free-space headroom a mutation requires before it may proceed, as a
-/// fraction (1/N) of the per-store redo entries-region capacity. Chosen well
-/// above the checkpoint high-water mark so the gate engages only in an extreme
-/// burst the fuzzy/blocking checkpoints cannot keep pace with — steady-state
-/// mutations pass the lock-free fast path untouched. The reserve must
-/// comfortably exceed the redo footprint of all mutation requests in flight
-/// past the gate at once; with the exclusive barrier serialising appends this
-/// leaves ample slack.
+/// Free-space headroom (PHYSICAL forward room — see
+/// [`crate::redo::RedoAtomics::available_space`]) a mutation requires before it
+/// may proceed, as a fraction (1/N) of the per-store redo entries-region
+/// capacity. Chosen above the checkpoint high-water mark so the gate engages
+/// only in an extreme burst the fuzzy/blocking checkpoints cannot keep pace
+/// with — steady-state mutations pass the lock-free fast path untouched.
+///
+/// This is a SOFT admission gate sized for the common case, not a hard
+/// guarantee that every admitted batch fits: a single oversized request (e.g.
+/// fat cold-data) can exceed the reserve, and several requests can pass on one
+/// free-space snapshot before serialising on the exclusive barrier. The HARD
+/// safety net is the per-store `would_fit` pre-flight in
+/// [`crate::ops::engine::Engine::append_redo_ops_routed`], which rejects an
+/// over-capacity batch CLEANLY (`ERR_STORAGE` + reservation rollback) instead
+/// of poisoning/bricking the store's log.
 const REDO_BACKPRESSURE_RESERVE_DIVISOR: u64 = 8;
 
 /// Upper bound on how long the gate stalls before giving up and letting the
@@ -21906,8 +21913,9 @@ mod tests {
                 txid[0] = 0xD0;
                 txid[1] = batch_tag;
                 txid[2] = k as u8;
-                // Vary low bytes so records shard across stores (multi-store
-                // placement hashes the txid).
+                // Distinct txids per item. (Placement is round-robin, not
+                // txid-hashed, so it spreads records across stores regardless;
+                // uniqueness here just keeps the index entries distinct.)
                 txid[31] = (batch_tag).wrapping_mul(31).wrapping_add(k as u8);
                 WireCreateItem {
                     txid,
@@ -21977,10 +21985,11 @@ mod tests {
             UnminedIndex::new(),
         ));
         // 512 KiB log → gate reserve = capacity/8 ≈ 63 KiB, comfortably above a
-        // single batch's worst-case footprint (~20 KiB if all 8 creates cluster
-        // on the store), so an admitted batch always fits — the invariant the
-        // gate relies on (production's 1 GiB log gives a 128 MiB reserve that
-        // dwarfs any realistic batch).
+        // single batch's footprint here (~20 KiB if all 8 creates cluster on
+        // the store), so the gate stalls the burst rather than over-admitting.
+        // (Production default is a 64 MiB log → 8 MiB reserve; a batch larger
+        // than the reserve is caught CLEANLY by the would_fit pre-flight in
+        // append_redo_ops_routed, not bricked.)
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(512 * 1024, 4096).unwrap());
         let redo_log = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 512 * 1024).unwrap()));
         engine.set_redo_log(redo_log.clone());

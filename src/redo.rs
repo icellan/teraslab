@@ -1898,7 +1898,6 @@ impl RedoEntry {
 #[derive(Debug)]
 pub struct RedoAtomics {
     write_pos: AtomicU64,
-    logical_start: AtomicU64,
     entries_region_size: u64, // immutable after open
 }
 
@@ -1908,11 +1907,23 @@ impl RedoAtomics {
         self.write_pos.load(AtomicOrdering::Relaxed)
     }
 
-    /// Bytes available for new entries (mirrors `RedoLog::available_space`).
+    /// Bytes available for a NEW forward append — `entries_region_size −
+    /// write_pos` — mirroring [`RedoLog::available_space`] and the forward
+    /// `LogFull` predicate `append` enforces (`write_pos + buffer + bytes >
+    /// entries_region_size`).
+    ///
+    /// This is the PHYSICAL forward headroom, not logical free space. The redo
+    /// log is linear: `write_pos` advances monotonically toward the region end
+    /// and an append fails when it would cross the end, regardless of how much
+    /// of the `[0, logical_start)` prefix a compaction has logically reclaimed
+    /// (that prefix is only returned to forward use by a `reset` / front-gap
+    /// relocation, both of which rewind `write_pos`). Subtracting
+    /// `logical_start` here (the prior bug) over-reported headroom after a
+    /// past-tail fuzzy compaction, so the backpressure gate admitted bursts
+    /// that then hit `LogFull` — the failure this gate exists to prevent.
     pub fn available_space(&self) -> u64 {
-        let used = self.write_pos.load(AtomicOrdering::Relaxed)
-            - self.logical_start.load(AtomicOrdering::Relaxed);
-        self.entries_region_size.saturating_sub(used)
+        self.entries_region_size
+            .saturating_sub(self.write_pos.load(AtomicOrdering::Relaxed))
     }
 
     /// Total entries-region capacity in bytes (mirrors [`RedoLog::capacity`]).
@@ -1962,8 +1973,13 @@ pub struct RedoBackpressure {
     /// Lock-free space mirrors of the stores this coordinator covers. The free
     /// signal is the MINIMUM available across them.
     atomics: Vec<Arc<RedoAtomics>>,
-    /// Guards the generation counters; paired with both condvars.
-    state: PlMutex<BackpressureState>,
+    /// Mutex paired with both condvars below — held by waiters across the
+    /// predicate re-check so a `notify_all` can never land in the gap between
+    /// check and park (lost-wakeup-free). Guards no data: the authoritative
+    /// free-space read is the lock-free [`RedoAtomics`] and the starvation
+    /// signal is the `blocked` atomic, so there are no generation counters to
+    /// protect.
+    state: PlMutex<()>,
     /// Notified after a reclaim frees space — wakes gated appenders.
     space_freed: Condvar,
     /// Notified when an appender starts waiting on a full log — wakes the
@@ -1975,15 +1991,6 @@ pub struct RedoBackpressure {
     blocked: AtomicUsize,
     /// Whether a drain task is running. The gate blocks only when armed.
     armed: AtomicBool,
-}
-
-#[derive(Default)]
-struct BackpressureState {
-    /// Bumped on every reclaim. Held only to give the condvars a mutex; the
-    /// authoritative free-space read is the lock-free [`RedoAtomics`].
-    reclaim_gen: u64,
-    /// Bumped whenever an appender requests a drain.
-    drain_gen: u64,
 }
 
 impl std::fmt::Debug for RedoBackpressure {
@@ -2001,7 +2008,7 @@ impl RedoBackpressure {
     pub(crate) fn new(atomics: Vec<Arc<RedoAtomics>>) -> Arc<Self> {
         Arc::new(Self {
             atomics,
-            state: PlMutex::new(BackpressureState::default()),
+            state: PlMutex::new(()),
             space_freed: Condvar::new(),
             drain_wanted: Condvar::new(),
             blocked: AtomicUsize::new(0),
@@ -2045,19 +2052,17 @@ impl RedoBackpressure {
     /// store's reclaim paths ([`RedoLog::reset`] /
     /// [`RedoLog::compact_prefix_through`]).
     pub fn note_reclaim(&self) {
-        {
-            let mut s = self.state.lock();
-            s.reclaim_gen = s.reclaim_gen.wrapping_add(1);
-        }
+        // Take+drop the paired mutex so a waiter mid-predicate-recheck cannot
+        // miss this wake (it re-checks `available_space` under this same lock
+        // before parking). The freed space is already published to the atomics
+        // by the caller's `publish_atomics` before this runs.
+        drop(self.state.lock());
         self.space_freed.notify_all();
     }
 
     /// Ask the checkpoint thread to drain now, without waiting for its poll.
     fn request_drain(&self) {
-        {
-            let mut s = self.state.lock();
-            s.drain_gen = s.drain_gen.wrapping_add(1);
-        }
+        drop(self.state.lock());
         self.drain_wanted.notify_all();
     }
 
@@ -2079,29 +2084,31 @@ impl RedoBackpressure {
         }
 
         const SLICE: Duration = Duration::from_millis(50);
+        // Absolute wall-clock deadline so the safety valve fires at ~max_wait
+        // regardless of how many non-timeout (reclaim) wakes interleave — a
+        // `waited`-accumulator that only advances on timed-out slices could run
+        // 1.5-2x over under reclaim churn.
+        let deadline = Instant::now() + max_wait;
         self.blocked.fetch_add(1, AtomicOrdering::SeqCst);
         // Kick the drainer immediately — an appender is now starved.
         self.request_drain();
 
-        let mut waited = Duration::ZERO;
         let mut guard = self.state.lock();
         let result = loop {
             if self.available_space() >= reserve {
                 break true;
             }
-            if waited >= max_wait {
+            let now = Instant::now();
+            if now >= deadline {
                 break false;
             }
             // Re-assert the drain request each slice (the previous one may have
             // raced a checkpoint that finished a non-draining fuzzy pass).
-            guard.drain_gen = guard.drain_gen.wrapping_add(1);
             self.drain_wanted.notify_all();
-            let slice = SLICE.min(max_wait - waited);
-            let outcome = self.space_freed.wait_for(&mut guard, slice);
-            if outcome.timed_out() {
-                waited = waited.saturating_add(slice);
-            }
-            // A non-timeout wake means a reclaim landed; loop re-checks.
+            let slice = SLICE.min(deadline - now);
+            // A non-timeout wake means a reclaim landed; loop re-checks the
+            // predicate under this lock (lost-wakeup-free).
+            self.space_freed.wait_for(&mut guard, slice);
         };
         drop(guard);
         self.blocked.fetch_sub(1, AtomicOrdering::SeqCst);
@@ -2290,7 +2297,6 @@ impl RedoLog {
             poisoned: false,
             atomics: Arc::new(RedoAtomics {
                 write_pos: AtomicU64::new(0),
-                logical_start: AtomicU64::new(0),
                 entries_region_size: log_size - header_block_size,
             }),
             shared_seq: None,
@@ -2347,13 +2353,10 @@ impl RedoLog {
             log.write_header()?;
         }
 
-        // Sync recovered write_pos/logical_start into the lock-free atomics.
+        // Sync the recovered forward write position into the lock-free mirror.
         log.atomics
             .write_pos
             .store(log.write_pos, AtomicOrdering::Relaxed);
-        log.atomics
-            .logical_start
-            .store(log.logical_start, AtomicOrdering::Relaxed);
         Ok(log)
     }
 
@@ -2516,6 +2519,33 @@ impl RedoLog {
             self.buffered_entries += 1;
         }
         Ok(seq)
+    }
+
+    /// Whether appending ALL of `ops` would fit in the current forward
+    /// headroom (no mutation, no sequence drawn).
+    ///
+    /// The per-store routed write ([`crate::ops::engine::Engine::append_redo_ops_routed`])
+    /// calls this BEFORE appending a batch so an oversized batch is rejected
+    /// CLEANLY — return `LogFull`, append nothing — instead of appending a
+    /// partial batch and then hitting the per-op `LogFull` mid-way, which
+    /// forces `poison()` (bricking the store's log until restart) because the
+    /// already-buffered ops carry consumed global sequences that must never
+    /// flush. Entry byte length is independent of the sequence value (fixed
+    /// 8-byte field), so a seq-0 dry serialize measures the real footprint.
+    pub fn would_fit(&self, ops: &[&RedoOp]) -> bool {
+        if self.poisoned {
+            return false;
+        }
+        let mut needed = self.write_pos + self.buffer.len() as u64;
+        for op in ops {
+            needed += RedoEntry {
+                sequence: 0,
+                op: (*op).clone(),
+            }
+            .serialize()
+            .len() as u64;
+        }
+        needed <= self.entries_region_size()
     }
 
     /// Flush the buffer to device, making all appended entries durable.
@@ -2809,6 +2839,13 @@ impl RedoLog {
         self.write_pos + self.buffer.len() as u64
     }
 
+    /// Test-only: the live-window start offset, for asserting a compaction took
+    /// the past-tail relocation branch (`logical_start > 0`).
+    #[cfg(test)]
+    pub(crate) fn logical_start_for_test(&self) -> u64 {
+        self.logical_start
+    }
+
     /// Space remaining in the entries region.
     pub fn available_space(&self) -> u64 {
         self.entries_region_size()
@@ -2841,9 +2878,6 @@ impl RedoLog {
         self.atomics
             .write_pos
             .store(self.write_pos, AtomicOrdering::Relaxed);
-        self.atomics
-            .logical_start
-            .store(self.logical_start, AtomicOrdering::Relaxed);
     }
 
     /// A cheap clonable handle to the lock-free space accounting.
@@ -3460,7 +3494,16 @@ mod tests {
             })
         };
 
-        std::thread::sleep(Duration::from_millis(50));
+        // Spin (not a fixed sleep) until the waiter registers as blocked —
+        // deterministic under load, no thread-startup race.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while bp.blocked_appenders() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiter never blocked on the full log"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(
             bp.blocked_appenders(),
             1,
@@ -3501,6 +3544,85 @@ mod tests {
             "unarmed gate must not block"
         );
         assert_eq!(bp.blocked_appenders(), 0);
+    }
+
+    /// S-P0 regression: the gate's free-space metric must be PHYSICAL forward
+    /// room (`capacity - write_pos`), matching the forward `LogFull` predicate
+    /// the append actually enforces — NOT logical free (`capacity - live`).
+    /// After a past-tail `compact_prefix_through`, `logical_start` jumps to the
+    /// old tail while `write_pos` stays near the physical end: a logical metric
+    /// reports the log nearly empty and the gate over-admits into `LogFull`,
+    /// which is the exact burst failure this branch exists to prevent.
+    #[test]
+    fn backpressure_available_space_is_physical_forward_room() {
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(dev, 0, 132 * 1024).unwrap();
+        let capacity = log.capacity();
+
+        // Fill past 60% so a past-tail relocation still fits beyond the tail.
+        while log.available_space() > capacity * 2 / 5 {
+            log.append_and_flush(fat_create(3, 2048)).unwrap();
+        }
+        // Retain only the final entry, forcing a past-tail relocation (not an
+        // empty-set reset): `logical_start` advances to the old tail.
+        let fence = log.current_sequence().saturating_sub(2);
+        log.compact_prefix_through(fence).unwrap();
+
+        let forward = capacity.saturating_sub(log.write_position());
+        assert!(
+            log.logical_start_for_test() > 0,
+            "test must exercise a past-tail relocation (logical_start advanced)"
+        );
+        let bp = log.backpressure();
+        assert_eq!(
+            bp.available_space(),
+            forward,
+            "coordinator must report PHYSICAL forward room (capacity - write_pos), \
+             not logical free space",
+        );
+        assert!(
+            bp.available_space() < capacity / 2,
+            "after near-full fill + compaction the gate must see the log is \
+             nearly physically full (forward room small), not nearly empty",
+        );
+    }
+
+    /// U-P2-2 regression: the `max_wait` timeout-degrade contract. An armed
+    /// gate with a never-satisfied reserve must return `false` after ~`max_wait`
+    /// (degrade to the caller's `LogFull` fallback) and leave `blocked` back at
+    /// 0 — the safety valve the PR relies on, previously only executed (by the
+    /// `park_drainer` test) but never asserted.
+    #[test]
+    fn backpressure_gate_times_out_and_degrades() {
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let log = RedoLog::open(dev, 0, 132 * 1024).unwrap();
+        let capacity = log.capacity();
+        let bp = log.backpressure();
+        bp.arm();
+
+        // Demand more than the whole log; no reclaim ever arrives.
+        let max_wait = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let ok = bp.wait_for_capacity(capacity + 1, max_wait);
+        let elapsed = start.elapsed();
+
+        assert!(
+            !ok,
+            "must return false on timeout (degrade to LogFull fallback)"
+        );
+        assert!(
+            elapsed >= max_wait,
+            "must actually wait out max_wait, not early-return: {elapsed:?}"
+        );
+        assert!(
+            elapsed < max_wait * 4,
+            "must fire near max_wait, not run far over: {elapsed:?}"
+        );
+        assert_eq!(
+            bp.blocked_appenders(),
+            0,
+            "blocked must be decremented back to 0 on the timeout path"
+        );
     }
 
     // -- Basic tests --
