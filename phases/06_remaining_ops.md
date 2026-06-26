@@ -140,7 +140,8 @@ Steps:
 3. Set `delete_at_height = 0`
 4. Set preserve_until = block_height
 5. Write metadata
-6. If external tx: signal PRESERVE
+6. Update the secondary indexes: remove any DAH-index entry (step 3 cleared `delete_at_height`) and insert/move the record into the preserve index (`src/index/preserve_index.rs`, spec §5.5.3) at `block_height`. A `block_height` of 0 (the replication-compensation undo) removes the preserve entry instead. The preserve index is what `OP_PROCESS_EXPIRED_PRESERVATIONS` range-queries to find expired records in O(expired) rather than scanning the whole primary index (issue #25).
+7. If external tx: signal PRESERVE
 
 ### 6.7 Record deletion / pruning — `src/ops/delete.rs`
 
@@ -157,7 +158,8 @@ Steps:
 4. Optionally: overwrite the magic number to invalidate the record on disk
 5. Free the allocation via `allocator.free(offset, size)`
 6. Remove from index
-7. Release lock
+7. Remove the txid from whichever secondary index holds it: the DAH index if `delete_at_height != 0`, or the preserve index if `preserve_until != 0` (the two are mutually exclusive). A preserved record carries no DAH entry, so the preserve removal is required or it leaks a dangling preserve-index entry.
+8. Release lock
 
 ### 6.8 GetSpend — `src/ops/get_spend.rs`
 
@@ -262,6 +264,10 @@ pub fn increment_spent_extra_recs_compat(/* ... */) -> Result<Response> {
 - [ ] Set preserveUntil: value stored, deleteAtHeight cleared
 - [ ] PreserveUntil blocks DAH evaluation on subsequent spend
 - [ ] External tx: signal PRESERVE returned
+- [x] PreserveUntil inserts into the preserve index; range_query at >= block_height returns the txid, and any prior DAH entry is evicted (mutual exclusion)
+- [x] PreserveUntil with block_height 0 removes the preserve-index entry
+- [x] Expired-preservation processing moves the record from the preserve index to the DAH index (range_query over the preserve index drives the sweep, O(expired))
+- [x] Preserve index re-derived from the primary index cache at boot matches the live preserved set
 ```
 
 ### Deletion tests
@@ -272,6 +278,7 @@ pub fn increment_spent_extra_recs_compat(/* ... */) -> Result<Response> {
 - [ ] Delete then allocate new record: can reuse freed space
 - [ ] Delete non-existent record: no-op or TxNotFound
 - [ ] Concurrent delete and spend on same tx: one succeeds, other gets TxNotFound
+- [x] Delete a preserved record: removed from the preserve index (no dangling entry)
 ```
 
 ### GetSpend tests

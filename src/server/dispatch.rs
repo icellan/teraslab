@@ -9331,16 +9331,18 @@ fn handle_process_expired(
     };
 
     // Phase 0 — expired-preservation processing (KO-1 / spec §3.18 Phase 3).
-    // Scan the primary index for records whose preservation has elapsed and
-    // schedule them for deletion (set DAH = current + retention, clear
-    // preserve_until). There is no dedicated preserve secondary index, so we
-    // use the cached HAS_PRESERVE_UNTIL discriminant + `dah_or_preserve`
-    // (which holds `preserve_until` when that bit is set) to filter the scan
-    // cheaply before reading device metadata. Each match is re-validated
-    // under the stripe lock inside `expire_preservation_set_dah`. Skipped
-    // entirely when retention is 0 (legacy 4-byte payload).
+    // Range-query the preserve secondary index for records whose preservation
+    // window has elapsed (preserve_until in [1, current_height]) and schedule
+    // them for deletion (set DAH = current + retention, clear preserve_until).
+    // This is O(expired), mirroring the Phase-2 DAH query
+    // (`dah_index().range_query`) below — it replaces the former
+    // O(index-size) primary-index walk that pinned a core during sync (#25).
+    // Each match is re-validated under the stripe lock inside
+    // `expire_preservation_set_dah`, so a preserve_until cleared or pushed
+    // forward since the query is handled correctly there. Skipped entirely
+    // when retention is 0 (legacy 4-byte payload).
     if block_height_retention != 0 {
-        let expired_candidates = engine.scan_expired_preservations(current_height);
+        let expired_candidates = engine.preserve_index().range_query(current_height);
         for key in &expired_candidates {
             // Ownership: only the master schedules expiry for its records.
             if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
@@ -11788,6 +11790,44 @@ mod tests {
             h.engine.lookup(&key).is_none(),
             "record gone after expiry + sweep (KO-1)"
         );
+    }
+
+    /// #25: the expiry sweep sources its candidates from the preserve
+    /// secondary index, NOT an O(index-size) primary walk. Proof: clear the
+    /// preserve index out from under a genuinely-preserved record; the sweep
+    /// then finds nothing to expire even though the on-device metadata still
+    /// says `preserve_until <= current`. A metadata scan would have found it.
+    #[test]
+    fn process_expired_sources_candidates_from_preserve_index() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(44);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+        assert_eq!(preserve_until(&h, txid, 100).status, STATUS_OK);
+        assert_eq!(
+            h.engine.preserve_index().range_query(100),
+            vec![key],
+            "preserve_until must populate the preserve index"
+        );
+
+        // Drop the index entry while the metadata stays preserved.
+        h.engine.preserve_index().clear().unwrap();
+
+        let resp = h.request(
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            process_expired_payload(100, 10),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(
+            deleted, 0,
+            "with the preserve index empty the sweep must find nothing — it \
+             does not fall back to an O(index) metadata scan"
+        );
+        // Metadata untouched: expiry never ran for this record.
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.preserve_until }, 100);
+        assert_eq!({ meta.delete_at_height }, 0);
     }
 
     /// Backward-compat: the legacy 4-byte payload (no retention) skips the
@@ -22629,7 +22669,7 @@ mod tests {
         );
 
         let hists = crate::metrics::ThreadHistograms::new();
-        let text = crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0);
+        let text = crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0, 0);
 
         // Every (op, outcome) cell must appear exactly once with matching value.
         let mut found_spend_ok = false;
