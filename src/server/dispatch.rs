@@ -6782,24 +6782,19 @@ fn handle_create_batch(
     // per-chunk fragments IN CHUNK ORDER so `repl_ops_by_key` matches serial.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let index_start = std::time::Instant::now();
-    // Acquire the per-key stripe writes for exactly the keys being registered,
-    // held ONLY across Phase 3. Combined with the `_global_vis` guard held above
-    // (global-before-stripes order preserved), this gives the same guarantees as
-    // the old whole-handler `mutation()` guard but holds the contended stripes
-    // for ~1ms (the apply) instead of ~13ms (apply + redo fsync + device write).
-    // Held on this thread across the parallel register below, so a read
-    // overlapping any batch key blocks until the WHOLE batch is registered
-    // (batch-atomic). Dropped before Phase 4 replication (no stripes across
-    // network I/O).
-    let stripe_vis = {
-        let keys: Vec<TxKey> = valid_items
-            .iter()
-            .map(|v| TxKey {
-                txid: v.create_req.tx_id,
-            })
-            .collect();
-        engine.visibility().mutation_stripes(&keys)
-    };
+    // No per-key visibility stripes on the create path. A create is a single
+    // atomic index insert of an already-device-written record: a concurrent
+    // reader of the key sees it either present (post-register, record already on
+    // device from Phase 2b) or absent (pre-register) — never torn — because
+    // `register_create_at_offset` and the reader's lookup take the same per-key
+    // index lock. Unlike spend/set_mined (read-modify-write, which DO need the
+    // stripe write-lock to hide a half-updated record), a create has no
+    // intermediate visible state to protect. The old whole-handler / Phase-3
+    // stripe guard was therefore pure contention: at high pipelined concurrency
+    // every create grabbed ~256 of 65536 stripes and held them across its own
+    // (contended) register, serializing stripe-overlapping creates on each
+    // other's register time. Checkpoint quiescence + the issue-#14 un-journaled-
+    // reservation window are still covered by the `_global_vis` guard above.
     if !valid_items.is_empty() {
         let max_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -6845,8 +6840,6 @@ fn handle_create_batch(
             }
         }
     }
-    // Phase 3 complete — release the per-key stripes before Phase 4's network I/O.
-    drop(stripe_vis);
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
         h.create_index_latency.record_since(index_start);
     }
