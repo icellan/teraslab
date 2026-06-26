@@ -6102,18 +6102,24 @@ fn handle_create_batch(
         m.creates_attempted.inc_by(items.len() as u64);
     }
 
-    // Per-key visibility over this batch's (new) keys for the apply window.
-    // Creates on disjoint keys run concurrently; a client read of a key being
-    // created is excluded until it is applied. Held for the handler (incl. the
-    // replication RTT) — a deliberate simplification vs spend/set_mined's
-    // early-release, since create's multi-path rollback makes a precise early
-    // drop fragile; it only delays a checkpoint or a read of these brand-new
-    // keys, never other mutations/reads (they take the global shared side).
+    // Hold ONLY the global (checkpoint-quiescence) side of the visibility
+    // barrier for the whole handler. This is the issue-#14 guarantee: a
+    // checkpoint cannot persist the allocator header while a reservation is in
+    // memory but its `AllocateRegion` redo is not yet durable (Phases 1b–2). The
+    // global side is SHARED, so concurrent creates never contend on it.
+    //
+    // The contended part — the per-key stripe WRITES that give a reader its
+    // batch-atomic view — is taken separately and held only around Phase 3 (the
+    // index registration, which is the moment a created key becomes reader-
+    // visible). Previously the combined `mutation()` guard held those stripes for
+    // the ENTIRE handler, so two creates sharing any one of their up-to-256
+    // stripes serialized on each other's multi-ms redo fsync + device writes
+    // (measured: ~50% of create latency was just acquiring this guard). Narrowing
+    // the stripe hold to Phase 3 lets stripe-overlapping creates pipeline through
+    // the I/O stages. Reads landing before Phase 3 correctly see "not found"
+    // (the key is not yet in the index), preserving batch-atomic visibility.
     let vis_start = std::time::Instant::now();
-    let _visibility_guard = {
-        let keys: Vec<TxKey> = items.iter().map(|it| TxKey { txid: it.txid }).collect();
-        engine.visibility().mutation(&keys)
-    };
+    let _global_vis = engine.visibility().global_read();
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
         h.create_vis_latency.record_since(vis_start);
     }
@@ -6776,6 +6782,24 @@ fn handle_create_batch(
     // per-chunk fragments IN CHUNK ORDER so `repl_ops_by_key` matches serial.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let index_start = std::time::Instant::now();
+    // Acquire the per-key stripe writes for exactly the keys being registered,
+    // held ONLY across Phase 3. Combined with the `_global_vis` guard held above
+    // (global-before-stripes order preserved), this gives the same guarantees as
+    // the old whole-handler `mutation()` guard but holds the contended stripes
+    // for ~1ms (the apply) instead of ~13ms (apply + redo fsync + device write).
+    // Held on this thread across the parallel register below, so a read
+    // overlapping any batch key blocks until the WHOLE batch is registered
+    // (batch-atomic). Dropped before Phase 4 replication (no stripes across
+    // network I/O).
+    let stripe_vis = {
+        let keys: Vec<TxKey> = valid_items
+            .iter()
+            .map(|v| TxKey {
+                txid: v.create_req.tx_id,
+            })
+            .collect();
+        engine.visibility().mutation_stripes(&keys)
+    };
     if !valid_items.is_empty() {
         let max_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -6821,6 +6845,8 @@ fn handle_create_batch(
             }
         }
     }
+    // Phase 3 complete — release the per-key stripes before Phase 4's network I/O.
+    drop(stripe_vis);
     if let Some(h) = DISPATCH_HISTOGRAMS.get() {
         h.create_index_latency.record_since(index_start);
     }

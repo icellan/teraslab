@@ -56,6 +56,15 @@ pub struct ReadVisibility<'a> {
     _stripes: Vec<RwLockReadGuard<'a, ()>>,
 }
 
+/// RAII guard holding ONLY the per-key WRITE stripes for a mutation, without the
+/// global side. Acquired via [`VisibilityBarrier::mutation_stripes`] by a caller
+/// that already holds [`VisibilityBarrier::global_read`] for a wider window, so
+/// the contended per-key locks can be held for a much shorter one (e.g. only the
+/// reader-visible apply) than the global quiescence guard.
+pub struct MutationStripes<'a> {
+    _stripes: Vec<RwLockWriteGuard<'a, ()>>,
+}
+
 /// RAII guard for a checkpoint: the global EXCLUSIVE guard, which excludes every
 /// mutation and read (both hold the global shared side).
 pub struct CheckpointVisibility<'a> {
@@ -108,6 +117,26 @@ impl VisibilityBarrier {
             _global: global,
             _stripes: stripes,
         }
+    }
+
+    /// Acquire ONLY the per-key WRITE stripes for `keys` (no global side).
+    ///
+    /// For a caller that already holds [`Self::global_read`] over a wider window
+    /// and wants to hold the contended per-key locks for a narrower one. The
+    /// stripes are taken in sorted/deduped order, identical to [`Self::mutation`],
+    /// so the global-before-stripes lock order is preserved as long as the
+    /// caller acquired its `global_read` guard first.
+    ///
+    /// SAFETY OF VISIBILITY CONTRACT: the caller is responsible for holding a
+    /// [`Self::global_read`] guard for as long as checkpoint quiescence is
+    /// required; this method alone does NOT exclude a checkpoint.
+    pub fn mutation_stripes(&self, keys: &[TxKey]) -> MutationStripes<'_> {
+        let stripes = self
+            .unique_sorted_stripes(keys)
+            .into_iter()
+            .map(|i| self.stripes[i].write())
+            .collect();
+        MutationStripes { _stripes: stripes }
     }
 
     /// Acquire read visibility for `keys`: global SHARED + per-key READ. Reads
@@ -264,6 +293,92 @@ mod tests {
             acquired.load(Ordering::SeqCst),
             "mutation proceeds after checkpoint"
         );
+    }
+
+    #[test]
+    fn mutation_stripes_excludes_read_of_same_key() {
+        // The stripes-only acquisition still write-locks the per-key stripes, so
+        // a read of the same key is excluded until it releases — identical
+        // per-key behavior to `mutation`, just without the global side.
+        let b = VisibilityBarrier::new(65536);
+        let k = key(42);
+        let started = Arc::new(AtomicBool::new(false));
+        let acquired = Arc::new(AtomicBool::new(false));
+
+        let g = b.mutation_stripes(&[k]);
+
+        let b2 = b.clone();
+        let started2 = started.clone();
+        let acquired2 = acquired.clone();
+        let handle = std::thread::spawn(move || {
+            started2.store(true, Ordering::SeqCst);
+            let _r = b2.read(&[key(42)]); // same stripe -> must block on the write
+            acquired2.store(true, Ordering::SeqCst);
+        });
+
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "read of the same key must NOT acquire while the stripe write is held"
+        );
+        drop(g);
+        handle.join().unwrap();
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "read must acquire once the stripe write releases"
+        );
+    }
+
+    #[test]
+    fn mutation_stripes_does_not_take_the_global_side() {
+        // The whole point of splitting the guard: stripes-only must NOT hold the
+        // global side, so a caller can hold `global_read()` for a long window
+        // (issue-#14 checkpoint quiescence) while taking and releasing the
+        // contended per-key stripes for a much shorter one. A checkpoint
+        // (global EXCLUSIVE) must still acquire while only stripes are held.
+        let b = VisibilityBarrier::new(65536);
+        let _s = b.mutation_stripes(&[key(1)]);
+        let acquired = Arc::new(AtomicBool::new(false));
+        let b2 = b.clone();
+        let acquired2 = acquired.clone();
+        let h = std::thread::spawn(move || {
+            let _cp = b2.checkpoint(); // global.write(); blocks only on the global side
+            acquired2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "checkpoint must acquire while only per-key stripes (not global) are held"
+        );
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn global_read_plus_stripes_equals_mutation_against_checkpoint() {
+        // Composition check: holding `global_read()` blocks a checkpoint exactly
+        // like `mutation()` does — the global side is what excludes the
+        // checkpoint, and stripes-only does not, so the create path must keep
+        // the global guard for its quiescence window.
+        let b = VisibilityBarrier::new(65536);
+        let _g = b.global_read();
+        let acquired = Arc::new(AtomicBool::new(false));
+        let b2 = b.clone();
+        let acquired2 = acquired.clone();
+        let h = std::thread::spawn(move || {
+            let _cp = b2.checkpoint();
+            acquired2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "checkpoint must be excluded while a global_read guard is held"
+        );
+        drop(_g);
+        h.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]
