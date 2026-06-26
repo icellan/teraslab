@@ -14,13 +14,15 @@
 //! `server::dispatch::send_replica_ops_to`), which keeps both sides
 //! consistent across restarts by construction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use parking_lot::Mutex;
+
+use crate::index::TxKey;
 
 fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
@@ -337,7 +339,11 @@ pub struct ReplicationIntentTracker {
 
 #[derive(Debug)]
 struct ReplicationIntentInner {
-    pending: BTreeSet<ReplicationIntentRange>,
+    /// Each pending range carries the EXACT key set of the RPC that recorded
+    /// it. Recovery replays only those keys from the merged redo window, so a
+    /// foreign op whose sequence interleaved into the range is never re-shipped
+    /// (the latent wrong-apply vector when a `ReplicaOp` is non-idempotent).
+    pending: BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
     commit_dirty: bool,
     last_flush: Instant,
     dirty_commit_count: u32,
@@ -362,7 +368,7 @@ impl ReplicationIntentTracker {
         Self {
             path: PathBuf::new(),
             inner: Mutex::new(ReplicationIntentInner {
-                pending: BTreeSet::new(),
+                pending: BTreeMap::new(),
                 commit_dirty: false,
                 last_flush: Instant::now(),
                 dirty_commit_count: 0,
@@ -370,20 +376,49 @@ impl ReplicationIntentTracker {
         }
     }
 
+    /// Record a pending replication intent for the redo range
+    /// `[first_sequence, last_sequence]` together with the EXACT key set
+    /// (`keys`) of the RPC that produced it.
+    ///
+    /// Duplicate keys are removed before storage. An empty `keys` slice is
+    /// still recorded (the range is preserved); recovery commits it as a no-op
+    /// since there is nothing keyed to replay. Invalid ranges
+    /// (`first_sequence == 0` or `last_sequence < first_sequence`) are ignored,
+    /// matching the prior contract.
+    ///
+    /// On a real (non-empty path) tracker the new pending set is written
+    /// durably before returning. Errors surface I/O failures from that write.
     pub fn begin(
         &self,
         first_sequence: u64,
         last_sequence: u64,
+        keys: &[TxKey],
     ) -> std::result::Result<(), ReplicationIntentError> {
         if first_sequence == 0 || last_sequence < first_sequence {
             return Ok(());
         }
-        let mut inner = self.inner.lock();
-        let changed = inner.pending.insert(ReplicationIntentRange {
+        let range = ReplicationIntentRange {
             first_sequence,
             last_sequence,
-        });
+        };
+        let mut deduped: Vec<TxKey> = Vec::with_capacity(keys.len());
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for key in keys {
+            if seen.insert(key.txid) {
+                deduped.push(*key);
+            }
+        }
+        let mut inner = self.inner.lock();
+        // Re-recording an identical range overwrites its key set: a begin for a
+        // range already pending is idempotent in identity but the caller's key
+        // set is authoritative. (Ranges are globally-unique per RPC in
+        // practice; this keeps semantics defined if a range ever repeats.)
+        let changed = match inner.pending.get(&range) {
+            Some(existing) => existing != &deduped,
+            None => true,
+        };
         if changed {
+            inner.pending.insert(range, deduped);
             self.write_locked(&inner.pending)?;
             inner.commit_dirty = false;
             inner.dirty_commit_count = 0;
@@ -401,10 +436,13 @@ impl ReplicationIntentTracker {
             return Ok(());
         }
         let mut inner = self.inner.lock();
-        let changed = inner.pending.remove(&ReplicationIntentRange {
-            first_sequence,
-            last_sequence,
-        });
+        let changed = inner
+            .pending
+            .remove(&ReplicationIntentRange {
+                first_sequence,
+                last_sequence,
+            })
+            .is_some();
         if changed {
             if self.path.as_os_str().is_empty() {
                 return Ok(());
@@ -421,9 +459,24 @@ impl ReplicationIntentTracker {
         Ok(())
     }
 
+    /// Snapshot of the pending ranges (without their key sets) in ascending
+    /// order. Retained for back-compat / diagnostics; recovery uses
+    /// [`pending_with_keys`](Self::pending_with_keys).
     pub fn pending(&self) -> Vec<ReplicationIntentRange> {
         let inner = self.inner.lock();
-        inner.pending.iter().copied().collect()
+        inner.pending.keys().copied().collect()
+    }
+
+    /// Snapshot of every pending range paired with the exact key set recorded
+    /// for it, in ascending range order. Recovery replays each range's redo
+    /// window filtered to these keys.
+    pub fn pending_with_keys(&self) -> Vec<(ReplicationIntentRange, Vec<TxKey>)> {
+        let inner = self.inner.lock();
+        inner
+            .pending
+            .iter()
+            .map(|(range, keys)| (*range, keys.clone()))
+            .collect()
     }
 
     pub fn flush(&self) -> std::result::Result<(), ReplicationIntentError> {
@@ -436,7 +489,7 @@ impl ReplicationIntentTracker {
 
     fn write_locked(
         &self,
-        pending: &BTreeSet<ReplicationIntentRange>,
+        pending: &BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
     ) -> std::result::Result<(), ReplicationIntentError> {
         if self.path.as_os_str().is_empty() {
             return Ok(());
@@ -455,43 +508,57 @@ impl ReplicationIntentTracker {
         Ok(())
     }
 
+    /// On-disk layout (no version field — nodes reset their intent file on
+    /// upgrade, so this format may change freely):
+    ///
+    /// ```text
+    /// [count:4 LE]
+    ///   ( [first:8 LE][last:8 LE][key_count:4 LE]
+    ///     [txid:32]{key_count} )*
+    /// ```
     fn write_to_disk(
         path: &Path,
-        pending: &BTreeSet<ReplicationIntentRange>,
+        pending: &BTreeMap<ReplicationIntentRange, Vec<TxKey>>,
     ) -> std::result::Result<(), ReplicationIntentError> {
-        let mut buf = Vec::with_capacity(4 + pending.len() * 16);
+        let total_keys: usize = pending.values().map(Vec::len).sum();
+        let mut buf = Vec::with_capacity(4 + pending.len() * 20 + total_keys * 32);
         buf.extend_from_slice(&(pending.len() as u32).to_le_bytes());
-        for range in pending {
+        for (range, keys) in pending {
             buf.extend_from_slice(&range.first_sequence.to_le_bytes());
             buf.extend_from_slice(&range.last_sequence.to_le_bytes());
+            buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+            for key in keys {
+                buf.extend_from_slice(&key.txid);
+            }
         }
         write_durable_file(path, &buf).map_err(ReplicationIntentError::Io)
     }
 
     fn read_from_disk(
         path: &Path,
-    ) -> std::result::Result<BTreeSet<ReplicationIntentRange>, ReplicationIntentError> {
+    ) -> std::result::Result<BTreeMap<ReplicationIntentRange, Vec<TxKey>>, ReplicationIntentError>
+    {
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeSet::new());
+                return Ok(BTreeMap::new());
             }
             Err(e) => return Err(ReplicationIntentError::Io(e)),
         };
         if data.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok(BTreeMap::new());
         }
         if data.len() < 4 {
             return Err(ReplicationIntentError::Corrupt("truncated header".into()));
         }
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        let expected = 4 + count * 16;
-        if data.len() < expected {
-            return Err(ReplicationIntentError::Corrupt("truncated ranges".into()));
-        }
-        let mut pending = BTreeSet::new();
+        let mut pending = BTreeMap::new();
         let mut pos = 4;
         for _ in 0..count {
+            // Fixed range + key-count header for this entry.
+            if pos + 20 > data.len() {
+                return Err(ReplicationIntentError::Corrupt("truncated ranges".into()));
+            }
             let first_sequence = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
             pos += 8;
             let last_sequence = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
@@ -501,10 +568,30 @@ impl ReplicationIntentTracker {
                     "invalid range {first_sequence}..{last_sequence}",
                 )));
             }
-            pending.insert(ReplicationIntentRange {
-                first_sequence,
-                last_sequence,
-            });
+            let key_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let keys_bytes = key_count
+                .checked_mul(32)
+                .ok_or_else(|| ReplicationIntentError::Corrupt("key count overflow".into()))?;
+            if pos + keys_bytes > data.len() {
+                return Err(ReplicationIntentError::Corrupt(
+                    "truncated intent keys".into(),
+                ));
+            }
+            let mut keys = Vec::with_capacity(key_count);
+            for _ in 0..key_count {
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[pos..pos + 32]);
+                pos += 32;
+                keys.push(TxKey { txid });
+            }
+            pending.insert(
+                ReplicationIntentRange {
+                    first_sequence,
+                    last_sequence,
+                },
+                keys,
+            );
         }
         Ok(pending)
     }
@@ -1381,9 +1468,9 @@ mod tests {
 
         {
             let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
-            tracker.begin(10, 12).unwrap();
-            tracker.begin(20, 20).unwrap();
-            tracker.begin(0, 2).unwrap();
+            tracker.begin(10, 12, &[]).unwrap();
+            tracker.begin(20, 20, &[]).unwrap();
+            tracker.begin(0, 2, &[]).unwrap();
             assert_eq!(
                 tracker.pending(),
                 vec![
@@ -1459,7 +1546,7 @@ mod tests {
 
         for i in 1..=INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD {
             let seq = u64::from(i);
-            tracker.begin(seq, seq).unwrap();
+            tracker.begin(seq, seq, &[]).unwrap();
         }
 
         for i in 1..INTENT_COMMIT_FLUSH_DIRTY_COUNT_THRESHOLD {
@@ -1488,9 +1575,9 @@ mod tests {
     fn replication_intent_tracker_begin_is_idempotent_and_commit_removes_range() {
         let tracker = ReplicationIntentTracker::in_memory();
 
-        tracker.begin(5, 7).unwrap();
-        tracker.begin(5, 7).unwrap();
-        tracker.begin(8, 7).unwrap();
+        tracker.begin(5, 7, &[]).unwrap();
+        tracker.begin(5, 7, &[]).unwrap();
+        tracker.begin(8, 7, &[]).unwrap();
         assert_eq!(
             tracker.pending(),
             vec![ReplicationIntentRange {
@@ -1510,7 +1597,7 @@ mod tests {
         let path = dir.path().join("missing").join("intent.dat");
         let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
 
-        tracker.begin(5, 7).unwrap();
+        tracker.begin(5, 7, &[]).unwrap();
 
         let reopened = ReplicationIntentTracker::load(path).unwrap();
         assert_eq!(
@@ -1528,7 +1615,7 @@ mod tests {
         let path = dir.path().join("intent.dat");
         let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
 
-        tracker.begin(5, 7).unwrap();
+        tracker.begin(5, 7, &[]).unwrap();
 
         assert!(path.exists());
         assert!(!durable_tmp_path(&path).exists());
@@ -1540,13 +1627,137 @@ mod tests {
         let path = dir.path().join("intent.dat");
         let mut data = Vec::new();
         data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&9u64.to_le_bytes());
-        data.extend_from_slice(&8u64.to_le_bytes());
+        data.extend_from_slice(&9u64.to_le_bytes()); // first
+        data.extend_from_slice(&8u64.to_le_bytes()); // last < first → invalid
+        data.extend_from_slice(&0u32.to_le_bytes()); // key_count
         std::fs::write(&path, data).unwrap();
 
         let err = ReplicationIntentTracker::load(path).expect_err("invalid range should reject");
         match err {
             ReplicationIntentError::Corrupt(msg) => assert!(msg.contains("invalid range")),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    fn intent_key(b: u8) -> TxKey {
+        TxKey { txid: [b; 32] }
+    }
+
+    #[test]
+    fn replication_intent_tracker_key_set_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let k_a = intent_key(0xAA);
+        let k_b = intent_key(0xBB);
+
+        {
+            let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+            // Range 10..12 owns two keys (with a duplicate to exercise dedup);
+            // range 20..20 owns one key.
+            tracker.begin(10, 12, &[k_a, k_b, k_a]).unwrap();
+            tracker.begin(20, 20, &[k_b]).unwrap();
+        }
+
+        let reopened = ReplicationIntentTracker::load(path.clone()).unwrap();
+        let with_keys = reopened.pending_with_keys();
+        assert_eq!(
+            with_keys,
+            vec![
+                (
+                    ReplicationIntentRange {
+                        first_sequence: 10,
+                        last_sequence: 12,
+                    },
+                    vec![k_a, k_b],
+                ),
+                (
+                    ReplicationIntentRange {
+                        first_sequence: 20,
+                        last_sequence: 20,
+                    },
+                    vec![k_b],
+                ),
+            ],
+            "begin → write_to_disk → read_from_disk must round-trip the exact \
+             (range, deduped key set) pairs"
+        );
+
+        // `pending()` (back-compat) returns the same ranges without keys.
+        assert_eq!(
+            reopened.pending(),
+            vec![
+                ReplicationIntentRange {
+                    first_sequence: 10,
+                    last_sequence: 12,
+                },
+                ReplicationIntentRange {
+                    first_sequence: 20,
+                    last_sequence: 20,
+                },
+            ],
+        );
+
+        // commit removes by range identity and the removal persists across a
+        // flush + reopen.
+        reopened.commit(10, 12).unwrap();
+        reopened.flush().unwrap();
+        let after_commit = ReplicationIntentTracker::load(path).unwrap();
+        assert_eq!(
+            after_commit.pending_with_keys(),
+            vec![(
+                ReplicationIntentRange {
+                    first_sequence: 20,
+                    last_sequence: 20,
+                },
+                vec![k_b],
+            )],
+        );
+    }
+
+    #[test]
+    fn replication_intent_tracker_empty_key_set_is_recorded() {
+        // An intent with no keys must still be recorded so its range is not lost
+        // (recovery commits it as a no-op). Round-trips with an empty key set.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        {
+            let tracker = ReplicationIntentTracker::load(path.clone()).unwrap();
+            tracker.begin(5, 7, &[]).unwrap();
+        }
+        let reopened = ReplicationIntentTracker::load(path).unwrap();
+        assert_eq!(
+            reopened.pending_with_keys(),
+            vec![(
+                ReplicationIntentRange {
+                    first_sequence: 5,
+                    last_sequence: 7,
+                },
+                vec![],
+            )],
+        );
+    }
+
+    #[test]
+    fn replication_intent_tracker_truncated_key_section_rejected() {
+        // A valid header + range + key_count=2 but only ONE txid worth of bytes
+        // must surface a Corrupt error, not a silent partial read.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intent.dat");
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        data.extend_from_slice(&10u64.to_le_bytes()); // first
+        data.extend_from_slice(&12u64.to_le_bytes()); // last
+        data.extend_from_slice(&2u32.to_le_bytes()); // key_count = 2
+        data.extend_from_slice(&[0xCC; 32]); // only 1 of the 2 promised keys
+        std::fs::write(&path, data).unwrap();
+
+        let err = ReplicationIntentTracker::load(path)
+            .expect_err("truncated key section must be rejected");
+        match err {
+            ReplicationIntentError::Corrupt(msg) => assert!(
+                msg.contains("truncated intent keys"),
+                "unexpected corrupt message: {msg}"
+            ),
             other => panic!("expected Corrupt, got {other:?}"),
         }
     }

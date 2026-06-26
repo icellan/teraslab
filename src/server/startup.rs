@@ -165,7 +165,7 @@ pub const MAX_TOLERATED_MISSING_PRIMARY: u64 = 65_536;
 /// Cap on the number of tolerable [`ReplayCause::ReplicaRecordAbsent`]
 /// failures during startup replay.
 ///
-/// `ReplicaRecordAbsent` is a legacy (payload-less) `RedoOp::Create` for a
+/// `ReplicaRecordAbsent` is a legacy (payload-less) `RedoOp::ReplicaCreate` for a
 /// replica / migration-received SECONDARY copy whose on-device record bytes
 /// were never durable on this node — the receiver's documented contract
 /// (fsync data device, then flush redo, then ACK) allows a stop between the
@@ -229,7 +229,7 @@ pub fn check_replay_tolerance_with_cap(
         ));
     }
     if stats.failed_missing_record_bytes > 0 {
-        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a CreateV2
+        // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): a Create
         // replay could not write the full record bytes captured in the
         // redo entry. Short I/O on the record area means the device is
         // misbehaving — continuing would silently register an index
@@ -470,6 +470,31 @@ pub fn load_sharded_index_in_memory(
     shard_count: usize,
 ) -> Result<ShardedIndex, RebuildError> {
     ShardedIndex::rebuild_in_memory(device, allocator, shard_count).map_err(|e| {
+        RebuildError::InMemoryPrimary {
+            rebuild_err: format!("{e}"),
+        }
+    })
+}
+
+/// Multi-store variant of [`load_sharded_index_in_memory`]: scan EVERY store's
+/// device, stamping each discovered record's `device_id` from the store it was
+/// found on, so a device-scan rebuild (snapshot lost/corrupt) recovers records
+/// placed across all stores — not just store 0.
+///
+/// Records are round-robin placed across the configured stores and routed by the
+/// index entry's `device_id`; a single-device scan would index only the records
+/// that happened to land on store 0 and silently lose the rest.
+///
+/// # Errors
+///
+/// Returns [`RebuildError::InMemoryPrimary`] if any store's device scan or shard
+/// routing fails.
+pub fn load_sharded_index_in_memory_multi(
+    devices: &[std::sync::Arc<dyn BlockDevice>],
+    allocators: &[SlotAllocator],
+    shard_count: usize,
+) -> Result<ShardedIndex, RebuildError> {
+    ShardedIndex::rebuild_in_memory_multi_store(devices, allocators, shard_count).map_err(|e| {
         RebuildError::InMemoryPrimary {
             rebuild_err: format!("{e}"),
         }
@@ -841,7 +866,7 @@ mod tests {
 
     #[test]
     fn replay_tolerance_rejects_one_missing_record_bytes() {
-        // The CreateV2 short-I/O class stays fatal regardless of count —
+        // The Create short-I/O class stays fatal regardless of count —
         // it signals a misbehaving device, distinct from the tolerable
         // legacy replica-record-absent class.
         let stats = RecoveryStats {

@@ -525,7 +525,7 @@ impl TinyRedoNode {
 #[test]
 fn large_migration_baseline_completes_without_log_full() {
     // Header block is one ALIGN-sized block; two blocks is the minimum
-    // region. With ~4 KiB usable, a CreateV2 redo entry (>100 bytes) lets
+    // region. With ~4 KiB usable, a Create redo entry (>100 bytes) lets
     // only a few dozen entries fit — far fewer than NUM.
     let redo_size = 2 * ALIGN as u64; // 8 KiB
     const NUM: usize = 400;

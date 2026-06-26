@@ -667,6 +667,15 @@ func decodePartitionMap(data []byte) (*PartitionMap, error) {
 		}
 		addr := string(data[pos : pos+addrLen])
 		pos += addrLen
+		// Consume the per-node is_alive byte. The server wire format is
+		// [id:8][addr_len:2][addr:N][is_alive:1] per node (see RoutingInfo::encode
+		// in src/cluster/routing.rs and the partition-map response in
+		// coordinator.rs). Omitting it misaligns every subsequent byte —
+		// corrupting all shard→node assignments — so this MUST match the server.
+		// Guarded for tolerance against a legacy map that lacks the trailer.
+		if pos < len(data) {
+			pos++
+		}
 		pm.Nodes = append(pm.Nodes, NodeInfo{ID: nodeID, Addr: addr})
 	}
 

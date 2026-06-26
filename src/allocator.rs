@@ -212,7 +212,7 @@ pub struct AllocatedRegion {
 /// A batch of regions reserved IN MEMORY but not yet durably journaled, returned
 /// by [`SlotAllocator::reserve_batch`]. The freelist already reflects the
 /// reservations; the caller must journal [`Self::allocate_region_redo_ops`]
-/// (atomically with its own redo, e.g. `CreateV2`) and then call
+/// (atomically with its own redo, e.g. `Create`) and then call
 /// [`SlotAllocator::commit_pending`], or call
 /// [`SlotAllocator::rollback_pending`] if it cannot. See `reserve_batch` for the
 /// issue-#14 orphan-prevention rationale.
@@ -274,11 +274,13 @@ pub struct SlotAllocator {
     /// and frees survive a power loss between [`SlotAllocator::persist`]
     /// snapshots.
     redo_log: Option<Arc<Mutex<RedoLog>>>,
-    /// Logical device identifier written into redo entries.
+    /// Store identifier this allocator owns, written into every
+    /// `AllocateRegion`/`FreeRegion` redo entry it emits.
     ///
-    /// Currently always 0 (single-device deployment) — reserved for a
-    /// future multi-device layout where each allocator tracks a distinct
-    /// logical device so recovery can route redo entries correctly.
+    /// 0 for a single-store deployment; set per store via
+    /// [`SlotAllocator::set_redo_device_id`] at boot under `device_split` so
+    /// recovery routes each region to the owning store's allocator and the
+    /// entry to that store's redo log.
     redo_device_id: u8,
     /// Test/fault-injection only: fail the next [`SlotAllocator::persist`]
     /// call with [`AllocatorError::PersistFaultInjected`], then auto-clear.
@@ -553,6 +555,24 @@ impl SlotAllocator {
         self.redo_log = Some(redo_log);
     }
 
+    /// Tag this allocator's store so its `AllocateRegion`/`FreeRegion` redo
+    /// entries carry the store's `device_id`. In a multi-store node each
+    /// store's allocator is set to its store index, so recovery routes each
+    /// region op to the right store and the per-allocator replay gate
+    /// (`device_id == redo_device_id`) accepts only its own entries. Defaults
+    /// to 0 (single store). Set once at startup before any allocation.
+    pub fn set_redo_device_id(&mut self, device_id: u8) {
+        self.redo_device_id = device_id;
+    }
+
+    /// The store tag this allocator stamps onto its `AllocateRegion`/`FreeRegion`
+    /// redo entries and requires on replay (`device_id == redo_device_id`). See
+    /// [`Self::set_redo_device_id`]. Recovery uses this to synthesize a
+    /// `FreeRegion` that THIS store's allocator will accept.
+    pub fn redo_device_id(&self) -> u8 {
+        self.redo_device_id
+    }
+
     /// Detach the redo log (mainly for tests).
     #[cfg(test)]
     fn clear_redo_log(&mut self) {
@@ -688,16 +708,16 @@ impl SlotAllocator {
     ///
     /// Issue #14 (orphan prevention): [`Self::allocate_batch`] fsyncs its
     /// `AllocateRegion` entries in its OWN flush, BEFORE the create path writes
-    /// the matching `CreateV2` entries. Under a redo-log-full window the
-    /// `CreateV2` write then fails and the compensating `free()` also can't
+    /// the matching `Create` entries. Under a redo-log-full window the
+    /// `Create` write then fails and the compensating `free()` also can't
     /// journal — leaving a DURABLE allocation with no record (an orphan that
     /// crash-loops rebuild before the tolerant-rebuild fix, and leaks space
     /// after it). `reserve_batch` instead applies the reservations to the
     /// freelist in memory and returns the `AllocateRegion` redo ops UNwritten,
     /// so the caller can journal them ATOMICALLY in the same batch as the
-    /// `CreateV2` entries (one fsync — all-or-nothing) and roll the reservations
+    /// `Create` entries (one fsync — all-or-nothing) and roll the reservations
     /// back in memory if that batch fails. No `AllocateRegion` is ever made
-    /// durable without its `CreateV2`.
+    /// durable without its `Create`.
     ///
     /// The returned [`PendingBatchAllocation`] MUST be passed to exactly one of
     /// [`Self::commit_pending`] (after the caller durably journaled the redo
@@ -1557,7 +1577,7 @@ impl SlotAllocator {
     /// Return true if `[offset, offset + size)` is inside the allocator's
     /// high-water mark and does not overlap any free region.
     ///
-    /// Recovery uses this before trusting a `CreateV2.record_offset`: a
+    /// Recovery uses this before trusting a `Create.record_offset`: a
     /// redo entry that points outside allocator-owned space must not
     /// register a primary index entry.
     pub fn is_allocated_range(&self, offset: u64, size: u64) -> bool {

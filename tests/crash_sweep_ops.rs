@@ -648,7 +648,7 @@ fn sweep_set_mined() {
     }
 }
 
-/// Create: WAL-first `CreateV2` carrying the full record bytes, then
+/// Create: WAL-first `Create` carrying the full record bytes, then
 /// `engine.create_at_offset` at the SAME pre-allocated offset the entry
 /// references. After a crash the record is fully present (all slots unspent,
 /// counter 0) or fully absent — never partial.
@@ -697,8 +697,9 @@ fn sweep_create() {
             crash,
             move |redo| {
                 redo.lock()
-                    .append_and_flush(RedoOp::CreateV2 {
+                    .append_and_flush(RedoOp::Create {
                         tx_key: k,
+                        device_id: 0,
                         record_offset,
                         utxo_count,
                         is_conflicting: false,
@@ -726,7 +727,7 @@ fn sweep_create() {
         if crash.intent_durable() {
             assert!(
                 rec.lookup(&k).is_some(),
-                "durable CreateV2 must replay the record into existence ({crash:?})",
+                "durable Create must replay the record into existence ({crash:?})",
             );
         }
     }

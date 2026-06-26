@@ -313,7 +313,7 @@ const OP_FREEZE: u8 = 4;
 const OP_UNFREEZE: u8 = 5;
 const OP_REASSIGN: u8 = 6;
 const OP_PRUNE_SLOT: u8 = 7;
-const OP_CREATE: u8 = 9;
+const OP_REPLICA_CREATE: u8 = 9;
 const OP_DELETE: u8 = 10;
 const OP_CHECKPOINT: u8 = 11;
 const OP_SET_CONFLICTING: u8 = 12;
@@ -330,9 +330,9 @@ const OP_HASHTABLE_RESIZE_COMMIT: u8 = 21;
 /// wrote at `record_offset` (metadata + UTXO slots + cold data) plus
 /// the parent_txids needed to rebuild conflicting-child links. Recovery
 /// can reconstruct the on-device record bit-for-bit identical to a
-/// successful create. The legacy [`OP_CREATE`] tag is retained for
+/// successful create. The legacy [`OP_REPLICA_CREATE`] tag is retained for
 /// back-compat decoding of redo logs written before this change.
-const OP_CREATE_V2: u8 = 22;
+const OP_CREATE: u8 = 22;
 /// Gap #8: compensation intent for unset-mined. Carries the prior
 /// `block_height` + `subtree_idx` captured BEFORE the engine applied the
 /// unset, so a crash mid-rollback can restore the block entry exactly.
@@ -377,7 +377,7 @@ const OP_APPEND_DELETED_CHILD: u8 = 34;
 /// B-5: Spend redo entry that additionally carries the slot's
 /// `utxo_hash`. A `SpendV2`/`UnspendV2` (opcodes 30/31) carries only the
 /// spending data, so a CRC-failing spent slot in the WAL window cannot be
-/// rebuilt the way `CreateV2` rebuilds a whole record — recovery
+/// rebuilt the way `Create` rebuilds a whole record — recovery
 /// fail-closed-bricks the node. The V3 entries embed the 32-byte
 /// `utxo_hash` so replay can reconstruct a torn slot from the durable
 /// redo intent. Legacy V2 entries (no hash) remain decodable with
@@ -402,17 +402,17 @@ const OP_REMOVE_CONFLICTING_CHILD: u8 = 37;
 const OP_REASSIGN_V2: u8 = 38;
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
-/// `CreateV2` redo entry. Bitcoin transactions in practice rarely have
+/// `Create` redo entry. Bitcoin transactions in practice rarely have
 /// more than a handful of conflicting parents; a wire-controlled
 /// `u16::MAX` would let a corrupt-but-CRC-valid entry pin ~2 MiB at
 /// startup per offending entry, multiplied by however many such entries
 /// the redo region contains.
-const MAX_CREATE_V2_PARENTS: usize = 64;
+const MAX_CREATE_PARENTS: usize = 64;
 /// F-G4-006: hard cap on the `record_bytes` slab decoded from a single
-/// `CreateV2` redo entry. The TeraSlab record size is bounded by
+/// `Create` redo entry. The TeraSlab record size is bounded by
 /// `TxMetadata::record_size_for(utxo_count)` plus cold data, which in
 /// the worst case the engine emits is well under 1 MiB.
-const MAX_CREATE_V2_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_CREATE_RECORD_BYTES: usize = 1024 * 1024;
 
 /// A redo log operation that can be serialized and replayed.
 #[derive(Debug, Clone, PartialEq)]
@@ -521,12 +521,16 @@ pub enum RedoOp {
         offset: u32,
         child_txid: [u8; 32],
     },
-    /// Legacy create entry: only enough payload to register the index
-    /// entry on replay. Kept so logs written before gap #2 can still be
-    /// replayed (back-compat). New writes use [`RedoOp::CreateV2`] which
-    /// carries enough state to rebuild the full on-device record.
-    Create {
+    /// Index-only create entry: just enough payload to register the index
+    /// entry on replay (no record bytes). Emitted by the replication /
+    /// migration receiver for a copy whose bytes already landed via the
+    /// streaming apply; the full-record payload is carried by the separate
+    /// [`RedoOp::Create`] variant. `device_id` names the store the replicated
+    /// record lives on so multi-store replay registers the index entry on the
+    /// right store (reads/mutations route by `TxIndexEntry::device_id`).
+    ReplicaCreate {
         tx_key: TxKey,
+        device_id: u8,
         record_offset: u64,
         utxo_count: u32,
     },
@@ -554,9 +558,12 @@ pub enum RedoOp {
     /// pwrites at `record_offset` (metadata header + UTXO slots + cold
     /// data, no device-alignment padding). `parent_txids` is empty
     /// when `is_conflicting` is false.
-    CreateV2 {
+    Create {
         /// Primary key of the new transaction.
         tx_key: TxKey,
+        /// Store (device) the new record was placed on. Recovery reconstructs
+        /// the record on this store's device; the offset is store-local.
+        device_id: u8,
         /// Device byte offset where the record starts.
         record_offset: u64,
         /// Number of UTXO slots written immediately after the metadata.
@@ -694,8 +701,9 @@ pub enum RedoOp {
         offset: u64,
         /// Size of the allocation in bytes (already aligned).
         size: u64,
-        /// Logical device identifier — currently always 0 (single device).
-        /// Reserved for future multi-device deployments.
+        /// Store this region belongs to (0 single-store; 0..N under
+        /// `device_split`). Routes the region to the owning store's allocator on
+        /// replay and the entry to that store's redo log under per-store redo.
         device_id: u8,
     },
     /// Durability record for a device-space release by the allocator.
@@ -864,8 +872,8 @@ impl RedoOp {
             RedoOp::ReassignV2 { .. } => OP_REASSIGN_V2,
             RedoOp::PruneSlot { .. } => OP_PRUNE_SLOT,
             RedoOp::PruneSlotIfSpentBy { .. } => OP_PRUNE_SLOT_IF_SPENT_BY,
+            RedoOp::ReplicaCreate { .. } => OP_REPLICA_CREATE,
             RedoOp::Create { .. } => OP_CREATE,
-            RedoOp::CreateV2 { .. } => OP_CREATE_V2,
             RedoOp::Delete { .. } => OP_DELETE,
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
             RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
@@ -907,8 +915,8 @@ impl RedoOp {
             | RedoOp::ReassignV2 { tx_key, .. }
             | RedoOp::PruneSlot { tx_key, .. }
             | RedoOp::PruneSlotIfSpentBy { tx_key, .. }
+            | RedoOp::ReplicaCreate { tx_key, .. }
             | RedoOp::Create { tx_key, .. }
-            | RedoOp::CreateV2 { tx_key, .. }
             | RedoOp::Delete { tx_key, .. }
             | RedoOp::SetConflicting { tx_key, .. }
             | RedoOp::SetLocked { tx_key, .. }
@@ -982,8 +990,8 @@ impl RedoOp {
             | RedoOp::UnfreezeV2 { .. }
             | RedoOp::PruneSlot { .. }
             | RedoOp::PruneSlotIfSpentBy { .. }
+            | RedoOp::ReplicaCreate { .. }
             | RedoOp::Create { .. }
-            | RedoOp::CreateV2 { .. }
             | RedoOp::Delete { .. }
             | RedoOp::AppendConflictingChild { .. }
             | RedoOp::RemoveConflictingChild { .. }
@@ -1151,17 +1159,20 @@ impl RedoOp {
                 buf.extend_from_slice(&spendable_after.to_le_bytes());
                 buf.extend_from_slice(prior_utxo_hash);
             }
-            RedoOp::Create {
+            RedoOp::ReplicaCreate {
                 tx_key,
+                device_id,
                 record_offset,
                 utxo_count,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
+                buf.push(*device_id);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&utxo_count.to_le_bytes());
             }
-            RedoOp::CreateV2 {
+            RedoOp::Create {
                 tx_key,
+                device_id,
                 record_offset,
                 utxo_count,
                 is_conflicting,
@@ -1169,6 +1180,7 @@ impl RedoOp {
                 parent_txids,
             } => {
                 buf.extend_from_slice(&tx_key.txid);
+                buf.push(*device_id);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&utxo_count.to_le_bytes());
                 buf.push(if *is_conflicting { 1 } else { 0 });
@@ -1548,39 +1560,42 @@ impl RedoOp {
                     prior_utxo_hash: prior,
                 })
             }
-            OP_CREATE if data.len() >= 44 => {
+            OP_REPLICA_CREATE if data.len() >= 45 => {
+                // Layout: tx_key(32) + device_id(1) + record_offset(8) + utxo_count(4)
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
-                Some(RedoOp::Create {
+                Some(RedoOp::ReplicaCreate {
                     tx_key: TxKey { txid },
-                    record_offset: u64::from_le_bytes(data[32..40].try_into().unwrap()),
-                    utxo_count: u32::from_le_bytes(data[40..44].try_into().unwrap()),
+                    device_id: data[32],
+                    record_offset: u64::from_le_bytes(data[33..41].try_into().unwrap()),
+                    utxo_count: u32::from_le_bytes(data[41..45].try_into().unwrap()),
                 })
             }
-            OP_CREATE_V2 if data.len() >= 51 => {
-                // Layout: tx_key(32) + record_offset(8) + utxo_count(4)
-                //       + is_conflicting(1) + record_len(4) + record_bytes(N)
-                //       + parents_count(2) + parents(32*M)
+            OP_CREATE if data.len() >= 52 => {
+                // Layout: tx_key(32) + device_id(1) + record_offset(8)
+                //       + utxo_count(4) + is_conflicting(1) + record_len(4)
+                //       + record_bytes(N) + parents_count(2) + parents(32*M)
                 let mut txid = [0u8; 32];
                 txid.copy_from_slice(&data[..32]);
-                let record_offset = u64::from_le_bytes(data[32..40].try_into().unwrap());
-                let utxo_count = u32::from_le_bytes(data[40..44].try_into().unwrap());
-                let is_conflicting = data[44] != 0;
-                let record_len = u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
+                let device_id = data[32];
+                let record_offset = u64::from_le_bytes(data[33..41].try_into().unwrap());
+                let utxo_count = u32::from_le_bytes(data[41..45].try_into().unwrap());
+                let is_conflicting = data[45] != 0;
+                let record_len = u32::from_le_bytes(data[46..50].try_into().unwrap()) as usize;
                 // F-G4-006: cap `record_len` so a corrupt-but-CRC-valid
                 // entry cannot inflate startup memory by a fabricated value
                 // larger than any legitimate record. Real records are
                 // bounded by `TxMetadata::record_size_for(utxo_count)`
                 // plus cold data; 1 MiB is a comfortable upper bound that
                 // exceeds anything the engine emits.
-                if record_len > MAX_CREATE_V2_RECORD_BYTES {
+                if record_len > MAX_CREATE_RECORD_BYTES {
                     return None;
                 }
-                let record_end = 49usize.checked_add(record_len)?;
+                let record_end = 50usize.checked_add(record_len)?;
                 if data.len() < record_end + 2 {
                     return None;
                 }
-                let record_bytes = data[49..record_end].to_vec();
+                let record_bytes = data[50..record_end].to_vec();
                 let parents_count_raw =
                     u16::from_le_bytes(data[record_end..record_end + 2].try_into().unwrap())
                         as usize;
@@ -1594,7 +1609,7 @@ impl RedoOp {
                 // transactions rarely have more than a few conflicting
                 // parents; cap at 64 (still well above any observed
                 // legitimate value).
-                if parents_count_raw > MAX_CREATE_V2_PARENTS {
+                if parents_count_raw > MAX_CREATE_PARENTS {
                     return None;
                 }
                 // Cap is enforced above; allocation is now bounded.
@@ -1605,8 +1620,9 @@ impl RedoOp {
                     ptx.copy_from_slice(&data[off..off + 32]);
                     parent_txids.push(ptx);
                 }
-                Some(RedoOp::CreateV2 {
+                Some(RedoOp::Create {
                     tx_key: TxKey { txid },
+                    device_id,
                     record_offset,
                     utxo_count,
                     is_conflicting,
@@ -1953,6 +1969,21 @@ pub struct RedoLog {
     poisoned: bool,
     /// Lock-free mirror of `write_pos`/`logical_start` for observers.
     atomics: Arc<RedoAtomics>,
+    /// Per-store redo: when several `RedoLog`s back one node's stores, they
+    /// share ONE global sequence counter so every redo entry — regardless of
+    /// which store's log it lands in — receives a globally-unique,
+    /// monotonically-increasing sequence. The replication contract
+    /// (`write_redo_ops` seq-range, `begin_replication_intent`, catch-up
+    /// `read_from_sequence`) depends on this global ordering.
+    ///
+    /// `None` (the default) preserves the historical single-log behaviour
+    /// exactly: sequences come from this log's own `next_sequence`, so the
+    /// `N == 1` case is byte-identical. When `Some`, `append` draws the next
+    /// sequence from the shared atomic and folds it into `next_sequence` so
+    /// the on-disk header still records this log's high-water mark for
+    /// restart (the shared counter is restored as the max over all logs'
+    /// headers at boot — see [`RedoLog::shared_sequence_floor`]).
+    shared_seq: Option<Arc<AtomicU64>>,
 }
 
 impl RedoLog {
@@ -2030,6 +2061,7 @@ impl RedoLog {
                 logical_start: AtomicU64::new(0),
                 entries_region_size: log_size - header_block_size,
             }),
+            shared_seq: None,
         };
 
         // Try to read the on-disk header. If the magic is absent
@@ -2085,6 +2117,45 @@ impl RedoLog {
             .logical_start
             .store(log.logical_start, AtomicOrdering::Relaxed);
         Ok(log)
+    }
+
+    /// Attach a shared global sequence counter for per-store redo.
+    ///
+    /// When several `RedoLog`s back one node's stores, every entry must draw
+    /// its sequence from ONE counter so the global ordering the replication
+    /// contract relies on holds across all logs. Call this on each store's log
+    /// at boot with the same `Arc<AtomicU64>`. The shared counter must already
+    /// be seeded to at least `max(next_sequence)` over all logs — see
+    /// [`RedoLog::local_high_water`] and [`RedoLog::shared_sequence_floor`].
+    ///
+    /// Attaching to a log that already has entries is supported: subsequent
+    /// appends use the shared counter while the on-disk header continues to
+    /// record this log's own high-water mark.
+    pub fn attach_shared_sequence(&mut self, shared: Arc<AtomicU64>) {
+        self.shared_seq = Some(shared);
+    }
+
+    /// This log's own next-sequence high-water mark (the value persisted in
+    /// the on-disk header), independent of any attached shared counter.
+    ///
+    /// Used at boot to seed the shared global counter to the maximum across
+    /// all stores' logs so restart never reuses a sequence number.
+    pub fn local_high_water(&self) -> u64 {
+        self.next_sequence
+    }
+
+    /// Compute the shared-counter seed (the first globally-unique sequence to
+    /// hand out) from a set of per-store logs: the max of every log's local
+    /// high-water mark, floored at 1.
+    ///
+    /// Returned value is suitable to construct the shared `AtomicU64` passed
+    /// to [`RedoLog::attach_shared_sequence`] on every log.
+    pub fn shared_sequence_floor(logs: &[&RedoLog]) -> u64 {
+        logs.iter()
+            .map(|l| l.next_sequence)
+            .max()
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Device byte offset of the first entry byte (header block end).
@@ -2159,8 +2230,15 @@ impl RedoLog {
         if self.poisoned {
             return Err(RedoError::Poisoned);
         }
-        let seq = self.next_sequence;
-        let entry = RedoEntry { sequence: seq, op };
+
+        // Serialize against a placeholder sequence so the capacity check can
+        // run BEFORE any sequence number is committed. The on-disk length is
+        // independent of the sequence value (always a fixed 8-byte field), so
+        // the byte count is identical to the final entry's. This ordering
+        // matters for the shared global counter: a `LogFull` must NOT burn a
+        // global sequence, which would punch a gap into a replication
+        // seq-range that ack-tracking expects to be contiguous.
+        let mut entry = RedoEntry { sequence: 0, op };
         let bytes = entry.serialize();
 
         let entries_capacity = self.entries_region_size();
@@ -2171,9 +2249,30 @@ impl RedoLog {
             });
         }
 
+        // Capacity is assured — now commit the sequence. With a shared global
+        // counter attached, draw from it and fold the value into this log's
+        // `next_sequence` so the on-disk header still records this log's
+        // high-water mark for restart. Without it, the local `next_sequence`
+        // is the sole source (single-log behaviour, byte-identical).
+        let seq = match &self.shared_seq {
+            Some(shared) => {
+                let s = shared.fetch_add(1, AtomicOrdering::SeqCst);
+                if s + 1 > self.next_sequence {
+                    self.next_sequence = s + 1;
+                }
+                s
+            }
+            None => {
+                let s = self.next_sequence;
+                self.next_sequence += 1;
+                s
+            }
+        };
+        entry.sequence = seq;
+        let bytes = entry.serialize();
+
         self.buffer.extend_from_slice(&bytes);
         self.pending_entries.push(entry);
-        self.next_sequence += 1;
         if let Some(m) = redo_metrics() {
             m.redo_append_total.inc();
             self.buffered_entries += 1;
@@ -2240,7 +2339,6 @@ impl RedoLog {
             self.poison_drop_buffer();
             return Err(e.into());
         }
-
         // F-G4-001 + PERF #5: pwrite the header (new `next_sequence` high-water
         // + checkpoint_seq + logical_start) and let the SINGLE entries fsync
         // below make BOTH durable. A `device.sync()` flushes every dirty block
@@ -2256,7 +2354,6 @@ impl RedoLog {
             self.poison_drop_buffer();
             return Err(e);
         }
-
         crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
         // Scope the sync call tightly so the latency histogram reflects only
         // the fsync wall time, not the buffer-assembly / pwrite preamble.
@@ -2308,6 +2405,20 @@ impl RedoLog {
         self.buffered_entries = 0;
     }
 
+    /// Fence this log against further writes: any subsequent [`Self::append`]
+    /// returns [`RedoError::Poisoned`].
+    ///
+    /// Used to fail closed when a multi-store batch flush partially succeeds (one
+    /// store durable, another failed) and there is no cross-store commit to undo
+    /// it — poisoning every touched store's log stops the node from accepting
+    /// more writes against the now-inconsistent durable state until a restart
+    /// (where recovery replays the durable redo and makes it authoritative). The
+    /// already-flushed on-disk data is untouched; only in-memory write
+    /// acceptance is blocked.
+    pub fn poison(&mut self) {
+        self.poison_drop_buffer();
+    }
+
     /// Append and flush in one call.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn append_and_flush(&mut self, op: RedoOp) -> Result<u64> {
@@ -2330,9 +2441,13 @@ impl RedoLog {
         if ops.is_empty() {
             return Ok((0, 0));
         }
-        let first_seq = self.next_sequence;
+        // Capture the first sequence from the actual `append` (works for both
+        // the local and shared-global counters) rather than reading
+        // `next_sequence` up front, which under a shared counter is not the
+        // value the next `append` will assign.
+        let first_seq = self.append(ops[0].clone())?;
         let mut last_seq = first_seq;
-        for op in ops {
+        for op in &ops[1..] {
             last_seq = self.append(op.clone())?;
         }
         self.flush()?;
@@ -2410,8 +2525,18 @@ impl RedoLog {
     }
 
     /// The next sequence number that will be assigned.
+    ///
+    /// With a shared global counter attached (per-store redo), this reflects
+    /// the global next sequence across every store's log — the value the next
+    /// `append` on ANY of the sibling logs will consume — so replication
+    /// snapshots (`current_sequence()` watermarks) stay consistent regardless
+    /// of which store's log is queried. Without it, this is this log's local
+    /// `next_sequence`.
     pub fn current_sequence(&self) -> u64 {
-        self.next_sequence
+        match &self.shared_seq {
+            Some(shared) => shared.load(AtomicOrdering::SeqCst),
+            None => self.next_sequence,
+        }
     }
 
     /// The sequence number of the earliest available entry in the log.
@@ -2430,6 +2555,15 @@ impl RedoLog {
     // in-memory `checkpoint_seq` and reclaimed nothing. The live
     // reclamation path is `compact_prefix_through`. The dead method has
     // been removed entirely.
+
+    /// Whether this log has appended-but-not-yet-flushed entries. A `flush()`
+    /// of an empty buffer is a no-op (returns `Ok(())`), so callers that need to
+    /// distinguish "made data durable" from "nothing to flush" — e.g. the
+    /// partial-failure fencing in `Engine::flush_all_redo_logs` — must check
+    /// this BEFORE flushing.
+    pub fn has_pending(&self) -> bool {
+        !self.buffer.is_empty()
+    }
 
     /// Current write position within the entries region (bytes from
     /// start of entries region; does NOT include the header block).
@@ -2753,18 +2887,30 @@ impl RedoLog {
             loop {
                 match RedoEntry::deserialize(&combined[local_pos..]) {
                     Some((entry, consumed_entry)) => {
+                        // Sequences within a single log must be strictly
+                        // increasing. Under per-store redo a node's stores
+                        // each have their own log but draw sequences from one
+                        // shared global counter, so a single log's own entries
+                        // are monotonic-with-gaps (the gaps are sequences that
+                        // landed in sibling logs) — NOT contiguous. The check
+                        // is therefore "strictly greater than the previous"
+                        // rather than "exactly previous + 1": that still
+                        // catches a regressed or duplicated sequence (the real
+                        // corruption signals) while admitting the legitimate
+                        // cross-store gaps. In the single-log case this is
+                        // equivalent to the old contiguity invariant because
+                        // every sequence lands in the one log.
                         if let Some(prev) = prev_seq
-                            && prev.checked_add(1) != Some(entry.sequence)
+                            && entry.sequence <= prev
                         {
                             if just_skipped_pad {
-                                // Non-consecutive sequence past a pad
-                                // skip: this is stale data beyond a
-                                // legitimate end-of-flush boundary
-                                // (e.g. left over from before
-                                // `compact_prefix_through` zeroed the
-                                // sentinel block). Stop here; the tail
-                                // position already points at this stale
-                                // block so future appends overwrite it.
+                                // A non-increasing sequence past a pad skip is
+                                // stale data beyond a legitimate end-of-flush
+                                // boundary (e.g. left over from before
+                                // `compact_prefix_through` zeroed the sentinel
+                                // block). Stop here; the tail position already
+                                // points at this stale block so future appends
+                                // overwrite it.
                                 stop_scan = true;
                                 break;
                             }
@@ -3124,17 +3270,22 @@ mod tests {
         log.append(second_op.clone()).unwrap();
         log.flush().unwrap();
 
-        // Rewrite the second entry's sequence number to 99 so the
-        // monotonicity scan rejects it. The first alignment unit of
-        // the redo region is the F-G4-001 header block; the entries
-        // region starts at offset = device alignment.
+        // Rewrite the second entry's sequence number so the monotonicity
+        // scan rejects it. Under per-store redo a single log's sequences are
+        // strictly-increasing-with-gaps (sibling logs consume the in-between
+        // values), so a FORWARD jump is legitimate. The corruption signal is
+        // a sequence that is NOT strictly greater than the previous — here we
+        // rewrite the second entry to sequence 1 (a duplicate / regression of
+        // the first), which must still be rejected. The first alignment unit
+        // of the redo region is the F-G4-001 header block; the entries region
+        // starts at offset = device alignment.
         let first_entry = RedoEntry {
             sequence: 1,
             op: first_op,
         }
         .serialize();
         let rewritten_second = RedoEntry {
-            sequence: 99,
+            sequence: 1,
             op: second_op,
         }
         .serialize();
@@ -3152,11 +3303,58 @@ mod tests {
                 previous, current, ..
             }) => {
                 assert_eq!(previous, 1);
-                assert_eq!(current, 99);
+                assert_eq!(current, 1);
             }
             Ok(_) => panic!("expected SequenceOutOfOrder, got Ok"),
             Err(other) => panic!("expected SequenceOutOfOrder, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn redo_sequence_forward_gap_is_accepted() {
+        // Per-store redo: a single log's sequences are strictly increasing but
+        // not contiguous (sibling logs take the in-between values). A forward
+        // gap on disk must therefore open cleanly rather than raising
+        // SequenceOutOfOrder.
+        let (dev, mut log) = make_log(1024 * 1024);
+        let first_op = RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 0,
+        };
+        let second_op = RedoOp::Freeze {
+            tx_key: test_key(2),
+            offset: 1,
+        };
+        log.append(first_op.clone()).unwrap();
+        log.append(second_op.clone()).unwrap();
+        log.flush().unwrap();
+
+        // Rewrite the second entry's sequence to 99 (forward jump). The first
+        // entry keeps sequence 1.
+        let first_entry = RedoEntry {
+            sequence: 1,
+            op: first_op,
+        }
+        .serialize();
+        let rewritten_second = RedoEntry {
+            sequence: 99,
+            op: second_op.clone(),
+        }
+        .serialize();
+        let align = dev.alignment();
+        let entries_region_offset = align as u64;
+        let mut buf = AlignedBuf::new(align, align);
+        dev.pread(&mut buf, entries_region_offset).unwrap();
+        let second_offset = first_entry.len();
+        buf[second_offset..second_offset + rewritten_second.len()]
+            .copy_from_slice(&rewritten_second);
+        dev.pwrite(&buf, entries_region_offset).unwrap();
+
+        let log2 = RedoLog::open(dev, 0, 1024 * 1024).expect("forward gap must open cleanly");
+        let entries = log2.recover().unwrap();
+        assert_eq!(entries.len(), 2, "both entries must survive the scan");
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 99);
     }
 
     // -- Serialization round-trip tests --
@@ -3209,8 +3407,9 @@ mod tests {
                 tx_key: test_key(8),
                 offset: 4,
             },
-            RedoOp::Create {
+            RedoOp::ReplicaCreate {
                 tx_key: test_key(9),
+                device_id: 0,
                 record_offset: 4096,
                 utxo_count: 10,
             },
@@ -4079,8 +4278,9 @@ mod tests {
 
     #[test]
     fn round_trip_create() {
-        assert_round_trip(RedoOp::Create {
+        assert_round_trip(RedoOp::ReplicaCreate {
             tx_key: make_txid(0x19),
+            device_id: 3,
             record_offset: 0x0000_DEAD_BEEF_0000,
             utxo_count: 250,
         });
@@ -4094,8 +4294,9 @@ mod tests {
     /// large record (10k bytes) to exercise the length encoding.
     #[test]
     fn round_trip_create_v2_minimal() {
-        assert_round_trip(RedoOp::CreateV2 {
+        assert_round_trip(RedoOp::Create {
             tx_key: make_txid(0x90),
+            device_id: 0,
             record_offset: 0x1000,
             utxo_count: 1,
             is_conflicting: false,
@@ -4107,8 +4308,9 @@ mod tests {
     #[test]
     fn round_trip_create_v2_with_conflicting_parents() {
         let parents: Vec<[u8; 32]> = (0..5u8).map(make_txid).map(|k| k.txid).collect();
-        assert_round_trip(RedoOp::CreateV2 {
+        assert_round_trip(RedoOp::Create {
             tx_key: make_txid(0x91),
+            device_id: 0,
             record_offset: 0x2000,
             utxo_count: 4,
             is_conflicting: true,
@@ -4121,8 +4323,9 @@ mod tests {
     fn round_trip_create_v2_large_record() {
         // 10 kB record bytes — exercises the 4-byte record_len field.
         let big = (0..10_000u32).map(|i| i as u8).collect::<Vec<u8>>();
-        assert_round_trip(RedoOp::CreateV2 {
+        assert_round_trip(RedoOp::Create {
             tx_key: make_txid(0x92),
+            device_id: 0,
             record_offset: 0x3000_0000,
             utxo_count: 1024,
             is_conflicting: true,
@@ -4357,6 +4560,115 @@ mod tests {
     }
 
     #[test]
+    fn shared_sequence_is_globally_unique_and_monotonic_across_logs() {
+        // Two independent logs (two stores) sharing ONE global counter must
+        // never assign the same sequence and must hand them out strictly
+        // increasing in fetch order.
+        let (_d0, mut log0) = make_log(1024 * 1024);
+        let (_d1, mut log1) = make_log(1024 * 1024);
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+
+        let mut seqs = Vec::new();
+        for i in 0..6u8 {
+            // Interleave appends across the two logs.
+            let target = if i % 2 == 0 { &mut log0 } else { &mut log1 };
+            let s = target
+                .append(RedoOp::Freeze {
+                    tx_key: test_key(i),
+                    offset: 0,
+                })
+                .unwrap();
+            seqs.push(s);
+        }
+        // Fresh logs start at floor 1; six appends => sequences 1..=6 with no
+        // duplicate and strict monotonicity even though they straddle stores.
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6]);
+        // Both logs report the SAME global current_sequence (next to assign).
+        assert_eq!(log0.current_sequence(), 7);
+        assert_eq!(log1.current_sequence(), 7);
+    }
+
+    #[test]
+    fn shared_sequence_floor_restored_across_reopen() {
+        // After a restart, the shared counter is seeded from the max local
+        // high-water across all logs' headers so sequences never get reused.
+        let dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        {
+            let mut log0 = RedoLog::open(dev0.clone(), 0, 1024 * 1024).unwrap();
+            let mut log1 = RedoLog::open(dev1.clone(), 0, 1024 * 1024).unwrap();
+            let shared = Arc::new(AtomicU64::new(1));
+            log0.attach_shared_sequence(shared.clone());
+            log1.attach_shared_sequence(shared.clone());
+            // Put two entries on log0, one on log1 (seqs 1,2 on log0; 3 on log1).
+            log0.append(RedoOp::Freeze {
+                tx_key: test_key(1),
+                offset: 0,
+            })
+            .unwrap();
+            log1.append(RedoOp::Freeze {
+                tx_key: test_key(2),
+                offset: 0,
+            })
+            .unwrap();
+            log0.append(RedoOp::Freeze {
+                tx_key: test_key(3),
+                offset: 0,
+            })
+            .unwrap();
+            log0.flush().unwrap();
+            log1.flush().unwrap();
+        }
+        // Reopen and recompute the floor: log0 saw seq 3 (next=4), log1 saw
+        // seq 2 (next=3), so the global floor is 4.
+        let log0 = RedoLog::open(dev0, 0, 1024 * 1024).unwrap();
+        let log1 = RedoLog::open(dev1, 0, 1024 * 1024).unwrap();
+        assert_eq!(RedoLog::shared_sequence_floor(&[&log0, &log1]), 4);
+    }
+
+    #[test]
+    fn shared_sequence_not_burned_on_log_full() {
+        // A `LogFull` must not consume a global sequence; otherwise the next
+        // successful append on a sibling log would leave a hole in a
+        // replication seq-range that ack tracking treats as contiguous.
+        let (_d0, mut log0) = make_log(8192);
+        let (_d1, mut log1) = make_log(1024 * 1024);
+        let shared = Arc::new(AtomicU64::new(1));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared.clone());
+
+        // Fill log0 until it returns LogFull.
+        let mut last_ok_seq = 0u64;
+        loop {
+            match log0.append(RedoOp::Freeze {
+                tx_key: test_key(7),
+                offset: 0,
+            }) {
+                Ok(s) => last_ok_seq = s,
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        // The next successful append on log1 must be exactly last_ok_seq + 1 —
+        // no gap from the failed LogFull attempts.
+        let s = log1
+            .append(RedoOp::Freeze {
+                tx_key: test_key(8),
+                offset: 0,
+            })
+            .unwrap();
+        assert_eq!(
+            s,
+            last_ok_seq + 1,
+            "LogFull burned a global sequence (gap detected)"
+        );
+    }
+
+    #[test]
     fn append_batch_and_flush_assigns_contiguous_sequences() {
         let (_, mut log) = make_log(1024 * 1024);
         let ops = vec![
@@ -4526,8 +4838,9 @@ mod tests {
                 subtree_idx: 3,
                 unset: false,
             },
-            RedoOp::Create {
+            RedoOp::ReplicaCreate {
                 tx_key: make_txid(0x03),
+                device_id: 0,
                 record_offset: 8192,
                 utxo_count: 5,
             },
@@ -5027,6 +5340,65 @@ mod tests {
             reopened.current_sequence(),
             high_seq,
             "next_sequence must not roll back",
+        );
+    }
+
+    /// PERF: a normal flush must cost exactly ONE fsync. The header
+    /// (next_sequence/checkpoint_seq/logical_start) is still rewritten every
+    /// flush — so the corrupted-tail watermark guarantee holds — but it rides
+    /// the SAME `device.sync()` as the entries block instead of paying a second
+    /// fsync. Reopen must see a consistent next_sequence + all entries.
+    #[test]
+    fn flush_issues_a_single_fsync_covering_entries_and_header() {
+        let align = 4096usize;
+        let size = 256 * 1024usize;
+        let dev = Arc::new(CrashCowDevice::new(size, align));
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+        let mut log = RedoLog::open(dyn_dev.clone(), 0, size as u64).unwrap();
+
+        // One append + flush costs exactly ONE fsync, even though it persists
+        // BOTH the entries block and the header. The previous implementation
+        // issued two fsyncs (entries sync, then a separate header sync).
+        let before = dev.sync_count.load(Ordering::SeqCst);
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(1),
+            offset: 1,
+        })
+        .unwrap();
+        log.flush().unwrap();
+        let after = dev.sync_count.load(Ordering::SeqCst);
+        assert_eq!(
+            after - before,
+            1,
+            "flush must issue exactly one fsync covering both entries and header"
+        );
+
+        for i in 2..=10u8 {
+            log.append_and_flush(RedoOp::Freeze {
+                tx_key: test_key(i),
+                offset: i as u32,
+            })
+            .unwrap();
+        }
+        assert_eq!(log.current_sequence(), 11, "10 appends → next_sequence 11");
+        drop(log);
+
+        let reopened = RedoLog::open(dyn_dev, 0, size as u64).unwrap();
+        assert_eq!(
+            reopened.current_sequence(),
+            11,
+            "next_sequence must survive reopen (header rode the entries fsync)"
+        );
+        let seqs: Vec<u64> = reopened
+            .read_from_sequence(1)
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(
+            seqs,
+            (1..=10).collect::<Vec<u64>>(),
+            "every flushed entry must recover after reopen"
         );
     }
 

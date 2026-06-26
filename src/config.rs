@@ -172,6 +172,36 @@ pub enum ConfigError {
     )]
     NoDevicePaths,
 
+    /// `device_split` is zero, or `device_paths.len() * device_split` exceeds
+    /// 256 (the index entry's `device_id` is a `u8`).
+    #[error(
+        "invalid store layout: device_paths.len()={paths} * device_split={split} \
+         must be in 1..=256 (device_id is a u8)"
+    )]
+    InvalidStoreLayout {
+        /// Number of configured device paths.
+        paths: usize,
+        /// Configured per-device split factor.
+        split: usize,
+    },
+
+    /// Multi-store (`device_paths.len() * device_split > 1`) is configured with a
+    /// non in-memory index backend. Only the in-memory backend's device-scan
+    /// rebuild scans every store; the redb / file-backed rebuilds scan store 0
+    /// only and would silently lose every record on stores 1..N after a snapshot
+    /// loss. Fail closed rather than risk silent data loss.
+    #[error(
+        "multi-store layout ({stores} stores) requires the in-memory index backend; \
+         backend={backend:?} only rebuilds store 0 from a device scan and would lose \
+         records on the other stores after a snapshot loss"
+    )]
+    MultiStoreRequiresMemoryBackend {
+        /// Total configured stores (`device_paths.len() * device_split`).
+        stores: usize,
+        /// The configured (unsupported-for-multi-store) backend.
+        backend: IndexBackendMode,
+    },
+
     /// `advertise_addr` does not parse as `host:port` (only checked when set).
     /// See F-G10-013.
     #[error(
@@ -480,6 +510,16 @@ pub struct ServerConfig {
 
     /// Device I/O alignment in bytes (4096 for most NVMe/SSDs).
     pub device_alignment: usize,
+
+    /// Number of virtual stores to carve each physical device into
+    /// (Aerospike-style virtual devices). `1` = one store per device. Splitting
+    /// a device into K stores gives K independent allocators + index lock
+    /// domains (lock/contention parallelism) sharing one physical device's I/O
+    /// bandwidth and fsync barrier. Total stores = `device_paths.len() *
+    /// device_split`, bounded by 256 (the index entry's `device_id` is a `u8`).
+    /// Records are placed round-robin across all stores at create time; reads
+    /// route by the index entry's recorded `device_id`.
+    pub device_split: usize,
 
     /// Size of the redo log region in bytes.
     pub redo_log_size: u64,
@@ -971,6 +1011,7 @@ impl Default for ServerConfig {
             device_paths: vec![PathBuf::from("teraslab-data.dat")],
             device_size: 1024 * 1024 * 1024, // 1 GiB
             device_alignment: 4096,
+            device_split: 1,
             redo_log_size: 64 * 1024 * 1024, // 64 MiB
             redo_log_path: None,
             tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
@@ -1476,6 +1517,27 @@ impl ServerConfig {
             return Err(ConfigError::NoDevicePaths);
         }
 
+        // Store layout: total stores = device_paths.len() * device_split, and
+        // a store index must fit the index entry's u8 device_id.
+        let num_stores = self.device_paths.len().saturating_mul(self.device_split);
+        if self.device_split == 0 || num_stores == 0 || num_stores > crate::subdevice::MAX_STORES {
+            return Err(ConfigError::InvalidStoreLayout {
+                paths: self.device_paths.len(),
+                split: self.device_split,
+            });
+        }
+        // Multi-store device-scan rebuild is only implemented for the in-memory
+        // backend (`load_sharded_index_in_memory_multi` scans every store). The
+        // redb / file-backed primary rebuilds scan store 0 only, so a multi-store
+        // node on those backends would silently lose records on stores 1..N after
+        // a snapshot/index-file loss. Fail closed.
+        if num_stores > 1 && self.index.backend != IndexBackendMode::Memory {
+            return Err(ConfigError::MultiStoreRequiresMemoryBackend {
+                stores: num_stores,
+                backend: self.index.backend.clone(),
+            });
+        }
+
         // (0b) Size sanity gates. Pre-fix `device_alignment = 0` or
         // non-power-of-2 `lock_stripes` produced cryptic runtime panics.
         self.validate_sizes()?;
@@ -1961,6 +2023,56 @@ backend = ""
 
         cfg.validate_cluster_safety()
             .expect("RF=1 with best_effort must validate successfully");
+    }
+
+    #[test]
+    fn multi_store_with_redb_backend_is_rejected() {
+        // device_split>1 → 2 stores; only the in-memory backend's device-scan
+        // rebuild scans every store, so redb must be rejected (fail closed
+        // rather than silently lose records on stores 1..N after a snapshot loss).
+        let cfg = ServerConfig {
+            device_paths: vec![std::path::PathBuf::from(
+                "/tmp/teraslab-multistore-test.dat",
+            )],
+            device_split: 2,
+            index: IndexConfig {
+                backend: IndexBackendMode::Redb,
+                ..IndexConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+
+        match cfg.validate_safe_defaults() {
+            Err(ConfigError::MultiStoreRequiresMemoryBackend { stores, backend }) => {
+                assert_eq!(stores, 2);
+                assert_eq!(backend, IndexBackendMode::Redb);
+            }
+            other => panic!("expected MultiStoreRequiresMemoryBackend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_store_with_memory_backend_does_not_trip_backend_guard() {
+        // The in-memory backend supports multi-store device-scan rebuild, so the
+        // backend guard must NOT fire (later unrelated checks may still fail).
+        let cfg = ServerConfig {
+            device_paths: vec![std::path::PathBuf::from(
+                "/tmp/teraslab-multistore-test.dat",
+            )],
+            device_split: 4,
+            index: IndexConfig {
+                backend: IndexBackendMode::Memory,
+                ..IndexConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+
+        if let Err(e) = cfg.validate_safe_defaults() {
+            assert!(
+                !matches!(e, ConfigError::MultiStoreRequiresMemoryBackend { .. }),
+                "in-memory backend must not trip the multi-store backend guard, got {e:?}"
+            );
+        }
     }
 
     #[test]

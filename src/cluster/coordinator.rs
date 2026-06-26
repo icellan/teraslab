@@ -5545,6 +5545,7 @@ fn run_migration_batch(
                                 snapshot_seqs[*i],
                                 fence_seq,
                                 task.shard,
+                                &engine,
                             )
                             .unwrap_or(true)
                         })
@@ -7111,7 +7112,7 @@ pub fn redo_entry_to_replica_op(
                 child_txid: *child_txid,
             })
         }
-        RedoOp::Create { tx_key, .. } | RedoOp::CreateV2 { tx_key, .. } => {
+        RedoOp::ReplicaCreate { tx_key, .. } | RedoOp::Create { tx_key, .. } => {
             // A record created after the baseline snapshot must be sent as a
             // delta, otherwise the target never receives it. We read the full
             // current record state from the engine (metadata, UTXOs, cold data)
@@ -7269,13 +7270,15 @@ fn collect_migration_delta_ops(
     if snapshot_seq == 0 || fence_seq <= snapshot_seq {
         return Ok(Vec::new());
     }
-    let Some(rl) = redo_log else {
+    if redo_log.is_none() {
         return Ok(Vec::new());
-    };
+    }
 
-    let entries = rl
-        .lock()
-        .read_from_sequence(snapshot_seq)
+    // Per-store redo: read the window MERGED across every store's log, sorted
+    // by global sequence, so the migration delta is the single sequence-ordered
+    // stream regardless of which store each op landed in.
+    let entries = engine
+        .read_redo_from_sequence_merged(snapshot_seq)
         .map_err(|e| format!("read redo from seq {snapshot_seq}: {e}"))?;
     let first_entry_seq = entries.first().map(|e| e.sequence);
     crate::replication::durable::check_redo_truncation(first_entry_seq, snapshot_seq)?;
@@ -7317,6 +7320,7 @@ fn shard_membership_changed_in_window(
     snapshot_seq: u64,
     fence_seq: u64,
     shard: u16,
+    engine: &Engine,
 ) -> std::result::Result<bool, String> {
     use crate::redo::RedoOp;
 
@@ -7327,9 +7331,9 @@ fn shard_membership_changed_in_window(
     // snapshot sequence to anchor against (`snapshot_seq == 0`, e.g. no redo
     // log) we have no evidence either way — report "changed" so the caller
     // falls back to the safe live scan rather than trusting a stale snapshot.
-    let Some(rl) = redo_log else {
+    if redo_log.is_none() {
         return Ok(true);
-    };
+    }
     if snapshot_seq == 0 {
         return Ok(true);
     }
@@ -7337,9 +7341,10 @@ fn shard_membership_changed_in_window(
         return Ok(false);
     }
 
-    let entries = rl
-        .lock()
-        .read_from_sequence(snapshot_seq)
+    // Per-store redo: read the window MERGED across every store's log so a
+    // create/delete that landed in any store's log is observed.
+    let entries = engine
+        .read_redo_from_sequence_merged(snapshot_seq)
         .map_err(|e| format!("read redo from seq {snapshot_seq}: {e}"))?;
     let first_entry_seq = entries.first().map(|e| e.sequence);
     crate::replication::durable::check_redo_truncation(first_entry_seq, snapshot_seq)?;
@@ -7348,8 +7353,8 @@ fn shard_membership_changed_in_window(
         .iter()
         .filter(|e| e.sequence < fence_seq)
         .any(|e| match &e.op {
-            RedoOp::Create { tx_key, .. }
-            | RedoOp::CreateV2 { tx_key, .. }
+            RedoOp::ReplicaCreate { tx_key, .. }
+            | RedoOp::Create { tx_key, .. }
             | RedoOp::Delete { tx_key, .. } => ShardTable::shard_for_key(tx_key) == shard,
             _ => false,
         }))
@@ -11232,6 +11237,10 @@ mod tests {
         let redo = Arc::new(ParkingMutex::new(
             RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
         ));
+        // The delta collection reads via the engine's merged reader; attach the
+        // redo handle so it is visible (single representative handle, no
+        // per-store logs).
+        engine.set_redo_log(redo.clone());
 
         let snapshot_seq = redo.lock().current_sequence();
         redo.lock()
@@ -11299,8 +11308,9 @@ mod tests {
             })
             .unwrap();
         redo.lock()
-            .append_and_flush(crate::redo::RedoOp::Create {
+            .append_and_flush(crate::redo::RedoOp::ReplicaCreate {
                 tx_key: created,
+                device_id: 0,
                 record_offset: 0,
                 utxo_count: 1,
             })
@@ -11312,10 +11322,22 @@ mod tests {
             })
             .unwrap();
         let fence_seq = redo.lock().current_sequence();
+        // Attach the redo handle to an engine; the window check reads through
+        // the engine's merged reader (which falls back to this single
+        // representative handle when no per-store logs are attached).
+        let redo_engine = test_engine();
+        redo_engine.set_redo_log(redo.clone());
         let redo_log = Some(redo);
 
         assert!(
-            shard_membership_changed_in_window(&redo_log, snapshot_seq, fence_seq, shard).unwrap(),
+            shard_membership_changed_in_window(
+                &redo_log,
+                snapshot_seq,
+                fence_seq,
+                shard,
+                &redo_engine
+            )
+            .unwrap(),
             "a windowed create/delete on the shard must flag the membership as changed",
         );
 
@@ -11338,37 +11360,53 @@ mod tests {
         // An unrelated-shard create in the window must also be ignored.
         mutate_redo
             .lock()
-            .append_and_flush(crate::redo::RedoOp::Create {
+            .append_and_flush(crate::redo::RedoOp::ReplicaCreate {
                 tx_key: other_shard_key,
+                device_id: 0,
                 record_offset: 0,
                 utxo_count: 1,
             })
             .unwrap();
         let mutate_fence = mutate_redo.lock().current_sequence();
+        let mutate_engine = test_engine();
+        mutate_engine.set_redo_log(mutate_redo.clone());
         let mutate_log = Some(mutate_redo);
 
         assert!(
-            !shard_membership_changed_in_window(&mutate_log, mutate_snapshot, mutate_fence, shard)
-                .unwrap(),
+            !shard_membership_changed_in_window(
+                &mutate_log,
+                mutate_snapshot,
+                mutate_fence,
+                shard,
+                &mutate_engine
+            )
+            .unwrap(),
             "a window with no same-shard create/delete must keep the fast-path valid",
         );
 
         // No window (snapshot == fence) means nothing could have changed.
         assert!(
-            !shard_membership_changed_in_window(&mutate_log, mutate_fence, mutate_fence, shard)
-                .unwrap(),
+            !shard_membership_changed_in_window(
+                &mutate_log,
+                mutate_fence,
+                mutate_fence,
+                shard,
+                &mutate_engine
+            )
+            .unwrap(),
             "an empty window must report no membership change",
         );
 
         // No evidence (absent redo log, or no anchoring snapshot sequence)
         // must conservatively report "changed" so the caller rescans the live
         // index instead of trusting a possibly-stale snapshot.
+        let absent_engine = test_engine();
         assert!(
-            shard_membership_changed_in_window(&None, 10, 20, shard).unwrap(),
+            shard_membership_changed_in_window(&None, 10, 20, shard, &absent_engine).unwrap(),
             "an absent redo log must conservatively report a membership change",
         );
         assert!(
-            shard_membership_changed_in_window(&mutate_log, 0, 20, shard).unwrap(),
+            shard_membership_changed_in_window(&mutate_log, 0, 20, shard, &mutate_engine).unwrap(),
             "a zero snapshot sequence must conservatively report a membership change",
         );
     }

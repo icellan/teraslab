@@ -1242,6 +1242,43 @@ impl ShardedIndex {
         Ok(sharded)
     }
 
+    /// Rebuild the index by scanning EACH store's device, stamping every
+    /// scanned entry with its store's `device_id` so reads route back to the
+    /// right store. Used by the multi-store boot path when no index snapshot is
+    /// available. With one store this is equivalent to [`Self::rebuild_in_memory`]
+    /// (device_id 0). `devices` and `allocators` are 1:1 per store.
+    pub fn rebuild_in_memory_multi_store(
+        devices: &[std::sync::Arc<dyn BlockDevice>],
+        allocators: &[SlotAllocator],
+        shard_count: usize,
+    ) -> Result<Self, IndexError> {
+        assert_eq!(
+            devices.len(),
+            allocators.len(),
+            "devices and allocators must be 1:1 per store"
+        );
+        // Scan each store independently (proven single-device scan logic).
+        let mut singles = Vec::with_capacity(devices.len());
+        let mut total = 0usize;
+        for (dev, alloc) in devices.iter().zip(allocators.iter()) {
+            let single = PrimaryBackend::rebuild(&**dev, alloc)?;
+            total += single.len();
+            singles.push(single);
+        }
+        let per_shard_hint = (total / clamp_shard_count(shard_count))
+            .max(64)
+            .saturating_mul(2);
+        let sharded =
+            Self::new_in_memory(per_shard_hint * clamp_shard_count(shard_count), shard_count)?;
+        for (store_id, single) in singles.into_iter().enumerate() {
+            for (key, mut entry) in single.iter() {
+                entry.device_id = store_id as u8;
+                sharded.register(key, entry)?;
+            }
+        }
+        Ok(sharded)
+    }
+
     // -----------------------------------------------------------------------
     // Per-shard resize entry point
     // -----------------------------------------------------------------------
@@ -2606,6 +2643,72 @@ mod tests {
         for (i, shard) in sharded.shards.iter().enumerate() {
             let guard = shard.read();
             assert_eq!(guard.len(), 0, "shard {i} must be empty");
+        }
+    }
+
+    /// Multi-store device-scan rebuild must recover records from EVERY store and
+    /// stamp each entry's `device_id` from the store it was found on. A store-0-
+    /// only scan (the bug this guards) would silently drop every record on the
+    /// other stores after a snapshot loss.
+    #[test]
+    fn rebuild_in_memory_multi_store_recovers_records_from_every_store() {
+        use crate::io::write_full_record;
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        // Write `count` records to a fresh device, salting the txid so records on
+        // different stores never collide. Returns (device, allocator, keys).
+        let seed = |count: usize, salt: u64| {
+            let dev: std::sync::Arc<dyn BlockDevice> = std::sync::Arc::new(
+                crate::device::MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+            );
+            let mut alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+            let mut keys = Vec::with_capacity(count);
+            for i in 0..count {
+                let mut meta = TxMetadata::new(3);
+                let mut txid = [0u8; 32];
+                let id = (i as u64).wrapping_add(salt.wrapping_mul(1_000_000));
+                txid[0..8].copy_from_slice(&id.to_le_bytes());
+                txid[8..16].copy_from_slice(&salt.to_le_bytes());
+                txid[24..32].copy_from_slice(&id.wrapping_mul(0x517C_C1B7_2722_0A95).to_le_bytes());
+                meta.tx_id = txid;
+                let record_size = TxMetadata::record_size_for(3);
+                let offset = alloc.allocate(record_size).unwrap();
+                let slots: Vec<UtxoSlot> = (0..3u8)
+                    .map(|s| {
+                        let mut h = [0u8; 32];
+                        h[0] = s;
+                        UtxoSlot::new_unspent(h)
+                    })
+                    .collect();
+                write_full_record(&*dev, offset, &meta, &slots).unwrap();
+                keys.push((TxKey { txid }, offset));
+            }
+            (dev, alloc, keys)
+        };
+
+        let (dev0, alloc0, keys0) = seed(30, 0);
+        let (dev1, alloc1, keys1) = seed(20, 1);
+
+        let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![dev0, dev1];
+        let allocators = vec![alloc0, alloc1];
+        let sharded =
+            ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16).unwrap();
+
+        assert_eq!(
+            sharded.len(),
+            keys0.len() + keys1.len(),
+            "rebuilt index must contain records from ALL stores, not just store 0"
+        );
+        for (key, expected_offset) in &keys0 {
+            let entry = sharded.lookup(key).expect("store-0 record must be present");
+            assert_eq!(entry.record_offset, *expected_offset);
+            assert_eq!(entry.device_id, 0, "store-0 record must carry device_id 0");
+        }
+        // The case the store-0-only scan silently dropped:
+        for (key, expected_offset) in &keys1 {
+            let entry = sharded.lookup(key).expect("store-1 record must be present");
+            assert_eq!(entry.record_offset, *expected_offset);
+            assert_eq!(entry.device_id, 1, "store-1 record must carry device_id 1");
         }
     }
 }

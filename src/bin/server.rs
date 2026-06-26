@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use parking_lot::Mutex;
+use teraslab::allocator::SlotAllocator;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
@@ -32,8 +33,9 @@ use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
     AllocatorOrigin, SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
     fallback_unmined_index, load_primary_index_file_backed, load_primary_index_redb,
-    load_sharded_index_in_memory, open_mandatory_redo_log, open_tombstone_log,
-    rebuild_in_memory_secondaries, recover_or_create_allocator, secondaries_from_pair,
+    load_sharded_index_in_memory, load_sharded_index_in_memory_multi, open_mandatory_redo_log,
+    open_tombstone_log, rebuild_in_memory_secondaries, recover_or_create_allocator,
+    secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -192,11 +194,11 @@ fn run_one_catchup_pass(
         return false; // already caught up
     }
 
-    let redo_ref = ctx.redo_log.clone();
     let eng_ref = ctx.engine.clone();
-    let first_avail_seq = redo_ref
-        .as_ref()
-        .and_then(|rl| rl.lock().earliest_sequence().ok().flatten());
+    // Per-store redo splits the one logical stream across N store logs; the
+    // earliest recoverable sequence is the min across them (== global fence + 1),
+    // and catch-up must read the merged, sequence-ordered view — not a single log.
+    let first_avail_seq = eng_ref.earliest_redo_sequence_merged().ok().flatten();
     let cluster_key_handle = ctx.cluster_key_handle.clone();
     let auth_secret = ctx.auth_secret.clone();
 
@@ -207,11 +209,7 @@ fn run_one_catchup_pass(
         1000,
         max_ops_per_pass,
         &|seq| {
-            let rl = match redo_ref.as_ref() {
-                Some(rl) => rl,
-                None => return Vec::new(),
-            };
-            let entries = match rl.lock().read_from_sequence(seq) {
+            let entries = match eng_ref.read_redo_from_sequence_merged(seq) {
                 Ok(e) => e,
                 Err(_) => return Vec::new(),
             };
@@ -482,6 +480,55 @@ fn main() {
             }
         };
 
+    // 1b. Build the per-store devices. Each configured device_path is carved
+    // into `device_split` virtual stores (SubDevices). `device_split == 1` with
+    // a single path keeps the raw device untouched (byte-identical single
+    // store). Total store count was validated to 1..=256 by
+    // `validate_safe_defaults` (the index entry's device_id is a u8).
+    let num_stores = config.device_paths.len() * config.device_split;
+    let store_devices: Vec<Arc<dyn BlockDevice>> = if num_stores == 1 {
+        vec![device.clone()]
+    } else {
+        let mut devs: Vec<Arc<dyn BlockDevice>> = Vec::with_capacity(num_stores);
+        for (i, path) in config.device_paths.iter().enumerate() {
+            // device_paths[0] is already open as `device`; open the rest.
+            let phys: Arc<dyn BlockDevice> = if i == 0 {
+                device.clone()
+            } else {
+                match DirectDevice::open(path, config.device_size, config.device_alignment) {
+                    Ok(d) => Arc::new(d),
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), err = %e, "failed to open device");
+                        std::process::exit(1);
+                    }
+                }
+            };
+            if config.device_split == 1 {
+                devs.push(phys);
+            } else {
+                match teraslab::subdevice::split_device(phys, config.device_split) {
+                    Ok(subs) => devs.extend(subs.into_iter().map(|s| s as Arc<dyn BlockDevice>)),
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), err = %e, "failed to split device into virtual stores");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        devs
+    };
+    // Store 0 backs the existing single-store boot code (snapshot load, header
+    // verify); stores 1..N are wired in below for allocators/recovery/engine.
+    let device = store_devices[0].clone();
+    if num_stores > 1 {
+        tracing::info!(
+            stores = num_stores,
+            paths = config.device_paths.len(),
+            split = config.device_split,
+            "multi-store layout: records placed round-robin across stores",
+        );
+    }
+
     // Validate device_id config format before using it.
     if let Err(e) = config.validate_device_id() {
         tracing::error!(err = %e, "FATAL: invalid config");
@@ -575,6 +622,31 @@ fn main() {
         }
     }
 
+    // 2b. Per-store allocators. Store 0 is the `allocator` just recovered;
+    // stores 1..N recover their own header. Each is tagged with its store
+    // index so its AllocateRegion/FreeRegion redo entries carry that store's
+    // device_id (recovery routes region ops to the right store's allocator).
+    let mut store_allocators: Vec<SlotAllocator> = Vec::with_capacity(num_stores);
+    let mut allocator = allocator;
+    allocator.set_redo_device_id(0);
+    store_allocators.push(allocator);
+    for (i, sdev) in store_devices.iter().enumerate().skip(1) {
+        let (mut alloc, _origin) = match recover_or_create_allocator(sdev.clone()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::error!(
+                    store = i,
+                    err = %e,
+                    "FATAL: store allocator header unusable — refusing to start (creates \
+                     could overwrite live records). Inspect/restore the store device.",
+                );
+                std::process::exit(1);
+            }
+        };
+        alloc.set_redo_device_id(i as u8);
+        store_allocators.push(alloc);
+    }
+
     // 3. Load or rebuild index (backend selected by config)
     let index_backend_name = match &config.index.backend {
         IndexBackendMode::Memory => "memory",
@@ -595,6 +667,19 @@ fn main() {
     // backends are not yet sharded (deferred follow-up) and run at one shard,
     // warning once if a multi-shard count is configured.
     let index_shards = config.index.index_shards;
+    // Device-scan primary rebuild (snapshot lost/corrupt). Records are round-robin
+    // placed across all stores and routed by `entry.device_id`, so the rebuild
+    // MUST scan every store — a single-store (store-0-only) scan silently loses
+    // every record on stores 1..N. `load_sharded_index_in_memory_multi` scans all
+    // stores and stamps each entry's `device_id`. N=1 keeps the byte-identical
+    // single-device path.
+    let rebuild_primary_from_scan = |shard_count: usize| -> Result<ShardedIndex, _> {
+        if num_stores > 1 {
+            load_sharded_index_in_memory_multi(&store_devices, &store_allocators, shard_count)
+        } else {
+            load_sharded_index_in_memory(&*device, &store_allocators[0], shard_count)
+        }
+    };
     let load_outcome: (ShardedIndex, SecondaryLoadOutcome) = if config.index.backend
         == IndexBackendMode::Redb
     {
@@ -606,7 +691,7 @@ fn main() {
                  using 1 shard (sharding is implemented for the in-memory backend)",
             );
         }
-        let primary = match load_primary_index_redb(&config.index, &*device, &allocator) {
+        let primary = match load_primary_index_redb(&config.index, &*device, &store_allocators[0]) {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "redb primary index opened");
                 idx
@@ -655,7 +740,7 @@ fn main() {
             fb_path,
             config.expected_records,
             &*device,
-            &allocator,
+            &store_allocators[0],
         ) {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "file-backed index opened");
@@ -667,7 +752,7 @@ fn main() {
             }
         };
         // File-backed mode: secondary indexes stay in-memory.
-        let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+        let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
         (ShardedIndex::from_single(primary), secondaries)
     } else {
         // In-memory backend (default). Builds a `ShardedIndex` at
@@ -686,14 +771,15 @@ fn main() {
                     );
                     let secondaries = if flags.dah_needs_rebuild && flags.unmined_needs_rebuild {
                         tracing::warn!("both secondary indexes need rebuild (snapshot corrupt)");
-                        rebuild_in_memory_secondaries(&*device, &allocator)
+                        rebuild_in_memory_secondaries(&*device, &store_allocators[0])
                     } else if flags.dah_needs_rebuild {
                         tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
                         // Preserve the intact unmined from the snapshot;
                         // rebuild only DAH from the device scan. Failure
                         // marks DAH as degraded but keeps unmined healthy.
                         match teraslab::index::PrimaryBackend::rebuild_secondary(
-                            &*device, &allocator,
+                            &*device,
+                            &store_allocators[0],
                         ) {
                             Ok((rebuilt_dah, _)) => SecondaryLoadOutcome {
                                 dah: DahBackend::from(rebuilt_dah),
@@ -721,7 +807,8 @@ fn main() {
                     } else if flags.unmined_needs_rebuild {
                         tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
                         match teraslab::index::PrimaryBackend::rebuild_secondary(
-                            &*device, &allocator,
+                            &*device,
+                            &store_allocators[0],
                         ) {
                             Ok((_, rebuilt_unmined)) => SecondaryLoadOutcome {
                                 dah: DahBackend::from(dah),
@@ -755,28 +842,27 @@ fn main() {
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
-                    let index =
-                        match load_sharded_index_in_memory(&*device, &allocator, index_shards) {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                                std::process::exit(1);
-                            }
-                        };
-                    let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+                    let index = match rebuild_primary_from_scan(index_shards) {
+                        Ok(idx) => idx,
+                        Err(e) => {
+                            tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                            std::process::exit(1);
+                        }
+                    };
+                    let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
                     (index, secondaries)
                 }
             }
         } else {
             tracing::info!("no index snapshot found, rebuilding from device");
-            let index = match load_sharded_index_in_memory(&*device, &allocator, index_shards) {
+            let index = match rebuild_primary_from_scan(index_shards) {
                 Ok(idx) => idx,
                 Err(e) => {
                     tracing::error!(err = %e, "FATAL: primary index rebuild failed");
                     std::process::exit(1);
                 }
             };
-            let secondaries = rebuild_in_memory_secondaries(&*device, &allocator);
+            let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
             (index, secondaries)
         }
     };
@@ -827,31 +913,59 @@ fn main() {
     // ack a lie (the bytes are in volatile memory and disappear at
     // shutdown). On open or create failure we fail closed so the operator
     // can fix permissions / disk / path and try again.
+    // Per-store redo: one redo log per store so writes get N parallel fsync
+    // streams instead of serializing on a single redo mutex. Store 0 uses the
+    // configured path; store i (i >= 1) uses a `.<i>` suffix sibling. All logs
+    // share ONE global sequence counter so the redo sequence — the replication
+    // contract — stays globally ordered across stores.
     let redo_log_path = config.resolved_redo_log_path();
-    let (redo_log_device, redo_log) = match open_mandatory_redo_log(
-        &redo_log_path,
-        config.redo_log_size,
-        config.device_alignment,
-    ) {
-        Ok(parts) => parts,
-        Err(e) => {
-            tracing::error!(
-                path = %redo_log_path.display(),
-                err = %e,
-                "FATAL: redo log unavailable — cannot start with mandatory WAL disabled",
-            );
-            std::process::exit(1);
+    let mut redo_log_devices: Vec<Arc<dyn BlockDevice>> = Vec::with_capacity(num_stores);
+    let mut redo_logs_owned: Vec<RedoLog> = Vec::with_capacity(num_stores);
+    for store_idx in 0..num_stores {
+        let path = if store_idx == 0 {
+            redo_log_path.clone()
+        } else {
+            let mut os = redo_log_path.clone().into_os_string();
+            os.push(format!(".{store_idx}"));
+            std::path::PathBuf::from(os)
+        };
+        match open_mandatory_redo_log(&path, config.redo_log_size, config.device_alignment) {
+            Ok((dev, log)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    store = store_idx,
+                    size_mib = config.redo_log_size / (1024 * 1024),
+                    "redo log opened (mandatory, per-store)",
+                );
+                redo_log_devices.push(dev);
+                redo_logs_owned.push(log);
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    store = store_idx,
+                    err = %e,
+                    "FATAL: redo log unavailable — cannot start with mandatory WAL disabled",
+                );
+                std::process::exit(1);
+            }
         }
-    };
-    tracing::info!(
-        path = %redo_log_path.display(),
-        size_mib = config.redo_log_size / (1024 * 1024),
-        "redo log opened (mandatory)",
-    );
-    // Keep the device handle alive for the lifetime of the process so
-    // any future redo-log replay/extension paths share the same fd.
-    let _redo_log_device: Arc<dyn BlockDevice> = redo_log_device;
-    let mut redo_log: Option<RedoLog> = Some(redo_log);
+    }
+
+    // Seed and attach the shared global sequence counter from the max
+    // local high-water mark across all stores' logs, so a restart never reuses
+    // a sequence number that landed in any store's log before the crash.
+    let shared_seq_floor =
+        teraslab::redo::RedoLog::shared_sequence_floor(&redo_logs_owned.iter().collect::<Vec<_>>());
+    let shared_seq = Arc::new(std::sync::atomic::AtomicU64::new(shared_seq_floor));
+    for log in &mut redo_logs_owned {
+        log.attach_shared_sequence(shared_seq.clone());
+    }
+
+    // Keep the device handles alive for the lifetime of the process so any
+    // future redo-log replay/extension paths share the same fds.
+    let _redo_log_devices: Vec<Arc<dyn BlockDevice>> = redo_log_devices;
+    let mut redo_logs: Option<Vec<RedoLog>> = Some(redo_logs_owned);
 
     // Construct the blob store up front so recovery can reconcile orphan
     // blobs against the freshly-replayed primary index (R-049). The store is
@@ -865,8 +979,7 @@ fn main() {
     // durability intent records (RedoOp::SecondaryUnminedUpdate /
     // SecondaryDahUpdate) reconcile the on-disk redb secondary indexes AND
     // RedoOp::AllocateRegion / FreeRegion entries replay into the rebuilt
-    // allocator so freelist mutations between snapshots are not lost.
-    let mut allocator = allocator;
+    // per-store allocators so freelist mutations between snapshots are not lost.
     let mut pending_conflicting_children = Vec::new();
     let mut pending_deleted_children = Vec::new();
     // Height subsystem (deletion-tombstone design §4; BUG3): the max block
@@ -874,7 +987,7 @@ fn main() {
     // into the last-durable-height floor below so a lost/corrupt `.height` file
     // cannot regress the node to height 0. Independent of `tombstones_enabled`.
     let mut recovery_height_floor: u32 = 0;
-    if let Some(ref mut redo) = redo_log {
+    if let Some(ref mut redo) = redo_logs {
         // B-7: only the redb backend has crash-durable secondaries that
         // already reflect committed state; when it loaded both cleanly,
         // reconcile just the redo-touched keys (O(redo)) instead of
@@ -886,13 +999,13 @@ fn main() {
         let full_secondary_rebuild = !(config.index.backend == IndexBackendMode::Redb
             && secondary_status.dah_ok
             && secondary_status.unmined_ok);
-        match teraslab::recovery::recover_all_with_allocator_collecting_pending_conflicts_progress(
-            &*device,
-            redo,
+        match teraslab::recovery::recover_all_multi_store(
+            &store_devices,
+            &mut store_allocators,
+            redo.as_mut_slice(),
             &index,
             &mut dah_index,
             &mut unmined_index,
-            Some(&mut allocator),
             full_secondary_rebuild,
         ) {
             Ok((stats, pending, deleted)) => {
@@ -968,21 +1081,30 @@ fn main() {
         }
     }
 
-    // Wrap redo log in Arc<Mutex> for shared access from dispatch threads
-    let redo_log: Option<Arc<Mutex<RedoLog>>> = redo_log.map(|log| Arc::new(Mutex::new(log)));
+    // Wrap each store's redo log in Arc<Mutex> for shared access from dispatch
+    // threads. `redo_logs_arc[i]` is store i's log; `redo_log` is store 0's,
+    // kept as the single representative handle the index / engine
+    // representative slot / replication receiver fall back to.
+    let redo_logs_arc: Option<Vec<Arc<Mutex<RedoLog>>>> =
+        redo_logs.map(|logs| logs.into_iter().map(|l| Arc::new(Mutex::new(l))).collect());
+    let redo_log: Option<Arc<Mutex<RedoLog>>> =
+        redo_logs_arc.as_ref().and_then(|v| v.first().cloned());
 
-    // Attach the redo log to the allocator BEFORE moving it into the engine,
-    // so all subsequent allocate/free operations are journaled and fsynced
-    // before the caller observes their effect. This closes the crash window
-    // between `persist()` snapshots.
-    if let Some(ref log) = redo_log {
-        allocator.set_redo_log(log.clone());
+    // Attach EACH store's redo log to ITS OWN allocator BEFORE moving them into
+    // the engine, so every allocate/free is journaled and fsynced to that
+    // store's log before the caller observes its effect. This closes the crash
+    // window between `persist()` snapshots. Each allocator already carries its
+    // store's `redo_device_id`.
+    if let Some(ref logs) = redo_logs_arc {
+        for (alloc, log) in store_allocators.iter_mut().zip(logs.iter()) {
+            alloc.set_redo_log(log.clone());
+        }
     }
 
-    // Attach the redo log to the primary index so file-backed hash table
-    // resizes are crash-atomic (Begin/Commit journaling + parent-dir fsync).
-    // The FileBacked variant actually uses the redo log; InMemory / OnDisk
-    // accept the attachment but treat it as a no-op.
+    // Attach the representative (store 0) redo log to the primary index so
+    // file-backed hash table resizes are crash-atomic (Begin/Commit journaling
+    // + parent-dir fsync). The FileBacked variant actually uses the redo log;
+    // InMemory / OnDisk accept the attachment but treat it as a no-op.
     if let Some(ref log) = redo_log {
         index.set_redo_log(log.clone());
     }
@@ -990,14 +1112,43 @@ fn main() {
     // 4. Create engine — index is already a ShardedIndex (from the recovery
     // path above), so pass it directly to avoid re-wrapping in N=1.
     let locks = StripedLocks::new(config.lock_stripes);
-    let mut engine = Engine::new_with_sharded_index(
-        device.clone(),
+    // Split the store allocators into store 0 (primary) + aux stores 1..N,
+    // pairing each aux allocator with its device, and construct the multi-store
+    // engine. With one store, aux is empty and this is exactly the prior
+    // single-store engine.
+    let mut alloc_iter = store_allocators.into_iter();
+    let primary_allocator = alloc_iter
+        .next()
+        .expect("at least one store allocator (validated >= 1 store)");
+    let aux_stores: Vec<(Arc<dyn BlockDevice>, SlotAllocator)> =
+        store_devices[1..].iter().cloned().zip(alloc_iter).collect();
+    let mut engine = Engine::new_multi_store(
+        store_devices[0].clone(),
+        primary_allocator,
+        aux_stores,
         index,
-        allocator,
         locks,
         dah_index,
         unmined_index,
     );
+
+    // Fail closed if the recovered/loaded index references a store that does not
+    // exist in the current layout (a `device_id >= store_count`). That means the
+    // node was previously run with MORE stores than are configured now, so the
+    // data placed on the removed stores is unreachable; routing such an entry
+    // would index out of bounds in `device_for`/`allocator_for` and panic the
+    // first request that touches it. Surface a clear operator error at boot.
+    if let Err(device_id) = engine.validate_device_ids() {
+        tracing::error!(
+            device_id,
+            store_count = engine.store_count(),
+            "FATAL: index references device_id {device_id} but only {} store(s) are \
+             configured — this node was previously run with more stores. Restore the \
+             original device layout (device_paths × device_split) or reset the node.",
+            engine.store_count(),
+        );
+        std::process::exit(1);
+    }
 
     // Drain R-221 engine-level append intents after constructing the engine
     // but before attaching the engine redo handle. The allocator already has
@@ -1067,10 +1218,13 @@ fn main() {
     // re-derived here from each record's authoritative CONFLICTING flag.
     engine.rebuild_conflicting_index();
 
-    // Attach the redo log so the engine performs two-phase durability for
-    // secondary index updates (redo fsync BEFORE redb commit).
-    if let Some(ref log) = redo_log {
-        engine.set_redo_log(log.clone());
+    // Attach the per-store redo logs so the engine performs two-phase durability
+    // for secondary index updates (redo fsync BEFORE redb commit), routing each
+    // intent to the owning store's log. This is the SOLE attach point: store 0's
+    // log is `logs[0]` (the representative handle the replication receiver and
+    // migration suppression read via `engine.redo_log()`).
+    if let Some(ref logs) = redo_logs_arc {
+        engine.set_redo_logs(logs.clone());
     }
 
     // 4b. Attach the (already-constructed) blobstore to the engine. The

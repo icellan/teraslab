@@ -94,7 +94,7 @@ const OP_REASSIGN: u8 = 7;
 const OP_SET_CONFLICTING: u8 = 8;
 const OP_SET_LOCKED: u8 = 9;
 const OP_PRESERVE_UNTIL: u8 = 10;
-const OP_CREATE: u8 = 11;
+const OP_REPLICA_CREATE: u8 = 11;
 const OP_DELETE: u8 = 12;
 const OP_PRUNE_SLOT: u8 = 13;
 const OP_MARK_LONGEST_CHAIN: u8 = 14;
@@ -103,7 +103,7 @@ const OP_PRUNE_SLOT_IF_SPENT_BY: u8 = 15;
 /// replica records the tombstone alongside the record removal. The legacy
 /// [`OP_DELETE`] (tag 12) stays decodable for back-compat (an old peer or an
 /// old redo/receive replay) and is emitted unchanged when tombstones are
-/// disabled. Mirrors the `CreateV2`/`SpendV2` versioning precedent: new tag,
+/// disabled. Mirrors the `Create`/`SpendV2` versioning precedent: new tag,
 /// old tag retained.
 const OP_DELETE_V2: u8 = 16;
 /// Remove a child txid from a parent's conflicting-children list. Replicated
@@ -516,7 +516,7 @@ impl ReplicaOp {
                 cold_data,
                 is_external,
             } => {
-                buf.push(OP_CREATE);
+                buf.push(OP_REPLICA_CREATE);
                 buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&(metadata_bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(metadata_bytes);
@@ -744,7 +744,7 @@ impl ReplicaOp {
                     41,
                 ))
             }
-            OP_CREATE => {
+            OP_REPLICA_CREATE => {
                 need(rest, 36)?; // key + meta_len
                 let key = read_key(rest);
                 let meta_len = r_u32(rest, 32) as usize;

@@ -18,6 +18,7 @@ func encodePartitionMapAssign(version uint64, nodes []NodeInfo, assign func(shar
 		buf = appendU64(buf, n.ID)
 		buf = appendU16(buf, uint16(len(n.Addr)))
 		buf = append(buf, []byte(n.Addr)...)
+		buf = append(buf, 1) // is_alive — matches the server wire format
 	}
 	for i := 0; i < NumShards; i++ {
 		buf = appendU64(buf, assign(i))
