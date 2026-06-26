@@ -4523,6 +4523,17 @@ fn needs_exclusive_visibility_barrier(op: u16) -> bool {
     is_mutation_opcode(op) || matches!(op, OP_REPLICA_BATCH)
 }
 
+/// Hot opcodes that take FINE-GRAINED, PER-KEY visibility instead of the coarse
+/// global barrier. `handle_request` acquires no guard for these; the handler
+/// itself acquires `engine.visibility().mutation(&keys)` (write) or `.read(&keys)`
+/// (read) once it has decoded its keys — so disjoint-key mutations/reads run
+/// concurrently while a read of key K is still excluded from a mutation of K
+/// (batch-atomic per key). All OTHER mutation opcodes keep the coarse global
+/// exclusive guard for now (correct, just not yet parallelized).
+fn manages_own_visibility(op: u16) -> bool {
+    matches!(op, OP_SPEND_BATCH | OP_GET_BATCH | OP_GET_SPEND_BATCH)
+}
+
 /// Owns whichever side of the `dispatch_visibility_barrier` rwlock is
 /// appropriate for the opcode. Dropping it releases the guard; the
 /// underlying enum keeps the borrow checker honest without exposing
@@ -4589,6 +4600,11 @@ fn acquire_dispatch_visibility_guard(
     flags: u16,
 ) -> Option<DispatchVisibilityGuard<'_>> {
     if !needs_dispatch_visibility_barrier(op) {
+        return None;
+    }
+    // Hot per-key ops self-manage their visibility inside the handler (after key
+    // decode), so `handle_request` takes no coarse guard for them.
+    if manages_own_visibility(op) {
         return None;
     }
     // W2/P3: a migration-flagged OP_REPLICA_BATCH takes the SHARED side of
@@ -4991,6 +5007,14 @@ fn handle_spend_batch(
     // on a stripe collision.
     let txid_keys: Vec<TxKey> = by_txid.keys().map(|t| TxKey { txid: *t }).collect();
     let stripe_guards = engine.lock_unique_stripes(&txid_keys);
+    // Per-key visibility: write-lock the stripes of this batch's keys (plus the
+    // global SHARED side = checkpoint coordination). Excludes any client read of
+    // THESE keys for the apply window (batch-atomic per key) while letting spends
+    // on disjoint keys run fully concurrently — the global exclusive barrier this
+    // replaces serialized every mutation. Acquired AFTER the stripe Mutexes
+    // (consistent table order) and dropped before replication, alongside
+    // `stripe_guards`.
+    let visibility_guard = engine.visibility().mutation(&txid_keys);
 
     // Per-group staged mutation carried from validate (Phase 1+2) to apply
     // (Phase 4) so the single redo flush (Phase 3) sits between them.
@@ -5300,6 +5324,10 @@ fn handle_spend_batch(
     // Release every stripe lock BEFORE replication (network I/O must not run
     // under the locks). On the error returns above the guards drop at scope end.
     drop(stripe_guards);
+    // Release per-key visibility before the replication round-trip (reads of
+    // these keys resume immediately, observing the fully-applied local batch),
+    // mirroring the old MutationBarrier early-release.
+    drop(visibility_guard);
 
     // Final per-item outcome classification for this batch. `errors` holds
     // validation failures *and* redirect errors (when the txid is not owned
@@ -8960,6 +8988,14 @@ fn handle_get_batch(
         Err(e) => return codec_error_response(req.request_id, "get batch", e),
     };
 
+    // Per-key read visibility: read-lock the stripes of the keys we read (plus
+    // the global SHARED side). A read of key K is excluded from a concurrent
+    // mutation of K (so it never observes K mid-batch), while reads share
+    // stripes with each other and run concurrently with disjoint mutations.
+    // Held across the (possibly fanned-out) reads below.
+    let vis_keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
+    let _visibility_guard = engine.visibility().read(&vis_keys);
+
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
     let results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
@@ -9615,6 +9651,12 @@ fn handle_get_spend_batch(
         Ok(r) => r,
         Err(e) => return codec_error_response(req.request_id, "get_spend batch", e),
     };
+
+    // Per-key read visibility (see handle_get_batch): exclude each read key from
+    // a concurrent mutation of that key while staying concurrent with disjoint
+    // mutations and other reads.
+    let vis_keys: Vec<TxKey> = items.iter().map(|i| TxKey { txid: i.txid }).collect();
+    let _visibility_guard = engine.visibility().read(&vis_keys);
 
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
@@ -16342,28 +16384,23 @@ mod tests {
         assert_eq!(entries[0].sequence, range.0);
     }
 
-    /// C-1: the exclusive visibility barrier serializes client reads
-    /// against the *local apply window* — a reader blocks while the
-    /// mutation handler holds the exclusive guard (during apply + redo
-    /// durability) and proceeds the instant it is released. After C-1 the
-    /// barrier is released *before* the replication round-trip, so this
-    /// test pins the local-apply portion of the contract (the no-torn-read
-    /// invariant) AND that `MutationBarrier::release` actually drops the
-    /// lock. The separate
-    /// `c1_barrier_released_before_replication_network_io` test pins that
-    /// the barrier is NOT held across the replication network RTT.
+    /// Per-key visibility: a client read of key K blocks while a mutation of K
+    /// holds the per-key write guard (the local apply window — no torn batch
+    /// observed) and proceeds the instant it is released. This is the
+    /// finer-grained replacement for the old global-barrier reader-blocking
+    /// test; cross-key concurrency (the throughput win) is pinned by the
+    /// `crate::visibility` primitive tests.
     #[test]
     fn reader_blocks_during_local_apply_window() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let engine = Arc::new(DispatchTestHarness::new().engine);
         let reader_engine = Arc::clone(&engine);
-        let mut mutation_guard =
-            acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH, 0);
-        assert!(
-            mutation_guard.is_some(),
-            "mutation op should acquire the visibility barrier",
-        );
+        let key = TxKey { txid: [0xAB; 32] };
+
+        // Hold the per-key mutation visibility for `key` (apply window).
+        let mutation_guard = engine.visibility().mutation(std::slice::from_ref(&key));
+
         let reader_entered = Arc::new(AtomicBool::new(false));
         let reader_finished = Arc::new(AtomicBool::new(false));
         let reader_entered_thread = Arc::clone(&reader_entered);
@@ -16371,9 +16408,10 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             reader_entered_thread.store(true, Ordering::SeqCst);
-            let _read_guard =
-                acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH, 0)
-                    .expect("read op should acquire the visibility barrier");
+            // A read of the SAME key must block on the mutation's per-key write.
+            let _read_guard = reader_engine
+                .visibility()
+                .read(std::slice::from_ref(&TxKey { txid: [0xAB; 32] }));
             reader_finished_thread.store(true, Ordering::SeqCst);
         });
 
@@ -16383,20 +16421,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(
             !reader_finished.load(Ordering::SeqCst),
-            "client reads must block while the mutation holds the exclusive \
-             barrier (local apply window) so no torn batch is observed"
+            "a read of the mutated key must block during its apply window so no \
+             torn batch is observed"
         );
 
-        // Releasing via the MutationBarrier handle (the C-1 early-release
-        // path) must unblock the reader exactly as dropping the whole guard
-        // does — proving `MutationBarrier::release`/drop releases the lock.
-        let barrier = mutation_barrier_from(&mut mutation_guard)
-            .expect("exclusive op yields a releasable MutationBarrier");
-        drop(barrier);
+        drop(mutation_guard);
         handle.join().expect("reader thread joins");
         assert!(
             reader_finished.load(Ordering::SeqCst),
-            "reader proceeds the instant the exclusive barrier is released"
+            "reader proceeds the instant the per-key mutation guard is released"
         );
     }
 
@@ -17619,7 +17652,11 @@ mod tests {
         let engine = Arc::new(DispatchTestHarness::new().engine);
         let reader_engine = Arc::clone(&engine);
 
-        let mut guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH, 0);
+        // A COLD mutation op (OP_FREEZE_BATCH) still takes the coarse global
+        // exclusive barrier + the releasable MutationBarrier — the C-1
+        // early-release mechanism under test. (Hot ops like spend now
+        // self-manage per-key visibility and don't use this path.)
+        let mut guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_FREEZE_BATCH, 0);
         let barrier = mutation_barrier_from(&mut guard)
             .expect("exclusive op yields a releasable MutationBarrier");
 
@@ -17635,8 +17672,9 @@ mod tests {
             // the fix).
             loop {
                 if let Some(t0) = *started_thread.lock() {
-                    let _read_guard =
-                        acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH, 0);
+                    // The global SHARED side a client read takes — blocked by the
+                    // cold mutation's global exclusive until it is released.
+                    let _read_guard = reader_engine.acquire_dispatch_visibility_guard();
                     reader_wait_thread.store(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
                     return;
                 }
@@ -17898,12 +17936,14 @@ mod tests {
             matches!(second_migration, DispatchVisibilityGuard::Shared(_)),
             "a second concurrent migration apply also takes the SHARED guard",
         );
-        let concurrent_read = acquire_dispatch_visibility_guard(engine.as_ref(), OP_GET_BATCH, 0)
-            .expect("read takes a visibility barrier");
-        assert!(
-            matches!(concurrent_read, DispatchVisibilityGuard::Shared(_)),
-            "a client read runs concurrently with migration applies (no starvation)",
-        );
+        // A client read self-manages per-key visibility, which takes the global
+        // SHARED side — so it acquires immediately alongside the migration
+        // applies (also shared), proving no starvation. (Acquiring here without
+        // blocking IS the assertion; the global shared side cannot block on
+        // another shared holder.)
+        let concurrent_read = engine
+            .visibility()
+            .read(std::slice::from_ref(&TxKey { txid: [0x5A; 32] }));
         drop(concurrent_read);
         drop(second_migration);
         drop(migration_guard);
@@ -17924,8 +17964,11 @@ mod tests {
         let finished_t = Arc::clone(&finished);
         let blocked = std::thread::spawn(move || {
             entered_t.store(true, Ordering::SeqCst);
-            let _g = acquire_dispatch_visibility_guard(blocked_engine.as_ref(), OP_SPEND_BATCH, 0)
-                .expect("mutation takes a visibility barrier");
+            // A COLD mutation (OP_FREEZE_BATCH) takes the global exclusive side,
+            // which the normal replica batch's exclusive guard blocks. (Hot ops
+            // self-manage per-key and would not contend on the global here.)
+            let _g = acquire_dispatch_visibility_guard(blocked_engine.as_ref(), OP_FREEZE_BATCH, 0)
+                .expect("cold mutation takes the global visibility barrier");
             finished_t.store(true, Ordering::SeqCst);
         });
         while !entered.load(Ordering::SeqCst) {
