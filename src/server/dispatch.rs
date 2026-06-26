@@ -5002,18 +5002,37 @@ fn handle_spend_batch(
     let mut staged: Vec<StagedSpend> = Vec::new();
     let mut all_redo_ops: Vec<RedoOp> = Vec::new();
 
-    // Phase 1+2: validate each owned group (guard-free; this fn holds the
-    // stripe locks) and build its redo + replica ops into the shared batch.
-    for (txid, group) in &by_txid {
+    // Per-group validate result, merged back in a deterministic order below.
+    struct GroupOut {
+        errors: Vec<BatchItemError>,
+        redo_ops: Vec<RedoOp>,
+        staged: Option<StagedSpend>,
+    }
+
+    // Phase 1+2: validate one owned group (guard-free; the caller holds every
+    // stripe lock) and build its redo + replica ops. This is READ-ONLY on the
+    // engine — index lookups plus device record reads inside
+    // `prepare_spend_multi` (`read_metadata_fast` + per-offset `read_slot_fast`)
+    // — so it is safe to run concurrently across groups, exactly like
+    // `decorate_get_item` in the GET path. No writes happen here; the single
+    // redo flush (Phase 3) and the serial apply (Phase 4) still run afterwards
+    // with all stripe locks held, so WAL-first ordering and per-txid atomicity
+    // are unchanged.
+    let validate_group = |txid: &[u8; 32], group: &[(usize, &WireSpendItem)]| -> GroupOut {
+        let mut out = GroupOut {
+            errors: Vec::new(),
+            redo_ops: Vec::new(),
+            staged: None,
+        };
         if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
             for &(i, _) in group {
-                errors.push(BatchItemError {
+                out.errors.push(BatchItemError {
                     item_index: i as u32,
                     error_code: redirect_err.error_code,
                     error_data: redirect_err.error_data.clone(),
                 });
             }
-            continue;
+            return out;
         }
 
         let spend_items: Vec<SpendItem> = group
@@ -5041,15 +5060,14 @@ fn handle_spend_batch(
             Ok(v) => v,
             Err(err) => {
                 for &(i, _) in group {
-                    errors.push(spend_error_to_batch_error(i as u32, &err));
+                    out.errors.push(spend_error_to_batch_error(i as u32, &err));
                 }
-                continue;
+                return out;
             }
         };
 
         // Build redo ops for the real UNSPENT→SPENT transitions. Semantics are
-        // identical to the original per-group logic — only accumulated across
-        // groups into one batch.
+        // identical to the original per-group logic.
         //
         // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): each Spend redo entry
         // carries the cumulative `new_spent_count` AFTER its own application,
@@ -5071,7 +5089,7 @@ fn handle_spend_batch(
                 // re-spends do not emit redo/replication or bump generation;
                 // they match the single-spend no-op contract.
                 running_count = running_count.wrapping_add(1);
-                all_redo_ops.push(RedoOp::SpendV2 {
+                out.redo_ops.push(RedoOp::SpendV2 {
                     tx_key: key,
                     offset: item.vout,
                     spending_data: item.spending_data,
@@ -5095,11 +5113,48 @@ fn handle_spend_batch(
             }
         }
 
-        staged.push(StagedSpend {
+        out.staged = Some(StagedSpend {
             key,
             prepared,
             key_repl_ops,
         });
+        out
+    };
+
+    // Deterministic group order (by each group's first item index) so the merged
+    // redo/replica op order never depends on HashMap iteration or, under the
+    // fan-out, on thread scheduling.
+    let mut groups: Vec<_> = by_txid.iter().collect();
+    groups.sort_unstable_by_key(|(_, g)| g[0].0);
+
+    // Fan the read-only validate across the read pool for batches at or above
+    // READ_FANOUT_THRESHOLD (distinct txids); smaller batches stay serial. The
+    // collect is order-preserving, so the merge below is deterministic.
+    let group_outs: Vec<GroupOut> = match (groups.len() >= READ_FANOUT_THRESHOLD)
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                groups
+                    .par_iter()
+                    .map(|&(txid, group)| validate_group(txid, group))
+                    .collect()
+            })
+        }
+        None => groups
+            .iter()
+            .map(|&(txid, group)| validate_group(txid, group))
+            .collect(),
+    };
+
+    for go in group_outs {
+        errors.extend(go.errors);
+        all_redo_ops.extend(go.redo_ops);
+        if let Some(s) = go.staged {
+            staged.push(s);
+        }
     }
 
     // Phase 3: ONE redo write for the whole RPC (single fsync), WAL-first. All
@@ -13796,6 +13851,164 @@ mod tests {
             "the whole {N}-txid-group SpendBatch RPC must be ONE effective redo \
              flush — one fsync (entries + folded header, PERF #5) — not one per \
              txid-group; got {flush_syncs} syncs",
+        );
+    }
+
+    /// Parallel read fan-out for the spend validate phase must preserve exact
+    /// per-item outcomes. Drives a batch above `READ_FANOUT_THRESHOLD` with a
+    /// mix of valid spends, a UTXO-hash mismatch, and a not-found txid, then
+    /// asserts the resulting on-device state and the single-flush contract —
+    /// so the fanned `prepare_spend_multi` reads can't reorder, drop, or
+    /// misclassify any item versus the old serial loop.
+    #[test]
+    fn spend_batch_parallel_validate_preserves_per_item_outcomes() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 16 * 1024 * 1024).unwrap(),
+        ));
+
+        let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &engine, 8192, None, Some(&redo_log), &mut cs, None)
+        };
+
+        // N valid txids, each with 2 utxos. N is comfortably above
+        // READ_FANOUT_THRESHOLD (8) so the parallel validate path is taken.
+        const N: usize = 10;
+        let mk_txid = |k: usize| {
+            let mut t = [0u8; 32];
+            t[0] = 0xA7;
+            t[1] = k as u8;
+            t
+        };
+        let mk_hash = |k: usize, vout: u8| {
+            let mut h = [0u8; 32];
+            h[0] = 0xA7;
+            h[1] = k as u8;
+            h[2] = vout;
+            h
+        };
+
+        let create_items: Vec<WireCreateItem> = (0..N)
+            .map(|k| WireCreateItem {
+                txid: mk_txid(k),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![mk_hash(k, 0), mk_hash(k, 1)],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
+        assert_eq!(
+            request(OP_CREATE_BATCH, encode_create_batch(&create_items)).status,
+            STATUS_OK,
+            "seed creates must succeed"
+        );
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 0,
+        };
+        // Build a spend batch: vout 0 valid on all N txids, plus two doomed
+        // items — a wrong-hash spend on txid 0's vout 1, and a spend of a txid
+        // that was never created. Distinct txids = N + 1 (>= threshold).
+        let mut spend_items: Vec<WireSpendItem> = (0..N)
+            .map(|k| WireSpendItem {
+                txid: mk_txid(k),
+                vout: 0,
+                utxo_hash: mk_hash(k, 0),
+                spending_data: [0xD3; 36],
+            })
+            .collect();
+        spend_items.push(WireSpendItem {
+            txid: mk_txid(0),
+            vout: 1,
+            utxo_hash: [0xEE; 32], // wrong hash -> must be rejected, slot stays unspent
+            spending_data: [0xD3; 36],
+        });
+        let missing_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xBB;
+            t
+        };
+        spend_items.push(WireSpendItem {
+            txid: missing_txid,
+            vout: 0,
+            utxo_hash: [0x00; 32],
+            spending_data: [0xD3; 36],
+        });
+
+        let syncs_before = redo_dev.sync_count();
+        let resp = request(OP_SPEND_BATCH, encode_spend_batch(&params, &spend_items));
+        let flush_syncs = redo_dev.sync_count() - syncs_before;
+
+        // Two of the items fail (wrong hash + not-found), so the batch reports
+        // a partial error; the valid items still applied.
+        assert_eq!(
+            resp.status, STATUS_PARTIAL_ERROR,
+            "batch with 2 doomed items should report partial error"
+        );
+
+        // Every valid txid's vout 0 must be SPENT; vout 1 must be UNSPENT.
+        for k in 0..N {
+            let slots = engine
+                .read_slots(&TxKey { txid: mk_txid(k) })
+                .expect("created txid must exist");
+            assert_eq!(
+                slots[0].status,
+                crate::record::UTXO_SPENT,
+                "txid {k} vout 0 must be spent by the fanned batch"
+            );
+            assert_eq!(
+                slots[1].status,
+                crate::record::UTXO_UNSPENT,
+                "txid {k} vout 1 must remain unspent"
+            );
+        }
+        // The wrong-hash item targeted txid 0 vout 1 — already asserted UNSPENT
+        // above, confirming the mismatch was rejected, not silently applied.
+        // The not-found txid must not have been created as a side effect.
+        assert!(
+            engine.read_slots(&TxKey { txid: missing_txid }).is_err(),
+            "spend of a missing txid must not materialize a record"
+        );
+
+        // WAL-first single-flush contract is unchanged by the fan-out: the N
+        // valid spends commit in exactly one redo fsync.
+        assert_eq!(
+            flush_syncs, 1,
+            "fanned spend validate must still collapse to one redo flush; got {flush_syncs}"
         );
     }
 
