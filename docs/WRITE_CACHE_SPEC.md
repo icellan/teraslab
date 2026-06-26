@@ -10,11 +10,11 @@ latency (the load-test harness measured `spend` ≈ 20 ms per 256-item batch on
 the macOS Docker virtual disk, with the server I/O-wait bound at ~0.75 of 8
 cores).
 
-Aerospike hides this with an in-RAM cache (the "2 GB write cache"): writes ack
-from a streaming write buffer and flush to the device asynchronously, and reads
-of recent records are served from RAM. This spec adds the equivalent to
-TeraSlab as a single, optional layer, **configurable down to zero for maximum
-safety** (zero = today's exact `O_DIRECT` behavior).
+Buffered-write stores hide this with an in-RAM cache: writes ack from a
+streaming write buffer and flush to the device asynchronously, and reads of
+recent records are served from RAM. This spec adds the equivalent to TeraSlab as
+a single, optional layer, **configurable down to zero for maximum safety** (zero
+= today's exact `O_DIRECT` behavior).
 
 ## Why a `BlockDevice` wrapper (the altitude)
 
@@ -47,7 +47,7 @@ lazy and WAL-covered.
 |---|---|---|
 | **#1 read cache (write-through)** | `pwrite` → inner device immediately **and** cache the block; `pread` served from cache on hit | **Identical.** Ack still gated by redo fsync; device still written in step 3. Pure read acceleration. |
 | **#2 write-back buffer** | `pwrite` → cache block, mark dirty, **do not** touch inner; `sync()` flushes dirty then `inner.sync()` | **Identical**, because the checkpoint already calls the data-device `sync()` barrier before compacting redo (`recovery.rs:19`). A dirty block lost on crash is replayed from the fsynced redo entry. Only step 3 becomes lazier — which the WAL already covers. |
-| ack-before-redo-fsync (Aerospike `commit-to-device=false`) | ack from RAM before redo is durable | **Weaker** — loses acked writes on crash. **Out of scope / not built.** "Max safety = 0" means redo-fsync-before-ack, which is the default. |
+| ack-before-redo-fsync (an async-commit mode) | ack from RAM before redo is durable | **Weaker** — loses acked writes on crash. **Out of scope / not built.** "Max safety = 0" means redo-fsync-before-ack, which is the default. |
 
 The single critical invariant for #2: the checkpoint's data-device barrier must
 flush the cache before redo compaction. This is satisfied **for free** because

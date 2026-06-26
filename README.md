@@ -475,16 +475,6 @@ loadgen's single shared `tokio::Mutex` work-queue (a client-side artifact). So
 the cache is a **latency** win on read-modify-write paths; raising end-to-end
 throughput needs a faster WAL path and a lock-free client.
 
-**Aerospike comparison (same Docker disk; `asbench`, harness not committed).** A
-disk-backed Aerospike CE namespace on the same virtualized disk sustains
-~200k TPS insert / ~117k TPS mixed (20% read / 80% write) — ~7× TeraSlab's ~17k
-here. The gap is **not** the data-device read cost (the cache addressed that): it
-is Aerospike acking writes from its in-RAM streaming buffers with async flush,
-plus an async-pipelined client, versus TeraSlab's WAL-fsync-before-ack durability
-and the batch loadgen's shared-mutex queue. The comparison is disk-to-disk but
-not durability-to-durability, and both are gated here by the macOS Docker virtual
-disk rather than the NVMe TeraSlab targets.
-
 ## Wire protocol
 
 TeraSlab uses a compact binary protocol over TCP. Every request and response is a length-prefixed frame:
