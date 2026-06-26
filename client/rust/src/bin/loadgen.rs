@@ -80,10 +80,19 @@ async fn main() {
             .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
             .unwrap_or_default(),
         pool: PoolConfig {
-            min_conns: conns.min(8),
+            // Open the FULL connection count up front. ConnPool::get() only
+            // round-robins existing connections and never grows past what the
+            // health loop maintains (min_conns), so a smaller min_conns would
+            // silently cap the bench at min_conns sockets regardless of --conns.
+            min_conns: conns,
             max_conns: conns,
             dial_timeout: Duration::from_secs(5),
-            health_check: Duration::from_secs(15),
+            // Short health interval so the pool replenishes to `min_conns`
+            // connections within the warmup window below. The pool only grows
+            // toward min_conns on the health tick (get() never creates beyond
+            // the first live conn), so a long interval would leave the bench
+            // running on a single socket.
+            health_check: Duration::from_millis(200),
             ..Default::default()
         },
         cluster_refresh_interval: Duration::from_secs(30),
@@ -106,6 +115,15 @@ async fn main() {
             eprintln!("Ping failed: {e}");
             std::process::exit(1);
         }
+    }
+
+    // Warm up the connection pool to `conns` sockets before timing. The pool
+    // fills toward min_conns on its (now 200ms) health tick rather than on
+    // demand, so without this the timed run would otherwise start on a single
+    // connection and ramp up mid-measurement.
+    if conns > 1 {
+        eprintln!("Warming up {conns} connections...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
