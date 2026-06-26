@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 /// Unlike the hashtable seed this value is never persisted and has no
 /// on-disk layout implications: lock striping is purely in-memory, so a
 /// fresh random seed every process start is free of compatibility concerns.
-fn stripe_seed() -> u64 {
+pub(crate) fn stripe_seed() -> u64 {
     // Prefer the OS CSPRNG. Unlike the index hashtable — where a non-random
     // seed would silently re-enable a DoS and therefore justifies a panic — a
     // lock stripe collision only costs contention, never correctness. So on the

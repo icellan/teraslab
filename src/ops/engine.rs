@@ -209,7 +209,12 @@ pub struct Engine {
     /// thus ran sequentially, and replicas added a 3 s per-RPC stall
     /// because OP_REPLICA_BATCH also acquires this guard. RwLock keeps
     /// the checkpoint guarantee while restoring per-op parallelism.
-    dispatch_visibility_barrier: parking_lot::RwLock<()>,
+    /// Per-key visibility barrier (see [`crate::visibility::VisibilityBarrier`]).
+    /// Its global side is the checkpoint gate (mutations/reads share, checkpoint
+    /// excludes); its per-key stripes give batch-atomic read-vs-mutation
+    /// exclusion without serializing disjoint mutations. The legacy
+    /// `acquire_*_visibility_guard` accessors map onto its global side.
+    visibility: std::sync::Arc<crate::visibility::VisibilityBarrier>,
     /// Per-store redo logs, one per store (index = `device_id`). Populated by
     /// [`Self::set_redo_logs`] at boot. Each store's log has its own backing
     /// region so writes get N parallel fsync streams instead of serializing on
@@ -489,6 +494,9 @@ impl Engine {
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
+        // Match the visibility barrier's per-key stripe count to the mutation
+        // lock table so the two granularities line up.
+        let visibility = crate::visibility::VisibilityBarrier::new(locks.stripe_count());
         let engine = Self {
             stores: vec![Store {
                 device,
@@ -501,7 +509,7 @@ impl Engine {
             dah_index: parking_lot::Mutex::new(dah_index),
             unmined_index: parking_lot::Mutex::new(unmined_index),
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
-            dispatch_visibility_barrier: parking_lot::RwLock::new(()),
+            visibility,
             redo_logs: std::sync::OnceLock::new(),
             redo_committers: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
@@ -1373,7 +1381,14 @@ impl Engine {
     /// compensation, and reads are blocked for the full window. Among
     /// themselves, reads are concurrent.
     pub(crate) fn acquire_dispatch_visibility_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
-        self.dispatch_visibility_barrier.read()
+        self.visibility.global_read()
+    }
+
+    /// The per-key visibility barrier, for handlers that take fine-grained
+    /// per-key read/mutation guards (hot paths) instead of the coarse global
+    /// side returned by the `acquire_*_visibility_guard` accessors.
+    pub(crate) fn visibility(&self) -> &std::sync::Arc<crate::visibility::VisibilityBarrier> {
+        &self.visibility
     }
 
     /// Acquire the EXCLUSIVE (write-side) dispatch visibility barrier —
@@ -1384,7 +1399,7 @@ impl Engine {
     pub(crate) fn acquire_mutation_visibility_guard(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, ()> {
-        self.dispatch_visibility_barrier.write()
+        self.visibility.global_write()
     }
 
     /// Backwards-compatible alias of [`Self::acquire_mutation_visibility_guard`]
@@ -1395,7 +1410,7 @@ impl Engine {
     pub(crate) fn acquire_checkpoint_visibility_guard(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, ()> {
-        self.dispatch_visibility_barrier.write()
+        self.visibility.global_write()
     }
 
     /// Update the DAH secondary index with two-phase durability.
