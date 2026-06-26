@@ -202,6 +202,15 @@ pub enum ConfigError {
         backend: IndexBackendMode,
     },
 
+    /// `cache.writeback = true` with `cache.bytes = 0`. Write-back needs a
+    /// buffer to defer writes into; a zero budget means "no cache" and can only
+    /// be write-through (i.e. the device is not wrapped at all).
+    #[error(
+        "cache.writeback = true requires cache.bytes > 0 (write-back needs a buffer); \
+         set cache.bytes to a non-zero budget or leave cache.writeback = false"
+    )]
+    WriteBackRequiresCacheBytes,
+
     /// `advertise_addr` does not parse as `host:port` (only checked when set).
     /// See F-G10-013.
     #[error(
@@ -486,6 +495,42 @@ impl IndexConfig {
     /// Whether the file-backed mmap backend is selected.
     pub fn is_file_backed(&self) -> bool {
         self.backend == IndexBackendMode::FileBacked
+    }
+}
+
+/// Optional in-RAM data-device block cache (see `docs/WRITE_CACHE_SPEC.md`).
+///
+/// `O_DIRECT` bypasses the OS page cache, so read-modify-write ops re-read each
+/// record from the device. This optional cache absorbs those reads (and, in
+/// write-back mode, defers the data writes to the next `sync()` barrier).
+///
+/// # Example (TOML)
+///
+/// ```toml
+/// [cache]
+/// bytes = 2147483648   # 2 GiB per-store; 0 (default) = no cache
+/// writeback = false    # false = write-through (no durability change)
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Per-store cache budget in bytes. `0` (default) disables the cache
+    /// entirely — the device is not wrapped and behavior is byte-for-byte the
+    /// raw `O_DIRECT` path (maximum safety).
+    pub bytes: usize,
+
+    /// `false` (default) = write-through (every write reaches the device
+    /// immediately; pure read acceleration, durability unchanged). `true` =
+    /// write-back (writes are buffered in RAM and flushed on the `sync()`
+    /// barrier the checkpoint already issues; still WAL-safe). Requires
+    /// `bytes > 0`.
+    pub writeback: bool,
+}
+
+impl CacheConfig {
+    /// Whether the cache is enabled (non-zero budget).
+    pub fn is_enabled(&self) -> bool {
+        self.bytes > 0
     }
 }
 
@@ -987,6 +1032,10 @@ pub struct ServerConfig {
     /// indexes use in-memory hash tables or on-disk redb B+ trees.
     pub index: IndexConfig,
 
+    /// Optional in-RAM data-device block cache. Disabled by default
+    /// (`bytes = 0`). See [`CacheConfig`].
+    pub cache: CacheConfig,
+
     /// Expected device identity (hex string). If set, the server refuses to
     /// start if the on-disk identity does not match. Use this to prevent
     /// accidentally pointing at the wrong device.
@@ -1080,6 +1129,7 @@ impl Default for ServerConfig {
             replica_lag_warn_threshold_ops: 10_000,
             recovery_missing_primary_tolerance: 65_536,
             index: IndexConfig::default(),
+            cache: CacheConfig::default(),
             device_id: None,
             observability: ObservabilityConfig::default(),
         }
@@ -1536,6 +1586,11 @@ impl ServerConfig {
                 stores: num_stores,
                 backend: self.index.backend.clone(),
             });
+        }
+
+        // Write-back caching needs a non-zero buffer to defer writes into.
+        if self.cache.writeback && self.cache.bytes == 0 {
+            return Err(ConfigError::WriteBackRequiresCacheBytes);
         }
 
         // (0b) Size sanity gates. Pre-fix `device_alignment = 0` or
@@ -2049,6 +2104,46 @@ backend = ""
             }
             other => panic!("expected MultiStoreRequiresMemoryBackend, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn writeback_cache_requires_nonzero_bytes() {
+        let cfg = ServerConfig {
+            cache: CacheConfig {
+                bytes: 0,
+                writeback: true,
+            },
+            ..ServerConfig::default()
+        };
+        match cfg.validate_safe_defaults() {
+            Err(ConfigError::WriteBackRequiresCacheBytes) => {}
+            other => panic!("expected WriteBackRequiresCacheBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_defaults_to_disabled_and_passes_validation() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.cache.bytes, 0, "cache is off by default");
+        assert!(!cfg.cache.writeback);
+        assert!(!cfg.cache.is_enabled());
+        // Default config (cache off) must validate.
+        cfg.validate_safe_defaults()
+            .expect("default config (cache disabled) must validate");
+    }
+
+    #[test]
+    fn writethrough_cache_with_bytes_passes_validation() {
+        let cfg = ServerConfig {
+            cache: CacheConfig {
+                bytes: 64 * 1024 * 1024,
+                writeback: false,
+            },
+            ..ServerConfig::default()
+        };
+        assert!(cfg.cache.is_enabled());
+        cfg.validate_safe_defaults()
+            .expect("write-through cache with a budget must validate");
     }
 
     #[test]

@@ -15,6 +15,7 @@
 // the trait + backends only when a real caller is ready to land
 // alongside.
 pub mod allocator;
+pub mod cache;
 pub mod checkpoint;
 pub mod cluster;
 pub mod config;

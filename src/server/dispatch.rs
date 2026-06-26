@@ -5722,22 +5722,22 @@ fn handle_set_mined_batch(
     let results: Vec<
         std::result::Result<crate::ops::set_mined::SetMinedResponse, crate::ops::error::SpendError>,
     > = match (keys.len() >= READ_FANOUT_THRESHOLD)
-            .then(read_pool)
-            .flatten()
-        {
-            Some(pool) => {
-                use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-                pool.install(|| {
-                    keys.par_iter()
-                        .map(|k| engine.set_mined_inner(k, &engine_params))
-                        .collect()
-                })
-            }
-            None => keys
-                .iter()
-                .map(|k| engine.set_mined_inner(k, &engine_params))
-                .collect(),
-        };
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                keys.par_iter()
+                    .map(|k| engine.set_mined_inner(k, &engine_params))
+                    .collect()
+            })
+        }
+        None => keys
+            .iter()
+            .map(|k| engine.set_mined_inner(k, &engine_params))
+            .collect(),
+    };
 
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
@@ -13903,7 +13903,12 @@ mod tests {
             UnminedIndex::new(),
         );
         let redo_log = Arc::new(Mutex::new(
-            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 16 * 1024 * 1024).unwrap(),
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
         ));
 
         let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
@@ -14061,7 +14066,12 @@ mod tests {
             UnminedIndex::new(),
         );
         let redo_log = Arc::new(Mutex::new(
-            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 16 * 1024 * 1024).unwrap(),
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
         ));
 
         let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
@@ -14230,6 +14240,45 @@ mod tests {
                 redo_dev.clone() as Arc<dyn BlockDevice>,
                 0,
                 redo_size.max(4096),
+            )
+            .unwrap();
+            Self {
+                engine,
+                redo_log: Arc::new(Mutex::new(redo_log)),
+                data_dev,
+                redo_dev,
+                _metrics_guard: metrics_test_lock(),
+            }
+        }
+
+        /// Engine + allocator over a [`crate::cache::CachingDevice`] wrapping the
+        /// data device, in write-through (`writeback = false`) or write-back
+        /// (`true`) mode. With write-back this proves the WAL recovers records
+        /// whose data write only ever landed in the (crash-lost) cache;
+        /// `crash_and_recover` rebuilds over the inner `data_dev`, simulating the
+        /// lost cache.
+        fn new_with_cache(writeback: bool) -> Self {
+            let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+            let cache: Arc<dyn BlockDevice> = Arc::new(crate::cache::CachingDevice::new(
+                data_dev.clone() as Arc<dyn BlockDevice>,
+                8 * 1024 * 1024,
+                writeback,
+            ));
+            let alloc = SlotAllocator::new(cache.clone()).unwrap();
+            let index = Index::new(10000).unwrap();
+            let engine = Engine::new(
+                cache.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let redo_log = crate::redo::RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                4 * 1024 * 1024,
             )
             .unwrap();
             Self {
@@ -14411,6 +14460,127 @@ mod tests {
             missing.len(),
             acked_keys.len()
         );
+    }
+
+    #[test]
+    fn writethrough_cache_is_transparent_to_engine_lifecycle() {
+        // A full create -> spend -> set_mined -> read lifecycle through a
+        // write-through cache must behave exactly as the raw device: the cache is
+        // a transparent BlockDevice wrapper.
+        let h = RedoDispatchHarness::new_with_cache(false);
+        let mut txid = [0u8; 32];
+        txid[0] = 0x42;
+        let key = TxKey { txid };
+
+        assert_eq!(h.create_tx(txid, 3).status, STATUS_OK, "create");
+        // Read back through the cache.
+        let hash = h.engine.read_slot(&key, 0).unwrap().hash;
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: hash,
+            spending_data: [0xCD; 36],
+        };
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]))
+                .status,
+            STATUS_OK,
+            "spend"
+        );
+        let sm = SetMinedBatchParams {
+            block_id: 9,
+            block_height: 500_000,
+            subtree_idx: 2,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 500_000,
+            block_height_retention: 288,
+        };
+        assert_eq!(
+            h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&sm, &[txid]))
+                .status,
+            STATUS_OK,
+            "set_mined"
+        );
+
+        // Final state is correct and coherent through the cache.
+        assert!(
+            h.engine.read_slot(&key, 0).unwrap().is_spent(),
+            "slot spent"
+        );
+        let entry = h
+            .engine
+            .read_block_entry(&key, 9)
+            .unwrap()
+            .expect("block entry present");
+        let bh = entry.block_height;
+        assert_eq!(bh, 500_000, "block height recorded");
+    }
+
+    #[test]
+    fn writeback_cache_lost_on_crash_is_recovered_from_wal() {
+        // The engine writes records through a WRITE-BACK cache, so the data-device
+        // write is deferred in RAM and never synced here. On crash that RAM is
+        // lost — exactly the volatile-write case the durability contract already
+        // tolerates (recovery.rs step 3: the data write "is NOT necessarily
+        // durable on return"). The fsynced WAL must still recover everything.
+        let h = RedoDispatchHarness::new_with_cache(true);
+
+        let mut acked = Vec::new();
+        for i in 0..20u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            txid[31] = i.wrapping_mul(11);
+            let resp = h.create_tx(txid, 3);
+            assert_eq!(resp.status, STATUS_OK, "create {i} failed");
+            acked.push(TxKey { txid });
+        }
+        // Spend slot 0 of the first 10 (the read is served coherently from the
+        // dirty cache).
+        let mut spent = Vec::new();
+        for key in acked.iter().take(10) {
+            let hash = h.engine.read_slot(key, 0).unwrap().hash;
+            let item = WireSpendItem {
+                txid: key.txid,
+                vout: 0,
+                utxo_hash: hash,
+                spending_data: [0xAB; 36],
+            };
+            let params = SpendBatchParams {
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            };
+            let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
+            assert_eq!(resp.status, STATUS_OK, "spend failed");
+            spent.push(*key);
+        }
+
+        // CRASH: drop the engine + write-back cache WITHOUT sync; recover over the
+        // inner data device, whose blocks never received the deferred writes.
+        let h2 = h.crash_and_recover();
+
+        for key in &acked {
+            assert!(
+                h2.engine.lookup(key).is_some(),
+                "created record lost after crash despite the WAL covering the write-back cache"
+            );
+        }
+        for key in &spent {
+            let slot = h2
+                .engine
+                .read_slot(key, 0)
+                .expect("spent record must be readable after recovery");
+            assert!(slot.is_spent(), "spend lost after crash despite the WAL");
+        }
     }
 
     #[test]

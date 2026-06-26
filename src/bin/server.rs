@@ -517,6 +517,38 @@ fn main() {
         }
         devs
     };
+
+    // 1c. Optionally interpose the in-RAM data-device block cache
+    // (docs/WRITE_CACHE_SPEC.md). `cache.bytes == 0` (default) leaves the raw
+    // O_DIRECT devices untouched — byte-for-byte today's behavior, maximum
+    // safety. When enabled, every store gets its own cache; the engine uses it
+    // transparently as a `BlockDevice`, and write-back stays WAL-safe because
+    // the checkpoint's data-device barrier flushes dirty blocks via `sync()`.
+    let store_devices: Vec<Arc<dyn BlockDevice>> = if config.cache.is_enabled() {
+        tracing::info!(
+            bytes = config.cache.bytes,
+            mode = if config.cache.writeback {
+                "write-back"
+            } else {
+                "write-through"
+            },
+            stores = store_devices.len(),
+            "interposing in-RAM data-device cache"
+        );
+        store_devices
+            .into_iter()
+            .map(|d| {
+                Arc::new(teraslab::cache::CachingDevice::new(
+                    d,
+                    config.cache.bytes,
+                    config.cache.writeback,
+                )) as Arc<dyn BlockDevice>
+            })
+            .collect()
+    } else {
+        store_devices
+    };
+
     // Store 0 backs the existing single-store boot code (snapshot load, header
     // verify); stores 1..N are wired in below for allocators/recovery/engine.
     let device = store_devices[0].clone();
