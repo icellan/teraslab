@@ -14586,6 +14586,10 @@ mod tests {
                 data_dev.clone() as Arc<dyn BlockDevice>,
                 8 * 1024 * 1024,
                 writeback,
+                // Long interval: keep the background writeback thread from
+                // preemptively flushing so this crash-recovery test deterministically
+                // exercises the WAL replaying cache-lost (un-synced) data writes.
+                3_600_000,
             ));
             let alloc = SlotAllocator::new(cache.clone()).unwrap();
             let index = Index::new(10000).unwrap();

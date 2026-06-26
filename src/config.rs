@@ -508,10 +508,11 @@ impl IndexConfig {
 ///
 /// ```toml
 /// [cache]
-/// bytes = 2147483648   # 2 GiB per-store; 0 (default) = no cache
-/// writeback = false    # false = write-through (no durability change)
+/// bytes = 2147483648         # 2 GiB per-store; 0 (default) = no cache
+/// writeback = false          # false = write-through (no durability change)
+/// writeback_interval_ms = 50 # write-back only: background drain cadence
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CacheConfig {
     /// Per-store cache budget in bytes. `0` (default) disables the cache
@@ -525,6 +526,30 @@ pub struct CacheConfig {
     /// barrier the checkpoint already issues; still WAL-safe). Requires
     /// `bytes > 0`.
     pub writeback: bool,
+
+    /// Write-back only: cadence in milliseconds of the background writeback
+    /// thread that continuously drains dirty blocks to the device so the dirty
+    /// footprint stays bounded (keeping writes RAM-fast and the checkpoint's
+    /// `sync()` cheap). Default 50 ms. Purely a performance knob — it changes
+    /// only *when* dirty blocks reach the device ahead of `sync()`, never what
+    /// `sync()`/recovery guarantee. Ignored in write-through mode (no thread is
+    /// spawned). Clamped to a minimum of 1 ms.
+    pub writeback_interval_ms: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            writeback: false,
+            writeback_interval_ms: default_cache_writeback_interval_ms(),
+        }
+    }
+}
+
+/// Default background writeback cadence (ms) for [`CacheConfig`].
+const fn default_cache_writeback_interval_ms() -> u64 {
+    50
 }
 
 impl CacheConfig {
@@ -2154,6 +2179,7 @@ backend = ""
             cache: CacheConfig {
                 bytes: 0,
                 writeback: true,
+                ..CacheConfig::default()
             },
             ..ServerConfig::default()
         };
@@ -2168,6 +2194,10 @@ backend = ""
         let cfg = ServerConfig::default();
         assert_eq!(cfg.cache.bytes, 0, "cache is off by default");
         assert!(!cfg.cache.writeback);
+        assert_eq!(
+            cfg.cache.writeback_interval_ms, 50,
+            "background writeback cadence defaults to 50 ms"
+        );
         assert!(!cfg.cache.is_enabled());
         // Default config (cache off) must validate.
         cfg.validate_safe_defaults()
@@ -2180,6 +2210,7 @@ backend = ""
             cache: CacheConfig {
                 bytes: 64 * 1024 * 1024,
                 writeback: false,
+                ..CacheConfig::default()
             },
             ..ServerConfig::default()
         };

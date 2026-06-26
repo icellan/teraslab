@@ -542,6 +542,7 @@ fn main() {
                     d,
                     config.cache.bytes,
                     config.cache.writeback,
+                    config.cache.writeback_interval_ms,
                 )) as Arc<dyn BlockDevice>
             })
             .collect()
