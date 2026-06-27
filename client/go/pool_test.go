@@ -104,6 +104,61 @@ func TestPoolReusesConnections(t *testing.T) {
 	}
 }
 
+// TestPoolGrowsWhenPickedConnIsBusy verifies the pool spreads concurrent load
+// across connections up to MaxConns instead of funnelling everything through a
+// single pipelined connection. The server processes each connection's requests
+// serially, so one connection caps throughput regardless of pipelining; under
+// concurrent load (the round-robin-picked connection already has in-flight
+// requests) and below MaxConns, get() must dial a fresh connection.
+func TestPoolGrowsWhenPickedConnIsBusy(t *testing.T) {
+	ln := startEchoServer(t)
+	defer ln.Close()
+
+	const maxConns = 4
+	p := newPool(ln.Addr().String(), PoolConfig{
+		MinConns:    1,
+		MaxConns:    maxConns,
+		DialTimeout: 2 * time.Second,
+		HealthCheck: 1 * time.Hour,
+	})
+	defer p.close()
+
+	ctx := context.Background()
+
+	// First get establishes one connection.
+	c1, err := p.get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mark every existing connection busy before each get so the pool is forced
+	// to grow rather than reuse. It must grow up to MaxConns and no further.
+	seen := map[*pipeConn]bool{c1: true}
+	for i := 0; i < maxConns*2; i++ {
+		p.mu.Lock()
+		for _, c := range p.conns {
+			c.inflight.Add(1)
+		}
+		p.mu.Unlock()
+
+		c, err := p.get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[c] = true
+	}
+
+	if len(seen) != maxConns {
+		t.Errorf("expected pool to grow to exactly MaxConns=%d distinct connections under concurrent load, got %d", maxConns, len(seen))
+	}
+	p.mu.Lock()
+	n := len(p.conns)
+	p.mu.Unlock()
+	if n != maxConns {
+		t.Errorf("expected pool size %d, got %d", maxConns, n)
+	}
+}
+
 func TestPoolCloseClosesAll(t *testing.T) {
 	ln := startEchoServer(t)
 	defer ln.Close()

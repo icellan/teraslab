@@ -78,16 +78,30 @@ func (p *connPool) get(ctx context.Context) (*pipeConn, error) {
 		idx := p.robin.Add(1) % uint64(n)
 		c := p.conns[idx]
 		if c.alive() {
-			p.mu.Unlock()
-			return c, nil
+			// Reuse this connection when the pool is already at capacity OR the
+			// picked connection is idle (no in-flight requests). When it is busy
+			// and we are still below MaxConns, dial a fresh connection instead:
+			// the server processes each connection's requests serially, so
+			// funnelling concurrent load through one pipelined connection caps
+			// throughput at single-connection speed. Spreading concurrent
+			// requests across up to MaxConns connections unlocks server-side
+			// parallelism. A sequential caller (each get after its previous
+			// request completed) still sees an idle pick and reuses the same
+			// connection — pipelining reuse is preserved.
+			if n >= p.config.MaxConns || !c.hasInflight() {
+				p.mu.Unlock()
+				return c, nil
+			}
+		} else {
+			// Remove dead connection.
+			p.conns[idx] = p.conns[n-1]
+			p.conns = p.conns[:n-1]
 		}
-		// Remove dead connection.
-		p.conns[idx] = p.conns[n-1]
-		p.conns = p.conns[:n-1]
 	}
 	p.mu.Unlock()
 
-	// No healthy connection available — create a new one.
+	// No healthy connection available, or all picks are busy and the pool can
+	// still grow — create a new one (createConn caps growth at MaxConns).
 	return p.createConn(ctx)
 }
 

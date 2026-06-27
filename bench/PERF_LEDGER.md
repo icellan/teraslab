@@ -113,3 +113,31 @@ native Rust client: batch-16 already yields ~9k spends/s (> reference 3342).
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
 |---|------|------|----|--------|----|-----|-------|------------|--------------|------------|
 | B0 | 2026-06-27 | loaded | spend | ops/s · p99.9 | 1381 · 295ms | 3342 · 26ms | 0.41× · 11× | baseline | — | — |
+| E1 | 2026-06-27 | loaded | all | conn pool | pool stuck at 1 conn | — | bug | pool never grew past 1 pipelined conn (get() reused first-alive); server processes a conn serially → throughput cap | client/go/pool.go (this repo) + test | grows to MaxConns under concurrent load when picked conn busy; correctness green |
+| E2 | 2026-06-27 | loaded | spend | RPC batching | 1 spend/RPC | reference batches spends | parity gap | adapter sent 1 SpendBatch RPC per Spend() while reference coalesces; added params-grouped spend batcher (adapter, Teranode tree) | teranode adapter | spend correctness suite green; helps open-loop, not the closed-loop bench |
+
+### E1/E2 outcome (honest)
+
+Both fixes are correct and verified, but **did not flip the closed-loop bench**:
+TeraSlab via the Go adapter stays ~6.5k ops/s (spend ~1.9k) vs reference ~11k.
+Why: this 128-worker bench is **closed-loop** (each worker blocks per op) over a
+**~7ms Docker-Desktop network RTT**, so throughput = workers ÷ per-op-latency.
+RPC batching and pool growth raise *open-loop* (production block-validation)
+throughput by amortizing RTT and unlocking server parallelism, but in closed-loop
+they cannot beat the latency floor. Profiling: Rust native client = 30k ops/s
+(batch 16) on the SAME server; the Go adapter adds ~12ms/op of client overhead
+atop the 7ms RTT. Higher worker counts (256/512) and shorter batch windows did
+NOT scale past ~7k — the cap is the adapter/client per-op latency + Docker RTT,
+not the datastore.
+
+**Remaining hypotheses / next steps (where it still loses + evidence):**
+1. The bench is unrepresentative: Teranode block validation is open-loop/bursty
+   (thousands of concurrent txs). An open-loop saturation harness (bounded
+   in-flight, not one-op-per-worker) would let batching/pool-growth show their
+   gain — the native Rust client already proves 30k > 11k under that pattern.
+2. Eliminate the Docker-Desktop RTT artifact (run both on Linux / host network);
+   the ~7ms RTT dominates and is not a datastore property.
+3. Server-side create cost is 1.2ms (vs spend 16µs) — a real create-path server
+   cost worth profiling for the create metric.
+4. Reduce the Go adapter's ~12ms/op overhead (go-batcher channel hop + result
+   round-trip); profile the adapter's per-op critical path.
