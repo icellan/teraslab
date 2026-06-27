@@ -153,6 +153,34 @@ pwrite. So the double-buffer fix is per-log and composes with sharding
 capacity). Confirms the fix target; not simple mutex contention nor the cache
 (devwrite 47µs) nor stripe locks (lock_wait 0).
 
+## E5 — Double-buffer redo: pwrite moved out of the log mutex (2026-06-27)
+
+Implemented the E4 fix. `RedoLog::flush_pwrite_no_sync` split into
+`prepare_flush` (under the log lock, O(1): drain buffer → device-ready blocks,
+advance cursor, move pending→cache, build header) + `commit_flush` (OUTSIDE the
+lock: the slow O_DIRECT pwrite of entries+header). `GroupCommit::flush` now does
+prepare under the lock, releases it, then pwrite+fsync — with a new `flush_guard`
+mutex serializing flushers so header blocks (sequence high-water) never regress.
+Committers contend on the log mutex only for the µs append, never the pwrite or
+fsync. Durability unchanged: the fsync still gates when bytes are durable, so a
+crash before it loses the un-synced tail exactly as before.
+
+Verification: new `buffered_flush_releases_lock_before_pwrite` test (red→green);
+full `cargo test --lib` = **2466 passed / 0 failed**, clippy clean, fmt clean.
+
+Outcome on this `[loaded-host]` (load avg ~9–18 on 8 cores): cumulative with
+E1+E2, TeraSlab spend **1381 → 2150 ops/s (+56%)**, total ~5.9k → ~7.1k. Real
+improvement, but still below the reference (spend 3342, total ~11k) — the
+closed-loop + ~7ms Docker RTT + machine-load artifacts still dominate, and the
+remaining server-side wait (create_redo still high, ~0.75 CPU cores) likely has
+another serialization (allocator `commit_pending` lock is a candidate — it falls
+inside the create_redo span). The fix is correct + tested and matters most on a
+quiet box / real hardware where the O_DIRECT pwrite is the actual cost; keeping
+it regardless of the noisy bench. Datastore still wins natively (Rust client 30k).
+
+Next: profile the create path's allocator/commit_pending lock under concurrency;
+re-measure on a quiet host; the open-loop harness remains the cleanest demo.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |

@@ -63,6 +63,13 @@ pub struct GroupCommit {
     /// checkpoint barrier) instead of per-commit. Trades a bounded crash-loss
     /// window (the un-flushed tail) for removing the fsync from the ack path.
     buffered: std::sync::atomic::AtomicBool,
+    /// Serializes flushers (the background flusher + the checkpoint barrier) so
+    /// the prepare→pwrite→fsync sequence runs in order — header blocks (which
+    /// carry the sequence high-water) are never written out of order. Committers
+    /// do NOT take this lock; they only ever contend on `log` for the O(1)
+    /// in-memory append, never the pwrite/fsync (which run under `flush_guard`
+    /// with `log` released).
+    flush_guard: Mutex<()>,
 }
 
 impl GroupCommit {
@@ -78,6 +85,7 @@ impl GroupCommit {
             }),
             cv: Condvar::new(),
             buffered: std::sync::atomic::AtomicBool::new(false),
+            flush_guard: Mutex::new(()),
         })
     }
 
@@ -99,16 +107,35 @@ impl GroupCommit {
     /// committer serialized behind whoever was mid-fsync, capping write
     /// throughput at `1 / fsync_latency`.
     pub fn flush(&self) -> Result<(), String> {
-        let (needs_sync, dev) = {
+        // Serialize flushers so prepared chunks are pwritten in cursor order and
+        // header blocks never regress. Committers never take this lock.
+        let _fg = self.flush_guard.lock();
+
+        // Phase 1 (under the log lock, O(1)): drain the buffer into device-ready
+        // blocks and advance the cursor. Release the lock immediately after.
+        let (prepared, dev) = {
             let mut log = self.log.lock();
-            let needs_sync = log
-                .flush_pwrite_no_sync()
+            let prepared = log
+                .prepare_flush()
                 .map_err(|e| format!("redo flush failed: {e}"))?;
-            (needs_sync, log.device_handle())
+            (prepared, log.device_handle())
         };
-        if !needs_sync {
-            return Ok(());
+        let Some(prepared) = prepared else {
+            return Ok(()); // nothing buffered
+        };
+
+        // Phase 2 (WITHOUT the log lock): the slow O_DIRECT pwrite of the entries
+        // + header. Concurrent committers keep appending under `log` meanwhile.
+        if let Err(e) = RedoLog::commit_flush(&dev, &prepared) {
+            if let Some(m) = crate::metrics::redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            // The buffer was already drained in Phase 1; poison so the node fails
+            // closed (recovery replays the durable prefix on restart).
+            self.log.lock().poison();
+            return Err(format!("redo flush failed: {e}"));
         }
+
         crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
         let sync_start = std::time::Instant::now();
         let sync_res = dev.sync_data();
@@ -579,6 +606,105 @@ mod tests {
         let committed = outcome.expect(
             "a buffered commit blocked behind an in-flight fsync — flush held the log lock \
              across the device barrier",
+        );
+        committed.expect("the concurrent commit itself succeeded");
+
+        // Both entries are durable after a final flush.
+        gc.flush().expect("final flush");
+        assert_eq!(gc.log().lock().recover().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn buffered_flush_releases_lock_before_pwrite() {
+        // Lever (write-concurrency): the slow O_DIRECT *pwrite* of the buffered
+        // entries must run WITHOUT the log mutex held, so a concurrent buffered
+        // commit (which only needs the lock for an in-memory append) completes
+        // while a flush is mid-pwrite. Profiling showed ~24ms `create_redo`
+        // under 60 concurrent writers came from committers blocking behind the
+        // pwrite-under-lock. Mirrors `buffered_flush_releases_lock_before_fsync`
+        // but parks the pwrite instead of the fsync.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct BlockingPwriteDev {
+            inner: MemoryDevice,
+            armed: AtomicBool,     // false during open() so header pwrites pass
+            in_pwrite: AtomicBool, // true while a pwrite is parked
+            release: AtomicBool,   // set true to let a parked pwrite return
+        }
+        impl BlockingPwriteDev {
+            fn park(&self) {
+                if self.armed.load(Ordering::SeqCst) {
+                    self.in_pwrite.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    self.in_pwrite.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        impl BlockDevice for BlockingPwriteDev {
+            fn pread(&self, b: &mut [u8], o: u64) -> DevResult<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> DevResult<usize> {
+                self.park();
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> DevResult<()> {
+                self.inner.sync()
+            }
+            fn sync_data(&self) -> DevResult<()> {
+                self.inner.sync_data()
+            }
+        }
+
+        let dev = Arc::new(BlockingPwriteDev {
+            inner: MemoryDevice::new(1024 * 1024, 4096).unwrap(),
+            armed: AtomicBool::new(false),
+            in_pwrite: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        });
+        let log = Arc::new(Mutex::new(
+            RedoLog::open(dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap(),
+        ));
+        let gc = GroupCommit::new(log);
+        gc.set_buffered(true);
+        gc.commit(vec![delete_op(1)]).expect("buffered append");
+        // Arm the blocking pwrite now that open()'s header pwrites are done.
+        dev.armed.store(true, Ordering::SeqCst);
+
+        // T1: flush enters the parked pwrite — holding NO log lock if the fix works.
+        let gc1 = gc.clone();
+        let t1 = std::thread::spawn(move || gc1.flush());
+        let mut waited = 0;
+        while !dev.in_pwrite.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 5000, "flush never reached the device pwrite");
+        }
+
+        // T2: a buffered commit must complete while the pwrite is still parked.
+        let (tx, rx) = mpsc::channel();
+        let gc2 = gc.clone();
+        let t2 = std::thread::spawn(move || {
+            let r = gc2.commit(vec![delete_op(2)]);
+            let _ = tx.send(r);
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5));
+        dev.release.store(true, Ordering::SeqCst);
+        t1.join().unwrap().expect("flush ok");
+        t2.join().unwrap();
+
+        let committed = outcome.expect(
+            "a buffered commit blocked behind an in-flight pwrite — flush held the log lock \
+             across the device pwrite",
         );
         committed.expect("the concurrent commit itself succeeded");
 

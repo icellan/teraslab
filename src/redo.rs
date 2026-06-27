@@ -2083,6 +2083,18 @@ impl RingState {
 /// **segment ring** ([`RingState`], `docs/REDO_SEGMENT_RING_DESIGN.md`) — the
 /// `write_pos`/`logical_start` linear fields are unused and the append/flush
 /// paths key off the ring pointers.
+/// Device-ready blocks produced by [`RedoLog::prepare_flush`] under the log lock
+/// and pwritten by [`RedoLog::commit_flush`] outside it. Carries the aligned
+/// entries block and the header block, each with its absolute device offset, so
+/// the slow O_DIRECT pwrite needs no `RedoLog` state and never holds the log
+/// mutex.
+pub struct PreparedFlush {
+    data: AlignedBuf,
+    data_offset: u64,
+    header: AlignedBuf,
+    header_offset: u64,
+}
+
 pub struct RedoLog {
     device: Arc<dyn BlockDevice>,
     /// Device byte offset of the redo region's first byte (the header).
@@ -2579,7 +2591,12 @@ impl RedoLog {
     /// (pwrite + its own fsync) because they make the header durable on its
     /// own, when the entries region is empty and cannot reconstruct
     /// `next_sequence` on reopen.
-    fn write_header_bytes(&self) -> Result<()> {
+    /// Build the on-disk header block for the log's CURRENT in-memory state
+    /// (`next_sequence` / `checkpoint_seq` high-water + layout pointers), padded
+    /// to the header block size. Shared by the synchronous [`Self::write_header_bytes`]
+    /// and the deferred-pwrite [`Self::prepare_flush`] path so both persist an
+    /// identical header.
+    fn build_header_buf(&self) -> AlignedBuf {
         // A ring log writes the v3 ring header (geometry + pointers); a linear
         // log writes the v2 format (byte-identical to pre-ring builds).
         let header = match &self.ring {
@@ -2600,6 +2617,11 @@ impl RedoLog {
         let mut buf = AlignedBuf::new(self.header_block_size as usize, align);
         buf[..bytes.len()].copy_from_slice(&bytes);
         // Trailing bytes are already zeroed by AlignedBuf::new.
+        buf
+    }
+
+    fn write_header_bytes(&self) -> Result<()> {
+        let buf = self.build_header_buf();
         self.device.pwrite_all_at(&buf, self.log_offset)?;
         Ok(())
     }
@@ -2945,11 +2967,47 @@ impl RedoLog {
     /// durability barrier over them. On a pwrite/header-write error the log is
     /// poisoned (buffer dropped) and the error is returned — fail-closed.
     pub fn flush_pwrite_no_sync(&mut self) -> Result<bool> {
+        match self.prepare_flush()? {
+            None => Ok(false),
+            Some(prepared) => {
+                if let Err(e) = Self::commit_flush(&self.device, &prepared) {
+                    if let Some(m) = redo_metrics() {
+                        m.redo_flush_errors_total.inc();
+                    }
+                    // The buffer was already drained by `prepare_flush`; mark the
+                    // log poisoned so the node fails closed (recovery replays the
+                    // durable prefix). `poison_drop_buffer` is idempotent on the
+                    // now-empty buffer.
+                    self.poison_drop_buffer();
+                    return Err(e);
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Phase 1 of a flush, run UNDER the log lock: drain the in-memory buffer
+    /// into device-ready blocks, advance the write cursor, move the pending
+    /// entries into the read cache, and persist the new sequence high-water in a
+    /// header block — all O(1)/in-memory (the only possible I/O is a rare
+    /// partial-block read-back when a previous flush left an unaligned tail).
+    /// Returns the prepared blocks for [`Self::commit_flush`] to pwrite OUTSIDE
+    /// the lock, or `None` when the buffer was empty.
+    ///
+    /// Splitting the slow O_DIRECT pwrite out of the log mutex (the caller does
+    /// it via `commit_flush` after releasing the lock) is what lets concurrent
+    /// committers append while a flush is mid-pwrite — profiling showed the
+    /// pwrite-under-lock was the dominant write-concurrency serialization
+    /// (~24ms `create_redo` under 60 writers). The fsync was already moved out by
+    /// lever 6b; this moves the pwrite out too. Durability is unchanged: the
+    /// fsync (`sync_device`) still gates when the pwritten bytes become durable,
+    /// so a crash before that fsync loses the un-synced tail exactly as before.
+    pub fn prepare_flush(&mut self) -> Result<Option<PreparedFlush>> {
         if self.poisoned {
             return Err(RedoError::Poisoned);
         }
         if self.buffer.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
 
         let align = self.device.alignment();
@@ -2965,67 +3023,44 @@ impl RedoLog {
             None => (self.entries_region_offset(), self.write_pos),
         };
         let device_offset = cursor_base + cursor;
-        // Append-only: writes start at an aligned offset. New flushes
-        // always keep the cursor block-aligned (see end of function),
-        // so `intra` is normally 0; the partial-block branch is taken
-        // only if a previous run left a non-aligned tail.
+        // Append-only: writes start at an aligned offset. New flushes always keep
+        // the cursor block-aligned (see below), so `intra` is normally 0; the
+        // partial-block branch is taken only if a previous run left a non-aligned
+        // tail.
         let aligned_offset = device_offset / align_u64 * align_u64;
         let intra = (device_offset - aligned_offset) as usize;
         let total = intra + self.buffer.len();
-        // Round up to alignment, padding with zeros — the
-        // sequence-monotonicity scan stops at the first length=0 word,
-        // so trailing zero bytes are the natural end-of-data sentinel.
+        // Round up to alignment, padding with zeros — the sequence-monotonicity
+        // scan stops at the first length=0 word, so trailing zero bytes are the
+        // natural end-of-data sentinel.
         let aligned_total = total.div_ceil(align) * align;
 
         let mut buf = AlignedBuf::new(aligned_total, align);
         if intra > 0 {
-            // F-G4-004: read back only the leading partial block — not
-            // the entire aligned_total. Trailing bytes past our buffer
-            // remain zero (AlignedBuf::new), so there is no
-            // read-then-rewrite of the tail.
+            // F-G4-004: read back only the leading partial block. This is the one
+            // device touch that stays under the lock; it is rare (only after an
+            // unaligned tail) and a single block.
             self.device
                 .pread_exact_at(&mut buf[..align], aligned_offset)?;
-            // Defensive zero of anything past `intra` that the read
-            // pulled in, so the post-buffer area is a clean tail-zero
-            // sentinel.
+            // Defensive zero of anything past `intra` the read pulled in.
             buf[intra..align].fill(0);
         }
-
         buf[intra..intra + self.buffer.len()].copy_from_slice(&self.buffer);
-        if let Err(e) = self.device.pwrite_all_at(&buf, aligned_offset) {
-            if let Some(m) = redo_metrics() {
-                m.redo_flush_errors_total.inc();
-            }
-            self.poison_drop_buffer();
-            return Err(e.into());
-        }
-        // F-G4-001 + PERF #5: pwrite the header (new `next_sequence` high-water
-        // + checkpoint_seq + logical_start) and let the SINGLE entries fsync
-        // (in `sync_device`) make BOTH durable. A `device.sync()` flushes every
-        // dirty block of the device, so one sync covers the entries block and
-        // the (non-overlapping) header block. This halves the per-flush fsync
-        // count versus a second standalone header fsync, while still persisting
-        // `next_sequence` on every flush — the high-water mark a corrupt-tail
-        // reopen relies on to avoid reusing a sequence number.
-        if let Err(e) = self.write_header_bytes() {
-            if let Some(m) = redo_metrics() {
-                m.redo_flush_errors_total.inc();
-            }
-            self.poison_drop_buffer();
-            return Err(e);
-        }
 
         let flushed_bytes = self.buffer.len() as u64;
         let flushed_entries = self.buffered_entries;
+
         // F-G4-004: bump the cursor by the aligned amount so subsequent flushes
-        // always start at the next aligned offset (within the active segment for
-        // a ring log; within the entries region for a linear log).
+        // always start at the next aligned offset.
         let new_cursor = (aligned_offset + aligned_total as u64) - cursor_base;
         match &mut self.ring {
             Some(r) => r.write_pos_in_seg = new_cursor,
             None => self.write_pos = new_cursor,
         }
         self.publish_atomics();
+        // Build the header AFTER advancing so it carries the post-flush
+        // high-water (next_sequence/checkpoint_seq/pointers).
+        let header = self.build_header_buf();
         self.buffer.clear();
         self.entries_cache.append(&mut self.pending_entries);
         self.buffered_entries = 0;
@@ -3034,7 +3069,27 @@ impl RedoLog {
             m.redo_bytes_per_flush.record_ns(flushed_bytes);
             m.redo_entries_per_flush.record_ns(flushed_entries);
         }
-        Ok(true)
+
+        Ok(Some(PreparedFlush {
+            data: buf,
+            data_offset: aligned_offset,
+            header,
+            header_offset: self.log_offset,
+        }))
+    }
+
+    /// Phase 2 of a flush, run OUTSIDE the log lock: pwrite the prepared entries
+    /// block then the header block. No `&mut self` state — operates on a captured
+    /// device handle and the prepared blocks — so concurrent committers hold the
+    /// log lock only for the O(1) [`Self::prepare_flush`], never the pwrite.
+    ///
+    /// F-G4-001 + PERF #5: the single entries fsync (`sync_device`, issued by the
+    /// caller afterwards) makes BOTH the entries and the (non-overlapping) header
+    /// block durable, so no separate header fsync is needed.
+    pub fn commit_flush(dev: &Arc<dyn BlockDevice>, prepared: &PreparedFlush) -> Result<()> {
+        dev.pwrite_all_at(&prepared.data, prepared.data_offset)?;
+        dev.pwrite_all_at(&prepared.header, prepared.header_offset)?;
+        Ok(())
     }
 
     /// Issue the durability fsync for bytes already pwritten by
