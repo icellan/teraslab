@@ -90,11 +90,42 @@ impl GroupCommit {
     /// Force the wrapped log durable (fsync). Used by the background flusher and
     /// the checkpoint barrier so buffered appends become durable. Idempotent and
     /// cheap when nothing is dirty.
+    ///
+    /// Lever 6(b): the (slow, ~ms `F_FULLFSYNC`) device barrier runs WITHOUT the
+    /// log mutex held. The buffered entries + header are pwritten under the lock
+    /// ([`RedoLog::flush_pwrite_no_sync`], advancing `write_pos` so concurrent
+    /// appenders resume at the new position), the lock is released, and only then
+    /// is the fsync issued on a captured device handle. Without this, every
+    /// committer serialized behind whoever was mid-fsync, capping write
+    /// throughput at `1 / fsync_latency`.
     pub fn flush(&self) -> Result<(), String> {
-        self.log
-            .lock()
-            .flush()
-            .map_err(|e| format!("redo flush failed: {e}"))
+        let (needs_sync, dev) = {
+            let mut log = self.log.lock();
+            let needs_sync = log
+                .flush_pwrite_no_sync()
+                .map_err(|e| format!("redo flush failed: {e}"))?;
+            (needs_sync, log.device_handle())
+        };
+        if !needs_sync {
+            return Ok(());
+        }
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
+        let sync_start = std::time::Instant::now();
+        let sync_res = dev.sync_data();
+        if let Some(m) = crate::metrics::redo_metrics() {
+            m.redo_flush_latency_ns.record_since(sync_start);
+        }
+        if let Err(e) = sync_res {
+            if let Some(m) = crate::metrics::redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            // The pwritten tail may not be durable — poison so the node fails
+            // closed (recovery replays the durable prefix on restart).
+            self.log.lock().poison();
+            return Err(format!("redo flush failed: {e}"));
+        }
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterRedoFsync);
+        Ok(())
     }
 
     /// The wrapped log, for paths that must lock it directly (checkpoint,
@@ -254,7 +285,7 @@ impl GroupCommit {
 mod tests {
     use super::*;
     use crate::device::{BlockDevice, MemoryDevice, Result as DevResult};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// MemoryDevice wrapper that counts `sync_data`/`sync` calls so tests can
     /// assert how many fsyncs N concurrent commits actually cost.
@@ -452,6 +483,108 @@ mod tests {
             }
         }
         panic!("log did not fill within the loop");
+    }
+
+    /// Lever 6(b): `GroupCommit::flush` must release the log mutex BEFORE the
+    /// device fsync so a concurrent buffered commit can append while a slow
+    /// fsync is in flight. A device whose `sync_data` blocks until signaled lets
+    /// us prove it: one thread starts a flush (entering the blocked sync holding
+    /// NO lock), and a commit on another thread must complete before the sync is
+    /// released. Pre-fix (fsync under the lock) the commit would block on the
+    /// log mutex until the sync returned → this test would time out.
+    #[test]
+    fn buffered_flush_releases_lock_before_fsync() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct BlockingSyncDev {
+            inner: MemoryDevice,
+            armed: AtomicBool,   // false during open() so the header sync passes
+            in_sync: AtomicBool, // true while a sync is parked
+            release: AtomicBool, // set true to let a parked sync return
+        }
+        impl BlockingSyncDev {
+            fn park(&self) {
+                if self.armed.load(Ordering::SeqCst) {
+                    self.in_sync.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    self.in_sync.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        impl BlockDevice for BlockingSyncDev {
+            fn pread(&self, b: &mut [u8], o: u64) -> DevResult<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> DevResult<usize> {
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> DevResult<()> {
+                self.park();
+                self.inner.sync()
+            }
+            fn sync_data(&self) -> DevResult<()> {
+                self.park();
+                self.inner.sync_data()
+            }
+        }
+
+        let dev = Arc::new(BlockingSyncDev {
+            inner: MemoryDevice::new(1024 * 1024, 4096).unwrap(),
+            armed: AtomicBool::new(false),
+            in_sync: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        });
+        let log = Arc::new(Mutex::new(
+            RedoLog::open(dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap(),
+        ));
+        let gc = GroupCommit::new(log);
+        gc.set_buffered(true);
+        gc.commit(vec![delete_op(1)]).expect("buffered append");
+        // Arm the blocking sync now that open()'s header sync is done.
+        dev.armed.store(true, Ordering::SeqCst);
+
+        // T1: flush enters the parked fsync — holding NO log lock if the fix works.
+        let gc1 = gc.clone();
+        let t1 = std::thread::spawn(move || gc1.flush());
+        // Wait until the fsync is parked.
+        let mut waited = 0;
+        while !dev.in_sync.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 5000, "flush never reached the device fsync");
+        }
+
+        // T2: a buffered commit must complete while the fsync is still parked.
+        let (tx, rx) = mpsc::channel();
+        let gc2 = gc.clone();
+        let t2 = std::thread::spawn(move || {
+            let r = gc2.commit(vec![delete_op(2)]);
+            let _ = tx.send(r);
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5));
+        // Release the fsync regardless so the threads can finish.
+        dev.release.store(true, Ordering::SeqCst);
+        t1.join().unwrap().expect("flush ok");
+        t2.join().unwrap();
+
+        let committed = outcome.expect(
+            "a buffered commit blocked behind an in-flight fsync — flush held the log lock \
+             across the device barrier",
+        );
+        committed.expect("the concurrent commit itself succeeded");
+
+        // Both entries are durable after a final flush.
+        gc.flush().expect("final flush");
+        assert_eq!(gc.log().lock().recover().unwrap().len(), 2);
     }
 
     #[test]

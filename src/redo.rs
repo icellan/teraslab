@@ -2356,11 +2356,39 @@ impl RedoLog {
     /// thread cannot accidentally re-flush the same bytes.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn flush(&mut self) -> Result<()> {
+        // pwrite the buffered entries + header (advancing write_pos and clearing
+        // the buffer), then the durability fsync — both under the caller's lock.
+        // This is the strict-durability path (the group-commit leader ack-waits
+        // on the fsync). The buffered background flusher uses the split form
+        // ([`Self::flush_pwrite_no_sync`] + a lock-free [`Self::sync_device`]) so
+        // it does not hold the log mutex across the (slow) barrier.
+        if !self.flush_pwrite_no_sync()? {
+            return Ok(());
+        }
+        self.sync_device()
+    }
+
+    /// Write the buffered entries + header to the device but do NOT fsync.
+    ///
+    /// Advances `write_pos`, clears the in-memory buffer, and moves the pending
+    /// entries into the read cache — so once this returns the log's in-memory
+    /// state already reflects the flush and a concurrent appender (under the
+    /// same lock) resumes at the new write position. Returns `true` if bytes
+    /// were written and a matching [`Self::sync_device`] is still required to
+    /// make them durable, `false` if the buffer was empty (nothing to sync).
+    ///
+    /// Separating the fsync lets the buffered background flusher release the log
+    /// mutex BEFORE the (slow, ~ms `F_FULLFSYNC`) device barrier, so concurrent
+    /// committers are not serialized behind another writer's fsync. The bytes
+    /// are already pwritten under the lock; the lock-free sync is a pure device
+    /// durability barrier over them. On a pwrite/header-write error the log is
+    /// poisoned (buffer dropped) and the error is returned — fail-closed.
+    pub fn flush_pwrite_no_sync(&mut self) -> Result<bool> {
         if self.poisoned {
             return Err(RedoError::Poisoned);
         }
         if self.buffer.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let align = self.device.alignment();
@@ -2403,10 +2431,10 @@ impl RedoLog {
         }
         // F-G4-001 + PERF #5: pwrite the header (new `next_sequence` high-water
         // + checkpoint_seq + logical_start) and let the SINGLE entries fsync
-        // below make BOTH durable. A `device.sync()` flushes every dirty block
-        // of the device, so one sync covers the entries block and the
-        // (non-overlapping) header block. This halves the per-flush fsync count
-        // versus a second standalone header fsync, while still persisting
+        // (in `sync_device`) make BOTH durable. A `device.sync()` flushes every
+        // dirty block of the device, so one sync covers the entries block and
+        // the (non-overlapping) header block. This halves the per-flush fsync
+        // count versus a second standalone header fsync, while still persisting
         // `next_sequence` on every flush — the high-water mark a corrupt-tail
         // reopen relies on to avoid reusing a sequence number.
         if let Err(e) = self.write_header_bytes() {
@@ -2416,29 +2444,6 @@ impl RedoLog {
             self.poison_drop_buffer();
             return Err(e);
         }
-        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
-        // Scope the sync call tightly so the latency histogram reflects only
-        // the fsync wall time, not the buffer-assembly / pwrite preamble.
-        //
-        // PERF #6: `sync_data` (fdatasync on Linux) — the redo log is a fixed
-        // length region (never resized), so the inode-metadata flush a full
-        // fsync would do is unnecessary; skipping it cuts redo flush cost on
-        // Linux. This one fsync covers both the entries pwrite and the folded
-        // header pwrite (PERF #5). reset/checkpoint/compaction keep the full
-        // `sync` (rare, and they rewrite the header on its own).
-        let sync_start = Instant::now();
-        let sync_res = self.device.sync_data();
-        if let Some(m) = redo_metrics() {
-            m.redo_flush_latency_ns.record_since(sync_start);
-        }
-        if let Err(e) = sync_res {
-            if let Some(m) = redo_metrics() {
-                m.redo_flush_errors_total.inc();
-            }
-            self.poison_drop_buffer();
-            return Err(e.into());
-        }
-        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterRedoFsync);
 
         let flushed_bytes = self.buffer.len() as u64;
         let flushed_entries = self.buffered_entries;
@@ -2454,7 +2459,44 @@ impl RedoLog {
             m.redo_bytes_per_flush.record_ns(flushed_bytes);
             m.redo_entries_per_flush.record_ns(flushed_entries);
         }
+        Ok(true)
+    }
+
+    /// Issue the durability fsync for bytes already pwritten by
+    /// [`Self::flush_pwrite_no_sync`]. Pure device-level barrier — holds no log
+    /// state — so the buffered background flusher can call it AFTER releasing
+    /// the log mutex. On failure the log is poisoned (fail-closed); a retry by a
+    /// different thread cannot make the un-synced tail durable behind the
+    /// caller's back.
+    ///
+    /// PERF #6: `sync_data` (fdatasync on Linux) — the redo log is a fixed
+    /// length region (never resized), so the inode-metadata flush a full fsync
+    /// would do is unnecessary. This one fsync covers both the entries pwrite
+    /// and the folded header pwrite (PERF #5).
+    pub fn sync_device(&mut self) -> Result<()> {
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeRedoFsync);
+        let sync_start = Instant::now();
+        let sync_res = self.device.sync_data();
+        if let Some(m) = redo_metrics() {
+            m.redo_flush_latency_ns.record_since(sync_start);
+        }
+        if let Err(e) = sync_res {
+            if let Some(m) = redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            self.poison_drop_buffer();
+            return Err(e.into());
+        }
+        crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterRedoFsync);
         Ok(())
+    }
+
+    /// A clone of the underlying device handle, so a caller holding the log lock
+    /// can capture it, release the lock, and then issue a lock-free
+    /// `sync_data()` (the buffered flush path) without serializing concurrent
+    /// appenders behind the barrier.
+    pub fn device_handle(&self) -> Arc<dyn BlockDevice> {
+        self.device.clone()
     }
 
     /// F-G4-002: drop all in-flight buffer + pending state on flush
