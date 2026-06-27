@@ -15,7 +15,10 @@ replication_factor = 1
 device_paths = ["/data/d0.dat"]
 device_size = 4294967296          # 4 GiB, matches the reference filesize 4G
 device_alignment = 4096
-redo_log_size = 67108864
+redo_log_size = 268435456   # 256 MiB: at the post-fsync-coalescing write rate the
+                            # old 64 MiB log filled faster than the checkpoint
+                            # compacted (transient LogFull backpressure). Fair vs
+                            # the reference's 4 GiB file + 128 MiB write cache.
 index_snapshot_path = "/data/index.snap"
 expected_records = 2000000
 lock_stripes = 65536

@@ -450,6 +450,57 @@ coalescing is THE win.
 finding — TeraSlab issues ~24× more, ~24× smaller device ops than the reference —
 is hardware-independent and is the real lever.
 
+## E13 — FIX LANDED: defer the secondary-index fsync in buffered mode → ~3× (2026-06-28)
+
+Pinned + fixed the E12 root cause (subagent, instrumented backtrace). The ~600
+fsync/s was **`setMined`'s two-phase secondary-index durability**:
+`update_both_secondary_indexes` / `sync_primary_and_both_secondary_atomic` called
+`RedoLog::append_batch_and_flush` — an **unconditional fsync per key** — bypassing
+buffered mode (the buffered flag lived only on the `GroupCommit` committers, not
+these engine-internal redo paths). setMined is 10% of ops but did 1–2 fsyncs each
+→ ~600/s, serializing the whole pipeline.
+
+Fix (`src/ops/engine.rs`): engine-level `redo_buffered` flag + `journal_secondary_ops`
+helper — buffered → `append_atomic` (append-only, durability deferred to the
+background flusher/checkpoint, coalesced); strict → `append_batch_and_flush`
+(unchanged). Durability preserved: secondaries are rebuilt on recovery from the
+authoritative primary metadata, and the primary write is itself buffered → primary
++ intent + redb share one flush boundary (consistent prefix on crash). lever-6
+LogFull (transient/no-poison) preserved; strict byte-identical. New test
+`buffered_secondary_index_updates_coalesce_fsyncs`. **Independently re-verified:
+`cargo test --lib` 2467 passed / 0 failed, clippy `-D warnings` clean, fmt clean.**
+Committed.
+
+Effect (open-loop, 1-store, disk, buffered+writeback):
+
+| metric | before fix | after fix |
+|--------|-----------|-----------|
+| total ops/s (IF=256, failed=0, 256MiB redo) | ~7,500 | **~22,473** (~3×) |
+| fsyncs/sec | ~437 | ~8.7 |
+| entries/flush | ~16 | **~2,445** |
+| CPU | ~0.5 core | ~0.5 core (still idle) |
+
+The dominant fsync bottleneck is GONE (entries/flush 16→2445). TeraSlab on disk
+went **~7.5k → ~22–24k** (the subagent saw 24.4k at IF=512 with the old 64 MiB
+log + transient LogFull; the clean number with a 256 MiB log is ~22.5k, failed=0).
+That is **~3× and ~60% of the reference's ~37.8k** (was ~20%). Config: bumped the
+matched config's `redo_log_size` 64→256 MiB (the old log backpressured at the new
+rate — a fair bump vs the reference's 4 GiB file + 128 MiB cache).
+
+**Remaining gap to the reference (and now-relevant levers):**
+- At high concurrency (IF=512) throughput dips and CPU stays idle → the **next
+  bottleneck is lock contention** (the redo mutex — now UNMASKED, which is what
+  E7/E8/E10's pre-encode + buffer-swap actually address — and the per-store
+  allocator `commit_pending`, E11). These were masked by the fsync before; they
+  now bind.
+- Colder secondary paths still fsync per-op in buffered mode (subagent follow-up
+  #1: `update_dah_index`/`update_unmined_index` single-secondary + conflicting/
+  deleted-child intents) — not the bottleneck here (0 samples) but share the bug;
+  fixing needs a `buffered` flag threaded through the index-backend `insert/remove`
+  signatures (~60 call sites).
+- The tmpfs ceiling (~38.6k) = the engine's true capacity = matches the reference,
+  so the headroom to close the last ~40% is real and lock-bound, not I/O-bound.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
