@@ -51,6 +51,36 @@ Median across 3 rounds (ops/sec, p99.9 µs):
 - H2: client/adapter batcher + pipelined-pool queueing inflates the tail
   independent of server time.
 
+## P1 — Profiling (2026-06-27): the datastore is NOT the bottleneck
+
+Deep profiling of the B0 loss, via `/admin/top`, `/debug/redo`, `/metrics`
+time-series, container CPU, and a client-vs-server cross-check:
+
+1. **Server-side compute is fast and uncontended.** `/admin/top` under 128-worker
+   load: spend mean **16µs** (p99.9 131µs), `lock_wait` **0**. Container CPU
+   **~0.5 of 8 cores** — the server is ~94% idle / I/O-waiting, never CPU-bound.
+2. **Server can do ~30k ops/s.** TeraSlab's *native Rust loadgen* against the SAME
+   server: **30,071 ops/s** (64 conns, batch 16) and 8,844 ops/s (64 conns,
+   batch 1) — vs the reference's ~11k ops/s aggregate. The datastore already wins
+   by ~3× on its own client.
+3. **The loss is entirely client/adapter-side.** Driven by the Teranode→TeraSlab
+   Go adapter (the production path), TeraSlab does only ~1500 ops/s because:
+   - the adapter's connection pool defaults to **16 conns** (vs the aerospike Go
+     client's ~100) — an unfair concurrency handicap [fixed in driver: pool_size];
+   - the adapter issues **1 spend per RPC** (no spend batching), while creates/gets
+     ARE batched; one spend RPC ≈ one redo-flush-rate slot → ~450 spends/s.
+   - server enforces a **per-IP connection cap of 64** (caps client concurrency).
+4. Raising the adapter pool 16→60 only lifted spend 1381→1779/s with p99.9 still
+   ~363ms — so connection count alone is not the fix; the adapter's batcher /
+   spend-per-RPC path dominates the tail.
+
+**Conclusion:** the TeraSlab *datastore* is already faster than the reference on
+the matched async-durability UTXO workload; the head-to-head loss on the
+production `utxo.Store` path is caused by the **WIP Go adapter** (lives in the
+Teranode tree, not this repo), not by the server. Next: confirm reference-adapter
+spend batching parity, then optimize the adapter (pool default + spend batching +
+batcher tuning) to realize the datastore's advantage on the production path.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
