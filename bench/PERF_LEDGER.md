@@ -395,6 +395,61 @@ shares one cache/index/allocator/checkpoint); (2) decontend the allocator
 DAH update into its single redo commit so spend takes the redo lock once. Each is
 a contained change; together they unwind the chain.
 
+## E12 — ROOT CAUSE (subagent profile): redo fsync GRANULARITY, not locks/sharding
+
+Decisive experiment — RAM-back the device (tmpfs) and re-measure:
+
+| config | backing | total ops/s | server CPU |
+|--------|---------|-------------|-----------|
+| TS 1-store | disk  | 7,544  | ~0.70 core (91% idle) |
+| TS 1-store | **tmpfs** | **38,618** | ~2.1 cores |
+| TS 4-store | disk  | 8,032  | ~1.0 core |
+| TS 4-store | **tmpfs** | **34,719** | ~2.3 cores |
+| reference  | disk  | ~37,800 | — |
+
+**RAM-backing gives 5×, and RAM-resident TeraSlab (~38.6k) MATCHES/BEATS the
+reference (~37.8k).** So the engine is NOT the bottleneck — the **physical-device
+sync pattern** is. This is the global ceiling that survived 8-way sharding: all
+stores' flushers sync to one volume and split one fixed fsync budget.
+
+Device-I/O pattern at the cap: TeraSlab issues **~600 fsyncs/sec of ~5.3 KiB
+(~16 entries) each**, and the flusher spends **87% of wall-clock inside fsync**
+(per-fsync 1.44ms @1-store, rising to 4.78ms @4-store = the shared volume
+saturating). The reference funnels writes through a 128 MiB post-write-cache
+flushed in **128 KiB** chunks → ~24× fewer, ~24× larger device ops on the SAME
+disk. That granularity gap is the entire story.
+
+**Crucial corrections to the prior direction:**
+- The `redo_commit_lock_wait` (41ms) I optimized in E7/E8/E10 is a **downstream
+  symptom**: committers queue on the redo mutex *because the flusher behind it is
+  stuck in fsync*. On tmpfs it drops to 0.05ms with NO code change. The redo-mutex
+  micro-opts (pre-encode, buffer-swap) are correct hygiene but did not and could
+  not move the disk-bound needle.
+- **Sharding the redo (E11) does not help** the real bottleneck: more shards = more
+  flushers fighting the same fixed device-fsync budget (4.78ms/fsync @4-store
+  proves contention). Do NOT build redo sharding for this.
+- `lock_wait` (stripe) = 0 throughout; the record data-write is 0.11ms (0.3% of
+  create). It is exclusively the redo *journal* fsync.
+
+**Open mechanism (the precise fix target):** the flushes are append-driven —
+`entries_per_flush ≈ 16`, NOT the 50ms background interval (raising the interval
+to 2000ms barely changed the rate). So a per-~block trigger fsyncs ~600×/s, and I
+have not yet pinned the exact call site in buffered mode (the buffered commit
+appends without flushing; the background flusher is 20/s; the 580/s remainder is
+unlocated). Pinning it (a 5-min instrument-and-rebuild) is step 1 of the fix.
+
+**THE LEVER: coalesce redo fsyncs — group-commit the flush into far fewer, far
+larger device syncs** (target ~128 KiB / hundreds of entries per fsync, like the
+reference). Buffered-compatible, contained, and the tmpfs ceiling shows the payoff
+is **~5× → ~35–40k, at/above the reference on the same disk.** Sequenced after
+that: decontend the allocator (E11) and fold spend's double-redo — but fsync
+coalescing is THE win.
+
+**Caveat (subagent):** this is Docker-on-macOS; fsync goes through virtualization
+(~1.4ms, slow). On bare-metal NVMe the absolute gap shrinks, but the relative
+finding — TeraSlab issues ~24× more, ~24× smaller device ops than the reference —
+is hardware-independent and is the real lever.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
