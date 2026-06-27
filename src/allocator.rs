@@ -865,7 +865,12 @@ impl SlotAllocator {
     /// failure the freelist is left untouched and
     /// [`AllocatorError::RedoLogFailure`] is returned.
     pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
-        let aligned_size = self.align_up(size);
+        // Align the SAME way the region was reserved (`align_reservation`): in
+        // packed mode that is the record granularity, NOT the device block, so
+        // freeing one packed record returns exactly its byte range and never
+        // over-frees the block-neighbours it shares a 4 KiB block with. In
+        // non-packed mode this is `align_up` (device block), unchanged.
+        let aligned_size = self.align_reservation(size);
 
         if aligned_size == 0 {
             return Err(AllocatorError::InvalidFree {
@@ -1735,7 +1740,10 @@ impl SlotAllocator {
     /// redo entry that points outside allocator-owned space must not
     /// register a primary index entry.
     pub fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
-        let aligned_size = self.align_up(size);
+        // Match the reservation granularity (record-aligned in packed mode, the
+        // device block otherwise) so the checked range is exactly the record's,
+        // not a 4 KiB-rounded span that would bleed into packed neighbours.
+        let aligned_size = self.align_reservation(size);
         let Some(end) = offset.checked_add(aligned_size) else {
             return false;
         };
@@ -3673,6 +3681,45 @@ mod tests {
         assert_eq!(o2 - o1, 600, "packed spacing == RECORD_ALIGN-aligned size");
         assert_eq!(o3 - o2, 600, "packed spacing == RECORD_ALIGN-aligned size");
         assert!(o3 - o1 < block, "all three must fit within one block");
+    }
+
+    #[test]
+    fn packed_free_does_not_overfree_block_neighbours() {
+        // The corruption GATE (PACKED_RECORD_STORAGE_DESIGN.md §3): freeing one
+        // packed record must return EXACTLY its byte range, not a 4 KiB-rounded
+        // span that would also free the records sharing its block.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+
+        let o1 = alloc.allocate(600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        let o3 = alloc.allocate(600).unwrap();
+        let block = 4096u64;
+        assert_eq!(o1 / block, o3 / block, "all three packed into one block");
+        assert!(alloc.is_allocated_range(o1, 600));
+        assert!(alloc.is_allocated_range(o3, 600));
+
+        // Free the MIDDLE record with its exact size.
+        alloc.free(o2, 600).unwrap();
+
+        // Neighbours must remain allocated — a 4 KiB-rounded free would have
+        // swept o3 (forward, within o2+4096) into the freelist.
+        assert!(
+            alloc.is_allocated_range(o1, 600),
+            "o1 must not be over-freed by free(o2)"
+        );
+        assert!(
+            alloc.is_allocated_range(o3, 600),
+            "o3 must not be over-freed by free(o2)"
+        );
+
+        // The freed hole is exactly o2's range and is reused as-is.
+        let reused = alloc.allocate(600).unwrap();
+        assert_eq!(
+            reused, o2,
+            "freed packed hole reused exactly; neighbours intact"
+        );
     }
 
     /// Packed reservation size rounds non-8-multiple sizes up to RECORD_ALIGN.
