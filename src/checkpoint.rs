@@ -281,7 +281,13 @@ fn run_checkpoint_loop(
             last_ckpt_completed.map(|t| t.elapsed()),
             last_fuzzy_duration,
         );
-        let blocking = usage >= emergency_water || escalate_blocking || fuzzy_overtaken;
+        // Lever 7: a segment-ring reclaim frees whole covered segments by a
+        // pointer advance — it never competes with the writer for entry space and
+        // never returns LogFull — so the blocking / escalation machinery (which
+        // exists to win the linear log's space race) is moot. Always run the
+        // non-blocking path for a ring, avoiding its needless serving stall.
+        let blocking = !engine.redo_is_ring()
+            && (usage >= emergency_water || escalate_blocking || fuzzy_overtaken);
 
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_triggered_total.inc();
@@ -641,6 +647,9 @@ where
     //    representative `redo_log` lock here, since store 0's log is the same
     //    Mutex and that would deadlock. When no per-store logs are attached
     //    (tests / single handle), fall back to the passed `redo_log` directly.
+    // The fence/reclaim helpers are layout-dispatched (lever 7): a ring records
+    // the fence in its header and reclaims by freeing covered segments; a linear
+    // log appends a RecoveryProgress marker and compacts the prefix.
     let per_store = engine.has_per_store_redo();
     if per_store {
         engine
@@ -649,7 +658,7 @@ where
     } else {
         redo_log
             .lock()
-            .mark_recovery_progress(snapshot_fence_sequence)
+            .checkpoint_fence(snapshot_fence_sequence)
             .map_err(|e| format!("redo checkpoint fence: {e}"))?;
     }
 
@@ -673,7 +682,7 @@ where
         } else {
             redo_log
                 .lock()
-                .compact_prefix_through(snapshot_fence_sequence)
+                .checkpoint_reclaim(snapshot_fence_sequence)
                 .map_err(|e| format!("redo compact: {e}"))?;
         }
         true
@@ -826,6 +835,37 @@ mod tests {
         let log = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
         let redo = Arc::new(Mutex::new(log));
         (engine, redo, dir)
+    }
+
+    /// Like [`make_engine_and_redo`] but the redo log is a fresh **segment ring**
+    /// of `count` segments of `segment_size` bytes (lever 7).
+    fn make_engine_and_ring_redo(
+        segment_size: u64,
+        count: u64,
+    ) -> (Arc<Engine>, Arc<Mutex<RedoLog>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let total = 4096 + segment_size * count;
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let log = RedoLog::format_ring(redo_dev, 0, total, segment_size).unwrap();
+        (engine, Arc::new(Mutex::new(log)), dir)
+    }
+
+    fn ring_freeze(n: u8) -> RedoOp {
+        RedoOp::Freeze {
+            tx_key: crate::index::TxKey { txid: [n; 32] },
+            offset: 0,
+        }
     }
 
     #[test]
@@ -1082,6 +1122,94 @@ mod tests {
             log.recover().unwrap().is_empty(),
             "startup recovery must skip entries covered by the durable snapshot fence"
         );
+    }
+
+    /// Phase 6: a checkpoint over a ring redo log fences (header) and reclaims
+    /// (frees covered segments) — usage drops, recovery is bounded by the fence,
+    /// and the log stays a usable ring afterwards.
+    #[test]
+    fn ring_checkpoint_fences_and_reclaims() {
+        let segment_size = 4096u64;
+        let (engine, redo, dir) = make_engine_and_ring_redo(segment_size, 4);
+        let snap_path = dir.path().join("ring.snap");
+
+        let usage_before = {
+            let mut log = redo.lock();
+            for i in 0..200u32 {
+                log.append(ring_freeze((i % 251) as u8)).unwrap();
+            }
+            log.flush().unwrap();
+            assert!(log.is_segment_ring());
+            log.usage_fraction()
+        };
+        assert!(usage_before > 0.4, "ring should be substantially filled");
+
+        let cfg = CheckpointConfig::new(snap_path);
+        let stats = perform_checkpoint(&cfg, &engine, &redo).unwrap();
+        assert!(stats.reset_performed, "ring reclaim ran");
+        assert!(
+            stats.usage_after < usage_before,
+            "reclaim freed covered segments: {} -> {}",
+            usage_before,
+            stats.usage_after
+        );
+
+        let log = redo.lock();
+        assert!(log.is_segment_ring(), "still a ring after checkpoint");
+        assert!(
+            log.recover().unwrap().is_empty(),
+            "all flushed entries are below the fence → recovery replays nothing"
+        );
+        drop(log);
+        // Still serving: more appends succeed after the checkpoint.
+        redo.lock().append(ring_freeze(7)).unwrap();
+    }
+
+    /// Phase 6: sustained fill→checkpoint cycles on a ring never brick — the ring
+    /// keeps accepting writes across many reclaim rounds (no LogFull wedge).
+    #[test]
+    fn ring_sustained_checkpoints_never_brick() {
+        let segment_size = 4096u64;
+        let (engine, redo, dir) = make_engine_and_ring_redo(segment_size, 4);
+        let cfg = CheckpointConfig::new(dir.path().join("sustained_ring.snap"));
+
+        // Many more entries than the ring can hold at once, interleaved with
+        // checkpoints — every append must succeed (reclaim keeps up).
+        for round in 0..20u32 {
+            {
+                let mut log = redo.lock();
+                for i in 0..60u32 {
+                    log.append(ring_freeze(
+                        (round.wrapping_mul(60).wrapping_add(i) % 251) as u8,
+                    ))
+                    .expect("ring append must never wedge under checkpoint reclaim");
+                }
+                log.flush().unwrap();
+            }
+            perform_checkpoint(&cfg, &engine, &redo).unwrap();
+        }
+        let log = redo.lock();
+        assert!(log.is_segment_ring());
+        assert!(log.usage_fraction() < 1.0, "ring is not stuck full");
+    }
+
+    /// Phase 6: `Engine::redo_is_ring` reflects the attached logs so the
+    /// checkpoint loop can pick the non-blocking ring path.
+    #[test]
+    fn engine_redo_is_ring_reflects_attached_logs() {
+        let (engine, _redo, _dir) = make_engine_and_redo();
+        assert!(
+            !engine.redo_is_ring(),
+            "no per-store logs attached → not ring"
+        );
+
+        let total = 4096 + 4096 * 4;
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let ring = Arc::new(Mutex::new(
+            RedoLog::format_ring(dev, 0, total, 4096).unwrap(),
+        ));
+        engine.set_redo_logs(vec![ring]);
+        assert!(engine.redo_is_ring(), "attached ring log → redo_is_ring");
     }
 
     // -- B-1 / G-1 durability-barrier tests --

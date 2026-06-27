@@ -996,15 +996,28 @@ impl Engine {
         &self,
         fence: u64,
     ) -> std::result::Result<(), crate::redo::RedoError> {
+        // Layout-dispatched per log (`checkpoint_reclaim`): a ring frees covered
+        // segments (pointer advance); a linear log compacts the prefix.
         match self.redo_logs.get() {
             Some(logs) if !logs.is_empty() => {
                 for log in logs {
-                    log.lock().compact_prefix_through(fence)?;
+                    log.lock().checkpoint_reclaim(fence)?;
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Whether this node's redo logs use the segment-ring layout (lever 7). The
+    /// representative handle's layout is authoritative; all stores' logs share
+    /// the same format. Used by the checkpoint task to pick the non-blocking ring
+    /// path. Returns `false` when no per-store logs are attached.
+    pub fn redo_is_ring(&self) -> bool {
+        match self.redo_logs.get() {
+            Some(logs) => logs.first().is_some_and(|l| l.lock().is_segment_ring()),
+            None => false,
+        }
     }
 
     /// Write a recovery-progress fence marker to EVERY attached redo log so a
@@ -1018,10 +1031,13 @@ impl Engine {
         &self,
         through_sequence: u64,
     ) -> std::result::Result<(), crate::redo::RedoError> {
+        // Layout-dispatched per log (`checkpoint_fence`): a ring writes the
+        // header fence (no log append); a linear log appends a RecoveryProgress
+        // marker.
         match self.redo_logs.get() {
             Some(logs) if !logs.is_empty() => {
                 for log in logs {
-                    log.lock().mark_recovery_progress(through_sequence)?;
+                    log.lock().checkpoint_fence(through_sequence)?;
                 }
             }
             _ => {}

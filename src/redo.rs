@@ -3227,6 +3227,38 @@ impl RedoLog {
         Ok(freed)
     }
 
+    /// Whether this log uses the segment-ring layout (public for the checkpoint
+    /// task to pick the non-blocking ring path).
+    pub fn is_segment_ring(&self) -> bool {
+        self.is_ring()
+    }
+
+    /// Checkpoint fence: record that every entry with sequence `<=
+    /// through_sequence` is covered by a durable snapshot. Dispatches by layout —
+    /// a ring writes the header fence ([`Self::set_fence`], no log append); a
+    /// linear log appends a `RecoveryProgress` marker
+    /// ([`Self::mark_recovery_progress`]). Lets the checkpoint treat both layouts
+    /// uniformly (lever 7 phase 6).
+    pub fn checkpoint_fence(&mut self, through_sequence: u64) -> Result<()> {
+        if self.is_ring() {
+            self.set_fence(through_sequence)
+        } else {
+            self.mark_recovery_progress(through_sequence)
+        }
+    }
+
+    /// Checkpoint reclaim: free redo space covered by the fence. Dispatches by
+    /// layout — a ring frees covered segments
+    /// ([`Self::reclaim_covered_segments`], an O(freed) pointer advance); a
+    /// linear log compacts the prefix ([`Self::compact_prefix_through`]).
+    pub fn checkpoint_reclaim(&mut self, through_sequence: u64) -> Result<()> {
+        if self.is_ring() {
+            self.reclaim_covered_segments().map(|_| ())
+        } else {
+            self.compact_prefix_through(through_sequence)
+        }
+    }
+
     /// Read all entries after the last checkpoint (for crash recovery).
     pub fn recover(&self) -> Result<Vec<RedoEntry>> {
         // Lever 7: a ring log's `entries_cache` already holds exactly the live
