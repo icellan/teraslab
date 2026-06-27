@@ -20,6 +20,16 @@ use thiserror::Error;
 /// the device header (freelist checkpoint, device metadata).
 pub const DATA_REGION_OFFSET: u64 = 1024 * 1024; // 1 MiB reserved for header
 
+/// Small reservation alignment used in packed mode (for struct field access),
+/// applied instead of rounding every reservation up to the device block.
+///
+/// In packed mode a small record (`size <= device block`) is rounded up to this
+/// boundary and packed contiguously within a single device block, instead of
+/// being rounded up to the full `device_alignment` (typically 4096) as the
+/// default non-packed mode does. See `docs/PACKED_RECORD_STORAGE_DESIGN.md`
+/// §3.1.
+pub const RECORD_ALIGN: u64 = 8;
+
 /// Magic number for the allocator header on device.
 const ALLOCATOR_MAGIC: u64 = 0x5445_5241_414C_4C43; // "TERAALLC"
 
@@ -282,6 +292,16 @@ pub struct SlotAllocator {
     /// recovery routes each region to the owning store's allocator and the
     /// entry to that store's redo log.
     redo_device_id: u8,
+    /// Opt-in packed allocation mode (default `false`).
+    ///
+    /// When `false` (the default), every reservation is rounded up to the
+    /// device block (`alignment`) exactly as before — byte-for-byte unchanged.
+    /// When `true`, small reservations (`size <= alignment`) are rounded up only
+    /// to [`RECORD_ALIGN`] and packed contiguously within a single device block
+    /// (never straddling a block boundary), while large reservations (`size >
+    /// alignment`) stay device-block-granular and block-aligned. See
+    /// [`Self::set_packed`] and `docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.1.
+    packed: bool,
     /// Test/fault-injection only: fail the next [`SlotAllocator::persist`]
     /// call with [`AllocatorError::PersistFaultInjected`], then auto-clear.
     ///
@@ -354,13 +374,37 @@ impl FreelistBackend {
     }
 
     /// Best-fit allocation. Returns `Some((offset, region_size))` or `None`.
-    fn best_fit(&mut self, aligned_size: u64) -> Option<(u64, u64)> {
+    ///
+    /// `block` carries the packed-mode placement constraint:
+    /// - `None` → non-packed: any region of sufficient size qualifies
+    ///   (behavior unchanged).
+    /// - `Some(block)` → packed: a region qualifies only if the head
+    ///   allocation `[region.offset, region.offset + aligned_size)` stays
+    ///   within a single `block` (small, `aligned_size <= block`) or starts
+    ///   block-aligned (large, `aligned_size > block`). Regions that would
+    ///   straddle a block boundary or misalign a large record are skipped so
+    ///   the caller falls through to the high-water path.
+    fn best_fit(&mut self, aligned_size: u64, block: Option<u64>) -> Option<(u64, u64)> {
+        // Does placing `aligned_size` at `offset` satisfy the packed
+        // within-one-block (small) / block-aligned (large) constraint?
+        let qualifies = |offset: u64| -> bool {
+            match block {
+                None => true,
+                Some(block) => {
+                    if aligned_size <= block {
+                        offset % block + aligned_size <= block
+                    } else {
+                        offset.is_multiple_of(block)
+                    }
+                }
+            }
+        };
         let result = match self {
             Self::Small(v) => {
                 let mut best_idx: Option<usize> = None;
                 let mut best_waste: u64 = u64::MAX;
                 for (i, region) in v.iter().enumerate() {
-                    if region.size >= aligned_size {
+                    if region.size >= aligned_size && qualifies(region.offset) {
                         let waste = region.size - aligned_size;
                         if waste < best_waste {
                             best_waste = waste;
@@ -384,7 +428,14 @@ impl FreelistBackend {
                 Some((region.offset, region.size))
             }
             Self::Large { by_offset, by_size } => {
-                let &(region_size, region_offset) = by_size.range((aligned_size, 0)..).next()?;
+                // Scan candidates in size order (smallest sufficient first) and
+                // take the first that also satisfies the block constraint. In
+                // non-packed mode `qualifies` is always true, so this stops at
+                // the first candidate — identical to the prior behavior.
+                let (region_size, region_offset) = by_size
+                    .range((aligned_size, 0)..)
+                    .map(|&(sz, off)| (sz, off))
+                    .find(|&(_, off)| qualifies(off))?;
                 by_size.remove(&(region_size, region_offset));
                 by_offset.remove(&region_offset);
                 if region_size > aligned_size {
@@ -537,6 +588,7 @@ impl SlotAllocator {
             device_id,
             redo_log: None,
             redo_device_id: 0,
+            packed: false,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_persist: std::cell::Cell::new(false),
         })
@@ -584,6 +636,24 @@ impl SlotAllocator {
         self.redo_log.is_some()
     }
 
+    /// Enable or disable packed allocation mode.
+    ///
+    /// Default is `false` (device-block reservations, unchanged behavior). When
+    /// set to `true`, small reservations are packed within a single device block
+    /// at [`RECORD_ALIGN`] granularity and large reservations stay block-aligned
+    /// — see [`Self::align_reservation`] for the exact rule. Set once at startup
+    /// before any allocation; toggling it on a device that already holds
+    /// records placed under the other mode is unsupported (offsets differ).
+    pub fn set_packed(&mut self, packed: bool) {
+        self.packed = packed;
+    }
+
+    /// Whether packed allocation mode is currently enabled. See
+    /// [`Self::set_packed`].
+    pub fn is_packed(&self) -> bool {
+        self.packed
+    }
+
     /// Allocate a contiguous region of at least `size` bytes.
     ///
     /// The returned offset is aligned to the device's minimum I/O size.
@@ -597,7 +667,7 @@ impl SlotAllocator {
     /// no externally-visible effect and must treat the allocation as not
     /// having happened.
     pub fn allocate(&mut self, size: u64) -> Result<u64> {
-        let aligned_size = self.align_up(size);
+        let aligned_size = self.align_reservation(size);
         let (offset, reservation) = self.reserve_aligned(aligned_size)?;
 
         // Journal the reservation BEFORE returning — ensures the allocation
@@ -648,7 +718,7 @@ impl SlotAllocator {
         let mut redo_ops: Vec<RedoOp> = Vec::new();
 
         for size in sizes {
-            let aligned_size = self.align_up(*size);
+            let aligned_size = self.align_reservation(*size);
             match self.reserve_aligned(aligned_size) {
                 Ok((offset, reservation)) => {
                     results.push(Some(AllocatedRegion {
@@ -731,7 +801,7 @@ impl SlotAllocator {
         let mut alloc_redo_ops: Vec<RedoOp> = Vec::new();
 
         for size in sizes {
-            let aligned_size = self.align_up(*size);
+            let aligned_size = self.align_reservation(*size);
             match self.reserve_aligned(aligned_size) {
                 Ok((offset, reservation)) => {
                     regions.push(Some(AllocatedRegion {
@@ -901,7 +971,18 @@ impl SlotAllocator {
     }
 
     fn reserve_aligned(&mut self, aligned_size: u64) -> Result<(u64, Reservation)> {
-        if let Some((region_offset, region_size)) = self.freelist.best_fit(aligned_size) {
+        // In packed mode, pass the device block to `best_fit` so a reused hole
+        // satisfies the within-one-block (small) / block-aligned (large)
+        // constraint for the allocation it hands out. In non-packed mode the
+        // constraint is absent and `best_fit` behaves exactly as before.
+        let block_constraint = if self.packed {
+            Some(self.alignment as u64)
+        } else {
+            None
+        };
+        if let Some((region_offset, region_size)) =
+            self.freelist.best_fit(aligned_size, block_constraint)
+        {
             // best_fit already removed/split the region in the freelist.
             self.freelist.maybe_demote();
             Ok((
@@ -913,7 +994,30 @@ impl SlotAllocator {
             ))
         } else {
             // No suitable free region — extend at the append point.
-            let offset = self.next_offset;
+            let previous_next_offset = self.next_offset;
+            let mut offset = self.next_offset;
+
+            // Packed placement invariant: a record never straddles a device
+            // block, and a large record starts block-aligned. If placing at
+            // the current high-water mark would violate that, advance to the
+            // next block boundary. The skipped tail
+            // `[previous_next_offset, offset)` is acceptable waste for this
+            // phase (~1%); `previous_next_offset` (the ORIGINAL high-water)
+            // is recorded below so rollback reclaims the record AND the tail.
+            if self.packed {
+                let block = self.alignment as u64;
+                let need_bump = if aligned_size <= block {
+                    offset % block + aligned_size > block
+                } else {
+                    !offset.is_multiple_of(block)
+                };
+                if need_bump {
+                    offset = offset.div_ceil(block) * block;
+                }
+            }
+
+            // Overflow + device-size bounds are checked against the possibly
+            // bumped offset.
             let Some(end) = offset.checked_add(aligned_size) else {
                 return Err(AllocatorError::DeviceFull {
                     requested: aligned_size,
@@ -926,7 +1030,6 @@ impl SlotAllocator {
                     largest_free: self.freelist.largest(),
                 });
             }
-            let previous_next_offset = self.next_offset;
             self.next_offset = end;
             Ok((
                 offset,
@@ -1082,7 +1185,11 @@ impl SlotAllocator {
     }
 
     fn replay_allocate(&mut self, offset: u64, size: u64) -> bool {
-        let aligned_size = self.align_up(size);
+        // Use the same size-alignment the live path used so packed offsets
+        // reconstruct identically from the redo `AllocateRegion` entries. The
+        // redo entry's `offset` is the exact placed offset, so no bump logic is
+        // needed here — only the SIZE alignment must match `align_reservation`.
+        let aligned_size = self.align_reservation(size);
         let Some(end) = offset.checked_add(aligned_size) else {
             tracing::error!(
                 target = "teraslab::allocator",
@@ -1174,7 +1281,13 @@ impl SlotAllocator {
     }
 
     fn replay_free(&mut self, offset: u64, size: u64) -> bool {
-        let aligned_size = self.align_up(size);
+        // Align the same way the live path sized the reservation so replay
+        // reconstructs identical packed ranges. `FreeRegion` redo entries store
+        // an already-aligned size, on which `align_reservation` is idempotent
+        // (it equals `align_up` for any block-multiple input), so this is a
+        // no-op for the current free path and stays exact if a later phase
+        // packs frees too.
+        let aligned_size = self.align_reservation(size);
         if aligned_size == 0 {
             tracing::error!(
                 target = "teraslab::allocator",
@@ -1558,6 +1671,7 @@ impl SlotAllocator {
             device_id,
             redo_log: None,
             redo_device_id: 0,
+            packed: false,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_persist: std::cell::Cell::new(false),
         })
@@ -1567,6 +1681,30 @@ impl SlotAllocator {
     fn align_up(&self, size: u64) -> u64 {
         let a = self.alignment as u64;
         size.div_ceil(a) * a
+    }
+
+    /// Compute the reservation size for `size` bytes, honoring packed mode.
+    ///
+    /// - Not packed → `align_up(size)` (device block — unchanged behavior).
+    /// - Packed, small (`size <= device block`) → rounded up to [`RECORD_ALIGN`]
+    ///   so several records pack within one block.
+    /// - Packed, large (`size > device block`) → `align_up(size)` (device-block
+    ///   multiple) so a large record owns whole blocks and stays block-granular.
+    ///
+    /// This sizes the reservation only; the within-one-block / block-aligned
+    /// *placement* invariant is enforced in [`Self::reserve_aligned`].
+    fn align_reservation(&self, size: u64) -> u64 {
+        if !self.packed {
+            return self.align_up(size);
+        }
+        let block = self.alignment as u64;
+        if size <= block {
+            // Small/packable: round up to the small struct-access alignment.
+            size.div_ceil(RECORD_ALIGN) * RECORD_ALIGN
+        } else {
+            // Large: keep device-block granularity so it owns its blocks.
+            self.align_up(size)
+        }
     }
 
     /// The number of free regions in the freelist.
@@ -3474,6 +3612,405 @@ mod tests {
             after_above - before_above >= 2,
             "generation_wrap_warn_total must advance by ≥ 2 when delta > 2^30, got {}",
             after_above - before_above,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: packed, block-aware allocation (docs/PACKED_RECORD_STORAGE_DESIGN
+    // §3.1). All tests use the 4096-alignment `test_device`.
+    // -----------------------------------------------------------------------
+
+    /// Default-off regression: with packing disabled, reservations are still
+    /// rounded up to the full 4 KB device block exactly as before. Pins the
+    /// pre-packed behavior so the opt-in cannot silently change the default.
+    #[test]
+    fn packed_default_off_reservations_stay_block_aligned() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        assert!(!alloc.is_packed(), "packing must default to OFF");
+
+        let o1 = alloc.allocate(600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        let o3 = alloc.allocate(600).unwrap();
+
+        assert_eq!(o1, DATA_REGION_OFFSET);
+        // Each ~600 B record consumes a full 4096 B block — 4096 B apart.
+        assert_eq!(o2 - o1, 4096, "non-packed records must be one block apart");
+        assert_eq!(o3 - o2, 4096, "non-packed records must be one block apart");
+    }
+
+    /// Packed mode places multiple small records within ONE 4 KB block: offsets
+    /// are RECORD_ALIGN-aligned, share a block, and are < a block apart —
+    /// contrasting with the 4096-apart non-packed layout above.
+    #[test]
+    fn packed_small_records_share_one_block() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        assert!(alloc.is_packed());
+
+        let block = 4096u64;
+        let o1 = alloc.allocate(600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        let o3 = alloc.allocate(600).unwrap();
+
+        assert_eq!(o1, DATA_REGION_OFFSET, "first packed record at data start");
+
+        // 600 rounds up to 600.div_ceil(8)*8 = 600 (already 8-aligned) -> 608?
+        // 600 % 8 == 0, so aligned size is 600. Spacing is the aligned size.
+        for (i, &o) in [o1, o2, o3].iter().enumerate() {
+            assert_eq!(
+                o % RECORD_ALIGN,
+                0,
+                "record {i} must be RECORD_ALIGN-aligned"
+            );
+            assert_eq!(
+                o / block,
+                o1 / block,
+                "record {i} must share the first block with o1"
+            );
+        }
+        assert_eq!(o2 - o1, 600, "packed spacing == RECORD_ALIGN-aligned size");
+        assert_eq!(o3 - o2, 600, "packed spacing == RECORD_ALIGN-aligned size");
+        assert!(o3 - o1 < block, "all three must fit within one block");
+    }
+
+    /// Packed reservation size rounds non-8-multiple sizes up to RECORD_ALIGN.
+    #[test]
+    fn packed_reservation_rounds_up_to_record_align() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+
+        // 393 -> rounds up to 400 (393.div_ceil(8)*8 = 400).
+        let o1 = alloc.allocate(393).unwrap();
+        let o2 = alloc.allocate(393).unwrap();
+        assert_eq!(
+            o2 - o1,
+            400,
+            "393 B must reserve 400 B (RECORD_ALIGN multiple)"
+        );
+        assert_eq!(o1 % RECORD_ALIGN, 0);
+        assert_eq!(o2 % RECORD_ALIGN, 0);
+    }
+
+    /// No small record straddles a block boundary: reserve until the next
+    /// record would cross, and assert it bumps to the next block start (leaving
+    /// the block tail as waste).
+    #[test]
+    fn packed_no_small_record_straddles_block() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+
+        // 1024 B records: 4 fit in a block exactly (4*1024 == 4096). The 5th
+        // would start at block+0 already since 4*1024 fills the block.
+        // Use 1000 B (rounds to 1000, 8-aligned) so 4 fit (4000) and the 5th
+        // would straddle (4000 + 1000 = 5000 > 4096) -> bump to next block.
+        let mut offsets = Vec::new();
+        for _ in 0..5 {
+            offsets.push(alloc.allocate(1000).unwrap());
+        }
+        // First four within block 0.
+        let first_block = DATA_REGION_OFFSET / block;
+        for (i, &o) in offsets.iter().take(4).enumerate() {
+            assert_eq!(o / block, first_block, "record {i} in block 0");
+            assert!(
+                o % block + 1000 <= block,
+                "record {i} at {o} must not straddle a block boundary"
+            );
+        }
+        // Fifth bumped to the start of the next block (no straddle).
+        let fifth = offsets[4];
+        assert_eq!(
+            fifth % block,
+            0,
+            "the straddling record must be bumped to a block boundary"
+        );
+        assert_eq!(
+            fifth,
+            DATA_REGION_OFFSET + block,
+            "fifth record must start at the next block"
+        );
+    }
+
+    /// A large record (> one block) gets a block-aligned offset and a
+    /// block-multiple reservation size, and stays block-granular even in packed
+    /// mode.
+    #[test]
+    fn packed_large_record_is_block_aligned() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+
+        // Place a small record first so the high-water is mid-block.
+        let small = alloc.allocate(600).unwrap();
+        assert_eq!(small, DATA_REGION_OFFSET);
+
+        // A large record (5000 B > block) must be bumped to a block boundary
+        // and reserve a block multiple (8192).
+        let large = alloc.allocate(5000).unwrap();
+        assert_eq!(large % block, 0, "large record must start block-aligned");
+        assert_eq!(
+            large,
+            DATA_REGION_OFFSET + block,
+            "large record bumped to next block after the small one"
+        );
+
+        // The next allocation must start a block-multiple past the large one
+        // (5000 -> align_up -> 8192).
+        let after = alloc.allocate(600).unwrap();
+        assert_eq!(
+            after,
+            large + 8192,
+            "large reservation must be a block multiple (8192)"
+        );
+    }
+
+    /// Freelist reuse in packed mode returns a within-block hole and hands out a
+    /// within-block, RECORD_ALIGN-aligned allocation from it.
+    ///
+    /// Holes are seeded as precise byte ranges via the test helper because
+    /// `free()` still block-rounds in this phase (the free path is not yet
+    /// packing-aware — out of scope for §3.1); best_fit's block-awareness is
+    /// what we exercise here.
+    #[test]
+    fn packed_freelist_reuse_respects_block_boundary() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+        let d = DATA_REGION_OFFSET;
+
+        // Advance the high-water past block 0 so reuse (not bump) is exercised.
+        let _hw = alloc.allocate(8000).unwrap(); // large -> blocks 0..1 owned
+
+        // Seed a 1000 B hole wholly within block 2: [D+2*block, D+2*block+1000).
+        let hole = d + 2 * block;
+        alloc.__test_force_push_free_region(hole, 1000);
+        assert_eq!(alloc.free_region_count(), 1);
+
+        // A 1000 B packed alloc must reuse that within-block hole exactly.
+        let reused = alloc.allocate(1000).unwrap();
+        assert_eq!(reused, hole, "packed reuse must take the within-block hole");
+        assert!(
+            reused % block + 1000 <= block,
+            "reuse must stay within one block"
+        );
+        assert_eq!(alloc.free_region_count(), 0, "exact-fit hole consumed");
+    }
+
+    /// A freelist hole that would force a straddling allocation is skipped:
+    /// best_fit must reject a hole whose head allocation crosses a block
+    /// boundary and fall through to the high-water mark instead, leaving the
+    /// hole untouched.
+    #[test]
+    fn packed_skips_straddling_freelist_hole() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+        let d = DATA_REGION_OFFSET;
+
+        // Seed a 2000 B hole that begins late in block 0:
+        // [D+3000, D+5000) — it spans the block-0/block-1 boundary at D+4096.
+        let hole = d + 3000;
+        alloc.__test_force_push_free_region(hole, 2000);
+        assert_eq!(alloc.free_region_count(), 1);
+
+        // A 1500 B request (aligned 1504). At the hole start D+3000:
+        // 3000 % 4096 + 1504 = 4504 > 4096 -> would straddle. best_fit must SKIP
+        // the hole and fall through to the high-water mark.
+        let placed = alloc.allocate(1500).unwrap();
+        assert!(
+            placed % block + 1504 <= block,
+            "1500 B packed alloc at {placed} must not straddle a block"
+        );
+        assert_ne!(
+            placed, hole,
+            "the straddling hole must be skipped, not reused"
+        );
+        // The 2000 B hole must still be in the freelist (untouched).
+        assert_eq!(
+            alloc.free_region_containing(hole),
+            Some((hole, 2000)),
+            "skipped hole must remain in the freelist"
+        );
+    }
+
+    /// Rolling back a bumped high-water reservation restores `next_offset`
+    /// fully, reclaiming BOTH the record bytes AND the skipped block tail.
+    #[test]
+    fn packed_rollback_of_bumped_reservation_reclaims_tail() {
+        // Drive the rollback via reserve_batch/rollback_pending (no redo log
+        // needed) so we exercise the exact rollback_reservation path.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let d = DATA_REGION_OFFSET;
+        let block = 4096u64;
+
+        // Fill block 0 to 4000 B (4 x 1000 B); high-water = D+4000, mid-block.
+        for _ in 0..4 {
+            alloc.allocate(1000).unwrap();
+        }
+        let hw_before = alloc.stats().next_offset;
+        assert_eq!(hw_before, d + 4000);
+
+        // A 1000 B packed alloc here straddles -> bumps to D+4096, advancing
+        // next_offset to D+4096+1000. Use reserve_batch so we can roll back.
+        let pending = alloc.reserve_batch(&[1000]).unwrap();
+        let region = pending.regions[0].expect("reservation must succeed");
+        assert_eq!(region.offset, d + block, "must bump to next block start");
+        assert_eq!(alloc.stats().next_offset, d + block + 1000);
+
+        // Roll back: next_offset must return to the ORIGINAL pre-bump value,
+        // reclaiming the 96 B tail [D+4000, D+4096) plus the 1000 B record.
+        alloc.rollback_pending(pending);
+        assert_eq!(
+            alloc.stats().next_offset,
+            hw_before,
+            "rollback must restore next_offset to before the bump (reclaim record + tail)"
+        );
+        assert_eq!(
+            alloc.free_region_count(),
+            0,
+            "high-water rollback must not leave a freelist hole"
+        );
+    }
+
+    /// Replay parity: drive packed allocations through a redo-logged allocator,
+    /// capture the `AllocateRegion` redo ops, replay them into a FRESH packed
+    /// allocator, and assert next_offset + freelist match the live allocator
+    /// exactly (no double-allocation, identical packed layout).
+    #[test]
+    fn packed_replay_parity_matches_live_layout() {
+        let dev = test_device(16);
+        let (_redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        // Live packed allocator with a redo log attached.
+        let mut live = SlotAllocator::new(dev.clone()).unwrap();
+        live.set_packed(true);
+        live.set_redo_log(redo.clone());
+
+        // A mix of small (packed, sharing blocks + a bump) and one large
+        // (block-aligned) reservation.
+        let sizes = [600u64, 600, 1000, 1000, 1000, 1000, 5000, 393];
+        for &s in &sizes {
+            live.allocate(s).unwrap();
+        }
+
+        // Capture the AllocateRegion redo ops the live path journaled.
+        let entries = redo.lock().read_from_sequence(1).unwrap();
+        let alloc_ops: Vec<RedoOp> = entries
+            .into_iter()
+            .map(|e| e.op)
+            .filter(|op| matches!(op, RedoOp::AllocateRegion { .. }))
+            .collect();
+        assert_eq!(
+            alloc_ops.len(),
+            sizes.len(),
+            "one AllocateRegion op per allocate"
+        );
+
+        // Replay into a FRESH packed allocator over a fresh device of the same
+        // geometry (no redo log on the replay target).
+        let replay_dev = test_device(16);
+        let mut replayed = SlotAllocator::new(replay_dev).unwrap();
+        replayed.set_packed(true);
+        for op in &alloc_ops {
+            replayed.replay_redo(op);
+        }
+
+        // next_offset must match exactly.
+        assert_eq!(
+            replayed.stats().next_offset,
+            live.stats().next_offset,
+            "replayed high-water must match the live packed layout"
+        );
+
+        // Freelist must match exactly (offset-ordered).
+        let live_free: Vec<(u64, u64)> = live.freelist.iter_offset_order().collect();
+        let replayed_free: Vec<(u64, u64)> = replayed.freelist.iter_offset_order().collect();
+        assert_eq!(
+            replayed_free, live_free,
+            "replayed freelist must match the live packed freelist"
+        );
+
+        // Sanity: the large record (5000 B) is block-aligned in the live layout.
+        // Its offset is the 7th AllocateRegion op.
+        if let RedoOp::AllocateRegion { offset, size, .. } = alloc_ops[6] {
+            assert_eq!(offset % 4096, 0, "large record must be block-aligned");
+            assert_eq!(size, 8192, "5000 B large record reserves 8192 B");
+        } else {
+            panic!("expected AllocateRegion op for the large record");
+        }
+    }
+
+    /// Block-aware best_fit on the Large/BTree freelist variant: seed enough
+    /// holes to promote past PROMOTE_THRESHOLD, then verify a straddling hole is
+    /// skipped and a within-block hole is reused — covering the BTree code path
+    /// (the small-freelist tests cover the Vec variant).
+    #[test]
+    fn packed_btree_best_fit_is_block_aware() {
+        let dev = test_device(64);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+        let d = DATA_REGION_OFFSET;
+
+        // Seed PROMOTE_THRESHOLD + 2 non-adjacent 64 B holes, one per block,
+        // forcing the freelist to promote to the BTree backend.
+        let n = PROMOTE_THRESHOLD + 2;
+        for i in 0..n as u64 {
+            // 64 B hole at the START of block (i+10): wholly within that block.
+            alloc.__test_force_push_free_region(d + (i + 10) * block, 64);
+        }
+        assert!(
+            alloc.free_region_count() > PROMOTE_THRESHOLD,
+            "freelist must be on the BTree backend"
+        );
+
+        // Add ONE straddling hole big enough to be the best-fit by size for a
+        // 100 B request, positioned to cross a block boundary: [block20+4050, +200).
+        let straddle = d + 20 * block + 4050;
+        alloc.__test_force_push_free_region(straddle, 200);
+
+        // A 100 B request (aligned 104). The 200 B straddling hole is the
+        // largest candidate but crosses the boundary (4050 % 4096 + 104 = 4154
+        // > 4096) -> must be skipped. A 64 B hole is too small. So it falls to
+        // the high-water mark (block-aligned, within one block).
+        let placed = alloc.allocate(100).unwrap();
+        assert!(
+            placed % block + 104 <= block,
+            "BTree packed alloc at {placed} must not straddle a block"
+        );
+        assert_ne!(placed, straddle, "straddling BTree hole must be skipped");
+        assert_eq!(
+            alloc.free_region_containing(straddle),
+            Some((straddle, 200)),
+            "skipped straddling hole must remain in the BTree freelist"
+        );
+
+        // A 64 B request (aligned 64) MUST reuse one of the within-block holes
+        // (exact fit), not the high-water mark. best_fit picks the smallest
+        // sufficient qualifying region.
+        let small = alloc.allocate(64).unwrap();
+        assert!(
+            small % block + 64 <= block,
+            "reused within-block hole must not straddle"
+        );
+        assert_eq!(
+            alloc.free_region_containing(small),
+            None,
+            "the reused hole must have been removed from the freelist"
+        );
+        assert_eq!(
+            small % RECORD_ALIGN,
+            0,
+            "reused offset must be RECORD_ALIGN-aligned"
         );
     }
 }
