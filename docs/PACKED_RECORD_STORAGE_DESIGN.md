@@ -88,20 +88,27 @@ Rationale for "no spanning": it guarantees every record's RMW touches **exactly 
 4 KB block**, which makes the block-granular lock (below) a single acquire and keeps
 the read/write paths single-block.
 
-### 3.2 Block-granular `io_locks`
+### 3.2 Block-granular `io_locks` — ALREADY SATISFIED by the existing design
 
-Today `io_locks()` is keyed by `record_offset`. Two packed records in the same block
-have different offsets → no mutual exclusion → concurrent spends on neighbours would
-each `pread` the block, patch their slot, and `pwrite` the block, losing one update.
+`io_locks()` (`StripedRwLocks`) is keyed by `record_offset`, but `stripe_index`
+computes `(record_offset >> 12) & mask` — it shifts off the low 12 bits (4096)
+**before** masking. So two records in the same 4 KiB block already map to the
+**same stripe** and serialize their read-modify-write. Combined with the
+allocator's no-straddle invariant (§3.1: no record crosses a 4 KiB block; small
+records sit within one block, large records own whole blocks), this is exactly the
+block-level mutual exclusion packed neighbours need — **no per-call-site rekey is
+required**. Every `io_locks().write(record_offset)` / `.read(record_offset)` keeps
+locking by record base; because all records sharing a block have bases in that same
+block, they collapse to one stripe; because no record straddles a block, a record's
+RMW never touches a block owned by a record on a *different* stripe.
 
-Change: key the record write/read guards by **block index** = `record_offset /
-device_alignment`. All readers and writers of any record in a block then serialize
-on one stripe. With ≈7 records/block this is ≈7× coarser than today but still
-per-block fine-grained, and it is the natural unit since a block is the atomic
-device I/O unit. (The striped lock table is unchanged; only the key derivation
-changes — audit every `io_locks().read(record_offset)` / `.write(record_offset)`
-call site to switch to the block key, and the ABA/coherent-snapshot reasoning in
-`read_record_identity_and_slots` carries over verbatim under the block key.)
+The one constraint: this hardcodes a 4096-byte lock block, so the device alignment
+(the RMW unit) must be **≤ 4096** for packing to be safe — otherwise two records in
+one physical device block could map to different stripes. `device_alignment` defaults
+to 4096; enabling `storage.packed` (phase 4) must validate `device_alignment ≤ 4096`
+(and ≥ 4096 packing simply degrades: records become "large"/block-aligned). Phase 2
+is therefore: a test pinning the same-block-same-stripe invariant + the alignment
+guard wired in phase 4 — not a lock rekey.
 
 ### 3.3 Cache-coordinated sub-block in-place I/O
 
