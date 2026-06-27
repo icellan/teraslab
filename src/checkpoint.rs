@@ -318,19 +318,62 @@ fn run_checkpoint_loop(
                 if let Some(m) = crate::metrics::redo_metrics() {
                     m.redo_checkpoint_failed_total.inc();
                 }
-                backoff = next_backoff(backoff, &config);
-                // Retry as blocking if the log is dangerously full; a failed
-                // fuzzy attempt has not reclaimed anything.
-                escalate_blocking = last_usage >= emergency_water;
-                tracing::error!(
-                    err = %e,
-                    next_backoff_ms = backoff.as_millis() as u64,
-                    "checkpoint failed",
-                );
+                let log_full = e.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX);
+                (backoff, escalate_blocking) =
+                    react_to_checkpoint_error(&e, backoff, last_usage, emergency_water, &config);
+                if log_full {
+                    // Expected under sustained overload: the fuzzy checkpoint
+                    // could not keep up. Escalating to a blocking reset (with no
+                    // back-off) is the designed response, so this is a WARN, not
+                    // an operator-actionable ERROR.
+                    tracing::warn!(
+                        err = %e,
+                        "fuzzy checkpoint could not keep up with write load — \
+                         escalating to a blocking checkpoint with no back-off",
+                    );
+                } else {
+                    tracing::error!(
+                        err = %e,
+                        next_backoff_ms = backoff.as_millis() as u64,
+                        "checkpoint failed",
+                    );
+                }
             }
         }
     }
     tracing::info!("checkpoint task exiting");
+}
+
+/// Decide how the checkpoint task should react to a failed checkpoint.
+///
+/// A `LogFull` failure is categorically different from a device fault: it means
+/// the redo is full and a (typically fuzzy / non-blocking) checkpoint could not
+/// reclaim it — at sustained write rates the entries appended during the
+/// snapshot pile up past the fence faster than the relocate-compaction can move
+/// them, so the compaction surfaces `LogFull`. Writes are already backpressured
+/// at this point, so the right response is to escalate to a BLOCKING checkpoint
+/// on the very next iteration with **no** back-off — every backed-off
+/// millisecond is pure write-stall time, and re-attempting a fuzzy checkpoint
+/// would just fail the same way. A genuine I/O fault, by contrast, keeps the
+/// exponential back-off (hammering a broken device is harmful) and only escalates
+/// to blocking when the log is already dangerously full.
+///
+/// Returns `(next_backoff, escalate_blocking)`.
+fn react_to_checkpoint_error(
+    err: &str,
+    current_backoff: Duration,
+    last_usage: f64,
+    emergency_water: f64,
+    config: &CheckpointConfig,
+) -> (Duration, bool) {
+    if err.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX) {
+        (Duration::ZERO, true)
+    } else {
+        (
+            next_backoff(current_backoff, config),
+            last_usage >= emergency_water,
+        )
+    }
 }
 
 /// Compute the next exponential back-off, doubling up to `max_backoff`.
@@ -622,6 +665,76 @@ mod tests {
     use crate::ops::engine::Engine;
     use crate::redo::{RedoLog, RedoOp};
     use std::sync::Arc;
+
+    /// Lever 6d: a `LogFull` checkpoint failure must escalate to a blocking
+    /// checkpoint with NO back-off (the redo is full, writes are backpressured,
+    /// every backed-off ms is stall time), whereas a genuine I/O fault must keep
+    /// the exponential back-off and only escalate when already dangerously full.
+    #[test]
+    fn react_to_checkpoint_error_escalates_on_log_full_without_backoff() {
+        let cfg = CheckpointConfig::new(PathBuf::from("/tmp/unused.snap"));
+
+        // LogFull during the (fuzzy) compact, triggered while usage was read as a
+        // STALE low value: still escalate + no back-off (do not trust last_usage).
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "redo compact: redo log full: 667873280/536866816 bytes used",
+            Duration::from_secs(4), // a backoff already in flight
+            0.75,                   // stale low usage from before the slow fuzzy ran
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(backoff, Duration::ZERO, "LogFull must clear the back-off");
+        assert!(
+            escalate,
+            "LogFull must escalate the next checkpoint to blocking"
+        );
+
+        // The fence variant is the same class of failure.
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "redo checkpoint fence: redo log full: 1/1 bytes used",
+            Duration::ZERO,
+            0.10,
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(backoff, Duration::ZERO);
+        assert!(escalate);
+
+        // A genuine I/O fault: keep the exponential back-off, and escalate ONLY
+        // when the log is already past the emergency mark.
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "data device sync: I/O error: disk on fire",
+            Duration::ZERO,
+            0.50, // below emergency
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(
+            backoff, cfg.initial_backoff,
+            "an I/O fault keeps the exponential back-off"
+        );
+        assert!(
+            !escalate,
+            "below emergency, an I/O fault does not force blocking"
+        );
+
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "data device sync: I/O error: disk on fire",
+            cfg.initial_backoff,
+            0.95, // past emergency
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(
+            backoff,
+            cfg.initial_backoff * 2,
+            "an I/O fault doubles the back-off"
+        );
+        assert!(
+            escalate,
+            "past emergency, even an I/O fault escalates to blocking"
+        );
+    }
 
     fn make_engine_and_redo() -> (Arc<Engine>, Arc<Mutex<RedoLog>>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
