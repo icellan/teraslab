@@ -83,6 +83,22 @@ Per op we report **p50 / p99 / p99.9 latency and sustained ops/sec**, for:
 2. batched throughput (batch sweep: 1, 16, 64, 256),
 3. the mixed create→spend→get→setMined churn at the ratios above.
 
+### Load model: closed-loop vs open-loop
+
+The driver supports two load models, because they expose different limits:
+
+- **Closed-loop** (`WORKERS=N`): N synchronous workers, each blocking per op, so
+  exactly N requests are in flight. Throughput = N ÷ latency. Models a fixed
+  caller-concurrency.
+- **Open-loop** (`OPEN_LOOP=1`, `IN_FLIGHT=M`, `DISPATCHERS=D`): a dispatcher pool
+  fires ops as goroutines bounded by an `IN_FLIGHT` semaphore, decoupling offered
+  load from completion latency and letting the adapter's batchers fill. This is
+  the faithful Teranode block-validation pattern (bursty, thousands of concurrent
+  txs). Sweep `IN_FLIGHT` to find each backend's **saturation throughput** and
+  compare peaks — this is the measurement that matters for the 10M-ops/s target.
+
+The open-loop sweep is the decisive comparison (see `PERF_LEDGER.md` E6).
+
 ## Explicit pass condition (defined before any tuning)
 
 Under the matched fair configuration above, measured **interleaved** over **≥ 3

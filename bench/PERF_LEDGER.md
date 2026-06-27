@@ -181,6 +181,43 @@ it regardless of the noisy bench. Datastore still wins natively (Rust client 30k
 Next: profile the create path's allocator/commit_pending lock under concurrency;
 re-measure on a quiet host; the open-loop harness remains the cleanest demo.
 
+## E6 — Open-loop harness: TeraSlab does NOT scale with concurrency (2026-06-27)
+
+Built an open-loop saturation mode (`OPEN_LOOP=1`, `IN_FLIGHT` semaphore + a
+dispatcher pool firing ops as goroutines, shared spendable/minted pools) — the
+realistic Teranode block-validation pattern (bursty, many concurrent txs), vs the
+closed-loop one-op-per-worker model. Swept IN_FLIGHT, `[loaded-host]`:
+
+| IN_FLIGHT | TeraSlab total · spend | Aerospike total · spend |
+|-----------|------------------------|-------------------------|
+| 256  | 5,371 · 1,607 (p99.9 317ms) | 21,977 · 6,596 (p99.9 55ms) |
+| 512  | 6,402 · 1,918 (p99.9 428ms) | 39,359 · 11,800 (p99.9 34ms) |
+| 1024 | 4,972 · 1,481 (p99.9 **1256ms**) | 44,336 · 13,295 (p99.9 269ms) |
+
+**The reference scales to ~44k ops/s; TeraSlab peaks ~6.4k then COLLAPSES** at
+IN_FLIGHT=1024 (throughput drops, p99.9 blows to 1.26s — classic queue overload
+past a ~6k ceiling). This is the honest, important correction to P1's framing:
+- The earlier "datastore wins natively, 30k" was the **Rust client with
+  `batch16`** (16 items/RPC). At **1 item/RPC concurrency** — how both backends
+  run through Teranode's per-op `utxo.Store` calls here — the TeraSlab **server**
+  caps at ~6–9k RPCs/s regardless of client (Rust batch1/64c ≈ 8.8k too), while
+  the reference server sustains 44k. So the gap is a real **server-side
+  concurrent-write scaling deficit (~7×)**, not a client/adapter artifact and not
+  a benchmark artifact.
+- The double-buffer (E5) helped but did not close it; `create_redo` stayed high
+  under concurrency → there is more serialization on the write path beyond the
+  pwrite (candidates: committer contention on the single per-store redo mutex
+  even for the µs append at 60+ concurrency; the allocator `commit_pending` lock
+  inside the create span; writeback interaction). Sharding to 4 stores (E4)
+  raised the ceiling but each store still collapses under its share.
+
+**Verdict:** TeraSlab loses the head-to-head, and open-loop shows it loses *more*
+than the closed-loop bench implied. The pass condition is NOT met. The remaining
+work is fundamental server-side write-concurrency engineering (make a single
+store sustain tens of thousands of concurrent 1-item write RPCs/s), not
+client/harness tuning. This is the honest stopping point for the profiled
+client/adapter direction; closing the gap needs a server concurrency redesign.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
