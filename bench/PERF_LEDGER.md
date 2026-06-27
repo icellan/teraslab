@@ -218,6 +218,37 @@ store sustain tens of thousands of concurrent 1-item write RPCs/s), not
 client/harness tuning. This is the honest stopping point for the profiled
 client/adapter direction; closing the gap needs a server concurrency redesign.
 
+## E7 — Audit: the redo mutex lock-WAIT is the concurrency cap (2026-06-27)
+
+Added `teraslab_redo_commit_lock_wait_ns` (time a buffered commit waits to acquire
+the per-store redo mutex, excluding the in-lock append). Open-loop IN_FLIGHT=512:
+
+```
+redo_commit_lock_wait : 72793 us   ← waiting to ACQUIRE the redo mutex
+create_redo           : 78160 us   (= 72ms wait + ~6ms in-lock work)
+create_devwrite       :   150 us   (cache write — fine)
+redo_flush (fsync)    :  3136 us   (background, off the ack path)
+spend (server)        : 95610 us   (same lock-wait domination)
+```
+
+So the single per-store redo mutex serializes all committers at ~6k commits/s,
+each holding the lock ~167µs. The hold is NOT I/O (double-buffer moved the pwrite
+out; fsync is background) — it is **serialization + heap allocation under the
+lock**: `append_atomic` serializes every op TWICE (once to measure length for the
+lever-6 capacity pre-check, once in `append`), each `serialize()` heap-allocates,
+and the create op carries the full record bytes — all under the lock, with the
+global allocator contended across 512 threads. That ~167µs × the serialized
+queue = the 72ms wait = the ~6k/s ceiling.
+
+**Redesign step 1 (lowest-risk, highest-leverage): serialize OUTSIDE the lock.**
+Pre-serialize each entry with a placeholder sequence before taking the mutex;
+under the mutex do only the O(1) work — capacity check, draw sequence(s), patch
+the 8-byte sequence field into the pre-serialized bytes, memcpy into the buffer,
+record pending. This should cut the in-lock hold ~10×+ (no alloc/encode under the
+lock), multiplying mutex throughput. Later steps if needed: shard the redo append
+per-core / lock-free reserve-then-write ring. Audit-before-fix complete; the
+mutex hold-time is the proven target.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |

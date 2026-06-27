@@ -1222,6 +1222,11 @@ pub(crate) fn render_metrics_text(
             "teraslab_redo_checkpoint_duration_ns",
             &r.redo_checkpoint_duration_ns,
         );
+        prom_histogram_ns(
+            &mut out,
+            "teraslab_redo_commit_lock_wait_ns",
+            &r.redo_commit_lock_wait_ns,
+        );
     }
     if let Some(mm) = migration_metrics() {
         use std::fmt::Write as _;

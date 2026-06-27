@@ -1196,6 +1196,10 @@ pub struct RedoMetrics {
     /// Wall-clock duration of each background checkpoint (log₂ ns
     /// buckets, reused from `LatencyHistogram`).
     pub redo_checkpoint_duration_ns: LatencyHistogram,
+    /// Wall time a buffered commit spent WAITING to acquire the per-store redo
+    /// log mutex (excludes the in-lock append). High values under concurrency
+    /// indicate the single redo mutex is the write-concurrency bottleneck.
+    pub redo_commit_lock_wait_ns: LatencyHistogram,
 }
 
 impl Default for RedoMetrics {
@@ -1216,6 +1220,7 @@ impl RedoMetrics {
             redo_checkpoint_triggered_total: PaddedCounter::new(),
             redo_checkpoint_failed_total: PaddedCounter::new(),
             redo_checkpoint_duration_ns: LatencyHistogram::new(),
+            redo_commit_lock_wait_ns: LatencyHistogram::new(),
         }
     }
 }

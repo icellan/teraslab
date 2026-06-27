@@ -180,7 +180,11 @@ impl GroupCommit {
         // make the appended entries durable. A bounded tail may be lost on crash
         // — the relaxed-durability contract.
         if self.buffered.load(std::sync::atomic::Ordering::Acquire) {
+            let wait_start = std::time::Instant::now();
             let mut log = self.log.lock();
+            if let Some(m) = crate::metrics::redo_metrics() {
+                m.redo_commit_lock_wait_ns.record_since(wait_start);
+            }
             return match log.append_atomic(&ops) {
                 Ok(range) => Ok(range),
                 Err(e @ crate::redo::RedoError::LogFull { .. }) => {
