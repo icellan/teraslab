@@ -2944,7 +2944,11 @@ impl RedoLog {
     /// [`RedoError::LogFull`] leaves no residue and burns no sequence (the
     /// lever-6 guarantee). Ring logs fall back to `append_atomic` (the ring
     /// segment-roll path is unchanged and is not the concurrency hot path).
-    pub fn append_preencoded_atomic(
+    ///
+    /// Crate-internal: takes a [`PreEncoded`] (itself `pub(crate)`), so the
+    /// visibility matches the only caller (the in-crate group-commit
+    /// coordinator). An external crate cannot construct a `PreEncoded` anyway.
+    pub(crate) fn append_preencoded_atomic(
         &mut self,
         entries: Vec<PreEncoded>,
     ) -> Result<Option<(u64, u64)>> {

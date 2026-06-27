@@ -242,6 +242,15 @@ pub struct Engine {
     /// serializing one-fsync-per-RPC on the log mutex. Built alongside
     /// `redo_logs` in [`Self::set_redo_logs`].
     redo_committers: std::sync::OnceLock<Vec<Arc<crate::redo_group::GroupCommit>>>,
+    /// Buffered (relaxed) redo durability, mirroring the per-store committers'
+    /// flag so the engine-internal redo paths that bypass the committers — the
+    /// two-phase secondary-index journalling ([`Self::update_both_secondary_indexes`]
+    /// and [`Self::sync_primary_and_both_secondary_atomic`]) — honour the same
+    /// contract: in buffered mode they APPEND the secondary intent without an
+    /// fsync (the background flusher / checkpoint make it durable, coalesced),
+    /// instead of fsyncing per key on the ack path. Set in
+    /// [`Self::set_buffered_durability`]; defaults to strict (`false`).
+    redo_buffered: std::sync::atomic::AtomicBool,
     /// Append-only on-device deletion-tombstone log (deletion-tombstone
     /// Phase 3). When attached AND [`Self::tombstones_enabled`] is true, the
     /// physical-delete path appends a [`crate::tombstone::Tombstone`] here
@@ -523,6 +532,7 @@ impl Engine {
             visibility,
             redo_logs: std::sync::OnceLock::new(),
             redo_committers: std::sync::OnceLock::new(),
+            redo_buffered: std::sync::atomic::AtomicBool::new(false),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
             // Default ON (design §11.5). A delete still writes no tombstone
@@ -610,17 +620,37 @@ impl Engine {
     }
 
     /// Enable buffered (relaxed) redo durability on every per-store group-commit
-    /// coordinator: mutations are acked after the in-memory redo append, and a
-    /// background flusher (plus the checkpoint barrier) makes them durable.
-    /// Trades a bounded crash-loss window for removing the fsync from the ack
-    /// path. Call once at startup after [`Self::set_redo_logs`]. No-op (strict)
-    /// when no per-store committers are attached.
+    /// coordinator AND on the engine itself: mutations are acked after the
+    /// in-memory redo append, and a background flusher (plus the checkpoint
+    /// barrier) makes them durable. Trades a bounded crash-loss window for
+    /// removing the fsync from the ack path. Call once at startup after
+    /// [`Self::set_redo_logs`].
+    ///
+    /// The engine-level flag ([`Self::redo_buffered`]) governs the
+    /// engine-internal redo paths that do NOT route through the committers — the
+    /// two-phase secondary-index journalling. Without it those paths fsync the
+    /// redo per key even in buffered mode (the per-key `setMined` fsync that
+    /// dominated the write workload). It is set unconditionally so single-store
+    /// / committer-less configurations honour the contract too; the committer
+    /// loop below additionally flips the primary write path's coordinators.
     pub fn set_buffered_durability(&self, buffered: bool) {
+        self.redo_buffered
+            .store(buffered, std::sync::atomic::Ordering::Release);
         if let Some(committers) = self.redo_committers.get() {
             for c in committers {
                 c.set_buffered(buffered);
             }
         }
+    }
+
+    /// Whether buffered (relaxed) redo durability is active for the
+    /// engine-internal redo paths (two-phase secondary-index journalling).
+    /// `true` => append the secondary intent without an ack-path fsync and let
+    /// the background flusher / checkpoint coalesce it durable; `false` (strict)
+    /// => fsync the intent before the redb commit, per round.
+    fn redo_buffered(&self) -> bool {
+        self.redo_buffered
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Force every per-store redo log durable (fsync). Used by the background
@@ -1535,12 +1565,69 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply a combined DAH + unmined update with a single redo fsync.
+    /// Journal a batch of secondary-index intents (`SecondaryDahUpdate` /
+    /// `SecondaryUnminedUpdate`) to the store's redo log, honouring the active
+    /// durability mode. The intents are appended atomically (all-or-nothing).
+    ///
+    /// - **Strict** (`redo_buffered == false`): append + fsync in one call
+    ///   ([`RedoLog::append_batch_and_flush`]) so the intent is durable BEFORE
+    ///   the redb secondary mutation that follows.
+    /// - **Buffered** (`redo_buffered == true`): append WITHOUT fsync
+    ///   ([`RedoLog::append_atomic`]); the background flusher / checkpoint make
+    ///   it durable, coalescing many keys into one fsync. This is what stops the
+    ///   per-key `setMined` fsync from dominating the write workload.
+    ///
+    /// Correctness under buffered mode: these intents are NOT the durable source
+    /// of truth — recovery rebuilds the secondary indexes from the authoritative
+    /// primary on-device metadata (`reconcile_secondary_indexes_*`), using the
+    /// intents only to mark which keys to reconcile. The primary metadata write
+    /// is itself buffered (write-back cache) and becomes durable on the same
+    /// flush boundary, so a crash loses the primary write, the secondary intent,
+    /// and the redb mutation together — a consistent prefix. A `LogFull` is
+    /// transient backpressure and must NOT poison (lever-6 semantics); a genuine
+    /// fault poisons the log (fail-closed). Empty `ops` is a no-op.
+    fn journal_secondary_ops(
+        &self,
+        log: &Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+        ops: &[crate::redo::RedoOp],
+    ) -> Result<(), SpendError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut guard = log.lock();
+        let result = if self.redo_buffered() {
+            // Append-only; durability deferred to the background flusher.
+            guard.append_atomic(ops).map(|_| ())
+        } else {
+            // Strict: fsync the intent before returning.
+            guard.append_batch_and_flush(ops).map(|_| ())
+        };
+        result.map_err(|e| match e {
+            // Transient full log: do NOT poison — the checkpoint reclaims space
+            // and the caller's op fails cleanly (its primary write is rolled
+            // back in memory). Poisoning would wedge the node on a momentary
+            // full log.
+            crate::redo::RedoError::LogFull { .. } => SpendError::StorageError {
+                detail: format!("secondary intent journal: {e}"),
+            },
+            // A genuine fault (already-poisoned log, or a strict-mode flush I/O
+            // error which already poisoned inside `flush`): fail closed.
+            other => {
+                guard.poison();
+                SpendError::StorageError {
+                    detail: format!("secondary intent journal: {other}"),
+                }
+            }
+        })
+    }
+
+    /// Apply a combined DAH + unmined update with a single redo fsync (strict)
+    /// or a single coalesced append (buffered).
     ///
     /// When both secondary indexes change in the same operation (e.g.
     /// `mark_on_longest_chain`), this batches both intent records into one
-    /// `RedoLog::append_batch_and_flush` so there is exactly one fsync for
-    /// the pair. Both redb commits then follow.
+    /// [`Self::journal_secondary_ops`] call so there is exactly one redo
+    /// append/fsync for the pair. Both redb commits then follow.
     fn update_both_secondary_indexes(
         &self,
         key: &TxKey,
@@ -1559,7 +1646,8 @@ impl Engine {
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
 
-        // Phase 1: one fsync covering both secondary intents (if both change).
+        // Phase 1: journal both secondary intents (one fsync in strict mode, a
+        // coalesced append in buffered mode) before the redb mutations.
         if let Some(ref log) = log_arc {
             let mut ops = Vec::with_capacity(2);
             if dah_changed {
@@ -1576,12 +1664,7 @@ impl Engine {
                     new_height: new_unmined,
                 });
             }
-            let mut guard = log.lock();
-            guard
-                .append_batch_and_flush(&ops)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("secondary batch append_and_flush: {e}"),
-                })?;
+            self.journal_secondary_ops(log, &ops)?;
         }
 
         // Phase 2: commit both redb transactions. The redo log already has the
@@ -1666,11 +1749,12 @@ impl Engine {
         let dah_changed = old_dah != new_dah;
         let unmined_changed = old_unmined != new_unmined;
 
-        // Phase 1: one fsync covering both secondary intents (if any change).
+        // Phase 1: journal both secondary intents (one fsync in strict mode, a
+        // coalesced append in buffered mode) before the primary+redb mutations.
         // Per-store redo: route the secondary-index intent to the log owning
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
-        if (dah_changed || unmined_changed) && log_arc.is_some() {
+        if let Some(ref log) = log_arc {
             let mut ops = Vec::with_capacity(2);
             if dah_changed {
                 ops.push(crate::redo::RedoOp::SecondaryDahUpdate {
@@ -1686,14 +1770,7 @@ impl Engine {
                     new_height: new_unmined,
                 });
             }
-            if let Some(ref log) = log_arc {
-                let mut guard = log.lock();
-                guard
-                    .append_batch_and_flush(&ops)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("atomic primary+secondary batch append_and_flush: {e}"),
-                    })?;
-            }
+            self.journal_secondary_ops(log, &ops)?;
         }
 
         // Phase 2: lock order = primary.write → dah → unmined (matches
@@ -14367,6 +14444,109 @@ mod tests {
                 "routed ranges must be contiguous with no gap/dup"
             );
         }
+    }
+
+    /// Drive `n` two-phase secondary-index updates (the `setMined` reorg path
+    /// that journals `SecondaryDahUpdate`/`SecondaryUnminedUpdate`) over a redo
+    /// log on a sync-counting device, and return how many redo fsyncs it cost.
+    /// `buffered` selects the durability mode under test. Each key is setMined
+    /// twice (off-chain then on-chain) so `unmined_since` is guaranteed to move
+    /// on at least one call regardless of the create-time default — i.e. the
+    /// secondary path provably fires for every key.
+    fn secondary_update_fsyncs(n: u8, buffered: bool) -> u64 {
+        let data_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Arc::new(Engine::new(
+            data_dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Redo log on its OWN sync-counting device so the count is exactly the
+        // secondary-path fsyncs, not data-device flushes.
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let (cdev, syncs) = SyncCountingDevice::new(inner);
+        let log =
+            crate::redo::RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        engine.set_buffered_durability(buffered);
+
+        // Create n records.
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let (_, req) = make_create_req(i + 1, 2);
+            engine.create(&req).unwrap();
+            keys.push(req.tx_key());
+        }
+
+        // Count only the secondary-path fsyncs (skip create's own journalling).
+        let baseline = syncs.load(Ordering::SeqCst);
+
+        let off_chain = SetMinedSharedParams {
+            block_id: 7,
+            block_height: 900_000,
+            subtree_idx: 0,
+            current_block_height: 900_000,
+            block_height_retention: 288,
+            on_longest_chain: false,
+            unset_mined: false,
+        };
+        let on_chain = SetMinedSharedParams {
+            on_longest_chain: true,
+            ..off_chain
+        };
+        for r in engine.set_mined_batch(&off_chain, &keys) {
+            r.expect("off-chain setMined ok");
+        }
+        for r in engine.set_mined_batch(&on_chain, &keys) {
+            r.expect("on-chain setMined ok");
+        }
+
+        // Make the buffered tail durable, exactly as the background flusher /
+        // checkpoint would, and assert the writes ARE recoverable (durability is
+        // preserved, just deferred).
+        engine.flush_all_redo().expect("flush ok");
+
+        syncs.load(Ordering::SeqCst) - baseline
+    }
+
+    #[test]
+    fn buffered_secondary_index_updates_coalesce_fsyncs() {
+        // PIN/FIX: in buffered durability the two-phase secondary-index path
+        // (`update_both_secondary_indexes` inside setMined) must NOT fsync the
+        // redo per key — it appends and lets the background flusher coalesce the
+        // tail into one fsync. Pre-fix every secondary update called
+        // `RedoLog::flush` directly (one fsync per key, the ~600 fsync/s
+        // bottleneck); post-fix N keys × 2 updates cost a single trailing flush.
+        const N: u8 = 32;
+
+        // Strict mode is the control: it fsyncs per update (>= one per key),
+        // proving the secondary path provably fires for every key.
+        let strict = secondary_update_fsyncs(N, false);
+        assert!(
+            strict >= u64::from(N),
+            "strict mode must fsync per secondary update: {N} keys gave only {strict} fsyncs \
+             (the path under test did not fire)"
+        );
+
+        // Buffered mode must coalesce: the only fsync is the single explicit
+        // flush_all_redo at the end. No per-key fsync on the append path.
+        let buffered = secondary_update_fsyncs(N, true);
+        assert_eq!(
+            buffered, 1,
+            "buffered secondary updates must not fsync on the ack path; expected exactly the \
+             one trailing flush, got {buffered}"
+        );
+        assert!(
+            buffered * 4 < strict,
+            "buffered ({buffered}) must use far fewer fsyncs than strict ({strict})"
+        );
     }
 
     #[test]
