@@ -160,6 +160,19 @@ pub enum RedoError {
     /// from the on-disk state.
     #[error("redo log poisoned by earlier flush failure; restart required")]
     Poisoned,
+
+    /// Lever 7: a segment-ring format was requested with a `segment_size` that
+    /// is not a non-zero multiple of the device alignment (each segment must be
+    /// independently O_DIRECT-writable).
+    #[error(
+        "redo segment size {segment_size} must be a non-zero multiple of alignment {alignment}"
+    )]
+    InvalidSegmentSize { segment_size: u64, alignment: u64 },
+
+    /// Lever 7: the redo region cannot hold the minimum number of ring segments
+    /// (one active, at least one free to wrap into, at least one reclaimable).
+    #[error("redo ring needs at least {minimum} segments, region fits only {segment_count}")]
+    TooFewRingSegments { segment_count: u32, minimum: u32 },
 }
 
 pub type Result<T> = std::result::Result<T, RedoError>;
@@ -2003,6 +2016,59 @@ impl RedoAtomics {
     }
 }
 
+/// Minimum number of segments a ring may have: one active, at least one free to
+/// wrap into, and at least one reclaimable. Fewer can livelock the ring against
+/// a slow checkpoint (see `docs/REDO_SEGMENT_RING_DESIGN.md` §6).
+const MIN_RING_SEGMENTS: u32 = 3;
+
+/// Segment-ring runtime state (lever 7, `docs/REDO_SEGMENT_RING_DESIGN.md`).
+///
+/// Present only for a ring-format log ([`RedoLog::ring`] is `Some`); `None` is
+/// the historical linear log, whose paths are untouched. The entries region is
+/// divided into `segment_count` equal `segment_size`-byte segments; appends fill
+/// the active segment and roll to the next in ring order, wrapping into freed
+/// segments. No entry straddles a segment boundary.
+#[derive(Debug)]
+struct RingState {
+    /// Size in bytes of one segment (a multiple of the device alignment).
+    segment_size: u64,
+    /// Number of segments in the ring (>= [`MIN_RING_SEGMENTS`]).
+    segment_count: u32,
+    /// Segment currently being appended.
+    active_seg: u32,
+    /// Oldest segment still holding un-reclaimed entries; equals `active_seg`
+    /// when the live span is one segment. Advanced by reclaim (a later phase).
+    oldest_seg: u32,
+    /// Flushed write cursor within the active segment (bytes from the segment's
+    /// start). The unflushed tail lives in [`RedoLog::buffer`].
+    write_pos_in_seg: u64,
+    /// Per-segment maximum sequence written, for reclaim eligibility (a later
+    /// phase frees a segment once its max-seq is covered by a durable snapshot).
+    /// Indexed by segment; `0` for a segment holding no live entries.
+    seg_max_seq: Vec<u64>,
+}
+
+impl RingState {
+    /// Device byte offset (relative to the entries region start) of the active
+    /// segment's flushed cursor.
+    fn active_base(&self) -> u64 {
+        self.active_seg as u64 * self.segment_size
+    }
+
+    /// Total usable capacity of the ring (segment-aligned; the entries-region
+    /// remainder past the last whole segment is unused).
+    fn capacity(&self) -> u64 {
+        self.segment_count as u64 * self.segment_size
+    }
+
+    /// Number of segments currently live (from `oldest_seg` to `active_seg`
+    /// inclusive, in ring order). `1` for an empty fresh ring.
+    fn live_segments(&self) -> u64 {
+        let n = self.segment_count;
+        u64::from((self.active_seg + n - self.oldest_seg) % n) + 1
+    }
+}
+
 /// Linear-with-reset redo log on a block device.
 ///
 /// Entries are appended to an in-memory buffer and flushed to device
@@ -2012,6 +2078,11 @@ impl RedoAtomics {
 /// appends start at the beginning of the log region. There is no
 /// in-place wrap — see the module-level documentation for the full
 /// rationale (R-027 / BC-13).
+///
+/// Lever 7: when [`Self::ring`] is `Some`, the log instead uses an in-device
+/// **segment ring** ([`RingState`], `docs/REDO_SEGMENT_RING_DESIGN.md`) — the
+/// `write_pos`/`logical_start` linear fields are unused and the append/flush
+/// paths key off the ring pointers.
 pub struct RedoLog {
     device: Arc<dyn BlockDevice>,
     /// Device byte offset of the redo region's first byte (the header).
@@ -2072,6 +2143,9 @@ pub struct RedoLog {
     /// restart (the shared counter is restored as the max over all logs'
     /// headers at boot — see [`RedoLog::shared_sequence_floor`]).
     shared_seq: Option<Arc<AtomicU64>>,
+    /// Lever 7: segment-ring state. `None` = the historical linear log (all
+    /// linear paths unchanged); `Some` = the in-device segment ring.
+    ring: Option<RingState>,
 }
 
 impl RedoLog {
@@ -2150,6 +2224,7 @@ impl RedoLog {
                 entries_region_size: log_size - header_block_size,
             }),
             shared_seq: None,
+            ring: None,
         };
 
         // Try to read the on-disk header. If the magic is absent
@@ -2205,6 +2280,62 @@ impl RedoLog {
             .logical_start
             .store(log.logical_start, AtomicOrdering::Relaxed);
         Ok(log)
+    }
+
+    /// Format a **fresh** redo region as a segment ring (lever 7,
+    /// `docs/REDO_SEGMENT_RING_DESIGN.md`).
+    ///
+    /// Divides the entries region into `floor(entries_region / segment_size)`
+    /// equal segments and writes a v3 ring header. The region MUST be fresh
+    /// (zeroed / no live entries to preserve) — the v1/v2→v3 upgrade path (a
+    /// later phase) drains an existing log before reformatting.
+    ///
+    /// # Errors
+    ///
+    /// * [`RedoError::InvalidSegmentSize`] if `segment_size` is zero or not a
+    ///   multiple of the device alignment.
+    /// * [`RedoError::TooFewRingSegments`] if the region holds fewer than
+    ///   [`MIN_RING_SEGMENTS`] whole segments.
+    /// * the same open-time errors as [`Self::open`].
+    pub fn format_ring(
+        device: Arc<dyn BlockDevice>,
+        log_offset: u64,
+        log_size: u64,
+        segment_size: u64,
+    ) -> Result<Self> {
+        let mut log = Self::open(device, log_offset, log_size)?;
+        let align = log.device.alignment() as u64;
+        if segment_size == 0 || !segment_size.is_multiple_of(align) {
+            return Err(RedoError::InvalidSegmentSize {
+                segment_size,
+                alignment: align,
+            });
+        }
+        let entries = log.entries_region_size();
+        let count = (entries / segment_size) as u32;
+        if count < MIN_RING_SEGMENTS {
+            return Err(RedoError::TooFewRingSegments {
+                segment_count: count,
+                minimum: MIN_RING_SEGMENTS,
+            });
+        }
+        log.ring = Some(RingState {
+            segment_size,
+            segment_count: count,
+            active_seg: 0,
+            oldest_seg: 0,
+            write_pos_in_seg: 0,
+            seg_max_seq: vec![0; count as usize],
+        });
+        // Persist the ring header so a reopen (a later phase) sees the format.
+        log.write_header()?;
+        log.publish_atomics();
+        Ok(log)
+    }
+
+    /// Whether this log uses the segment-ring layout (lever 7).
+    fn is_ring(&self) -> bool {
+        self.ring.is_some()
     }
 
     /// Attach a shared global sequence counter for per-store redo.
@@ -2298,11 +2429,21 @@ impl RedoLog {
     /// own, when the entries region is empty and cannot reconstruct
     /// `next_sequence` on reopen.
     fn write_header_bytes(&self) -> Result<()> {
-        // Phase 1: the live log is still linear, so it writes the v2 format
-        // (byte-identical to pre-ring builds). The ring code path (a later
-        // phase) will construct a ring header instead.
-        let header =
-            RedoHeader::linear(self.next_sequence, self.checkpoint_seq, self.logical_start);
+        // A ring log writes the v3 ring header (geometry + pointers); a linear
+        // log writes the v2 format (byte-identical to pre-ring builds).
+        let header = match &self.ring {
+            Some(r) => RedoHeader {
+                next_sequence: self.next_sequence,
+                checkpoint_seq: self.checkpoint_seq,
+                logical_start: 0,
+                segment_size: r.segment_size,
+                segment_count: r.segment_count,
+                oldest_seg: r.oldest_seg,
+                active_seg: r.active_seg,
+                write_pos_in_seg: r.write_pos_in_seg,
+            },
+            None => RedoHeader::linear(self.next_sequence, self.checkpoint_seq, self.logical_start),
+        };
         let bytes = header.serialize();
         let align = self.device.alignment();
         let mut buf = AlignedBuf::new(self.header_block_size as usize, align);
@@ -2342,24 +2483,63 @@ impl RedoLog {
 
     /// Append an operation to the buffer (not yet durable).
     ///
-    /// Returns the assigned sequence number. Ordinary appends are bounded by
-    /// [`Self::append_capacity`] (the region minus the checkpoint-fence reserve);
-    /// the checkpoint's reclaim markers use [`Self::append_reclaim_marker`] to
-    /// reach the full region.
+    /// Returns the assigned sequence number. For a ring log the entry rolls to
+    /// the next segment if it does not fit the active one (lever 7); for a
+    /// linear log ordinary appends are bounded by [`Self::append_capacity`] (the
+    /// region minus the checkpoint-fence reserve) and the checkpoint's reclaim
+    /// markers use [`Self::append_reclaim_marker`] to reach the full region.
     pub fn append(&mut self, op: RedoOp) -> Result<u64> {
+        if self.is_ring() {
+            return self.append_ring(op);
+        }
         let cap = self.append_capacity();
         self.append_with_capacity(op, cap)
     }
 
     /// Append a checkpoint reclaim marker, bypassing the fence reserve so it can
     /// always be written even when ordinary appends see the log as full —
-    /// otherwise reclaim could never free a full log (lever 6c).
+    /// otherwise reclaim could never free a full log (lever 6c). Linear logs
+    /// only; a ring log records the reclaim fence in the header (lever 7).
     fn append_reclaim_marker(&mut self, op: RedoOp) -> Result<u64> {
         let cap = self.entries_region_size();
         self.append_with_capacity(op, cap)
     }
 
-    /// Shared append body: buffer `op` if it fits within `entries_capacity`.
+    /// Draw the next sequence number. With a shared global counter (per-store
+    /// redo) draw from it and fold the value into this log's `next_sequence` so
+    /// the on-disk header still records this log's high-water mark; otherwise
+    /// the local `next_sequence` is the sole source (single-log, byte-identical).
+    fn draw_sequence(&mut self) -> u64 {
+        match &self.shared_seq {
+            Some(shared) => {
+                let s = shared.fetch_add(1, AtomicOrdering::SeqCst);
+                if s + 1 > self.next_sequence {
+                    self.next_sequence = s + 1;
+                }
+                s
+            }
+            None => {
+                let s = self.next_sequence;
+                self.next_sequence += 1;
+                s
+            }
+        }
+    }
+
+    /// Commit `op` into the in-memory buffer with sequence `seq` already drawn.
+    /// Caller guarantees space (linear capacity check / ring segment roll).
+    fn buffer_entry(&mut self, op: RedoOp, seq: u64) {
+        let entry = RedoEntry { sequence: seq, op };
+        let bytes = entry.serialize();
+        self.buffer.extend_from_slice(&bytes);
+        self.pending_entries.push(entry);
+        if let Some(m) = redo_metrics() {
+            m.redo_append_total.inc();
+            self.buffered_entries += 1;
+        }
+    }
+
+    /// Linear append: buffer `op` if it fits within `entries_capacity`.
     fn append_with_capacity(&mut self, op: RedoOp, entries_capacity: u64) -> Result<u64> {
         // F-G4-002: refuse to append on a poisoned log.
         if self.poisoned {
@@ -2374,44 +2554,96 @@ impl RedoLog {
         // global sequence, which would punch a gap into a replication
         // seq-range that ack-tracking expects to be contiguous.
         let mut entry = RedoEntry { sequence: 0, op };
-        let bytes = entry.serialize();
+        let len = entry.serialize().len() as u64;
 
-        if self.write_pos + self.buffer.len() as u64 + bytes.len() as u64 > entries_capacity {
+        if self.write_pos + self.buffer.len() as u64 + len > entries_capacity {
             return Err(RedoError::LogFull {
                 used: self.write_pos + self.buffer.len() as u64,
                 capacity: entries_capacity,
             });
         }
 
-        // Capacity is assured — now commit the sequence. With a shared global
-        // counter attached, draw from it and fold the value into this log's
-        // `next_sequence` so the on-disk header still records this log's
-        // high-water mark for restart. Without it, the local `next_sequence`
-        // is the sole source (single-log behaviour, byte-identical).
-        let seq = match &self.shared_seq {
-            Some(shared) => {
-                let s = shared.fetch_add(1, AtomicOrdering::SeqCst);
-                if s + 1 > self.next_sequence {
-                    self.next_sequence = s + 1;
-                }
-                s
-            }
-            None => {
-                let s = self.next_sequence;
-                self.next_sequence += 1;
-                s
-            }
-        };
+        let seq = self.draw_sequence();
         entry.sequence = seq;
-        let bytes = entry.serialize();
+        self.buffer_entry(entry.op, seq);
+        Ok(seq)
+    }
 
-        self.buffer.extend_from_slice(&bytes);
-        self.pending_entries.push(entry);
-        if let Some(m) = redo_metrics() {
-            m.redo_append_total.inc();
-            self.buffered_entries += 1;
+    /// Ring append (lever 7): buffer `op` into the active segment, rolling to the
+    /// next segment in ring order if it does not fit. Returns
+    /// [`RedoError::LogFull`] — **without poisoning** — only when the ring is
+    /// genuinely full (the next segment is still live / un-reclaimed). No entry
+    /// straddles a segment boundary; the active segment's buffered bytes are
+    /// pwritten (no fsync) before the roll so they are not lost.
+    fn append_ring(&mut self, op: RedoOp) -> Result<u64> {
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
+        let mut entry = RedoEntry { sequence: 0, op };
+        let len = entry.serialize().len() as u64;
+
+        // Decide whether the entry fits the active segment (immutable borrow).
+        let (need_roll, ring_full) = {
+            let r = self.ring.as_ref().expect("ring log");
+            // An entry larger than a whole segment can never be written; surface
+            // it as LogFull (open-time validation keeps this from happening).
+            if len > r.segment_size {
+                return Err(RedoError::LogFull {
+                    used: r.write_pos_in_seg + self.buffer.len() as u64,
+                    capacity: r.segment_size,
+                });
+            }
+            let used_in_seg = r.write_pos_in_seg + self.buffer.len() as u64;
+            let need = used_in_seg + len > r.segment_size;
+            let full = need && (r.active_seg + 1) % r.segment_count == r.oldest_seg;
+            (need, full)
+        };
+        if ring_full {
+            return Err(RedoError::LogFull {
+                used: self.ring_used(),
+                capacity: self.ring_capacity(),
+            });
+        }
+        if need_roll {
+            // Persist the active segment's buffered bytes (pwrite, no fsync —
+            // durability comes from the caller's flush) before moving on, so the
+            // buffer never spans a segment boundary.
+            self.flush_pwrite_no_sync()?;
+            let r = self.ring.as_mut().expect("ring log");
+            r.active_seg = (r.active_seg + 1) % r.segment_count;
+            r.write_pos_in_seg = 0;
+        }
+
+        let seq = self.draw_sequence();
+        entry.sequence = seq;
+        self.buffer_entry(entry.op, seq);
+        // Track the active segment's high-water sequence for reclaim (phase 3).
+        if let Some(r) = self.ring.as_mut() {
+            let a = r.active_seg as usize;
+            if seq > r.seg_max_seq[a] {
+                r.seg_max_seq[a] = seq;
+            }
         }
         Ok(seq)
+    }
+
+    /// Total usable capacity of the ring (0 for a linear log).
+    fn ring_capacity(&self) -> u64 {
+        self.ring.as_ref().map_or(0, RingState::capacity)
+    }
+
+    /// Approximate live bytes in the ring: the older live segments counted whole
+    /// (slightly over-counting any roll tail-gaps, which only makes the
+    /// checkpoint trigger marginally early) plus the active segment's used bytes.
+    fn ring_used(&self) -> u64 {
+        match &self.ring {
+            Some(r) => {
+                (r.live_segments() - 1) * r.segment_size
+                    + r.write_pos_in_seg
+                    + self.buffer.len() as u64
+            }
+            None => 0,
+        }
     }
 
     /// Append every op in `ops` as an **atomic unit**: either all are buffered
@@ -2442,30 +2674,42 @@ impl RedoLog {
             return Ok(None);
         }
 
-        // Measure the batch's total on-disk size with a placeholder sequence.
-        // The serialized length is sequence-independent (the sequence is a
-        // fixed 8-byte field), so this equals the committed size exactly — and
+        // Measure each entry's on-disk size with a placeholder sequence. The
+        // serialized length is sequence-independent (the sequence is a fixed
+        // 8-byte field), so this equals the committed size exactly — and
         // measuring before drawing keeps a `LogFull` from burning a sequence.
-        let mut total = 0u64;
-        for op in ops {
-            let entry = RedoEntry {
-                sequence: 0,
-                op: op.clone(),
-            };
-            total += entry.serialize().len() as u64;
-        }
-        let entries_capacity = self.append_capacity();
-        let used = self.write_pos + self.buffer.len() as u64;
-        if used + total > entries_capacity {
-            return Err(RedoError::LogFull {
-                used,
-                capacity: entries_capacity,
-            });
+        let lens: Vec<u64> = ops
+            .iter()
+            .map(|op| {
+                RedoEntry {
+                    sequence: 0,
+                    op: op.clone(),
+                }
+                .serialize()
+                .len() as u64
+            })
+            .collect();
+
+        // Pre-check that the WHOLE batch fits before drawing any sequence or
+        // buffering any byte — so a `LogFull` leaves no half-appended residue
+        // (the all-or-nothing guarantee the lever-6 fix relies on).
+        if self.is_ring() {
+            self.ring_batch_fits(&lens)?;
+        } else {
+            let total: u64 = lens.iter().sum();
+            let entries_capacity = self.append_capacity();
+            let used = self.write_pos + self.buffer.len() as u64;
+            if used + total > entries_capacity {
+                return Err(RedoError::LogFull {
+                    used,
+                    capacity: entries_capacity,
+                });
+            }
         }
 
-        // Capacity is assured for the entire batch, so every per-op `append`
-        // below now succeeds (its own capacity re-check cannot trip), letting us
-        // reuse it for the sequence draw and buffering.
+        // Fit is assured for the entire batch, so every per-op append below
+        // succeeds (no capacity trip / no ring-full mid-batch); ring rolls still
+        // happen but never fail.
         let mut first = u64::MAX;
         let mut last = 0u64;
         for op in ops {
@@ -2474,6 +2718,38 @@ impl RedoLog {
             last = last.max(seq);
         }
         Ok(Some((first, last)))
+    }
+
+    /// Ring pre-check (lever 7): simulate placing entries of `lens` from the
+    /// current cursor, rolling at segment boundaries, and return
+    /// [`RedoError::LogFull`] if the batch would run into a still-live segment
+    /// (ring full) or contains an entry larger than a whole segment. No state is
+    /// mutated — the actual append performs the same rolls.
+    fn ring_batch_fits(&self, lens: &[u64]) -> Result<()> {
+        let r = self.ring.as_ref().expect("ring log");
+        let mut cur_seg = r.active_seg;
+        let mut cur_off = r.write_pos_in_seg + self.buffer.len() as u64;
+        for &len in lens {
+            if len > r.segment_size {
+                return Err(RedoError::LogFull {
+                    used: cur_off,
+                    capacity: r.segment_size,
+                });
+            }
+            if cur_off + len > r.segment_size {
+                let next = (cur_seg + 1) % r.segment_count;
+                if next == r.oldest_seg {
+                    return Err(RedoError::LogFull {
+                        used: self.ring_used(),
+                        capacity: self.ring_capacity(),
+                    });
+                }
+                cur_seg = next;
+                cur_off = 0;
+            }
+            cur_off += len;
+        }
+        Ok(())
     }
 
     /// Flush the buffer to device, making all appended entries durable.
@@ -2527,10 +2803,19 @@ impl RedoLog {
 
         let align = self.device.alignment();
         let align_u64 = align as u64;
-        let entries_region_off = self.entries_region_offset();
-        let device_offset = entries_region_off + self.write_pos;
+        // The cursor base is the entries region for a linear log, or the active
+        // segment's base for a ring log (lever 7); the cursor within it is
+        // `write_pos` / `write_pos_in_seg` respectively.
+        let (cursor_base, cursor) = match &self.ring {
+            Some(r) => (
+                self.entries_region_offset() + r.active_base(),
+                r.write_pos_in_seg,
+            ),
+            None => (self.entries_region_offset(), self.write_pos),
+        };
+        let device_offset = cursor_base + cursor;
         // Append-only: writes start at an aligned offset. New flushes
-        // always keep `write_pos` block-aligned (see end of function),
+        // always keep the cursor block-aligned (see end of function),
         // so `intra` is normally 0; the partial-block branch is taken
         // only if a previous run left a non-aligned tail.
         let aligned_offset = device_offset / align_u64 * align_u64;
@@ -2581,9 +2866,14 @@ impl RedoLog {
 
         let flushed_bytes = self.buffer.len() as u64;
         let flushed_entries = self.buffered_entries;
-        // F-G4-004: bump write_pos by the aligned amount so subsequent
-        // flushes always start at the next aligned offset.
-        self.write_pos = (aligned_offset + aligned_total as u64) - entries_region_off;
+        // F-G4-004: bump the cursor by the aligned amount so subsequent flushes
+        // always start at the next aligned offset (within the active segment for
+        // a ring log; within the entries region for a linear log).
+        let new_cursor = (aligned_offset + aligned_total as u64) - cursor_base;
+        match &mut self.ring {
+            Some(r) => r.write_pos_in_seg = new_cursor,
+            None => self.write_pos = new_cursor,
+        }
         self.publish_atomics();
         self.buffer.clear();
         self.entries_cache.append(&mut self.pending_entries);
@@ -2800,47 +3090,70 @@ impl RedoLog {
         !self.buffer.is_empty()
     }
 
-    /// Current write position within the entries region (bytes from
-    /// start of entries region; does NOT include the header block).
+    /// Current write position (bytes; for a ring log, the absolute offset within
+    /// the entries region of the active segment's cursor + buffered tail).
     pub fn write_position(&self) -> u64 {
-        self.write_pos + self.buffer.len() as u64
+        match &self.ring {
+            Some(r) => r.active_base() + r.write_pos_in_seg + self.buffer.len() as u64,
+            None => self.write_pos + self.buffer.len() as u64,
+        }
     }
 
-    /// Space remaining in the entries region.
+    /// Space remaining before the log is full.
     pub fn available_space(&self) -> u64 {
-        self.entries_region_size()
-            .saturating_sub(self.write_pos + self.buffer.len() as u64)
+        self.capacity().saturating_sub(if self.is_ring() {
+            self.ring_used()
+        } else {
+            self.write_pos + self.buffer.len() as u64
+        })
     }
 
-    /// Fraction of the entries region's capacity currently used (0.0 .. 1.0).
+    /// Fraction of capacity currently used (0.0 .. 1.0).
     ///
-    /// Used by the background checkpoint task to decide when to roll the
-    /// log: when this exceeds the configured threshold the task takes a
-    /// snapshot of the rest of the durability state, writes a checkpoint
-    /// marker, and `reset()`s the log so future appends write from offset
-    /// 0 again.
+    /// Used by the background checkpoint task to decide when to reclaim: when
+    /// this exceeds the configured threshold the task snapshots the rest of the
+    /// durability state and reclaims redo space. For a ring log this is the live
+    /// span over the ring capacity; for a linear log the entries used over the
+    /// entries region.
     pub fn usage_fraction(&self) -> f64 {
-        let cap = self.entries_region_size();
+        let (used, cap) = if self.is_ring() {
+            (self.ring_used(), self.ring_capacity())
+        } else {
+            (
+                self.write_pos + self.buffer.len() as u64,
+                self.entries_region_size(),
+            )
+        };
         if cap == 0 {
             return 1.0;
         }
-        let used = self.write_pos + self.buffer.len() as u64;
         used as f64 / cap as f64
     }
 
-    /// Total capacity of the entries region in bytes.
+    /// Total capacity in bytes (ring capacity for a ring log; the entries region
+    /// for a linear log).
     pub fn capacity(&self) -> u64 {
-        self.entries_region_size()
+        if self.is_ring() {
+            self.ring_capacity()
+        } else {
+            self.entries_region_size()
+        }
     }
 
-    /// Mirror the current `write_pos`/`logical_start` into the lock-free atomics.
+    /// Mirror the current used/start accounting into the lock-free atomics. For a
+    /// ring log the "write_pos" slot carries the live used bytes and the
+    /// logical_start slot is 0 (observability only; the locked accessors are
+    /// authoritative).
     fn publish_atomics(&self) {
-        self.atomics
-            .write_pos
-            .store(self.write_pos, AtomicOrdering::Relaxed);
+        let (wp, ls) = if self.is_ring() {
+            (self.ring_used(), 0)
+        } else {
+            (self.write_pos, self.logical_start)
+        };
+        self.atomics.write_pos.store(wp, AtomicOrdering::Relaxed);
         self.atomics
             .logical_start
-            .store(self.logical_start, AtomicOrdering::Relaxed);
+            .store(ls, AtomicOrdering::Relaxed);
     }
 
     /// A cheap clonable handle to the lock-free space accounting.
@@ -6055,6 +6368,179 @@ mod tests {
             RedoHeader::deserialize(&bytes),
             Err(RedoError::HeaderCrcMismatch { .. })
         ));
+    }
+
+    /// Build a fresh segment-ring log sized to exactly `segment_count` segments
+    /// of `segment_size` bytes (plus the one-block header).
+    fn make_ring(segment_size: u64, segment_count: u64) -> (Arc<MemoryDevice>, RedoLog) {
+        let total = 4096 + segment_size * segment_count;
+        let dev = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let log = RedoLog::format_ring(dev.clone(), 0, total, segment_size).unwrap();
+        (dev, log)
+    }
+
+    fn freeze(n: u8) -> RedoOp {
+        RedoOp::Freeze {
+            tx_key: test_key(n),
+            offset: 0,
+        }
+    }
+
+    /// Phase 2: a fresh ring is set up with the requested geometry and starts
+    /// empty (active == oldest == 0, nothing used).
+    #[test]
+    fn format_ring_initializes_geometry() {
+        let (_dev, log) = make_ring(8192, 5);
+        let r = log.ring.as_ref().expect("ring");
+        assert_eq!(r.segment_size, 8192);
+        assert_eq!(r.segment_count, 5);
+        assert_eq!((r.active_seg, r.oldest_seg, r.write_pos_in_seg), (0, 0, 0));
+        assert_eq!(log.capacity(), 8192 * 5);
+        assert_eq!(log.usage_fraction(), 0.0);
+        assert!(log.is_ring());
+    }
+
+    /// Phase 2: bad ring geometry is rejected at format time.
+    #[test]
+    fn format_ring_rejects_bad_geometry() {
+        let dev = Arc::new(MemoryDevice::new(4096 + 4096 * 8, 4096).unwrap());
+        // segment_size not a multiple of alignment.
+        assert!(matches!(
+            RedoLog::format_ring(dev.clone(), 0, dev.size(), 5000),
+            Err(RedoError::InvalidSegmentSize { .. })
+        ));
+        // Region holds fewer than MIN_RING_SEGMENTS whole segments.
+        let small = Arc::new(MemoryDevice::new(4096 + 4096 * 2, 4096).unwrap());
+        assert!(matches!(
+            RedoLog::format_ring(small.clone(), 0, small.size(), 4096),
+            Err(RedoError::TooFewRingSegments {
+                minimum: MIN_RING_SEGMENTS,
+                ..
+            })
+        ));
+    }
+
+    /// Phase 2: appends roll to the next segment when the active one fills, and
+    /// the rolled entry physically lands at the next segment's base (no
+    /// straddle). The pre-roll segment's bytes are persisted during the roll.
+    #[test]
+    fn ring_append_rolls_to_next_segment_at_its_base() {
+        let (dev, mut log) = make_ring(4096, 4);
+        let mut count = 0u32;
+        // Append until a roll into segment 1 occurs.
+        loop {
+            log.append(freeze((count % 251) as u8)).unwrap();
+            count += 1;
+            if log.ring.as_ref().unwrap().active_seg == 1 {
+                break;
+            }
+            assert!(count < 1000, "should roll well within 1000 small entries");
+        }
+        log.flush().unwrap();
+        assert_eq!(log.entries_cache.len(), count as usize);
+
+        // Segment 0's base and segment 1's base both begin with a valid entry —
+        // i.e. the roll started a fresh entry at seg1's base, not mid-entry.
+        let entries_off = 4096u64; // header block
+        for seg in 0..2u64 {
+            let mut blk = AlignedBuf::new(4096, 4096);
+            dev.pread_exact_at(&mut blk, entries_off + seg * 4096)
+                .unwrap();
+            assert!(
+                RedoEntry::deserialize(&blk).is_some(),
+                "segment {seg} must begin with a whole entry"
+            );
+        }
+    }
+
+    /// Phase 2: a full ring returns `LogFull` (transient) WITHOUT poisoning —
+    /// the next segment to roll into is still live/un-reclaimed.
+    #[test]
+    fn ring_full_returns_logfull_without_poison() {
+        let (_dev, mut log) = make_ring(4096, 3);
+        let mut hit_full = false;
+        for i in 0..100_000u32 {
+            match log.append(freeze((i % 251) as u8)) {
+                Ok(_) => {}
+                Err(RedoError::LogFull { .. }) => {
+                    hit_full = true;
+                    break;
+                }
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        assert!(hit_full, "a 3-segment ring must fill to LogFull");
+        assert!(!log.poisoned, "ring-full must not poison the log");
+        // Still transient: another append also LogFull, not Poisoned.
+        assert!(matches!(
+            log.append(freeze(1)),
+            Err(RedoError::LogFull { .. })
+        ));
+    }
+
+    /// Phase 2: after a segment is freed (reclaim, simulated by advancing
+    /// `oldest_seg`), the cursor wraps into it — no relocation.
+    #[test]
+    fn ring_wraps_into_freed_segment() {
+        let (_dev, mut log) = make_ring(4096, 3);
+        // Fill to full (active ends at segment 2).
+        while !matches!(log.append(freeze(0)), Err(RedoError::LogFull { .. })) {}
+        assert_eq!(log.ring.as_ref().unwrap().active_seg, 2);
+
+        // Simulate reclaiming segment 0: advance oldest_seg past it.
+        {
+            let r = log.ring.as_mut().unwrap();
+            r.oldest_seg = 1;
+            r.seg_max_seq[0] = 0;
+        }
+        // The next append rolls from seg 2 into the now-free seg 0.
+        log.append(freeze(9)).unwrap();
+        assert_eq!(
+            log.ring.as_ref().unwrap().active_seg,
+            0,
+            "cursor wrapped into the freed segment 0"
+        );
+        log.flush().unwrap();
+    }
+
+    /// Phase 2: `append_atomic` spans rolls and stays all-or-nothing — a batch
+    /// that fits is fully buffered; a batch too big for the whole ring returns
+    /// `LogFull` with NO residue and NO poison.
+    #[test]
+    fn ring_append_atomic_is_atomic_across_rolls() {
+        let (_dev, mut log) = make_ring(4096, 4);
+        // A batch larger than one segment (forces a roll) but well within the ring.
+        let batch: Vec<RedoOp> = (0..100u32).map(|i| freeze((i % 251) as u8)).collect();
+        let (first, last) = log.append_atomic(&batch).unwrap().expect("range");
+        assert_eq!(last - first, 99, "100 ops -> span of 100 sequences");
+        assert!(
+            log.ring.as_ref().unwrap().active_seg >= 1,
+            "the batch spanned at least one roll"
+        );
+        log.flush().unwrap();
+
+        // A batch far larger than the whole ring: rejected atomically.
+        let active_before = log.ring.as_ref().unwrap().active_seg;
+        let huge: Vec<RedoOp> = (0..10_000u32).map(|i| freeze((i % 251) as u8)).collect();
+        let next_seq_before = log.next_sequence;
+        assert!(matches!(
+            log.append_atomic(&huge),
+            Err(RedoError::LogFull { .. })
+        ));
+        assert!(!log.poisoned, "an over-capacity batch must not poison");
+        assert!(
+            log.buffer.is_empty(),
+            "rejected batch left no buffered residue"
+        );
+        assert_eq!(
+            log.ring.as_ref().unwrap().active_seg,
+            active_before,
+            "rejected batch did not advance the cursor"
+        );
+        assert_eq!(
+            log.next_sequence, next_seq_before,
+            "rejected batch burned no sequence"
+        );
     }
 
     /// Phase 1: a v3 header truncated below its declared length is rejected
