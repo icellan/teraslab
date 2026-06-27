@@ -65,7 +65,7 @@ time-series, container CPU, and a client-vs-server cross-check:
    by ~3× on its own client.
 3. **The loss is entirely client/adapter-side.** Driven by the Teranode→TeraSlab
    Go adapter (the production path), TeraSlab does only ~1500 ops/s because:
-   - the adapter's connection pool defaults to **16 conns** (vs the aerospike Go
+   - the adapter's connection pool defaults to **16 conns** (vs the reference's Go
      client's ~100) — an unfair concurrency handicap [fixed in driver: pool_size];
    - the adapter issues **1 spend per RPC** (no spend batching), while creates/gets
      ARE batched; one spend RPC ≈ one redo-flush-rate slot → ~450 spends/s.
@@ -188,7 +188,7 @@ dispatcher pool firing ops as goroutines, shared spendable/minted pools) — the
 realistic Teranode block-validation pattern (bursty, many concurrent txs), vs the
 closed-loop one-op-per-worker model. Swept IN_FLIGHT, `[loaded-host]`:
 
-| IN_FLIGHT | TeraSlab total · spend | Aerospike total · spend |
+| IN_FLIGHT | TeraSlab total · spend | Reference total · spend |
 |-----------|------------------------|-------------------------|
 | 256  | 5,371 · 1,607 (p99.9 317ms) | 21,977 · 6,596 (p99.9 55ms) |
 | 512  | 6,402 · 1,918 (p99.9 428ms) | 39,359 · 11,800 (p99.9 34ms) |

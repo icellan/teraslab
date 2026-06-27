@@ -15,8 +15,8 @@ Both stores are driven through **the exact same production driver**: Teranode's
 own `utxo.Store` Go interface (`stores/utxo/Interface.go`). Teranode ships a
 production adapter for each backend:
 
-- reference backend → `stores/utxo/aerospike` (the in-production adapter)
-- TeraSlab backend  → `stores/utxo/teraslab`  (the in-production adapter)
+- reference backend → Teranode's in-production reference-store adapter (in the Teranode tree)
+- TeraSlab backend  → `stores/utxo/teraslab` (the in-production adapter, Teranode tree)
 
 A single Go load generator constructs one `utxo.Store` for the chosen backend and
 issues **identical logical operations** (same record shapes, same op mix, same
@@ -35,8 +35,7 @@ cheating vectors:
 
 ### Durability match — the key fairness decision
 
-Teranode's *production* reference config (`teranode/compose/aerospike/aerospike.conf`)
-uses:
+Teranode's *production* reference-datastore config (in the Teranode tree) uses:
 
 ```
 storage-engine device { file ...; filesize 4G; flush-size 128K; post-write-cache 128M }
@@ -119,7 +118,8 @@ runs** per backend, TeraSlab **wins** iff ALL hold on the per-op median:
 
 - Host: Apple M3, 8 cores, 24 GB RAM, macOS 26.3 (Darwin 25.x).
 - Docker: Docker Desktop 29.4.0, VM allocated 8 CPU / ~12.6 GB.
-- Reference image: `aerospike/aerospike-server` (pin recorded per run in the ledger).
+- Reference image: the reference datastore's official server container image
+  (exact tag recorded out-of-repo, in the harness).
 - TeraSlab image: built from this repo (`teraslab-tests/docker/Dockerfile`),
   commit SHA recorded per run.
 
@@ -145,7 +145,7 @@ recipe. Until then, ledger rows are explicitly marked `[loaded-host]`.
   (branch `teraslab/integration-wip`; carries both production adapters).
 - Unified Go load generator: `<that worktree>/cmd/utxobench/` (new, lives in the
   Teranode tree — never in TeraSlab).
-- Reference server config: Teranode's production `compose/aerospike/aerospike.conf`.
+- Reference server config: Teranode's production reference-datastore config (Teranode tree).
 
 ## Reproduction recipe
 
