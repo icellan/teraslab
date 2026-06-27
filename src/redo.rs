@@ -3198,6 +3198,13 @@ impl RedoLog {
         }
         let fence = self.checkpoint_seq;
         let mut freed = 0u32;
+        // Highest sequence in the segments we free; everything at or below it is
+        // reclaimed and must be dropped from the in-memory entries cache too, so
+        // replica catch-up (`read_from_sequence` / `earliest_sequence`) reports
+        // the reclaimed range as gone (needs full resync) and the cache stays
+        // bounded. Freed segments hold increasing sequences, so the last freed
+        // segment carries the highest.
+        let mut freed_through = 0u64;
         if let Some(r) = self.ring.as_mut() {
             while r.oldest_seg != r.active_seg {
                 let o = r.oldest_seg as usize;
@@ -3206,12 +3213,14 @@ impl RedoLog {
                 if r.seg_max_seq[o] > fence {
                     break;
                 }
+                freed_through = freed_through.max(r.seg_max_seq[o]);
                 r.seg_max_seq[o] = 0;
                 r.oldest_seg = (r.oldest_seg + 1) % r.segment_count;
                 freed += 1;
             }
         }
         if freed > 0 {
+            self.entries_cache.retain(|e| e.sequence > freed_through);
             self.publish_atomics();
             self.write_header()?;
         }
@@ -7037,6 +7046,69 @@ mod tests {
             recovered,
             vec![s1, s2],
             "unflushed tail dropped on recovery"
+        );
+    }
+
+    /// Phase 5: replica catch-up (`read_from_sequence`) on a ring returns the
+    /// live entries from the requested sequence on, spanning segment rolls.
+    #[test]
+    fn ring_read_from_sequence_spans_segments() {
+        let (_dev, mut log) = make_ring(4096, 4);
+        let tracked = append_tracking(&mut log, 150);
+        log.flush().unwrap();
+        assert!(
+            log.ring.as_ref().unwrap().active_seg >= 1,
+            "must span >1 segment"
+        );
+
+        let from = tracked[75].0;
+        let got: Vec<u64> = log
+            .read_from_sequence(from)
+            .unwrap()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        let exp: Vec<u64> = tracked
+            .iter()
+            .map(|(q, _)| *q)
+            .filter(|q| *q >= from)
+            .collect();
+        assert_eq!(got, exp, "catch-up returns all live entries from `from` on");
+    }
+
+    /// Phase 5: reclaim prunes the in-memory entries cache, so replica catch-up
+    /// reports the reclaimed prefix as gone (the caller sees a gap → full
+    /// resync) and the cache stays bounded.
+    #[test]
+    fn ring_reclaim_prunes_cache_and_signals_gap() {
+        let (_dev, mut log) = make_ring(4096, 4);
+        let tracked = append_tracking(&mut log, 200);
+        log.flush().unwrap();
+        let before_len = log.entries_cache.len();
+
+        let seg0_max = seg_max(&tracked, 0);
+        log.set_fence(seg0_max).unwrap();
+        assert!(log.reclaim_covered_segments().unwrap() >= 1);
+
+        assert!(
+            log.entries_cache.iter().all(|e| e.sequence > seg0_max),
+            "reclaimed entries dropped from the cache"
+        );
+        assert!(log.entries_cache.len() < before_len, "cache shrank");
+
+        let earliest = log.earliest_sequence().unwrap().unwrap();
+        assert!(
+            earliest > seg0_max,
+            "earliest available is now above the fence"
+        );
+
+        // A replica asking from sequence 1 gets a gap: the first available entry
+        // is `earliest`, not 1 — the reclaimed prefix is gone (needs resync).
+        let got = log.read_from_sequence(1).unwrap();
+        assert_eq!(
+            got.first().unwrap().sequence,
+            earliest,
+            "reclaimed prefix is gone → catch-up from 1 starts at the earliest live entry"
         );
     }
 
