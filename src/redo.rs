@@ -3003,6 +3003,70 @@ impl RedoLog {
         self.flush()
     }
 
+    /// Lever 7 (segment ring): record the durable recovery fence in the HEADER.
+    ///
+    /// Every redo entry with sequence `<= through_sequence` is covered by a
+    /// durable snapshot, so recovery skips it and any segment holding only such
+    /// entries can be reclaimed ([`Self::reclaim_covered_segments`]). Unlike the
+    /// linear [`Self::mark_recovery_progress`], this writes NO log entry — the
+    /// fence is a header field (`checkpoint_seq`), so reclaim never needs log
+    /// space (this is what retires the lever-6c reserve). The header pwrite is
+    /// fsynced so the fence is durable before any segment is freed.
+    ///
+    /// The fence only ever advances (monotonic); a stale lower value is ignored.
+    /// Persists durably via [`Self::write_header`] (pwrite + fsync).
+    pub fn set_fence(&mut self, through_sequence: u64) -> Result<()> {
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
+        let new_fence = through_sequence.max(self.checkpoint_seq);
+        if new_fence == self.checkpoint_seq {
+            return Ok(()); // no advance — nothing to persist
+        }
+        self.checkpoint_seq = new_fence;
+        self.write_header()
+    }
+
+    /// Lever 7 (segment ring): free every segment whose entries are all covered
+    /// by the current fence (`checkpoint_seq`), advancing `oldest_seg` in ring
+    /// order. The active segment is never freed (it is the write target).
+    ///
+    /// Reclaim is an O(freed) pointer advance — no relocation and no log append,
+    /// replacing the linear [`Self::compact_prefix_through`]'s relocate (which
+    /// failed under load) and removing the need for the lever-6c fence reserve.
+    /// Because sequences increase in ring order from `oldest_seg` to
+    /// `active_seg`, the first segment whose maximum sequence exceeds the fence
+    /// (a straggler) pins itself and every segment after it, so the scan stops
+    /// there. Persists the new `oldest_seg` durably (header pwrite + fsync) when
+    /// anything was freed. Returns the number of segments freed.
+    ///
+    /// No-op (returns 0) on a linear log.
+    pub fn reclaim_covered_segments(&mut self) -> Result<u32> {
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
+        let fence = self.checkpoint_seq;
+        let mut freed = 0u32;
+        if let Some(r) = self.ring.as_mut() {
+            while r.oldest_seg != r.active_seg {
+                let o = r.oldest_seg as usize;
+                // A live segment always has a sequence >= 1; a straggler whose
+                // max exceeds the fence pins this segment and all later ones.
+                if r.seg_max_seq[o] > fence {
+                    break;
+                }
+                r.seg_max_seq[o] = 0;
+                r.oldest_seg = (r.oldest_seg + 1) % r.segment_count;
+                freed += 1;
+            }
+        }
+        if freed > 0 {
+            self.publish_atomics();
+            self.write_header()?;
+        }
+        Ok(freed)
+    }
+
     /// Read all entries after the last checkpoint (for crash recovery).
     pub fn recover(&self) -> Result<Vec<RedoEntry>> {
         let all = self.scan_all()?;
@@ -6541,6 +6605,137 @@ mod tests {
             log.next_sequence, next_seq_before,
             "rejected batch burned no sequence"
         );
+    }
+
+    /// Append `n` entries one at a time, returning `(sequence, active_seg)` for
+    /// each so a test can compute per-segment max sequences and pick fences.
+    fn append_tracking(log: &mut RedoLog, n: u32) -> Vec<(u64, u32)> {
+        (0..n)
+            .map(|i| {
+                let seq = log.append(freeze((i % 251) as u8)).unwrap();
+                (seq, log.ring.as_ref().unwrap().active_seg)
+            })
+            .collect()
+    }
+
+    /// Max sequence written to `seg` from a `(seq, active_seg)` trace.
+    fn seg_max(tracked: &[(u64, u32)], seg: u32) -> u64 {
+        tracked
+            .iter()
+            .filter(|(_, s)| *s == seg)
+            .map(|(q, _)| *q)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Phase 3: the reclaim fence is recorded in the HEADER (no log entry) and
+    /// is durable — a re-read of the device header shows the advanced fence.
+    #[test]
+    fn ring_set_fence_persists_in_header() {
+        let (dev, mut log) = make_ring(4096, 4);
+        log.append(freeze(1)).unwrap();
+        log.flush().unwrap();
+        log.set_fence(1).unwrap();
+
+        let mut blk = AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut blk, 0).unwrap();
+        let h = RedoHeader::deserialize(&blk).unwrap();
+        assert!(h.is_ring(), "header is a ring header");
+        assert_eq!(h.checkpoint_seq, 1, "fence persisted in the header");
+
+        // The fence only advances — a stale lower value is ignored.
+        log.set_fence(0).unwrap();
+        dev.pread_exact_at(&mut blk, 0).unwrap();
+        assert_eq!(
+            RedoHeader::deserialize(&blk).unwrap().checkpoint_seq,
+            1,
+            "fence must not regress"
+        );
+    }
+
+    /// Phase 3: reclaim frees segments whose entries are all covered by the
+    /// fence, advancing `oldest_seg` — an O(1) pointer move, no relocation.
+    #[test]
+    fn ring_reclaim_frees_covered_segments() {
+        let (_dev, mut log) = make_ring(4096, 4);
+        let tracked = append_tracking(&mut log, 200);
+        log.flush().unwrap();
+        assert!(
+            log.ring.as_ref().unwrap().active_seg >= 2,
+            "200 small entries should fill into segment 2"
+        );
+
+        // Fence covering segments 0 AND 1 (their highest sequence).
+        let seg1_max = seg_max(&tracked, 1);
+        log.set_fence(seg1_max).unwrap();
+        let freed = log.reclaim_covered_segments().unwrap();
+        assert_eq!(freed, 2, "segments 0 and 1 are covered → freed");
+        assert_eq!(log.ring.as_ref().unwrap().oldest_seg, 2);
+        // The freed segments' max-seq is cleared.
+        assert_eq!(log.ring.as_ref().unwrap().seg_max_seq[0], 0);
+        assert_eq!(log.ring.as_ref().unwrap().seg_max_seq[1], 0);
+    }
+
+    /// Phase 3: a segment whose max sequence exceeds the fence is retained (and
+    /// pins every later segment), so reclaim stops at it.
+    #[test]
+    fn ring_reclaim_retains_uncovered_segment() {
+        let (_dev, mut log) = make_ring(4096, 4);
+        let tracked = append_tracking(&mut log, 200);
+        log.flush().unwrap();
+
+        // Fence covering ONLY segment 0.
+        let seg0_max = seg_max(&tracked, 0);
+        log.set_fence(seg0_max).unwrap();
+        let freed = log.reclaim_covered_segments().unwrap();
+        assert_eq!(freed, 1, "only segment 0 is covered");
+        assert_eq!(log.ring.as_ref().unwrap().oldest_seg, 1);
+        assert!(
+            log.ring.as_ref().unwrap().seg_max_seq[1] > seg0_max,
+            "segment 1 retained (a straggler above the fence)"
+        );
+    }
+
+    /// Phase 3: reclaim never frees the active segment even when the fence covers
+    /// everything — `oldest_seg` stops at `active_seg`, which stays appendable.
+    #[test]
+    fn ring_reclaim_never_frees_active_segment() {
+        let (_dev, mut log) = make_ring(4096, 4);
+        append_tracking(&mut log, 200);
+        log.flush().unwrap();
+        let active = log.ring.as_ref().unwrap().active_seg;
+        assert!(active >= 1);
+
+        log.set_fence(u64::MAX).unwrap(); // covers everything, incl. the active seg
+        let freed = log.reclaim_covered_segments().unwrap();
+        assert_eq!(freed, active, "every non-active live segment freed");
+        let r = log.ring.as_ref().unwrap();
+        assert_eq!(r.oldest_seg, r.active_seg, "oldest stops at the active seg");
+        // The active segment is still usable.
+        log.append(freeze(7)).unwrap();
+    }
+
+    /// Phase 3: end-to-end — fill the ring to `LogFull`, reclaim the covered
+    /// segments, then the cursor wraps into a freed segment (no relocation).
+    #[test]
+    fn ring_reclaim_then_wrap() {
+        let (_dev, mut log) = make_ring(4096, 3);
+        while !matches!(log.append(freeze(0)), Err(RedoError::LogFull { .. })) {}
+        assert_eq!(log.ring.as_ref().unwrap().active_seg, 2);
+        assert_eq!(log.ring.as_ref().unwrap().oldest_seg, 0);
+
+        // Fence covers everything written; reclaim frees segments 0 and 1.
+        log.set_fence(log.current_sequence()).unwrap();
+        let freed = log.reclaim_covered_segments().unwrap();
+        assert_eq!(freed, 2);
+        let r = log.ring.as_ref().unwrap();
+        assert_eq!((r.oldest_seg, r.active_seg), (2, 2));
+
+        // A new append rolls from segment 2 into the freed segment 0 — the ring
+        // wraps without any relocation, and no LogFull.
+        log.append(freeze(9)).unwrap();
+        assert_eq!(log.ring.as_ref().unwrap().active_seg, 0);
+        log.flush().unwrap();
     }
 
     /// Phase 1: a v3 header truncated below its declared length is rejected
