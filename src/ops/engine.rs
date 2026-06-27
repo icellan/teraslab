@@ -14238,20 +14238,20 @@ mod tests {
         );
     }
 
-    /// P1: a mid-batch append failure (LogFull) in `append_redo_ops_routed` must
-    /// fail closed AND poison the log. Earlier ops of the batch were buffered
-    /// with already-consumed global sequences; if the log stayed live they would
-    /// become durable on the next successful flush even though the caller treats
-    /// the batch as failed and rolls its reservations back — diverging durable
-    /// from acknowledged state. Pre-fix the `?` on `append` returned without
-    /// poisoning, leaving that residue live.
+    /// Lever 6: an over-capacity batch (`LogFull`) in `append_redo_ops_routed`
+    /// must fail closed but stay TRANSIENT — the log is rejected atomically with
+    /// no buffered residue and is NOT poisoned, because `LogFull` is reclaimed by
+    /// the checkpoint. Poisoning would turn a momentarily full log into a
+    /// permanent "restart required" wedge (the bug this replaces: the old path
+    /// poisoned on every mid-batch `LogFull`). After space is reclaimed a fitting
+    /// batch succeeds and is durable.
     #[test]
-    fn append_redo_ops_routed_poisons_log_on_midbatch_append_failure() {
+    fn append_redo_ops_routed_logfull_is_transient_not_poison() {
         use crate::redo::{RedoLog, RedoOp};
 
         let engine = create_engine(); // single store
         // Tiny log: a 4 KiB header block + ~4 KiB entries region holds ~100
-        // small ops, so a 2000-op batch overflows mid-append.
+        // small ops, so a 2000-op batch overflows the whole region.
         let rdev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
         let log = RedoLog::open(rdev.clone(), 0, 8192).unwrap();
         let log_arc = Arc::new(parking_lot::Mutex::new(log));
@@ -14266,32 +14266,32 @@ mod tests {
             .collect();
         let err = engine
             .append_redo_ops_routed(&ops)
-            .expect_err("a mid-batch LogFull must fail closed");
+            .expect_err("an over-capacity batch must fail closed");
         assert!(
-            err.contains("redo log append failed"),
-            "expected the append-failure error, got: {err}"
+            err.contains("redo log full"),
+            "expected the transient full-log error, got: {err}"
         );
 
-        // The log is poisoned: no later write can extend the partial batch.
-        assert!(
-            matches!(
-                log_arc.lock().append(RedoOp::AllocateRegion {
-                    device_id: 0,
-                    offset: 0,
-                    size: 4096
-                }),
-                Err(crate::redo::RedoError::Poisoned)
-            ),
-            "log must be poisoned after a mid-batch append failure"
-        );
+        // The log is NOT poisoned and carries no residue: the over-capacity
+        // batch buffered nothing, so a small batch appends and flushes cleanly.
+        let small: Vec<RedoOp> = (0..2u64)
+            .map(|i| RedoOp::AllocateRegion {
+                device_id: 0,
+                offset: i * 4096,
+                size: 4096,
+            })
+            .collect();
+        let (first, last) = engine
+            .append_redo_ops_routed(&small)
+            .expect("log must accept writes — a transient LogFull must not poison");
+        assert_eq!(last - first, 1, "two ops -> span of 2 sequences");
 
-        // And NOTHING from the failed batch is durable: a fresh log over the same
-        // device recovers zero entries (the failed batch never flushed, and the
-        // poisoned buffer can never flush).
+        // Only the small batch is durable; the failed big batch left no residue.
         let fresh = RedoLog::open(rdev, 0, 8192).unwrap();
-        assert!(
-            fresh.recover().unwrap().is_empty(),
-            "no residue from the failed batch may be durable"
+        assert_eq!(
+            fresh.recover().unwrap().len(),
+            2,
+            "only the fitting batch is durable; no residue from the rejected batch"
         );
     }
 

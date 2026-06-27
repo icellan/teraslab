@@ -106,8 +106,11 @@ impl GroupCommit {
 
     /// Durably append `ops` to the log, coalescing the fsync with any concurrent
     /// commits. Returns this submission's own `(first, last)` sequence range
-    /// (or `Ok(None)` for empty `ops`). Returns `Err` if the log was poisoned or
-    /// the flush failed — the same fail-closed contract as the direct path.
+    /// (or `Ok(None)` for empty `ops`). Returns `Err` if the log was poisoned,
+    /// the flush failed, or the log is transiently full (`LogFull`). A `LogFull`
+    /// error is retryable backpressure and does **not** poison the log — the
+    /// submission is rejected atomically (nothing buffered) and succeeds on a
+    /// retry once the checkpoint reclaims space.
     pub fn commit(&self, ops: Vec<RedoOp>) -> CommitOutcome {
         if ops.is_empty() {
             return Ok(None);
@@ -120,21 +123,22 @@ impl GroupCommit {
         // — the relaxed-durability contract.
         if self.buffered.load(std::sync::atomic::Ordering::Acquire) {
             let mut log = self.log.lock();
-            let mut first = u64::MAX;
-            let mut last = 0u64;
-            for op in &ops {
-                match log.append(op.clone()) {
-                    Ok(seq) => {
-                        first = first.min(seq);
-                        last = last.max(seq);
-                    }
-                    Err(e) => {
-                        log.poison();
-                        return Err(format!("redo log append failed: {e}"));
-                    }
+            return match log.append_atomic(&ops) {
+                Ok(range) => Ok(range),
+                Err(e @ crate::redo::RedoError::LogFull { .. }) => {
+                    // Transient backpressure: the checkpoint reclaims space.
+                    // `append_atomic` rejected the whole batch (nothing
+                    // buffered), so the log is NOT poisoned — the caller retries
+                    // once space frees. Poisoning here would turn a momentary
+                    // full log into a permanent "restart required" wedge.
+                    Err(format!("{e}"))
                 }
-            }
-            return Ok(Some((first, last)));
+                Err(e) => {
+                    // A genuine fault (already-poisoned log): fail closed.
+                    log.poison();
+                    Err(format!("redo log append failed: {e}"))
+                }
+            };
         }
 
         let my_id = {
@@ -195,53 +199,54 @@ impl GroupCommit {
     }
 
     /// Append every submission's ops to the log and flush once. Returns the
-    /// per-submission outcome. On an append error the log is poisoned (its buffer
-    /// dropped) and every submission in the batch fails — fail-closed, exactly as
-    /// the direct routed path does for a mid-batch append failure.
+    /// per-submission outcome.
+    ///
+    /// Each submission is appended **atomically** ([`RedoLog::append_atomic`]):
+    /// it either fits entirely or is rejected whole, leaving nothing buffered.
+    /// A rejected submission gets a transient `LogFull` error and is skipped —
+    /// the log is **not** poisoned, because `LogFull` is reclaimed by the
+    /// checkpoint and poisoning would wedge the node ("restart required") on a
+    /// momentarily full log. Submissions that fit are made durable by the single
+    /// flush; a small submission can still make progress in the same round that
+    /// a large one is deferred. The only fatal append error is an
+    /// already-poisoned log, which fails that submission. A flush I/O fault
+    /// poisons (inside `flush`) and fails every appended submission.
     fn flush_batch(&self, batch: &[Submission]) -> Vec<(u64, CommitOutcome)> {
         let mut guard = self.log.lock();
 
-        // Append all submissions, tracking each one's (first, last) range.
-        let mut ranges: Vec<(u64, Option<(u64, u64)>)> = Vec::with_capacity(batch.len());
-        let mut append_err: Option<String> = None;
-        'append: for sub in batch {
-            let mut first = u64::MAX;
-            let mut last = 0u64;
-            let mut wrote = false;
-            for op in &sub.ops {
-                match guard.append(op.clone()) {
-                    Ok(seq) => {
-                        first = first.min(seq);
-                        last = last.max(seq);
-                        wrote = true;
+        let mut outcomes: Vec<(u64, CommitOutcome)> = Vec::with_capacity(batch.len());
+        let mut any_appended = false;
+        for sub in batch {
+            match guard.append_atomic(&sub.ops) {
+                Ok(range) => {
+                    if range.is_some() {
+                        any_appended = true;
                     }
-                    Err(e) => {
-                        // Drop the whole batch's buffered residue so it can never
-                        // flush, and fail every submission. Mirrors the routed
-                        // path: a partial batch must not become durable.
-                        guard.poison();
-                        append_err = Some(format!("redo log append failed: {e}"));
-                        break 'append;
-                    }
+                    outcomes.push((sub.id, Ok(range)));
+                }
+                Err(e @ crate::redo::RedoError::LogFull { .. }) => {
+                    // Transient: retryable backpressure, no poison. `append_atomic`
+                    // buffered nothing for this submission.
+                    outcomes.push((sub.id, Err(format!("{e}"))));
+                }
+                Err(e) => {
+                    // Already-poisoned log: fail this submission, fail closed.
+                    outcomes.push((sub.id, Err(format!("redo log append failed: {e}"))));
                 }
             }
-            ranges.push((sub.id, wrote.then_some((first, last))));
         }
 
-        if let Some(err) = append_err {
-            return batch.iter().map(|s| (s.id, Err(err.clone()))).collect();
-        }
-
-        match guard.flush() {
-            Ok(()) => ranges
+        if any_appended && let Err(e) = guard.flush() {
+            // `flush` poisoned + dropped the buffer, so every submission that
+            // WAS appended loses durability and must fail. Submissions that
+            // already hold a (non-durable) LogFull/poison error keep it.
+            let msg = format!("redo log flush failed: {e}");
+            return outcomes
                 .into_iter()
-                .map(|(id, range)| (id, Ok(range)))
-                .collect(),
-            Err(e) => {
-                let msg = format!("redo log flush failed: {e}");
-                batch.iter().map(|s| (s.id, Err(msg.clone()))).collect()
-            }
+                .map(|(id, oc)| (id, Err(oc.err().unwrap_or_else(|| msg.clone()))))
+                .collect();
         }
+        outcomes
     }
 }
 
@@ -424,6 +429,77 @@ mod tests {
             entries.len(),
             2,
             "both buffered entries recoverable after flush"
+        );
+    }
+
+    /// Build a GroupCommit over a small log so a fill loop reaches `LogFull`
+    /// quickly. Returns both the coordinator and the shared log handle so a
+    /// test can reclaim space directly.
+    fn small_log_gc() -> (Arc<GroupCommit>, Arc<Mutex<RedoLog>>) {
+        let dev = Arc::new(MemoryDevice::new(16 * 1024, 4096).unwrap());
+        let log = Arc::new(Mutex::new(
+            RedoLog::open(dev as Arc<dyn BlockDevice>, 0, 16 * 1024).unwrap(),
+        ));
+        (GroupCommit::new(log.clone()), log)
+    }
+
+    /// Fill the log via single-op commits until one reports `LogFull`. Returns
+    /// the error so the caller can assert it is the transient full-log error.
+    fn fill_until_full(gc: &GroupCommit) -> String {
+        for i in 0..8192u32 {
+            if let Err(e) = gc.commit(vec![delete_op((i % 251) as u8)]) {
+                return e;
+            }
+        }
+        panic!("log did not fill within the loop");
+    }
+
+    #[test]
+    fn commit_logfull_does_not_poison_log() {
+        // Strict (group) path: a full log returns a transient error, but the
+        // log must NOT be poisoned. After reclaiming space, a commit succeeds —
+        // a poisoned log would keep failing forever regardless of free space.
+        let (gc, log) = small_log_gc();
+        let err = fill_until_full(&gc);
+        assert!(
+            err.contains("redo log full"),
+            "fill should end on a transient LogFull, got: {err}"
+        );
+
+        log.lock().reset().expect("reclaim space");
+        let range = gc
+            .commit(vec![delete_op(7)])
+            .expect("log must accept writes again after reclaim — not poisoned")
+            .expect("range");
+        assert_eq!(range.0, range.1, "single op -> single sequence");
+        assert_eq!(
+            gc.log().lock().recover().unwrap().len(),
+            1,
+            "the post-reclaim commit is durable"
+        );
+    }
+
+    #[test]
+    fn buffered_commit_logfull_does_not_poison_log() {
+        // Buffered path: same invariant. Buffered commits append without fsync,
+        // so the buffer fills; a full log returns a transient error and the log
+        // stays live — after reclaim a buffered commit + flush succeeds.
+        let (gc, log) = small_log_gc();
+        gc.set_buffered(true);
+        let err = fill_until_full(&gc);
+        assert!(
+            err.contains("redo log full"),
+            "buffered fill should end on a transient LogFull, got: {err}"
+        );
+
+        log.lock().reset().expect("reclaim space");
+        gc.commit(vec![delete_op(7)])
+            .expect("buffered log must accept writes again after reclaim");
+        gc.flush().expect("flush ok");
+        assert_eq!(
+            gc.log().lock().recover().unwrap().len(),
+            1,
+            "the post-reclaim buffered commit is durable after flush"
         );
     }
 

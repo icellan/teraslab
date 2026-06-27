@@ -2280,6 +2280,68 @@ impl RedoLog {
         Ok(seq)
     }
 
+    /// Append every op in `ops` as an **atomic unit**: either all are buffered
+    /// (returning the contiguous `(first, last)` sequence range) or none is and
+    /// [`RedoError::LogFull`] is returned — **without poisoning the log**.
+    ///
+    /// This is the safe primitive for committing a multi-op submission against a
+    /// log that may be transiently full. The per-op [`Self::append`] cannot
+    /// offer this: a mid-batch `LogFull` would leave the earlier ops buffered
+    /// with already-drawn sequences, so a later successful flush would make a
+    /// partial submission durable. The historical workaround was to *poison* the
+    /// log on any mid-batch append failure — but `LogFull` is transient (the
+    /// checkpoint reclaims space), so poisoning turned a momentary backpressure
+    /// condition into a permanent "restart required" wedge.
+    ///
+    /// By pre-measuring the whole batch's on-disk size against the remaining
+    /// capacity *before* drawing any sequence, this method guarantees there is
+    /// never a half-appended residue: on `LogFull` nothing is buffered and no
+    /// sequence is burned, so the caller can simply retry once space frees.
+    ///
+    /// Returns `Ok(None)` for empty `ops`. Returns [`RedoError::Poisoned`] if
+    /// the log was already poisoned by a genuine (non-transient) fault.
+    pub fn append_atomic(&mut self, ops: &[RedoOp]) -> Result<Option<(u64, u64)>> {
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
+        if ops.is_empty() {
+            return Ok(None);
+        }
+
+        // Measure the batch's total on-disk size with a placeholder sequence.
+        // The serialized length is sequence-independent (the sequence is a
+        // fixed 8-byte field), so this equals the committed size exactly — and
+        // measuring before drawing keeps a `LogFull` from burning a sequence.
+        let mut total = 0u64;
+        for op in ops {
+            let entry = RedoEntry {
+                sequence: 0,
+                op: op.clone(),
+            };
+            total += entry.serialize().len() as u64;
+        }
+        let entries_capacity = self.entries_region_size();
+        let used = self.write_pos + self.buffer.len() as u64;
+        if used + total > entries_capacity {
+            return Err(RedoError::LogFull {
+                used,
+                capacity: entries_capacity,
+            });
+        }
+
+        // Capacity is assured for the entire batch, so every per-op `append`
+        // below now succeeds (its own capacity re-check cannot trip), letting us
+        // reuse it for the sequence draw and buffering.
+        let mut first = u64::MAX;
+        let mut last = 0u64;
+        for op in ops {
+            let seq = self.append(op.clone())?;
+            first = first.min(seq);
+            last = last.max(seq);
+        }
+        Ok(Some((first, last)))
+    }
+
     /// Flush the buffer to device, making all appended entries durable.
     ///
     /// F-G4-004: writes are append-only at aligned offsets — the buffer
@@ -2438,20 +2500,17 @@ impl RedoLog {
     /// secondary-intent entries (e.g. one DAH + one unmined) are grouped
     /// into a single fsync before the redb transactions are committed.
     pub fn append_batch_and_flush(&mut self, ops: &[RedoOp]) -> Result<(u64, u64)> {
-        if ops.is_empty() {
-            return Ok((0, 0));
+        // Append the whole batch atomically: a transient `LogFull` rejects it
+        // whole (leaving no half-appended residue that a later flush could make
+        // durable) and does NOT poison the log. Empty `ops` returns `(0, 0)`
+        // without flushing.
+        match self.append_atomic(ops)? {
+            None => Ok((0, 0)),
+            Some(range) => {
+                self.flush()?;
+                Ok(range)
+            }
         }
-        // Capture the first sequence from the actual `append` (works for both
-        // the local and shared-global counters) rather than reading
-        // `next_sequence` up front, which under a shared counter is not the
-        // value the next `append` will assign.
-        let first_seq = self.append(ops[0].clone())?;
-        let mut last_seq = first_seq;
-        for op in &ops[1..] {
-            last_seq = self.append(op.clone())?;
-        }
-        self.flush()?;
-        Ok((first_seq, last_seq))
     }
 
     /// Write and flush a checkpoint marker.
@@ -3501,6 +3560,59 @@ mod tests {
             }
         }
         assert!(count > 0);
+    }
+
+    #[test]
+    fn append_atomic_overflow_is_transient_not_poison() {
+        // A batch that does not fit must fail with `LogFull` WITHOUT poisoning
+        // the log — `LogFull` is transient (the checkpoint reclaims space),
+        // unlike a real I/O fault. After the failed batch: no sequence was
+        // burned, nothing it carried was buffered (so nothing of it can later
+        // become durable), and the log still accepts a batch that fits.
+        let (dev, mut log) = make_log(16 * 1024);
+
+        // A batch far larger than the whole entries region.
+        let big: Vec<RedoOp> = (0..4096u32)
+            .map(|i| RedoOp::Freeze {
+                tx_key: test_key((i % 251) as u8),
+                offset: i,
+            })
+            .collect();
+        let next_seq_before = log.next_sequence;
+        match log.append_atomic(&big) {
+            Err(RedoError::LogFull { .. }) => {}
+            other => panic!("expected LogFull, got {other:?}"),
+        }
+        // No sequence burned: the next assignable sequence is unchanged.
+        assert_eq!(
+            log.next_sequence, next_seq_before,
+            "a LogFull batch must not consume any sequence"
+        );
+
+        // The log is NOT poisoned: a small batch that fits still commits.
+        let small = vec![
+            RedoOp::Freeze {
+                tx_key: test_key(1),
+                offset: 0,
+            },
+            RedoOp::Freeze {
+                tx_key: test_key(2),
+                offset: 0,
+            },
+        ];
+        let (first, last) = log
+            .append_atomic(&small)
+            .expect("log must stay live after a transient LogFull")
+            .expect("non-empty batch yields a range");
+        assert_eq!(last - first, 1, "two ops -> span of 2 sequences");
+        log.flush().expect("flush after recovery");
+
+        // Only the small batch is durable: the over-capacity batch left no
+        // buffered prefix behind (had it appended the ops that individually
+        // fit, recover would see more than 2).
+        let fresh = RedoLog::open(dev.clone(), 0, 16 * 1024).unwrap();
+        let entries = fresh.recover().unwrap();
+        assert_eq!(entries.len(), 2, "only the fitting batch is durable");
     }
 
     #[test]
