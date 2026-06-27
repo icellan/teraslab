@@ -2234,42 +2234,49 @@ impl RedoLog {
         // silently misparsing.
         let header_present = log.read_header_or_init()?;
 
-        // Scan existing entries from the entries region to find the
-        // write tail and entries cache. A checksum/truncation failure at
-        // the final entry is treated as the end of valid log data, so
-        // appends after restart resume at the last fully-valid entry
-        // instead of overwriting from offset zero.
-        let (entries, tail_pos) = log.scan_entries_region_with_tail()?;
-        log.write_pos = tail_pos;
-        log.entries_cache = entries.clone();
+        if log.is_ring() {
+            // Lever 7: a segment-ring log (v3 header). Scan the live segments
+            // in ring order, rebuilding entries_cache / seg_max_seq and
+            // re-deriving the active segment's tail + next_sequence.
+            log.recover_ring_scan()?;
+        } else {
+            // Linear log. Scan existing entries from the entries region to find
+            // the write tail and entries cache. A checksum/truncation failure at
+            // the final entry is treated as the end of valid log data, so
+            // appends after restart resume at the last fully-valid entry instead
+            // of overwriting from offset zero.
+            let (entries, tail_pos) = log.scan_entries_region_with_tail()?;
+            log.write_pos = tail_pos;
+            log.entries_cache = entries.clone();
 
-        // F-G4-001: the on-disk header is the authoritative source for
-        // `next_sequence`. Only fall back to scan-derived value if the
-        // region was freshly initialised (no header was written yet) or
-        // the scan observed a strictly higher sequence than the header
-        // recorded.
-        if let Some(last) = entries.last() {
-            let scan_next = last.sequence + 1;
-            if !header_present || scan_next > log.next_sequence {
-                log.next_sequence = scan_next;
-            }
-        }
-
-        // Find last checkpoint to set checkpoint_seq (only if not
-        // already set authoritatively by the header).
-        if !header_present {
-            for e in entries.iter().rev() {
-                if e.op == RedoOp::Checkpoint {
-                    log.checkpoint_seq = e.sequence;
-                    break;
+            // F-G4-001: the on-disk header is the authoritative source for
+            // `next_sequence`. Only fall back to scan-derived value if the
+            // region was freshly initialised (no header was written yet) or
+            // the scan observed a strictly higher sequence than the header
+            // recorded.
+            if let Some(last) = entries.last() {
+                let scan_next = last.sequence + 1;
+                if !header_present || scan_next > log.next_sequence {
+                    log.next_sequence = scan_next;
                 }
             }
-        }
 
-        // If the region looked fresh, write an initial header so the
-        // next open sees the same authoritative state.
-        if !header_present {
-            log.write_header()?;
+            // Find last checkpoint to set checkpoint_seq (only if not
+            // already set authoritatively by the header).
+            if !header_present {
+                for e in entries.iter().rev() {
+                    if e.op == RedoOp::Checkpoint {
+                        log.checkpoint_seq = e.sequence;
+                        break;
+                    }
+                }
+            }
+
+            // If the region looked fresh, write an initial header so the
+            // next open sees the same authoritative state.
+            if !header_present {
+                log.write_header()?;
+            }
         }
 
         // Sync recovered write_pos/logical_start into the lock-free atomics.
@@ -2336,6 +2343,118 @@ impl RedoLog {
     /// Whether this log uses the segment-ring layout (lever 7).
     fn is_ring(&self) -> bool {
         self.ring.is_some()
+    }
+
+    /// Scan one ring segment for live entries, reading it whole from the device.
+    ///
+    /// Parses entries from the segment base, validating each entry's CRC (via
+    /// [`RedoEntry::deserialize`]). Stops at the first of: an aligned length-0
+    /// sentinel (end of flushed data), a torn / CRC-failing entry, a non-zero
+    /// byte inside a flush pad block (corruption), or a **non-increasing
+    /// sequence**. The last case is how reuse is handled: a freed segment is
+    /// rewritten from its base, and any stale entry from the prior epoch left
+    /// past the new content has a LOWER sequence than the new entries, so it is
+    /// treated as end-of-segment — not an error (a genuinely corrupt sequence is
+    /// caught by the CRC, so a CRC-valid lower sequence is a stale remnant, not
+    /// corruption). `prev_seq` (0 = none) carries the running max across
+    /// segments, since sequences increase in ring order. Returns the entries,
+    /// the alignment-rounded tail offset within the segment, and the updated
+    /// running max sequence.
+    fn scan_segment(&self, seg: u32, mut prev_seq: u64) -> Result<(Vec<RedoEntry>, u64, u64)> {
+        let r = self.ring.as_ref().expect("ring log");
+        let align = self.device.alignment();
+        let align_u64 = align as u64;
+        let seg_base = self.entries_region_offset() + u64::from(seg) * r.segment_size;
+        let seg_size = r.segment_size as usize;
+
+        let mut buf = AlignedBuf::new(seg_size, align);
+        self.device.pread_exact_at(&mut buf, seg_base)?;
+
+        let mut entries = Vec::new();
+        let mut pos = 0usize;
+        loop {
+            match RedoEntry::deserialize(&buf[pos..]) {
+                Some((entry, consumed)) => {
+                    if prev_seq != 0 && entry.sequence <= prev_seq {
+                        // Stale remnant from a reused segment / non-monotonic →
+                        // end of this segment's live data.
+                        break;
+                    }
+                    prev_seq = entry.sequence;
+                    entries.push(entry);
+                    pos += consumed;
+                }
+                None => {
+                    if buf[pos..].len() < ENTRY_HEADER_SIZE {
+                        break;
+                    }
+                    let lw = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+                    if lw != 0 {
+                        // Truncated / CRC-failing entry → end of segment.
+                        break;
+                    }
+                    // length=0. Aligned boundary → true end of data.
+                    if (pos as u64).is_multiple_of(align_u64) {
+                        break;
+                    }
+                    // Mid-block length=0 → flush pad (F-G4-004). Skip to the next
+                    // block boundary if the pad is all zeros; otherwise corruption.
+                    let pad_end = ((pos as u64).next_multiple_of(align_u64) as usize).min(seg_size);
+                    if buf[pos..pad_end].iter().all(|b| *b == 0) {
+                        pos = pad_end;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        let tail = (pos as u64).next_multiple_of(align_u64).min(r.segment_size);
+        Ok((entries, tail, prev_seq))
+    }
+
+    /// Recover a ring log's live entries from the device (lever 7 phase 4).
+    ///
+    /// Scans the live segments `[oldest_seg ..= active_seg]` in ring order,
+    /// rebuilding `entries_cache` and the per-segment `seg_max_seq`, re-deriving
+    /// the active segment's tail (`write_pos_in_seg`, robust to a torn tail), and
+    /// advancing `next_sequence` past the highest live sequence. The replay set
+    /// (entries with sequence > the header fence `checkpoint_seq`) is produced by
+    /// [`Self::recover`].
+    fn recover_ring_scan(&mut self) -> Result<()> {
+        let (count, oldest, active) = {
+            let r = self.ring.as_ref().expect("ring log");
+            (r.segment_count, r.oldest_seg, r.active_seg)
+        };
+        let live = (active + count - oldest) % count + 1;
+
+        let mut all_entries = Vec::new();
+        let mut seg_max = vec![0u64; count as usize];
+        let mut prev_seq = 0u64;
+        let mut active_tail = 0u64;
+        let mut seg = oldest;
+        for _ in 0..live {
+            let (entries, tail, new_prev) = self.scan_segment(seg, prev_seq)?;
+            if let Some(last) = entries.last() {
+                seg_max[seg as usize] = last.sequence;
+            }
+            prev_seq = new_prev;
+            if seg == active {
+                active_tail = tail;
+            }
+            all_entries.extend(entries);
+            seg = (seg + 1) % count;
+        }
+
+        if let Some(r) = self.ring.as_mut() {
+            r.seg_max_seq = seg_max;
+            r.write_pos_in_seg = active_tail;
+        }
+        self.entries_cache = all_entries;
+        if prev_seq + 1 > self.next_sequence {
+            self.next_sequence = prev_seq + 1;
+        }
+        self.publish_atomics();
+        Ok(())
     }
 
     /// Attach a shared global sequence counter for per-store redo.
@@ -2405,6 +2524,38 @@ impl RedoLog {
         self.next_sequence = header.next_sequence.max(1);
         self.checkpoint_seq = header.checkpoint_seq;
         self.logical_start = header.logical_start;
+        if header.is_ring() {
+            // Lever 7: validate the ring geometry (a CRC-valid header should
+            // always be consistent, but guard against a future writer bug
+            // before allocating per-segment state).
+            let align = self.device.alignment() as u64;
+            let region = self.entries_region_size();
+            if header.segment_size == 0 || !header.segment_size.is_multiple_of(align) {
+                return Err(RedoError::InvalidSegmentSize {
+                    segment_size: header.segment_size,
+                    alignment: align,
+                });
+            }
+            if header.segment_count < MIN_RING_SEGMENTS
+                || u64::from(header.segment_count) * header.segment_size > region
+                || header.active_seg >= header.segment_count
+                || header.oldest_seg >= header.segment_count
+            {
+                return Err(RedoError::TooFewRingSegments {
+                    segment_count: header.segment_count,
+                    minimum: MIN_RING_SEGMENTS,
+                });
+            }
+            self.ring = Some(RingState {
+                segment_size: header.segment_size,
+                segment_count: header.segment_count,
+                active_seg: header.active_seg,
+                oldest_seg: header.oldest_seg,
+                write_pos_in_seg: header.write_pos_in_seg,
+                // Rebuilt by `recover_ring_scan` from the live segments' entries.
+                seg_max_seq: vec![0; header.segment_count as usize],
+            });
+        }
         Ok(true)
     }
 
@@ -3069,6 +3220,19 @@ impl RedoLog {
 
     /// Read all entries after the last checkpoint (for crash recovery).
     pub fn recover(&self) -> Result<Vec<RedoEntry>> {
+        // Lever 7: a ring log's `entries_cache` already holds exactly the live
+        // entries (rebuilt by `recover_ring_scan`); the replay set is those above
+        // the header fence (`checkpoint_seq`) — the snapshot covers the rest.
+        // There are no `Checkpoint` / `RecoveryProgress` log entries to consult.
+        if self.is_ring() {
+            let fence = self.checkpoint_seq;
+            return Ok(self
+                .entries_cache
+                .iter()
+                .filter(|e| e.sequence > fence)
+                .cloned()
+                .collect());
+        }
         let all = self.scan_all()?;
 
         // F-G4-010: bound `progress_through` against the highest entry
@@ -6736,6 +6900,144 @@ mod tests {
         log.append(freeze(9)).unwrap();
         assert_eq!(log.ring.as_ref().unwrap().active_seg, 0);
         log.flush().unwrap();
+    }
+
+    /// Phase 4: a ring log reopened from the device recovers its live entries
+    /// (across segment rolls), the active segment, and `next_sequence`.
+    #[test]
+    fn ring_reopen_recovers_entries() {
+        let segment_size = 4096u64;
+        let total = 4096 + segment_size * 4;
+        let dev = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let (exp_seqs, active, next) = {
+            let mut log = RedoLog::format_ring(dev.clone(), 0, total, segment_size).unwrap();
+            let tracked = append_tracking(&mut log, 120);
+            log.flush().unwrap();
+            let exp: Vec<u64> = tracked.iter().map(|(q, _)| *q).collect();
+            (
+                exp,
+                log.ring.as_ref().unwrap().active_seg,
+                log.current_sequence(),
+            )
+        };
+        assert!(active >= 1, "120 small entries should roll at least once");
+
+        let log2 = RedoLog::open(dev.clone(), 0, total).unwrap();
+        assert!(log2.is_ring(), "reopen detects the ring format");
+        let recovered: Vec<u64> = log2.recover().unwrap().iter().map(|e| e.sequence).collect();
+        assert_eq!(recovered, exp_seqs, "all live entries recovered in order");
+        assert_eq!(
+            log2.ring.as_ref().unwrap().active_seg,
+            active,
+            "active segment recovered"
+        );
+        assert_eq!(
+            log2.current_sequence(),
+            next,
+            "next_sequence continues across reopen"
+        );
+    }
+
+    /// Phase 4: after a reclaim, a reopened ring recovers the header fence and
+    /// replays only the entries above it (the snapshot covers the rest); the
+    /// freed segments are not even scanned.
+    #[test]
+    fn ring_reopen_after_reclaim_replays_above_fence() {
+        let segment_size = 4096u64;
+        let total = 4096 + segment_size * 4;
+        let dev = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let (fence, post_fence_seqs) = {
+            let mut log = RedoLog::format_ring(dev.clone(), 0, total, segment_size).unwrap();
+            let tracked = append_tracking(&mut log, 200);
+            log.flush().unwrap();
+            let seg0_max = seg_max(&tracked, 0);
+            log.set_fence(seg0_max).unwrap();
+            assert!(log.reclaim_covered_segments().unwrap() >= 1);
+            let post: Vec<u64> = tracked
+                .iter()
+                .filter(|(q, _)| *q > seg0_max)
+                .map(|(q, _)| *q)
+                .collect();
+            (seg0_max, post)
+        };
+
+        let log2 = RedoLog::open(dev.clone(), 0, total).unwrap();
+        assert_eq!(log2.checkpoint_seq, fence, "header fence recovered");
+        let recovered: Vec<u64> = log2.recover().unwrap().iter().map(|e| e.sequence).collect();
+        assert_eq!(
+            recovered, post_fence_seqs,
+            "only entries above the fence replay after reopen"
+        );
+    }
+
+    /// Phase 4: the segment scan stops at a stale, lower-sequence entry — a
+    /// remnant left in a reused segment past the new content — instead of
+    /// folding it into the live set or corrupting the tail.
+    #[test]
+    fn ring_scan_segment_stops_at_stale_lower_sequence() {
+        let (dev, log) = make_ring(4096, 3);
+        // Lay out segment 0: two "new" entries (seq 100, 101) then a "stale"
+        // remnant (seq 5) with a valid CRC — simulating a reused segment.
+        let mut bytes = Vec::new();
+        for seq in [100u64, 101] {
+            bytes.extend_from_slice(
+                &RedoEntry {
+                    sequence: seq,
+                    op: freeze(1),
+                }
+                .serialize(),
+            );
+        }
+        let new_end = bytes.len();
+        bytes.extend_from_slice(
+            &RedoEntry {
+                sequence: 5,
+                op: freeze(2),
+            }
+            .serialize(),
+        );
+        let mut blk = AlignedBuf::new(4096, 4096);
+        blk[..bytes.len()].copy_from_slice(&bytes);
+        dev.pwrite_all_at(&blk, 4096).unwrap(); // entries region base = segment 0
+
+        let (entries, tail, prev) = log.scan_segment(0, 0).unwrap();
+        let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
+        assert_eq!(
+            seqs,
+            vec![100, 101],
+            "scan stops at the stale lower-seq entry"
+        );
+        assert_eq!(prev, 101);
+        assert_eq!(
+            tail,
+            (new_end as u64).next_multiple_of(4096),
+            "tail is aligned past the new content, not the stale remnant"
+        );
+    }
+
+    /// Phase 4: buffered-but-unflushed entries (a crash before fsync) are NOT
+    /// recovered — only the durable, flushed prefix survives.
+    #[test]
+    fn ring_reopen_drops_unflushed_tail() {
+        let segment_size = 4096u64;
+        let total = 4096 + segment_size * 4;
+        let dev = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let mut log = RedoLog::format_ring(dev.clone(), 0, total, segment_size).unwrap();
+        let s1 = log.append(freeze(1)).unwrap();
+        let s2 = log.append(freeze(2)).unwrap();
+        log.flush().unwrap();
+        // Appended but never flushed → never written to the device.
+        log.append(freeze(3)).unwrap();
+        log.append(freeze(4)).unwrap();
+
+        // A fresh open sees only the durable (flushed) bytes.
+        let log2 = RedoLog::open(dev.clone(), 0, total).unwrap();
+        let recovered: Vec<u64> = log2.recover().unwrap().iter().map(|e| e.sequence).collect();
+        assert_eq!(
+            recovered,
+            vec![s1, s2],
+            "unflushed tail dropped on recovery"
+        );
     }
 
     /// Phase 1: a v3 header truncated below its declared length is rejected
