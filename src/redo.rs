@@ -1920,6 +1920,15 @@ impl RedoOp {
 // RedoEntry
 // ---------------------------------------------------------------------------
 
+/// An op encoded OUTSIDE the redo lock by [`RedoEntry::pre_encode`], awaiting
+/// finalization under the lock by [`RedoLog::append_preencoded_atomic`]. Carries
+/// the payload `body` (`[placeholder seq][op_type][op_data]`, no CRC/length yet)
+/// and the owned `op` for the post-flush read cache.
+pub(crate) struct PreEncoded {
+    body: Vec<u8>,
+    op: RedoOp,
+}
+
 /// A single redo log entry with sequence number and checksum.
 #[derive(Debug, Clone)]
 pub struct RedoEntry {
@@ -1953,6 +1962,25 @@ impl RedoEntry {
         out.extend_from_slice(&length.to_le_bytes());
         out.extend_from_slice(&payload);
         out
+    }
+
+    /// Encode an op's payload body OUTSIDE the redo lock: the expensive part
+    /// (op encode + heap allocation) with a PLACEHOLDER sequence. The owning
+    /// commit finalizes it under the lock via
+    /// [`RedoLog::append_preencoded_atomic`], which patches the real sequence,
+    /// computes the CRC, and frames the length — all O(1)/no-alloc. Moving the
+    /// encode off the lock is the write-concurrency fix (E7): it cut the in-lock
+    /// hold from ~167µs (encode+alloc under contention) toward a memcpy.
+    ///
+    /// `body` layout = `[seq: 8 placeholder][op_type: 1][op_data…]` — i.e. the
+    /// serialized payload MINUS its trailing CRC, byte-identical to
+    /// [`Self::serialize`]'s payload-before-checksum.
+    pub(crate) fn pre_encode(op: RedoOp) -> PreEncoded {
+        let mut body = Vec::with_capacity(ENTRY_SEQ_SIZE + ENTRY_TYPE_SIZE + 64);
+        body.extend_from_slice(&0u64.to_le_bytes()); // placeholder sequence
+        body.push(op.op_type());
+        op.serialize_data(&mut body);
+        PreEncoded { body, op }
     }
 
     /// Deserialize from bytes. Returns (entry, bytes_consumed) or None.
@@ -2889,6 +2917,78 @@ impl RedoLog {
             let seq = self.append(op.clone())?;
             first = first.min(seq);
             last = last.max(seq);
+        }
+        Ok(Some((first, last)))
+    }
+
+    /// Atomically append entries that were already encoded OUTSIDE the lock by
+    /// [`RedoEntry::pre_encode`]. The expensive op-encode + heap allocation
+    /// happened off the lock; here, under the lock, the per-entry work is O(1)
+    /// with no allocation: patch the real sequence into the 8-byte placeholder,
+    /// compute the CRC, frame the length, and `extend` the buffer. This is the
+    /// write-concurrency fast path (E7) — it slashes the in-lock hold so the
+    /// per-store redo mutex stops being the concurrency cap.
+    ///
+    /// All-or-nothing, identical to [`Self::append_atomic`]: the whole batch is
+    /// capacity-checked BEFORE any sequence is drawn or byte buffered, so a
+    /// [`RedoError::LogFull`] leaves no residue and burns no sequence (the
+    /// lever-6 guarantee). Ring logs fall back to `append_atomic` (the ring
+    /// segment-roll path is unchanged and is not the concurrency hot path).
+    pub fn append_preencoded_atomic(
+        &mut self,
+        entries: Vec<PreEncoded>,
+    ) -> Result<Option<(u64, u64)>> {
+        if self.poisoned {
+            return Err(RedoError::Poisoned);
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        // Ring layout: reconstruct ops and use the existing path (handles segment
+        // rolls). Ring is default-off and not the concurrency target.
+        if self.is_ring() {
+            let ops: Vec<RedoOp> = entries.into_iter().map(|e| e.op).collect();
+            return self.append_atomic(&ops);
+        }
+
+        // Linear fast path. On-disk size of each entry is
+        // length-prefix(4) + body + crc(4); `body` already holds
+        // [seq placeholder(8)][op_type(1)][op_data].
+        let total: u64 = entries
+            .iter()
+            .map(|e| (ENTRY_HEADER_SIZE + e.body.len() + ENTRY_CHECKSUM_SIZE) as u64)
+            .sum();
+        let entries_capacity = self.append_capacity();
+        let used = self.write_pos + self.buffer.len() as u64;
+        if used + total > entries_capacity {
+            return Err(RedoError::LogFull {
+                used,
+                capacity: entries_capacity,
+            });
+        }
+
+        let mut first = u64::MAX;
+        let mut last = 0u64;
+        for mut e in entries {
+            let seq = self.draw_sequence();
+            first = first.min(seq);
+            last = last.max(seq);
+            // Patch the real sequence over the placeholder, then CRC the payload
+            // body (the original `serialize` CRCs exactly these bytes).
+            e.body[..ENTRY_SEQ_SIZE].copy_from_slice(&seq.to_le_bytes());
+            let crc = crc32fast::hash(&e.body);
+            let length = (e.body.len() + ENTRY_CHECKSUM_SIZE) as u32;
+            self.buffer.extend_from_slice(&length.to_le_bytes());
+            self.buffer.extend_from_slice(&e.body);
+            self.buffer.extend_from_slice(&crc.to_le_bytes());
+            self.pending_entries.push(RedoEntry {
+                sequence: seq,
+                op: e.op,
+            });
+            if let Some(m) = redo_metrics() {
+                m.redo_append_total.inc();
+                self.buffered_entries += 1;
+            }
         }
         Ok(Some((first, last)))
     }

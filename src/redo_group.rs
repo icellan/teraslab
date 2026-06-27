@@ -175,17 +175,25 @@ impl GroupCommit {
         }
 
         // Buffered durability: append under the log lock and return WITHOUT
-        // fsync. Appends are cheap (in-memory buffer + sequence draw), so the
-        // log mutex is held only briefly; the background flusher and checkpoint
-        // make the appended entries durable. A bounded tail may be lost on crash
-        // — the relaxed-durability contract.
+        // fsync. The background flusher and checkpoint make the appended entries
+        // durable. A bounded tail may be lost on crash — the relaxed-durability
+        // contract.
+        //
+        // E7: the op encode + heap allocation (the expensive part — ~167µs in
+        // lock under contention) is done OUTSIDE the lock via `pre_encode`; under
+        // the lock only the O(1) finalize (sequence patch + CRC + memcpy) runs,
+        // so the per-store redo mutex stops being the write-concurrency cap.
         if self.buffered.load(std::sync::atomic::Ordering::Acquire) {
+            let pre: Vec<_> = ops
+                .into_iter()
+                .map(crate::redo::RedoEntry::pre_encode)
+                .collect();
             let wait_start = std::time::Instant::now();
             let mut log = self.log.lock();
             if let Some(m) = crate::metrics::redo_metrics() {
                 m.redo_commit_lock_wait_ns.record_since(wait_start);
             }
-            return match log.append_atomic(&ops) {
+            return match log.append_preencoded_atomic(pre) {
                 Ok(range) => Ok(range),
                 Err(e @ crate::redo::RedoError::LogFull { .. }) => {
                     // Transient backpressure: the checkpoint reclaims space.

@@ -249,6 +249,39 @@ lock), multiplying mutex throughput. Later steps if needed: shard the redo appen
 per-core / lock-free reserve-then-write ring. Audit-before-fix complete; the
 mutex hold-time is the proven target.
 
+## E8 — Redesign step 1: serialize outside the redo lock (2026-06-27)
+
+Implemented the E7 fix. `RedoEntry::pre_encode` encodes the op payload (the
+expensive op-encode + heap alloc) OUTSIDE the redo mutex with a placeholder
+sequence; `RedoLog::append_preencoded_atomic` finalizes under the lock with only
+O(1)/no-alloc work — patch the real sequence over the placeholder, CRC the
+payload, frame the length, `extend` the buffer. Buffered commit path routes
+through it (ring layout falls back to `append_atomic`). All-or-nothing LogFull /
+no-poison semantics preserved.
+
+Verification: full `cargo test --lib` = **2466 passed / 0 failed**, clippy + fmt
+clean (recovery round-trips entries written via the pre-encoded path).
+
+Effect (open-loop IF=512, same `[loaded-host]`): `redo_commit_lock_wait`
+**72.8ms → 51.3ms** (mutex throughput ~+40%), `create_redo` 78ms → 55ms. The
+targeted bottleneck improved, but **end-to-end throughput barely moved** (~5.7k).
+
+Why the ceiling persists — diagnosis sharpened:
+- The redo mutex now handles ~10k commits/s but the server only offers ~4.5k
+  write-commits/s, so the mutex is no longer saturated — yet lock-wait is still
+  51ms. That residual is **scheduler delay, not contention**: TeraSlab uses
+  **one OS thread per connection** (60 conn-threads here) on a host at load
+  9–18 (oversubscribed 8 cores), so threads park/wake late and every lock
+  acquire eats scheduler latency. The reference's event-loop/thread-pool model
+  is far less sensitive to oversubscription — a large part of the head-to-head
+  gap on THIS box is the threading model × loaded host, not the redo path.
+
+**Next architectural lever (big): thread-per-connection → async / bounded
+thread-pool dispatch**, so N connections don't map to N OS threads thrashing a
+small (loaded) core count. Plus: re-measure on a quiet host to separate the
+threading-model effect from real serialization. The pre-encode fix is correct +
+tested and strictly improves the redo path; keeping it.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
