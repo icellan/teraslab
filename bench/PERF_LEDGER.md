@@ -282,6 +282,39 @@ small (loaded) core count. Plus: re-measure on a quiet host to separate the
 threading-model effect from real serialization. The pre-encode fix is correct +
 tested and strictly improves the redo path; keeping it.
 
+## E9 — More threads do NOT help; the redo mutex is the serialization (2026-06-27)
+
+Two corrections to the prior diagnosis, both empirical:
+
+1. **The whole benchmark ran with the server's own concurrency feature OFF.**
+   `pipeline_depth` defaults to **1** (strict per-connection serial path) and the
+   bench config never set it — so the bounded `DispatchPool` (the mechanism that
+   decouples request processing from connection count, sized `cores×8`) was never
+   created. A methodology gap: TeraSlab was under-configured.
+
+2. **Enabling it does not help — proving the cap is serialization, not threads.**
+   `pipeline_depth=16` (DispatchPool active, 64 workers) open-loop: TOTAL ~5.0k
+   (IF=256) / ~4.9k (IF=512) — *no better* than the serial path (~6.4k), slightly
+   worse. Under the pool: `redo_commit_lock_wait = 58ms ≈ create_redo 58ms` at
+   **0.74 of 8 CPU cores** — 64 worker threads parked waiting on the single
+   per-store redo mutex. Adding threads just lengthens that queue.
+
+**Conclusion (answers "would tokio help"): NO.** The server already has the
+concurrency mechanism async would provide (a bounded pool decoupling processing
+from connections); turning it on adds threads that all serialize on the SAME redo
+mutex. The bottleneck is **lock serialization on the write path**, not I/O
+multiplexing or thread count, and the storage path is deliberately synchronous
+O_DIRECT (io_uring removed by design) — so async-over-blocking-I/O would be an
+anti-pattern, not a fix. This supersedes E8's "async dispatch" next-lever note.
+
+**Real lever (continue E7/E8): make the redo append lock-light.** Options, in
+rough order: (a) finish the double-buffer — `prepare_flush` still COPIES the
+buffer under the lock; `mem::take` the buffer O(1) under the lock and build the
+device blocks outside it; (b) shard the redo append per-core / lock-free
+reserve-then-write ring so concurrent committers don't serialize on one mutex;
+(c) right-size the DispatchPool (cores×8=64 is too many for a lock-bound workload)
+and re-measure on a QUIET host (the load-9–18 box inflates every park/wake).
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
