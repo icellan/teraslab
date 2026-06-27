@@ -967,12 +967,19 @@ fn main() {
             os.push(format!(".{store_idx}"));
             std::path::PathBuf::from(os)
         };
-        match open_mandatory_redo_log(&path, config.redo_log_size, config.device_alignment) {
+        let segment_ring = config.redo_segment_ring.then_some(config.redo_segment_size);
+        match open_mandatory_redo_log(
+            &path,
+            config.redo_log_size,
+            config.device_alignment,
+            segment_ring,
+        ) {
             Ok((dev, log)) => {
                 tracing::info!(
                     path = %path.display(),
                     store = store_idx,
                     size_mib = config.redo_log_size / (1024 * 1024),
+                    segment_ring = log.is_segment_ring(),
                     "redo log opened (mandatory, per-store)",
                 );
                 redo_log_devices.push(dev);

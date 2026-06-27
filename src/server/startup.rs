@@ -711,6 +711,7 @@ pub fn open_mandatory_redo_log(
     path: &Path,
     size: u64,
     alignment: usize,
+    segment_ring: Option<u64>,
 ) -> Result<
     (
         std::sync::Arc<dyn crate::device::BlockDevice>,
@@ -730,7 +731,50 @@ pub fn open_mandatory_redo_log(
             path: path.display().to_string(),
             reason: format!("{e}"),
         })?;
+
+    // Lever 7: adopt the segment-ring layout per config, with the same
+    // "device-format-wins" discipline as `storage.packed`:
+    //   * an existing on-disk ring is always used as a ring (handled above by
+    //     `RedoLog::open`);
+    //   * a FRESH region (never written: current_sequence == 1) adopts the ring;
+    //   * an existing NON-EMPTY linear region stays linear this session (the
+    //     ring is not read-compatible and we will not discard live redo) — the
+    //     operator drains (clean shutdown) + resets the region to adopt it.
+    if let Some(seg_cfg) = segment_ring {
+        if log.is_segment_ring() {
+            return Ok((device, log));
+        }
+        if log.current_sequence() == 1 {
+            let seg_size = if seg_cfg == 0 {
+                derive_ring_segment_size(size, alignment)
+            } else {
+                seg_cfg
+            };
+            let ring = crate::redo::RedoLog::format_ring(device.clone(), 0, size, seg_size)
+                .map_err(|e| RedoOpenError::Log {
+                    path: path.display().to_string(),
+                    reason: format!("{e}"),
+                })?;
+            return Ok((device, ring));
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "redo_segment_ring enabled but the redo region holds existing linear data — \
+             staying on the linear layout this session; drain (clean shutdown) and reset \
+             the redo region to adopt the segment ring",
+        );
+    }
     Ok((device, log))
+}
+
+/// Auto-derive a ring segment size (~8 segments) from the redo region size,
+/// rounded down to the device alignment and floored at one alignment block so a
+/// tiny region still yields whole segments.
+fn derive_ring_segment_size(size: u64, alignment: usize) -> u64 {
+    let align = alignment as u64;
+    let entries = size.saturating_sub(align);
+    let eighth = (entries / 8) / align * align;
+    eighth.max(align)
 }
 
 /// Errors raised by [`open_tombstone_log`] when the deletion-tombstone log
@@ -1551,7 +1595,7 @@ mod tests {
     fn mandatory_redo_open_succeeds_in_clean_dir() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("redo.log");
-        let result = super::open_mandatory_redo_log(&path, 1 << 20, 4096);
+        let result = super::open_mandatory_redo_log(&path, 1 << 20, 4096, None);
         let (_dev, log) = match result {
             Ok(parts) => parts,
             Err(e) => panic!("clean tmp path must open: {e}"),
@@ -1564,13 +1608,63 @@ mod tests {
         );
     }
 
+    /// Phase 7: with the ring enabled, a FRESH redo region adopts the segment
+    /// ring; reopening the same region keeps it a ring (device format wins).
+    #[test]
+    fn mandatory_redo_open_fresh_adopts_ring() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ring.redo");
+        // segment_ring = Some(0) → auto-derive segment size.
+        let (_dev, log) = super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0)).unwrap();
+        assert!(log.is_segment_ring(), "fresh region adopts the ring");
+        drop(log);
+
+        // Reopen WITHOUT requesting the ring: the on-disk ring is still used.
+        let (_dev2, log2) = super::open_mandatory_redo_log(&path, 1 << 20, 4096, None).unwrap();
+        assert!(log2.is_segment_ring(), "on-disk ring format wins on reopen");
+    }
+
+    /// Phase 7: an explicit segment size is honored when adopting the ring.
+    #[test]
+    fn mandatory_redo_open_honors_explicit_segment_size() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ring_explicit.redo");
+        let (_dev, log) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(64 * 1024)).unwrap();
+        assert!(log.is_segment_ring());
+        // 1 MiB region − 4 KiB header = 1044480 B; / 64 KiB = 15 segments.
+        assert_eq!(log.capacity(), 15 * 64 * 1024);
+    }
+
+    /// Phase 7: requesting the ring on a region that already holds linear data
+    /// stays linear (does not discard live redo).
+    #[test]
+    fn mandatory_redo_open_keeps_existing_linear() {
+        use crate::redo::RedoOp;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("linear.redo");
+        {
+            let (_dev, mut log) =
+                super::open_mandatory_redo_log(&path, 1 << 20, 4096, None).unwrap();
+            log.append(RedoOp::Checkpoint).unwrap();
+            log.flush().unwrap();
+            assert!(!log.is_segment_ring());
+        }
+        // Now request the ring: existing linear data → stays linear this session.
+        let (_dev, log) = super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0)).unwrap();
+        assert!(
+            !log.is_segment_ring(),
+            "non-empty linear region must not be reformatted to a ring"
+        );
+    }
+
     #[test]
     fn mandatory_redo_open_fails_on_unwritable_path() {
         // Pointing at a parent directory that does not exist returns a
         // `DeviceError` from `DirectDevice::open` — the gap #2 contract
         // is that this propagates instead of falling back to memory.
         let path = std::path::Path::new("/this/path/does/not/exist/redo.log");
-        let result = super::open_mandatory_redo_log(path, 1 << 20, 4096);
+        let result = super::open_mandatory_redo_log(path, 1 << 20, 4096, None);
         let err = match result {
             Ok(_) => panic!("missing parent dir must fail closed (no in-memory fallback)"),
             Err(e) => e,
@@ -1597,7 +1691,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // tmp.path() itself exists as a directory.
         let dir_path = tmp.path().to_path_buf();
-        let result = super::open_mandatory_redo_log(&dir_path, 1 << 20, 4096);
+        let result = super::open_mandatory_redo_log(&dir_path, 1 << 20, 4096, None);
         let err = match result {
             Ok(_) => panic!("a directory path must fail closed (no in-memory fallback)"),
             Err(e) => e,

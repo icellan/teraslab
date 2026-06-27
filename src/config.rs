@@ -875,6 +875,22 @@ pub struct ServerConfig {
     /// Ignored under strict durability.
     pub redo_flush_interval_ms: u64,
 
+    /// Lever 7: use the in-device segment-ring redo layout
+    /// (`docs/REDO_SEGMENT_RING_DESIGN.md`) instead of the linear-with-reset log.
+    /// `false` (default) keeps the linear layout. A FRESH redo region adopts this
+    /// setting; an existing on-disk ring is always used as a ring regardless
+    /// (the device format wins), and an existing non-empty LINEAR log stays
+    /// linear until it is drained (clean shutdown) + the region reset — the node
+    /// warns and runs on linear that session rather than discarding live redo.
+    pub redo_segment_ring: bool,
+
+    /// Segment size in bytes for the ring layout when [`Self::redo_segment_ring`]
+    /// is enabled. `0` (default) auto-derives ~8 segments from
+    /// [`Self::redo_log_size`]. When set, must be a non-zero multiple of
+    /// [`Self::device_alignment`] and leave at least 3 whole segments in the
+    /// region. Ignored when the ring is disabled.
+    pub redo_segment_size: u64,
+
     /// HTTP listen address for observability endpoints (metrics, health, debug).
     pub http_listen_addr: String,
 
@@ -1202,6 +1218,8 @@ impl Default for ServerConfig {
             pipeline_depth: 1,
             redo_buffered: false,
             redo_flush_interval_ms: 5,
+            redo_segment_ring: false,
+            redo_segment_size: 0,
             http_listen_addr: "127.0.0.1:9100".to_string(),
             enable_remote_bind: false,
             enable_admin_endpoints: false,
@@ -1909,6 +1927,26 @@ impl ServerConfig {
         nonzero_u32("max_batch_size", self.max_batch_size)?;
         nonzero_usize("max_connections", self.max_connections)?;
 
+        // Lever 7: validate an explicit ring segment size (0 = auto-derive). The
+        // redo region (minus its one-block header) must hold at least 3 whole
+        // segments, each independently O_DIRECT-writable (alignment-multiple).
+        if self.redo_segment_ring && self.redo_segment_size != 0 {
+            let align = self.device_alignment as u64;
+            if !self.redo_segment_size.is_multiple_of(align) {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "redo_segment_size = {} must be a multiple of device_alignment {}",
+                    self.redo_segment_size, self.device_alignment
+                )));
+            }
+            let entries = self.redo_log_size.saturating_sub(align);
+            if entries / self.redo_segment_size < 3 {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "redo_segment_size = {} leaves fewer than 3 segments in a {}-byte redo region",
+                    self.redo_segment_size, self.redo_log_size
+                )));
+            }
+        }
+
         // BC-01: checkpoint watermarks must form a valid hysteresis
         // band (0 < low < high < 1) so the background trigger has
         // somewhere to fall back to between consecutive checkpoints.
@@ -2281,6 +2319,67 @@ backend = ""
         };
         cfg.validate_safe_defaults()
             .expect("packed with device_alignment = 4096 must validate");
+    }
+
+    #[test]
+    fn redo_segment_ring_defaults_off_and_validates() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.redo_segment_ring, "segment ring must default OFF");
+        assert_eq!(cfg.redo_segment_size, 0, "segment size defaults to auto");
+        cfg.validate_sizes()
+            .expect("default config (ring off) must validate");
+    }
+
+    #[test]
+    fn redo_segment_ring_auto_and_valid_explicit_size_validate() {
+        // Auto (0) is always valid.
+        let auto = ServerConfig {
+            redo_segment_ring: true,
+            redo_segment_size: 0,
+            device_alignment: 4096,
+            redo_log_size: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        auto.validate_sizes()
+            .expect("ring with auto segment size validates");
+
+        // Explicit, alignment-multiple, >= 3 segments.
+        let explicit = ServerConfig {
+            redo_segment_size: 8 * 1024 * 1024,
+            ..auto
+        };
+        explicit
+            .validate_sizes()
+            .expect("ring with a valid explicit segment size validates");
+    }
+
+    #[test]
+    fn redo_segment_ring_rejects_bad_segment_size() {
+        // Not a multiple of device_alignment.
+        let misaligned = ServerConfig {
+            redo_segment_ring: true,
+            redo_segment_size: 5000,
+            device_alignment: 4096,
+            redo_log_size: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        assert!(
+            misaligned.validate_sizes().is_err(),
+            "misaligned segment size rejected"
+        );
+
+        // Too large → fewer than 3 segments.
+        let too_big = ServerConfig {
+            redo_segment_ring: true,
+            redo_segment_size: 32 * 1024 * 1024,
+            device_alignment: 4096,
+            redo_log_size: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        assert!(
+            too_big.validate_sizes().is_err(),
+            "segment size leaving < 3 segments rejected"
+        );
     }
 
     #[test]
