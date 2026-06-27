@@ -174,30 +174,41 @@ pub type Result<T> = std::result::Result<T, RedoError>;
 /// header) is rejected at open with [`RedoError::HeaderMagicMismatch`].
 const REDO_HEADER_MAGIC: [u8; 8] = *b"TSLREDO1";
 
-/// Current redo-log format version. Bumping this rejects older logs at
-/// open with [`RedoError::UnsupportedHeaderVersion`] rather than silently
-/// misparsing them.
+/// Redo-log header format versions.
 ///
-/// Version 2 (B-3) appends a `logical_start` field after `checkpoint_seq`
-/// recording the byte offset (relative to the entries region) at which
-/// the first live entry begins. Version-1 logs are decoded with
-/// `logical_start = 0` (the historical implicit start), so existing
-/// on-disk logs upgrade transparently on the next compaction.
-const REDO_HEADER_VERSION: u16 = 2;
+/// * Version 1 (F-G4-001): `magic | version | reserved | next_sequence |
+///   checkpoint_seq | crc`.
+/// * Version 2 (B-3): appends a `logical_start` field (byte offset of the first
+///   live entry) before the CRC. Version-1 logs decode with `logical_start = 0`.
+/// * Version 3 (segment ring, `docs/REDO_SEGMENT_RING_DESIGN.md`): appends the
+///   ring geometry + pointers (`segment_size | segment_count | oldest_seg |
+///   active_seg | write_pos_in_seg`). Version-1/2 logs decode with all ring
+///   fields `0` (`segment_count == 0` ⇒ a linear log).
+///
+/// The version a header is WRITTEN as is chosen per-header by
+/// [`RedoHeader::serialize`] (linear ⇒ v2, ring ⇒ v3), NOT by a single global
+/// constant — so a linear log stays byte-for-byte identical to the v2 format
+/// until the ring is actually adopted. [`REDO_HEADER_MAX_VERSION`] is the
+/// highest version this binary can READ; a higher on-disk version is rejected
+/// with [`RedoError::UnsupportedHeaderVersion`].
+const REDO_HEADER_VERSION_LINEAR: u16 = 2;
+const REDO_HEADER_VERSION_RING: u16 = 3;
+const REDO_HEADER_MAX_VERSION: u16 = REDO_HEADER_VERSION_RING;
 
-/// On-disk layout of the redo-region header block (F-G4-001, B-3).
+/// Byte length of a version-1 header (no `logical_start`, no ring fields).
+const HEADER_FIXED_LEN_V1: usize = 8 + 2 + 2 + 8 + 8 + 4;
+
+/// Byte length of a version-2 (linear) header: v1 + `logical_start(8)`.
 ///
 /// Layout: `magic(8) | version(2) | reserved(2) | next_sequence(8) |
-/// checkpoint_seq(8) | logical_start(8) | crc32(4)` = 40 bytes; written
-/// into the first `HEADER_BLOCK_SIZE` bytes of the redo region with the
-/// remaining bytes zeroed. The CRC covers every byte before it.
-///
-/// A version-1 header (B-3 predecessor) is 32 bytes and omits the
-/// `logical_start` field; [`RedoHeader::deserialize`] decodes both.
-const HEADER_FIXED_LEN: usize = 8 + 2 + 2 + 8 + 8 + 8 + 4;
+/// checkpoint_seq(8) | logical_start(8) | crc32(4)` = 40 bytes. The CRC covers
+/// every byte before it; the block is padded with zeros to `HEADER_BLOCK_SIZE`.
+const HEADER_FIXED_LEN_V2: usize = HEADER_FIXED_LEN_V1 + 8;
 
-/// Byte length of the legacy version-1 header (no `logical_start`).
-const HEADER_FIXED_LEN_V1: usize = 8 + 2 + 2 + 8 + 8 + 4;
+/// Byte length of a version-3 (segment-ring) header: the v2 fields (minus its
+/// CRC) plus `segment_size(8) | segment_count(4) | oldest_seg(4) |
+/// active_seg(4) | write_pos_in_seg(8)` and the CRC = 68 bytes.
+const HEADER_FIXED_LEN_V3: usize = (HEADER_FIXED_LEN_V2 - 4) + 8 + 4 + 4 + 4 + 8 + 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RedoHeader {
@@ -208,34 +219,82 @@ struct RedoHeader {
     /// rewriting retained entries to the front of the region, so a torn
     /// compaction write can never destroy a durable (possibly acked)
     /// retained entry. Always `0` immediately after [`RedoLog::reset`].
+    /// Unused (and `0`) for a segment-ring (v3) header.
     logical_start: u64,
+    /// Segment-ring geometry & pointers (v3). All `0` for a v1/v2 linear
+    /// header; `segment_count > 0` (see [`Self::is_ring`]) is the marker that a
+    /// log uses the ring layout. Size in bytes of one segment; number of
+    /// segments; the oldest segment still holding un-reclaimed entries; the
+    /// segment currently being appended; the write cursor within the active
+    /// segment. See `docs/REDO_SEGMENT_RING_DESIGN.md` §3.1.
+    segment_size: u64,
+    segment_count: u32,
+    oldest_seg: u32,
+    active_seg: u32,
+    write_pos_in_seg: u64,
 }
 
 impl RedoHeader {
-    /// Serialize the header into a fresh `Vec<u8>` of length
-    /// [`HEADER_FIXED_LEN`]. Callers should pad to the chosen block size
-    /// (typically the device alignment) before writing to the device.
+    /// A linear (v2) header — the historical format with zeroed ring fields.
+    /// Serializes to the v2 wire format (byte-identical to pre-ring builds).
+    fn linear(next_sequence: u64, checkpoint_seq: u64, logical_start: u64) -> Self {
+        RedoHeader {
+            next_sequence,
+            checkpoint_seq,
+            logical_start,
+            segment_size: 0,
+            segment_count: 0,
+            oldest_seg: 0,
+            active_seg: 0,
+            write_pos_in_seg: 0,
+        }
+    }
+
+    /// Whether this header describes a segment-ring (v3) log. `segment_count`
+    /// is `0` exactly for linear (v1/v2) logs, so it is the format discriminator.
+    fn is_ring(&self) -> bool {
+        self.segment_count > 0
+    }
+
+    /// Serialize the header into a fresh `Vec<u8>`. A ring header
+    /// ([`Self::is_ring`]) is written in the v3 format ([`HEADER_FIXED_LEN_V3`]);
+    /// a linear header in the v2 format ([`HEADER_FIXED_LEN_V2`]). Callers pad to
+    /// the chosen block size (typically the device alignment) before writing.
     fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(HEADER_FIXED_LEN);
+        let ring = self.is_ring();
+        let (version, len) = if ring {
+            (REDO_HEADER_VERSION_RING, HEADER_FIXED_LEN_V3)
+        } else {
+            (REDO_HEADER_VERSION_LINEAR, HEADER_FIXED_LEN_V2)
+        };
+        let mut buf = Vec::with_capacity(len);
         buf.extend_from_slice(&REDO_HEADER_MAGIC);
-        buf.extend_from_slice(&REDO_HEADER_VERSION.to_le_bytes());
+        buf.extend_from_slice(&version.to_le_bytes());
         buf.extend_from_slice(&[0u8; 2]); // reserved
         buf.extend_from_slice(&self.next_sequence.to_le_bytes());
         buf.extend_from_slice(&self.checkpoint_seq.to_le_bytes());
         buf.extend_from_slice(&self.logical_start.to_le_bytes());
+        if ring {
+            buf.extend_from_slice(&self.segment_size.to_le_bytes());
+            buf.extend_from_slice(&self.segment_count.to_le_bytes());
+            buf.extend_from_slice(&self.oldest_seg.to_le_bytes());
+            buf.extend_from_slice(&self.active_seg.to_le_bytes());
+            buf.extend_from_slice(&self.write_pos_in_seg.to_le_bytes());
+        }
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
-        debug_assert_eq!(buf.len(), HEADER_FIXED_LEN);
+        debug_assert_eq!(buf.len(), len);
         buf
     }
 
-    /// Parse a header from the prefix of `data`.
+    /// Parse a header from `data` (the first bytes of the header block; trailing
+    /// padding past the version's fixed length is ignored).
     ///
-    /// Returns [`RedoError::HeaderMagicMismatch`] if the magic byte string
-    /// does not match the current format (rejecting older logs and foreign
-    /// regions), [`RedoError::UnsupportedHeaderVersion`] for a known-magic
-    /// but unknown-version header, [`RedoError::HeaderCrcMismatch`] if the
-    /// CRC is corrupt.
+    /// Returns [`RedoError::HeaderMagicMismatch`] if the magic byte string does
+    /// not match (rejecting foreign regions and too-short buffers),
+    /// [`RedoError::UnsupportedHeaderVersion`] for a known-magic but
+    /// newer-than-[`REDO_HEADER_MAX_VERSION`] header, or
+    /// [`RedoError::HeaderCrcMismatch`] if the CRC is corrupt.
     fn deserialize(data: &[u8]) -> Result<Self> {
         // The version-1 length is the smallest header we can parse; the
         // version field then selects how many further bytes are present.
@@ -260,30 +319,54 @@ impl RedoHeader {
             });
         }
         let version = u16::from_le_bytes(data[8..10].try_into().unwrap());
-        if version > REDO_HEADER_VERSION {
+        if version > REDO_HEADER_MAX_VERSION {
             return Err(RedoError::UnsupportedHeaderVersion {
-                expected: REDO_HEADER_VERSION,
+                expected: REDO_HEADER_MAX_VERSION,
                 found: version,
             });
         }
+        // A header whose declared version needs more bytes than `data` carries
+        // is corrupt/truncated; report it as a magic mismatch (self-describing).
+        let too_short = || -> RedoError {
+            let mut found = [0u8; 8];
+            found.copy_from_slice(&data[..8]);
+            RedoError::HeaderMagicMismatch {
+                expected: REDO_HEADER_MAGIC,
+                found,
+            }
+        };
         // skip reserved 2 bytes
         let next_sequence = u64::from_le_bytes(data[12..20].try_into().unwrap());
         let checkpoint_seq = u64::from_le_bytes(data[20..28].try_into().unwrap());
-        // B-3: version 2 appends `logical_start(8)` before the CRC.
-        // Version 1 has the CRC immediately at byte 28 and no
-        // `logical_start` (implicit 0).
-        let (logical_start, crc_off) = if version >= 2 {
-            if data.len() < HEADER_FIXED_LEN {
-                let mut found = [0u8; 8];
-                found.copy_from_slice(&data[..8]);
-                return Err(RedoError::HeaderMagicMismatch {
-                    expected: REDO_HEADER_MAGIC,
-                    found,
-                });
+
+        // Decode the version-specific tail and locate the CRC.
+        // v1: CRC at 28, no logical_start/ring. v2: logical_start at 28, CRC at
+        // 36. v3: logical_start at 28, ring fields at 36..64, CRC at 64.
+        let mut logical_start = 0u64;
+        let mut segment_size = 0u64;
+        let mut segment_count = 0u32;
+        let mut oldest_seg = 0u32;
+        let mut active_seg = 0u32;
+        let mut write_pos_in_seg = 0u64;
+        let crc_off = if version >= REDO_HEADER_VERSION_RING {
+            if data.len() < HEADER_FIXED_LEN_V3 {
+                return Err(too_short());
             }
-            (u64::from_le_bytes(data[28..36].try_into().unwrap()), 36)
+            logical_start = u64::from_le_bytes(data[28..36].try_into().unwrap());
+            segment_size = u64::from_le_bytes(data[36..44].try_into().unwrap());
+            segment_count = u32::from_le_bytes(data[44..48].try_into().unwrap());
+            oldest_seg = u32::from_le_bytes(data[48..52].try_into().unwrap());
+            active_seg = u32::from_le_bytes(data[52..56].try_into().unwrap());
+            write_pos_in_seg = u64::from_le_bytes(data[56..64].try_into().unwrap());
+            64
+        } else if version >= REDO_HEADER_VERSION_LINEAR {
+            if data.len() < HEADER_FIXED_LEN_V2 {
+                return Err(too_short());
+            }
+            logical_start = u64::from_le_bytes(data[28..36].try_into().unwrap());
+            36
         } else {
-            (0u64, 28)
+            28
         };
         let stored_crc = u32::from_le_bytes(data[crc_off..crc_off + 4].try_into().unwrap());
         let computed = crc32fast::hash(&data[..crc_off]);
@@ -297,6 +380,11 @@ impl RedoHeader {
             next_sequence,
             checkpoint_seq,
             logical_start,
+            segment_size,
+            segment_count,
+            oldest_seg,
+            active_seg,
+            write_pos_in_seg,
         })
     }
 }
@@ -2177,10 +2265,12 @@ impl RedoLog {
         let align = self.device.alignment();
         let mut buf = AlignedBuf::new(self.header_block_size as usize, align);
         self.device.pread_exact_at(&mut buf, self.log_offset)?;
-        if buf[..HEADER_FIXED_LEN].iter().all(|b| *b == 0) {
+        if buf[..HEADER_FIXED_LEN_V2].iter().all(|b| *b == 0) {
             return Ok(false);
         }
-        let header = RedoHeader::deserialize(&buf[..HEADER_FIXED_LEN])?;
+        // Pass the whole header block: `deserialize` reads only the bytes its
+        // on-disk version declares (v2 = 40, v3 = 68) and ignores the padding.
+        let header = RedoHeader::deserialize(&buf)?;
         self.next_sequence = header.next_sequence.max(1);
         self.checkpoint_seq = header.checkpoint_seq;
         self.logical_start = header.logical_start;
@@ -2208,11 +2298,11 @@ impl RedoLog {
     /// own, when the entries region is empty and cannot reconstruct
     /// `next_sequence` on reopen.
     fn write_header_bytes(&self) -> Result<()> {
-        let header = RedoHeader {
-            next_sequence: self.next_sequence,
-            checkpoint_seq: self.checkpoint_seq,
-            logical_start: self.logical_start,
-        };
+        // Phase 1: the live log is still linear, so it writes the v2 format
+        // (byte-identical to pre-ring builds). The ring code path (a later
+        // phase) will construct a ring header instead.
+        let header =
+            RedoHeader::linear(self.next_sequence, self.checkpoint_seq, self.logical_start);
         let bytes = header.serialize();
         let align = self.device.alignment();
         let mut buf = AlignedBuf::new(self.header_block_size as usize, align);
@@ -5850,6 +5940,142 @@ mod tests {
         assert_eq!(header.next_sequence, 42);
         assert_eq!(header.checkpoint_seq, 7);
         assert_eq!(header.logical_start, 0, "v1 logical_start defaults to 0");
+        assert!(!header.is_ring(), "v1 header is linear");
+        assert_eq!(header.segment_count, 0);
+    }
+
+    /// Phase 1 (segment ring): a linear header serializes to the v2 wire format
+    /// (byte-identical to pre-ring builds) and round-trips with zeroed ring
+    /// fields. This pins that adding v3 support does NOT switch the live format.
+    #[test]
+    fn redo_header_linear_round_trips_as_v2() {
+        let h = RedoHeader::linear(42, 7, 4096);
+        let bytes = h.serialize();
+        assert_eq!(
+            bytes.len(),
+            HEADER_FIXED_LEN_V2,
+            "a linear header uses the v2 wire length"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            REDO_HEADER_VERSION_LINEAR,
+            "a linear header is written as version 2"
+        );
+        let back = RedoHeader::deserialize(&bytes).unwrap();
+        assert_eq!(back, h);
+        assert!(!back.is_ring());
+        assert_eq!(
+            (back.segment_size, back.segment_count, back.write_pos_in_seg),
+            (0, 0, 0)
+        );
+    }
+
+    /// Phase 1: a segment-ring (v3) header round-trips, carrying the ring
+    /// geometry and pointers, and is written in the v3 wire format.
+    #[test]
+    fn redo_header_ring_v3_round_trips() {
+        let h = RedoHeader {
+            next_sequence: 1000,
+            checkpoint_seq: 900,
+            logical_start: 0,
+            segment_size: 4 * 1024 * 1024,
+            segment_count: 8,
+            oldest_seg: 3,
+            active_seg: 6,
+            write_pos_in_seg: 12345,
+        };
+        let bytes = h.serialize();
+        assert_eq!(bytes.len(), HEADER_FIXED_LEN_V3);
+        assert_eq!(
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            REDO_HEADER_VERSION_RING,
+            "a ring header is written as version 3"
+        );
+        let back = RedoHeader::deserialize(&bytes).unwrap();
+        assert_eq!(back, h);
+        assert!(back.is_ring());
+        assert_eq!(
+            (back.oldest_seg, back.active_seg, back.write_pos_in_seg),
+            (3, 6, 12345)
+        );
+    }
+
+    /// Phase 1: `deserialize` reads only the bytes the on-disk version declares,
+    /// so a v3 header parsed from a full (zero-padded) header block — exactly
+    /// what `read_header_or_init` passes — round-trips intact.
+    #[test]
+    fn redo_header_ring_v3_parses_from_padded_block() {
+        let h = RedoHeader {
+            next_sequence: 5,
+            checkpoint_seq: 4,
+            logical_start: 0,
+            segment_size: 1 << 20,
+            segment_count: 4,
+            oldest_seg: 0,
+            active_seg: 1,
+            write_pos_in_seg: 64,
+        };
+        let mut block = h.serialize();
+        block.resize(4096, 0); // pad as on a real device header block
+        assert_eq!(RedoHeader::deserialize(&block).unwrap(), h);
+    }
+
+    /// Phase 1: a header version newer than this binary supports is rejected
+    /// (not silently misparsed). Fix the CRC so only the version gate can fail.
+    #[test]
+    fn redo_header_rejects_future_version() {
+        let mut bytes = RedoHeader::linear(1, 0, 0).serialize();
+        bytes[8..10].copy_from_slice(&(REDO_HEADER_MAX_VERSION + 1).to_le_bytes());
+        let crc_off = bytes.len() - 4;
+        let crc = crc32fast::hash(&bytes[..crc_off]);
+        bytes[crc_off..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            RedoHeader::deserialize(&bytes),
+            Err(RedoError::UnsupportedHeaderVersion { found, .. }) if found == REDO_HEADER_MAX_VERSION + 1
+        ));
+    }
+
+    /// Phase 1: a corrupt ring-field byte (CRC left stale) is caught by the CRC
+    /// check — the v3 fields are covered by the CRC, not just the v2 prefix.
+    #[test]
+    fn redo_header_ring_v3_detects_crc_corruption() {
+        let h = RedoHeader {
+            next_sequence: 9,
+            checkpoint_seq: 0,
+            logical_start: 0,
+            segment_size: 1 << 20,
+            segment_count: 8,
+            oldest_seg: 0,
+            active_seg: 0,
+            write_pos_in_seg: 0,
+        };
+        let mut bytes = h.serialize();
+        bytes[44] ^= 0xFF; // flip a byte inside segment_count
+        assert!(matches!(
+            RedoHeader::deserialize(&bytes),
+            Err(RedoError::HeaderCrcMismatch { .. })
+        ));
+    }
+
+    /// Phase 1: a v3 header truncated below its declared length is rejected
+    /// rather than read out of bounds.
+    #[test]
+    fn redo_header_ring_v3_truncated_is_rejected() {
+        let h = RedoHeader {
+            next_sequence: 1,
+            checkpoint_seq: 0,
+            logical_start: 0,
+            segment_size: 1 << 20,
+            segment_count: 2,
+            oldest_seg: 0,
+            active_seg: 0,
+            write_pos_in_seg: 0,
+        };
+        let bytes = h.serialize();
+        // Cut to a v2-sized buffer: the v3 version byte says "expect 68" but only
+        // 40 are present → rejected (no panic / OOB read).
+        let truncated = &bytes[..HEADER_FIXED_LEN_V2];
+        assert!(RedoHeader::deserialize(truncated).is_err());
     }
 
     #[test]
