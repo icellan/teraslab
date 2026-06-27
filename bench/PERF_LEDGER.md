@@ -345,6 +345,56 @@ Plus a **quiet-host** run to strip the convoy confound (load-21 inflates every
 measured hold/wait). These are the next dedicated steps; the redo-path
 micro-optimizations (E5/E8/E10) are now exhausted.
 
+## E11 — Sharding exploration: redo sharding helps 2×, but the write path is a CHAIN of per-store mutexes (2026-06-27)
+
+Same-host, same-time reference number this session: **37.8k ops/s** (so the host
+is NOT the limiter — TeraSlab's cap is its own serialization, as the user noted).
+
+Store-count sweep (multi-store = redo sharding at store granularity; open-loop
+IF=512, buffered, load ~6):
+
+| config | total ops/s | redo lock-wait |
+|--------|-------------|----------------|
+| reference | 37,769 | — |
+| TS 1-store | 3,974 | 67.3ms |
+| TS 4-store | **7,772** (~2×) | 25.0ms |
+| TS 8-store | 7,297 (flat) | 20.4ms |
+
+- **Redo sharding genuinely helps**: 1→4 stores ≈ 2×, redo lock-wait 67→25ms.
+  Confirms the redo mutex is a real, dominant bottleneck — sharding it is worth
+  building.
+- **But it plateaus at ~7.7k** (8 stores ≤ 4; adding request concurrency —
+  pipe16 + 256 conns — made it *worse*, 4.4k, p99.9 1.5s, as more writers
+  re-contend the shards). And the 4-store saturation profile shows why it is not
+  just the redo mutex:
+
+```
+CPU = 0.98 of 8 cores (88% idle — pure lock serialization, never compute)
+create = 39ms  (redo 37ms  devwrite 0.45ms  reserve 0.02ms)
+  └ of redo 37ms: lock-wait 19ms + ~18ms NON-lock-wait
+spend  = 44ms
+```
+
+**The write path is a chain of per-store mutexes, each serializing concurrent
+writers; sharding the redo fixes only the first link:**
+1. **Redo log mutex** — the 19ms lock-wait. Sharding addresses this (✓ 2×).
+2. **Allocator mutex** (`engine.rs:170`, one `Mutex<SlotAllocator>`/store) — the
+   ~18ms in `create_redo`: create's `pending_allocs` → `allocator_for(d).lock()
+   .commit_pending()` serializes all creates to a store.
+3. **Spend takes the redo lock TWICE** — the spend op + a second
+   `commit_dah_batch` redo commit (the DAH delete-at-height update).
+
+**Verdict:** sharding the redo log is necessary and worth ~2×, but NOT sufficient
+to reach the reference's ~38–44k — the allocator commit and spend's double-redo
+then bind at ~7.7k, and CPU is 88% idle throughout (the reference's event-loop +
+lock-light engine is the structural difference). Closing the gap is a
+**write-path lock-decontention campaign**, not one change. Recommended sequence:
+(1) shard the redo append (in-store K sub-logs, lower overhead than multi-store —
+shares one cache/index/allocator/checkpoint); (2) decontend the allocator
+`commit_pending` (shard the freelist / commit outside the lock); (3) fold spend's
+DAH update into its single redo commit so spend takes the redo lock once. Each is
+a contained change; together they unwind the chain.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
