@@ -334,6 +334,63 @@ pub fn recover_or_create_allocator(
     }
 }
 
+/// Reconcile a store's allocator packed-ness with the configured `packed`
+/// flag, honoring the rule that the DEVICE's on-disk format always wins.
+///
+/// - **Fresh device** ([`AllocatorOrigin::Fresh`]): the device has no format
+///   yet, so config decides — `set_packed(config_packed)` BEFORE any
+///   allocation, so the first reservations pack and the first `persist`
+///   stamps the packed header version.
+/// - **Recovered device** ([`AllocatorOrigin::Recovered`]):
+///   [`SlotAllocator::recover`] already set packed-ness from the header. The
+///   config is NOT allowed to override it: reopening a packed device
+///   non-packed (or vice versa) would corrupt it via `free()`'s block-rounding.
+///   If config disagrees with the device, the device wins and a clear warning
+///   is logged (packing a non-packed device, or un-packing a packed one,
+///   requires a fresh device / migration — out of scope).
+///
+/// `store` is the store index, used only for log context.
+pub fn apply_packed_mode(
+    alloc: &mut SlotAllocator,
+    origin: AllocatorOrigin,
+    config_packed: bool,
+    store: usize,
+) {
+    match origin {
+        AllocatorOrigin::Fresh => {
+            // Fresh device: config decides the on-disk format.
+            alloc.set_packed(config_packed);
+            if config_packed {
+                tracing::info!(
+                    store,
+                    "storage.packed = true: fresh device will use the packed record layout"
+                );
+            }
+        }
+        AllocatorOrigin::Recovered => {
+            // Device format wins. Warn on any config/device mismatch but never
+            // override the recovered packed-ness.
+            let device_packed = alloc.is_packed();
+            if config_packed && !device_packed {
+                tracing::warn!(
+                    store,
+                    "storage.packed = true but this device recovered as NON-packed \
+                     (existing data uses the block-per-record layout); honoring the \
+                     device and staying NON-packed. Packing requires a fresh device / \
+                     migration (no in-place migration exists)."
+                );
+            } else if !config_packed && device_packed {
+                tracing::warn!(
+                    store,
+                    "storage.packed = false but this device recovered as PACKED; \
+                     honoring the device and staying PACKED. Opening a packed device \
+                     non-packed would corrupt it via free()'s block-rounding."
+                );
+            }
+        }
+    }
+}
+
 /// Load the redb primary index. Restore first, fall back to a
 /// device-rebuild on a clean restore-error, fail closed otherwise.
 ///
@@ -1348,6 +1405,72 @@ mod tests {
                 panic!("corrupt header must fail closed, got a {origin:?} allocator")
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Packed-mode startup wiring (apply_packed_mode): fresh adopts config,
+    // recovered honors the device (device format wins).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_packed_mode_fresh_device_adopts_config_on() {
+        // Fresh device + config packed -> allocator becomes packed before use.
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("fresh");
+        assert_eq!(origin, AllocatorOrigin::Fresh);
+        assert!(!alloc.is_packed(), "fresh allocator starts non-packed");
+        apply_packed_mode(&mut alloc, origin, true, 0);
+        assert!(alloc.is_packed(), "fresh + config packed -> packed");
+    }
+
+    #[test]
+    fn apply_packed_mode_fresh_device_adopts_config_off() {
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("fresh");
+        apply_packed_mode(&mut alloc, origin, false, 0);
+        assert!(!alloc.is_packed(), "fresh + config off -> non-packed");
+    }
+
+    #[test]
+    fn apply_packed_mode_recovered_packed_device_wins_over_config_off() {
+        // A v2 (packed) device must STAY packed even when config says off —
+        // opening it non-packed would corrupt it via free()'s block-rounding.
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        {
+            let mut a = SlotAllocator::new(dev.clone()).unwrap();
+            a.set_packed(true);
+            a.allocate(600).unwrap();
+            a.persist().unwrap();
+        }
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("recover packed");
+        assert_eq!(origin, AllocatorOrigin::Recovered);
+        assert!(alloc.is_packed(), "recovered device is packed");
+        // Config says OFF, but the device wins.
+        apply_packed_mode(&mut alloc, origin, false, 0);
+        assert!(
+            alloc.is_packed(),
+            "recovered packed device must stay packed regardless of config"
+        );
+    }
+
+    #[test]
+    fn apply_packed_mode_recovered_nonpacked_device_wins_over_config_on() {
+        // A v1 (non-packed) device must STAY non-packed even when config says
+        // packed — packing existing data needs a fresh device / migration.
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        {
+            let mut a = SlotAllocator::new(dev.clone()).unwrap();
+            a.allocate(600).unwrap();
+            a.persist().unwrap();
+        }
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("recover non-packed");
+        assert_eq!(origin, AllocatorOrigin::Recovered);
+        assert!(!alloc.is_packed());
+        apply_packed_mode(&mut alloc, origin, true, 0);
+        assert!(
+            !alloc.is_packed(),
+            "recovered non-packed device must stay non-packed regardless of config"
+        );
     }
 
     #[test]

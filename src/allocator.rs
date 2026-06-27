@@ -35,7 +35,24 @@ const ALLOCATOR_MAGIC: u64 = 0x5445_5241_414C_4C43; // "TERAALLC"
 
 /// Current header version. Stored at bytes 40..44 so `recover()` can reject
 /// incompatible on-disk formats written by future builds.
+///
+/// This is the NON-PACKED (default) layout version. A packed device stamps
+/// [`HEADER_VERSION_PACKED`] instead; see [`SlotAllocator::persist`] and
+/// [`SlotAllocator::recover`].
 const HEADER_VERSION: u32 = 1;
+
+/// On-disk header version stamped by a PACKED allocator (sub-4 KiB record
+/// offsets, packed within a device block — see
+/// `docs/PACKED_RECORD_STORAGE_DESIGN.md`).
+///
+/// Packing must be persisted so a device's format wins over config across
+/// restarts: reopening a packed device in non-packed mode would make `free()`
+/// `align_up` to the full device block and over-free packed block-neighbours
+/// (silent corruption). `recover` restores packed-ness from this marker; an
+/// older binary that only knows [`HEADER_VERSION`] sees `version > max_known`
+/// and fails CLOSED with [`AllocatorError::UnsupportedVersion`] rather than
+/// misreading a packed device non-packed.
+const HEADER_VERSION_PACKED: u32 = 2;
 
 /// Byte offset of the header CRC32 field (little-endian u32). Computed over
 /// the header bytes from offset 0 up through the freelist entries, with the
@@ -1504,7 +1521,16 @@ impl SlotAllocator {
         buf[8..16].copy_from_slice(&self.next_offset.to_le_bytes());
         buf[16..24].copy_from_slice(&(count as u64).to_le_bytes());
         buf[24..40].copy_from_slice(&self.device_id);
-        buf[40..44].copy_from_slice(&HEADER_VERSION.to_le_bytes());
+        // Stamp the layout version: packed devices write
+        // `HEADER_VERSION_PACKED` (2) so `recover` restores packed-ness and an
+        // old v1-only binary fails closed; non-packed devices write
+        // `HEADER_VERSION` (1), byte-identical to before.
+        let version = if self.packed {
+            HEADER_VERSION_PACKED
+        } else {
+            HEADER_VERSION
+        };
+        buf[40..44].copy_from_slice(&version.to_le_bytes());
         // CRC slot stays zero until we hash — this is part of the contract.
         buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&0u32.to_le_bytes());
 
@@ -1594,9 +1620,17 @@ impl SlotAllocator {
                 .try_into()
                 .map_err(|_| AllocatorError::CorruptedHeader)?,
         );
-        if version > HEADER_VERSION {
-            return Err(AllocatorError::UnsupportedVersion(version));
-        }
+        // Classify the on-disk layout from the version field. The DEVICE's
+        // format wins: packed-ness comes from here, never from config. Any
+        // version this build does not know (including a v2 packed header read
+        // by an old v1-only binary, where `HEADER_VERSION_PACKED` would not be
+        // a known value) fails CLOSED — opening a packed device non-packed
+        // would corrupt it via `free()`'s block-rounding.
+        let packed = match version {
+            HEADER_VERSION => false,
+            HEADER_VERSION_PACKED => true,
+            other => return Err(AllocatorError::UnsupportedVersion(other)),
+        };
 
         // Read the full freelist and verify CRC32.
         //
@@ -1676,7 +1710,7 @@ impl SlotAllocator {
             device_id,
             redo_log: None,
             redo_device_id: 0,
-            packed: false,
+            packed,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_persist: std::cell::Cell::new(false),
         })
@@ -4058,6 +4092,183 @@ mod tests {
             small % RECORD_ALIGN,
             0,
             "reused offset must be RECORD_ALIGN-aligned"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4: on-disk packed format marker (HEADER_VERSION_PACKED).
+    // The device's persisted packed-ness must win over config across restarts;
+    // opening a packed device non-packed would corrupt via `free()`'s 4 KiB
+    // align_up (PACKED_RECORD_STORAGE_DESIGN.md §1/§5).
+    // -----------------------------------------------------------------------
+
+    /// A packed allocator persists header version 2 and recovers as packed.
+    #[test]
+    fn packed_allocator_persists_version_2_and_recovers_packed() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            alloc.allocate(600).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        // Raw header: version field at 40..44 must be HEADER_VERSION_PACKED.
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        let version = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        assert_eq!(
+            version, HEADER_VERSION_PACKED,
+            "a packed allocator must stamp header version {HEADER_VERSION_PACKED}"
+        );
+
+        let recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(
+            recovered.is_packed(),
+            "recover of a v2 header must restore packed mode from the device"
+        );
+    }
+
+    /// A non-packed allocator persists header version 1 and recovers non-packed.
+    #[test]
+    fn nonpacked_allocator_persists_version_1_and_recovers_nonpacked() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            assert!(!alloc.is_packed());
+            alloc.allocate(600).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        let version = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        assert_eq!(
+            version, HEADER_VERSION,
+            "a non-packed allocator must stamp header version {HEADER_VERSION} (unchanged)"
+        );
+
+        let recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(
+            !recovered.is_packed(),
+            "recover of a v1 header must restore non-packed mode"
+        );
+    }
+
+    /// The DEVICE wins: a v2 (packed) device recovers as packed regardless of
+    /// how the allocator was constructed — there is no config override on the
+    /// recover path. (`recover` cannot be told to be non-packed.)
+    #[test]
+    fn recovered_v2_device_is_always_packed() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            alloc.allocate(600).unwrap();
+            alloc.allocate(600).unwrap();
+            alloc.persist().unwrap();
+        }
+        let recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(
+            recovered.is_packed(),
+            "a v2 device must always recover packed (device-format-wins)"
+        );
+    }
+
+    /// Old-binary fail-closed: a v1-only build (one that does not understand
+    /// version 2) must reject a v2/packed header rather than misread it
+    /// non-packed and corrupt it via `free()`. Simulated by checking the
+    /// version gate: bumping HEADER_VERSION to anything below the persisted
+    /// packed marker would make `recover` return `UnsupportedVersion`.
+    #[test]
+    fn v1_build_rejects_v2_packed_header() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            alloc.persist().unwrap();
+        }
+
+        // Confirm the persisted version really is the packed marker (2).
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        let on_disk = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        assert_eq!(on_disk, HEADER_VERSION_PACKED);
+
+        // A v1-only build's max-known version is HEADER_VERSION (1). The recover
+        // gate rejects any on-disk version it does not know. Assert that the
+        // packed marker is strictly greater than the v1 max, so such a build
+        // hits the `version > max_known` branch and fails CLOSED.
+        assert!(
+            HEADER_VERSION_PACKED > HEADER_VERSION,
+            "packed marker must exceed the v1 max-known version so an old binary fails closed"
+        );
+
+        // Drive the actual rejection: rewrite the version to a value ABOVE the
+        // CURRENT build's max-known (HEADER_VERSION_PACKED) so `recover` takes
+        // the same `UnsupportedVersion` branch a v1 build takes on a v2 header.
+        // (CRC must be recomputed so we exercise the version gate, not the CRC
+        // gate.) This proves the gate is the fail-closed path.
+        let future = HEADER_VERSION_PACKED + 1;
+        buf[40..44].copy_from_slice(&future.to_le_bytes());
+        // Recompute CRC over the covered range with the CRC field zeroed.
+        let count = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+        let covered_end = FREELIST_OFFSET + count * 16;
+        for b in &mut buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4] {
+            *b = 0;
+        }
+        let crc = {
+            let mut h = crc32fast::Hasher::new();
+            h.update(&buf[..covered_end]);
+            h.finalize()
+        };
+        buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        dev.pwrite(&buf, 0).unwrap();
+
+        match SlotAllocator::recover(dev) {
+            Err(AllocatorError::UnsupportedVersion(v)) => assert_eq!(v, future),
+            Err(other) => panic!("expected UnsupportedVersion({future}), got: {other}"),
+            Ok(_) => panic!("expected UnsupportedVersion, but recover succeeded"),
+        }
+    }
+
+    /// End-to-end packing corruption gate across a persist/recover cycle:
+    /// several packed records share one block; free the middle; recover; the
+    /// surviving neighbours must read back intact and must not have been
+    /// over-freed (the freed hole is reused exactly, not a 4 KiB span).
+    #[test]
+    fn packed_persist_recover_preserves_block_neighbours() {
+        let dev = test_device(16);
+        let (o1, o2, o3);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            o1 = alloc.allocate(600).unwrap();
+            o2 = alloc.allocate(600).unwrap();
+            o3 = alloc.allocate(600).unwrap();
+            let block = 4096u64;
+            assert_eq!(o1 / block, o3 / block, "all three packed in one block");
+            // Free the middle with its exact size, then snapshot.
+            alloc.free(o2, 600).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        // Recover: packed mode restored from the header, neighbours still live,
+        // the middle hole still free and reused exactly.
+        let mut recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(recovered.is_packed(), "must recover packed");
+        assert!(
+            recovered.is_allocated_range(o1, 600),
+            "o1 must survive persist/recover (not over-freed)"
+        );
+        assert!(
+            recovered.is_allocated_range(o3, 600),
+            "o3 must survive persist/recover (not over-freed)"
+        );
+        let reused = recovered.allocate(600).unwrap();
+        assert_eq!(
+            reused, o2,
+            "the freed packed hole is reused exactly after recovery"
         );
     }
 }

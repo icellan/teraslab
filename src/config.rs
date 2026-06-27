@@ -211,6 +211,21 @@ pub enum ConfigError {
     )]
     WriteBackRequiresCacheBytes,
 
+    /// `storage.packed = true` with `device_alignment > 4096`. Packed mode's
+    /// block-granular `io_locks` hardcode a 4096-byte lock block; a larger
+    /// device block could map two packed records in the same physical block to
+    /// different lock stripes and under-lock a shared block (torn writes). See
+    /// `docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.2.
+    #[error(
+        "storage.packed = true requires device_alignment <= 4096 (the packed io_locks lock \
+         block is 4096 bytes), found device_alignment = {device_alignment}; either set \
+         device_alignment <= 4096 or disable packing (storage.packed = false)"
+    )]
+    PackedAlignmentTooLarge {
+        /// The configured device alignment that exceeds the packed lock block.
+        device_alignment: usize,
+    },
+
     /// `advertise_addr` does not parse as `host:port` (only checked when set).
     /// See F-G10-013.
     #[error(
@@ -558,6 +573,36 @@ impl CacheConfig {
         self.bytes > 0
     }
 }
+
+/// On-device storage layout configuration (`[storage]` TOML section).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Pack multiple sub-block records contiguously within a single device
+    /// block instead of giving each record its own 4 KiB block. `false`
+    /// (default) is the unchanged block-per-record layout — byte-for-byte
+    /// identical behavior and no extra I/O.
+    ///
+    /// Packing kills create write amplification (≈7 records per device write)
+    /// but changes the on-disk format: a packed device stamps allocator
+    /// header version 2 and MUST always be reopened packed (reopening it
+    /// non-packed corrupts it via `free()`'s block-rounding). Packing therefore
+    /// requires a FRESH device — there is no in-place migration. See
+    /// `docs/PACKED_RECORD_STORAGE_DESIGN.md`.
+    ///
+    /// When enabled, `device_alignment` must be `<= 4096`: the block-granular
+    /// `io_locks` hardcode a 4096-byte lock block, so a larger device block
+    /// could map two packed records to different lock stripes and under-lock a
+    /// shared block. Validation rejects `packed = true` with
+    /// `device_alignment > 4096`.
+    pub packed: bool,
+}
+
+/// Maximum `device_alignment` (bytes) compatible with packed mode. The
+/// block-granular `io_locks` / `lock_span_blocks` hardcode a 4096-byte lock
+/// block (`docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.2); a larger device block
+/// could under-lock a shared block, so packing is refused above this.
+const PACKED_MAX_DEVICE_ALIGNMENT: usize = 4096;
 
 /// TeraSlab server configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -1100,6 +1145,10 @@ pub struct ServerConfig {
     /// (`bytes = 0`). See [`CacheConfig`].
     pub cache: CacheConfig,
 
+    /// On-device storage layout (`[storage]`). `packed` is off by default. See
+    /// [`StorageConfig`].
+    pub storage: StorageConfig,
+
     /// Expected device identity (hex string). If set, the server refuses to
     /// start if the on-disk identity does not match. Use this to prevent
     /// accidentally pointing at the wrong device.
@@ -1197,6 +1246,7 @@ impl Default for ServerConfig {
             recovery_missing_primary_tolerance: 65_536,
             index: IndexConfig::default(),
             cache: CacheConfig::default(),
+            storage: StorageConfig::default(),
             device_id: None,
             observability: ObservabilityConfig::default(),
         }
@@ -1658,6 +1708,16 @@ impl ServerConfig {
         // Write-back caching needs a non-zero buffer to defer writes into.
         if self.cache.writeback && self.cache.bytes == 0 {
             return Err(ConfigError::WriteBackRequiresCacheBytes);
+        }
+
+        // Packed mode is only safe when the device block (the RMW unit) is no
+        // larger than the 4096-byte io_locks lock block; otherwise two packed
+        // records in one physical block could map to different lock stripes and
+        // a shared block could be under-locked. Off by default → no-op.
+        if self.storage.packed && self.device_alignment > PACKED_MAX_DEVICE_ALIGNMENT {
+            return Err(ConfigError::PackedAlignmentTooLarge {
+                device_alignment: self.device_alignment,
+            });
         }
 
         // (0b) Size sanity gates. Pre-fix `device_alignment = 0` or
@@ -2202,6 +2262,57 @@ backend = ""
         // Default config (cache off) must validate.
         cfg.validate_safe_defaults()
             .expect("default config (cache disabled) must validate");
+    }
+
+    #[test]
+    fn storage_packed_defaults_off_and_validates() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.storage.packed, "packed must default to OFF");
+        cfg.validate_safe_defaults()
+            .expect("default config (packed off) must validate");
+    }
+
+    #[test]
+    fn packed_with_4096_alignment_validates() {
+        let cfg = ServerConfig {
+            storage: StorageConfig { packed: true },
+            device_alignment: 4096,
+            ..ServerConfig::default()
+        };
+        cfg.validate_safe_defaults()
+            .expect("packed with device_alignment = 4096 must validate");
+    }
+
+    #[test]
+    fn packed_with_alignment_above_4096_is_rejected() {
+        let cfg = ServerConfig {
+            storage: StorageConfig { packed: true },
+            device_alignment: 8192,
+            ..ServerConfig::default()
+        };
+        match cfg.validate_safe_defaults() {
+            Err(ConfigError::PackedAlignmentTooLarge { device_alignment }) => {
+                assert_eq!(device_alignment, 8192);
+            }
+            other => panic!("expected PackedAlignmentTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonpacked_with_alignment_above_4096_is_allowed() {
+        // The packed-only alignment gate must NOT fire when packing is off:
+        // a non-packed device may legitimately use a larger block.
+        let cfg = ServerConfig {
+            storage: StorageConfig { packed: false },
+            device_alignment: 8192,
+            ..ServerConfig::default()
+        };
+        if let Err(e) = cfg.validate_safe_defaults() {
+            assert!(
+                !matches!(e, ConfigError::PackedAlignmentTooLarge { .. }),
+                "non-packed config must not trip the packed alignment gate, got {e:?}"
+            );
+        }
     }
 
     #[test]

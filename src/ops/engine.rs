@@ -168,6 +168,13 @@ pub(crate) struct Store {
     /// raw O_DIRECT), in which case I/O falls back to `pread`/`pwrite`.
     device_ptr: *mut u8,
     allocator: parking_lot::Mutex<SlotAllocator>,
+    /// Cached copy of this store's allocator packed-ness, snapshotted at
+    /// construction. Packed-ness is set once at startup (fresh device from
+    /// config, recovered device from the header) and never toggled afterwards,
+    /// so caching it here lets the create write path branch its buffer padding
+    /// (gate #2: pad to `RECORD_ALIGN` in packed mode, full block otherwise)
+    /// without locking the allocator mutex on every write.
+    packed: bool,
 }
 
 pub struct Engine {
@@ -458,10 +465,12 @@ impl Engine {
             .into_iter()
             .map(|(device, allocator)| {
                 let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
+                let packed = allocator.is_packed();
                 Store {
                     device,
                     device_ptr,
                     allocator: parking_lot::Mutex::new(allocator),
+                    packed,
                 }
             })
             .collect();
@@ -497,11 +506,13 @@ impl Engine {
         // Match the visibility barrier's per-key stripe count to the mutation
         // lock table so the two granularities line up.
         let visibility = crate::visibility::VisibilityBarrier::new(locks.stripe_count());
+        let store0_packed = allocator.is_packed();
         let engine = Self {
             stores: vec![Store {
                 device,
                 device_ptr,
                 allocator: parking_lot::Mutex::new(allocator),
+                packed: store0_packed,
             }],
             placer,
             index,
@@ -1887,6 +1898,14 @@ impl Engine {
     #[inline]
     pub fn device_for(&self, device_id: u8) -> &Arc<dyn BlockDevice> {
         &self.stores[device_id as usize].device
+    }
+
+    /// Whether store `device_id` uses the packed record layout (sub-block,
+    /// `RECORD_ALIGN`-granular). Read from a value cached at construction (no
+    /// allocator lock); packed-ness is fixed for a store's lifetime.
+    #[inline]
+    pub(crate) fn store_is_packed(&self, device_id: u8) -> bool {
+        self.stores[device_id as usize].packed
     }
 
     /// Fsync the data device of EVERY store.
@@ -4566,9 +4585,22 @@ impl Engine {
     ) -> Result<(), CreateError> {
         let align = self.device_for(device_id).alignment();
         let data_len = METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE + cold_data.len();
-        let aligned_len = data_len.div_ceil(align) * align;
+        // Gate #2 (packed): a packed single-create must land the EXACT record
+        // image (padded only to `RECORD_ALIGN`, the allocator's reservation
+        // granularity) so the RMW in `write_record_bytes` patches only its own
+        // bytes and never over-writes a block-neighbour packed record. The
+        // non-packed path is byte-identical to before: pad to the full device
+        // block so `write_record_bytes` takes the single aligned write with no
+        // extra `pread`. (The bulk coalesced create path already sizes its
+        // buffer by the reservation, so it was already correct.)
+        let image_len = if self.store_is_packed(device_id) {
+            data_len.div_ceil(crate::allocator::RECORD_ALIGN as usize)
+                * crate::allocator::RECORD_ALIGN as usize
+        } else {
+            data_len.div_ceil(align) * align
+        };
 
-        let mut buf = crate::device::AlignedBuf::new(aligned_len, align);
+        let mut buf = crate::device::AlignedBuf::new(image_len, align);
 
         // Write metadata
         let mut meta_bytes = [0u8; METADATA_SIZE];
@@ -19064,5 +19096,108 @@ mod tests {
         let corrupt = dir.path().join("corrupt.height");
         std::fs::write(&corrupt, b"not a valid height file").unwrap();
         assert_eq!(read_durable_height_file(&corrupt), None);
+    }
+
+    /// Build an in-memory engine whose allocator runs in PACKED mode (set
+    /// before construction so the cached `Store::packed` flag is true and the
+    /// first reservations pack within one device block).
+    fn make_packed_engine() -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        alloc.set_packed(true);
+        Arc::new(Engine::new(
+            dev,
+            Index::new(100).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    }
+
+    /// Gate #2 (PACKED_RECORD_STORAGE_DESIGN.md §3.1): a single-record create in
+    /// packed mode must RMW only its OWN bytes and never over-write a FORWARD
+    /// block-neighbour. Pack A, B, C contiguously in one block; delete A; then
+    /// single-create D into A's freed hole and assert B and C survive.
+    ///
+    /// Before the gate-#2 fix, `write_full_record_with_cold` padded D's buffer
+    /// to the full 4 KiB block; D's RMW at A's (mid-block) offset then wrote a
+    /// 4096-byte image starting at A's offset, clobbering B and C (which sit in
+    /// `[A_offset, A_offset + 4096)`). The fix pads D's image only to
+    /// `RECORD_ALIGN`, so the RMW touches just D's own bytes.
+    #[test]
+    fn packed_single_create_preserves_forward_block_neighbour() {
+        let engine = make_packed_engine();
+
+        let (_a_h, a_req) = make_create_req(0xA1, 2);
+        let (b_hashes, b_req) = make_create_req(0xB2, 2);
+        let (c_hashes, c_req) = make_create_req(0xC3, 2);
+        let a_key = a_req.tx_key();
+        let b_key = b_req.tx_key();
+        let c_key = c_req.tx_key();
+
+        // Pack A, B, C — the bump allocator places them back-to-back within the
+        // first device block (small 2-utxo records).
+        engine.create(&a_req).expect("create A");
+        engine.create(&b_req).expect("create B");
+        engine.create(&c_req).expect("create C");
+
+        let a_off = engine
+            .lookup_checked(&a_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        let b_off = engine
+            .lookup_checked(&b_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        let c_off = engine
+            .lookup_checked(&c_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        // Preconditions: all three in one block, B and C AFTER A (the forward
+        // neighbours a 4096-padded D-write would clobber).
+        assert_eq!(a_off / 4096, c_off / 4096, "A,B,C must share one block");
+        assert!(b_off > a_off && c_off > b_off, "B,C must follow A in-block");
+        assert!(
+            c_off + 256 <= a_off + 4096,
+            "B and C must sit within A's 4096-byte padding window"
+        );
+
+        // Delete A, freeing its exact packed hole, then single-create D, which
+        // best-fit reuses A's hole (same offset, same block as B and C).
+        engine
+            .delete(&DeleteRequest {
+                tx_key: a_key,
+                due_guard: None,
+            })
+            .expect("delete A");
+        let (_d_h, d_req) = make_create_req(0xD4, 2);
+        let d_key = d_req.tx_key();
+        engine.create(&d_req).expect("create D into A's hole");
+        let d_off = engine
+            .lookup_checked(&d_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        assert_eq!(d_off, a_off, "D must reuse A's freed packed hole");
+
+        // B and C must read back EXACTLY — D's packed single-create must not
+        // have over-written its forward neighbours.
+        let b_slots = engine.read_slots(&b_key).expect("read B slots");
+        assert_eq!(b_slots.len(), 2);
+        for (i, slot) in b_slots.iter().enumerate() {
+            assert_eq!(slot.hash, b_hashes[i], "B slot {i} clobbered by D's write");
+            assert!(!slot.is_spent(), "B slot {i} zeroed by D's write");
+        }
+        let c_slots = engine.read_slots(&c_key).expect("read C slots");
+        assert_eq!(c_slots.len(), 2);
+        for (i, slot) in c_slots.iter().enumerate() {
+            assert_eq!(slot.hash, c_hashes[i], "C slot {i} clobbered by D's write");
+            assert!(!slot.is_spent(), "C slot {i} zeroed by D's write");
+        }
     }
 }

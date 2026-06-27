@@ -31,11 +31,11 @@ use teraslab::server::Server;
 use teraslab::server::dispatch::{SecondaryStatus, set_secondary_status};
 use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
-    AllocatorOrigin, SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
-    fallback_unmined_index, load_primary_index_file_backed, load_primary_index_redb,
-    load_sharded_index_in_memory, load_sharded_index_in_memory_multi, open_mandatory_redo_log,
-    open_tombstone_log, rebuild_in_memory_secondaries, recover_or_create_allocator,
-    secondaries_from_pair,
+    AllocatorOrigin, SecondaryLoadOutcome, apply_packed_mode, check_replay_tolerance_with_cap,
+    fallback_dah_index, fallback_unmined_index, load_primary_index_file_backed,
+    load_primary_index_redb, load_sharded_index_in_memory, load_sharded_index_in_memory_multi,
+    open_mandatory_redo_log, open_tombstone_log, rebuild_in_memory_secondaries,
+    recover_or_create_allocator, secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -662,9 +662,13 @@ fn main() {
     let mut store_allocators: Vec<SlotAllocator> = Vec::with_capacity(num_stores);
     let mut allocator = allocator;
     allocator.set_redo_device_id(0);
+    // Packed mode: a FRESH device adopts config.storage.packed (before any
+    // allocation); a RECOVERED device keeps its on-disk format (device wins,
+    // mismatch logged). Done per store so every store is consistent.
+    apply_packed_mode(&mut allocator, allocator_origin, config.storage.packed, 0);
     store_allocators.push(allocator);
     for (i, sdev) in store_devices.iter().enumerate().skip(1) {
-        let (mut alloc, _origin) = match recover_or_create_allocator(sdev.clone()) {
+        let (mut alloc, origin) = match recover_or_create_allocator(sdev.clone()) {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::error!(
@@ -677,6 +681,7 @@ fn main() {
             }
         };
         alloc.set_redo_device_id(i as u8);
+        apply_packed_mode(&mut alloc, origin, config.storage.packed, i);
         store_allocators.push(alloc);
     }
 
