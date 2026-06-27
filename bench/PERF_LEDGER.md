@@ -315,6 +315,36 @@ reserve-then-write ring so concurrent committers don't serialize on one mutex;
 (c) right-size the DispatchPool (cores×8=64 is too many for a lock-bound workload)
 and re-measure on a QUIET host (the load-9–18 box inflates every park/wake).
 
+## E10 — Double-buffer refinement: swap the buffer, don't copy under the lock
+
+`prepare_flush` no longer allocates the aligned device block, copies the entries
+buffer into it, or does the partial-block read-back UNDER the log lock. It now
+swaps the buffer out in O(1) (`mem::replace` with a capacity-preserving fresh
+buffer — one untouched `with_capacity` alloc, no memcpy) and returns the raw
+bytes; `commit_flush` builds the aligned block (alloc + copy + rare read-back)
+OFF the lock. `cargo test --lib` = **2466 passed / 0 failed**, clippy + fmt clean.
+
+Effect (open-loop IF=512, on a MORE loaded host — load 21 vs 9–18 earlier, so
+conservative): `redo_commit_lock_wait` **51 → 40.6ms**; cumulative across the
+three redo fixes (E5 double-buffer, E8 pre-encode, E10 buffer-swap) the wait is
+**72 → 40.6ms (−44%)** and the in-lock work fell **~6ms → ~0.4ms** (and most of
+that 0.4ms is holder-preemption on the loaded box, not real work). The redo
+critical section is now essentially empty — there is nothing left to shave inside
+it.
+
+**What remains (structural, not a tuning knob):** with in-lock work ~0, the 40ms
+is **pure serialization × concurrency** — ALL writes still pass through ONE
+per-store redo mutex, so wait ≈ (concurrent writers) × (tiny hold) + loaded-host
+lock-convoy. Throughput stays ~6.9k vs the reference's ~44k. The only way past it
+is to STOP funnelling every writer through one mutex:
+- **shard the redo append into K sub-logs** (per-core / by txid-stripe), each with
+  its own mutex+buffer, merged by sequence on recovery → wait ≈ (writers/K)×hold; or
+- a **lock-free reserve-then-write ring** (atomic `fetch_add` for the slot, write
+  payload without a mutex).
+Plus a **quiet-host** run to strip the convoy confound (load-21 inflates every
+measured hold/wait). These are the next dedicated steps; the redo-path
+micro-optimizations (E5/E8/E10) are now exhausted.
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |

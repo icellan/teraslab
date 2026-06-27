@@ -2111,13 +2111,23 @@ impl RingState {
 /// **segment ring** ([`RingState`], `docs/REDO_SEGMENT_RING_DESIGN.md`) — the
 /// `write_pos`/`logical_start` linear fields are unused and the append/flush
 /// paths key off the ring pointers.
-/// Device-ready blocks produced by [`RedoLog::prepare_flush`] under the log lock
-/// and pwritten by [`RedoLog::commit_flush`] outside it. Carries the aligned
-/// entries block and the header block, each with its absolute device offset, so
-/// the slow O_DIRECT pwrite needs no `RedoLog` state and never holds the log
-/// mutex.
+/// A flush prepared by [`RedoLog::prepare_flush`] under the log lock and written
+/// by [`RedoLog::commit_flush`] outside it. Carries the **raw entries buffer**
+/// swapped out of the log in O(1) (no copy/alloc-of-aligned-block under the
+/// lock); `commit_flush` builds the aligned device block from it OFF the lock.
+/// Also carries the header block (small, built under the lock) and the device
+/// offsets, so the slow work — the aligned-block allocation, the (rare)
+/// partial-block read-back, and the O_DIRECT pwrite — never holds the log mutex.
 pub struct PreparedFlush {
-    data: AlignedBuf,
+    /// The entries buffer swapped out of the log; aligned block built from it in
+    /// `commit_flush`.
+    raw: Vec<u8>,
+    /// Leading partial-block byte offset within the aligned write (normally 0,
+    /// non-zero only after a previous flush left an unaligned tail).
+    intra: usize,
+    /// Device block alignment.
+    align: usize,
+    /// Aligned device offset for the entries write.
     data_offset: u64,
     header: AlignedBuf,
     header_offset: u64,
@@ -3135,18 +3145,6 @@ impl RedoLog {
         // natural end-of-data sentinel.
         let aligned_total = total.div_ceil(align) * align;
 
-        let mut buf = AlignedBuf::new(aligned_total, align);
-        if intra > 0 {
-            // F-G4-004: read back only the leading partial block. This is the one
-            // device touch that stays under the lock; it is rare (only after an
-            // unaligned tail) and a single block.
-            self.device
-                .pread_exact_at(&mut buf[..align], aligned_offset)?;
-            // Defensive zero of anything past `intra` the read pulled in.
-            buf[intra..align].fill(0);
-        }
-        buf[intra..intra + self.buffer.len()].copy_from_slice(&self.buffer);
-
         let flushed_bytes = self.buffer.len() as u64;
         let flushed_entries = self.buffered_entries;
 
@@ -3161,7 +3159,15 @@ impl RedoLog {
         // Build the header AFTER advancing so it carries the post-flush
         // high-water (next_sequence/checkpoint_seq/pointers).
         let header = self.build_header_buf();
-        self.buffer.clear();
+
+        // Swap the entries buffer OUT in O(1) instead of copying it into an
+        // aligned block under the lock (the copy + aligned-block allocation +
+        // any partial-block read-back now happen in `commit_flush`, OFF the
+        // lock). Replace with a fresh buffer that keeps the previous capacity so
+        // subsequent appends do not re-grow from zero (one cheap, untouched
+        // `with_capacity` allocation vs. a full memcpy under the mutex).
+        let cap = self.buffer.capacity();
+        let raw = std::mem::replace(&mut self.buffer, Vec::with_capacity(cap));
         self.entries_cache.append(&mut self.pending_entries);
         self.buffered_entries = 0;
 
@@ -3171,7 +3177,9 @@ impl RedoLog {
         }
 
         Ok(Some(PreparedFlush {
-            data: buf,
+            raw,
+            intra,
+            align,
             data_offset: aligned_offset,
             header,
             header_offset: self.log_offset,
@@ -3187,7 +3195,24 @@ impl RedoLog {
     /// caller afterwards) makes BOTH the entries and the (non-overlapping) header
     /// block durable, so no separate header fsync is needed.
     pub fn commit_flush(dev: &Arc<dyn BlockDevice>, prepared: &PreparedFlush) -> Result<()> {
-        dev.pwrite_all_at(&prepared.data, prepared.data_offset)?;
+        // Build the aligned entries block from the raw swapped-out buffer. This
+        // allocation + copy (and the rare partial-block read-back) runs OFF the
+        // log lock — the whole point of the prepare/commit split. Trailing bytes
+        // past the entries stay zero (the end-of-data sentinel).
+        let align = prepared.align;
+        let total = prepared.intra + prepared.raw.len();
+        let aligned_total = total.div_ceil(align) * align;
+        let mut buf = AlignedBuf::new(aligned_total, align);
+        if prepared.intra > 0 {
+            // F-G4-004: read back only the leading partial block (rare — only
+            // after an unaligned tail). Serialized with other flushers by the
+            // caller's flush guard, so this off-lock device read is race-free.
+            dev.pread_exact_at(&mut buf[..align], prepared.data_offset)?;
+            buf[prepared.intra..align].fill(0);
+        }
+        buf[prepared.intra..prepared.intra + prepared.raw.len()].copy_from_slice(&prepared.raw);
+
+        dev.pwrite_all_at(&buf, prepared.data_offset)?;
         dev.pwrite_all_at(&prepared.header, prepared.header_offset)?;
         Ok(())
     }
