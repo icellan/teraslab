@@ -108,6 +108,51 @@ them into multi-item SpendBatch RPCs (mirroring storeBatcher), + make the bench'
 spend workload block-realistic (a block's spends share a height). Validated by the
 native Rust client: batch-16 already yields ~9k spends/s (> reference 3342).
 
+## E4 — Server bottleneck localized: redo pwrite under the log mutex (2026-06-27)
+
+Direction = server write-concurrency (chosen). Using `create`'s sub-stage
+metrics (same redo+cache path as spend) under 60 concurrent writers:
+
+```
+create total : 24952 us   (n=28878)
+  redo       : 23909 us   ← 96% of the time
+  devwrite   :    47 us   ← cache write is fine
+  reserve    :     6 us
+```
+
+So the write serialization is **entirely the redo path** (not the cache, not the
+stripe locks — `lock_wait=0`). Mechanism: the single per-store redo-log mutex is
+held across `RedoLog::flush_pwrite_no_sync` — the O_DIRECT **pwrite** of the
+buffered entries. Lever 6b already moved the *fsync* (`sync_device`) outside the
+lock, but the **pwrite is still under it**. Under 60 concurrent committers, every
+`commit()` (which must take the same mutex to append) blocks behind whoever is
+mid-pwrite → ~24ms average. BATCH_SIZE=1 (no spend coalescing) shows the same
+33ms, confirming it is not the new spend batcher.
+
+**Fix (next, TDD): double-buffer the redo.** Under the log mutex, swap the full
+in-memory buffer out (replace with an empty one) and snapshot `write_pos` — O(1),
+µs. Release the lock. Do the O_DIRECT pwrite of the swapped-out buffer OUTSIDE the
+lock; committers only ever wait on the µs swap, never the pwrite. Must preserve:
+WAL ordering (entries pwritten in sequence order), the lever-6 LogFull/no-poison
+semantics, ring + linear layouts, and crash recovery (a swapped-but-not-yet-
+pwritten buffer is lost on crash — acceptable under buffered durability, same
+window as today; under strict the fsync still gates the ack). Verify with the
+redo + recovery test suites + a re-measure (expect redo time to collapse from
+~24ms toward the µs append cost, unblocking concurrent write throughput).
+
+Status: localized + committed; the double-buffer change is the teed-up next step
+(crash-critical — deserves its own TDD pass).
+
+**4-store cross-check (confirms E4 is per-log):** running 4 devices = 4
+independent redo logs/mutexes raised total throughput (7000→7835/s) and halved
+the spend tail (p99.9 286→132ms), but per-log `create_redo` stayed ~30ms. That
+is exactly what "pwrite held under the per-log mutex" predicts: sharding adds
+log capacity but each log still serializes its share of writers behind its own
+pwrite. So the double-buffer fix is per-log and composes with sharding
+(double-buffer removes the per-log stall; sharding multiplies the freed
+capacity). Confirms the fix target; not simple mutex contention nor the cache
+(devwrite 47µs) nor stripe locks (lock_wait 0).
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
