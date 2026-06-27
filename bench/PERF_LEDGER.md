@@ -141,3 +141,22 @@ not the datastore.
    cost worth profiling for the create metric.
 4. Reduce the Go adapter's ~12ms/op overhead (go-batcher channel hop + result
    round-trip); profile the adapter's per-op critical path.
+
+## E3 — Pool fix exposed a SERVER-side serialization (2026-06-27)
+
+After E1, the pool correctly grows to 60 connections (server `/admin/top`
+`connections: 60`). That 60-way client concurrency exposed the next wall:
+- server-side **spend latency jumped 16µs → ~32ms** under 60 concurrent writers,
+- while **server CPU is only ~0.75 of 8 cores** (NOT CPU-bound), and
+- **`lock_wait` (stripe locks) = 0** — so the block is NOT the per-txid locks.
+
+The server is *waiting*, not computing, under real write concurrency — a
+serialization not attributed to stripe locks. Prime suspects: the single
+per-store redo-log mutex held across the buffered `flush_pwrite_no_sync`
+O_DIRECT pwrite (~1.9ms/flush, 15 entries each), and/or writeback-cache
+backpressure as the dirty set grows. This is a **server-side concurrency fix**
+(redo/cache), which is outside the "optimize Go client/adapter" direction chosen
+for this loop — flagging for a direction check. Net: the client-side fixes (E1,
+E2) are correct and unblock concurrency, but the win now hinges on server-side
+write-concurrency, or on a representative open-loop benchmark + non-Docker
+network (the native Rust client already does 30k > reference 11k).
