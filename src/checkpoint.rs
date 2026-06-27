@@ -223,6 +223,17 @@ fn run_checkpoint_loop(
     // checkpoint to BLOCKING instead of spinning fuzzy snapshots that cannot
     // keep up. Reset once a checkpoint actually drains.
     let mut escalate_blocking = false;
+    // Fill-rate vs checkpoint-cost tracking (lever 6d): when the redo refills to
+    // high-water FASTER than a fuzzy (non-blocking) checkpoint takes to run, a
+    // fuzzy will be overtaken — the log fills to 100% mid-snapshot, writes stall
+    // for the rest of its duration, and it ends in `LogFull` and falls back to
+    // blocking anyway. Skip straight to a blocking (drain-reset) checkpoint in
+    // that case: a brief, bounded serving stall instead of a long one at a full
+    // log. `last_fuzzy_duration` is updated only after a fuzzy attempt, so a
+    // fast blocking reset does not reset the estimate; it relaxes back to fuzzy
+    // once the workload slows and the refill again outlasts a fuzzy.
+    let mut last_ckpt_completed: Option<std::time::Instant> = None;
+    let mut last_fuzzy_duration = Duration::ZERO;
 
     while !shutdown.load(Ordering::Relaxed) {
         // Adaptive poll: responsive while filling, lazy while idle. The
@@ -261,10 +272,16 @@ fn run_checkpoint_loop(
         }
 
         // FUZZY by default (non-blocking serving). BLOCKING when the log has
-        // crossed the emergency mark, or when the previous fuzzy attempt could
-        // not drain it — a brief serving stall to fully reclaim, far better
-        // than letting appends fail with `LogFull`.
-        let blocking = usage >= emergency_water || escalate_blocking;
+        // crossed the emergency mark, when the previous fuzzy attempt could not
+        // drain it, or when the log refills faster than a fuzzy checkpoint runs
+        // (it would be overtaken — see `last_fuzzy_duration`). A brief blocking
+        // stall to fully reclaim is far better than letting appends fail with
+        // `LogFull` for the duration of a doomed fuzzy snapshot.
+        let fuzzy_overtaken = fuzzy_would_be_overtaken(
+            last_ckpt_completed.map(|t| t.elapsed()),
+            last_fuzzy_duration,
+        );
+        let blocking = usage >= emergency_water || escalate_blocking || fuzzy_overtaken;
 
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_triggered_total.inc();
@@ -294,6 +311,13 @@ fn run_checkpoint_loop(
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_duration_ns
                 .record_ns(elapsed.as_nanos() as u64);
+        }
+        // Record how long a FUZZY checkpoint costs (only fuzzy attempts, so a
+        // fast blocking reset does not shrink the estimate) and when this
+        // checkpoint finished, for the next iteration's fill-rate comparison.
+        last_ckpt_completed = Some(std::time::Instant::now());
+        if !blocking {
+            last_fuzzy_duration = elapsed;
         }
 
         match outcome {
@@ -342,6 +366,26 @@ fn run_checkpoint_loop(
         }
     }
     tracing::info!("checkpoint task exiting");
+}
+
+/// Whether a fuzzy (non-blocking) checkpoint would be overtaken by the write
+/// load before it can reclaim — true when the redo refilled to the trigger
+/// threshold (`refill_since_last`) in less time than the last fuzzy checkpoint
+/// took to run (`last_fuzzy_duration`). In that regime the loop should run a
+/// blocking (drain-reset) checkpoint directly rather than start a doomed fuzzy
+/// that fills the log mid-snapshot and stalls writes for its whole duration.
+///
+/// Returns false with no history (`None`) or a zero estimate, so the first
+/// checkpoints are fuzzy until a real fuzzy duration is observed; it relaxes
+/// back to fuzzy once the workload slows and the refill again outlasts a fuzzy.
+fn fuzzy_would_be_overtaken(
+    refill_since_last: Option<Duration>,
+    last_fuzzy_duration: Duration,
+) -> bool {
+    match refill_since_last {
+        Some(refill) => last_fuzzy_duration > Duration::ZERO && refill < last_fuzzy_duration,
+        None => false,
+    }
 }
 
 /// Decide how the checkpoint task should react to a failed checkpoint.
@@ -734,6 +778,30 @@ mod tests {
             escalate,
             "past emergency, even an I/O fault escalates to blocking"
         );
+    }
+
+    /// Lever 6d: pick a blocking checkpoint when the log refills faster than a
+    /// fuzzy checkpoint runs (a fuzzy would be overtaken), but stay fuzzy under
+    /// light load and before any fuzzy duration is known.
+    #[test]
+    fn fuzzy_would_be_overtaken_only_under_fast_refill() {
+        // No history yet → fuzzy.
+        assert!(!fuzzy_would_be_overtaken(None, Duration::from_secs(2)));
+        // No measured fuzzy duration yet → fuzzy.
+        assert!(!fuzzy_would_be_overtaken(
+            Some(Duration::from_millis(100)),
+            Duration::ZERO
+        ));
+        // Refill (5s) slower than a fuzzy (2s) → light load → stay fuzzy.
+        assert!(!fuzzy_would_be_overtaken(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(2)
+        ));
+        // Refill (1s) faster than a fuzzy (2s) → write-heavy → go blocking.
+        assert!(fuzzy_would_be_overtaken(
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(2)
+        ));
     }
 
     fn make_engine_and_redo() -> (Arc<Engine>, Arc<Mutex<RedoLog>>, tempfile::TempDir) {
