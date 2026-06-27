@@ -1,0 +1,42 @@
+# Matched-durability TeraSlab config for the head-to-head against the reference
+# datastore. The reference (as Teranode runs it) uses asynchronous/buffered
+# durability (no commit-to-device; post-write-cache + background flush). The
+# fair TeraSlab match is therefore BUFFERED redo durability + a write-back cache,
+# NOT strict fsync-per-batch. See bench/METHODOLOGY.md "Durability match".
+#
+# IMPORTANT: redo_buffered and all other scalar keys are top-level and MUST come
+# BEFORE any [section] table, or TOML folds them into the preceding section.
+node_id = 0
+listen_addr = "0.0.0.0:3300"
+http_listen_addr = "0.0.0.0:9100"
+seed_nodes = []
+replication_factor = 1
+
+device_paths = ["/data/d0.dat"]
+device_size = 4294967296          # 4 GiB, matches the reference filesize 4G
+device_alignment = 4096
+redo_log_size = 67108864
+index_snapshot_path = "/data/index.snap"
+expected_records = 2000000
+lock_stripes = 65536
+max_batch_size = 8192
+max_connections = 1024
+block_height_retention = 288
+
+# Async durability to match the reference's no-commit-to-device posture.
+redo_buffered = true
+redo_flush_interval_ms = 50
+
+strict_auth = false
+enable_remote_bind = true
+enable_admin_endpoints = true     # /metrics /debug/* needed for profiling
+admin_token = "bench-local-admin-token-0001"  # ≥16B; local bench only
+
+[index]
+backend = "memory"
+
+[cache]
+bytes = 4294967296                # 4 GiB cache (covers the 4 GiB device), parity
+                                  # with the reference's RAM-resident dataset
+writeback = true
+writeback_interval_ms = 50

@@ -1,0 +1,47 @@
+{
+  "backend": "aerospike",
+  "workers": 128,
+  "measure_seconds": 20.0000425,
+  "results": [
+    {
+      "op": "create",
+      "ok_total": 113626,
+      "failed_total": 0,
+      "latency_samples": 90813,
+      "ops_sec": 4540.640351139254,
+      "p50_us": 12471,
+      "p99_us": 19508,
+      "p999_us": 24767
+    },
+    {
+      "op": "spend",
+      "ok_total": 85199,
+      "failed_total": 0,
+      "latency_samples": 68541,
+      "ops_sec": 3427.042717534225,
+      "p50_us": 12189,
+      "p99_us": 18813,
+      "p999_us": 26089
+    },
+    {
+      "op": "get",
+      "ok_total": 56943,
+      "failed_total": 0,
+      "latency_samples": 45751,
+      "ops_sec": 2287.54513896658,
+      "p50_us": 11912,
+      "p99_us": 16816,
+      "p999_us": 24535
+    },
+    {
+      "op": "setmined",
+      "ok_total": 28369,
+      "failed_total": 0,
+      "latency_samples": 22788,
+      "ops_sec": 1139.397578780145,
+      "p50_us": 465,
+      "p99_us": 2100,
+      "p999_us": 7523
+    }
+  ]
+}
