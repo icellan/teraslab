@@ -2222,10 +2222,55 @@ impl RedoLog {
         Ok(())
     }
 
+    /// Bytes at the tail of the entries region reserved exclusively for the
+    /// checkpoint's reclaim markers ([`Self::mark_recovery_progress`] /
+    /// [`Self::mark_checkpoint`]).
+    ///
+    /// Ordinary appends stop at `entries_region_size - reserve` and return
+    /// [`RedoError::LogFull`]; the reclaim markers ([`Self::append_reclaim_marker`])
+    /// may use the full region. Without this a 100%-full redo DEADLOCKS: the only
+    /// way to free space is to write a fence marker, but a full log rejects it,
+    /// so the checkpoint can never reclaim (lever 6c). Two alignment blocks
+    /// comfortably cover one small marker entry plus its aligned flush rounding.
+    ///
+    /// The reserve only activates once the region is large enough that it is a
+    /// negligible fraction; tiny logs (only ever used in tests, which drive the
+    /// reclaim markers explicitly via the bypassing path) keep their full
+    /// capacity so a single block is not swallowed whole.
+    fn fence_reserve_bytes(&self) -> u64 {
+        let align = self.device.alignment() as u64;
+        let region = self.entries_region_size();
+        if region >= 64 * align { 2 * align } else { 0 }
+    }
+
+    /// Usable capacity for ordinary appends: the entries region minus the
+    /// checkpoint-fence reserve (see [`Self::fence_reserve_bytes`]).
+    fn append_capacity(&self) -> u64 {
+        self.entries_region_size()
+            .saturating_sub(self.fence_reserve_bytes())
+    }
+
     /// Append an operation to the buffer (not yet durable).
     ///
-    /// Returns the assigned sequence number.
+    /// Returns the assigned sequence number. Ordinary appends are bounded by
+    /// [`Self::append_capacity`] (the region minus the checkpoint-fence reserve);
+    /// the checkpoint's reclaim markers use [`Self::append_reclaim_marker`] to
+    /// reach the full region.
     pub fn append(&mut self, op: RedoOp) -> Result<u64> {
+        let cap = self.append_capacity();
+        self.append_with_capacity(op, cap)
+    }
+
+    /// Append a checkpoint reclaim marker, bypassing the fence reserve so it can
+    /// always be written even when ordinary appends see the log as full —
+    /// otherwise reclaim could never free a full log (lever 6c).
+    fn append_reclaim_marker(&mut self, op: RedoOp) -> Result<u64> {
+        let cap = self.entries_region_size();
+        self.append_with_capacity(op, cap)
+    }
+
+    /// Shared append body: buffer `op` if it fits within `entries_capacity`.
+    fn append_with_capacity(&mut self, op: RedoOp, entries_capacity: u64) -> Result<u64> {
         // F-G4-002: refuse to append on a poisoned log.
         if self.poisoned {
             return Err(RedoError::Poisoned);
@@ -2241,7 +2286,6 @@ impl RedoLog {
         let mut entry = RedoEntry { sequence: 0, op };
         let bytes = entry.serialize();
 
-        let entries_capacity = self.entries_region_size();
         if self.write_pos + self.buffer.len() as u64 + bytes.len() as u64 > entries_capacity {
             return Err(RedoError::LogFull {
                 used: self.write_pos + self.buffer.len() as u64,
@@ -2320,7 +2364,7 @@ impl RedoLog {
             };
             total += entry.serialize().len() as u64;
         }
-        let entries_capacity = self.entries_region_size();
+        let entries_capacity = self.append_capacity();
         let used = self.write_pos + self.buffer.len() as u64;
         if used + total > entries_capacity {
             return Err(RedoError::LogFull {
@@ -2561,7 +2605,7 @@ impl RedoLog {
     /// space; callers that have durably snapshotted all state must call
     /// [`RedoLog::reset`] after this marker to make earlier bytes reusable.
     pub fn mark_checkpoint(&mut self) -> Result<()> {
-        let seq = self.append(RedoOp::Checkpoint)?;
+        let seq = self.append_reclaim_marker(RedoOp::Checkpoint)?;
         self.flush()?;
         self.checkpoint_seq = seq;
         // F-G4-001: persist the updated checkpoint_seq in the header.
@@ -2575,7 +2619,7 @@ impl RedoLog {
     /// not reclaim bytes; it only bounds repeated recovery work if the
     /// process crashes again before the next checkpoint can reset the log.
     pub fn mark_recovery_progress(&mut self, through_sequence: u64) -> Result<()> {
-        self.append(RedoOp::RecoveryProgress { through_sequence })?;
+        self.append_reclaim_marker(RedoOp::RecoveryProgress { through_sequence })?;
         self.flush()
     }
 
@@ -3655,6 +3699,54 @@ mod tests {
         let fresh = RedoLog::open(dev.clone(), 0, 16 * 1024).unwrap();
         let entries = fresh.recover().unwrap();
         assert_eq!(entries.len(), 2, "only the fitting batch is durable");
+    }
+
+    #[test]
+    fn checkpoint_fence_fits_when_full_for_normal_appends() {
+        // Lever 6c: a redo log that is full for ORDINARY appends must still
+        // accept the checkpoint's reclaim fence — otherwise reclaim can never
+        // free space and writes livelock (the bug the packed+lock-free-fsync
+        // bench exposed: "checkpoint failed: redo checkpoint fence: redo log
+        // full"). A small tail reserve, usable only by the reclaim markers,
+        // breaks the deadlock. Use a >= threshold log so the reserve is active.
+        let (_dev, mut log) = make_log(2 * 1024 * 1024);
+        let mut last_seq = 0u64;
+        loop {
+            match log.append(RedoOp::Freeze {
+                tx_key: test_key(1),
+                offset: 0,
+            }) {
+                Ok(s) => last_seq = s,
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        log.flush().expect("flush the filled entries");
+
+        // Ordinary append is still refused (the log is full for normal writes)…
+        assert!(
+            matches!(
+                log.append(RedoOp::Freeze {
+                    tx_key: test_key(2),
+                    offset: 0,
+                }),
+                Err(RedoError::LogFull { .. })
+            ),
+            "ordinary append must still see the log as full"
+        );
+        // …but the checkpoint's reclaim fence has reserved room and succeeds, so
+        // the checkpoint can fence + reclaim and free the log.
+        log.mark_recovery_progress(last_seq)
+            .expect("reclaim fence must fit in the reserve even when full for normal appends");
+        // And once a checkpoint resets the log, ordinary appends resume.
+        log.mark_checkpoint()
+            .expect("checkpoint marker fits in the reserve");
+        log.reset().expect("reclaim");
+        log.append(RedoOp::Freeze {
+            tx_key: test_key(3),
+            offset: 0,
+        })
+        .expect("ordinary appends resume after reclaim");
     }
 
     #[test]
