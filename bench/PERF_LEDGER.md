@@ -81,6 +81,33 @@ Teranode tree, not this repo), not by the server. Next: confirm reference-adapte
 spend batching parity, then optimize the adapter (pool default + spend batching +
 batcher tuning) to realize the datastore's advantage on the production path.
 
+## P2 — Profiling (2026-06-27): latency-bound, RPC-batching is the lever
+
+Go client/adapter profiled with block/mutex/CPU profiles + per-op math:
+
+- **Both ends idle.** Client (Go loadgen) ~18% CPU; server ~0.5/8 cores. Mutex
+  contention negligible (343ms total). Not CPU- or lock-bound.
+- **Latency-bound on ~7ms Docker-network RTT.** Throughput ≈ in-flight ÷ RTT.
+  Aggregate ops/s: reference **11.1k**, Go adapter **5.9k**, TeraSlab native Rust
+  client **8.8k** (batch 1) / **30k** (batch 16). Batching amortizes the RTT —
+  the dominant lever.
+- **TeraSlab Go adapter batches create & get but NOT spend** (5399 spend RPCs for
+  5399 spends = 1 item/RPC). Create/get use go-batcher (concurrent dispatch,
+  unbounded goroutines — verified, not serial). The create/get batchers work.
+- **Two distinct gaps:** (a) spend has no adapter batching → 1 RPC/spend, so spend
+  throughput = concurrency÷RTT, not the server's 16µs capability; (b) server-side
+  create is 1.2ms each (vs spend 16µs) — a real server cost for the create path.
+- Spend batching is constrained by `current_block_height`: a SpendBatch RPC takes
+  ONE params, so only spends sharing a height coalesce. Production (block
+  validation) shares one height per block — so batching IS the production pattern;
+  the loadgen's per-spend height increment must mirror that to benefit.
+
+**Plan (chosen direction = optimize Go client/adapter):** add a spend batcher to
+the teraslab adapter that groups concurrent Spend() calls by params and coalesces
+them into multi-item SpendBatch RPCs (mirroring storeBatcher), + make the bench's
+spend workload block-realistic (a block's spends share a height). Validated by the
+native Rust client: batch-16 already yields ~9k spends/s (> reference 3342).
+
 ## Entries
 
 | # | date | host | op | metric | TS | REF | delta | hypothesis | change (SHA) | re-measure |
