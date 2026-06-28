@@ -76,13 +76,16 @@ conn-per-request over a sharded pool.**
   reference (40.7k links/s).** Both have idle cores → cap = client
   coordination+allocation, not compute.
 
-**NEXT (mostly local code; box only to measure) — see RECIPE_CHAIN_FINDINGS.md
-§NEXT hypotheses:** (1) cut client allocations (pool wire-frame buffers + batcher
-items; mallocgc 25%); (2) de-funnel the adapter go-batcher (one channel+worker
-per op-type → M lanes / lock-free accumulate); (3) if needed, adopt the reference
-transport model (synchronous conn-per-command over the sharded pool → far fewer
-goroutines, kills scheduler thrash — see REFERENCE_CLIENT_ANALYSIS.md). Then
-re-run chain h2h fresh-per-round, strict 4/4.
+**NEXT — DECISIVE lever (cum profile reprioritized this):** the client CPU is
+dominated by SHARED harness tx-build (`makeSpendTx`) + GC-assist, which both
+backends pay equally — so cutting allocs / de-funneling won't close the gap (pool
+sharding already = 0). The differentiator is TeraSlab's transport runs far more
+goroutines/coordination (per-conn readLoop ×N + go-batcher workers +
+done-channel+pending-map per request). **Redesign the teraslab Go client transport
+to synchronous conn-per-command over the sharded bounded pool** (drop
+readLoop-per-conn / pending-map / per-request channel → goroutines collapse toward
+just the callers; keep adapter coalescing). See RECIPE_CHAIN_FINDINGS.md §NEXT +
+REFERENCE_CLIENT_ANALYSIS.md. Then re-run chain h2h fresh-per-round, strict 4/4.
 
 **EC2: torn down after this round** (measurements captured). Re-provision via the
 recipe above for the next measure. Server writeback fix + client coalescing/

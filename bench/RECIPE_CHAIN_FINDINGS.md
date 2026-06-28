@@ -212,20 +212,37 @@ this central coordination/alloc (sharded conn-per-command, fewer goroutines).
 Still ~3.4× behind the reference (40.7k links/s). Both client & server now have
 idle cores → the cap is client coordination+allocation, not compute.**
 
-### NEXT hypotheses (local work; measure on a fresh box)
-1. **Cut client allocations (mallocgc 25%)**: reuse/pool the wire frame buffers
-   and batcher item structs in the teraslab client + adapter hot path; avoid
-   per-request allocations. (sha256/tx-build is shared with the reference, leave
-   it.)
-2. **De-funnel the adapter go-batcher**: it is one channel + one worker goroutine
-   per op-type (selectgo/lock contention). Shard it into M lanes, or replace with
-   a lock-free per-shard accumulator, so 10k callers don't serialize on one
-   channel+worker.
-3. **If 1+2 don't close it, adopt the reference transport model**: synchronous
-   conn-per-command over the (now sharded) bounded pool — far fewer goroutines
-   (no readLoop-per-conn, no done-channel-per-request), which kills the scheduler
-   thrash. Biggest change, highest potential.
-Then re-run the chain h2h fresh-per-round and apply strict 4/4.
+### NEXT hypotheses — REPRIORITIZED after the cumulative profile
+
+The cum profile (`client-pprof-cum-allfixes.txt`) shows client CPU is dominated by
+`runRecipe.func6` (chain worker, 53%) → **`makeSpendTx` 12% (sha256 9.7%)** plus
+**`mallocgc` 25.9% with `gcAssistAlloc` 17.9%** (allocation rate so high that
+goroutines are forced into GC assist). KEY: `makeSpendTx` is the HARNESS's
+tx-builder and `runRecipe` is backend-agnostic — **BOTH backends pay it equally**,
+and the reference still hits 40.7k on the same harness. So:
+
+- **Pool conn-sharding already gave ~0** ("remove central contention" #1 = no win).
+- **Cutting `makeSpendTx`/alloc speeds up BOTH equally → won't close the gap.**
+- The differentiator is that TeraSlab's transport runs FAR more goroutines +
+  coordination than the reference (per-conn readLoop goroutine ×256, go-batcher
+  worker goroutines, a done-channel + pending-map entry per request) → more
+  scheduler churn + GC roots/assist for the SAME useful work.
+
+**DECISIVE lever (do this, skip #1/#2 as profile-predicted-low):** redesign the
+teraslab Go client transport toward the reference model — **synchronous
+conn-per-command over the sharded bounded pool**: each request checks out a conn,
+writes, reads its OWN response on the same goroutine, returns the conn. Removes
+the per-conn readLoop goroutine, the pending sync.Map, and the
+done-channel-per-request — collapsing goroutine count from ~(callers + conns +
+batcher-workers) toward just the callers, which is what lets the reference sustain
+high throughput over few connections (see REFERENCE_CLIENT_ANALYSIS.md). Keep the
+adapter coalescing (batches still go out). This is a focused but non-trivial
+client rewrite — do it as its own measured step, then re-run the chain h2h
+fresh-per-round and apply strict 4/4.
+
+(Secondary, only if the rewrite doesn't fully close it: profile the REFERENCE
+run's client CPU for a like-for-like transport comparison to confirm where its
+remaining advantage is.)
 
 ### (done) coalesce SetLocked + BatchDecorate in the adapter
 
