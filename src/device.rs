@@ -1026,6 +1026,33 @@ impl DirectDevice {
             let existing = file.metadata()?.len();
             if existing < size {
                 file.set_len(size)?;
+                // Pre-allocate the backing blocks. `set_len` (ftruncate) leaves a
+                // SPARSE file, so every O_DIRECT write to a not-yet-written region
+                // triggers synchronous ext4 block allocation (ext4_mb_new_blocks +
+                // block-bitmap reads) inside the write syscall — profiled as the
+                // dominant on-CPU cost of the write-back flush path under load, and
+                // a source of write-latency that backs the cache up and stalls the
+                // serving threads. fallocate reserves the extents up front so the
+                // hot-path writes are pure data writes. Best-effort: filesystems
+                // that lack fallocate (or anything that returns an error here) just
+                // keep the sparse file — correctness is unchanged either way.
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = file.as_raw_fd();
+                    // Safety: fd is a valid, open, writable regular file; fallocate
+                    // reads/writes no user memory and only reserves blocks in
+                    // [0, size). mode 0 = allocate (no FALLOC_FL_* flags).
+                    let rc = unsafe { libc::fallocate(fd, 0, 0, size as libc::off_t) };
+                    if rc != 0 {
+                        let e = std::io::Error::last_os_error();
+                        tracing::warn!(
+                            err = %e,
+                            size,
+                            "fallocate failed; using sparse file (O_DIRECT writes may pay ext4 block-allocation cost on first touch)"
+                        );
+                    }
+                }
                 size
             } else {
                 existing
