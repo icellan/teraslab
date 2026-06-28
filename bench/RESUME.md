@@ -6,22 +6,41 @@
 worktree `.worktrees/device-cache`. Constraint: never name the reference product
 in-repo (`git grep -i` stays empty — verified); call it "the reference datastore".
 
-## CURRENT STATE (2026-06-28)
+## CURRENT STATE (2026-06-28, updated PM) — REALISTIC WORKLOAD: TeraSlab LOSES ~4-5×
 
-**WON the un-batched head-to-head (strict 4/4), committed + reproducible.** On a
-quiet 24-core EC2 NVMe host TeraSlab beats the reference on EVERY priority op,
-throughput AND p99.9, 0 failures (10 interleaved fresh-per-round; FINAL_REPORT.md,
-raw in bench/results/20260628-ec2-quiet-cert/):
-spend 15,012 vs 13,303/s (+12.9%), p99.9 15.6 vs 22.6ms; create +12.9%; get +13%;
-setmined +13% / p99.9 1.2 vs 4.4ms. The decisive fix was **per-store dispatch
-sharding** (51bb8b2) breaking the global DispatchPool funnel (~40-48k cap, CPU 30%
-idle).
+**⚠ The un-batched 4/4 "win" (FINAL_REPORT.md) is SUPERSEDED.** On the realistic
+chain workload (the one the real node runs) TeraSlab loses badly. Full diagnosis:
+**`bench/RECIPE_CHAIN_FINDINGS.md`** (read this first). Raw:
+`bench/results/20260628-recipe-chain/`.
 
-**THE OPEN GAP (what the Stop hook wants):** that win is on the harness's
-**un-batched** workload (~50k, concurrency/latency-bound — both backends hit it, so
-it under-tests capacity). The goal also wants the **batched / production-churn
-(realistic recipe)** workload. That head-to-head has NOT been run. Everything for it
-is built; only the NVMe run remains (a cost decision the user is steering).
+- Rebuilt the head-to-head on the real **`bitcoin-sv/teranode-coinbase` txblaster2**
+  chain model (N goroutine chains, Create-LOCKED→Spend→unlock→decorate, wait per op,
+  advance; SetMined burst + prune overlays). 0 failures both backends. Harness:
+  teranode-bench-wt `cmd/utxobench/bench_test.go` RECIPE=1 (committed b0162e2a0).
+- **Result (10k chains, i3en.6xlarge, NVMe, async):** TeraSlab ~9.4k links/s,
+  create p99 4,600ms · Reference ~40.7k links/s, p99 130ms. **~4-5× slower.**
+- **Root cause: NOT hardware.** Server is CPU-IDLE under load (<1 of 24 cores, all
+  dispatch threads ~0%) → starved/latency-bound. The limiter is the
+  request/connection-parallelism path: the Go client (client/go/pool.go) opens
+  one-conn-per-concurrent-caller (231 conns at pool_size=64), storms past the
+  server per-IP cap (1024) at higher pools → failures, and underuses the server's
+  pipelined dispatch pool (192 workers, pipeline_depth=16).
+- **Levers tested:** raising conn caps + pool_size→512-1024 fixed the TAIL
+  (p99 4600→450ms, p50 128→50ms, srvCPU→1.8 cores) but throughput stayed ~7.5k +
+  introduced ~2k dial-storm failures. TCP_NODELAY on client (committed abc092b,
+  correct but not dominant). redo/writeback interval + batch window = minor.
+
+**FIX PLAN (next, see RECIPE_CHAIN_FINDINGS.md §fix):** (1) client pipelining model —
+drive many in-flight requests PER connection (not one conn per caller), bound total
+conns under the cap; (2) coalesce SetLocked+Delete in the adapter like the spend
+batcher (Teranode always batches, size + 2-5ms window); (3) kill dial-storm
+failures (pre-warm pool); (4) re-profile server once actually fed; (5) re-run
+chain h2h fresh-per-round, apply strict 4/4.
+
+**EC2:** spot i-0c5a37ca745bdaac5 (us-east-1) UP, 6h self-terminate backstop;
+off-limits core-m-demo i-0dd1b439a6b470c4f untouched. Runners: /tmp/ts_run.sh
+(TS-only sweep), /tmp/h2h_recipe.sh (interleaved h2h). Key files on box:
+/home/ec2-user/{teraslab,harness,utxobench.test}, configs ts-bigconn.toml.
 
 ## ⚠ UNCOMMITTED WORK — survives only if noted (lives OUTSIDE this repo)
 
