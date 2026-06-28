@@ -10,26 +10,38 @@ throughput + p99.9 at minimum) under a **fair matched config**, proven by
 reproducible numbers. Constraint: never name/import the reference product anywhere
 in this repo — call it "the reference datastore" (grep confirms zero refs).
 
-**Current (2026-06-28, after E13-E19): TeraSlab WINS throughput + p99; misses ONLY
-spend p99.9 (a macOS-Docker host artifact). Read PERF_LEDGER.md E18-E19 — latest.**
-On the FAIR matched config (device_split=4, redo 256MB/store ≈1GiB total ≈ ref's
-1024M cache, ring, buffered, flush 50ms), quiet host, 5-6 interleaved rounds @
-IF=512, **0 failed both sides**:
-- Spend throughput **TS +8.3%** (margin ~23σ), total **+8.2%**, every op **+8%**,
-  spend **p99 wins** (19.4 vs 20.1ms, tighter), setMined p99.9 wins (24 vs 200ms).
-- Spend **p99.9: TS ~28-29 vs ref ~24-26ms = +13% — the LONE strict-criterion miss.**
-  Pinned (E19) to a **macOS-Docker O_DIRECT redo-flush fsync that freezes the VM's
-  virtualized I/O ~100ms** (it stalls read-only GET too — not a write-path/logic
-  flaw). NOT closable by flush cadence (tested 1000/50/20ms). On Linux/NVMe (the
-  real Teranode target) O_DIRECT fsync is ~0.1ms with no VM freeze → TS p99.9 →
-  ~p99 (~19ms) ≤ ref → strict 4/4 passes. Do NOT bound/abandon O_DIRECT to chase
-  the macOS tail (core to the 10-50× SSD-wear goal; the freeze hits reads too).
-- The arc: E13 fsync-coalescing → E14 secondary sharding → E15 redo ring (kills the
-  ~10s checkpoint freeze) → E16 device_split=4 (lock-domain cap) → E17 ring-encode
-  + index-probe → E18 Arc-ify RedoOp::Create.record_bytes (per-create clone = O(1)).
-  All committed; `cargo test --all` 2965/0.
-- **TO CERTIFY THE STRICT 4/4: re-run this exact suite on a Linux/bare-metal NVMe
-  host (load<1/core).** Everything except the host-artifact p99.9 already passes.
+**Current (2026-06-28, after E13-E20): PRIMARY condition WON on this host. Read
+PERF_LEDGER.md E20 — latest (it SUPERSEDES the E18-E19 "needs Linux" conclusion,
+which was WRONG).** E20's buffered/async redo (commit f522556, config
+`redo_buffered_io=true`) closed the spend p99.9 on macOS-Docker itself.
+FAIR config (device_split=4, redo 256MB/store ≈1GiB total ≈ ref 1024M cache, ring,
+buffered, redo_buffered_io=true, flush 50ms), disk, IF=512, 8 interleaved rounds,
+**0 failed both sides**:
+- **PRIMARY PASS: spend throughput TS 14,184 vs ref 13,114 = +8.2%** (margin >2σ)
+  **AND spend p99.9 TS 24.95ms ≤ ref 25.39ms** (the fsync-freeze tail is gone —
+  buffered redo, no per-flush fsync; durability via the checkpoint barrier).
+- Also wins: spend p99 (18 vs 20ms), total +8.1%, every op ops/s +8%, get p99.9
+  (22.6 vs 23.9), setMined p99.9 (12.3 vs 200.7). 0 failed.
+- **LONE strict-4/4 miss = the create-p99.9 GUARDRAIL: TS 29.3 vs ref 26.1ms =
+  +12.3% (>10%).** It is NOT the cache preload (REFUTED — create writes are already
+  whole-block; a no-preload fix = dead code, don't build it). NOT disk-specific
+  (+6% on tmpfs too, WITHIN guardrail). It's create-path WORK (heaviest op + the
+  bench creates at height=1 so each create also does the sharded unmined-index
+  insert + its redo intent — work spend lacks) + the shared ~25ms VM/scheduler
+  floor + noise. BORDERLINE/possibly within-noise (+12% disk vs +6% tmpfs spans
+  the ref's create-p99.9 variance).
+- Arc: E13 fsync-coalesce → E14 secondary shard → E15 redo ring → E16 device_split
+  → E17 ring-encode+index-probe → E18 Arc record_bytes → E20 buffered/async redo.
+  All committed (…5d3757a, f522556). cargo test --all 2497-2965 pass + 1 known
+  load-flake (see below).
+- **REMAINING for strict 4/4 (see E20 for detail):** (1) settle create-p99.9 with a
+  10-round run + STDEVs — if within ~2σ of ref → guardrail satisfied within
+  precision → 4/4; if real >10% → drop/coalesce the per-create unmined redo intent
+  (unmined is rebuilt from primary metadata on recovery). (2) De-flake
+  `redo_group::tests::concurrent_commits_coalesce_and_get_distinct_ranges`
+  (load-flaky, passes isolated; make the coalescing assertion deterministic via the
+  BlockingSyncDev pattern — NOT masking) so `cargo test --all` is reliably green.
+  (3) FINAL_REPORT.md + final green gate + grep-clean.
 
 ## The arc (why we are where we are)
 1. **B0**: baseline lost ~5× (closed-loop bench, masked the real issues).
