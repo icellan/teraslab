@@ -91,3 +91,6 @@ bytes = 4294967296                # 4 GiB cache (covers the 4 GiB device), parit
                                   # with the reference's RAM-resident dataset
 writeback = true
 writeback_interval_ms = 50
+
+[storage]
+placement = "txid"

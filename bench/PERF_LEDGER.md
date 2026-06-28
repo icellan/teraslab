@@ -957,3 +957,33 @@ index removes); the ~48k cap is the off-CPU dispatch funnel.
 NEXT to settle/win: (1) quiet-host head-to-head (fresh spot Linux box, BOTH
 backends) — likely shows TS wins p99.9 too. (2) dispatch-sharding refactor
 (txid-last-byte per-store routing) for tail robustness + 10M scaling.
+
+## E23 — Dispatch sharding (Phase 1+2) VALIDATED: +13% throughput, create p99.9 199→38ms (2026-06-28)
+
+Implemented per-store dispatch sharding (txid-last-byte routing):
+- **Phase 1** (68c120f): deterministic txid→store placement, opt-in `[storage]
+  placement="txid"` (default round_robin). Read path unchanged (index authoritative).
+- **Phase 2** (51bb8b2): split the single `DispatchPool` Mutex+Condvar queue into
+  per-store shards routed by `hash(txid[24..32]) % num_stores`. Routing is a HINT
+  (engine resolves the real store via index/placer → a mis-route can't corrupt).
+  Recovery/replication bypass the pool (auth ops serial). 2993+ tests + clippy + fmt
+  + client all green.
+
+A/B (macOS Docker, fair async config, TS saturation IF=512, back-to-back, load ~5):
+| metric | OLD (single queue, round-robin, 1020125) | NEW (sharded, txid, 51bb8b2) | Δ |
+|---|---|---|---|
+| total ops/s | 41,648 | **47,201** | **+13.3%** |
+| create | 16643 (p999 **199.0ms**) | 18868 (p999 **38.5ms**) | +13%, tail 5.2× |
+| spend | 12489 (39.9ms) | 14142 (38.0ms) | +13% |
+| get | 8334 (35.9ms) | 9453 (28.0ms) | +13% |
+| setmined | 4181 (22.7ms) | 4738 (13.4ms) | +13% |
+
+Single queue caused head-of-line blocking → 199ms create tail; per-store sharding
+removed it (→38ms) AND lifted throughput +13%. On **8 SHARED cores** (loadgen
+co-resident) this is MUTED; on the 24-core EC2 box the funnel left 70% CPU idle, so
+the gain there will be larger. VALIDATED (helps, no regressions). Bench configs now
+`placement="txid"` (code default stays round_robin for resharding safety).
+
+NEXT for strict cert: quiet multi-core host head-to-head (NEW vs reference) — macOS
+noise (load ~5) still inflates TS p99.9 vs the reference; the tail benefit needs idle
+cores to fully show. EC2 24-core is the venue.

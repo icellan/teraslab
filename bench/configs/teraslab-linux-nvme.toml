@@ -56,3 +56,6 @@ admin_token = "bench-local-admin-token-0001"
 # used separately for the throughput-ceiling run.)
 [index]
 backend = "memory"
+
+[storage]
+placement = "txid"
