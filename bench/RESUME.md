@@ -10,28 +10,26 @@ throughput + p99.9 at minimum) under a **fair matched config**, proven by
 reproducible numbers. Constraint: never name/import the reference product anywhere
 in this repo — call it "the reference datastore" (grep confirms zero refs).
 
-**Current (2026-06-28, after E13-E17): NOT won. Read PERF_LEDGER.md E17 — latest.**
-TeraSlab went from ~20% → competitive-in-isolation (~44k ops/s isolated vs the
-reference ~51k). Every architecture/config lever is RESOLVED:
-- E13 fsync coalescing (3×), E14 secondary-index sharding (create_index 9-22ms→3.6ms),
-  E15 redo segment-ring (kills the ~10s checkpoint freeze), E16 `device_split=4`
-  (breaks the per-store lock-domain cap, ~33k→~44k, CPU 210%→420%).
-- **THE REMAINING GAP IS CPU EFFICIENCY** (reference ~51µs CPU/op vs TeraSlab
-  ~95-157µs). E17 began the CPU pass via the server's pprof flamegraph (encode
-  ~30%, index lookups ~32%): **two fixes committed** — redo ring-encode reuse
-  (stop discarding the pre-encoded body + re-serializing in ring mode) + index
-  single-probe (fuse the create lookup+insert). A/B: **MIN CPU-µs/op −11.8%**
-  (median/throughput noise-dominated). cargo test --all 2962/0.
-- **Why it can't be finished/certified HERE:** at IF=256 the server has IDLE CPU,
-  so per-op CPU cuts don't raise throughput (only convert to throughput when
-  CPU-bound = high device_split + spare cores); and this box has an EXTERNAL
-  `perl` job eating ~2 cores so throughput + steady-state CPU/op are noise-swamped.
-  Remaining CPU targets (documented, harder): the `engine.rs:933` redo-op clone
-  (needs Arc-ifying RedoOp's record — replication keeps its own copy), the ~19%
-  background writeback, the 16% inherent hash-probe. **Next session: re-run on a
-  QUIET host (load<1/core, `--cpuset-cpus`) to certify the CPU-fix throughput
-  payoff + scale device_split into the spare cores (reference appears to cap
-  ~51k); continue the CPU pass from a fresh flamegraph.**
+**Current (2026-06-28, after E13-E19): TeraSlab WINS throughput + p99; misses ONLY
+spend p99.9 (a macOS-Docker host artifact). Read PERF_LEDGER.md E18-E19 — latest.**
+On the FAIR matched config (device_split=4, redo 256MB/store ≈1GiB total ≈ ref's
+1024M cache, ring, buffered, flush 50ms), quiet host, 5-6 interleaved rounds @
+IF=512, **0 failed both sides**:
+- Spend throughput **TS +8.3%** (margin ~23σ), total **+8.2%**, every op **+8%**,
+  spend **p99 wins** (19.4 vs 20.1ms, tighter), setMined p99.9 wins (24 vs 200ms).
+- Spend **p99.9: TS ~28-29 vs ref ~24-26ms = +13% — the LONE strict-criterion miss.**
+  Pinned (E19) to a **macOS-Docker O_DIRECT redo-flush fsync that freezes the VM's
+  virtualized I/O ~100ms** (it stalls read-only GET too — not a write-path/logic
+  flaw). NOT closable by flush cadence (tested 1000/50/20ms). On Linux/NVMe (the
+  real Teranode target) O_DIRECT fsync is ~0.1ms with no VM freeze → TS p99.9 →
+  ~p99 (~19ms) ≤ ref → strict 4/4 passes. Do NOT bound/abandon O_DIRECT to chase
+  the macOS tail (core to the 10-50× SSD-wear goal; the freeze hits reads too).
+- The arc: E13 fsync-coalescing → E14 secondary sharding → E15 redo ring (kills the
+  ~10s checkpoint freeze) → E16 device_split=4 (lock-domain cap) → E17 ring-encode
+  + index-probe → E18 Arc-ify RedoOp::Create.record_bytes (per-create clone = O(1)).
+  All committed; `cargo test --all` 2965/0.
+- **TO CERTIFY THE STRICT 4/4: re-run this exact suite on a Linux/bare-metal NVMe
+  host (load<1/core).** Everything except the host-artifact p99.9 already passes.
 
 ## The arc (why we are where we are)
 1. **B0**: baseline lost ~5× (closed-loop bench, masked the real issues).
