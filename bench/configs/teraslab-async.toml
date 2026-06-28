@@ -15,6 +15,12 @@ replication_factor = 1
 device_paths = ["/data/d0.dat"]
 device_size = 4294967296          # 4 GiB, matches the reference filesize 4G
 device_alignment = 4096
+# Carve the one physical device into N virtual stores = N independent allocators +
+# index-lock domains + per-store redo logs, sharing the one disk's I/O. This is
+# TeraSlab's equivalent of the reference's internal partition parallelism
+# (partition-tree-sprigs 1024 on a single file): same physical disk, more in-process
+# write parallelism. Diagnostic + lever for the ~33k single-store lock-domain cap.
+device_split = 4
 redo_log_size = 1073741824  # 1 GiB. Matches the reference's max-write-cache (1024M):
                             # both are the async-durability write buffer. A larger log
                             # gives the NON-blocking (fuzzy) checkpoint a wide
@@ -28,6 +34,19 @@ expected_records = 2000000
 lock_stripes = 65536
 max_batch_size = 8192
 max_connections = 1024
+# Allow the client to express the offered concurrency. The default per-IP cap (64)
+# throttles a single-host load generator to ~64 connections; with pipeline_depth=1
+# that pins server-side concurrency at ~64 ops regardless of the offered IN_FLIGHT,
+# capping throughput well below the engine's capacity (CPU sits idle). The
+# reference's client keeps hundreds of requests in flight; this lets TeraSlab
+# express the same offered load. Local bench only.
+max_connections_per_ip = 1024
+# Pipeline depth > 1 lets each connection dispatch multiple in-flight requests on a
+# bounded worker pool (responses matched by request_id), so the offered concurrency
+# reaches the redo group-commit without needing one OS connection per in-flight op.
+# This is the per-connection-serial throughput lever (see config doc). The bench's
+# ops are independent per worker, so the >1 reordering caveat is irrelevant.
+pipeline_depth = 16
 block_height_retention = 288
 
 # Async durability to match the reference's no-commit-to-device posture.

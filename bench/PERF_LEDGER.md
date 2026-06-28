@@ -637,3 +637,45 @@ Config committed: 1GiB redo + checkpoint watermarks + `redo_segment_ring=true` i
 bench/configs/teraslab-async.toml (reproducible from clean checkout; flipping the
 code default is a separate production change pending soak). Caveat: host too noisy
 for certification; all numbers RELATIVE, interleaved.
+
+## E16 — the cap chain resolved; remaining gap is CPU EFFICIENCY (2026-06-28)
+
+Chased the ~33k single-store ceiling (CPU idle at ~210%/800% → a serialization,
+not CPU). Ruled out, with measurements: fsync cadence (50→1000ms: 20x fewer
+fsyncs, ZERO throughput change), connection/pipeline concurrency
+(`pipeline_depth` 1→16 + `max_connections_per_ip` 64→1024 + POOL_SIZE 60→512:
+no change, CPU stayed ~210%). **FOUND IT: per-store lock-domain serialization.**
+`device_split=4` (4 virtual stores on the one disk = 4 independent redo logs +
+allocators + index-lock domains; fair = TeraSlab's analogue of the reference's
+internal partition parallelism on one file) **broke the ceiling: ~33k→~44k in
+isolation, CPU 210%→~420%.** device_split=8 over-fragments (more CPU, ~35k) — 4
+is best.
+
+**But that exposed the REAL, fundamental gap — CPU efficiency:**
+- Interleaved head-to-head (split=4): reference ~42k @ IF=512 / ~51k @ IF=1024 at
+  only **160-260% CPU**; TeraSlab ~29k (interleaved) / ~44k (isolated) at
+  **400-540% CPU**. The reference does MORE ops with ~HALF the CPU → it is
+  **~2-3x more CPU-efficient per op** (~51µs CPU/op vs TeraSlab ~95µs/op).
+- So TeraSlab is now CPU-BOUND and brittle: under host contention its CPU-heavy
+  path degrades far more than the reference's CPU-light one.
+- WIN verdict: FAIL on all axes (total −31-40%, spend −30-35%, spend p99.9 1.4-5x
+  worse). NOT won.
+
+**Progress: TeraSlab went from ~20% → competitive-in-isolation (~44k vs the
+reference's ~51k).** Every architecture/config lever is now resolved (fsync
+coalescing E13, secondary sharding E14, redo ring E15 kills the freeze,
+device_split E16 kills the lock-domain cap). 
+
+**THE REMAINING LEVER = CPU cycles/op.** This is a different class of work
+(profiling-driven micro-optimization of the hot create/spend paths — allocations,
+memcpies, CRC, cold-data serialization, protocol encode), NOT a config/architecture
+knob. It needs (1) a CPU flamegraph to find the hot paths and (2) a QUIET host to
+measure gains. BLOCKER: this shared box has a persistent EXTERNAL load (a `perl`
+job pinning ~2 cores) — certification is impossible here regardless. Recommend:
+re-run the whole suite on a quiet host (load < 1/core), and start the
+CPU-efficiency pass from a flamegraph of the create path at IF=16.
+
+Fair-config note: with device_split=4 the redo buffer is 4x per-store (generous to
+TeraSlab); a stricter fair config would scale redo_log_size down so the TOTAL ≈ the
+reference's 1024M cache — the conclusion (TeraSlab trails on CPU efficiency) holds
+either way, since it trails even with the generous buffer.

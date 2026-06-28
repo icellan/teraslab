@@ -10,12 +10,21 @@ throughput + p99.9 at minimum) under a **fair matched config**, proven by
 reproducible numbers. Constraint: never name/import the reference product anywhere
 in this repo — call it "the reference datastore" (grep confirms zero refs).
 
-**Current (2026-06-28): NOT won yet, but ~3× closer.** 1-store, disk, open-loop:
-- TeraSlab **~22.5k ops/s** (was ~7.5k at the start of the server work) — **~60%
-  of the reference's ~37.8k** (was ~20%).
-- The engine's true ceiling (device RAM-backed / tmpfs) is **~38.6k = matches the
-  reference**, so the remaining ~40% is reachable and is **lock-bound, not
-  I/O-bound** (CPU sits ~0.5 core / idle on disk).
+**Current (2026-06-28, after E13-E16): NOT won. Read PERF_LEDGER.md E16 — it is
+the latest state.** TeraSlab went from ~20% → competitive-in-isolation
+(~44k ops/s isolated vs the reference ~51k), but the reference still wins
+head-to-head. Every architecture/config lever is RESOLVED:
+- E13 fsync coalescing (3×), E14 secondary-index sharding (create_index 9-22ms→3.6ms),
+  E15 redo segment-ring (kills the ~10s checkpoint freeze), E16 `device_split=4`
+  (breaks the per-store lock-domain cap, ~33k→~44k, CPU 210%→420%).
+- **THE REMAINING GAP IS CPU EFFICIENCY:** the reference does ~42-51k at 160-260%
+  CPU; TeraSlab does ~29-44k at 400-540% CPU → it burns **~2-3× the CPU per op**
+  (~95µs vs ~51µs). It is now CPU-bound, not lock/IO-bound. Closing this is a
+  profiling-driven micro-optimization pass on the create/spend hot paths
+  (allocations / memcpy / CRC / cold-data serialization / protocol encode) — a
+  different class of work than the config/architecture levers, and it needs a
+  CPU flamegraph + a QUIET host to measure. This shared box has a persistent
+  EXTERNAL `perl` job pinning ~2 cores → certification impossible here.
 
 ## The arc (why we are where we are)
 1. **B0**: baseline lost ~5× (closed-loop bench, masked the real issues).
