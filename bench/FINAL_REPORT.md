@@ -103,6 +103,22 @@ create p99.9 199 ms → 38 ms** even on a noisy 8-core macOS box; on the quiet
 
 ## 5. Caveats / scope
 
+> **⚠ IMPORTANT — this cert measures efficiency at a fixed operating point, NOT
+> capacity.** The Go head-to-head harness issues **one record per RPC** (un-batched).
+> Open-loop at IN_FLIGHT=512 with ~10 ms/op latency caps both backends at
+> ~50k records/s ( = concurrency ÷ latency ), *independent of hardware* — which is
+> why the 24-core/2-NVMe box performed like an 8-core MacBook and server CPU sat at
+> ~30%. Both TeraSlab (~50k) and the reference (~44k) hit this harness ceiling, so
+> neither DB was stressed. TeraSlab wins because it is ~13% lower-latency per op (so
+> it completes more at fixed concurrency) — a real, fair win on the stated condition,
+> but it does **not** represent the machine's capacity. The real node runs ~1M tx/s
+> **batched at ~488 records/req** (see `utxo-db-benchmark-recipe.md`); a capacity
+> measurement must use the batched recipe workload. Capacity re-measure is pending
+> (also: `device_split` should scale to the core count — the cert used 4 on 24 cores —
+> and a server batch-path slowdown at batch>1, seen in `LINUX_NVME_REPORT.md`, must be
+> resolved for large batches).
+
+
 - The win is on a **quiet multi-core host**. macOS-Docker (8 cores, never idle —
   WindowServer ~44%) cannot certify p99.9 there; it inflates TeraSlab's tail. The
   per-store sharding's tail benefit needs idle cores, which the quiet 24-core host
