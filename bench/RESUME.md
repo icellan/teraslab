@@ -10,20 +10,17 @@ throughput + p99.9 at minimum) under a **fair matched config**, proven by
 reproducible numbers. Constraint: never name/import the reference product anywhere
 in this repo — call it "the reference datastore" (grep confirms zero refs).
 
-**⚠ ON RESUME FIRST (compaction checkpoint, see PERF_LEDGER.md E21):** two CPU-fix
-subagents were STILL RUNNING when we compacted (4 cargo procs in final verify), so
-the tree has UNCOMMITTED WIP and `git status`/`git diff` is the source of truth —
-trust it over any filename list here.
-- **SipHash→fast-hasher swap (#130)** for the create-batch dedup: at checkpoint =
-  `src/server/dispatch.rs` + `src/server/mod.rs` + NEW `src/server/fast_hash.rs`,
-  and the tree COMPILED (`cargo check` clean). ~5% server CPU, zero correctness risk.
-- **De-flake (#129)** of `redo_group::tests::concurrent_commits_coalesce_and_get_
-  distinct_ranges`: `src/redo_group.rs` — may or may not have landed at checkpoint
-  (it had reverted mid-iteration). 
-ON RESUME: read the subagent .output files (paths in E21) for their final
-verdicts/diffs; `git status`+`git diff`; `cargo test --all` to gate; commit what
-passes (separate commits). If the de-flake didn't land, re-dispatch it. Do NOT
-git-reset/checkout (would lose the WIP). Then continue per E21 "NEXT".
+**✅ E21 WIP LANDED (was: uncommitted at compaction).** Both CPU-fix subagents'
+work is committed on `feat/device-cache`, `cargo test --all` green (exit 0), tree clean:
+- **SipHash→fast-hasher swap (#130)** — commit `8fd086b` (`src/server/fast_hash.rs`
+  + `dispatch.rs` 2-site swap + `mod.rs`). ~5% create CPU, correctness-neutral
+  (`[u8;32]`/`u8` Eq unchanged; index `register_create_at_offset` stays authoritative).
+- **De-flake (#129)** — commit `7e2c40e` (`src/redo_group.rs`); the coalescing test
+  is now deterministic (asserts `fsyncs==2` exactly, strictly stronger than the old
+  `< N`), verified 10/10.
+The earlier "fast_hash load-flaky" scare was a concurrent-cargo-on-shared-`target/`
+artifact (two `cargo test` racing), NOT a test defect — the two flagged tests are
+pure/deterministic and pass clean single-process + under `cargo test --all`.
 
 **Current (2026-06-28, after E13-E20): PRIMARY condition WON on this host. Read
 PERF_LEDGER.md E20-E21 — latest (E20 SUPERSEDES the E18-E19 "needs Linux"

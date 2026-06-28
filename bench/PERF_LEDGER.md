@@ -901,18 +901,16 @@ admin-gated; SVG output). % of the create subtree (~34% of server CPU):**
   backend appends NO intent; it's redb-only). The "drop the intent" idea is a no-op
   in this config — DO NOT pursue it.
 
-**IN-FLIGHT WORK (uncommitted in the tree at compaction — ON RESUME: read the
-subagent .output files, gate with `cargo test --all`, commit if green):**
+**IN-FLIGHT WORK — NOW COMMITTED (2026-06-28):** both landed on `feat/device-cache`,
+`cargo test --all` green (exit 0), tree clean:
 1. **De-flake** `redo_group::tests::concurrent_commits_coalesce_and_get_distinct_
-   ranges` (load-flaky; make coalescing deterministic via BlockingSyncDev). Touches
-   `src/redo_group.rs`. Subagent output:
-   `…/tasks/ae6c089a9d3419ff6.output`.
-2. **SipHash→fast-hasher swap** for the create-batch dedup (~5% server CPU, zero
-   correctness risk). Touches `src/server/mod.rs` + NEW `src/server/fast_hash.rs`.
-   Subagent output: `…/tasks/a47f52d8ab747bd22.output`.
-   (tasks/ dir = /private/tmp/claude-501/-Users-siggioskarsson-gitcheckout-teraslab/
-   c3460642-d1fb-4c50-b79b-4096f3b4589e/tasks/ — may not survive; if gone, just
-   `git diff` the 3 files + gate + commit.)
+   ranges` → commit `7e2c40e` (`src/redo_group.rs`); now deterministic (asserts
+   `fsyncs==2` exactly, strictly stronger than the old `< N`); verified 10/10.
+2. **SipHash→fast-hasher swap** for the create-batch dedup → commit `8fd086b`
+   (`src/server/fast_hash.rs` + `dispatch.rs` 2-site swap + `mod.rs`); ~5% create
+   CPU, correctness-neutral. The "fast_hash load-flaky" scare was a concurrent-
+   cargo-on-shared-`target/` artifact, NOT a defect (the two flagged tests are pure/
+   deterministic and pass clean single-process + under `cargo test --all`).
 
 **NEXT (after committing the in-flight work):**
 1. Optional 2nd create-CPU cut: drop the redundant early dup-check `lookup_checked`
