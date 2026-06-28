@@ -1194,6 +1194,17 @@ fn main() {
         unmined_index,
     );
 
+    // Honor the configured create-time store placement strategy (round-robin by
+    // default, or deterministic txid→store). Reads always route by the recorded
+    // device_id, so this only changes where NEW records land — safe to set on an
+    // already-populated store.
+    engine.set_placement_strategy(config.storage.placement);
+    tracing::info!(
+        placement = ?config.storage.placement,
+        stores = engine.store_count(),
+        "store placement strategy set",
+    );
+
     // Fail closed if the recovered/loaded index references a store that does not
     // exist in the current layout (a `device_id >= store_count`). That means the
     // node was previously run with MORE stores than are configured now, so the

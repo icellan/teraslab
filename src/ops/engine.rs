@@ -186,8 +186,10 @@ pub struct Engine {
     /// `device_id` via [`Self::device_for`] / [`Self::device_ptr_for`] /
     /// [`Self::allocator_for`].
     stores: Vec<Store>,
-    /// Round-robin placement of new records across all stores.
-    placer: crate::subdevice::RoundRobinPlacer,
+    /// Store placement for new records (round-robin by default, or deterministic
+    /// txid→store when configured). Reads always route by the recorded
+    /// `device_id`, so the strategy only affects where NEW records land.
+    placer: crate::subdevice::StorePlacer,
     /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
     /// behind its own `RwLock`, so a write to one shard does not block
     /// reads/writes on other shards. Constructed at the configured
@@ -499,7 +501,7 @@ impl Engine {
             .collect();
         let total = 1 + aux_stores.len();
         engine.stores.extend(aux_stores);
-        engine.placer = crate::subdevice::RoundRobinPlacer::new(total);
+        engine.placer = crate::subdevice::StorePlacer::round_robin(total);
         engine
     }
 
@@ -521,7 +523,7 @@ impl Engine {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
         // Single-device construction: store 0 only, no aux stores. The
         // multi-store boot path uses `new_multi_store`.
-        let placer = crate::subdevice::RoundRobinPlacer::new(1);
+        let placer = crate::subdevice::StorePlacer::round_robin(1);
         let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -2164,13 +2166,26 @@ impl Engine {
         &self.stores[device_id as usize].allocator
     }
 
-    /// Choose the store for a NEW record (round-robin across all stores) and
-    /// return the `device_id` to stamp into its index entry. Placement is a
-    /// free local choice recorded in the index; reads route by the stored
-    /// `device_id`, never by a function of the key.
+    /// Choose the store for a NEW record and return the `device_id` to stamp
+    /// into its index entry. With the default round-robin strategy the `txid`
+    /// is ignored; with the txid strategy the store is a deterministic function
+    /// of the txid's last 8 bytes (see [`crate::subdevice::StorePlacer::place`]).
+    ///
+    /// Placement is a free local choice recorded in the index; reads route by
+    /// the stored `device_id`, never by re-deriving placement — so switching
+    /// strategies on an existing store is safe for already-written records.
     #[inline]
-    pub fn place_new_record(&self) -> u8 {
-        self.placer.pick() as u8
+    pub fn place_new_record(&self, txid: &[u8; 32]) -> u8 {
+        self.placer.place(txid) as u8
+    }
+
+    /// Replace the placement strategy, preserving the store count. Called once
+    /// at boot to honor the configured `[storage] placement` key. The strategy
+    /// only affects where NEW records land; existing records keep their recorded
+    /// `device_id`, so this is safe to flip on an already-populated store.
+    pub fn set_placement_strategy(&mut self, strategy: crate::subdevice::PlacementStrategy) {
+        let num_stores = self.placer.num_stores();
+        self.placer = crate::subdevice::StorePlacer::new(strategy, num_stores);
     }
 
     /// Get a reference to the blobstore, if configured.
@@ -4121,10 +4136,11 @@ impl Engine {
         let base_size = TxMetadata::record_size_for(utxo_count);
         let total_size = base_size + cold_size as u64;
 
-        // Place this new record on a store (round-robin) and allocate there.
-        // The chosen store is recorded in the index entry's device_id below, so
+        // Place this new record on a store (round-robin by default, or
+        // deterministic txid→store when configured) and allocate there. The
+        // chosen store is recorded in the index entry's device_id below, so
         // every later access routes to it via device_for(entry.device_id).
-        let device_id = self.place_new_record();
+        let device_id = self.place_new_record(&key.txid);
         let record_offset = self
             .allocator_for(device_id)
             .lock()
@@ -9059,7 +9075,9 @@ mod tests {
         let a1 = engine.allocator_for(1) as *const _;
         assert_ne!(a0, a1);
         // Round-robin placement cycles across both stores and stays in range.
-        let picks: Vec<u8> = (0..4).map(|_| engine.place_new_record()).collect();
+        // (Round-robin ignores the txid, so any value works here.)
+        let zero = [0u8; 32];
+        let picks: Vec<u8> = (0..4).map(|_| engine.place_new_record(&zero)).collect();
         assert_eq!(picks, vec![0, 1, 0, 1]);
     }
 
@@ -13918,6 +13936,163 @@ mod tests {
         engine.spend_multi(&multi).expect("spend on store 1");
         let slot = engine.read_slot(&store1_key, 0).expect("read spent slot");
         assert!(slot.is_spent(), "slot on store 1 must read back as spent");
+    }
+
+    /// Build a 4-byte CreateRequest whose txid's LAST 8 bytes encode `tail`
+    /// (little-endian); leading bytes are derived from `n` so different records
+    /// have distinct keys. Used to drive deterministic txid placement.
+    fn make_create_req_with_tail(
+        n: u8,
+        tail: u64,
+        utxo_count: usize,
+    ) -> (Vec<[u8; 32]>, CreateRequest<'static>) {
+        let (hashes, mut req) = make_create_req(n, utxo_count);
+        // Overwrite the trailing 8 bytes so txid placement is fully controlled.
+        req.tx_id[24..32].copy_from_slice(&tail.to_le_bytes());
+        (hashes, req)
+    }
+
+    /// A two-store engine in deterministic txid-placement mode, returning the
+    /// engine plus the underlying store devices and a snapshot of their
+    /// allocators (for a recovery-by-device-scan test). Devices are shared
+    /// `Arc`s, so writes through the engine are visible on the returned handles.
+    fn create_two_store_engine_txid() -> (
+        Engine,
+        Vec<Arc<dyn BlockDevice>>,
+        Arc<dyn BlockDevice>,
+        Arc<dyn BlockDevice>,
+    ) {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut engine = Engine::new_multi_store(
+            dev0.clone(),
+            alloc0,
+            vec![(dev1.clone(), alloc1)],
+            ShardedIndex::from_single(Index::new(1000).unwrap().into()),
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        engine.set_placement_strategy(crate::subdevice::PlacementStrategy::Txid);
+        (engine, vec![dev0.clone(), dev1.clone()], dev0, dev1)
+    }
+
+    #[test]
+    fn txid_placement_create_lands_in_hashed_store_and_reads_back() {
+        let (engine, _devs, _d0, _d1) = create_two_store_engine_txid();
+        assert_eq!(engine.store_count(), 2);
+
+        // Pick tails that land on each store: store = tail % 2.
+        // tail=10 -> store 0, tail=11 -> store 1, tail=20 -> store 0, tail=21 -> store 1.
+        let cases: [(u8, u64); 4] = [(1, 10), (2, 11), (3, 20), (4, 21)];
+        let mut keys = Vec::new();
+        let mut hashes_by_key = Vec::new();
+        for (n, tail) in cases {
+            let (hashes, req) = make_create_req_with_tail(n, tail, 3);
+            engine.create(&req).expect("create");
+            keys.push((req.tx_key(), tail));
+            hashes_by_key.push(hashes);
+        }
+
+        for (i, (key, tail)) in keys.iter().enumerate() {
+            let expected_store = (tail % 2) as u8;
+            let entry = engine.lookup(key).expect("entry");
+            assert_eq!(
+                entry.device_id, expected_store,
+                "record {i} (tail {tail}) must land on store {expected_store} = tail % num_stores",
+            );
+            // Reads route by the recorded device_id (the normal path) — correct
+            // contents prove the record is on, and read from, the right store.
+            let meta = engine.read_metadata(key).expect("read_metadata");
+            assert_eq!(meta.tx_id, key.txid, "record {i} read from the wrong store");
+            let slots = engine.read_slots(key).expect("read_slots");
+            assert_eq!(slots.len(), hashes_by_key[i].len(), "record {i} slot count");
+        }
+
+        // Both stores were actually used (txids covered store 0 and store 1).
+        let used: std::collections::BTreeSet<u8> = keys
+            .iter()
+            .map(|(k, _)| engine.lookup(k).unwrap().device_id)
+            .collect();
+        assert_eq!(
+            used,
+            std::collections::BTreeSet::from([0, 1]),
+            "txid placement must have used both stores for this txid set",
+        );
+    }
+
+    #[test]
+    fn txid_placement_records_recover_with_correct_device_id_across_restart() {
+        // Create several records in txid mode, then simulate a restart: drop the
+        // engine's in-memory index and rebuild it by scanning EVERY store's
+        // device (the multi-store recovery path). Each record must be recovered
+        // with the device_id of the store it physically lives on (== txid
+        // placement) and read back correctly.
+        let (dev0, dev1, keys) = {
+            let (engine, _devs, dev0, dev1) = create_two_store_engine_txid();
+            // Tails covering both stores. tail % 2 decides the store.
+            let cases: [(u8, u64); 6] =
+                [(1, 100), (2, 101), (3, 102), (4, 103), (5, 200), (6, 201)];
+            let mut keys = Vec::new();
+            for (n, tail) in cases {
+                let (_h, req) = make_create_req_with_tail(n, tail, 3);
+                engine.create(&req).expect("create");
+                keys.push((req.tx_key(), (tail % 2) as u8));
+            }
+            // Persist each store's allocator header (what a checkpoint does)
+            // so the post-restart recover() sees the correct high-water mark
+            // and the device scan covers every written record.
+            for id in 0..engine.store_count() as u8 {
+                engine.allocator_for(id).lock().persist().unwrap();
+            }
+            (dev0, dev1, keys)
+        }; // engine (and its index) dropped here — the "restart".
+
+        // Reconstruct allocators from the persisted device headers (the real
+        // boot path), then rebuild the index by scanning every store's device.
+        let a0 = SlotAllocator::recover(dev0.clone()).unwrap();
+        let a1 = SlotAllocator::recover(dev1.clone()).unwrap();
+        let devices: Vec<Arc<dyn BlockDevice>> = vec![dev0.clone(), dev1.clone()];
+        let allocators = vec![a0, a1];
+        let rebuilt =
+            ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16, 0).unwrap();
+
+        assert_eq!(
+            rebuilt.len(),
+            keys.len(),
+            "every txid-placed record must be recovered from its store after restart",
+        );
+
+        // Rebuild an engine over the recovered index + same devices and read
+        // each record back through the normal (index-routed) read path.
+        let alloc0 = SlotAllocator::recover(devices[0].clone()).unwrap();
+        let alloc1 = SlotAllocator::recover(devices[1].clone()).unwrap();
+        let engine2 = Engine::new_multi_store(
+            devices[0].clone(),
+            alloc0,
+            vec![(devices[1].clone(), alloc1)],
+            rebuilt,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        for (key, expected_store) in &keys {
+            let entry = engine2.lookup(key).expect("recovered entry");
+            assert_eq!(
+                entry.device_id, *expected_store,
+                "recovered record must carry the device_id of the store it lives on",
+            );
+            let meta = engine2.read_metadata(key).expect("read recovered record");
+            assert_eq!(
+                meta.tx_id, key.txid,
+                "recovered record read from wrong store"
+            );
+        }
     }
 
     #[test]

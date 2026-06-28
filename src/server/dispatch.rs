@@ -6409,15 +6409,16 @@ fn handle_create_batch(
     // window is safe against a concurrent checkpoint persisting the un-journaled
     // reservation because the create holds the exclusive mutation barrier (the
     // same lock the checkpoint task takes) across Phases 1b–3.
-    // Round-robin each new record across the configured stores (placement is a
-    // free local choice recorded in the index `device_id`; reads route by it).
+    // Place each new record across the configured stores (round-robin by
+    // default, or deterministic txid→store when configured). Placement is a
+    // free local choice recorded in the index `device_id`; reads route by it.
     // Records destined for the same store must be reserved together on THAT
     // store's allocator — offsets are store-local — so group positions by store
     // and run one `reserve_batch` per store. Each store's allocator tags its
     // own `AllocateRegion` redo ops with its `device_id` (set at boot).
     let device_ids: Vec<u8> = pending_items
         .iter()
-        .map(|_| engine.place_new_record())
+        .map(|item| engine.place_new_record(&item.create_req.tx_id))
         .collect();
     let store_count = engine.store_count();
     let mut positions_by_store: Vec<Vec<usize>> = vec![Vec::new(); store_count];

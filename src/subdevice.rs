@@ -290,40 +290,92 @@ pub fn validate_store_count(num_stores: usize) -> std::result::Result<(), StoreC
     }
 }
 
-/// Round-robin store placement for new records.
+/// How a new record is assigned to a store at create time.
 ///
-/// Placement at create time is a free local choice — the chosen store is
-/// recorded in the index entry's `device_id`, so reads and later mutations
-/// follow the index, not any function of the key. Round-robin gives an even
-/// fill across equal-sized stores with a single atomic and no per-store query.
-/// (A least-loaded policy is a drop-in replacement for [`Self::pick`] if churn
-/// ever skews fill.)
+/// Placement is a free LOCAL choice: the chosen store is recorded in the index
+/// entry's `device_id`, and every later access (read, spend, setMined, delete)
+/// routes by that recorded `device_id`, never by re-deriving placement. So the
+/// strategy only affects WHICH store a *new* record lands on; switching modes
+/// on an existing store is safe — already-written records keep whatever
+/// `device_id` was recorded for them and remain readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlacementStrategy {
+    /// Even fill across stores via a rotating counter (default). Placement is
+    /// independent of the txid — record N goes to store `N % num_stores`.
+    #[default]
+    RoundRobin,
+    /// Deterministic function of the txid: store = `last8(txid) as u64 (LE) %
+    /// num_stores`. Because a txid is a double-SHA256 (uniformly random), this
+    /// is uniform across stores, and a record's store is computable from its
+    /// txid for EVERY op — the foundation for per-store dispatch routing.
+    ///
+    /// The cluster already shards BETWEEN nodes on the FIRST bytes of the txid,
+    /// so this uses the LAST 8 bytes: independent of the inter-node shard, and
+    /// uniform within a single node.
+    Txid,
+}
+
+/// Store placement for new records.
+///
+/// Wraps a [`PlacementStrategy`] plus the round-robin counter. Placement at
+/// create time is a free local choice — the chosen store is recorded in the
+/// index entry's `device_id`, so reads and later mutations follow the index,
+/// not any function of the key. See [`PlacementStrategy`] for why switching
+/// modes is safe for already-written records.
 #[derive(Debug)]
-pub struct RoundRobinPlacer {
+pub struct StorePlacer {
+    strategy: PlacementStrategy,
     num_stores: usize,
     next: std::sync::atomic::AtomicUsize,
 }
 
-impl RoundRobinPlacer {
-    /// Create a placer over `num_stores` stores (must be >= 1).
-    pub fn new(num_stores: usize) -> Self {
+impl StorePlacer {
+    /// Create a placer over `num_stores` stores (must be >= 1) using `strategy`.
+    pub fn new(strategy: PlacementStrategy, num_stores: usize) -> Self {
         debug_assert!(num_stores >= 1);
         Self {
+            strategy,
             num_stores,
             next: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Pick the next store index in `0..num_stores`.
+    /// Convenience constructor for the default round-robin strategy.
+    pub fn round_robin(num_stores: usize) -> Self {
+        Self::new(PlacementStrategy::RoundRobin, num_stores)
+    }
+
+    /// The placement strategy in effect.
     #[inline]
-    pub fn pick(&self) -> usize {
+    pub fn strategy(&self) -> PlacementStrategy {
+        self.strategy
+    }
+
+    /// Choose the store index in `0..num_stores` for a record with `txid`.
+    ///
+    /// In [`PlacementStrategy::RoundRobin`] the txid is ignored and a rotating
+    /// counter is used. In [`PlacementStrategy::Txid`] the store is the
+    /// little-endian `u64` formed from the LAST 8 bytes of `txid`, modulo
+    /// `num_stores` — deterministic and uniform for random txids.
+    #[inline]
+    pub fn place(&self, txid: &[u8; 32]) -> usize {
         if self.num_stores == 1 {
             return 0;
         }
-        self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.num_stores
+        match self.strategy {
+            PlacementStrategy::RoundRobin => {
+                self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.num_stores
+            }
+            PlacementStrategy::Txid => {
+                let last8: [u8; 8] = txid[24..32]
+                    .try_into()
+                    .expect("a 32-byte txid always has 8 trailing bytes");
+                (u64::from_le_bytes(last8) % self.num_stores as u64) as usize
+            }
+        }
     }
 
-    /// Number of stores this placer rotates over.
+    /// Number of stores this placer distributes over.
     #[inline]
     pub fn num_stores(&self) -> usize {
         self.num_stores
@@ -494,19 +546,100 @@ mod tests {
         );
     }
 
+    /// Build a txid whose last 8 bytes encode `tail` (little-endian); the rest
+    /// is `lead` so we can prove the first bytes are IGNORED by txid placement.
+    fn txid_with_tail(lead: u8, tail: u64) -> [u8; 32] {
+        let mut t = [lead; 32];
+        t[24..32].copy_from_slice(&tail.to_le_bytes());
+        t
+    }
+
+    #[test]
+    fn round_robin_is_the_default_strategy() {
+        let p = StorePlacer::round_robin(3);
+        assert_eq!(p.strategy(), PlacementStrategy::RoundRobin);
+        assert_eq!(PlacementStrategy::default(), PlacementStrategy::RoundRobin);
+    }
+
     #[test]
     fn round_robin_cycles_and_stays_in_range() {
-        let p = RoundRobinPlacer::new(3);
-        let picks: Vec<usize> = (0..7).map(|_| p.pick()).collect();
+        let p = StorePlacer::round_robin(3);
+        let zero = [0u8; 32];
+        // Round-robin ignores the txid: identical txid still rotates.
+        let picks: Vec<usize> = (0..7).map(|_| p.place(&zero)).collect();
         assert_eq!(picks, vec![0, 1, 2, 0, 1, 2, 0]);
         assert!(picks.iter().all(|&s| s < 3));
     }
 
     #[test]
     fn round_robin_single_store_always_zero() {
-        let p = RoundRobinPlacer::new(1);
+        let p = StorePlacer::round_robin(1);
+        let zero = [0u8; 32];
         for _ in 0..10 {
-            assert_eq!(p.pick(), 0);
+            assert_eq!(p.place(&zero), 0);
+        }
+    }
+
+    #[test]
+    fn txid_placement_is_deterministic_for_the_same_txid() {
+        let p = StorePlacer::new(PlacementStrategy::Txid, 4);
+        let txid = txid_with_tail(0xAB, 0x0102_0304_0506_0707);
+        let first = p.place(&txid);
+        // Same txid → same store across many calls (no hidden counter state).
+        for _ in 0..100 {
+            assert_eq!(p.place(&txid), first);
+        }
+        // It is exactly last8(txid) LE % num_stores.
+        assert_eq!(first, (0x0102_0304_0506_0707u64 % 4) as usize);
+    }
+
+    #[test]
+    fn txid_placement_uses_last_bytes_not_first() {
+        let p = StorePlacer::new(PlacementStrategy::Txid, 7);
+        // Same trailing 8 bytes, different leading bytes → same store.
+        let a = txid_with_tail(0x00, 12345);
+        let b = txid_with_tail(0xFF, 12345);
+        assert_eq!(p.place(&a), p.place(&b));
+        assert_eq!(p.place(&a), (12345u64 % 7) as usize);
+        // Different trailing bytes generally route differently.
+        let c = txid_with_tail(0x00, 12346);
+        assert_ne!(p.place(&a), p.place(&c));
+    }
+
+    #[test]
+    fn txid_placement_single_store_always_zero() {
+        let p = StorePlacer::new(PlacementStrategy::Txid, 1);
+        for tail in 0..50u64 {
+            assert_eq!(p.place(&txid_with_tail(1, tail)), 0);
+        }
+    }
+
+    #[test]
+    fn txid_placement_distributes_random_txids_roughly_uniformly() {
+        const NUM_STORES: usize = 8;
+        const SAMPLES: usize = 80_000;
+        let p = StorePlacer::new(PlacementStrategy::Txid, NUM_STORES);
+        let mut counts = [0usize; NUM_STORES];
+        // Deterministic PRNG (splitmix64) standing in for random double-SHA256
+        // txids — no external dependency, reproducible.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..SAMPLES {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let mut txid = [0u8; 32];
+            txid[24..32].copy_from_slice(&z.to_le_bytes());
+            counts[p.place(&txid)] += 1;
+        }
+        // Every store gets a reasonable share (expected ~12.5%); allow ±20%.
+        let expected = SAMPLES / NUM_STORES;
+        for (store, &c) in counts.iter().enumerate() {
+            assert!(
+                c > expected * 4 / 5 && c < expected * 6 / 5,
+                "store {store} got {c} of {SAMPLES} (expected ~{expected}); skewed"
+            );
         }
     }
 

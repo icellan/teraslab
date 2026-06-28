@@ -596,6 +596,44 @@ pub struct StorageConfig {
     /// shared block. Validation rejects `packed = true` with
     /// `device_alignment > 4096`.
     pub packed: bool,
+
+    /// How a new record is assigned to a store at create time:
+    /// `"round_robin"` (default) or `"txid"`.
+    ///
+    /// `"round_robin"` (default) is the unchanged behavior — even fill across
+    /// stores via a rotating counter, independent of the txid. `"txid"` makes
+    /// placement a deterministic function of the txid's last 8 bytes
+    /// (`store = last8(txid) LE % num_stores`), so a record's store is
+    /// computable from its txid for every op — the foundation for per-store
+    /// dispatch routing.
+    ///
+    /// Reads always route by the index entry's recorded `device_id`, never by
+    /// re-deriving placement, so switching this key on an already-populated
+    /// store is safe: existing records keep their recorded store and stay
+    /// readable; only NEW records follow the new strategy.
+    #[serde(deserialize_with = "deserialize_placement")]
+    pub placement: crate::subdevice::PlacementStrategy,
+}
+
+/// Deserialize the `[storage] placement` key into a [`PlacementStrategy`].
+/// Accepts `"round_robin"` (or empty) and `"txid"`; rejects anything else with
+/// a typed serde error so a typo fails startup loudly instead of silently
+/// defaulting.
+fn deserialize_placement<'de, D>(
+    deserializer: D,
+) -> std::result::Result<crate::subdevice::PlacementStrategy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::subdevice::PlacementStrategy;
+    let s = String::deserialize(deserializer)?;
+    match s.as_str() {
+        "round_robin" | "" => Ok(PlacementStrategy::RoundRobin),
+        "txid" => Ok(PlacementStrategy::Txid),
+        other => Err(serde::de::Error::custom(format!(
+            "unknown placement strategy: {other:?} (expected \"round_robin\" or \"txid\")"
+        ))),
+    }
 }
 
 /// Maximum `device_alignment` (bytes) compatible with packed mode. The
@@ -632,8 +670,10 @@ pub struct ServerConfig {
     /// domains (lock/contention parallelism) sharing one physical device's I/O
     /// bandwidth and fsync barrier. Total stores = `device_paths.len() *
     /// device_split`, bounded by 256 (the index entry's `device_id` is a `u8`).
-    /// Records are placed round-robin across all stores at create time; reads
-    /// route by the index entry's recorded `device_id`.
+    /// Records are placed across all stores at create time per the
+    /// `[storage] placement` strategy (round-robin by default, or deterministic
+    /// txid→store); reads always route by the index entry's recorded
+    /// `device_id`.
     pub device_split: usize,
 
     /// Size of the redo log region in bytes.
@@ -2348,12 +2388,60 @@ backend = ""
     #[test]
     fn packed_with_4096_alignment_validates() {
         let cfg = ServerConfig {
-            storage: StorageConfig { packed: true },
+            storage: StorageConfig {
+                packed: true,
+                ..StorageConfig::default()
+            },
             device_alignment: 4096,
             ..ServerConfig::default()
         };
         cfg.validate_safe_defaults()
             .expect("packed with device_alignment = 4096 must validate");
+    }
+
+    #[test]
+    fn placement_defaults_to_round_robin() {
+        let cfg = ServerConfig::default();
+        assert_eq!(
+            cfg.storage.placement,
+            crate::subdevice::PlacementStrategy::RoundRobin,
+            "placement must default to round_robin (unchanged behavior)",
+        );
+        // A config with no [storage] section at all also defaults to round_robin.
+        let cfg2: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg2.storage.placement,
+            crate::subdevice::PlacementStrategy::RoundRobin,
+        );
+    }
+
+    #[test]
+    fn placement_txid_parses_from_toml() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nplacement = \"txid\"\n").unwrap();
+        assert_eq!(
+            cfg.storage.placement,
+            crate::subdevice::PlacementStrategy::Txid,
+        );
+    }
+
+    #[test]
+    fn placement_round_robin_parses_from_toml() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nplacement = \"round_robin\"\n").unwrap();
+        assert_eq!(
+            cfg.storage.placement,
+            crate::subdevice::PlacementStrategy::RoundRobin,
+        );
+    }
+
+    #[test]
+    fn placement_unknown_value_is_rejected() {
+        let result: std::result::Result<ServerConfig, _> =
+            toml::from_str("[storage]\nplacement = \"by_size\"\n");
+        let err = result.expect_err("unknown placement strategy must fail to parse");
+        assert!(
+            err.to_string().contains("unknown placement strategy"),
+            "error must name the bad key: {err}",
+        );
     }
 
     #[test]
@@ -2469,7 +2557,10 @@ backend = ""
     #[test]
     fn packed_with_alignment_above_4096_is_rejected() {
         let cfg = ServerConfig {
-            storage: StorageConfig { packed: true },
+            storage: StorageConfig {
+                packed: true,
+                ..StorageConfig::default()
+            },
             device_alignment: 8192,
             ..ServerConfig::default()
         };
@@ -2486,7 +2577,10 @@ backend = ""
         // The packed-only alignment gate must NOT fire when packing is off:
         // a non-packed device may legitimately use a larger block.
         let cfg = ServerConfig {
-            storage: StorageConfig { packed: false },
+            storage: StorageConfig {
+                packed: false,
+                ..StorageConfig::default()
+            },
             device_alignment: 8192,
             ..ServerConfig::default()
         };
