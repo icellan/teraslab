@@ -10,14 +10,20 @@ throughput + p99.9 at minimum) under a **fair matched config**, proven by
 reproducible numbers. Constraint: never name/import the reference product anywhere
 in this repo — call it "the reference datastore" (grep confirms zero refs).
 
-**⚠ ON RESUME FIRST (compaction checkpoint, see PERF_LEDGER.md E21):** two CPU
-fixes are UNCOMMITTED in the tree (subagents were finishing when we compacted):
-(1) de-flake of `redo_group::tests::concurrent_commits_coalesce_and_get_distinct_
-ranges` (`src/redo_group.rs`), (2) SipHash→fast-hasher swap for the create-batch
-dedup (`src/server/mod.rs` + NEW `src/server/fast_hash.rs`, ~5% server CPU). Do
-`git diff` those 3 files (+ read the subagent .output files named in E21 if still
-present), run `cargo test --all` to gate, and commit if green. Then continue per
-E21 "NEXT". Do NOT git-reset/checkout (would lose the WIP).
+**⚠ ON RESUME FIRST (compaction checkpoint, see PERF_LEDGER.md E21):** two CPU-fix
+subagents were STILL RUNNING when we compacted (4 cargo procs in final verify), so
+the tree has UNCOMMITTED WIP and `git status`/`git diff` is the source of truth —
+trust it over any filename list here.
+- **SipHash→fast-hasher swap (#130)** for the create-batch dedup: at checkpoint =
+  `src/server/dispatch.rs` + `src/server/mod.rs` + NEW `src/server/fast_hash.rs`,
+  and the tree COMPILED (`cargo check` clean). ~5% server CPU, zero correctness risk.
+- **De-flake (#129)** of `redo_group::tests::concurrent_commits_coalesce_and_get_
+  distinct_ranges`: `src/redo_group.rs` — may or may not have landed at checkpoint
+  (it had reverted mid-iteration). 
+ON RESUME: read the subagent .output files (paths in E21) for their final
+verdicts/diffs; `git status`+`git diff`; `cargo test --all` to gate; commit what
+passes (separate commits). If the de-flake didn't land, re-dispatch it. Do NOT
+git-reset/checkout (would lose the WIP). Then continue per E21 "NEXT".
 
 **Current (2026-06-28, after E13-E20): PRIMARY condition WON on this host. Read
 PERF_LEDGER.md E20-E21 — latest (E20 SUPERSEDES the E18-E19 "needs Linux"
