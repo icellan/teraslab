@@ -76,7 +76,18 @@ conn-per-request over a sharded pool.**
   reference (40.7k links/s).** Both have idle cores → cap = client
   coordination+allocation, not compute.
 
-**⭐ 2026-06-29 ISOLATION TEST CORRECTS THE DIAGNOSIS — bottleneck is the SERVER:**
+**⭐⭐ 2026-06-29 BIGGEST WIN — fallocate device file → +110% (2×), gap 3×→1.4×:**
+Off-CPU+perf profiling showed the CPU-idle server's writes hit `ext4_mb_new_blocks`
+(ext4 block allocation) because the data file was SPARSE (`set_len`). Fix: fallocate
+the file (commit 5b82b2e, src/device.rs, Linux best-effort). **Measured: 13,666 →
+28,742 links/s (+110%); server CPU 0.6 → 5.8 cores; 0 fail; device tests 69/0.**
+Now 28.7k vs reference 40.7k (~1.4×, was ~3×). device_split=4 optimal (8/12 worse).
+Remaining cap = cache-shard mutex + redo lock contention (`__futex_wait`; perf:
+cache::flush_block vs CachingDevice::pread + redo::prepare_flush). NEXT LEVER:
+reduce cache/redo lock contention (separate flush vs serving lock domains; finer
+buckets; redo append batching). See RECIPE_CHAIN_FINDINGS.md §BIGGEST WIN.
+
+**[earlier] 2026-06-29 ISOLATION TEST CORRECTED THE DIAGNOSIS — bottleneck is the SERVER:**
 A mock-server test (teranode-bench-wt `TestRecipeMockServer`, commit 7f27ecf80) runs
 the recipe loadgen through the REAL client+adapter into an instant-success mock.
 **Client pipeline ceiling = ~303k links/s (1.2M store-ops/s), p50 8ms** (mac 8-core)

@@ -25,7 +25,37 @@ workload. The client-side work this campaign did (pool sharding, transport rewri
 batcher goroutine fix) gave only marginal gains precisely because the client was
 never the cap; the writeback fix (server) was the right kind of lever.
 
-**REFRAMED NEXT LEVER:** profile the teraslab SERVER's per-request latency under the
+## ⭐⭐ BIGGEST WIN (2026-06-29) — fallocate the device file: +110% (server lever)
+
+Off-CPU + perf profiling of the server (commit 5b82b2e): the CPU-idle server's
+dominant wait was `__futex_wait`, with the on-CPU work being `cache-flush` threads
+in `DirectDevice::pwrite` → **`ext4_mb_new_blocks` (ext4 block allocation)**. Root
+cause: the data file was created SPARSE (`set_len`/ftruncate), so every O_DIRECT
+write to a fresh region did synchronous ext4 block allocation inside the write
+syscall → slow writes backed up the write-back cache and parked the serving threads.
+
+**Fix:** `fallocate()` the file-backed device on creation (Linux, best-effort).
+**Measured (i3en.6xlarge, 10k chains, device_split=4): 13,666 → 28,742 links/s
+(+110%, 2×); server CPU 0.6 → 5–5.8 cores; 0 failures.** Gap to the reference
+closed from ~3× to **~1.4× (28.7k vs 40.7k)**. Device tests green (69/0).
+
+- `device_split` sweep with fallocate: 4 → 28.7k, 8 → 27.7k, 12 → 26.1k. **4 is
+  optimal** (more stores add redo/overhead). Kept at 4.
+- Re-profile after fallocate: device-I/O wait gone (ext4_mb_new_blocks gone, only
+  the cheaper `ext4_convert_unwritten_extents` of fallocate's unwritten extents
+  remains); the SOLE remaining wait is `__futex_wait`. Contended locks (perf):
+  the **cache shard mutex** (`cache::CacheState::flush_block` vs
+  `CachingDevice::pread` both take it) + `redo::RedoLog::prepare_flush`. Server at
+  ~5.8 cores with ~18 idle → still lock-serialization-bound.
+
+**NEXT LEVER (the remaining ~1.4×):** reduce cache-shard / redo lock contention
+under concurrent flush+read+write. Ideas: separate the writeback-flush lock domain
+from the serving read/write path; finer/lock-free cache buckets; reduce flush-thread
+contention with serving threads; redo append batching. Profile-guided, one at a time.
+Also consider FALLOC_FL zeroing to drop the `convert_unwritten_extents` residue.
+
+## (history) earlier REFRAMED NEXT LEVER — superseded by the fallocate win above
+profile the teraslab SERVER's per-request latency under the
 chain workload — why does an idle (~0.6–3 core) server cap the closed-loop client at
 ~55k store-ops/s? Suspects: dispatch-pool pickup latency / polling, redo
 group-commit or per-op redo wait (cf. the historical "200µs redo-sleep" note),
