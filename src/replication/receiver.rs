@@ -1776,13 +1776,15 @@ pub fn apply_op_journal(
             };
 
             // Extract frozen/conflicting/locked from the wire flags byte
-            // at offset 45 (locked=0x01, conflicting=0x02, frozen=0x04).
+            // at offset 45. The CREATE-wire numbering (locked=0x01,
+            // conflicting=0x02, frozen=0x04) is a SEPARATE namespace from the
+            // persisted `TxFlags`; use the named CREATE_FLAG_* constants.
             let (frozen, conflicting, locked) = if metadata_bytes.len() >= 46 {
                 let wire_flags = metadata_bytes[45];
                 (
-                    wire_flags & 0x04 != 0,
-                    wire_flags & 0x02 != 0,
-                    wire_flags & 0x01 != 0,
+                    wire_flags & CREATE_FLAG_FROZEN != 0,
+                    wire_flags & CREATE_FLAG_CONFLICTING != 0,
+                    wire_flags & CREATE_FLAG_LOCKED != 0,
                 )
             } else {
                 (false, false, false)

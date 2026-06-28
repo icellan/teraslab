@@ -487,9 +487,49 @@ pub const STATUS_PARTIAL_ERROR: u8 = 4;
 /// in `server/dispatch.rs`).
 pub const STATUS_DEGRADED_DURABILITY: u8 = 5;
 
+// ---------------------------------------------------------------------------
+// CREATE-wire flag bits (the `flags` byte on a `CreateItem` / OP_CREATE_BATCH)
+// ---------------------------------------------------------------------------
+//
+// IMPORTANT — wire vs persisted numbering are DIFFERENT namespaces.
+//
+// These constants describe the bit layout of the `flags` byte carried on the
+// CREATE wire (decoded in `server::dispatch` create handler and in
+// `replication::receiver`). The engine maps these wire bits onto the persisted
+// [`crate::record::TxFlags`], which use a DIFFERENT numbering:
+//
+//   wire (here):       LOCKED=0x01, CONFLICTING=0x02, FROZEN=0x04, EXTERNAL_BLOB=0x08
+//   persisted TxFlags: IS_COINBASE=0x01, CONFLICTING=0x02, LOCKED=0x04, EXTERNAL=0x08
+//
+// The footgun these named constants exist to prevent: a caller that reaches for
+// the *persisted* LOCKED bit (0x04) and puts it on the CREATE wire silently
+// creates a FROZEN UTXO (wire 0x04). Always build the CREATE `flags` byte from
+// the `CREATE_FLAG_*` constants below, never from raw bit literals or the
+// `TxFlags` constants.
+
+/// CREATE-wire bit: create this transaction LOCKED (spends rejected until an
+/// explicit `OP_SET_LOCKED_BATCH(false)` clears it). Wire 0x01 — NOT the
+/// persisted `TxFlags::LOCKED` (0x04).
+pub const CREATE_FLAG_LOCKED: u8 = 0x01;
+
+/// CREATE-wire bit: create this transaction marked CONFLICTING. Wire 0x02
+/// (coincides with `TxFlags::CONFLICTING`, but treat as a separate namespace).
+pub const CREATE_FLAG_CONFLICTING: u8 = 0x02;
+
+/// CREATE-wire bit: create this transaction FROZEN. Wire 0x04 — NOT the
+/// persisted `TxFlags::LOCKED` (0x04); persisted FROZEN is tracked separately.
+pub const CREATE_FLAG_FROZEN: u8 = 0x04;
+
+/// CREATE-wire bit (alias of [`FLAG_EXTERNAL_BLOB`]): cold_data was pre-uploaded
+/// to the blobstore via OP_STREAM_CHUNK/OP_STREAM_END. Wire 0x08.
+pub const CREATE_FLAG_EXTERNAL_BLOB: u8 = 0x08;
+
 /// Wire flags bit indicating cold_data was pre-uploaded to blobstore.
 /// Set on CreateItem.flags byte (bit 3) when the client has already
 /// uploaded the blob via OP_STREAM_CHUNK/OP_STREAM_END.
+///
+/// Retained name for existing call sites; identical to
+/// [`CREATE_FLAG_EXTERNAL_BLOB`].
 pub const FLAG_EXTERNAL_BLOB: u8 = 0x08;
 
 /// Request flag: bypass shard ownership check and read locally.
@@ -690,3 +730,83 @@ pub const MAX_UTXO_HASHES_PER_CREATE_ITEM: u32 = 131_072;
 /// cap still permits pathological conflict fanout while bounding the decoder's
 /// pre-allocation to 2 MiB per create item.
 pub const MAX_PARENT_TXIDS_PER_CREATE_ITEM: u32 = 65_536;
+
+#[cfg(test)]
+mod create_flag_tests {
+    use super::*;
+
+    /// Mirrors the CREATE-wire decode in `server::dispatch` and
+    /// `replication::receiver`: a `flags` byte → (frozen, conflicting, locked,
+    /// external) using the named constants. Kept in lockstep with those call
+    /// sites so the constant numbering can never silently drift.
+    fn decode_create_flags(flags: u8) -> (bool, bool, bool, bool) {
+        (
+            flags & CREATE_FLAG_FROZEN != 0,
+            flags & CREATE_FLAG_CONFLICTING != 0,
+            flags & CREATE_FLAG_LOCKED != 0,
+            flags & CREATE_FLAG_EXTERNAL_BLOB != 0,
+        )
+    }
+
+    #[test]
+    fn create_flag_constants_have_locked_layout_not_persisted_layout() {
+        // The footgun guard: wire LOCKED is bit 0x01, NOT the persisted
+        // TxFlags::LOCKED (0x04). Wire 0x04 is FROZEN.
+        assert_eq!(CREATE_FLAG_LOCKED, 0x01);
+        assert_eq!(CREATE_FLAG_CONFLICTING, 0x02);
+        assert_eq!(CREATE_FLAG_FROZEN, 0x04);
+        assert_eq!(CREATE_FLAG_EXTERNAL_BLOB, 0x08);
+        // EXTERNAL_BLOB alias is byte-identical to the legacy name.
+        assert_eq!(CREATE_FLAG_EXTERNAL_BLOB, FLAG_EXTERNAL_BLOB);
+    }
+
+    #[test]
+    fn create_flag_constants_are_distinct_single_bits() {
+        let bits = [
+            CREATE_FLAG_LOCKED,
+            CREATE_FLAG_CONFLICTING,
+            CREATE_FLAG_FROZEN,
+            CREATE_FLAG_EXTERNAL_BLOB,
+        ];
+        // Each is exactly one bit set.
+        for b in bits {
+            assert_eq!(b.count_ones(), 1, "flag {b:#04x} is not a single bit");
+        }
+        // No two share a bit (OR of all == sum of all == no overlap).
+        let or_all = bits.iter().fold(0u8, |acc, b| acc | b);
+        let sum_all: u8 = bits.iter().copied().sum();
+        assert_eq!(or_all, sum_all, "flag bits overlap");
+        assert_eq!(or_all, 0x0F);
+    }
+
+    #[test]
+    fn each_named_bit_decodes_to_its_field_only() {
+        assert_eq!(
+            decode_create_flags(CREATE_FLAG_LOCKED),
+            (false, false, true, false),
+            "LOCKED must set only `locked`"
+        );
+        assert_eq!(
+            decode_create_flags(CREATE_FLAG_CONFLICTING),
+            (false, true, false, false),
+            "CONFLICTING must set only `conflicting`"
+        );
+        assert_eq!(
+            decode_create_flags(CREATE_FLAG_FROZEN),
+            (true, false, false, false),
+            "FROZEN must set only `frozen`"
+        );
+        assert_eq!(
+            decode_create_flags(CREATE_FLAG_EXTERNAL_BLOB),
+            (false, false, false, true),
+            "EXTERNAL_BLOB must set only `external`"
+        );
+    }
+
+    #[test]
+    fn combined_flags_decode_independently() {
+        let combined = CREATE_FLAG_LOCKED | CREATE_FLAG_FROZEN;
+        assert_eq!(decode_create_flags(combined), (true, false, true, false));
+        assert_eq!(decode_create_flags(0), (false, false, false, false));
+    }
+}

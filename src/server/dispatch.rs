@@ -6338,9 +6338,9 @@ fn handle_create_batch(
             created_at: item.created_at,
             block_height: item.block_height,
             mined_block_infos: &mined_infos[i],
-            frozen: item.flags & 0x04 != 0,
-            conflicting: item.flags & 0x02 != 0,
-            locked: item.flags & 0x01 != 0,
+            frozen: item.flags & CREATE_FLAG_FROZEN != 0,
+            conflicting: item.flags & CREATE_FLAG_CONFLICTING != 0,
+            locked: item.flags & CREATE_FLAG_LOCKED != 0,
             external_ref,
             parent_txids: &item.parent_txids,
         };

@@ -1010,15 +1010,14 @@ async fn preload(
 
 /// CREATE-wire flags byte that marks a transaction LOCKED on the server.
 ///
-/// NOTE: the create-wire flags byte is a SEPARATE namespace from the persisted
-/// `TxFlags`. The server's create dispatch and the replication receiver both
-/// decode the create-wire byte as `locked=0x01, conflicting=0x02, frozen=0x04`
-/// — NOT the persisted-TxFlags layout (coinbase=0x01, conflicting=0x02,
-/// locked=0x04). So a LOCKED create is `flags = 0x01` on the wire. (Sending
-/// 0x04 would create a FROZEN UTXO, which `set_locked(false)` cannot clear —
-/// spends would fail FROZEN forever.) The recipe creates every tx LOCKED; a
-/// spend of a locked UTXO is rejected until the UNLOCK stream clears it.
-const FLAG_LOCKED: u8 = 0b0000_0001;
+/// Points at the shared [`CREATE_FLAG_LOCKED`] constant (single source of
+/// truth) rather than a local literal. The create-wire flags byte is a SEPARATE
+/// namespace from the persisted `TxFlags`: a LOCKED create is `flags = 0x01` on
+/// the wire; sending the persisted-LOCKED bit (0x04) would instead create a
+/// FROZEN UTXO that `set_locked(false)` cannot clear. The recipe creates every
+/// tx LOCKED; a spend of a locked UTXO is rejected until the UNLOCK stream
+/// clears it.
+const FLAG_LOCKED: u8 = CREATE_FLAG_LOCKED;
 
 /// Build `n` fresh CreateItems and the `(txid, first_utxo_hash)` of each. When
 /// `locked` is true each tx carries the LOCKED flag, so its UTXO is not spendable
