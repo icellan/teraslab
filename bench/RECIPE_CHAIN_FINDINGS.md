@@ -106,6 +106,34 @@ then writes them one-by-one.** With a 4 GiB cache under heavy writes that clones
    handoff) once the client feeds it — profile with the server actually busy.
 5. Then re-run the chain head-to-head fresh-per-round and apply the strict 4/4.
 
+## PROGRESS — writeback fix landed (commit 6c97a37)
+
+Implemented fix-plan step 0 (`src/cache.rs`): parallel per-shard flush on a
+dedicated rayon pool + `Arc<[u8]>` CoW block data (snapshot = refcount bump, not
+a memcpy). Measured on EC2 (10k chains):
+
+| metric | before | after fix | reference |
+|---|---|---|---|
+| server CPU under load | ~1.0–1.8 cores | **3.2 cores** | — |
+| create p50 | 84–128 ms | **28 ms** | 76 ms |
+| create p99 | 449–4600 ms | **193 ms** | 130 ms |
+| throughput (links/s) | ~7.5–9.4k | ~6.8–8.7k | ~40.7k |
+
+**The 1-core writeback ceiling is broken** (3.2 cores, latency now *better than
+the reference's p50*). But **throughput did NOT rise** — it is now capped
+~8.7k links/s (~35k store-ops/s) **independent of server CPU**, so the
+bottleneck has MOVED OFF the server to the **client**:
+
+- Low pool (128): 0 failures but server starved (0.6 core), high latency →
+  client offers too little concurrency.
+- High pool (512–1024): server busy (3.2 cores), great latency, but the client
+  **dial-storms** (opens one conn per concurrent caller, 2.7k–4.4k op failures)
+  → each failure kills a chain → throughput stays capped.
+
+**Next bottleneck = the Go client connection/pipelining model** (fix-plan step 1
+below) + a ~35k store-ops/s client-side ceiling (go-batcher single-worker per
+batcher / adapter — profile the CLIENT next, the server now has headroom).
+
 ## Reproduce
 
 Box: EC2 i3en.6xlarge spot, AMI `ami-08f44e8eca9095668` (us-east-1). Build
