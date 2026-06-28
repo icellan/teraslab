@@ -16,6 +16,7 @@ pub mod redb_tombstone;
 pub mod redb_unmined;
 pub mod secondary_backend;
 pub mod sharded;
+pub mod sharded_secondary;
 pub mod unmined_index;
 mod util;
 
@@ -26,6 +27,7 @@ pub use hashtable::{TxIndexEntry, TxKey};
 pub use redb_primary::CachedFieldsUpdate;
 pub use secondary_backend::{DahBackend, UnminedBackend};
 pub use sharded::ShardedIndex;
+pub use sharded_secondary::{ShardedDahIndex, ShardedSecondary, ShardedUnminedIndex};
 pub use unmined_index::{UnminedIndex, UnminedRedoEntry};
 
 use crate::allocator::SlotAllocator;
@@ -987,6 +989,30 @@ fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKe
 pub(crate) fn serialize_secondary_sections(dah: &DahIndex, unmined: &UnminedIndex) -> Vec<u8> {
     let mut buf = serialize_secondary(&DAH_SECTION_MAGIC, dah.iter());
     buf.extend_from_slice(&serialize_secondary(&UNMINED_SECTION_MAGIC, unmined.iter()));
+    buf
+}
+
+/// Serialize the DAH + unmined secondary sections from already-collected
+/// `(height, key)` pair lists, producing the SAME byte layout as
+/// [`serialize_secondary_sections`].
+///
+/// Used by the sharded-secondary checkpoint path
+/// ([`crate::index::sharded::ShardedIndex::snapshot_all_concurrent`]): the
+/// sharded wrappers spread entries across `N` shards, so their full contents are
+/// gathered into two pair vectors (each shard locked and released in turn) and
+/// serialized here. Entry ORDER within a section is irrelevant — the format is a
+/// flat `(height, key)` list that [`parse_secondary_sections`] re-inserts
+/// unordered — so a shard-then-bucket order round-trips identically to the
+/// single-backend bucket order.
+pub(crate) fn serialize_secondary_sections_from_pairs(
+    dah_pairs: &[(u32, TxKey)],
+    unmined_pairs: &[(u32, TxKey)],
+) -> Vec<u8> {
+    let mut buf = serialize_secondary(&DAH_SECTION_MAGIC, dah_pairs.iter().copied());
+    buf.extend_from_slice(&serialize_secondary(
+        &UNMINED_SECTION_MAGIC,
+        unmined_pairs.iter().copied(),
+    ));
     buf
 }
 

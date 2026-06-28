@@ -5,7 +5,10 @@
 
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend};
+use crate::index::{
+    DahBackend, PrimaryBackend, ShardedDahIndex, ShardedIndex, ShardedUnminedIndex, TxIndexEntry,
+    TxKey, UnminedBackend,
+};
 use crate::io;
 use crate::locks::StripedLocks;
 use crate::ops::create::*;
@@ -193,8 +196,19 @@ pub struct Engine {
     /// single recovered/rebuilt backend via [`ShardedIndex::from_single`]).
     index: ShardedIndex,
     locks: StripedLocks,
-    dah_index: parking_lot::Mutex<DahBackend>,
-    unmined_index: parking_lot::Mutex<UnminedBackend>,
+    /// DAH (delete-at-height) secondary index, sharded by txkey to remove the
+    /// single-global-mutex contention that previously serialised every Spend /
+    /// SetMined. Routes a key to the same shard NUMBER as the primary `index`
+    /// (same seed + hashing), so the per-key secondary shard lock taken while
+    /// holding the primary key's shard lock is a disjoint lock set — no deadlock
+    /// cycle. Sharded only for the in-memory backend; the redb variant stays
+    /// single-shard (`from_single`).
+    dah_index: ShardedDahIndex,
+    /// `unmined_since` secondary index, sharded by txkey. See [`Self::dah_index`]
+    /// for the routing + lock-ordering contract. An A/B test showed this index's
+    /// former single global mutex alone cost ~21 % of throughput under the
+    /// create-heavy workload.
+    unmined_index: ShardedUnminedIndex,
     /// In-memory set of CONFLICTING transactions, backing the
     /// `OP_QUERY_CONFLICTING` query. No redo/redb durability: rebuilt at
     /// startup from the primary index via [`Self::rebuild_conflicting_index`].
@@ -516,6 +530,16 @@ impl Engine {
         // lock table so the two granularities line up.
         let visibility = crate::visibility::VisibilityBarrier::new(locks.stripe_count());
         let store0_packed = allocator.is_packed();
+        // Shard both secondary indexes at the SAME count as the primary index so
+        // a key routes to the same shard number everywhere. `shard_in_memory`
+        // re-shards the (already recovered/reconciled) single in-memory backend
+        // by draining its entries; the redb / on-disk variant stays single-shard
+        // (self-durable, manages its own concurrency). Infallible — the in-memory
+        // shards built here have an infallible insert and the redb backend takes
+        // the non-inserting single-shard pass-through.
+        let secondary_shards = index.shard_count();
+        let dah_index = ShardedDahIndex::shard_in_memory(dah_index, secondary_shards);
+        let unmined_index = ShardedUnminedIndex::shard_in_memory(unmined_index, secondary_shards);
         let engine = Self {
             stores: vec![Store {
                 device,
@@ -526,8 +550,8 @@ impl Engine {
             placer,
             index,
             locks,
-            dah_index: parking_lot::Mutex::new(dah_index),
-            unmined_index: parking_lot::Mutex::new(unmined_index),
+            dah_index,
+            unmined_index,
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             visibility,
             redo_logs: std::sync::OnceLock::new(),
@@ -1515,16 +1539,20 @@ impl Engine {
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
         let log_ref = log_arc.as_deref();
-        let mut dah = self.dah_index.lock();
+        // The sharded wrapper locks ONLY the shard owning `key` for each call;
+        // remove + insert route to the same shard (same key), so this is the
+        // same single-shard critical section the global mutex used to be.
         let _writer_gauge = crate::metrics::writer_enter();
         if old_height != 0 {
-            dah.remove(key, log_ref)
+            self.dah_index
+                .remove(key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("dah secondary remove: {e}"),
                 })?;
         }
         if new_height != 0 {
-            dah.insert(new_height, *key, log_ref)
+            self.dah_index
+                .insert(new_height, *key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("dah secondary insert: {e}"),
                 })?;
@@ -1546,17 +1574,19 @@ impl Engine {
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
         let log_ref = log_arc.as_deref();
-        let mut unmined = self.unmined_index.lock();
+        // The sharded wrapper locks ONLY the shard owning `key`; remove + insert
+        // route to the same shard, so this is the same single-shard critical
+        // section the global mutex used to be.
         let _writer_gauge = crate::metrics::writer_enter();
         if old_height != 0 {
-            unmined
+            self.unmined_index
                 .remove(key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("unmined secondary remove: {e}"),
                 })?;
         }
         if new_height != 0 {
-            unmined
+            self.unmined_index
                 .insert(new_height, *key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("unmined secondary insert: {e}"),
@@ -1668,33 +1698,36 @@ impl Engine {
         }
 
         // Phase 2: commit both redb transactions. The redo log already has the
-        // durable record; recovery replay handles any redb commit failure.
+        // durable record; recovery replay handles any redb commit failure. Each
+        // sharded call locks only `key`'s shard (dah and unmined are separate
+        // wrappers); the two were never held at once here, so routing each by
+        // key preserves the prior critical-section structure.
         if dah_changed {
-            let mut dah = self.dah_index.lock();
             if old_dah != 0 {
-                dah.remove(key, None)
+                self.dah_index
+                    .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("dah secondary remove (post-fsync): {e}"),
                     })?;
             }
             if new_dah != 0 {
-                dah.insert(new_dah, *key, None)
-                    .map_err(|e| SpendError::StorageError {
+                self.dah_index.insert(new_dah, *key, None).map_err(|e| {
+                    SpendError::StorageError {
                         detail: format!("dah secondary insert (post-fsync): {e}"),
-                    })?;
+                    }
+                })?;
             }
         }
         if unmined_changed {
-            let mut unmined = self.unmined_index.lock();
             if old_unmined != 0 {
-                unmined
+                self.unmined_index
                     .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("unmined secondary remove (post-fsync): {e}"),
                     })?;
             }
             if new_unmined != 0 {
-                unmined
+                self.unmined_index
                     .insert(new_unmined, *key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("unmined secondary insert (post-fsync): {e}"),
@@ -1796,6 +1829,17 @@ impl Engine {
         // where a secondary reader cross-checking the primary must wait for
         // this write to drop. At one shard this is the whole index, exactly as
         // before; at N shards it is the shard owning `key`.
+        //
+        // H1 under sharded secondaries: each `dah_index`/`unmined_index` call
+        // below locks only the secondary shard owning `key` (dah and unmined
+        // route the same key to the same shard number, but they are independent
+        // wrappers → independent lock sets). Those shard locks are taken WHILE
+        // `primary_guard` is held, so the lock order stays primary.write → dah →
+        // unmined — never unmined-before-dah, never two secondary shards of one
+        // index at once. The H1 cross-check window is preserved because a
+        // secondary reader cross-checks the PRIMARY (gated by
+        // `read_shard(key)`), which still blocks on `primary_guard` until every
+        // secondary mutation here has landed.
         let mut primary_guard = self.index.write_shard(key);
         primary_guard
             .update_cached_fields(
@@ -1811,34 +1855,33 @@ impl Engine {
                 detail: format!("index update_cached_fields failed: {e}"),
             })?;
 
-        let mut dah = self.dah_index.lock();
-        let mut unmined = self.unmined_index.lock();
-
         if dah_changed {
             if old_dah != 0 {
-                dah.remove(key, None)
+                self.dah_index
+                    .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic dah remove: {e}"),
                     })?;
             }
             if new_dah != 0 {
-                dah.insert(new_dah, *key, None)
-                    .map_err(|e| SpendError::StorageError {
+                self.dah_index.insert(new_dah, *key, None).map_err(|e| {
+                    SpendError::StorageError {
                         detail: format!("atomic dah insert: {e}"),
-                    })?;
+                    }
+                })?;
             }
         }
 
         if unmined_changed {
             if old_unmined != 0 {
-                unmined
+                self.unmined_index
                     .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic unmined remove: {e}"),
                     })?;
             }
             if new_unmined != 0 {
-                unmined
+                self.unmined_index
                     .insert(new_unmined, *key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic unmined insert: {e}"),
@@ -1846,8 +1889,6 @@ impl Engine {
             }
         }
 
-        drop(unmined);
-        drop(dah);
         drop(primary_guard);
 
         Ok(())
@@ -7541,9 +7582,16 @@ impl Engine {
         })
     }
 
-    /// Get the unmined index (for testing).
-    pub fn unmined_index(&self) -> parking_lot::MutexGuard<'_, UnminedBackend> {
-        self.unmined_index.lock()
+    /// Borrow the sharded unmined secondary index.
+    ///
+    /// Returns the [`ShardedUnminedIndex`] wrapper, which exposes the same
+    /// `range_query` / `len` / `is_empty` / `insert` / `remove` surface the
+    /// callers used on the former `MutexGuard` — each call locks only the shard
+    /// owning the key (or fans out for the whole-index reads). Used by the
+    /// pruner read path (`dispatch::handle_query_old_unmined`), the metrics /
+    /// status endpoints, and tests.
+    pub fn unmined_index(&self) -> &ShardedUnminedIndex {
+        &self.unmined_index
     }
 
     /// Get the conflicting index (backs `OP_QUERY_CONFLICTING`; also used in tests).
@@ -7819,9 +7867,14 @@ impl Engine {
             .find(|entry| entry.block_id == block_id))
     }
 
-    /// Get the DAH index (for testing).
-    pub fn dah_index(&self) -> parking_lot::MutexGuard<'_, DahBackend> {
-        self.dah_index.lock()
+    /// Borrow the sharded DAH secondary index.
+    ///
+    /// Returns the [`ShardedDahIndex`] wrapper. See [`Self::unmined_index`] for
+    /// the surface and locking contract. Used by the pruner read path
+    /// (`dispatch::handle_process_expired_preservations`), the metrics / status
+    /// endpoints, and tests.
+    pub fn dah_index(&self) -> &ShardedDahIndex {
+        &self.dah_index
     }
 
     /// Number of entries in the primary index.
@@ -7962,8 +8015,8 @@ impl Engine {
     /// flush fails; the caller must treat all index state as NOT durable.
     pub fn flush_index_durable(&self) -> crate::index::Result<()> {
         self.index.flush_durable()?;
-        self.dah_index.lock().flush_durable()?;
-        self.unmined_index.lock().flush_durable()
+        self.dah_index.flush_durable()?;
+        self.unmined_index.flush_durable()
     }
 }
 
@@ -8251,17 +8304,23 @@ impl PreparedSpend {
 
         // Phase 2: commit each redb DAH transaction (intent already durable, so
         // pass no log — recovery reconciles from primary metadata regardless).
-        let mut dah = engine.dah_index.lock();
+        // The sharded wrapper locks each key's own shard per call, so distinct
+        // keys in the batch commit against independent shard locks instead of
+        // serialising on the former single global DAH mutex.
         let _writer_gauge = crate::metrics::writer_enter();
         for &(tx_key, old_height, new_height) in transitions {
             if old_height != 0 {
-                dah.remove(&tx_key, None)
+                engine
+                    .dah_index
+                    .remove(&tx_key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("dah secondary remove (batched): {e}"),
                     })?;
             }
             if new_height != 0 {
-                dah.insert(new_height, tx_key, None)
+                engine
+                    .dah_index
+                    .insert(new_height, tx_key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("dah secondary insert (batched): {e}"),
                     })?;
@@ -14667,6 +14726,177 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ))
+    }
+
+    /// Sharded-secondary consistency under concurrency: drive concurrent
+    /// `create` (→ unmined hot helper) + `mark_on_longest_chain` (→ the H1
+    /// `sync_primary_and_both_secondary_atomic` path that touches BOTH secondary
+    /// indexes under the primary shard write guard) + `set_mined` (→ DAH) over
+    /// many disjoint keys, and require the final DAH / unmined membership to
+    /// equal a single-threaded reference run of the SAME workload.
+    ///
+    /// Because each key's operations are deterministic and the key ranges are
+    /// disjoint across threads, any divergence from the reference means the
+    /// sharded secondaries lost, duplicated, or mis-routed an entry — i.e. a
+    /// broken shard route or a lock-ordering regression in the atomic path.
+    #[test]
+    fn secondary_indexes_consistent_under_concurrent_create_setmined() {
+        // txids that spread across BOTH the index-shard bytes [24..32] and the
+        // rest of the key, so the secondaries' per-key routing is exercised.
+        fn spread_txid(n: u64) -> [u8; 32] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&n.to_le_bytes());
+            txid[8..16].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            txid[16..24].copy_from_slice(&n.wrapping_mul(0xD1B5_4A32_D192_ED03).to_le_bytes());
+            txid[24..32].copy_from_slice(&n.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).to_le_bytes());
+            txid
+        }
+
+        // Deterministic per-key workload: create the tx as UNMINED (block_height
+        // > 0, no block infos → enters the unmined index), then either clear it
+        // off the unmined index via mark_on_longest_chain (n % 3 == 0) or mine it
+        // on the longest chain via set_mined, which evaluates a delete-at-height
+        // (→ enters the DAH index). The two branches give a mix of final unmined
+        // and DAH entries.
+        fn apply_one(engine: &Engine, n: u64) {
+            let txid = spread_txid(n);
+            let hashes = [[(n as u8).wrapping_add(1); 32]];
+            // The set_mined branch (n not a multiple of 3) creates the tx
+            // CONFLICTING so that the DAH evaluation sets a delete-at-height (the
+            // conflicting branch of `evaluate_delete_at_height` sets DAH
+            // unconditionally when none is set yet); the mark_on_longest_chain
+            // branch (n a multiple of 3) stays clean and only exercises the
+            // unmined transition.
+            let conflicting = !n.is_multiple_of(3);
+            engine
+                .create(&CreateRequest {
+                    tx_id: txid,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 0,
+                    size_in_bytes: 100,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &hashes,
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 0,
+                    // Non-zero, no block infos → unmined_since = 700.
+                    block_height: 700,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting,
+                    locked: false,
+                    external_ref: None,
+                    parent_txids: &[],
+                })
+                .expect("create");
+            let key = TxKey { txid };
+            if conflicting {
+                // Mine on the longest chain: clears unmined AND (because the tx
+                // is conflicting) sets a DAH — exercising the DAH hot helper.
+                engine
+                    .set_mined(&SetMinedRequest {
+                        tx_key: key,
+                        block_id: 1,
+                        block_height: 900,
+                        subtree_idx: 0,
+                        current_block_height: 1000,
+                        block_height_retention: 288,
+                        on_longest_chain: true,
+                        unset_mined: false,
+                    })
+                    .expect("set_mined");
+            } else {
+                // Clear off the unmined index via the atomic both-secondary path.
+                engine
+                    .mark_on_longest_chain(&MarkOnLongestChainRequest {
+                        tx_key: key,
+                        on_longest_chain: true,
+                        current_block_height: 1000,
+                        block_height_retention: 288,
+                    })
+                    .expect("mark_on_longest_chain");
+            }
+        }
+
+        const KEYS: u64 = 4096;
+        const THREADS: u64 = 8;
+
+        // Reference: single-threaded over all keys.
+        let reference = create_sharded_engine(16);
+        for n in 0..KEYS {
+            apply_one(&reference, n);
+        }
+        let ref_dah: std::collections::HashSet<[u8; 32]> = reference
+            .dah_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        let ref_unmined: std::collections::HashSet<[u8; 32]> = reference
+            .unmined_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+
+        // Concurrent: same workload, disjoint key ranges across threads.
+        let concurrent = create_sharded_engine(16);
+        assert!(
+            concurrent.index_shard_count() > 1,
+            "need N>1 to be meaningful"
+        );
+        let per = KEYS / THREADS;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let engine = Arc::clone(&concurrent);
+                std::thread::spawn(move || {
+                    for n in (t * per)..((t + 1) * per) {
+                        apply_one(&engine, n);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        let cc_dah: std::collections::HashSet<[u8; 32]> = concurrent
+            .dah_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        let cc_unmined: std::collections::HashSet<[u8; 32]> = concurrent
+            .unmined_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+
+        assert_eq!(
+            cc_dah, ref_dah,
+            "concurrent DAH membership must equal the single-threaded reference",
+        );
+        assert_eq!(
+            cc_unmined, ref_unmined,
+            "concurrent unmined membership must equal the single-threaded reference",
+        );
+        // Sanity: the workload actually populates DAH and clears most unmined.
+        assert!(!ref_dah.is_empty(), "reference DAH must be non-empty");
+        assert_eq!(
+            reference.dah_index().len(),
+            concurrent.dah_index().len(),
+            "DAH lengths must match (no duplicates / drops)",
+        );
+        assert_eq!(
+            reference.unmined_index().len(),
+            concurrent.unmined_index().len(),
+            "unmined lengths must match (no duplicates / drops)",
+        );
     }
 
     /// Find a `tx_id` (varying only the index-shard bytes `[24..32]`) whose

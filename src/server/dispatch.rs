@@ -11469,7 +11469,7 @@ mod tests {
 
         // Manually insert into unmined index at different heights
         {
-            let mut ui = h.engine.unmined_index();
+            let ui = h.engine.unmined_index();
             ui.insert(100, TxKey { txid: txid_a }, None).unwrap();
             ui.insert(200, TxKey { txid: txid_b }, None).unwrap();
             ui.insert(300, TxKey { txid: txid_c }, None).unwrap();
@@ -11601,7 +11601,7 @@ mod tests {
         assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
 
         {
-            let mut ui = h.engine.unmined_index();
+            let ui = h.engine.unmined_index();
             ui.insert(100, TxKey { txid }, None).unwrap();
         }
 
@@ -11774,7 +11774,7 @@ mod tests {
         // spent_utxos == 0 — process-expired must skip it after
         // the re-validation step (R-102 / IJK-09).
         {
-            let mut dah = h.engine.dah_index();
+            let dah = h.engine.dah_index();
             dah.insert(500, TxKey { txid: txid_c }, None).unwrap();
         }
 
@@ -12083,7 +12083,7 @@ mod tests {
         assert_ne!(dah_before, 0);
         assert_eq!(preserve_until(&h, txid, 100_000).status, STATUS_OK);
         {
-            let mut dah = h.engine.dah_index();
+            let dah = h.engine.dah_index();
             dah.insert(dah_before, key, None).unwrap();
         }
 

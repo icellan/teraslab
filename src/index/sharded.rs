@@ -77,9 +77,35 @@ const V2_MAX_SHARD_COUNT: usize = 256;
 ///
 /// Initialised once from `getrandom`; falls back to `RandomState` if the
 /// syscall is unavailable (e.g. restricted sandboxes).
-fn index_shard_seed() -> u64 {
+///
+/// Exposed to the crate so the sharded SECONDARY indexes
+/// ([`crate::index::sharded_secondary::ShardedSecondary`]) install the SAME
+/// seed: a given key then maps to the same shard NUMBER in both the primary and
+/// the secondary index, which keeps the cross-subsystem lock-order reasoning
+/// simple (the per-key secondary shard lock is taken while already holding the
+/// primary key's shard lock — different lock sets, same shard index).
+pub(crate) fn index_shard_seed() -> u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
     *SEED.get_or_init(crate::index::hashmix::init_process_seed)
+}
+
+/// Map `key` to a shard in `[0, shard_count)` using the SplitMix64 finaliser
+/// over txid bytes `[24..32]` XOR-ed with `seed`.
+///
+/// `shard_count` MUST be a power of two ≥ 1 (every constructor in this crate
+/// routes through `clamp_shard_count`), so `shard_count - 1` is the correct
+/// bitmask. Shared by [`ShardedIndex::index_shard_for_key`] and the sharded
+/// secondary indexes so a key routes to the same shard number in both.
+#[inline]
+pub(crate) fn shard_for_key(seed: u64, key: &TxKey, shard_count: usize) -> usize {
+    // The `try_into` on a statically-32-byte array with a fixed slice range
+    // cannot fail; `unwrap_or` maps the impossible error to 0 (panic-free
+    // library code per project rules, mirroring `locks.rs`).
+    let raw = u64::from_le_bytes(key.txid[24..32].try_into().unwrap_or([0u8; 8]));
+    // SplitMix64 finalizer over (raw XOR seed) — shared impl in
+    // `crate::index::hashmix`.
+    let x = crate::index::hashmix::splitmix64_finalize(raw ^ seed);
+    (x as usize) & (shard_count - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,17 +226,12 @@ impl ShardedIndex {
     /// stripe `[16..24]`) XOR-mixed with the per-process seed through a
     /// SplitMix64 finaliser.
     pub fn index_shard_for_key(&self, key: &TxKey) -> usize {
-        // The `try_into` on a statically-32-byte array with a fixed slice range
-        // cannot fail; `unwrap_or` maps the impossible error to 0 (panic-free
-        // library code per project rules, mirroring `locks.rs`).
-        let raw = u64::from_le_bytes(key.txid[24..32].try_into().unwrap_or([0u8; 8]));
-        // SplitMix64 finalizer over (raw XOR seed) — shared impl in
-        // `crate::index::hashmix`.
-        let x = crate::index::hashmix::splitmix64_finalize(raw ^ self.seed);
         // `shards.len()` is always a clamped power-of-two ≥ 1 (every constructor
-        // routes through `clamp_shard_count`), so `len - 1` is always the
-        // correct bitmask — no separate `shard_mask` field needed.
-        (x as usize) & (self.shards.len() - 1)
+        // routes through `clamp_shard_count`), so the shared `shard_for_key`
+        // bitmask (`len - 1`) is always correct — no separate `shard_mask`
+        // field needed. Factored so the sharded secondary indexes route a key
+        // to the same shard number under the same seed.
+        shard_for_key(self.seed, key, self.shards.len())
     }
 
     /// Acquire a read lock on the shard that owns `key`.
@@ -897,24 +918,43 @@ impl ShardedIndex {
     /// lock) are never blocked; a writer to shard `i` waits only while shard `i`
     /// itself is being serialized.
     ///
+    /// # Sharded secondaries
+    ///
+    /// `dah` / `unmined` are the sharded-secondary wrappers. They are spread
+    /// across the SAME shard count as this primary index, so:
+    /// - At one primary shard both wrappers are single-shard; the v1 path locks
+    ///   the primary shard FIRST and then the single secondary shards (write-path
+    ///   order), and delegates to the unchanged single-backend `snapshot_all`,
+    ///   producing a byte-identical v1 file.
+    /// - At N primary shards the v2 path serializes each primary region, releases
+    ///   every primary lock, then gathers the FULL (unsharded) secondary contents
+    ///   by fanning out over each wrapper's shards (`collect_pairs`, one shard
+    ///   locked at a time) — so no cross-subsystem lock is ever held at once and
+    ///   the on-disk secondary section is identical in layout to the single-table
+    ///   path (entry order within a section is irrelevant — restore re-inserts
+    ///   unordered).
+    ///
     /// # Errors
     ///
-    /// [`IndexError::FormatError`] if any shard or secondary backend is not the
-    /// in-memory variant; [`IndexError::Io`] on a filesystem failure; and the
-    /// v1 delegate's error at a single shard.
+    /// [`IndexError::FormatError`] if any primary shard or secondary backend is
+    /// not the in-memory variant; [`IndexError::Io`] on a filesystem failure; and
+    /// the v1 delegate's error at a single shard.
     pub fn snapshot_all_concurrent(
         &self,
-        dah: &parking_lot::Mutex<crate::index::DahBackend>,
-        unmined: &parking_lot::Mutex<crate::index::UnminedBackend>,
+        dah: &crate::index::ShardedDahIndex,
+        unmined: &crate::index::ShardedUnminedIndex,
         path: &std::path::Path,
     ) -> Result<(), IndexError> {
-        // One shard: keep the v1 format. Acquire the shard read lock FIRST,
-        // then the secondaries — the write path's order — so no barrier is
-        // needed to prevent the dah/unmined→shard inversion.
+        // One shard: keep the v1 format. Acquire the primary shard read lock
+        // FIRST, then the (single) secondary shards — the write path's order —
+        // so no barrier is needed to prevent the dah/unmined→shard inversion.
+        // The secondary wrappers are also single-shard here (same count as the
+        // primary), so `lock_shard0` yields the one backend, exactly matching the
+        // pre-sharding `&DahBackend` / `&UnminedBackend` the delegate expects.
         if self.shards.len() == 1 {
             let shard = self.shards[0].read();
-            let dah_g = dah.lock();
-            let unmined_g = unmined.lock();
+            let dah_g = dah.lock_shard0();
+            let unmined_g = unmined.lock_shard0();
             return shard.snapshot_all(&dah_g, &unmined_g, path);
         }
 
@@ -935,26 +975,25 @@ impl ShardedIndex {
             regions.push(idx.serialize_primary());
         }
 
-        // 2) Serialize the secondaries under their own locks, AFTER every shard
-        // lock above has been released (no nested lock → no write-path
-        // inversion).
-        let secondary = {
-            let dah_g = dah.lock();
-            let unmined_g = unmined.lock();
-            let (
-                crate::index::DahBackend::InMemory(dah_idx),
-                crate::index::UnminedBackend::InMemory(unmined_idx),
-            ) = (&*dah_g, &*unmined_g)
-            else {
-                return Err(IndexError::FormatError {
-                    detail:
-                        "ShardedIndex::snapshot_all_concurrent v2 requires in-memory dah/unmined \
+        // 2) Gather the secondaries' FULL contents AFTER every primary shard
+        // lock above has been released (no nested cross-subsystem lock → no
+        // write-path inversion). Mirror the prior "in-memory only" contract: a
+        // redb secondary is self-durable and must not be folded into the file.
+        if !dah.all_in_memory() || !unmined.all_in_memory() {
+            return Err(IndexError::FormatError {
+                detail: "ShardedIndex::snapshot_all_concurrent v2 requires in-memory dah/unmined \
                          backends"
-                            .into(),
-                });
-            };
-            crate::index::serialize_secondary_sections(dah_idx, unmined_idx)
-        };
+                    .into(),
+            });
+        }
+        // Each wrapper fans out over its own shards, locking one shard at a time
+        // (see `ShardedSecondary::collect_pairs`); the resulting pair lists are
+        // the full union, serialized into the same layout as the single-table
+        // path.
+        let dah_pairs = dah.collect_pairs();
+        let unmined_pairs = unmined.collect_pairs();
+        let secondary =
+            crate::index::serialize_secondary_sections_from_pairs(&dah_pairs, &unmined_pairs);
 
         let data = Self::assemble_v2(self.seed, &regions, &secondary);
 
@@ -2343,9 +2382,31 @@ mod tests {
             expected.insert(key.txid, entry);
         }
 
-        let dah = parking_lot::Mutex::new(crate::index::DahBackend::InMemory(DahIndex::new()));
-        let unmined =
-            parking_lot::Mutex::new(crate::index::UnminedBackend::InMemory(UnminedIndex::new()));
+        // Sharded secondaries at the SAME 16-shard count as the primary, so the
+        // v2 snapshot exercises the per-shard secondary fan-out. Populate both
+        // with pre-snapshot entries (keyed identically to the primary keys so
+        // they spread across the 16 secondary shards) and require every one to
+        // survive the restore.
+        let dah = crate::index::ShardedDahIndex::shard_in_memory(
+            crate::index::DahBackend::new_in_memory(),
+            16,
+        );
+        let unmined = crate::index::ShardedUnminedIndex::shard_in_memory(
+            crate::index::UnminedBackend::new_in_memory(),
+            16,
+        );
+        assert!(dah.shard_count() > 1, "secondaries must actually shard");
+        let mut expected_dah = std::collections::HashSet::new();
+        let mut expected_unmined = std::collections::HashSet::new();
+        for i in 0..PRE {
+            let key = make_key(i);
+            let dah_h = (i as u32 % 1000) + 1;
+            dah.insert(dah_h, key, None).unwrap();
+            expected_dah.insert(key.txid);
+            let unmined_h = (i as u32 % 700) + 1;
+            unmined.insert(unmined_h, key, None).unwrap();
+            expected_unmined.insert(key.txid);
+        }
 
         // Three writers register NEW entries (disjoint key ranges) concurrently
         // with the snapshot, so each shard is mutated while it is being — or
@@ -2376,7 +2437,7 @@ mod tests {
             w.join().unwrap();
         }
 
-        let (restored, _dah, _unmined, _flags) =
+        let (restored, restored_dah, restored_unmined, _flags) =
             ShardedIndex::restore_all(&path, 16).expect("fuzzy snapshot must restore");
         for (txid, entry) in &expected {
             let key = TxKey { txid: *txid };
@@ -2390,6 +2451,36 @@ mod tests {
             restored.len() >= PRE as usize,
             "restored index must hold at least the {PRE} pre-snapshot entries, got {}",
             restored.len()
+        );
+
+        // The sharded-secondary fan-out must serialize EVERY pre-snapshot
+        // secondary entry (these are stable — no concurrent secondary writes).
+        // `restore_all` returns the secondaries UNSHARDED, exactly as the v1
+        // path does, proving the on-disk secondary section is format-compatible.
+        assert_eq!(
+            restored_dah.len(),
+            expected_dah.len(),
+            "every pre-snapshot DAH entry must survive the sharded fan-out snapshot",
+        );
+        let restored_dah_set: std::collections::HashSet<[u8; 32]> = restored_dah
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        assert_eq!(restored_dah_set, expected_dah, "DAH membership must match");
+        assert_eq!(
+            restored_unmined.len(),
+            expected_unmined.len(),
+            "every pre-snapshot unmined entry must survive the sharded fan-out snapshot",
+        );
+        let restored_unmined_set: std::collections::HashSet<[u8; 32]> = restored_unmined
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        assert_eq!(
+            restored_unmined_set, expected_unmined,
+            "unmined membership must match",
         );
     }
 
