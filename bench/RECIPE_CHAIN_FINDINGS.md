@@ -134,6 +134,30 @@ bottleneck has MOVED OFF the server to the **client**:
 below) + a ~35k store-ops/s client-side ceiling (go-batcher single-worker per
 batcher / adapter — profile the CLIENT next, the server now has headroom).
 
+### Update 2 — client connection fix landed (commit 3381397)
+
+Fix-plan step 1 (`client/go/pool.go`,`conn.go`): bounded pre-warmed pool +
+per-conn pipelining (reuse least-loaded conn while inflight < PipelineDepth=16;
+dial only when all saturated & below MaxConns; capped non-fatal dials).
+**Eliminated the dial-storm failures: 2,777 → 0** across pool 64–1024.
+
+BUT throughput stayed ~8.7–9.8k links/s (~35k store-ops/s) and the server fell
+back to ~0.6 core. Scaling chains 10k → 30k → 50k did **NOT** raise throughput —
+it only raised latency (p50 250 → 450 → 705 ms). **So the ~35k store-ops/s cap is
+a HARD client-side serialization, not under-offered concurrency** (server idle
+throughout). The reference's client stack does 40.7k links/s (~163k store-ops/s);
+TeraSlab's adapter+client caps ~4.5× lower.
+
+### REMAINING bottleneck (next session) — the Go client/adapter throughput cap
+
+~35k store-ops/s hard cap in the **client stack** (server idle). Suspects, in
+order: (a) the Teranode teraslab **adapter's go-batcher** — ONE worker goroutine
+per batcher (store/spend/get); SetLocked+Delete not coalesced at all; (b) the
+teraslab Go client lib per-op overhead. **Next step: pprof the Go harness/adapter
+under load** (add net/http/pprof to the harness or use `go test -cpuprofile`),
+find the single-threaded hot path, parallelize it. Then re-run the chain h2h
+fresh-per-round and apply strict 4/4.
+
 ## Reproduce
 
 Box: EC2 i3en.6xlarge spot, AMI `ami-08f44e8eca9095668` (us-east-1). Build

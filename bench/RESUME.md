@@ -30,12 +30,27 @@ chain workload (the one the real node runs) TeraSlab loses badly. Full diagnosis
   introduced ~2k dial-storm failures. TCP_NODELAY on client (committed abc092b,
   correct but not dominant). redo/writeback interval + batch window = minor.
 
-**FIX PLAN (next, see RECIPE_CHAIN_FINDINGS.md §fix):** (1) client pipelining model —
-drive many in-flight requests PER connection (not one conn per caller), bound total
-conns under the cap; (2) coalesce SetLocked+Delete in the adapter like the spend
-batcher (Teranode always batches, size + 2-5ms window); (3) kill dial-storm
-failures (pre-warm pool); (4) re-profile server once actually fed; (5) re-run
-chain h2h fresh-per-round, apply strict 4/4.
+**PROGRESS (2 fixes landed + measured, both committed on feat/device-cache):**
+- ✅ **Server writeback** (6c97a37, src/cache.rs): single-thread flusher cloning
+  every dirty block each tick was the 1-core ceiling → parallel per-shard flush
+  (rayon pool) + Arc/CoW block data. Measured: server 1.8→3.2 cores, create p50
+  84→28ms, p99 449→193ms (better than ref p50). 3008 tests green.
+- ✅ **Client dial-storm** (3381397, client/go/pool.go+conn.go): one-conn-per-caller
+  → bounded pre-warmed pool + per-conn pipelining (depth 16), capped non-fatal
+  dials. Measured: op failures 2,777→0 across pool 64–1024.
+- ❌ **Throughput STILL ~9k links/s** (~35k store-ops/s) — UNCHANGED. The cap kept
+  moving (server→failures→client). Scaling chains 10k→30k→50k only raised latency
+  (p50 250→705ms), throughput flat, server idle (0.6 core): **a HARD client-stack
+  serialization at ~35k store-ops/s**. Reference does 40.7k links/s (~163k
+  store-ops/s) through ITS client — TeraSlab's adapter+client is ~4.5× slower.
+
+**REMAINING (next session) — pprof the Go client/adapter:** the ~35k cap is in the
+client stack (server has headroom). Prime suspect: the Teranode teraslab adapter's
+**go-batcher = ONE worker goroutine per batcher** (store/spend/get), and
+SetLocked+Delete not coalesced. Add pprof to the harness (or `go test -cpuprofile`),
+find the single-threaded hot path, parallelize (multiple batcher workers / shard
+the batcher). Then re-run chain h2h fresh-per-round, strict 4/4. Full detail +
+all measured tables: **bench/RECIPE_CHAIN_FINDINGS.md**.
 
 **EC2:** spot i-0c5a37ca745bdaac5 (us-east-1) UP, 6h self-terminate backstop;
 off-limits core-m-demo i-0dd1b439a6b470c4f untouched. Runners: /tmp/ts_run.sh
