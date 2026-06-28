@@ -67,17 +67,36 @@ teraslab client conn pool by hint; de-funnel the batcher (M lanes or lock-free
 accumulate); bounded pool + non-blocking acquire; consider simpler
 conn-per-request over a sharded pool.**
 
-**NEXT (needs a fresh spot box):** (1) re-provision spot NVMe box (see recipe
-above; i3en.6xlarge got reclaimed — try another type/AZ or accept reclaim risk);
-(2) deploy + MEASURE the coalescing fix (8031f0bc8) — does it move ~35k? (3)
-implement the client pool/batcher sharding from REFERENCE_CLIENT_ANALYSIS.md;
-(4) re-run chain h2h fresh-per-round, strict 4/4. Full measured tables:
-**bench/RECIPE_CHAIN_FINDINGS.md**.
+**MEASURED 3 fixes (2026-06-28 PM, fresh box, all committed):**
+- coalescing (8031f0bc8): 8.7k→11.6k links/s (+33%), create p99 ~2000→78ms (25×), f=0.
+- client pool sharding (de52542): ~0 gain → **pool lock ruled out**.
+- re-profile (cli2.prof): server now 2.8 cores (fed at last); **client is GC +
+  contention bound** — mallocgc 25.9%, selectgo/lock2/futex/lfstack.
+- **NET: 8.7k → ~12k links/s (+38%), p99 28× tighter. STILL ~3.4× behind the
+  reference (40.7k links/s).** Both have idle cores → cap = client
+  coordination+allocation, not compute.
 
-**EC2:** spot i-0c5a37ca745bdaac5 (us-east-1) UP, 6h self-terminate backstop;
-off-limits core-m-demo i-0dd1b439a6b470c4f untouched. Runners: /tmp/ts_run.sh
-(TS-only sweep), /tmp/h2h_recipe.sh (interleaved h2h). Key files on box:
-/home/ec2-user/{teraslab,harness,utxobench.test}, configs ts-bigconn.toml.
+**NEXT (mostly local code; box only to measure) — see RECIPE_CHAIN_FINDINGS.md
+§NEXT hypotheses:** (1) cut client allocations (pool wire-frame buffers + batcher
+items; mallocgc 25%); (2) de-funnel the adapter go-batcher (one channel+worker
+per op-type → M lanes / lock-free accumulate); (3) if needed, adopt the reference
+transport model (synchronous conn-per-command over the sharded pool → far fewer
+goroutines, kills scheduler thrash — see REFERENCE_CLIENT_ANALYSIS.md). Then
+re-run chain h2h fresh-per-round, strict 4/4.
+
+**EC2: torn down after this round** (measurements captured). Re-provision via the
+recipe above for the next measure. Server writeback fix + client coalescing/
+sharding are committed, so a fresh box only needs deploy+measure of the NEXT
+client allocation/batcher changes.
+
+**EC2:** all perftest boxes TERMINATED (none running). off-limits core-m-demo
+i-0dd1b439a6b470c4f untouched. To re-provision: key `teraslab-perftest-key`
+(/tmp/teraslab-perftest-key.pem) + SG sg-001ae8932446f7499 still exist in
+us-east-1; AMI ami-08f44e8eca9095668; bootstrap=/tmp/ts_bootstrap.sh; runners
+/tmp/ts_run.sh (TS-only) + /tmp/h2h_recipe.sh (h2h). Deploy = git archive HEAD →
+build server; rsync teranode-bench-wt (fix go.mod replace → /home/ec2-user/
+teraslab/client/go); `go test -c -tags utxobench`; configs: derive ts-bigconn.toml
+(max_connections[_per_ip]=16384) from bench/configs/teraslab-async.toml.
 
 ## ⚠ UNCOMMITTED WORK — survives only if noted (lives OUTSIDE this repo)
 
