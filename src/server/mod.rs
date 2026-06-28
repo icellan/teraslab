@@ -891,7 +891,6 @@ fn handle_connection_inner(
     // produces a payload `Bytes` that shares the underlying allocation
     // — no `to_vec()` copy on the request hot path.
     let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
-    read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
     // H-2: `0` disables the idle reaper; any positive value installs a
     // per-stream idle deadline enforced on each request (see the
     // `reap_idle_streams` call in the loop below).
@@ -929,6 +928,12 @@ fn handle_connection_inner(
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
+
+        // PERF: reclaim the read buffer cheaply (in place when uniquely
+        // owned, fresh allocation when a pipelined worker still holds the
+        // previous frame) so the body-assembly write below never triggers
+        // a per-frame realloc + memcpy. See `prepare_read_buf`.
+        prepare_read_buf(&mut read_buf);
 
         // Read the 4-byte length prefix
         let mut len_buf = [0u8; 4];
@@ -1182,12 +1187,14 @@ fn handle_connection_inner(
             Bytes::from(sink)
         } else {
             // Assemble the full frame (length prefix + body) into the
-            // persistent `read_buf`. The 4-byte length prefix and the
+            // persistent `read_buf`, which `prepare_read_buf` reset to
+            // len 0 with at least `READ_BUF_RETAINED_SIZE` capacity at the
+            // top of the loop. The 4-byte length prefix and the
             // `head_to_read` peeked bytes are spliced in first; the
-            // remainder is read from the stream.
-            if read_buf.len() < 4 + frame_len {
-                read_buf.resize(4 + frame_len, 0);
-            }
+            // remainder is read from the stream. `resize` grows `len` from
+            // 0 — in place against the reclaimed/fresh capacity (no
+            // realloc for frames up to `READ_BUF_RETAINED_SIZE`).
+            read_buf.resize(4 + frame_len, 0);
             read_buf[..4].copy_from_slice(&len_buf);
             read_buf[4..4 + head_to_read].copy_from_slice(&head_buf[..head_to_read]);
             if frame_len > head_to_read {
@@ -1195,22 +1202,14 @@ fn handle_connection_inner(
                     .read_exact(&mut read_buf[4 + head_to_read..4 + frame_len])
                     .map_err(|e| format!("read frame body: {e}"))?;
             }
-            let frame_bytes_mut = read_buf.split_to(4 + frame_len);
-            // Shrink read_buf IMMEDIATELY after split_to so a giant
-            // frame does not pin peak-frame capacity on the connection
-            // during dispatch + response write. Under the per-IP
-            // connection cap (`max_connections_per_ip = 64` by default)
-            // a 16 MiB peak frame would otherwise hold 64 × 16 MiB
-            // = 1 GiB pinned across concurrent slow-loris-ish clients
-            // until each connection's iteration completed.
-            reset_read_buf_if_oversized(&mut read_buf);
-            if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
-                read_buf.reserve(READ_BUF_RETAINED_SIZE - read_buf.capacity());
-            }
-            if read_buf.len() < READ_BUF_RETAINED_SIZE {
-                read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
-            }
-            frame_bytes_mut.freeze()
+            // `split_to` hands the frame off as a zero-copy `Bytes`. The
+            // buffer is reclaimed (or replaced, if a worker still holds
+            // this frame) on the NEXT iteration's `prepare_read_buf` —
+            // never via a per-frame `reserve` memcpy. An oversized frame
+            // that grew the allocation past `READ_BUF_RETAINED_SIZE` is
+            // shed there too, so peak-frame capacity is not pinned on the
+            // connection across iterations.
+            read_buf.split_to(4 + frame_len).freeze()
         };
 
         // L-01: a deadline-capped read may have shrunk the socket read
@@ -1284,10 +1283,11 @@ fn handle_connection_inner(
                 opts.cluster_secret.as_ref(),
             )?;
         }
-        // (The per-iteration read_buf reset has moved up to right
-        // after `split_to` so a giant frame does not pin per-IP
-        // capacity through the dispatch + response window. Reset
-        // again here is redundant.)
+        // The per-iteration read_buf reclaim happens at the TOP of the
+        // loop (`prepare_read_buf`), not here: doing it there lets the
+        // pipelined path observe whether the just-handed-off frame is
+        // still held by a worker (shared → fresh buffer) vs. already
+        // dispatched (unique → in-place reclaim, no copy).
     }
 }
 
@@ -1525,12 +1525,51 @@ fn dispatch_worker(
     }
 }
 
-fn reset_read_buf_if_oversized(read_buf: &mut BytesMut) {
+/// Prepare the per-connection read buffer for the next frame WITHOUT a
+/// per-frame realloc + memcpy.
+///
+/// PERF (Linux/NVMe profile, bench/LINUX_NVME_REPORT.md): ~31% of the
+/// server's ON-CPU time was `__memcpy` inside `BytesMut::reserve_inner`,
+/// driven from here. The previous design, after `split_to`-freezing each
+/// frame, eagerly called `read_buf.reserve(RET - cap)` + `resize(RET, 0)`
+/// at the *bottom* of the loop. In the pipelined path the frozen frame
+/// `Bytes` is handed to a worker and stays alive across the iteration, so
+/// the underlying allocation is still shared (`KIND_ARC`, not unique).
+/// `reserve` on a shared `BytesMut` whose remaining capacity is short
+/// abandons the buffer and **memcpys the entire retained `len` (~256 KiB
+/// of zeros) into a fresh allocation every single frame** — confirmed
+/// against `bytes-1.11.1` `reserve_inner` (KIND_ARC, non-unique branch).
+///
+/// The fix: at the TOP of each loop, `clear()` the buffer (len → 0) and
+/// `try_reclaim(RET)`. `try_reclaim` reclaims the advanced head offset
+/// in place when the buffer is uniquely owned (serial path: the previous
+/// frame was already dispatched and dropped) and NEVER reallocates — it
+/// returns `false` instead. When it returns `false` (pipelined path: a
+/// worker still holds the previous frame) we install a fresh
+/// `RET`-capacity buffer. Either way nothing is copied: the only assembly
+/// write is the `resize(4 + frame_len, 0)` for the actual frame, which is
+/// in-place against the reclaimed/fresh capacity.
+///
+/// Oversized-frame handling is preserved: a buffer grown past `RET` by a
+/// large frame is replaced with a fresh `RET`-capacity allocation so a
+/// single 16 MiB frame does not pin peak capacity on the connection.
+fn prepare_read_buf(read_buf: &mut BytesMut) {
+    // Drop any retained bytes from the previous frame (there are none in
+    // steady state — each frame is fully read then split off — but a
+    // partial assembly that errored out could leave a tail; clearing is
+    // the correctness-preserving reset point).
+    read_buf.clear();
+    // Shed an oversized allocation outright so peak-frame capacity is not
+    // pinned across iterations.
     if read_buf.capacity() > READ_BUF_RETAINED_SIZE {
         *read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
-        read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
-    } else if read_buf.len() != READ_BUF_RETAINED_SIZE {
-        read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
+        return;
+    }
+    // Cheaply reclaim the advanced head offset in place when we are the
+    // sole owner; if a worker still holds the prior frame's `Bytes`,
+    // `try_reclaim` returns false WITHOUT copying and we allocate fresh.
+    if !read_buf.try_reclaim(READ_BUF_RETAINED_SIZE) {
+        *read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
     }
 }
 
@@ -1608,15 +1647,74 @@ mod tests {
     }
 
     #[test]
-    fn read_buf_shrinks_after_small_frame() {
+    fn prepare_read_buf_sheds_oversized_allocation() {
+        // A frame larger than the retained size grew the buffer; the next
+        // `prepare_read_buf` must shed it back to the retained capacity so
+        // peak-frame memory is not pinned on the connection.
         let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE * 4);
         read_buf.resize(READ_BUF_RETAINED_SIZE * 4, 0);
         assert!(read_buf.capacity() > READ_BUF_RETAINED_SIZE);
 
-        reset_read_buf_if_oversized(&mut read_buf);
+        prepare_read_buf(&mut read_buf);
 
-        assert_eq!(read_buf.len(), READ_BUF_RETAINED_SIZE);
-        assert_eq!(read_buf.capacity(), READ_BUF_RETAINED_SIZE);
+        assert_eq!(read_buf.len(), 0, "buffer must be cleared for assembly");
+        assert_eq!(
+            read_buf.capacity(),
+            READ_BUF_RETAINED_SIZE,
+            "oversized allocation must be shed to the retained size",
+        );
+    }
+
+    /// PERF regression guard (Linux/NVMe profile: ~31% ON-CPU in
+    /// `BytesMut::reserve_inner`→memcpy). When the previous frame has been
+    /// dropped (serial path: the buffer is uniquely owned), the steady-state
+    /// assemble→split→reclaim cycle must reclaim the head offset IN PLACE —
+    /// the backing allocation pointer must not change and nothing is copied.
+    #[test]
+    fn prepare_read_buf_reclaims_in_place_when_unique() {
+        let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
+        prepare_read_buf(&mut read_buf);
+        let base_ptr = read_buf.as_ptr() as usize;
+
+        for frame_len in [4usize, 100, 4096, 65536] {
+            // Assemble a frame, hand it off, then drop it (serial dispatch).
+            read_buf.resize(frame_len, 0);
+            let frame = read_buf.split_to(frame_len).freeze();
+            drop(frame);
+
+            prepare_read_buf(&mut read_buf);
+            assert_eq!(
+                read_buf.as_ptr() as usize,
+                base_ptr,
+                "unique buffer must be reclaimed in place (no realloc/memcpy) \
+                 for frame_len={frame_len}",
+            );
+            assert_eq!(read_buf.len(), 0);
+            assert!(read_buf.capacity() >= READ_BUF_RETAINED_SIZE);
+        }
+    }
+
+    /// When a pipelined worker still holds the previous frame's `Bytes`,
+    /// the backing allocation is shared and cannot be reclaimed; the buffer
+    /// is replaced with a fresh retained-capacity allocation rather than
+    /// (the old behaviour) memcpying the retained tail into a new buffer via
+    /// `reserve`. The just-handed-off frame's bytes must stay intact.
+    #[test]
+    fn prepare_read_buf_replaces_when_frame_still_held() {
+        let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
+        prepare_read_buf(&mut read_buf);
+
+        read_buf.resize(8, 0);
+        read_buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let held = read_buf.split_to(8).freeze(); // worker keeps this alive
+
+        prepare_read_buf(&mut read_buf);
+
+        // Buffer is usable for the next frame...
+        assert_eq!(read_buf.len(), 0);
+        assert!(read_buf.capacity() >= READ_BUF_RETAINED_SIZE);
+        // ...and the handed-off frame was not disturbed.
+        assert_eq!(&held[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -1900,6 +1998,126 @@ mod tests {
         drop(client);
         let result = rx
             .recv_timeout(Duration::from_secs(2))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+    }
+
+    /// PERF + correctness regression for the per-frame buffer reclaim
+    /// (`prepare_read_buf`). Drives `handle_connection_inner` over a real
+    /// socket with MANY back-to-back frames of VARYING sizes — exercising
+    /// the assemble → split → reclaim cycle repeatedly — and interleaves a
+    /// frame deliberately fragmented across multiple `write`s with the
+    /// split landing mid-body. Every response must carry the matching
+    /// `request_id` in order: a reclaim bug that dropped, duplicated, or
+    /// corrupted retained bytes would mis-parse the `request_id` (read out
+    /// of the frame body after the buffer was reclaimed) or desynchronise
+    /// the stream, and this would catch it.
+    #[test]
+    fn many_frames_and_partial_split_decode_correctly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(2),
+                    write_timeout: Duration::from_secs(2),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+
+        // Send 64 PING frames whose payload length varies frame-to-frame so
+        // the per-frame `resize`/reclaim runs at many sizes. PING ignores
+        // payload bytes but still echoes `request_id`, so the request_id is
+        // the integrity witness for the post-reclaim frame body.
+        let count = 64u64;
+        for id in 1..=count {
+            let payload_len = (id as usize * 7) % 257; // 0..256, varies
+            let req = RequestFrame {
+                request_id: 1000 + id,
+                op_code: OP_PING,
+                flags: 0,
+                payload: Bytes::from(vec![(id & 0xFF) as u8; payload_len]),
+            };
+            client.write_all(&req.encode()).unwrap();
+        }
+        // Read all 64 responses; they must arrive in order with matching
+        // request_ids (serial path → in-order), proving no frame was
+        // dropped or duplicated across the reclaim cycle.
+        for id in 1..=count {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(
+                resp.request_id,
+                1000 + id,
+                "response {id} out of order or corrupted",
+            );
+            assert_eq!(resp.status, STATUS_OK);
+        }
+
+        // Now a frame deliberately fragmented across writes, with the split
+        // landing MID-BODY (after the length prefix + head peek but before
+        // the body is complete). This exercises the `read_exact` body
+        // completion against the reclaimed buffer.
+        let frag = RequestFrame {
+            request_id: 9999,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Bytes::from(vec![0xCD; 200]),
+        }
+        .encode();
+        // First chunk: length prefix + part of the head/body.
+        client.write_all(&frag[..10]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Second chunk: more body, still incomplete.
+        client.write_all(&frag[10..120]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Final chunk: completes the frame.
+        client.write_all(&frag[120..]).unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(resp.request_id, 9999, "fragmented frame mis-decoded");
+        assert_eq!(resp.status, STATUS_OK);
+
+        // One more whole frame after the fragmented one: the stream must
+        // remain in sync (a reclaim/offset bug would desynchronise here).
+        let after = RequestFrame {
+            request_id: 12345,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Bytes::new(),
+        };
+        client.write_all(&after.encode()).unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(resp.request_id, 12345);
+        assert_eq!(resp.status, STATUS_OK);
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(3))
             .expect("server should exit after client disconnect");
         assert!(result.is_ok(), "connection result was {result:?}");
     }
