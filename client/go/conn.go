@@ -46,6 +46,14 @@ func (c *pipeConn) hasInflight() bool {
 	return c.inflight.Load() > 0
 }
 
+// inflightCount returns the number of requests currently in flight on this
+// connection (including health pings). The pool uses this to pick the
+// least-loaded connection and to decide whether a connection still has headroom
+// below the pipeline-depth target before growing the pool.
+func (c *pipeConn) inflightCount() int64 {
+	return c.inflight.Load()
+}
+
 // dial creates a new pipelined connection to the given address.
 func dial(ctx context.Context, addr string, timeout time.Duration) (*pipeConn, error) {
 	d := net.Dialer{Timeout: timeout}

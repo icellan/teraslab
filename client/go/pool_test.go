@@ -81,12 +81,26 @@ func TestPoolReusesConnections(t *testing.T) {
 	defer ln.Close()
 
 	p := newPool(ln.Addr().String(), PoolConfig{
-		MinConns:    1,
-		MaxConns:    4,
-		DialTimeout: 2 * time.Second,
-		HealthCheck: 1 * time.Hour,
+		MinConns:     1,
+		MaxConns:     4,
+		PrewarmConns: 1,
+		DialTimeout:  2 * time.Second,
+		HealthCheck:  1 * time.Hour,
 	})
 	defer p.close()
+
+	// Wait for the single warm connection so the sequential gets below pipeline
+	// onto it rather than racing the cold-start dial.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p.mu.Lock()
+		ready := len(p.conns) == 1 && len(p.dialSem) == 0
+		p.mu.Unlock()
+		if ready || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	ctx := context.Background()
 	c1, err := p.get(ctx)
@@ -98,46 +112,79 @@ func TestPoolReusesConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Since pipelining shares connections, they should be the same.
+	// A sequential caller pipelines onto the single warm connection: both gets
+	// (each below PipelineDepth, the prior request having completed) return it.
 	if c1 != c2 {
 		t.Error("expected same connection (pipelining reuse)")
 	}
 }
 
-// TestPoolGrowsWhenPickedConnIsBusy verifies the pool spreads concurrent load
-// across connections up to MaxConns instead of funnelling everything through a
-// single pipelined connection. The server processes each connection's requests
-// serially, so one connection caps throughput regardless of pipelining; under
-// concurrent load (the round-robin-picked connection already has in-flight
-// requests) and below MaxConns, get() must dial a fresh connection.
-func TestPoolGrowsWhenPickedConnIsBusy(t *testing.T) {
+// TestPoolGrowsOnlyWhenConnsSaturated verifies the pipelining model: the pool
+// reuses a connection while it has headroom below PipelineDepth, and only dials
+// a new connection once EVERY existing connection is saturated to PipelineDepth
+// — and never beyond MaxConns. This replaces the old dial-per-busy-caller
+// behavior that caused a dial storm under high concurrency.
+func TestPoolGrowsOnlyWhenConnsSaturated(t *testing.T) {
 	ln := startEchoServer(t)
 	defer ln.Close()
 
 	const maxConns = 4
+	const depth = 8
 	p := newPool(ln.Addr().String(), PoolConfig{
-		MinConns:    1,
-		MaxConns:    maxConns,
-		DialTimeout: 2 * time.Second,
-		HealthCheck: 1 * time.Hour,
+		MinConns:      1,
+		MaxConns:      maxConns,
+		PipelineDepth: depth,
+		PrewarmConns:  1,
+		DialTimeout:   2 * time.Second,
+		HealthCheck:   1 * time.Hour,
 	})
 	defer p.close()
 
 	ctx := context.Background()
 
-	// First get establishes one connection.
+	// Wait for pre-warm to settle so no background dial holds a dial-semaphore
+	// slot during the saturation loop below (which would make a grow attempt
+	// fall back to an existing conn instead of dialing, flaking the count).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p.mu.Lock()
+		ready := len(p.conns) >= 1 && len(p.dialSem) == 0
+		p.mu.Unlock()
+		if ready || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// First get finds the prewarmed connection.
 	c1, err := p.get(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Mark every existing connection busy before each get so the pool is forced
-	// to grow rather than reuse. It must grow up to MaxConns and no further.
+	// Below PipelineDepth, get() must reuse the same connection, not grow.
+	c1.inflight.Store(depth - 1)
+	c2, err := p.get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2 != c1 {
+		t.Fatalf("expected reuse of the warm connection below PipelineDepth, got a different conn")
+	}
+	p.mu.Lock()
+	n := len(p.conns)
+	p.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("pool grew while a connection had pipeline headroom: size=%d", n)
+	}
+
+	// Now saturate every connection to PipelineDepth before each get so the pool
+	// is forced to grow. It must grow up to MaxConns and no further.
 	seen := map[*pipeConn]bool{c1: true}
-	for i := 0; i < maxConns*2; i++ {
+	for i := 0; i < maxConns*3; i++ {
 		p.mu.Lock()
 		for _, c := range p.conns {
-			c.inflight.Add(1)
+			c.inflight.Store(int64(depth))
 		}
 		p.mu.Unlock()
 
@@ -149,10 +196,10 @@ func TestPoolGrowsWhenPickedConnIsBusy(t *testing.T) {
 	}
 
 	if len(seen) != maxConns {
-		t.Errorf("expected pool to grow to exactly MaxConns=%d distinct connections under concurrent load, got %d", maxConns, len(seen))
+		t.Errorf("expected pool to grow to exactly MaxConns=%d distinct connections, got %d", maxConns, len(seen))
 	}
 	p.mu.Lock()
-	n := len(p.conns)
+	n = len(p.conns)
 	p.mu.Unlock()
 	if n != maxConns {
 		t.Errorf("expected pool size %d, got %d", maxConns, n)
