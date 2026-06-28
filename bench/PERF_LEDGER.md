@@ -987,3 +987,27 @@ the gain there will be larger. VALIDATED (helps, no regressions). Bench configs 
 NEXT for strict cert: quiet multi-core host head-to-head (NEW vs reference) — macOS
 noise (load ~5) still inflates TS p99.9 vs the reference; the tail benefit needs idle
 cores to fully show. EC2 24-core is the venue.
+
+## E24 — *** WIN *** TeraSlab beats the reference, strict 4/4 PASS (quiet-host cert) (2026-06-28)
+
+EC2 i3en.6xlarge (24 vCPU, NVMe ext4, both backends fair/async), 10 interleaved
+fresh-per-round rounds, IF=512, **0 failed both sides**. Full: bench/FINAL_REPORT.md;
+raw: bench/results/20260628-ec2-quiet-cert/.
+
+| op | TS ops/s | REF | Δ tput | TS p99.9 | REF p99.9 | Δ p99.9 |
+|---|---|---|---|---|---|---|
+| spend | 15012±39 | 13303 | +12.9% | 15.6ms | 22.6ms | -30.9% |
+| create | 20038±49 | 17744 | +12.9% | 20.7ms | 23.9ms | -13.2% |
+| get | 10039 | 8887 | +13.0% | 13.5ms | 20.6ms | -34.3% |
+| setmined | 5038 | 4458 | +13.0% | 1.2ms | 4.4ms | -71.9% |
+
+**STRICT 4/4 PASS:** C1 spend-tput ✓, C2 spend-p99.9 ✓ (15.6≤22.6 — the
+macOS-failing condition now wins by 31%), C3 guardrail ✓ (every op better on tput
+AND p99.9), C4 margin ✓ (Δ1710 ≫ 2σ=77). Green gate (test/clippy/fmt/client) ✓;
+opponent-name grep empty ✓.
+
+Decisive fix: per-store dispatch sharding (51bb8b2) broke the global DispatchPool
+funnel (~40-48k cap, CPU 30% idle) → +13% tput + robust tail; built on the BytesMut
+realloc fix (1020125, -31% on-CPU) + txid placement (68c120f). Arc: E20 (buffered
+redo closed spend-p99.9 on macOS) → E22 (BytesMut) → E23 (sharding validated +13%)
+→ E24 (WIN on quiet 24-core host).

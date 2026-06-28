@@ -1,0 +1,47 @@
+{
+  "backend": "teraslab",
+  "concurrency": 512,
+  "measure_seconds": 15.000047235,
+  "results": [
+    {
+      "op": "create",
+      "ok_total": 359265,
+      "failed_total": 0,
+      "latency_samples": 300607,
+      "ops_sec": 20040.403559435857,
+      "p50_us": 12661,
+      "p99_us": 16765,
+      "p999_us": 20947
+    },
+    {
+      "op": "spend",
+      "ok_total": 268857,
+      "failed_total": 0,
+      "latency_samples": 225129,
+      "ops_sec": 15008.552738067428,
+      "p50_us": 10594,
+      "p99_us": 12866,
+      "p999_us": 13643
+    },
+    {
+      "op": "get",
+      "ok_total": 179876,
+      "failed_total": 0,
+      "latency_samples": 150696,
+      "ops_sec": 10046.368363986021,
+      "p50_us": 9812,
+      "p99_us": 11846,
+      "p999_us": 12790
+    },
+    {
+      "op": "setmined",
+      "ok_total": 90188,
+      "failed_total": 0,
+      "latency_samples": 75573,
+      "ops_sec": 5038.184134758159,
+      "p50_us": 111,
+      "p99_us": 342,
+      "p999_us": 972
+    }
+  ]
+}
