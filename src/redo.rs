@@ -2750,6 +2750,31 @@ impl RedoLog {
         }
     }
 
+    /// Commit a [`PreEncoded`] (body encoded OFF the lock) into the in-memory
+    /// buffer with sequence `seq` already drawn — the E7 no-re-serialize commit.
+    /// Patches the real sequence over the 8-byte placeholder in `e.body`, CRCs
+    /// the whole body, frames the length, and pushes the on-disk frame
+    /// `[length:4][body][crc:4]`. This is byte-for-byte what
+    /// [`Self::buffer_entry`] → [`RedoEntry::serialize`] produces, but consumes
+    /// the pre-encoded body (MOVE of `e.op` into the read-cache entry — no clone,
+    /// no re-encode). Caller guarantees space (linear capacity / ring roll).
+    fn buffer_preencoded(&mut self, mut e: PreEncoded, seq: u64) {
+        e.body[..ENTRY_SEQ_SIZE].copy_from_slice(&seq.to_le_bytes());
+        let crc = crc32fast::hash(&e.body);
+        let length = (e.body.len() + ENTRY_CHECKSUM_SIZE) as u32;
+        self.buffer.extend_from_slice(&length.to_le_bytes());
+        self.buffer.extend_from_slice(&e.body);
+        self.buffer.extend_from_slice(&crc.to_le_bytes());
+        self.pending_entries.push(RedoEntry {
+            sequence: seq,
+            op: e.op,
+        });
+        if let Some(m) = redo_metrics() {
+            m.redo_append_total.inc();
+            self.buffered_entries += 1;
+        }
+    }
+
     /// Linear append: buffer `op` if it fits within `entries_capacity`.
     fn append_with_capacity(&mut self, op: RedoOp, entries_capacity: u64) -> Result<u64> {
         // F-G4-002: refuse to append on a poisoned log.
@@ -2958,20 +2983,24 @@ impl RedoLog {
         if entries.is_empty() {
             return Ok(None);
         }
-        // Ring layout: reconstruct ops and use the existing path (handles segment
-        // rolls). Ring is default-off and not the concurrency target.
-        if self.is_ring() {
-            let ops: Vec<RedoOp> = entries.into_iter().map(|e| e.op).collect();
-            return self.append_atomic(&ops);
-        }
 
-        // Linear fast path. On-disk size of each entry is
-        // length-prefix(4) + body + crc(4); `body` already holds
-        // [seq placeholder(8)][op_type(1)][op_data].
-        let total: u64 = entries
+        // On-disk size of each entry is length-prefix(4) + body + crc(4); `body`
+        // already holds [seq placeholder(8)][op_type(1)][op_data], so this needs
+        // NO serialize — exactly the size `RedoEntry::serialize` would emit. The
+        // sizes are computed once and reused by both the ring fit pre-check and
+        // the linear capacity check.
+        let lens: Vec<u64> = entries
             .iter()
             .map(|e| (ENTRY_HEADER_SIZE + e.body.len() + ENTRY_CHECKSUM_SIZE) as u64)
-            .sum();
+            .collect();
+
+        if self.is_ring() {
+            return self.append_preencoded_atomic_ring(entries, &lens);
+        }
+
+        // Linear fast path. Capacity-check the WHOLE batch before drawing any
+        // sequence or buffering a byte (all-or-nothing on `LogFull`).
+        let total: u64 = lens.iter().sum();
         let entries_capacity = self.append_capacity();
         let used = self.write_pos + self.buffer.len() as u64;
         if used + total > entries_capacity {
@@ -2983,25 +3012,71 @@ impl RedoLog {
 
         let mut first = u64::MAX;
         let mut last = 0u64;
-        for mut e in entries {
+        for e in entries {
             let seq = self.draw_sequence();
             first = first.min(seq);
             last = last.max(seq);
-            // Patch the real sequence over the placeholder, then CRC the payload
-            // body (the original `serialize` CRCs exactly these bytes).
-            e.body[..ENTRY_SEQ_SIZE].copy_from_slice(&seq.to_le_bytes());
-            let crc = crc32fast::hash(&e.body);
-            let length = (e.body.len() + ENTRY_CHECKSUM_SIZE) as u32;
-            self.buffer.extend_from_slice(&length.to_le_bytes());
-            self.buffer.extend_from_slice(&e.body);
-            self.buffer.extend_from_slice(&crc.to_le_bytes());
-            self.pending_entries.push(RedoEntry {
-                sequence: seq,
-                op: e.op,
-            });
-            if let Some(m) = redo_metrics() {
-                m.redo_append_total.inc();
-                self.buffered_entries += 1;
+            self.buffer_preencoded(e, seq);
+        }
+        Ok(Some((first, last)))
+    }
+
+    /// Ring fast path for [`Self::append_preencoded_atomic`]: consume the
+    /// pre-encoded bodies into the segment ring with NO re-serialize and NO op
+    /// clone. Byte- and semantics-identical to appending the same ops via
+    /// [`Self::append_atomic`] (which routes through [`Self::append_ring`] +
+    /// [`Self::buffer_entry`]) — but it patches+CRCs+frames each pre-encoded body
+    /// directly instead of re-encoding the op under the lock.
+    ///
+    /// All-or-nothing: [`Self::ring_batch_fits`] pre-measures the WHOLE batch
+    /// (rolls accounted for, same contract `append_atomic` feeds it) BEFORE any
+    /// sequence is drawn, so a [`RedoError::LogFull`] leaves no buffered residue
+    /// and burns no sequence. Each entry then either fits the active segment or
+    /// triggers a roll handled exactly as [`Self::append_ring`] does
+    /// (`flush_pwrite_no_sync` the active segment, advance `active_seg`, reset
+    /// `write_pos_in_seg`); the pre-check guarantees the roll never hits a live
+    /// segment mid-batch. `seg_max_seq` is updated per entry for reclaim.
+    fn append_preencoded_atomic_ring(
+        &mut self,
+        entries: Vec<PreEncoded>,
+        lens: &[u64],
+    ) -> Result<Option<(u64, u64)>> {
+        // Pre-check the whole batch against ring capacity (with rolls) before any
+        // mutation — identical fit contract to the op-append path.
+        self.ring_batch_fits(lens)?;
+
+        let mut first = u64::MAX;
+        let mut last = 0u64;
+        for (e, &len) in entries.into_iter().zip(lens.iter()) {
+            // Mirror `append_ring`'s per-entry roll decision: an entry that does
+            // not fit the active segment's remaining space rolls to the next
+            // segment (the fit pre-check has already proven the next segment is
+            // free, so the roll cannot run into a live segment here).
+            let need_roll = {
+                let r = self.ring.as_ref().expect("ring log");
+                let used_in_seg = r.write_pos_in_seg + self.buffer.len() as u64;
+                used_in_seg + len > r.segment_size
+            };
+            if need_roll {
+                // Persist the active segment's buffered bytes (pwrite, no fsync —
+                // durability comes from the caller's flush) so the buffer never
+                // spans a segment boundary, then advance to the next segment.
+                self.flush_pwrite_no_sync()?;
+                let r = self.ring.as_mut().expect("ring log");
+                r.active_seg = (r.active_seg + 1) % r.segment_count;
+                r.write_pos_in_seg = 0;
+            }
+
+            let seq = self.draw_sequence();
+            first = first.min(seq);
+            last = last.max(seq);
+            self.buffer_preencoded(e, seq);
+            // Track the active segment's high-water sequence for reclaim.
+            if let Some(r) = self.ring.as_mut() {
+                let a = r.active_seg as usize;
+                if seq > r.seg_max_seq[a] {
+                    r.seg_max_seq[a] = seq;
+                }
             }
         }
         Ok(Some((first, last)))
@@ -6994,6 +7069,155 @@ mod tests {
             log.next_sequence, next_seq_before,
             "rejected batch burned no sequence"
         );
+    }
+
+    /// A non-trivial `Create` op — the hot path. `data_len` controls the size of
+    /// `record_bytes` so a test can force the pre-encoded `body` well past the
+    /// 64-byte head-room `pre_encode` reserves (exercising buffer growth that the
+    /// old `with_capacity(.. + 64)` under-sized).
+    fn create_op(n: u8, data_len: usize) -> RedoOp {
+        RedoOp::Create {
+            tx_key: test_key(n),
+            device_id: 0,
+            record_offset: 0x4000 + u64::from(n) * 0x1000,
+            utxo_count: 3,
+            is_conflicting: false,
+            record_bytes: (0..data_len).map(|i| (i as u8) ^ n).collect(),
+            parent_txids: Vec::new(),
+        }
+    }
+
+    /// E7 ring fast path: appending pre-encoded bodies into a ring is BYTE- and
+    /// SEMANTICALLY-identical to appending the same ops via `append_atomic`. Two
+    /// rings with identical geometry receive the same op mix (incl. a hot-path
+    /// `Create` and ops whose `op_data` exceeds 64 bytes); the returned sequence
+    /// ranges match and `recover()` yields identical entries — proving the
+    /// consuming ring branch reproduces the on-disk frames exactly.
+    #[test]
+    fn ring_preencoded_append_byte_identical_to_op_append() {
+        let ops: Vec<RedoOp> = vec![
+            freeze(1),
+            create_op(2, 200),  // hot path, op_data > 64 bytes
+            create_op(3, 1024), // forces buffer growth past pre_encode's +64
+            RedoOp::SetMined {
+                tx_key: test_key(4),
+                block_id: 7,
+                block_height: 42,
+                subtree_idx: 1,
+                unset: false,
+            },
+            freeze(5),
+        ];
+
+        // Log A: classic op append.
+        let (_dev_a, mut log_a) = make_ring(8192, 4);
+        let range_a = log_a.append_atomic(&ops).unwrap().expect("range A");
+        log_a.flush().unwrap();
+
+        // Log B: pre-encoded consume path.
+        let (_dev_b, mut log_b) = make_ring(8192, 4);
+        let pre: Vec<PreEncoded> = ops.iter().cloned().map(RedoEntry::pre_encode).collect();
+        let range_b = log_b
+            .append_preencoded_atomic(pre)
+            .unwrap()
+            .expect("range B");
+        log_b.flush().unwrap();
+
+        // (a) Identical returned sequence ranges.
+        assert_eq!(range_a, range_b, "sequence ranges must match");
+
+        // (b) Identical recovered entries (same sequences AND same ops) — this is
+        // the byte/semantic-identity proof: a divergent frame would deserialize
+        // to a different op or drop out on CRC.
+        let rec_a = log_a.recover().unwrap();
+        let rec_b = log_b.recover().unwrap();
+        assert_eq!(rec_a.len(), ops.len(), "all ops recovered");
+        assert_eq!(rec_a.len(), rec_b.len(), "same entry count");
+        for (a, b) in rec_a.iter().zip(rec_b.iter()) {
+            assert_eq!(a.sequence, b.sequence, "sequence mismatch");
+            assert_eq!(a.op, b.op, "op mismatch");
+        }
+        // And the entries are exactly the ops we appended, in order.
+        for (entry, op) in rec_b.iter().zip(ops.iter()) {
+            assert_eq!(&entry.op, op, "recovered op differs from appended op");
+        }
+    }
+
+    /// E7 ring fast path: an over-capacity pre-encoded batch fails `LogFull`
+    /// (transient, NOT poison) with NO residue and NO burned sequence — then the
+    /// next successful single append gets the very sequence the failed batch
+    /// would have started at (no gap). Mirrors the op-append all-or-nothing
+    /// guarantee for the ring.
+    #[test]
+    fn ring_preencoded_logfull_is_atomic_no_burned_seq() {
+        let (_dev, mut log) = make_ring(4096, 3);
+
+        // A batch far larger than the whole 3-segment ring.
+        let huge: Vec<RedoOp> = (0..10_000u32).map(|i| freeze((i % 251) as u8)).collect();
+        let pre: Vec<PreEncoded> = huge.iter().cloned().map(RedoEntry::pre_encode).collect();
+
+        let next_seq_before = log.next_sequence;
+        let active_before = log.ring.as_ref().unwrap().active_seg;
+        match log.append_preencoded_atomic(pre) {
+            Err(RedoError::LogFull { .. }) => {}
+            other => panic!("expected LogFull, got {other:?}"),
+        }
+        assert!(!log.poisoned, "an over-capacity batch must not poison");
+        assert!(log.buffer.is_empty(), "rejected batch left no residue");
+        assert_eq!(
+            log.next_sequence, next_seq_before,
+            "rejected batch burned no sequence"
+        );
+        assert_eq!(
+            log.ring.as_ref().unwrap().active_seg,
+            active_before,
+            "rejected batch did not advance the cursor"
+        );
+
+        // The next successful append gets the sequence the batch would have
+        // started at — no gap was punched.
+        let seq = log.append(freeze(9)).unwrap();
+        assert_eq!(
+            seq, next_seq_before,
+            "next append must reuse the un-burned sequence"
+        );
+    }
+
+    /// E7 ring fast path: a pre-encoded batch that spans at least one segment
+    /// roll is buffered whole and recovers intact — all entries present,
+    /// sequences strictly increasing, ops byte-identical to what was appended.
+    #[test]
+    fn ring_preencoded_spans_segment_roll() {
+        let (_dev, mut log) = make_ring(4096, 4);
+        // Enough small entries to overflow one 4096-byte segment and force a roll.
+        let ops: Vec<RedoOp> = (0..120u32).map(|i| freeze((i % 251) as u8)).collect();
+        let pre: Vec<PreEncoded> = ops.iter().cloned().map(RedoEntry::pre_encode).collect();
+
+        let (first, last) = log
+            .append_preencoded_atomic(pre)
+            .unwrap()
+            .expect("non-empty range");
+        assert_eq!(
+            last - first,
+            ops.len() as u64 - 1,
+            "contiguous range over all ops"
+        );
+        assert!(
+            log.ring.as_ref().unwrap().active_seg >= 1,
+            "the batch must have spanned at least one segment roll"
+        );
+        log.flush().unwrap();
+
+        let recovered = log.recover().unwrap();
+        assert_eq!(recovered.len(), ops.len(), "all entries present after roll");
+        let mut prev = None;
+        for (entry, op) in recovered.iter().zip(ops.iter()) {
+            if let Some(p) = prev {
+                assert!(entry.sequence > p, "sequences strictly increasing");
+            }
+            prev = Some(entry.sequence);
+            assert_eq!(&entry.op, op, "op intact across the roll");
+        }
     }
 
     /// Append `n` entries one at a time, returning `(sequence, active_seg)` for
