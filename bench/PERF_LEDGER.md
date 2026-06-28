@@ -1042,3 +1042,28 @@ FINDINGS surfaced by the realistic workload:
 
 NEXT: (a) optimize setMined-under-burst (the recipe peak); (b) review the flag
 namespace; (c) full realistic benchmark on EC2 (24-core NVMe) for real capacity.
+
+## E26 — Local fixes: flag-namespace, setMined RAM O(1), Go locked-on-create (2026-06-28)
+
+Per user directives ("fix findings locally first" + locked-on-create + setMined intent):
+- **Flag-namespace footgun** (86a6257): named CREATE-wire flag constants
+  (CREATE_FLAG_LOCKED=0x01 / CONFLICTING=0x02 / FROZEN=0x04 / EXTERNAL_BLOB=0x08) in
+  src/protocol + Rust-client re-export + Go-client (FlagLocked…); replaced the magic
+  numbers in dispatch.rs:6341 + receiver.rs; wire-vs-persisted numbering documented;
+  tests both languages.
+- **Go locked-on-create**: the Teranode teraslab adapter `txToCreateItem` already set
+  the create-wire locked bit from `opts.Locked` AT CREATE (not a separate SetLocked);
+  switched its magic 0x01/0x02/0x04 to `teraslab.FlagLocked/FlagConflicting/FlagFrozen`
+  (single source of truth). go build clean. (in teranode-bench-wt integration repo,
+  stores/utxo/teraslab/convert.go.)
+- **setMined RAM-index O(1)** (e100363): the unmined + DAH secondary indexes stored
+  each height's keys as `Vec<TxKey>` (O(bucket) `retain` removal); a mined block's
+  ~10k same-height txs collapse into one bucket → O(n²)/burst. Changed to
+  `HashSet<TxKey, FastTxHasher>` → O(1) insert/remove. Green (2532 lib + client 62).
+
+**setMined design CONFIRMED correct**: in buffered mode it updates the RAM index (now
+O(1)) + appends the buffered redo (no ack-path fsync — `journal_secondary_ops`
+`append_atomic`) + writes the record via the writeback cache (lazy). The macOS-Docker
+setMined-BURST stall (multi-second) is the device-writeback HOST artifact (cache
+flusher can't keep up on the slow Docker volume), NOT the ack path. NEEDS NVMe to
+confirm setMined-burst is fast (the design goal) + the realistic capacity/head-to-head.
