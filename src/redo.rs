@@ -676,7 +676,13 @@ pub enum RedoOp {
         /// The exact bytes the engine wrote at `record_offset` (metadata
         /// header + UTXO slots + cold data). Recovery `pwrite`s these
         /// directly so the post-replay record is byte-identical.
-        record_bytes: Vec<u8>,
+        ///
+        /// Stored as `Arc<[u8]>` so cloning the op (the journaling path
+        /// clones every op once for replication / `pending_entries`
+        /// retention) is a refcount bump rather than a deep copy of the
+        /// record. Derefs to `&[u8]`, so serialization and every read site
+        /// are unchanged and the on-disk / wire format is byte-identical.
+        record_bytes: Arc<[u8]>,
         /// Parent transaction IDs whose conflicting-child lists must
         /// receive `tx_key.txid`. Empty when `is_conflicting` is false.
         parent_txids: Vec<[u8; 32]>,
@@ -1696,7 +1702,7 @@ impl RedoOp {
                 if data.len() < record_end + 2 {
                     return None;
                 }
-                let record_bytes = data[50..record_end].to_vec();
+                let record_bytes: Arc<[u8]> = Arc::from(&data[50..record_end]);
                 let parents_count_raw =
                     u16::from_le_bytes(data[record_end..record_end + 2].try_into().unwrap())
                         as usize;
@@ -5477,7 +5483,7 @@ mod tests {
             record_offset: 0x1000,
             utxo_count: 1,
             is_conflicting: false,
-            record_bytes: vec![0xAB; 200],
+            record_bytes: vec![0xAB_u8; 200].into(),
             parent_txids: Vec::new(),
         });
     }
@@ -5491,7 +5497,7 @@ mod tests {
             record_offset: 0x2000,
             utxo_count: 4,
             is_conflicting: true,
-            record_bytes: vec![0xCD; 512],
+            record_bytes: vec![0xCD_u8; 512].into(),
             parent_txids: parents,
         });
     }
@@ -5506,9 +5512,172 @@ mod tests {
             record_offset: 0x3000_0000,
             utxo_count: 1024,
             is_conflicting: true,
-            record_bytes: big,
+            record_bytes: big.into(),
             parent_txids: vec![[0xEE; 32]; 3],
         });
+    }
+
+    /// PERF: `RedoOp::Create.record_bytes` was changed from `Vec<u8>` to
+    /// `Arc<[u8]>` so the per-op clone in the journaling path is a refcount
+    /// bump, not a record deep-copy. The on-disk / wire format MUST be
+    /// byte-identical: `serialize_data` writes `[record_len:4 LE][record_bytes]`
+    /// regardless of the owning container (`Arc<[u8]>` derefs to `&[u8]`).
+    ///
+    /// This test (a) asserts the serialized op-body bytes equal a
+    /// hand-constructed reference matching the documented wire layout, and
+    /// (b) round-trips the op through the full redo-entry path (serialize +
+    /// CRC + length framing, then deserialize) and asserts the recovered op
+    /// `==` the original. Together they prove the Arc change did not perturb
+    /// the format.
+    #[test]
+    fn create_op_serialize_roundtrip_byte_identical() {
+        // Non-trivial record split across the two example sizes from the spec
+        // (300 + 1100 bytes) so the 4-byte record_len field carries a real
+        // value and the body is large enough to be a meaningful copy.
+        let mut record: Vec<u8> = Vec::with_capacity(1400);
+        record.extend((0..300u32).map(|i| (i % 251) as u8));
+        record.extend((0..1100u32).map(|i| (i % 199 + 7) as u8));
+        assert_eq!(record.len(), 1400);
+
+        let tx_key = make_txid(0x3C);
+        let device_id = 2u8;
+        let record_offset = 0x0000_1234_5678_9ABCu64;
+        let utxo_count = 17u32;
+        let is_conflicting = true;
+        let parents: Vec<[u8; 32]> = vec![make_txid(0xA0).txid, make_txid(0xB1).txid];
+
+        let op = RedoOp::Create {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+            is_conflicting,
+            record_bytes: Arc::<[u8]>::from(record.clone()),
+            parent_txids: parents.clone(),
+        };
+
+        // (a) Golden op-body bytes: exactly the documented layout
+        //   [tx_key:32][device_id:1][record_offset:8 LE][utxo_count:4 LE]
+        //   [is_conflicting:1][record_len:4 LE][record_bytes][parents:2 LE][32*N]
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(&tx_key.txid);
+        expected.push(device_id);
+        expected.extend_from_slice(&record_offset.to_le_bytes());
+        expected.extend_from_slice(&utxo_count.to_le_bytes());
+        expected.push(1); // is_conflicting
+        expected.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&record);
+        expected.extend_from_slice(&(parents.len() as u16).to_le_bytes());
+        for p in &parents {
+            expected.extend_from_slice(p);
+        }
+
+        let mut body = Vec::new();
+        op.serialize_data(&mut body);
+        assert_eq!(
+            body, expected,
+            "serialized Create op body diverged from the documented wire layout"
+        );
+        // The record_len prefix must hold the true 1400-byte length so the
+        // reader allocates exactly the right buffer.
+        let len_at = 32 + 1 + 8 + 4 + 1;
+        assert_eq!(
+            u32::from_le_bytes(body[len_at..len_at + 4].try_into().unwrap()),
+            1400,
+            "record_len prefix must equal the record byte length"
+        );
+
+        // (b) Full entry round-trip through the redo log: recovered op must
+        // compare equal (PartialEq on Arc<[u8]> compares contents).
+        let (_, mut log) = make_log(1024 * 1024);
+        log.append_and_flush(op.clone()).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1, "expected exactly 1 recovered entry");
+        assert_eq!(
+            entries[0].op, op,
+            "recovered Create op does not match original after Arc change"
+        );
+        // And the recovered record bytes are exactly the 1400 we wrote.
+        match &entries[0].op {
+            RedoOp::Create { record_bytes, .. } => {
+                assert_eq!(&record_bytes[..], &record[..]);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    /// PERF: cloning a `RedoOp::Create` must share the `record_bytes`
+    /// allocation (an `Arc` refcount bump), NOT deep-copy the record. This is
+    /// the whole point of the change — the journaling path clones each op once
+    /// (engine `append_redo_ops_routed`, `append_atomic`'s `op.clone()`,
+    /// `pending_entries` retention) and that clone must be O(1).
+    #[test]
+    fn create_op_clone_shares_record_arc() {
+        let record: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let op = RedoOp::Create {
+            tx_key: make_txid(0x77),
+            device_id: 1,
+            record_offset: 0x4000,
+            utxo_count: 8,
+            is_conflicting: false,
+            record_bytes: Arc::<[u8]>::from(record),
+            parent_txids: Vec::new(),
+        };
+        let cloned = op.clone();
+        let a = match &op {
+            RedoOp::Create { record_bytes, .. } => record_bytes,
+            other => panic!("expected Create, got {other:?}"),
+        };
+        let b = match &cloned {
+            RedoOp::Create { record_bytes, .. } => record_bytes,
+            other => panic!("expected Create, got {other:?}"),
+        };
+        assert!(
+            Arc::ptr_eq(a, b),
+            "cloning RedoOp::Create must share the record_bytes Arc allocation \
+             (refcount bump), not deep-copy the record"
+        );
+        // Contents still equal — clone is a faithful copy at the value level.
+        assert_eq!(&a[..], &b[..]);
+    }
+
+    /// PERF: appending a `Create` to a redo log, flushing, and recovering must
+    /// reconstruct the exact `record_bytes` that were written — the recovery
+    /// path reads `record_len` + bytes back into an owned buffer and converts
+    /// to `Arc<[u8]>`. Guards that the Arc field change did not lose or
+    /// truncate the variable-length record on the recovery read path.
+    #[test]
+    fn recover_reconstructs_create_record_bytes() {
+        let record: Vec<u8> = (0..777u32).map(|i| (i.wrapping_mul(31)) as u8).collect();
+        let op = RedoOp::Create {
+            tx_key: make_txid(0x5E),
+            device_id: 0,
+            record_offset: 0x9_0000,
+            utxo_count: 6,
+            is_conflicting: false,
+            record_bytes: Arc::<[u8]>::from(record.clone()),
+            parent_txids: Vec::new(),
+        };
+
+        let (_, mut log) = make_log(1024 * 1024);
+        log.append_and_flush(op).unwrap();
+        let entries = log.recover().unwrap();
+        assert_eq!(entries.len(), 1, "expected exactly 1 recovered entry");
+        match &entries[0].op {
+            RedoOp::Create { record_bytes, .. } => {
+                assert_eq!(
+                    record_bytes.len(),
+                    777,
+                    "recovered record length must match the written record"
+                );
+                assert_eq!(
+                    &record_bytes[..],
+                    &record[..],
+                    "recovered record_bytes must be byte-for-byte the written record"
+                );
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
     }
 
     #[test]

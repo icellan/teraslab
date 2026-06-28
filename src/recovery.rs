@@ -4949,7 +4949,7 @@ mod tests {
                 record_offset: off_a,
                 utxo_count: 3,
                 is_conflicting: false,
-                record_bytes: rb_a.clone(),
+                record_bytes: rb_a.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -4960,7 +4960,7 @@ mod tests {
                 record_offset: off_b,
                 utxo_count: 3,
                 is_conflicting: false,
-                record_bytes: rb_b.clone(),
+                record_bytes: rb_b.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5176,7 +5176,7 @@ mod tests {
                 record_offset,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes: rb.clone(),
+                record_bytes: rb.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5292,7 +5292,7 @@ mod tests {
                     record_offset: off_a,
                     utxo_count,
                     is_conflicting: false,
-                    record_bytes: rb.clone(),
+                    record_bytes: rb.clone().into(),
                     parent_txids: Vec::new(),
                 })
                 .unwrap();
@@ -5318,7 +5318,7 @@ mod tests {
                     record_offset: off_b,
                     utxo_count,
                     is_conflicting: false,
-                    record_bytes: rb.clone(),
+                    record_bytes: rb.clone().into(),
                     parent_txids: Vec::new(),
                 })
                 .unwrap();
@@ -5468,7 +5468,7 @@ mod tests {
                 record_offset: bogus_offset,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes: vec![0u8; base as usize],
+                record_bytes: vec![0u8; base as usize].into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5484,7 +5484,7 @@ mod tests {
                 record_offset: off_b,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes: rb_b.clone(),
+                record_bytes: rb_b.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5606,7 +5606,7 @@ mod tests {
                         record_offset: offset,
                         utxo_count,
                         is_conflicting: false,
-                        record_bytes: rb,
+                        record_bytes: rb.into(),
                         parent_txids: Vec::new(),
                     })
                     .unwrap();
@@ -6014,7 +6014,7 @@ mod tests {
             record_offset,
             utxo_count,
             is_conflicting: false,
-            record_bytes: record_bytes.clone(),
+            record_bytes: record_bytes.clone().into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -6105,7 +6105,7 @@ mod tests {
             record_offset: crate::allocator::DATA_REGION_OFFSET,
             utxo_count,
             is_conflicting: false,
-            record_bytes,
+            record_bytes: record_bytes.into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -6502,7 +6502,7 @@ mod tests {
             record_offset,
             utxo_count,
             is_conflicting: false,
-            record_bytes: record_bytes.clone(),
+            record_bytes: record_bytes.clone().into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -8792,7 +8792,7 @@ mod tests {
             record_offset: offset_a,
             utxo_count,
             is_conflicting: false,
-            record_bytes,
+            record_bytes: record_bytes.into(),
             parent_txids: Vec::new(),
         })
         .unwrap();

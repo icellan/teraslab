@@ -1265,7 +1265,7 @@ mod tests {
             record_offset,
             utxo_count,
             is_conflicting: false,
-            record_bytes,
+            record_bytes: record_bytes.into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -1923,7 +1923,7 @@ mod tests {
                 record_offset: region_r,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes,
+                record_bytes: record_bytes.into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();

@@ -514,7 +514,7 @@ impl Simulation {
                         record_offset,
                         utxo_count,
                         is_conflicting: false,
-                        record_bytes,
+                        record_bytes: record_bytes.into(),
                         parent_txids: Vec::new(),
                     })
                     .is_err()

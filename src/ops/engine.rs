@@ -14037,7 +14037,7 @@ mod tests {
                 record_offset: 4096,
                 utxo_count: 0,
                 is_conflicting: false,
-                record_bytes: vec![0u8; 64],
+                record_bytes: vec![0u8; 64].into(),
                 parent_txids: Vec::new(),
             },
             RedoOp::Freeze {

@@ -6192,7 +6192,11 @@ fn handle_create_batch(
         create_req: CreateRequest<'a>,
         utxo_count: u32,
         reservation_size: u64,
-        record_bytes: Vec<u8>,
+        // `Arc<[u8]>` so the record image is allocated once here and shared
+        // (refcount bump) between the `RedoOp::Create` redo entry and the
+        // retained `ValidCreate` used for the coalesced device write —
+        // `RedoOp::Create.record_bytes` is `Arc<[u8]>`.
+        record_bytes: std::sync::Arc<[u8]>,
         /// F-IJ-002: keeps the external blob pinned against the periodic
         /// blob-GC sweep from the digest check until index registration.
         /// Released on drop — every failure path (item `continue`, batch
@@ -6211,8 +6215,10 @@ fn handle_create_batch(
         /// PERF #9: the exact on-device record image (== the CreateV2 redo
         /// bytes). Written to device in one coalesced bulk pwrite per
         /// contiguous run (Phase 2b) after the redo flush; Phase 3 then only
-        /// registers the index entry.
-        record_bytes: Vec<u8>,
+        /// registers the index entry. `Arc<[u8]>`: same allocation as the
+        /// `RedoOp::Create.record_bytes` entry (shared by refcount bump, not
+        /// re-copied).
+        record_bytes: std::sync::Arc<[u8]>,
         /// See [`PendingCreate::blob_pin`]; held until after
         /// `create_at_offset` registers the index entry. Never read —
         /// exists purely for its `Drop` (un-pin).
@@ -6370,6 +6376,10 @@ fn handle_create_batch(
             }
         };
         let reservation_size = record_bytes.len() as u64;
+        // Move the freshly-built record image into an `Arc<[u8]>` once (the one
+        // unavoidable copy). Downstream the redo entry and the retained
+        // `ValidCreate` share this allocation via refcount bumps.
+        let record_bytes: std::sync::Arc<[u8]> = record_bytes.into();
         pending_items.push(PendingCreate {
             idx: i,
             create_req,
@@ -6485,11 +6495,13 @@ fn handle_create_batch(
             record_offset: region.offset,
             utxo_count: pending.utxo_count,
             is_conflicting: pending.create_req.conflicting,
-            // PERF #9: clone the record image — the original is retained on
-            // ValidCreate for the coalesced bulk device write (Phase 2b). The
-            // redo append serializes its own copy regardless, so this is one
-            // memcpy, not an extra serialize.
-            record_bytes: pending.record_bytes.clone(),
+            // PERF: `record_bytes` is `Arc<[u8]>`, so this clone is a refcount
+            // bump — NOT a record copy. The same allocation is retained on
+            // ValidCreate (moved below) for the coalesced bulk device write
+            // (Phase 2b). The redo append still serializes its own bytes into
+            // the log buffer; the per-op CLONE the journaling path does
+            // (engine `append_redo_ops_routed`, `pending_entries`) is now O(1).
+            record_bytes: std::sync::Arc::clone(&pending.record_bytes),
             parent_txids,
         });
         valid_items.push(ValidCreate {
@@ -6554,7 +6566,7 @@ fn handle_create_batch(
         bulk_by_store.entry(v.device_id).or_default().push((
             v.record_offset,
             v.reservation_size,
-            v.record_bytes.as_slice(),
+            &v.record_bytes[..],
         ));
     }
     // Fan the per-store coalesced device writes across scoped threads so the N

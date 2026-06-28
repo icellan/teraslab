@@ -169,7 +169,7 @@ fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
         record_offset,
         utxo_count,
         is_conflicting: false,
-        record_bytes: record_bytes.clone(),
+        record_bytes: record_bytes.clone().into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
@@ -220,7 +220,7 @@ fn boundary_after_record_write_before_replication_local_state_consistent() {
         record_offset,
         utxo_count,
         is_conflicting: false,
-        record_bytes: record_bytes.clone(),
+        record_bytes: record_bytes.clone().into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
@@ -362,7 +362,7 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
         record_offset,
         utxo_count,
         is_conflicting: false,
-        record_bytes,
+        record_bytes: record_bytes.into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
@@ -449,7 +449,7 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
         record_offset,
         utxo_count,
         is_conflicting: false,
-        record_bytes,
+        record_bytes: record_bytes.into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
@@ -527,7 +527,7 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
         record_offset,
         utxo_count,
         is_conflicting: false,
-        record_bytes,
+        record_bytes: record_bytes.into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
@@ -599,7 +599,7 @@ fn full_pipeline_recovery_reconstructs_create_v2() {
         record_offset,
         utxo_count,
         is_conflicting: false,
-        record_bytes,
+        record_bytes: record_bytes.into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
@@ -683,7 +683,7 @@ fn wal_create_plus_set_mined(
         record_offset,
         utxo_count: 1,
         is_conflicting: false,
-        record_bytes,
+        record_bytes: record_bytes.into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
@@ -933,7 +933,7 @@ fn boundary_set_mined_overflow_realloc_does_not_clobber_neighbor() {
         record_offset: offset_b,
         utxo_count: 2,
         is_conflicting: false,
-        record_bytes: record_bytes_b,
+        record_bytes: record_bytes_b.into(),
         parent_txids: Vec::new(),
     })
     .unwrap();
