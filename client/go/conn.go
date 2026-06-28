@@ -53,6 +53,16 @@ func dial(ctx context.Context, addr string, timeout time.Duration) (*pipeConn, e
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
+	// Disable Nagle's algorithm. Requests and responses are small framed
+	// messages; with Nagle on, the client's small request writes are held in
+	// the kernel TCP send buffer waiting for a peer ACK, interacting with the
+	// peer's delayed-ACK to add 40 ms–3 s of latency per RPC. The server sets
+	// TCP_NODELAY on its accept path (src/server/mod.rs); without the matching
+	// client-side setting, every round-trip still pays the Nagle/delayed-ACK
+	// tax. Best-effort: only *net.TCPConn supports it.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
 	pc := &pipeConn{
 		conn:     conn,
 		writeBuf: make([]byte, 0, 4096),
