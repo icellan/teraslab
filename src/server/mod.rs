@@ -493,13 +493,26 @@ impl Server {
         let dispatch_pool: Option<Arc<DispatchPool>> = if self.config.pipeline_depth > 1 {
             let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
             let num_workers = cores.saturating_mul(8).clamp(16, 256);
+            // One dispatch shard per store (total stores = device_paths.len() *
+            // device_split, matching `ServerConfig` validation). Routing each
+            // request to its store's shard by txid hash breaks the single-queue
+            // funnel (PERF_LEDGER E22); the per-shard worker subset shares the
+            // bounded `num_workers` total threads.
+            let num_shards = self
+                .config
+                .device_paths
+                .len()
+                .saturating_mul(self.config.device_split)
+                .max(1);
             tracing::info!(
                 num_workers,
+                num_shards,
                 pipeline_depth = self.config.pipeline_depth,
-                "per-connection request pipelining enabled (shared dispatch pool)"
+                "per-connection request pipelining enabled (per-store sharded dispatch pool)"
             );
             Some(DispatchPool::new(
                 num_workers,
+                num_shards,
                 self.engine.clone(),
                 self.cluster.clone(),
                 self.redo_log.clone(),
@@ -1394,77 +1407,197 @@ fn write_response(
         .map_err(|e| format!("write response: {e}"))
 }
 
-/// Process-wide bounded dispatch pool shared by ALL pipelined connections.
+/// One independent dispatch shard: its own queue + condvar, polled only by its
+/// own subset of workers. Sharding the queue this way removes the single
+/// process-wide `Mutex<VecDeque>` that every pipelined connection used to
+/// funnel through (PERF, PERF_LEDGER E22: ~40-48k ops/s software cap, ~192
+/// workers contending one mutex while CPU sat ~30% idle).
+struct DispatchShard {
+    queue: Mutex<std::collections::VecDeque<WorkItem>>,
+    not_empty: parking_lot::Condvar,
+}
+
+/// Compute the dispatch shard index for a routing txid, matching Phase 1's
+/// txid placement (`src/subdevice.rs` `StorePlacer::place` in
+/// [`crate::subdevice::PlacementStrategy::Txid`]): the store/shard is the
+/// little-endian `u64` of the LAST 8 bytes of the txid, modulo the shard count.
+///
+/// Routing a request to "its" store's shard is purely an affinity hint -- the
+/// engine always reaches the correct store via the index entry's `device_id`
+/// (reads/mutations) or the placer (creates), never via the dispatch shard. A
+/// mis-routed request still executes correctly; routing only affects
+/// contention/affinity. See [`routing_shard`].
+#[inline]
+fn shard_index_for_txid(txid: &[u8; 32], k: usize) -> usize {
+    if k <= 1 {
+        return 0;
+    }
+    let last8: [u8; 8] = txid[24..32]
+        .try_into()
+        .expect("a 32-byte txid always has 8 trailing bytes");
+    (u64::from_le_bytes(last8) % k as u64) as usize
+}
+
+/// Byte offset of the FIRST item's txid in a batch request payload, by opcode,
+/// or `None` for ops that carry no per-record txid (admin/cluster/ping/etc).
+///
+/// These offsets are the fixed header sizes the matching `decode_*_batch`
+/// codecs skip before the first item (see `src/protocol/codec.rs`). For
+/// `decode_txid_batch`-based ops the offset is `4 + shared_len`. The offset is
+/// only used to derive a routing hint, so an unknown/short payload safely falls
+/// back to shard 0 -- correctness never depends on it.
+#[inline]
+fn first_txid_offset(op_code: u16) -> Option<usize> {
+    Some(match op_code {
+        // count(4) + ignore_c(1) + ignore_l(1) + cbh(4) + bhr(4)
+        OP_SPEND_BATCH => 14,
+        // count(4) + cbh(4) + bhr(4)
+        OP_UNSPEND_BATCH => 12,
+        // count(4) + block_id(4) + height(4) + subtree(4) + 2xu8 + cbh(4) + bhr(4)
+        OP_SET_MINED_BATCH => 26,
+        // count(4)
+        OP_CREATE_BATCH => 4,
+        // count(4) + height(4) + spendable_after(4)
+        OP_REASSIGN_BATCH => 12,
+        // slot-item batches: count(4)
+        OP_FREEZE_BATCH | OP_UNFREEZE_BATCH => 4,
+        // get-spend items: count(4)
+        OP_GET_SPEND_BATCH => 4,
+        // get batch: count(4) + field_mask(4)
+        OP_GET_BATCH => 8,
+        // remove-conflicting-child pairs: count(4)
+        OP_REMOVE_CONFLICTING_CHILD_BATCH => 4,
+        // txid_batch ops: 4 + shared_len (shared_len per dispatch handler)
+        OP_SET_CONFLICTING_BATCH => 4 + 9,
+        OP_SET_LOCKED_BATCH => 4 + 1,
+        OP_PRESERVE_UNTIL_BATCH => 4 + 4,
+        OP_DELETE_BATCH => 4,
+        OP_MARK_LONGEST_CHAIN_BATCH => 4 + 9,
+        OP_QUERY_CONFLICTING | OP_PRESERVE_TRANSACTIONS => 4 + 4,
+        _ => return None,
+    })
+}
+
+/// Choose the dispatch shard for a request: extract the FIRST item's txid (a
+/// routing hint -- a batch may span stores, which the engine handles
+/// per-record) and hash it like Phase 1 placement. Ops with no txid
+/// (admin/cluster/ping) route to shard 0. Always returns a valid index in
+/// `0..k`.
+fn routing_shard(request: &RequestFrame, k: usize) -> usize {
+    if k <= 1 {
+        return 0;
+    }
+    let payload = &request.payload;
+    match first_txid_offset(request.op_code) {
+        Some(off) if payload.len() >= off + 32 => {
+            let txid: [u8; 32] = payload[off..off + 32]
+                .try_into()
+                .expect("checked len >= off + 32");
+            shard_index_for_txid(&txid, k)
+        }
+        // No txid, or payload too short to contain one: a harmless hint miss.
+        _ => 0,
+    }
+}
+
+/// Process-wide bounded dispatch pool shared by ALL pipelined connections,
+/// sharded into `K` independent queues (one per store) to break the single
+/// queue funnel.
 ///
 /// A fixed set of worker threads pull [`WorkItem`]s and dispatch them
 /// concurrently, writing each response to its own connection's writer. Sharing
-/// one pool — instead of spawning `pipeline_depth` threads per connection —
+/// one pool -- instead of spawning `pipeline_depth` threads per connection --
 /// keeps the total thread count bounded regardless of connection count (the
-/// per-connection model exploded to `conns × depth` threads and thrashed the
+/// per-connection model exploded to `conns x depth` threads and thrashed the
 /// scheduler). Per-connection concurrency is still bounded to `depth` by each
 /// connection's [`ConnInFlight`]; the pool size bounds total concurrent
 /// dispatch (and thus the degree of redo group-commit coalescing).
+///
+/// PERF (PERF_LEDGER E22): with a single shared queue, ALL pipelined
+/// connections contended one `Mutex<VecDeque>` + `Condvar`. Splitting into one
+/// shard per store -- and routing each [`WorkItem`] to its store's shard by
+/// txid hash (an affinity hint; correctness still flows through the
+/// index/placer) -- removes that funnel while keeping total threads bounded.
 struct DispatchPool {
-    queue: Mutex<std::collections::VecDeque<WorkItem>>,
-    not_empty: parking_lot::Condvar,
+    shards: Vec<DispatchShard>,
     closed: AtomicBool,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl DispatchPool {
-    /// Spawn `num_workers` dispatch threads. Each holds clones of the
+    /// Spawn the worker threads, sharded into `num_shards` independent queues
+    /// (`num_shards = num_stores`, min 1). The `num_workers` total threads are
+    /// split evenly across shards (`max(1, num_workers / num_shards)` each), so
+    /// the total stays bounded as before. Each worker holds clones of the
     /// engine-global handles (cloned `Arc`s, so the workers are `'static`) and
-    /// dispatches with its own throwaway [`ConnectionState`] — valid because
+    /// dispatches with its own throwaway [`ConnectionState`] -- valid because
     /// only non-pipelineable (blob-stream) ops touch connection state and those
-    /// never reach the pool.
+    /// never reach the pool, so ANY worker can process ANY [`WorkItem`].
     fn new(
         num_workers: usize,
+        num_shards: usize,
         engine: Arc<Engine>,
         cluster: Option<Arc<RunningCluster>>,
         redo_log: Option<Arc<Mutex<RedoLog>>>,
         blob_store: Option<Arc<dyn BlobStore>>,
         max_batch_size: u32,
     ) -> Arc<Self> {
+        let num_shards = num_shards.max(1);
+        let workers_per_shard = (num_workers / num_shards).max(1);
+        let mut shards = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            shards.push(DispatchShard {
+                queue: Mutex::new(std::collections::VecDeque::new()),
+                not_empty: parking_lot::Condvar::new(),
+            });
+        }
         let pool = Arc::new(Self {
-            queue: Mutex::new(std::collections::VecDeque::new()),
-            not_empty: parking_lot::Condvar::new(),
+            shards,
             closed: AtomicBool::new(false),
             workers: Mutex::new(Vec::new()),
         });
-        let mut handles = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let pool = Arc::clone(&pool);
-            let engine = Arc::clone(&engine);
-            let cluster = cluster.clone();
-            let redo_log = redo_log.clone();
-            let blob_store = blob_store.clone();
-            handles.push(std::thread::spawn(move || {
-                dispatch_worker(
-                    &pool,
-                    &engine,
-                    cluster.as_deref(),
-                    redo_log.as_deref(),
-                    blob_store.as_deref(),
-                    max_batch_size,
-                );
-            }));
+        let mut handles = Vec::with_capacity(num_shards * workers_per_shard);
+        for shard_idx in 0..num_shards {
+            for _ in 0..workers_per_shard {
+                let pool = Arc::clone(&pool);
+                let engine = Arc::clone(&engine);
+                let cluster = cluster.clone();
+                let redo_log = redo_log.clone();
+                let blob_store = blob_store.clone();
+                handles.push(std::thread::spawn(move || {
+                    dispatch_worker(
+                        &pool,
+                        shard_idx,
+                        &engine,
+                        cluster.as_deref(),
+                        redo_log.as_deref(),
+                        blob_store.as_deref(),
+                        max_batch_size,
+                    );
+                }));
+            }
         }
         *pool.workers.lock() = handles;
         pool
     }
 
-    /// Reader: enqueue a request. Backpressure is applied by the caller via the
-    /// connection's [`ConnInFlight::acquire`] BEFORE submitting, so the queue is
-    /// bounded transitively by (active connections × depth).
+    /// Reader: enqueue a request onto the shard chosen by [`routing_shard`].
+    /// Backpressure is applied by the caller via the connection's
+    /// [`ConnInFlight::acquire`] BEFORE submitting, so the queue is bounded
+    /// transitively by (active connections x depth).
     fn submit(&self, item: WorkItem) {
-        self.queue.lock().push_back(item);
-        self.not_empty.notify_one();
+        let idx = routing_shard(&item.request, self.shards.len());
+        let shard = &self.shards[idx];
+        shard.queue.lock().push_back(item);
+        shard.not_empty.notify_one();
     }
 
-    /// Worker: block for the next item without holding a lock across the wait,
-    /// so all workers can park concurrently. `None` once closed and drained.
-    fn recv(&self) -> Option<WorkItem> {
-        let mut q = self.queue.lock();
+    /// Worker: block for the next item on shard `shard_idx` without holding a
+    /// lock across the wait, so all workers can park concurrently. `None` once
+    /// closed and the shard is drained.
+    fn recv(&self, shard_idx: usize) -> Option<WorkItem> {
+        let shard = &self.shards[shard_idx];
+        let mut q = shard.queue.lock();
         loop {
             if let Some(item) = q.pop_front() {
                 return Some(item);
@@ -1472,15 +1605,17 @@ impl DispatchPool {
             if self.closed.load(Ordering::Acquire) {
                 return None;
             }
-            self.not_empty.wait(&mut q);
+            shard.not_empty.wait(&mut q);
         }
     }
 
-    /// Stop the pool: wake all workers so they observe the drained queue and
-    /// exit, then join them. Called on server shutdown.
+    /// Stop the pool: wake every shard's workers so they observe the drained
+    /// queue and exit, then join them all. Called on server shutdown.
     fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
-        self.not_empty.notify_all();
+        for shard in &self.shards {
+            shard.not_empty.notify_all();
+        }
         let handles = std::mem::take(&mut *self.workers.lock());
         for h in handles {
             let _ = h.join();
@@ -1488,12 +1623,15 @@ impl DispatchPool {
     }
 }
 
-/// One shared-pool dispatch worker. Pulls items, dispatches each (pipeline-
-/// eligible ops never touch `conn_state`, so a private throwaway state is
-/// sufficient), writes the response to that item's connection writer, and
-/// releases the connection's in-flight slot.
+/// One shard-bound dispatch worker. Pulls items from its assigned shard
+/// (`shard_idx`), dispatches each (pipeline-eligible ops never touch
+/// `conn_state`, so a private throwaway state is sufficient, and any worker can
+/// process any item -- the shard is only an affinity hint), writes the response
+/// to that item's connection writer, and releases the connection's in-flight
+/// slot.
 fn dispatch_worker(
     pool: &DispatchPool,
+    shard_idx: usize,
     engine: &Engine,
     cluster: Option<&RunningCluster>,
     redo_log: Option<&Mutex<RedoLog>>,
@@ -1501,7 +1639,7 @@ fn dispatch_worker(
     max_batch_size: u32,
 ) {
     let mut conn_state = ConnectionState::new();
-    while let Some(item) = pool.recv() {
+    while let Some(item) = pool.recv(shard_idx) {
         let response = dispatch::handle_request(
             &item.request,
             engine,
@@ -2367,7 +2505,7 @@ mod tests {
         let server_engine = engine.clone();
         let server_shutdown = shutdown.clone();
         // Real shared pool, exercising the production dispatch path.
-        let pool = DispatchPool::new(8, engine.clone(), None, None, None, 1024);
+        let pool = DispatchPool::new(8, 1, engine.clone(), None, None, None, 1024);
         let server_pool = Arc::clone(&pool);
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -2432,6 +2570,415 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("server should exit after client disconnect");
         assert!(result.is_ok(), "connection result was {result:?}");
+        pool.shutdown();
+    }
+
+    /// Build a 32-byte txid whose LAST 8 bytes are the little-endian `tail`.
+    /// Placement (`StorePlacer::place` in Txid mode) and dispatch routing both
+    /// key on these last 8 bytes, so `tail` directly selects the store/shard.
+    fn txid_with_tail(tail: u64) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[24..32].copy_from_slice(&tail.to_le_bytes());
+        t
+    }
+
+    /// A two-store engine in deterministic txid-placement mode (store =
+    /// last8(txid) % 2), exercised through the wire dispatch path.
+    fn two_store_txid_engine() -> Engine {
+        use crate::index::ShardedIndex;
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut engine = Engine::new_multi_store(
+            dev0,
+            alloc0,
+            vec![(dev1, alloc1)],
+            ShardedIndex::from_single(Index::new(1024).unwrap().into()),
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        engine.set_placement_strategy(crate::subdevice::PlacementStrategy::Txid);
+        engine
+    }
+
+    fn create_payload_for(tail: u64) -> (([u8; 32], [u8; 32]), Vec<u8>) {
+        use crate::protocol::codec::{WireCreateItem, encode_create_batch};
+        let txid = txid_with_tail(tail);
+        let mut uh = [0u8; 32];
+        uh[0] = 0xAB;
+        uh[31] = (tail & 0xff) as u8;
+        let item = WireCreateItem {
+            txid,
+            tx_version: 2,
+            locktime: 0,
+            fee: 1000,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1_700_000_000_000,
+            flags: 0,
+            utxo_hashes: vec![uh],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        ((txid, uh), encode_create_batch(&[item]))
+    }
+
+    /// UNIT: the dispatch shard index for a txid equals Phase 1 placement
+    /// (`last8(txid) LE % k`) — exactly what `StorePlacer::place` computes in
+    /// Txid mode, so a store's ops land on that store's shard.
+    #[test]
+    fn shard_index_matches_txid_placement() {
+        for k in [1usize, 2, 3, 4, 7, 16] {
+            let placer =
+                crate::subdevice::StorePlacer::new(crate::subdevice::PlacementStrategy::Txid, k);
+            for tail in [0u64, 1, 2, 3, 10, 11, 255, 4096, u64::MAX, 12_345_678_901] {
+                let txid = txid_with_tail(tail);
+                assert_eq!(
+                    shard_index_for_txid(&txid, k),
+                    placer.place(&txid),
+                    "shard for tail={tail} k={k} must match StorePlacer::place",
+                );
+            }
+        }
+    }
+
+    /// UNIT: `routing_shard` extracts the FIRST item's txid at the correct
+    /// per-op offset and hashes it like placement; ops with no txid (and short
+    /// payloads) fall back to shard 0.
+    #[test]
+    fn routing_shard_uses_first_item_txid_and_falls_back() {
+        const K: usize = 4;
+        // A GET batch (header 8) whose first txid has tail=11 -> shard 11%4=3.
+        let get = RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_BATCH,
+            flags: 0,
+            payload: crate::protocol::codec::encode_get_batch(0, &[txid_with_tail(11)]).into(),
+        };
+        assert_eq!(
+            routing_shard(&get, K),
+            shard_index_for_txid(&txid_with_tail(11), K)
+        );
+        assert_eq!(routing_shard(&get, K), 3);
+
+        // A CREATE batch (header 4) with tail=10 -> shard 10%4=2.
+        let (_k, create_payload) = create_payload_for(10);
+        let create = RequestFrame {
+            request_id: 2,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: create_payload.into(),
+        };
+        assert_eq!(routing_shard(&create, K), 2);
+
+        // A txid-less op (PING) and a too-short batch both route to shard 0.
+        let ping = RequestFrame {
+            request_id: 3,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Bytes::new(),
+        };
+        assert_eq!(routing_shard(&ping, K), 0);
+        let truncated = RequestFrame {
+            request_id: 4,
+            op_code: OP_GET_BATCH,
+            flags: 0,
+            payload: Bytes::from_static(&[0u8; 8]), // header only, no item
+        };
+        assert_eq!(routing_shard(&truncated, K), 0);
+
+        // k == 1: everything routes to the single shard.
+        assert_eq!(routing_shard(&get, 1), 0);
+    }
+
+    /// INTEGRATION: many pipelined requests across BOTH stores, mixed ops
+    /// (create then get), routed through the K-shard pool over the real
+    /// connection handler. Every response must come back correct and exactly
+    /// once. Catches routing / response-assembly regressions.
+    #[test]
+    fn sharded_pool_serves_mixed_ops_across_stores() {
+        use crate::protocol::codec::{FieldMask, decode_get_response_checked, encode_get_batch};
+        use std::io::Read as _;
+
+        let engine = Arc::new(two_store_txid_engine());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // 2 stores -> 2 shards. Workers split across shards.
+        let pool = DispatchPool::new(8, 2, engine.clone(), None, None, None, 1024);
+        assert_eq!(pool.shards.len(), 2);
+        let server_pool = Arc::clone(&pool);
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 8,
+                    dispatch_pool: Some(server_pool),
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(5),
+                    write_timeout: Duration::from_secs(5),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+
+        // Tails 0..16 land on store tail%2: a uniform spread across both shards.
+        let tails: Vec<u64> = (0..16).collect();
+        let mut keys = Vec::new();
+
+        // Phase A: pipeline 16 creates without reading between them.
+        let mut buf = Vec::new();
+        for (i, &tail) in tails.iter().enumerate() {
+            let ((txid, uh), payload) = create_payload_for(tail);
+            keys.push((txid, uh));
+            buf.extend_from_slice(
+                &RequestFrame {
+                    request_id: (i + 1) as u64,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: payload.into(),
+                }
+                .encode(),
+            );
+        }
+        client.write_all(&buf).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..tails.len() {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "create {} not OK: {:?}",
+                resp.request_id, resp.payload
+            );
+            assert!(
+                seen.insert(resp.request_id),
+                "dup create resp {}",
+                resp.request_id
+            );
+        }
+        assert_eq!(seen, (1..=tails.len() as u64).collect());
+
+        // Phase B: pipeline 16 gets; each must return the seeded utxo_hash,
+        // proving the record was created on (and read from) the right store
+        // regardless of which shard dispatched it.
+        let mut buf = Vec::new();
+        for (i, (txid, _uh)) in keys.iter().enumerate() {
+            buf.extend_from_slice(
+                &RequestFrame {
+                    request_id: 1000 + i as u64,
+                    op_code: OP_GET_BATCH,
+                    flags: 0,
+                    payload: encode_get_batch(FieldMask::ALL, &[*txid]).into(),
+                }
+                .encode(),
+            );
+        }
+        client.write_all(&buf).unwrap();
+        let mut got = std::collections::HashSet::new();
+        for _ in 0..keys.len() {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(resp.status, STATUS_OK, "get {} not OK", resp.request_id);
+            assert!(
+                got.insert(resp.request_id),
+                "dup get resp {}",
+                resp.request_id
+            );
+            let items = decode_get_response_checked(&resp.payload, 4).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].status, STATUS_OK, "record must exist after create");
+        }
+        assert_eq!(got, (1000..1000 + keys.len() as u64).collect());
+
+        // PER-CONNECTION ORDER: a fresh, serial round-trip must preserve
+        // request_id (the pipelined client matches by id, but the serial
+        // single-in-flight case must be strictly ordered).
+        for (i, (txid, _uh)) in keys.iter().take(4).enumerate() {
+            let req = RequestFrame {
+                request_id: 9000 + i as u64,
+                op_code: OP_GET_BATCH,
+                flags: 0,
+                payload: encode_get_batch(FieldMask::ALL, &[*txid]).into(),
+            };
+            client.write_all(&req.encode()).unwrap();
+            let mut len_buf = [0u8; 4];
+            client.read_exact(&mut len_buf).unwrap();
+            let n = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; n];
+            client.read_exact(&mut body).unwrap();
+            let (resp, _) =
+                ResponseFrame::decode(&[len_buf.as_slice(), body.as_slice()].concat()).unwrap();
+            assert_eq!(
+                resp.request_id,
+                9000 + i as u64,
+                "serial round-trip must answer in request order",
+            );
+        }
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+        pool.shutdown();
+    }
+
+    /// INTEGRATION (hint-not-correctness): force a record onto store X (its txid
+    /// hashes there) but run the pool with K=3 shards so the SAME txid hashes to
+    /// a DIFFERENT shard index than its store id. The create+get must still
+    /// succeed — proving the dispatch shard is only an affinity hint and the
+    /// engine resolves the real store via the index/placer.
+    #[test]
+    fn mismatched_shard_still_executes_against_correct_store() {
+        use crate::protocol::codec::{FieldMask, decode_get_response_checked, encode_get_batch};
+
+        // tail=1: store = 1 % 2 = 1; with K=3 shards, shard = 1 % 3 = 1 too —
+        // pick tail=2 instead: store = 2%2 = 0, shard = 2%3 = 2. Different.
+        let tail = 2u64;
+        let txid = txid_with_tail(tail);
+        assert_ne!(
+            shard_index_for_txid(&txid, 3),
+            (tail % 2) as usize,
+            "test precondition: chosen tail must map shard != store",
+        );
+
+        let engine = Arc::new(two_store_txid_engine());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Deliberately K=3 shards over a 2-store engine — a mismatch.
+        let pool = DispatchPool::new(6, 3, engine.clone(), None, None, None, 1024);
+        assert_eq!(pool.shards.len(), 3);
+        let server_pool = Arc::clone(&pool);
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 8,
+                    dispatch_pool: Some(server_pool),
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(5),
+                    write_timeout: Duration::from_secs(5),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+
+        let ((_txid, _uh), create_payload) = create_payload_for(tail);
+        client
+            .write_all(
+                &RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: create_payload.into(),
+                }
+                .encode(),
+            )
+            .unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "create must succeed despite shard!=store"
+        );
+
+        client
+            .write_all(
+                &RequestFrame {
+                    request_id: 2,
+                    op_code: OP_GET_BATCH,
+                    flags: 0,
+                    payload: encode_get_batch(FieldMask::ALL, &[txid]).into(),
+                }
+                .encode(),
+            )
+            .unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(resp.status, STATUS_OK);
+        let items = decode_get_response_checked(&resp.payload, 4).unwrap();
+        assert_eq!(
+            items[0].status, STATUS_OK,
+            "record readable via index, not shard"
+        );
+
+        // The record actually lives on store `tail % 2`, not the dispatch shard.
+        let entry = engine
+            .lookup(&crate::index::TxKey { txid })
+            .expect("entry exists");
+        assert_eq!(
+            entry.device_id as usize,
+            (tail % 2) as usize,
+            "record stored by placer/index on the right store, independent of dispatch shard",
+        );
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+        pool.shutdown();
+    }
+
+    /// A K-shard pool with no traffic must shut down cleanly: every shard's
+    /// workers wake on close and join without hanging.
+    #[test]
+    fn sharded_pool_shutdown_drains_and_joins_all_shards() {
+        let engine = Arc::new(test_engine());
+        let pool = DispatchPool::new(12, 4, engine, None, None, None, 1024);
+        assert_eq!(pool.shards.len(), 4);
+        // shutdown must return (join all workers) — a stuck shard would hang the
+        // test under the harness timeout.
+        pool.shutdown();
+        // Idempotent: a second shutdown after workers are gone is a no-op.
         pool.shutdown();
     }
 
