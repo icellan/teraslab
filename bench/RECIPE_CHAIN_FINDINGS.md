@@ -64,7 +64,33 @@ multi-second tails**. (`bench/results/20260628-recipe-chain/`.)
 - **redo flush / writeback interval 50 ms → 5 ms**: minor, ~+15%.
 - **batch window 20 ms → 3 ms**: minor.
 
-## The fix plan (not yet done)
+## ⭐ PINNED root cause (perf profile of the server under load)
+
+`perf record` of the server (bc512, srvCPU ~1.8 cores) shows the hot thread is
+**`cache-writeback`** — the single write-back-cache flusher — spending
+**64.86% of CPU in `Vec::from_iter`** (the `b.data.clone()` in
+`src/cache.rs::flush_all_dirty`, ~line 457) plus serial O_DIRECT `pwrite64`
+(ext4 dio, ~13%). i.e. **one thread, every `writeback_interval` tick, for each
+shard: scans ALL cached blocks, CLONES every dirty block's 4 KiB into a Vec,
+then writes them one-by-one.** With a 4 GiB cache under heavy writes that clones
+~GiB/cycle on a single core → this IS the ~1-core server ceiling.
+
+```
+64.86% cache-writeback  [.] Vec::...::from_iter         <- b.data.clone() of all dirty blocks
+18.92% cache-writeback  [k] ...pwrite64 / ext4_dio_rw   <- serial per-block O_DIRECT writes
+```
+
+## The fix plan (server-side writeback is the #1 lever; client is #2)
+
+0. **Parallelize the write-back flush + kill the full-data clone**
+   (`src/cache.rs`): the cache is already sharded (cores*2 shards) but ONE
+   thread drains them serially and clones every dirty block each tick.
+   (a) flush shards **in parallel** (a pool of writeback threads, one per shard
+   group) so writeback uses many cores; (b) make `Block.data` an `Arc<[u8]>`
+   (copy-on-write on mutation) so the per-tick snapshot is a refcount bump, not
+   a 4 KiB memcpy — removes the 65% `from_iter` cost; (c) batch/iovec the device
+   writes instead of one `pwrite` per block. This is the change that should
+   break the 1-core ceiling.
 
 1. **Client connection/pipelining model** (`client/go/pool.go`, `conn.go`): drive
    many concurrent in-flight requests **per connection** (the server already
