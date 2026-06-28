@@ -602,3 +602,38 @@ re-validates). Ship UNMINED first (create 40% hits it), measure, then DAH (spend
 layout; recovery rebuilds from primary metadata regardless). Standing this noisy
 session: CONTROL ~27.5k @ IF=512 vs reference ~37.8k; unmined-skip ceiling ~33k;
 tmpfs ~34k. Closing the gap = unmined + DAH sharding.
+
+## E15 — sharding + redo-ring landed; now ~96% at 15s, blocker = global tail (2026-06-28)
+
+Secondary sharding (E14 fix) committed (f28a96c): create_index 9-22ms → ~3.6ms.
+Head-to-head then exposed TWO new things, both diagnosed:
+1. **Checkpoint stop-the-world freeze.** No server-side load shedding (all
+   *_failed/inflight_rejected = 0); the "failures" were client RPC timeouts during
+   a ~10s BLOCKING redo checkpoint (`checkpoint.rs:540-573` holds the exclusive
+   dispatch barrier across the full snapshot+compaction). The fuzzy (non-blocking)
+   checkpoint can't reclaim as fast as 512 writers append → escalates to blocking.
+   Config tuning (1GiB redo, high_water 0.5) only DELAYED it (60s run still froze
+   3.3s) — a rate mismatch, not sizing.
+   **FIX (config, no rebuild): enable the segment-RING redo layout**
+   (`redo_segment_ring=true` — Lever 7, already implemented+tested, default-off
+   pending soak). Reclamation = O(freed) pointer advance, independent of index
+   size/append rate; the checkpoint loop skips the blocking path for a ring.
+   PROVEN: 60s sustained, `blocking:true`=0, NO op >1.07s, failed=0 — freeze GONE.
+   (A one-off 49s FUZZY snapshot is background wall-time, barrier held only µs.)
+2. **Standing with the ring (interleaved, IF=512, noisy host):**
+   - 15s (ckpt never fires): TS 36.4k vs ref 37.5k = **−3% total / −3% spend
+     (near-tie throughput)**, but spend p99.9 **188ms vs 44ms (4.3× worse)**.
+   - 30s: TS 33.2k vs ref 36.7k = −10%, throughput DECAYS 36→33k (ckpt=0, so NOT
+     the snapshot), p99.9 226ms vs 51ms.
+   - Progress: TS went from ~20% → ~96% of the reference at 15s.
+
+**REMAINING BLOCKERS (both needed for the win — spend tput ≥ ref AND p99.9 ≤ ref):**
+- **(A) Global tail latency 4-10× worse on EVERY op INCLUDING read-only GET** →
+  a single GLOBAL periodic stall in request processing (not write-path-specific;
+  GET touches no redo/cache-write). Hard pass-condition blocker. PROFILE THIS NEXT.
+- **(B) Sustained throughput decay** 36→33k over 30s with ckpt=0 — something
+  degrades over time (dataset growth? writeback dirty-set pressure? not checkpoint).
+Config committed: 1GiB redo + checkpoint watermarks + `redo_segment_ring=true` in
+bench/configs/teraslab-async.toml (reproducible from clean checkout; flipping the
+code default is a separate production change pending soak). Caveat: host too noisy
+for certification; all numbers RELATIVE, interleaved.

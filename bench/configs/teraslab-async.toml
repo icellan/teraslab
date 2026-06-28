@@ -15,10 +15,14 @@ replication_factor = 1
 device_paths = ["/data/d0.dat"]
 device_size = 4294967296          # 4 GiB, matches the reference filesize 4G
 device_alignment = 4096
-redo_log_size = 268435456   # 256 MiB: at the post-fsync-coalescing write rate the
-                            # old 64 MiB log filled faster than the checkpoint
-                            # compacted (transient LogFull backpressure). Fair vs
-                            # the reference's 4 GiB file + 128 MiB write cache.
+redo_log_size = 1073741824  # 1 GiB. Matches the reference's max-write-cache (1024M):
+                            # both are the async-durability write buffer. A larger log
+                            # gives the NON-blocking (fuzzy) checkpoint a wide
+                            # high->emergency margin so it reclaims before the redo can
+                            # reach the emergency BLOCKING (stop-the-world) threshold
+                            # under sustained write load — keeping the checkpoint
+                            # non-blocking (its design intent) and removing the ~10s
+                            # serving freeze that otherwise dominates tail latency.
 index_snapshot_path = "/data/index.snap"
 expected_records = 2000000
 lock_stripes = 65536
@@ -29,6 +33,24 @@ block_height_retention = 288
 # Async durability to match the reference's no-commit-to-device posture.
 redo_buffered = true
 redo_flush_interval_ms = 50
+
+# Checkpoint watermarks: keep the NON-blocking (fuzzy) checkpoint the common case.
+# Trigger it early (0.50) with a wide gap to the emergency blocking threshold
+# (0.90) so it always reclaims the redo prefix before usage can reach emergency
+# under sustained writes. The blocking checkpoint (which freezes serving for the
+# full snapshot+compaction) then effectively never fires in steady state.
+checkpoint_high_water = 0.50
+checkpoint_low_water = 0.15
+checkpoint_emergency_water = 0.90
+checkpoint_poll_interval_ms = 250
+
+# Lever 7: segment-ring redo layout. Reclamation is an O(freed) pointer advance
+# (advance the oldest-segment marker) instead of a stop-the-world compaction/reset,
+# so it is independent of index size and append rate: the slow fuzzy index snapshot
+# no longer pins redo space, the emergency BLOCKING checkpoint never fires (the
+# checkpoint loop skips it for a ring), and sustained writes never freeze serving.
+# A fresh redo region (the bench wipes its volume each run) adopts this cleanly.
+redo_segment_ring = true
 
 strict_auth = false
 enable_remote_bind = true
