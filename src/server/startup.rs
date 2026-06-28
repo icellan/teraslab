@@ -716,11 +716,19 @@ pub enum RedoOpenError {
 ///   mismatch, etc.).
 /// * [`RedoOpenError::Log`] — the device opened but `RedoLog::open`
 ///   could not establish a valid log (bounds, corrupt history, etc.).
+///
+/// `buffered_io` selects the device open mode: `false` (default / strict)
+/// opens the redo with `O_DIRECT` (Linux) / `F_NOCACHE` (macOS) exactly as
+/// before; `true` opens it through the OS page cache
+/// ([`crate::device::DirectDevice::open_buffered`]) for the relaxed
+/// `redo_buffered_io` mode. It affects ONLY the redo device — the data
+/// device(s) are opened elsewhere and always stay `O_DIRECT`.
 pub fn open_mandatory_redo_log(
     path: &Path,
     size: u64,
     alignment: usize,
     segment_ring: Option<u64>,
+    buffered_io: bool,
 ) -> Result<
     (
         std::sync::Arc<dyn crate::device::BlockDevice>,
@@ -728,11 +736,14 @@ pub fn open_mandatory_redo_log(
     ),
     RedoOpenError,
 > {
-    let device = crate::device::DirectDevice::open(path, size, alignment).map_err(|e| {
-        RedoOpenError::Device {
-            path: path.display().to_string(),
-            reason: format!("{e}"),
-        }
+    let open_res = if buffered_io {
+        crate::device::DirectDevice::open_buffered(path, size, alignment)
+    } else {
+        crate::device::DirectDevice::open(path, size, alignment)
+    };
+    let device = open_res.map_err(|e| RedoOpenError::Device {
+        path: path.display().to_string(),
+        reason: format!("{e}"),
     })?;
     let device: std::sync::Arc<dyn crate::device::BlockDevice> = std::sync::Arc::new(device);
     let log =
@@ -1604,7 +1615,7 @@ mod tests {
     fn mandatory_redo_open_succeeds_in_clean_dir() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("redo.log");
-        let result = super::open_mandatory_redo_log(&path, 1 << 20, 4096, None);
+        let result = super::open_mandatory_redo_log(&path, 1 << 20, 4096, None, false);
         let (_dev, log) = match result {
             Ok(parts) => parts,
             Err(e) => panic!("clean tmp path must open: {e}"),
@@ -1624,12 +1635,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("ring.redo");
         // segment_ring = Some(0) → auto-derive segment size.
-        let (_dev, log) = super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0)).unwrap();
+        let (_dev, log) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0), false).unwrap();
         assert!(log.is_segment_ring(), "fresh region adopts the ring");
         drop(log);
 
         // Reopen WITHOUT requesting the ring: the on-disk ring is still used.
-        let (_dev2, log2) = super::open_mandatory_redo_log(&path, 1 << 20, 4096, None).unwrap();
+        let (_dev2, log2) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, None, false).unwrap();
         assert!(log2.is_segment_ring(), "on-disk ring format wins on reopen");
     }
 
@@ -1639,7 +1652,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("ring_explicit.redo");
         let (_dev, log) =
-            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(64 * 1024)).unwrap();
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(64 * 1024), false).unwrap();
         assert!(log.is_segment_ring());
         // 1 MiB region − 4 KiB header = 1044480 B; / 64 KiB = 15 segments.
         assert_eq!(log.capacity(), 15 * 64 * 1024);
@@ -1654,13 +1667,14 @@ mod tests {
         let path = tmp.path().join("linear.redo");
         {
             let (_dev, mut log) =
-                super::open_mandatory_redo_log(&path, 1 << 20, 4096, None).unwrap();
+                super::open_mandatory_redo_log(&path, 1 << 20, 4096, None, false).unwrap();
             log.append(RedoOp::Checkpoint).unwrap();
             log.flush().unwrap();
             assert!(!log.is_segment_ring());
         }
         // Now request the ring: existing linear data → stays linear this session.
-        let (_dev, log) = super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0)).unwrap();
+        let (_dev, log) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0), false).unwrap();
         assert!(
             !log.is_segment_ring(),
             "non-empty linear region must not be reformatted to a ring"
@@ -1673,7 +1687,7 @@ mod tests {
         // `DeviceError` from `DirectDevice::open` — the gap #2 contract
         // is that this propagates instead of falling back to memory.
         let path = std::path::Path::new("/this/path/does/not/exist/redo.log");
-        let result = super::open_mandatory_redo_log(path, 1 << 20, 4096, None);
+        let result = super::open_mandatory_redo_log(path, 1 << 20, 4096, None, false);
         let err = match result {
             Ok(_) => panic!("missing parent dir must fail closed (no in-memory fallback)"),
             Err(e) => e,
@@ -1700,7 +1714,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // tmp.path() itself exists as a directory.
         let dir_path = tmp.path().to_path_buf();
-        let result = super::open_mandatory_redo_log(&dir_path, 1 << 20, 4096, None);
+        let result = super::open_mandatory_redo_log(&dir_path, 1 << 20, 4096, None, false);
         let err = match result {
             Ok(_) => panic!("a directory path must fail closed (no in-memory fallback)"),
             Err(e) => e,

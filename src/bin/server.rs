@@ -989,6 +989,7 @@ fn main() {
             config.redo_log_size,
             config.device_alignment,
             segment_ring,
+            config.redo_buffered_io,
         ) {
             Ok((dev, log)) => {
                 tracing::info!(
@@ -1288,10 +1289,13 @@ fn main() {
         engine.set_redo_logs(logs.clone());
         // Apply buffered (relaxed) redo durability if configured. Must follow
         // set_redo_logs so the per-store group-commit coordinators exist.
-        if config.redo_buffered {
+        // `redo_buffered_io` implies buffered durability (see
+        // `redo_buffered_effective`).
+        if config.redo_buffered_effective() {
             engine.set_buffered_durability(true);
             tracing::warn!(
                 flush_interval_ms = config.redo_flush_interval_ms,
+                buffered_io = config.redo_buffered_io,
                 "BUFFERED redo durability enabled — mutations are acked before \
                  fsync; up to one flush interval of acked writes may be lost on \
                  an unclean shutdown (relaxed-durability mode)"
@@ -1891,22 +1895,42 @@ fn main() {
         }
     });
 
-    // Background redo flusher for buffered durability: periodically fsync every
-    // store's redo log so acked-but-unflushed mutations become durable, bounding
-    // the crash-loss window to ~one interval. Strict durability skips this (each
-    // commit already fsyncs). Observes the shutdown flag and exits promptly.
-    let redo_flush_handle: Option<std::thread::JoinHandle<()>> = if config.redo_buffered {
+    // Background redo flusher for buffered durability: periodically push every
+    // store's redo log to the device so acked-but-unflushed mutations become
+    // durable, bounding the crash-loss window to ~one interval. Strict
+    // durability skips this (each commit already fsyncs). Observes the shutdown
+    // flag and exits promptly.
+    //
+    // Under `redo_buffered_io` the periodic flush pwrites WITHOUT a per-flush
+    // fsync (`flush_all_redo_no_sync`): the redo device is opened buffered, so
+    // the bytes go to the OS page cache and durability is provided by kernel
+    // writeback plus the checkpoint barrier's redo fsync before it reclaims.
+    // This removes the periodic device fsync that, on some virtualized hosts,
+    // stalls the VM for tens of milliseconds. Without `redo_buffered_io` the
+    // periodic flush keeps its per-flush fsync (`flush_all_redo`), unchanged.
+    //
+    // The FINAL flush on a clean shutdown ALWAYS fsyncs (`flush_all_redo`),
+    // regardless of `redo_buffered_io`, so a graceful stop loses nothing.
+    let redo_flush_handle: Option<std::thread::JoinHandle<()>> = if config.redo_buffered_effective()
+    {
         let engine = engine.clone();
         let shutdown_flag = shutdown_flag.clone();
         let interval = std::time::Duration::from_millis(config.redo_flush_interval_ms.max(1));
+        let buffered_io = config.redo_buffered_io;
         Some(std::thread::spawn(move || {
             while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(interval);
-                if let Err(e) = engine.flush_all_redo() {
+                let res = if buffered_io {
+                    engine.flush_all_redo_no_sync()
+                } else {
+                    engine.flush_all_redo()
+                };
+                if let Err(e) = res {
                     tracing::error!(err = %e, "background redo flush failed");
                 }
             }
-            // Final flush on shutdown so a clean stop loses nothing.
+            // Final flush on shutdown so a clean stop loses nothing — always a
+            // real fsync, even under `redo_buffered_io`.
             if let Err(e) = engine.flush_all_redo() {
                 tracing::error!(err = %e, "final redo flush on shutdown failed");
             }

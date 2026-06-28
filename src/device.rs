@@ -889,17 +889,69 @@ impl DirectDevice {
     /// reports a zero-byte block device or a block count x block size
     /// product that overflows `u64`.
     pub fn open(path: &std::path::Path, size: u64, alignment: usize) -> Result<Self> {
+        Self::open_inner(path, size, alignment, false)
+    }
+
+    /// Open or create a file-backed device at `path` using the OS page cache
+    /// (buffered I/O): `O_DIRECT` is NOT set on Linux and `F_NOCACHE` is NOT
+    /// applied on macOS. Everything else — size handling, block-device
+    /// detection, alignment validation, the `pread`/`pwrite`/`sync` API — is
+    /// identical to [`Self::open`].
+    ///
+    /// This exists only for the redo log under the relaxed
+    /// `redo_buffered_io` mode: routing redo writes through the page cache
+    /// lets the kernel coalesce writeback smoothly instead of forcing each
+    /// background flush down to the device, which on some virtualized hosts
+    /// stalls the VM for tens of milliseconds. The data device(s) must
+    /// continue to use [`Self::open`] (`O_DIRECT`). Durability for a
+    /// buffered redo comes from OS writeback plus the checkpoint barrier's
+    /// explicit [`BlockDevice::sync`] before it reclaims the log — see
+    /// `crate::checkpoint`.
+    ///
+    /// Callers still issue aligned reads/writes (the alignment contract is
+    /// unchanged); only the device-cache-bypass flags differ. The returned
+    /// device's [`alignment`](BlockDevice::alignment) and bounds checks are
+    /// the same as for an `O_DIRECT` open, so an existing on-disk redo log
+    /// reads back byte-for-byte regardless of which open variant created it.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::open`]: [`DeviceError::Io`],
+    /// [`DeviceError::InvalidAlignment`],
+    /// [`DeviceError::InvalidBlockDeviceGeometry`].
+    pub fn open_buffered(path: &std::path::Path, size: u64, alignment: usize) -> Result<Self> {
+        Self::open_inner(path, size, alignment, true)
+    }
+
+    /// Shared body for [`Self::open`] (`cached == false`, the default
+    /// `O_DIRECT`/`F_NOCACHE` path) and [`Self::open_buffered`]
+    /// (`cached == true`, page-cache path). When `cached` is `false` the
+    /// behavior is byte-for-byte identical to the pre-existing `open`.
+    fn open_inner(
+        path: &std::path::Path,
+        size: u64,
+        alignment: usize,
+        cached: bool,
+    ) -> Result<Self> {
         validate_alignment(alignment)?;
+        // `cached` is consumed by the Linux `O_DIRECT` and macOS `F_NOCACHE`
+        // branches below. On any other unix target neither branch exists, so
+        // bind it to silence the unused-variable lint without changing behavior.
+        #[cfg(all(unix, not(target_os = "linux"), not(target_os = "macos")))]
+        let _ = cached;
         use std::fs::OpenOptions;
 
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);
 
-        // On Linux, open with O_DIRECT for zero-copy NVMe I/O.
+        // On Linux, open with O_DIRECT for zero-copy NVMe I/O — UNLESS the
+        // caller asked for the buffered (page-cache) variant.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_DIRECT);
+            if !cached {
+                opts.custom_flags(libc::O_DIRECT);
+            }
         }
 
         let file = opts.open(path)?;
@@ -980,9 +1032,11 @@ impl DirectDevice {
             }
         };
 
-        // On macOS, disable caching to approximate O_DIRECT behavior.
+        // On macOS, disable caching to approximate O_DIRECT behavior — UNLESS
+        // the caller asked for the buffered (page-cache) variant, in which case
+        // we deliberately leave the page cache enabled.
         #[cfg(target_os = "macos")]
-        {
+        if !cached {
             use std::os::unix::io::AsRawFd;
             // F_NOCACHE = 48 on macOS
             let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
@@ -1375,6 +1429,63 @@ mod tests {
         assert!(
             !dev.is_block_device(),
             "temp file must not be reported as a block device"
+        );
+    }
+
+    #[test]
+    fn buffered_direct_device_write_read() {
+        // A buffered (page-cache, non-O_DIRECT / non-F_NOCACHE) open must obey
+        // the exact same read/write/alignment/bounds contract as the default
+        // O_DIRECT open — only the device-cache-bypass flags differ.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buffered.dat");
+        let dev = DirectDevice::open_buffered(&path, 65536, 4096).unwrap();
+        assert_eq!(dev.alignment(), 4096);
+        assert_eq!(dev.size(), 65536);
+
+        let mut write_buf = AlignedBuf::new(4096, 4096);
+        for (i, b) in write_buf.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+        dev.pwrite_all_at(&write_buf, 4096).unwrap();
+
+        let mut read_buf = AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut read_buf, 4096).unwrap();
+        assert_eq!(&*write_buf, &*read_buf);
+
+        // Alignment is still enforced on the buffered device.
+        assert!(dev.pwrite(&write_buf, 100).is_err());
+        // Sync is a no-op success on a regular file.
+        dev.sync().unwrap();
+    }
+
+    #[test]
+    fn buffered_and_direct_open_are_byte_compatible_on_disk() {
+        // The on-disk format is identical: a file written through a buffered
+        // open reads back byte-for-byte through a default O_DIRECT open of the
+        // same path (the recovery path always uses the default open). This is
+        // the load-bearing invariant for `redo_buffered_io`: switching the open
+        // variant must never change what recovery sees.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compat.dat");
+
+        let mut payload = AlignedBuf::new(4096, 4096);
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 7 + 3) % 256) as u8;
+        }
+        {
+            let dev = DirectDevice::open_buffered(&path, 8192, 4096).unwrap();
+            dev.pwrite_all_at(&payload, 0).unwrap();
+            // Make the page-cache writeback durable before reopening O_DIRECT,
+            // which would otherwise bypass the still-dirty page cache.
+            dev.sync().unwrap();
+        }
+        let dev = DirectDevice::open(&path, 8192, 4096).unwrap();
+        let mut read_buf = AlignedBuf::new(4096, 4096);
+        dev.pread_exact_at(&mut read_buf, 0).unwrap();
+        assert_eq!(
+            &*payload, &*read_buf,
+            "buffered write must be readable via O_DIRECT open"
         );
     }
 

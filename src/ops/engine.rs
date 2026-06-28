@@ -689,6 +689,25 @@ impl Engine {
         Ok(())
     }
 
+    /// Pwrite every per-store redo log's buffered entries to the device WITHOUT
+    /// issuing the durability fsync.
+    ///
+    /// Used by the background flusher ONLY under the relaxed `redo_buffered_io`
+    /// mode (redo device opened buffered). Durability comes from the kernel's
+    /// page-cache writeback plus the checkpoint barrier, which still calls
+    /// [`Self::flush_all_redo`] (a real fsync) BEFORE it fences and reclaims the
+    /// redo prefix — so reclamation safety is unchanged. Under strict durability
+    /// the background flusher uses [`Self::flush_all_redo`] instead, and this is
+    /// never called.
+    pub fn flush_all_redo_no_sync(&self) -> std::result::Result<(), String> {
+        if let Some(committers) = self.redo_committers.get() {
+            for c in committers {
+                c.flush_no_sync()?;
+            }
+        }
+        Ok(())
+    }
+
     /// The redo log owning store `device_id`, for secondary-index two-phase
     /// durability journalling.
     ///
@@ -744,6 +763,18 @@ impl Engine {
             }
             _ => None,
         }
+    }
+
+    /// Test-only accessor for the per-store group-commit coordinator, so unit
+    /// tests can drive buffered redo appends through the same path the dispatch
+    /// write path uses. Panics if no committers are attached (a test bug).
+    #[cfg(test)]
+    pub(crate) fn redo_committer_for_test(
+        &self,
+        device_id: u8,
+    ) -> Arc<crate::redo_group::GroupCommit> {
+        self.redo_committer_for_device(device_id)
+            .expect("test: redo committers must be attached via set_redo_logs")
     }
 
     /// The redo log owning the store that holds `key`, by primary-index

@@ -2540,4 +2540,291 @@ mod tests {
             "task must shut down within 1 s, took {elapsed:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // redo_buffered_io: no-per-flush-fsync background flush + barrier durability
+    // -----------------------------------------------------------------------
+
+    /// A redo-log block device that (a) counts `sync`/`sync_data` calls and
+    /// (b) models a volatile write cache with a durable shadow: `sync` copies
+    /// live → shadow; [`Self::simulate_power_loss`] reverts live → shadow,
+    /// dropping every write issued since the last sync. Returns `None` from
+    /// `as_raw_ptr` so the redo log always uses the pread/pwrite path the shadow
+    /// governs. This is the counting-device pattern from `redo_group.rs` /
+    /// `engine.rs` tests, extended with the volatile shadow so a recovery test
+    /// can prove the un-fsynced tail is dropped while the barrier-synced prefix
+    /// survives.
+    struct CountingShadowDevice {
+        live: parking_lot::Mutex<Vec<u8>>,
+        shadow: parking_lot::Mutex<Vec<u8>>,
+        alignment: usize,
+        syncs: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingShadowDevice {
+        fn new(size: usize, alignment: usize) -> Arc<Self> {
+            Arc::new(Self {
+                live: parking_lot::Mutex::new(vec![0u8; size]),
+                shadow: parking_lot::Mutex::new(vec![0u8; size]),
+                alignment,
+                syncs: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        fn sync_count(&self) -> u64 {
+            self.syncs.load(Ordering::SeqCst)
+        }
+
+        /// Drop every write since the last durable sync (revert live → shadow).
+        fn simulate_power_loss(&self) {
+            let shadow = self.shadow.lock();
+            let mut live = self.live.lock();
+            live.copy_from_slice(&shadow);
+        }
+    }
+
+    impl BlockDevice for CountingShadowDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            let live = self.live.lock();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > live.len() {
+                return Err(crate::device::DeviceError::Io(std::io::Error::other(
+                    "oob pread",
+                )));
+            }
+            buf.copy_from_slice(&live[start..end]);
+            Ok(buf.len())
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            let mut live = self.live.lock();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > live.len() {
+                return Err(crate::device::DeviceError::Io(std::io::Error::other(
+                    "oob pwrite",
+                )));
+            }
+            live[start..end].copy_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn alignment(&self) -> usize {
+            self.alignment
+        }
+
+        fn size(&self) -> u64 {
+            self.live.lock().len() as u64
+        }
+
+        fn sync(&self) -> crate::device::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            let live = self.live.lock();
+            let mut shadow = self.shadow.lock();
+            shadow.copy_from_slice(&live);
+            Ok(())
+        }
+
+        // No `sync_data` override: the trait default calls `sync`, so the redo
+        // hot-path `sync_data()` is counted AND makes the shadow durable.
+
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
+    /// Build an engine whose single per-store redo log lives on a
+    /// `CountingShadowDevice`, with buffered durability enabled — the
+    /// `redo_buffered_io` runtime shape (page-cache open is a device concern;
+    /// here the shadow device stands in for the cache so the test is
+    /// deterministic). Returns the engine, the shared redo Arc, the redo device
+    /// handle (for sync-count / power-loss), and the temp dir for the snapshot.
+    fn make_buffered_engine_and_redo() -> (
+        Arc<Engine>,
+        Arc<Mutex<RedoLog>>,
+        Arc<CountingShadowDevice>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        let redo_dev = CountingShadowDevice::new(256 * 1024, 4096);
+        let log = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 256 * 1024).unwrap();
+        let redo = Arc::new(Mutex::new(log));
+        // Attach to the engine so `flush_all_redo[_no_sync]` and the checkpoint
+        // barrier operate on this exact log, and enable buffered durability.
+        engine.set_redo_logs(vec![redo.clone()]);
+        engine.set_buffered_durability(true);
+        (engine, redo, redo_dev, dir)
+    }
+
+    /// Core `redo_buffered_io` guarantee: a periodic buffered flush
+    /// (`flush_all_redo_no_sync`) pwrites WITHOUT a device fsync, while the
+    /// checkpoint barrier DOES fsync the redo before it fences/reclaims. After
+    /// the barrier the fenced prefix is durable and recovery is bounded by it.
+    #[test]
+    fn async_redo_flush_no_per_flush_fsync_but_barrier_is_durable() {
+        let (engine, redo, redo_dev, dir) = make_buffered_engine_and_redo();
+
+        // Drive several buffered appends through the engine's committer (buffered
+        // durability → the append itself does NOT fsync).
+        {
+            let committer = engine.redo_committer_for_test(0);
+            for i in 0..20u8 {
+                committer
+                    .commit(vec![RedoOp::Freeze {
+                        tx_key: crate::index::TxKey { txid: [i + 1; 32] },
+                        offset: i as u32,
+                    }])
+                    .expect("buffered append must succeed");
+            }
+        }
+
+        // A periodic buffered-io flush: pwrite the entries, but NO device fsync.
+        let before_flush = redo_dev.sync_count();
+        engine
+            .flush_all_redo_no_sync()
+            .expect("no-sync flush must succeed");
+        let after_flush = redo_dev.sync_count();
+        assert_eq!(
+            after_flush, before_flush,
+            "the buffered-io periodic flush must NOT fsync the redo device \
+             (sync count went {before_flush} -> {after_flush})"
+        );
+
+        // The bytes were pwritten (live), so they are READABLE in-process even
+        // though they are not yet durable — this is exactly the page-cache state.
+        let readable = redo.lock().read_from_sequence(1).unwrap();
+        assert_eq!(
+            readable.len(),
+            20,
+            "no-sync flush still pwrites the entries (page-cache visible)"
+        );
+
+        // Now the checkpoint barrier. It MUST fsync the redo before fencing and
+        // reclaiming the covered prefix.
+        let before_ckpt = redo_dev.sync_count();
+        let cfg = CheckpointConfig::new(dir.path().join("buffered.snap"));
+        let stats = perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
+        let after_ckpt = redo_dev.sync_count();
+        assert!(
+            after_ckpt > before_ckpt,
+            "the checkpoint barrier MUST fsync the redo before fence/reclaim \
+             (sync count went {before_ckpt} -> {after_ckpt}); removing the per-flush \
+             fsync is only safe because of this barrier fsync"
+        );
+        assert!(
+            stats.reset_performed,
+            "barrier covers the whole flushed prefix → reclaim runs"
+        );
+
+        // The fenced prefix is durable: a power loss now (drop everything since
+        // the last sync) must NOT lose the checkpointed entries, and recovery is
+        // bounded by the durable fence (all entries are at/below it → empty).
+        redo_dev.simulate_power_loss();
+        let recovered = redo.lock().recover().unwrap();
+        assert!(
+            recovered.is_empty(),
+            "all flushed entries are covered by the durable barrier fence → \
+             recovery replays nothing, found {} entries",
+            recovered.len()
+        );
+    }
+
+    /// Recovery prefix invariant under `redo_buffered_io`: entries made durable
+    /// by the barrier survive a simulated power loss + reopen; entries appended
+    /// AFTER the last barrier and only no-sync-flushed (never fsynced) are
+    /// allowed to be absent — the lost tail is a consistent prefix, never a hole.
+    #[test]
+    fn buffered_io_recovery_keeps_barrier_prefix_drops_unsynced_tail() {
+        let (engine, redo, redo_dev, dir) = make_buffered_engine_and_redo();
+        let committer = engine.redo_committer_for_test(0);
+
+        // Phase A: durable set — appended, then made durable by the checkpoint
+        // barrier (which fsyncs the redo). These must survive a crash. We append
+        // entries that recovery can REPLAY (Freeze ops) and checkpoint so the
+        // fence covers them; post-fence they recover as an empty set, so to prove
+        // survival we read them back from the durable shadow via a fresh reopen
+        // BEFORE the fence is consulted is not possible — instead we assert the
+        // durable WRITE POSITION below. First, drive + barrier:
+        for i in 0..10u8 {
+            committer
+                .commit(vec![RedoOp::Freeze {
+                    tx_key: crate::index::TxKey { txid: [i + 1; 32] },
+                    offset: i as u32,
+                }])
+                .expect("durable-set append");
+        }
+        let cfg = CheckpointConfig::new(dir.path().join("prefix.snap"));
+        perform_checkpoint(&cfg, &engine, &redo).expect("barrier must fsync the durable set");
+        // Capture the durable high-water sequence the fence advanced to.
+        let durable_seq = redo.lock().current_sequence();
+        let durable_sync_count = redo_dev.sync_count();
+
+        // Phase B: at-risk tail — appended and only NO-SYNC flushed (pwritten to
+        // the page cache, never fsynced). On a power loss these are dropped.
+        for i in 10..20u8 {
+            committer
+                .commit(vec![RedoOp::Freeze {
+                    tx_key: crate::index::TxKey { txid: [i + 1; 32] },
+                    offset: i as u32,
+                }])
+                .expect("at-risk append");
+        }
+        engine
+            .flush_all_redo_no_sync()
+            .expect("no-sync flush of the at-risk tail");
+        // The at-risk tail cost ZERO additional fsyncs (the invariant under test).
+        assert_eq!(
+            redo_dev.sync_count(),
+            durable_sync_count,
+            "the at-risk tail must not have been fsynced"
+        );
+        // In-process the tail IS visible (page-cache) — sequence advanced past
+        // the durable high-water.
+        assert!(
+            redo.lock().current_sequence() > durable_seq,
+            "the at-risk tail advanced the in-memory sequence"
+        );
+
+        // Power loss: drop everything since the last durable sync (the at-risk
+        // tail), then reopen from the durable shadow.
+        redo_dev.simulate_power_loss();
+        drop(redo);
+        let reopened =
+            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 256 * 1024).unwrap();
+
+        // Prefix invariant: the reopened durable sequence is the barrier's
+        // high-water — the at-risk tail is gone, and what remains is a clean
+        // prefix (never a partial/hole). The durable sequence must not roll back
+        // below the fence, and must not include the dropped tail.
+        let recovered_seq = reopened.current_sequence();
+        assert_eq!(
+            recovered_seq, durable_seq,
+            "after power loss the durable sequence must equal the barrier fence \
+             ({durable_seq}); the un-fsynced tail is dropped as a clean prefix, \
+             found {recovered_seq}"
+        );
+        // And recovery is bounded by the durable fence: the barrier-covered
+        // entries are at/below it, so replay is empty (no hole, no resurrection
+        // of the dropped tail).
+        let replay = reopened.recover().unwrap();
+        assert!(
+            replay.is_empty(),
+            "recovery from the durable prefix replays nothing past the fence, \
+             found {} entries",
+            replay.len()
+        );
+    }
 }

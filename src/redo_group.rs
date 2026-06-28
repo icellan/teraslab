@@ -155,6 +155,52 @@ impl GroupCommit {
         Ok(())
     }
 
+    /// Pwrite the buffered entries + header to the device but do NOT issue the
+    /// durability fsync.
+    ///
+    /// Used by the background flusher ONLY under the relaxed `redo_buffered_io`
+    /// mode. The bytes are pushed into the OS page cache (the redo device is
+    /// opened buffered, i.e. without `O_DIRECT`/`F_NOCACHE`, in that mode), and
+    /// durability is provided by (a) the kernel's page-cache writeback and (b)
+    /// the checkpoint barrier's explicit redo fsync via [`Self::flush`]
+    /// ([`crate::ops::engine::Engine::flush_all_redo`]) BEFORE it fences and
+    /// reclaims the log. Removing the per-flush fsync here is therefore safe for
+    /// reclamation: the prefix is reclaimed only after the barrier has fsynced
+    /// the redo, exactly as under strict durability.
+    ///
+    /// This advances `write_pos` (so a concurrent appender resumes at the new
+    /// position) and moves the pending entries into the read cache, identically
+    /// to [`Self::flush`] — only the trailing `sync_data()` is skipped. On a
+    /// pwrite error the log is poisoned (fail-closed), matching [`Self::flush`].
+    pub fn flush_no_sync(&self) -> Result<(), String> {
+        // Serialize flushers so prepared chunks are pwritten in cursor order and
+        // header blocks never regress — same guard as `flush`.
+        let _fg = self.flush_guard.lock();
+
+        let (prepared, dev) = {
+            let mut log = self.log.lock();
+            let prepared = log
+                .prepare_flush()
+                .map_err(|e| format!("redo flush failed: {e}"))?;
+            (prepared, log.device_handle())
+        };
+        let Some(prepared) = prepared else {
+            return Ok(()); // nothing buffered
+        };
+
+        if let Err(e) = RedoLog::commit_flush(&dev, &prepared) {
+            if let Some(m) = crate::metrics::redo_metrics() {
+                m.redo_flush_errors_total.inc();
+            }
+            // The buffer was already drained in `prepare_flush`; poison so the
+            // node fails closed (recovery replays the durable prefix on restart).
+            self.log.lock().poison();
+            return Err(format!("redo flush failed: {e}"));
+        }
+        // Intentionally NO `dev.sync_data()` here — see the doc comment.
+        Ok(())
+    }
+
     /// The wrapped log, for paths that must lock it directly (checkpoint,
     /// secondary-index two-phase flush, recovery). They serialize with the
     /// coordinator on the same mutex; they simply do not coalesce with it.
@@ -499,6 +545,59 @@ mod tests {
             entries.len(),
             2,
             "both buffered entries recoverable after flush"
+        );
+    }
+
+    #[test]
+    fn flush_no_sync_pwrites_without_fsync_but_flush_does_fsync() {
+        // `redo_buffered_io`: the background flusher's no-sync flush pwrites the
+        // buffered entries (so they are in-process readable / page-cache visible)
+        // but issues ZERO device fsyncs. A real `flush()` (the checkpoint barrier
+        // / shutdown path) DOES fsync. Together these are the durability gate the
+        // no-sync periodic flush relies on.
+        let dev = CountingDev::new();
+        let gc = GroupCommit::new(open_log(dev.clone()));
+        gc.set_buffered(true);
+
+        // Batch 1: buffered append, then a NO-SYNC flush.
+        gc.commit(vec![delete_op(1)]).unwrap().expect("range");
+        gc.commit(vec![delete_op(2)]).unwrap().expect("range");
+        let before = dev.syncs.load(Ordering::SeqCst);
+        gc.flush_no_sync().expect("no-sync flush ok");
+        assert_eq!(
+            dev.syncs.load(Ordering::SeqCst) - before,
+            0,
+            "flush_no_sync must NOT issue any device fsync"
+        );
+        // The pwritten entries are readable (the bytes are on the device, just
+        // not yet fsynced) — recovery would replay them if they survive.
+        assert_eq!(
+            gc.log().lock().recover().unwrap().len(),
+            2,
+            "flush_no_sync still pwrites the entries"
+        );
+
+        // A second no-sync flush with nothing buffered is a clean no-op (0 sync).
+        gc.flush_no_sync().expect("empty no-sync flush ok");
+        assert_eq!(
+            dev.syncs.load(Ordering::SeqCst) - before,
+            0,
+            "an empty no-sync flush touches the device zero times"
+        );
+
+        // Batch 2: a real flush DOES fsync (exactly once for the buffered batch).
+        gc.commit(vec![delete_op(3)]).unwrap().expect("range");
+        let before2 = dev.syncs.load(Ordering::SeqCst);
+        gc.flush().expect("flush ok");
+        assert_eq!(
+            dev.syncs.load(Ordering::SeqCst) - before2,
+            1,
+            "flush() fsyncs once even when flush_no_sync was used earlier"
+        );
+        assert_eq!(
+            gc.log().lock().recover().unwrap().len(),
+            3,
+            "all entries recoverable after the fsyncing flush"
         );
     }
 

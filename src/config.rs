@@ -875,6 +875,29 @@ pub struct ServerConfig {
     /// Ignored under strict durability.
     pub redo_flush_interval_ms: u64,
 
+    /// Open the redo log through the OS page cache (buffered I/O) instead of
+    /// `O_DIRECT` (Linux) / `F_NOCACHE` (macOS), AND make the background
+    /// flusher pwrite WITHOUT a per-flush fsync. `false` (default) keeps the
+    /// existing behavior byte-for-byte: the redo device is opened `O_DIRECT`
+    /// and every background flush fsyncs.
+    ///
+    /// When `true`, redo writes go through the page cache (smooth, kernel-
+    /// coalesced writeback) and the background flusher skips the per-flush
+    /// fsync — durability for the redo then comes from (a) OS writeback and
+    /// (b) the checkpoint barrier, which still fsyncs the redo BEFORE it
+    /// fences/reclaims the log, so reclamation safety is unchanged. The DATA
+    /// device(s) are UNAFFECTED — they always stay `O_DIRECT`. Only the redo
+    /// WAL is buffered. This is a relaxed-durability lever (matching a
+    /// no-commit-to-device posture): on an unclean shutdown the un-fsynced
+    /// redo tail is lost, but the store stays internally consistent because
+    /// the data writes for that tail are equally relaxed.
+    ///
+    /// This implies buffered redo durability: it is only meaningful together
+    /// with [`Self::redo_buffered`] (the ack path must already be off the
+    /// fsync), and the server enables buffered durability automatically when
+    /// this is set.
+    pub redo_buffered_io: bool,
+
     /// Lever 7: use the in-device segment-ring redo layout
     /// (`docs/REDO_SEGMENT_RING_DESIGN.md`) instead of the linear-with-reset log.
     /// `false` (default) keeps the linear layout. A FRESH redo region adopts this
@@ -1218,6 +1241,7 @@ impl Default for ServerConfig {
             pipeline_depth: 1,
             redo_buffered: false,
             redo_flush_interval_ms: 5,
+            redo_buffered_io: false,
             redo_segment_ring: false,
             redo_segment_size: 0,
             http_listen_addr: "127.0.0.1:9100".to_string(),
@@ -1361,6 +1385,17 @@ impl ServerConfig {
     /// otherwise derives it from the first device path by appending `.redo`.
     ///
     /// When `redo_log_path` is `None` and `device_paths` is empty (a
+    /// Whether buffered (relaxed) redo durability is in effect.
+    ///
+    /// `true` when [`Self::redo_buffered`] is set OR [`Self::redo_buffered_io`]
+    /// is set: the page-cache redo open + no-per-flush-fsync flusher only make
+    /// sense once the ack path is already off the fsync, so `redo_buffered_io`
+    /// implies buffered durability. This single source of truth gates both the
+    /// engine's `set_buffered_durability` and the background flusher's spawn.
+    pub fn redo_buffered_effective(&self) -> bool {
+        self.redo_buffered || self.redo_buffered_io
+    }
+
     /// misconfiguration that `validate_safe_defaults` rejects with
     /// `ConfigError::NoDevicePaths`), this falls back to the built-in
     /// default `teraslab-data.dat.redo` rather than panicking. The
@@ -2328,6 +2363,55 @@ backend = ""
         assert_eq!(cfg.redo_segment_size, 0, "segment size defaults to auto");
         cfg.validate_sizes()
             .expect("default config (ring off) must validate");
+    }
+
+    #[test]
+    fn redo_buffered_io_defaults_off_and_implies_buffered_durability() {
+        // Default: both off → strict durability, no buffered effect.
+        let cfg = ServerConfig::default();
+        assert!(!cfg.redo_buffered_io, "redo_buffered_io must default OFF");
+        assert!(!cfg.redo_buffered);
+        assert!(
+            !cfg.redo_buffered_effective(),
+            "neither flag set → not buffered"
+        );
+
+        // redo_buffered alone → buffered.
+        let buffered = ServerConfig {
+            redo_buffered: true,
+            ..ServerConfig::default()
+        };
+        assert!(buffered.redo_buffered_effective());
+
+        // redo_buffered_io alone → implies buffered durability.
+        let io = ServerConfig {
+            redo_buffered_io: true,
+            redo_buffered: false,
+            ..ServerConfig::default()
+        };
+        assert!(
+            io.redo_buffered_effective(),
+            "redo_buffered_io must imply buffered durability"
+        );
+    }
+
+    #[test]
+    fn redo_buffered_io_parses_from_toml_top_level_scalar() {
+        // Top-level scalar before any [section], as required by the async config.
+        let toml_str = "redo_buffered = true\nredo_buffered_io = true\n";
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            cfg.redo_buffered_io,
+            "redo_buffered_io must parse from TOML"
+        );
+        assert!(cfg.redo_buffered_effective());
+
+        // Absent key → default false (backward compatibility with old configs).
+        let cfg2: ServerConfig = toml::from_str("redo_buffered = true\n").unwrap();
+        assert!(
+            !cfg2.redo_buffered_io,
+            "absent redo_buffered_io defaults to false"
+        );
     }
 
     #[test]

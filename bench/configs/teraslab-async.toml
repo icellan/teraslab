@@ -52,6 +52,13 @@ block_height_retention = 288
 # Async durability to match the reference's no-commit-to-device posture.
 redo_buffered = true
 redo_flush_interval_ms = 50
+# Open the redo log through the OS page cache (NOT O_DIRECT/F_NOCACHE) and have
+# the background flusher pwrite WITHOUT a per-flush fsync — matching the
+# reference's async page-cache writes. The DATA device stays O_DIRECT. Durability
+# for the redo comes from OS writeback + the checkpoint barrier (which still
+# fsyncs the redo before it reclaims), so reclamation safety is unchanged. This
+# removes the periodic redo fsync that stalls the macOS-Docker VM ~tens of ms.
+redo_buffered_io = true
 
 # Checkpoint watermarks: keep the NON-blocking (fuzzy) checkpoint the common case.
 # Trigger it early (0.50) with a wide gap to the emergency blocking threshold
