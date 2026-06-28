@@ -150,13 +150,35 @@ TeraSlab's adapter+client caps ~4.5× lower.
 
 ### REMAINING bottleneck (next session) — the Go client/adapter throughput cap
 
-~35k store-ops/s hard cap in the **client stack** (server idle). Suspects, in
-order: (a) the Teranode teraslab **adapter's go-batcher** — ONE worker goroutine
-per batcher (store/spend/get); SetLocked+Delete not coalesced at all; (b) the
-teraslab Go client lib per-op overhead. **Next step: pprof the Go harness/adapter
-under load** (add net/http/pprof to the harness or use `go test -cpuprofile`),
-find the single-threaded hot path, parallelize it. Then re-run the chain h2h
-fresh-per-round and apply strict 4/4.
+~35k store-ops/s hard cap in the **client stack** (server idle).
+
+### PROFILED (commit pending) — `client-cpu.prof` / `client-pprof-cum.txt`
+
+CPU profile of the Go harness under load: the client process uses **~1 core**
+(108% total) and is **not CPU-bound** — it is drowning in Go runtime
+scheduler/lock contention (futex 7.9%, lfstack.pop 6.6%, lock2 6.2%, selectgo
+6.2%, findRunnable/schedule ~18/21% cum). Cumulative app paths reveal WHY:
+
+- create → storeBatcher, spend → spendBatcher: **coalesced** into batches,
+  dispatched concurrently, pipelined per conn (after the pool fix). ✅
+- **unlock → `SetLocked → SetLockedBatch → sendTxIDBatch` (9.8%)** and
+  **get → `BatchDecorate → GetRecordBatch` (13.6%)**: sent as **single-item
+  RPCs — NOT batched at all.** 2 of every 4 ops/link are 1-item round-trips,
+  each taking the per-conn write mutex (`conn.mu` in roundTrip/writeRequest).
+
+So ~17k single-item RPCs/s + 10k goroutines funneling through one
+channel+worker per go-batcher = the coordination storm that caps throughput at
+~35k store-ops/s with both client and server at ~1 core.
+
+### FIX (next) — coalesce SetLocked + BatchDecorate in the adapter
+
+Add coalescing batchers for `SetLocked` and the get/decorate path in
+`stores/utxo/teraslab` exactly like the existing `spendBatcher` (merge concurrent
+single-item calls into one wire batch, size + 2–5 ms window, ItemIndex re-map).
+This makes ALL four ops real batches ("never single items, always batches"),
+~halves RPC count, and breaks the single-item write-lock storm. Consider also
+multiple go-batcher workers (sharded channel) to cut the single-worker
+contention. Then re-run the chain h2h fresh-per-round and apply strict 4/4.
 
 ## Reproduce
 
