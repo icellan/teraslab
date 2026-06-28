@@ -10,21 +10,28 @@ throughput + p99.9 at minimum) under a **fair matched config**, proven by
 reproducible numbers. Constraint: never name/import the reference product anywhere
 in this repo — call it "the reference datastore" (grep confirms zero refs).
 
-**Current (2026-06-28, after E13-E16): NOT won. Read PERF_LEDGER.md E16 — it is
-the latest state.** TeraSlab went from ~20% → competitive-in-isolation
-(~44k ops/s isolated vs the reference ~51k), but the reference still wins
-head-to-head. Every architecture/config lever is RESOLVED:
+**Current (2026-06-28, after E13-E17): NOT won. Read PERF_LEDGER.md E17 — latest.**
+TeraSlab went from ~20% → competitive-in-isolation (~44k ops/s isolated vs the
+reference ~51k). Every architecture/config lever is RESOLVED:
 - E13 fsync coalescing (3×), E14 secondary-index sharding (create_index 9-22ms→3.6ms),
   E15 redo segment-ring (kills the ~10s checkpoint freeze), E16 `device_split=4`
   (breaks the per-store lock-domain cap, ~33k→~44k, CPU 210%→420%).
-- **THE REMAINING GAP IS CPU EFFICIENCY:** the reference does ~42-51k at 160-260%
-  CPU; TeraSlab does ~29-44k at 400-540% CPU → it burns **~2-3× the CPU per op**
-  (~95µs vs ~51µs). It is now CPU-bound, not lock/IO-bound. Closing this is a
-  profiling-driven micro-optimization pass on the create/spend hot paths
-  (allocations / memcpy / CRC / cold-data serialization / protocol encode) — a
-  different class of work than the config/architecture levers, and it needs a
-  CPU flamegraph + a QUIET host to measure. This shared box has a persistent
-  EXTERNAL `perl` job pinning ~2 cores → certification impossible here.
+- **THE REMAINING GAP IS CPU EFFICIENCY** (reference ~51µs CPU/op vs TeraSlab
+  ~95-157µs). E17 began the CPU pass via the server's pprof flamegraph (encode
+  ~30%, index lookups ~32%): **two fixes committed** — redo ring-encode reuse
+  (stop discarding the pre-encoded body + re-serializing in ring mode) + index
+  single-probe (fuse the create lookup+insert). A/B: **MIN CPU-µs/op −11.8%**
+  (median/throughput noise-dominated). cargo test --all 2962/0.
+- **Why it can't be finished/certified HERE:** at IF=256 the server has IDLE CPU,
+  so per-op CPU cuts don't raise throughput (only convert to throughput when
+  CPU-bound = high device_split + spare cores); and this box has an EXTERNAL
+  `perl` job eating ~2 cores so throughput + steady-state CPU/op are noise-swamped.
+  Remaining CPU targets (documented, harder): the `engine.rs:933` redo-op clone
+  (needs Arc-ifying RedoOp's record — replication keeps its own copy), the ~19%
+  background writeback, the 16% inherent hash-probe. **Next session: re-run on a
+  QUIET host (load<1/core, `--cpuset-cpus`) to certify the CPU-fix throughput
+  payoff + scale device_split into the spare cores (reference appears to cap
+  ~51k); continue the CPU pass from a fresh flamegraph.**
 
 ## The arc (why we are where we are)
 1. **B0**: baseline lost ~5× (closed-loop bench, masked the real issues).
