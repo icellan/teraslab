@@ -170,7 +170,29 @@ So ~17k single-item RPCs/s + 10k goroutines funneling through one
 channel+worker per go-batcher = the coordination storm that caps throughput at
 ~35k store-ops/s with both client and server at ~1 core.
 
-### FIX (next) — coalesce SetLocked + BatchDecorate in the adapter
+### Update 3 — coalescing landed + MEASURED (teranode-bench-wt 8031f0bc8)
+
+Coalesced SetLocked + BatchDecorate in the adapter (all 4 ops now batched, matches
+production). Measured on a fresh box (10k chains, pool 256, bigconn caps):
+
+| metric | pre-coalesce | post-coalesce |
+|---|---|---|
+| throughput (links/s) | ~8.7k | **~11.6k (+33%)** |
+| create p50 | 250 ms | **46 ms** |
+| create p99 | ~2,000 ms | **78 ms** (25× tighter) |
+| op failures | 0 | 0 |
+
+Big latency win + 33% throughput. BUT still ~46k store-ops/s with the **server
+idle (0.6 core)** — the client transport is STILL the ceiling. Throughput is far
+below what the tight per-op latency implies (10k workers × ~184ms/link ⇒ ~54k
+links/s expected, only 11.6k seen), i.e. chain goroutines spend most wall-clock
+NOT in op latency → **Go scheduler/coordination overhead in the client process**
+(too many goroutines + central go-batcher funnel + pool lock), exactly the
+contention the reference client avoids. Next = the client transport redesign
+(see REFERENCE_CLIENT_ANALYSIS.md): shard the conn pool by hint + de-funnel the
+batcher.
+
+### (done) coalesce SetLocked + BatchDecorate in the adapter
 
 Add coalescing batchers for `SetLocked` and the get/decorate path in
 `stores/utxo/teraslab` exactly like the existing `spendBatcher` (merge concurrent
