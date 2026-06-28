@@ -109,9 +109,7 @@ func TestPoolBoundedUnderConcurrency(t *testing.T) {
 
 	// Wait for pre-warm to finish so the connection set exists before load.
 	if !waitFor(t, 3*time.Second, func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.conns) == maxConns
+		return p.connCount() == maxConns
 	}) {
 		t.Fatalf("pre-warm did not reach MaxConns=%d", maxConns)
 	}
@@ -134,13 +132,7 @@ func TestPoolBoundedUnderConcurrency(t *testing.T) {
 
 	// Let all callers reach get() and pipeline their requests.
 	if !waitFor(t, 3*time.Second, func() bool {
-		p.mu.Lock()
-		var total int64
-		for _, c := range p.conns {
-			total += c.inflightCount()
-		}
-		p.mu.Unlock()
-		return total >= callers
+		return p.totalInflight() >= callers
 	}) {
 		t.Fatal("not all callers became in-flight; pool may be blocking on get()")
 	}
@@ -171,6 +163,7 @@ func TestPoolPipelinesMultipleInflight(t *testing.T) {
 		MaxConns:      8,
 		PipelineDepth: 16, // well above the number of callers
 		PrewarmConns:  1,
+		PoolShards:    1, // single shard so all callers route to the one warm conn
 		DialTimeout:   2 * time.Second,
 		HealthCheck:   1 * time.Hour,
 	})
@@ -178,9 +171,7 @@ func TestPoolPipelinesMultipleInflight(t *testing.T) {
 
 	// Ensure exactly one warm connection.
 	if !waitFor(t, 3*time.Second, func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.conns) == 1
+		return p.connCount() == 1
 	}) {
 		t.Fatal("pre-warm did not establish the single connection")
 	}
@@ -203,17 +194,15 @@ func TestPoolPipelinesMultipleInflight(t *testing.T) {
 
 	// All callers should be in flight ON THE SINGLE connection simultaneously.
 	if !waitFor(t, 3*time.Second, func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.conns) == 1 && p.conns[0].inflightCount() == callers
+		conns := p.allConns()
+		return len(conns) == 1 && conns[0].inflightCount() == callers
 	}) {
-		p.mu.Lock()
-		n := len(p.conns)
+		conns := p.allConns()
+		n := len(conns)
 		var inflight int64
 		if n > 0 {
-			inflight = p.conns[0].inflightCount()
+			inflight = conns[0].inflightCount()
 		}
-		p.mu.Unlock()
 		t.Fatalf("expected %d in-flight on one connection, got conns=%d inflight=%d", callers, n, inflight)
 	}
 
@@ -239,6 +228,7 @@ func TestPoolDialFailureNonFatal(t *testing.T) {
 		MaxConns:      4,
 		PipelineDepth: 1,
 		PrewarmConns:  1,
+		PoolShards:    1, // single shard so the saturated conn is the only fallback
 		DialTimeout:   2 * time.Second,
 		HealthCheck:   1 * time.Hour,
 	})
@@ -248,15 +238,12 @@ func TestPoolDialFailureNonFatal(t *testing.T) {
 
 	// Wait for pre-warm to settle on exactly one healthy connection.
 	if !waitFor(t, 3*time.Second, func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.conns) == 1
+		return p.connCount() == 1
 	}) {
 		t.Fatal("pre-warm did not establish the single connection")
 	}
-	p.mu.Lock()
-	healthy := p.conns[0]
-	p.mu.Unlock()
+	conns := p.allConns()
+	healthy := conns[0]
 
 	// Saturate it to PipelineDepth so get() tries to grow.
 	healthy.inflight.Store(1)
@@ -332,5 +319,136 @@ func TestPoolCloseDrainsInflight(t *testing.T) {
 
 	if conn.alive() {
 		t.Fatal("connection still alive after pool Close")
+	}
+}
+
+// TestPoolShardingSpreadsAcquisition proves the sharding refactor: under
+// concurrency the pool spreads connections across MORE THAN ONE shard (no
+// single global lock funnels every acquisition through one connection set),
+// while the total connection count still respects MaxConns as a hard ceiling
+// and Close() drains every shard.
+func TestPoolShardingSpreadsAcquisition(t *testing.T) {
+	var accepted atomic.Int64
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	// Hold every request in flight so callers cannot serially reuse one conn —
+	// the pool must spread them across shards/conns to absorb the concurrency.
+	ln := countingEchoServer(t, &accepted, func() { <-release })
+	defer ln.Close()
+
+	const (
+		maxConns = 16
+		shards   = 4
+	)
+	p := newPool(ln.Addr().String(), PoolConfig{
+		MinConns:           1,
+		MaxConns:           maxConns,
+		PoolShards:         shards,
+		PipelineDepth:      1, // 1 in-flight saturates a conn, forcing growth/spread
+		PrewarmConns:       shards,
+		MaxConcurrentDials: shards,
+		DialTimeout:        2 * time.Second,
+		HealthCheck:        1 * time.Hour,
+	})
+	defer func() { releaseAll(); p.close() }()
+
+	if got := len(p.shards); got != shards {
+		t.Fatalf("expected %d shards, got %d", shards, got)
+	}
+
+	// Wait for pre-warm to seed connections across shards.
+	if !waitFor(t, 3*time.Second, func() bool { return p.connCount() == shards }) {
+		t.Fatalf("pre-warm did not reach %d conns, got %d", shards, p.connCount())
+	}
+
+	const callers = 200
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := p.get(ctx)
+			if err != nil {
+				return
+			}
+			_, _ = conn.roundTrip(ctx, OpPing, 0, nil)
+		}()
+	}
+
+	// Wait for the callers to fan out in flight.
+	if !waitFor(t, 3*time.Second, func() bool { return p.totalInflight() >= callers }) {
+		t.Fatalf("callers did not fan out in flight; got inflight=%d", p.totalInflight())
+	}
+
+	// (a) Acquisition is sharded: more than one shard ended up with connections.
+	if got := p.shardsWithConns(); got < 2 {
+		t.Fatalf("expected acquisition to spread across >1 shard, only %d shard(s) hold conns", got)
+	}
+
+	// (b) MaxConns is a hard ceiling across all shards.
+	if got := p.connCount(); got > maxConns {
+		t.Fatalf("MaxConns breached: %d conns across shards, want <= %d", got, maxConns)
+	}
+	if got := accepted.Load(); got > maxConns {
+		t.Fatalf("dial storm past MaxConns: opened %d, want <= %d", got, maxConns)
+	}
+	if got := p.totalConns.Load(); got != int64(p.connCount()) {
+		t.Fatalf("global counter %d drifted from actual conn count %d", got, p.connCount())
+	}
+
+	releaseAll()
+	wg.Wait()
+
+	// (c) Close() drains every shard.
+	conns := p.allConns()
+	if err := p.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	for _, c := range conns {
+		if c.alive() {
+			t.Fatal("Close left a connection alive in some shard")
+		}
+	}
+	if got := p.connCount(); got != 0 {
+		t.Fatalf("Close did not drain all shards: %d conns remain", got)
+	}
+	if got := p.totalConns.Load(); got != 0 {
+		t.Fatalf("Close did not reset global counter: %d", got)
+	}
+}
+
+// TestPoolShardsDefaultsClamp verifies shard-count derivation and clamping: an
+// unset PoolShards derives a sane default (>=1, <= MaxConns), an oversized value
+// is clamped to MaxConns, and the global cap holds regardless of shard count.
+func TestPoolShardsDefaultsClamp(t *testing.T) {
+	cases := []struct {
+		name      string
+		maxConns  int
+		shards    int
+		wantMin   int
+		wantMaxLE int // shards must be <= this
+	}{
+		{"derived default", 16, 0, 1, 16},
+		{"clamped to maxconns", 4, 100, 1, 4},
+		{"explicit small", 8, 2, 2, 2},
+		{"maxconns one forces single shard", 1, 8, 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := PoolConfig{MaxConns: tc.maxConns, PoolShards: tc.shards}
+			cfg.defaults()
+			if cfg.PoolShards < tc.wantMin {
+				t.Errorf("PoolShards=%d, want >= %d", cfg.PoolShards, tc.wantMin)
+			}
+			if cfg.PoolShards > tc.wantMaxLE {
+				t.Errorf("PoolShards=%d, want <= %d", cfg.PoolShards, tc.wantMaxLE)
+			}
+			if cfg.PoolShards > cfg.MaxConns {
+				t.Errorf("PoolShards=%d exceeds MaxConns=%d", cfg.PoolShards, cfg.MaxConns)
+			}
+		})
 	}
 }

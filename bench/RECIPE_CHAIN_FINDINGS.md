@@ -192,6 +192,41 @@ contention the reference client avoids. Next = the client transport redesign
 (see REFERENCE_CLIENT_ANALYSIS.md): shard the conn pool by hint + de-funnel the
 batcher.
 
+### Update 4 — client conn-pool sharding landed (UNMEASURED-WIN: ~0)
+
+Sharded the teraslab Go client conn pool by round-robin hint (global atomic
+MaxConns cap), removing the single global pool mutex + O(conns) least-loaded scan.
+Measured: 11.9k links/s — **no gain over coalescing's 11.6k**. So the global pool
+lock was NOT the bottleneck (ruled out). Race/vet/gofmt clean, tests pass.
+
+### Update 5 — re-profile with ALL fixes: client is GC + contention bound
+
+`cli2.prof` (coalescing + pool-sharding): server now at **2.8 cores** (up from
+0.6 — the client finally feeds it), but throughput still ~12k links/s. The CLIENT
+is the wall, dominated by **mallocgc 25.9% cum** (allocation/GC pressure) +
+channel/lock contention (selectgo 12%, lock2 8.9%, futex 9.2%, lfstack 9.2%) +
+sha256 8% (tx build, shared with the reference). The reference's client avoids all
+this central coordination/alloc (sharded conn-per-command, fewer goroutines).
+
+**NET so far: 8.7k → ~12k links/s (+38%), create p99 ~2000ms → ~70ms (28×).
+Still ~3.4× behind the reference (40.7k links/s). Both client & server now have
+idle cores → the cap is client coordination+allocation, not compute.**
+
+### NEXT hypotheses (local work; measure on a fresh box)
+1. **Cut client allocations (mallocgc 25%)**: reuse/pool the wire frame buffers
+   and batcher item structs in the teraslab client + adapter hot path; avoid
+   per-request allocations. (sha256/tx-build is shared with the reference, leave
+   it.)
+2. **De-funnel the adapter go-batcher**: it is one channel + one worker goroutine
+   per op-type (selectgo/lock contention). Shard it into M lanes, or replace with
+   a lock-free per-shard accumulator, so 10k callers don't serialize on one
+   channel+worker.
+3. **If 1+2 don't close it, adopt the reference transport model**: synchronous
+   conn-per-command over the (now sharded) bounded pool — far fewer goroutines
+   (no readLoop-per-conn, no done-channel-per-request), which kills the scheduler
+   thrash. Biggest change, highest potential.
+Then re-run the chain h2h fresh-per-round and apply strict 4/4.
+
 ### (done) coalesce SetLocked + BatchDecorate in the adapter
 
 Add coalescing batchers for `SetLocked` and the get/decorate path in

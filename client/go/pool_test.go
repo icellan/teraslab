@@ -84,6 +84,7 @@ func TestPoolReusesConnections(t *testing.T) {
 		MinConns:     1,
 		MaxConns:     4,
 		PrewarmConns: 1,
+		PoolShards:   1, // single shard so sequential gets route to the same conn
 		DialTimeout:  2 * time.Second,
 		HealthCheck:  1 * time.Hour,
 	})
@@ -93,9 +94,7 @@ func TestPoolReusesConnections(t *testing.T) {
 	// onto it rather than racing the cold-start dial.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		p.mu.Lock()
-		ready := len(p.conns) == 1 && len(p.dialSem) == 0
-		p.mu.Unlock()
+		ready := p.connCount() == 1 && !p.dialSemBusy()
 		if ready || time.Now().After(deadline) {
 			break
 		}
@@ -135,6 +134,7 @@ func TestPoolGrowsOnlyWhenConnsSaturated(t *testing.T) {
 		MaxConns:      maxConns,
 		PipelineDepth: depth,
 		PrewarmConns:  1,
+		PoolShards:    1, // single shard so the least-loaded scan is pool-wide here
 		DialTimeout:   2 * time.Second,
 		HealthCheck:   1 * time.Hour,
 	})
@@ -147,9 +147,7 @@ func TestPoolGrowsOnlyWhenConnsSaturated(t *testing.T) {
 	// fall back to an existing conn instead of dialing, flaking the count).
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		p.mu.Lock()
-		ready := len(p.conns) >= 1 && len(p.dialSem) == 0
-		p.mu.Unlock()
+		ready := p.connCount() >= 1 && !p.dialSemBusy()
 		if ready || time.Now().After(deadline) {
 			break
 		}
@@ -171,9 +169,7 @@ func TestPoolGrowsOnlyWhenConnsSaturated(t *testing.T) {
 	if c2 != c1 {
 		t.Fatalf("expected reuse of the warm connection below PipelineDepth, got a different conn")
 	}
-	p.mu.Lock()
-	n := len(p.conns)
-	p.mu.Unlock()
+	n := p.connCount()
 	if n != 1 {
 		t.Fatalf("pool grew while a connection had pipeline headroom: size=%d", n)
 	}
@@ -182,11 +178,9 @@ func TestPoolGrowsOnlyWhenConnsSaturated(t *testing.T) {
 	// is forced to grow. It must grow up to MaxConns and no further.
 	seen := map[*pipeConn]bool{c1: true}
 	for i := 0; i < maxConns*3; i++ {
-		p.mu.Lock()
-		for _, c := range p.conns {
+		for _, c := range p.allConns() {
 			c.inflight.Store(int64(depth))
 		}
-		p.mu.Unlock()
 
 		c, err := p.get(ctx)
 		if err != nil {
@@ -198,9 +192,7 @@ func TestPoolGrowsOnlyWhenConnsSaturated(t *testing.T) {
 	if len(seen) != maxConns {
 		t.Errorf("expected pool to grow to exactly MaxConns=%d distinct connections, got %d", maxConns, len(seen))
 	}
-	p.mu.Lock()
-	n = len(p.conns)
-	p.mu.Unlock()
+	n = p.connCount()
 	if n != maxConns {
 		t.Errorf("expected pool size %d, got %d", maxConns, n)
 	}
@@ -323,9 +315,8 @@ func TestCheckHealthSkipsConnWithInflight(t *testing.T) {
 	if !c.alive() {
 		t.Fatal("checkHealth closed a connection with an in-flight request")
 	}
-	p.mu.Lock()
-	inPool := len(p.conns) == 1 && p.conns[0] == c
-	p.mu.Unlock()
+	conns := p.allConns()
+	inPool := len(conns) == 1 && conns[0] == c
 	if !inPool {
 		t.Fatal("checkHealth removed a busy connection from the pool")
 	}
