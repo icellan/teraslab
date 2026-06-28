@@ -679,3 +679,40 @@ Fair-config note: with device_split=4 the redo buffer is 4x per-store (generous 
 TeraSlab); a stricter fair config would scale redo_log_size down so the TOTAL ≈ the
 reference's 1024M cache — the conclusion (TeraSlab trails on CPU efficiency) holds
 either way, since it trails even with the generous buffer.
+
+## E17 — CPU-efficiency pass: redo ring-encode + index single-probe (2026-06-28)
+
+Started attacking the CPU-cycles/op gap (E16). Profiled via the server's built-in
+pprof endpoint (perf unavailable on Docker-macOS): baseline **~157 CPU-µs/op** @
+IF=256. Top self-CPU buckets: `Vec::from_iter`/encode **~30%**, index lookups
+(`get_entry` + `lookup_checked`) **~32%**, crc ~8%, background writeback ~19%.
+
+Two fixes (committed 56884d3, a669244; `cargo test --all` 2962/0):
+1. **redo ring-encode reuse** (`redo.rs`): the segment-ring branch of
+   `append_preencoded_atomic` was DISCARDING the off-lock pre-encoded body and
+   calling `append_atomic`, which re-clones + re-serializes every op 2-3× UNDER
+   the lock (E7's "encode outside the lock" was defeated in ring mode — which has
+   been the default since E15). Now it consumes the pre-encoded bodies directly
+   (patch seq, CRC once, byte-identical frame, MOVE op into pending_entries).
+   Byte-identical + recovery roundtrip proven by tests.
+2. **index single-probe** (`hashtable.rs`/`mod.rs`/`backend.rs`/`engine.rs`):
+   `register_new_with_shard_count` probed the index TWICE per create
+   (`lookup_checked` then `insert`). Fused into one Robin-Hood walk
+   (`insert_if_absent`, reject-not-overwrite).
+
+A/B (precpu image = 0329d3a vs bench = both fixes; SAME config; interleaved, 5
+rounds, fresh containers, IF=256): **MIN (least-contended) CPU-µs/op −11.8%**
+(47.4→41.8); median −0.8% and throughput flat (−0.2%) — host noise (per-round
+CPU swung 42-55µs) swamps the median, and at IF=256 the server has idle CPU so a
+per-op CPU cut does NOT raise throughput (only converts to throughput when
+CPU-bound: high device_split + high IF + spare cores). Best-case −12% is the real
+signal; steady-state magnitude + any throughput/head-to-head payoff need a QUIET
+host (the box still has the external `perl` load eating ~2 cores).
+
+**Remaining CPU targets (same flamegraph, not yet done):** the `engine.rs:933`
+redo-op deep clone (`append_redo_ops_routed` takes `&[RedoOp]` because the caller
+reuses ops for replication — needs a caller refactor); pre_encode buffer
+pre-sizing (the `with_capacity(...+64)` reallocs for >64B records); the ~19%
+background writeback CPU. Stacking these + a quiet host is the path to the
+reference's ~51µs/op (and, when CPU-bound with spare cores, to out-scaling its
+~51k ceiling via device_split).
