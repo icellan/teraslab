@@ -553,3 +553,52 @@ for this loop — flagging for a direction check. Net: the client-side fixes (E1
 E2) are correct and unblock concurrency, but the win now hinges on server-side
 write-concurrency, or on a representative open-loop benchmark + non-Docker
 network (the native Rust client already does 30k > reference 11k).
+
+## E14 — REAL binder found: the single `Mutex<UnminedBackend>` on create (2026-06-28)
+
+RESUME's "next levers" (redo mutex, allocator lock) were WRONG. Profiled the
+post-E13 write path properly (subagent, fresh-container IF sweep + create-path
+latency decomposition). Findings:
+- `redo_commit_lock_wait` 7→19→87µs (<0.3% of create latency) — NOT the redo mutex.
+- `create_reserve` (allocator) 18→48µs (flat, ~0.2%) — NOT the allocator.
+- **`create_index` 754µs→1.7ms→9ms→22ms as IF doubles** — 78–87% of create
+  latency, super-linear = lock-queue signature. Device-independent (tmpfs barely
+  moves it) → lock-bound, not I/O-bound. CPU idle → decontention raises the
+  ceiling. Peak disk was actually **32.7k @ IF=512 (87% of the reference's
+  ~37.8k)**, higher than RESUME's IF=256-only 22.5k.
+
+Two root causes inside `create_index`, found by reading the code:
+
+1. **Fresh-rebuild index under-sizing → resize storm (FIXED, committed).** On a
+   wiped volume `ShardedIndex::rebuild_in_memory` sized each of 256 shards to the
+   *scanned count* (≈0) → ~183 buckets/shard; steady-state inserts then resized
+   repeatedly UNDER the per-shard write guard (`engine.rs:2291`). Fix: thread
+   `expected_records` through the rebuild → `basis = count.max(expected_records)`
+   (sharded.rs/startup.rs/server.rs). TDD: `rebuild_in_memory_presizes_to_
+   expected_records_on_empty_device` (capacity 65536→≥2M). `cargo test --all`
+   green, clippy `--all -D warnings` + fmt clean. 521 MiB idle RSS confirms it's
+   active. **Correct + verified, but A/B showed it is NOT the dominant binder
+   here** (create_index stayed super-linear with resizes eliminated). It still
+   matters for a fresh production node under create load; kept.
+
+2. **The single `Mutex<UnminedBackend>` (THE binder, A/B-PROVEN).** The bench
+   creates at `height := 1` (driver), so every create hits
+   `if meta.unmined_since != 0 → update_unmined_index → self.unmined_index.lock()`
+   — ONE global Mutex, all creates funnelling into `by_height[1]`'s single Vec,
+   contended by every parallel register thread (`thread::scope`).
+   Decisive interleaved A/B (env-gated toggle to skip the create unmined insert,
+   3 pairs @ IF=512, same host/window so noise cancels; toggle reverted, never
+   committed): **skipping it → total +21% (27.5k→33.4k median), create_index
+   −77% (11.4ms→2.6ms), every DIAG run > every CONTROL run.** Toggle verified
+   (unmined_index_entries 0 vs 158–189k). Caveat: the toggle *drops* work
+   (failures appear under the higher offered rate); the real fix must SHARD the
+   index — preserve every insert, failed=0.
+
+**THE NEXT FIX:** shard the secondary indexes by txkey like the primary
+`ShardedIndex` (generic `ShardedSecondary<B>`, 256 shards, in-memory variant
+only; cold-path range queries fan-out+concat — order doesn't matter, pruner
+re-validates). Ship UNMINED first (create 40% hits it), measure, then DAH (spend
+30% + setMined 10% hit it). No on-disk/redo/recovery changes (pure in-RAM
+layout; recovery rebuilds from primary metadata regardless). Standing this noisy
+session: CONTROL ~27.5k @ IF=512 vs reference ~37.8k; unmined-skip ceiling ~33k;
+tmpfs ~34k. Closing the gap = unmined + DAH sharding.

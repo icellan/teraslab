@@ -1210,6 +1210,12 @@ impl ShardedIndex {
     /// - `shard_count`: the target number of index shards. Rounded up to the
     ///   next power of two and clamped to `[1, 256]` by `clamp_shard_count`.
     ///   Use `1` for the N=1 degenerate case (single-lock pass-through).
+    /// - `expected_records`: configured steady-state record count. The hash
+    ///   table is pre-sized to `max(scanned_count, expected_records)`, so a
+    ///   fresh/empty device still allocates steady-state capacity and avoids a
+    ///   resize storm (repeated rehash-under-write-guard as creates arrive).
+    ///   Pass `0` to size purely from the scanned count (the pre-change
+    ///   behavior).
     ///
     /// # Errors
     ///
@@ -1220,14 +1226,20 @@ impl ShardedIndex {
         device: &dyn BlockDevice,
         allocator: &SlotAllocator,
         shard_count: usize,
+        expected_records: usize,
     ) -> Result<Self, IndexError> {
         // Single-backend device scan — reuses all proven scan logic.
         let single = PrimaryBackend::rebuild(device, allocator)?;
         let count = single.len();
 
-        // Capacity hint: at least 64 per shard so small devices don't
-        // allocate tiny tables; scale proportionally for larger scans.
-        let per_shard_hint = (count / clamp_shard_count(shard_count))
+        // Sizing basis is `max(scanned_count, expected_records)`: a fresh/empty
+        // device scans 0 records, so without the `expected_records` floor each
+        // shard would start tiny and rehash-under-write-guard repeatedly as
+        // steady-state creates arrive — a resize storm that serializes the
+        // create path. Capacity hint: at least 64 per shard so small devices
+        // don't allocate tiny tables; scale proportionally for larger inputs.
+        let basis = count.max(expected_records);
+        let per_shard_hint = (basis / clamp_shard_count(shard_count))
             .max(64)
             .saturating_mul(2);
 
@@ -1247,10 +1259,15 @@ impl ShardedIndex {
     /// right store. Used by the multi-store boot path when no index snapshot is
     /// available. With one store this is equivalent to [`Self::rebuild_in_memory`]
     /// (device_id 0). `devices` and `allocators` are 1:1 per store.
+    ///
+    /// The hash table is pre-sized to `max(total_scanned_count, expected_records)`
+    /// — see [`Self::rebuild_in_memory`] — so a fresh/empty cluster of stores
+    /// still allocates steady-state capacity and avoids a resize storm.
     pub fn rebuild_in_memory_multi_store(
         devices: &[std::sync::Arc<dyn BlockDevice>],
         allocators: &[SlotAllocator],
         shard_count: usize,
+        expected_records: usize,
     ) -> Result<Self, IndexError> {
         assert_eq!(
             devices.len(),
@@ -1265,7 +1282,11 @@ impl ShardedIndex {
             total += single.len();
             singles.push(single);
         }
-        let per_shard_hint = (total / clamp_shard_count(shard_count))
+        // Sizing basis is `max(total_scanned_count, expected_records)` — see
+        // `rebuild_in_memory`: the `expected_records` floor pre-sizes a fresh
+        // cluster of stores to steady-state capacity, avoiding a resize storm.
+        let basis = total.max(expected_records);
+        let per_shard_hint = (basis / clamp_shard_count(shard_count))
             .max(64)
             .saturating_mul(2);
         let sharded =
@@ -2569,7 +2590,8 @@ mod tests {
     fn rebuild_in_memory_roundtrip() {
         let (dev, alloc, records) = setup_device_for_rebuild(50);
 
-        let sharded = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16).unwrap();
+        // expected_records=0 → sizing basis is the scanned count, unchanged.
+        let sharded = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16, 0).unwrap();
         assert_eq!(sharded.shard_count(), 16);
         assert_eq!(
             sharded.len(),
@@ -2633,7 +2655,7 @@ mod tests {
             std::sync::Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
 
-        let result = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16);
+        let result = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16, 0);
         let sharded = result.expect("rebuild_in_memory on empty device must succeed");
 
         assert_eq!(sharded.shard_count(), 16, "must produce 16 shards");
@@ -2644,6 +2666,66 @@ mod tests {
             let guard = shard.read();
             assert_eq!(guard.len(), 0, "shard {i} must be empty");
         }
+    }
+
+    /// Regression guard for the fresh-start resize storm: on an EMPTY device the
+    /// scanned count is 0, so the old sizing (basis = `count`) allocated ~183
+    /// buckets/shard and forced a rehash-under-write-guard storm as steady-state
+    /// inserts arrived. Threading `expected_records` into the rebuild must
+    /// pre-size the table to steady-state capacity so no resize is needed.
+    #[test]
+    fn rebuild_in_memory_presizes_to_expected_records_on_empty_device() {
+        let dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+
+        let expected_records = 2_000_000usize;
+        let idx = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 256, expected_records)
+            .expect("rebuild_in_memory on empty device must succeed");
+
+        let capacity = idx.stats().capacity;
+        assert!(
+            capacity >= expected_records,
+            "fresh-device rebuild must pre-size to expected_records to avoid a \
+             resize storm: capacity={capacity} < expected_records={expected_records}"
+        );
+    }
+
+    /// Backward-compat / regression pin: `expected_records = 0` must be a no-op
+    /// change — the sizing basis falls back to the scanned count exactly as
+    /// before. On an empty device that means the SAME capacity the old code
+    /// produced (`count=0` → `per_shard_hint = 128` → `new_in_memory(128*S, S)`),
+    /// proving the new max() only ever raises the floor and never alters the old
+    /// behavior when no expectation is supplied. Also guards that when the
+    /// scanned count exceeds `expected_records`, the larger count still governs.
+    #[test]
+    fn rebuild_in_memory_uses_scanned_count_when_larger_than_expected() {
+        let dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+
+        // expected_records = 0 reproduces the OLD capacity exactly: with count=0
+        // the basis is count.max(0) = count = 0, identical to pre-change sizing.
+        let shard_count = 256usize;
+        let old_basis = 0usize; // scanned count on an empty device
+        let per_shard_hint = (old_basis / clamp_shard_count(shard_count))
+            .max(64)
+            .saturating_mul(2);
+        let expected_old = ShardedIndex::new_in_memory(
+            per_shard_hint * clamp_shard_count(shard_count),
+            shard_count,
+        )
+        .unwrap()
+        .stats()
+        .capacity;
+
+        let idx = ShardedIndex::rebuild_in_memory(&*dev, &alloc, shard_count, 0)
+            .expect("rebuild_in_memory with expected_records=0 must succeed");
+        assert_eq!(
+            idx.stats().capacity,
+            expected_old,
+            "expected_records=0 must reproduce the old capacity exactly (no-op change)"
+        );
     }
 
     /// Multi-store device-scan rebuild must recover records from EVERY store and
@@ -2692,7 +2774,7 @@ mod tests {
         let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![dev0, dev1];
         let allocators = vec![alloc0, alloc1];
         let sharded =
-            ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16).unwrap();
+            ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16, 0).unwrap();
 
         assert_eq!(
             sharded.len(),

@@ -515,6 +515,10 @@ pub fn load_primary_index_in_memory(
 /// - `allocator`: slot allocator whose freelist is used to skip free holes.
 /// - `shard_count`: number of index shards to create (rounded up to the next
 ///   power of two, clamped to `[1, 256]`).
+/// - `expected_records`: configured steady-state record count. Each shard's
+///   hash table is pre-sized to `max(scanned_count, expected_records)` so a
+///   fresh/empty device still allocates steady-state capacity and avoids a
+///   rehash-under-write-guard resize storm on the create path.
 ///
 /// # Errors
 ///
@@ -525,8 +529,9 @@ pub fn load_sharded_index_in_memory(
     device: &dyn BlockDevice,
     allocator: &SlotAllocator,
     shard_count: usize,
+    expected_records: usize,
 ) -> Result<ShardedIndex, RebuildError> {
-    ShardedIndex::rebuild_in_memory(device, allocator, shard_count).map_err(|e| {
+    ShardedIndex::rebuild_in_memory(device, allocator, shard_count, expected_records).map_err(|e| {
         RebuildError::InMemoryPrimary {
             rebuild_err: format!("{e}"),
         }
@@ -542,6 +547,10 @@ pub fn load_sharded_index_in_memory(
 /// index entry's `device_id`; a single-device scan would index only the records
 /// that happened to land on store 0 and silently lose the rest.
 ///
+/// `expected_records` pre-sizes each shard's hash table to
+/// `max(total_scanned_count, expected_records)`, so a fresh/empty cluster of
+/// stores still allocates steady-state capacity and avoids a resize storm.
+///
 /// # Errors
 ///
 /// Returns [`RebuildError::InMemoryPrimary`] if any store's device scan or shard
@@ -550,12 +559,12 @@ pub fn load_sharded_index_in_memory_multi(
     devices: &[std::sync::Arc<dyn BlockDevice>],
     allocators: &[SlotAllocator],
     shard_count: usize,
+    expected_records: usize,
 ) -> Result<ShardedIndex, RebuildError> {
-    ShardedIndex::rebuild_in_memory_multi_store(devices, allocators, shard_count).map_err(|e| {
-        RebuildError::InMemoryPrimary {
+    ShardedIndex::rebuild_in_memory_multi_store(devices, allocators, shard_count, expected_records)
+        .map_err(|e| RebuildError::InMemoryPrimary {
             rebuild_err: format!("{e}"),
-        }
-    })
+        })
 }
 
 /// Rebuild secondary indexes from the device, returning a
@@ -1749,7 +1758,7 @@ mod tests {
             expected.push((TxKey { txid }, offset));
         }
 
-        let sharded = super::load_sharded_index_in_memory(&*dev, &alloc, 16)
+        let sharded = super::load_sharded_index_in_memory(&*dev, &alloc, 16, 0)
             .expect("load_sharded_index_in_memory must succeed with populated device");
 
         assert_eq!(sharded.shard_count(), 16, "must produce 16 shards");

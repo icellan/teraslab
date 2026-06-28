@@ -711,11 +711,27 @@ fn main() {
     // every record on stores 1..N. `load_sharded_index_in_memory_multi` scans all
     // stores and stamps each entry's `device_id`. N=1 keeps the byte-identical
     // single-device path.
+    // Pre-size the rebuilt in-memory index to the configured steady-state
+    // record count: on a fresh/empty device the scan finds 0 records, so without
+    // this each shard would start tiny and rehash-under-write-guard repeatedly as
+    // creates arrive — a resize storm that serializes the create path. Captured
+    // into a local so the closure borrows only the scalar, not all of `config`.
+    let expected_records = config.expected_records;
     let rebuild_primary_from_scan = |shard_count: usize| -> Result<ShardedIndex, _> {
         if num_stores > 1 {
-            load_sharded_index_in_memory_multi(&store_devices, &store_allocators, shard_count)
+            load_sharded_index_in_memory_multi(
+                &store_devices,
+                &store_allocators,
+                shard_count,
+                expected_records,
+            )
         } else {
-            load_sharded_index_in_memory(&*device, &store_allocators[0], shard_count)
+            load_sharded_index_in_memory(
+                &*device,
+                &store_allocators[0],
+                shard_count,
+                expected_records,
+            )
         }
     };
     let load_outcome: (ShardedIndex, SecondaryLoadOutcome) = if config.index.backend
