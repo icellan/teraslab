@@ -76,7 +76,14 @@ impl WritebackShutdown {
 struct Block {
     /// Block contents. Length is the block size (or the clamped tail length for
     /// a final block on a device whose size is not a block multiple).
-    data: Box<[u8]>,
+    ///
+    /// Held behind an [`Arc`] so the per-tick dirty snapshot taken under the
+    /// shard lock is a cheap refcount bump instead of a multi-KiB `memcpy`. A
+    /// write that mutates a block currently being flushed uses [`Arc::make_mut`]
+    /// (copy-on-write): if the flusher still holds a clone of the old `Arc`, the
+    /// writer transparently gets a fresh buffer, so the in-flight snapshot is
+    /// never corrupted.
+    data: Arc<[u8]>,
     /// `true` in write-back mode when the block holds writes not yet flushed to
     /// the inner device.
     dirty: bool,
@@ -108,6 +115,14 @@ struct CacheState {
     writeback: bool,
     shards: Box<[Mutex<Shard>]>,
     shard_count: u64,
+    /// Dedicated work-stealing pool used to flush shards concurrently in
+    /// [`CacheState::flush_all_dirty`]. Built once at construction (persistent —
+    /// no per-tick spawn cost) and sized to `min(shard_count, cores)`. Isolated
+    /// from the global rayon pool and the dispatch read-pool so writeback never
+    /// contends with request-serving fan-out. `None` if the pool failed to build
+    /// or only one worker is warranted, in which case shards flush serially on
+    /// the calling thread (correct, just single-core for that path).
+    flush_pool: Option<rayon::ThreadPool>,
 }
 
 /// In-RAM block cache over an inner [`BlockDevice`].
@@ -171,12 +186,39 @@ impl CachingDevice {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        // Dedicated writeback flush pool: only write-back ever flushes dirty
+        // blocks, so write-through skips it entirely. Cap workers at the shard
+        // count (no point in more workers than shards) and at the host's
+        // parallelism. With <= 1 worker there is nothing to parallelize, so we
+        // keep `None` and flush serially on the calling thread.
+        let flush_pool = if writeback {
+            let workers = (shard_count as usize).min(cores);
+            if workers <= 1 {
+                None
+            } else {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .thread_name(|i| format!("cache-flush-{i}"))
+                    .build()
+                    .map_err(|e| {
+                        tracing::error!(
+                            err = %e,
+                            "cache writeback flush pool build failed; shards flush serially"
+                        );
+                    })
+                    .ok()
+            }
+        } else {
+            None
+        };
+
         let state = Arc::new(CacheState {
             inner,
             block_size,
             writeback,
             shards,
             shard_count,
+            flush_pool,
         });
 
         // Write-back: spawn the background writeback thread. Write-through never
@@ -276,12 +318,12 @@ impl CacheState {
 
     /// Read block `block_idx` from the inner device into an owned buffer, using
     /// an aligned bounce buffer so the inner `O_DIRECT` read is legal.
-    fn load_from_inner(&self, block_idx: u64) -> Result<Box<[u8]>> {
+    fn load_from_inner(&self, block_idx: u64) -> Result<Arc<[u8]>> {
         let block_start = block_idx * self.block_size as u64;
         let len = self.block_len(block_start);
         let mut buf = AlignedBuf::new(len, self.block_size);
         self.inner.pread_exact_at(&mut buf[..len], block_start)?;
-        Ok(buf[..len].to_vec().into_boxed_slice())
+        Ok(Arc::from(&buf[..len]))
     }
 
     /// Evict the least-recently-used block from a full shard, flushing it first
@@ -407,23 +449,31 @@ impl CacheState {
             let mut shard = self.shard_of(block_idx).lock();
             let t = shard.bump();
             if let Some(b) = shard.blocks.get_mut(&block_idx) {
-                b.data[in_block..in_block + n].copy_from_slice(&buf[in_buf..in_buf + n]);
+                // Copy-on-write: `make_mut` mutates in place when this block is
+                // uniquely owned, but clones into a fresh buffer if a flusher is
+                // still holding a snapshot `Arc` of the old bytes — so a write
+                // concurrent with an in-flight flush never corrupts the snapshot.
+                Arc::make_mut(&mut b.data)[in_block..in_block + n]
+                    .copy_from_slice(&buf[in_buf..in_buf + n]);
                 b.last_used = t;
                 if self.writeback {
                     b.dirty = true;
                 }
             } else {
                 self.evict_if_full(&mut shard)?;
-                let mut data = match preload {
-                    Some(d) => d,
-                    None => vec![0u8; self.block_len(block_idx * bs)].into_boxed_slice(),
+                let mut data: Vec<u8> = match preload {
+                    // Partial write into a non-resident block: start from the
+                    // device bytes (loaded outside the lock) so untouched bytes
+                    // are preserved.
+                    Some(d) => d.to_vec(),
+                    None => vec![0u8; self.block_len(block_idx * bs)],
                 };
                 data[in_block..in_block + n].copy_from_slice(&buf[in_buf..in_buf + n]);
                 let t = shard.bump();
                 shard.blocks.insert(
                     block_idx,
                     Block {
-                        data,
+                        data: Arc::from(data),
                         dirty: self.writeback,
                         last_used: t,
                     },
@@ -443,46 +493,83 @@ impl CacheState {
         self.inner.sync_data()
     }
 
-    /// Flush every dirty block to the inner device (write-back). A no-op in
-    /// write-through mode (no block is ever dirty).
+    /// Flush every dirty block in a single shard to the inner device.
     ///
     /// Locking discipline (identical to the eviction path so it can never lose
-    /// or clobber a concurrent write): collect the dirty `(idx, bytes)` snapshot
-    /// under each shard lock, perform the device `pwrite` OUTSIDE the lock, then
-    /// re-acquire the lock and clear the dirty flag ONLY IF the cached bytes are
-    /// unchanged since the snapshot. A block re-written concurrently keeps its
-    /// dirty flag set and is flushed again on the next tick / `sync()`. The
-    /// shard lock is never held across a device `pwrite`, so this can never
-    /// deadlock against `pread`/`pwrite`/`sync`/eviction.
-    fn flush_all_dirty(&self) -> Result<()> {
-        if !self.writeback {
-            return Ok(());
-        }
-        for shard in self.shards.iter() {
-            // Collect dirty (idx, bytes) under the lock, flush outside it, then
-            // clear the dirty flag if the bytes are unchanged.
-            let dirty: Vec<(u64, Box<[u8]>)> = {
-                let shard = shard.lock();
-                shard
-                    .blocks
-                    .iter()
-                    .filter(|(_, b)| b.dirty)
-                    .map(|(idx, b)| (*idx, b.data.clone()))
-                    .collect()
-            };
-            for (idx, data) in dirty {
-                self.flush_block(idx, &data)?;
-                let mut shard = shard.lock();
-                if let Some(b) = shard.blocks.get_mut(&idx) {
-                    // Only clear if untouched since the snapshot (length is a
-                    // cheap, sufficient proxy: blocks never change length).
-                    if b.data.as_ref() == data.as_ref() {
-                        b.dirty = false;
-                    }
+    /// or clobber a concurrent write): collect the dirty `(idx, Arc<bytes>)`
+    /// snapshot under the shard lock — a cheap refcount bump, NOT a `memcpy` —
+    /// perform the device `pwrite` OUTSIDE the lock, then re-acquire the lock and
+    /// clear the dirty flag ONLY IF the cached `Arc` is still the exact one we
+    /// snapshotted. A concurrent write goes through [`Arc::make_mut`], which
+    /// swaps in a fresh allocation while a flusher holds the old `Arc`, so the
+    /// pointer identity check ([`Arc::ptr_eq`]) cleanly detects "re-written since
+    /// snapshot": such a block keeps its dirty flag and is flushed again on the
+    /// next tick / `sync()`. The shard lock is never held across a device
+    /// `pwrite`, so this can never deadlock against
+    /// `pread`/`pwrite`/`sync`/eviction.
+    fn flush_shard(&self, shard: &Mutex<Shard>) -> Result<()> {
+        let dirty: Vec<(u64, Arc<[u8]>)> = {
+            let shard = shard.lock();
+            shard
+                .blocks
+                .iter()
+                .filter(|(_, b)| b.dirty)
+                .map(|(idx, b)| (*idx, b.data.clone()))
+                .collect()
+        };
+        for (idx, data) in dirty {
+            self.flush_block(idx, &data)?;
+            let mut shard = shard.lock();
+            if let Some(b) = shard.blocks.get_mut(&idx) {
+                // Clear only if the stored Arc is byte-for-byte the snapshot we
+                // flushed. `Arc::ptr_eq` is exact and O(1): a concurrent write
+                // replaces the Arc (CoW), so a different pointer means re-dirtied.
+                if Arc::ptr_eq(&b.data, &data) {
+                    b.dirty = false;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Flush every dirty block across all shards to the inner device (write-back).
+    /// A no-op in write-through mode (no block is ever dirty).
+    ///
+    /// Shards are independent (disjoint locks, disjoint device ranges), so they
+    /// are flushed concurrently across the dedicated [`CacheState::flush_pool`]
+    /// when present — this is what breaks the old single-thread, one-core
+    /// writeback ceiling. Each shard still obeys the per-shard locking discipline
+    /// in [`CacheState::flush_shard`]. Falls back to a serial flush on the
+    /// calling thread if no pool was built (single-core host, or pool-build
+    /// failure). The first shard error is returned; remaining shards are still
+    /// attempted so a single bad block does not strand the rest dirty.
+    fn flush_all_dirty(&self) -> Result<()> {
+        if !self.writeback {
+            return Ok(());
+        }
+        match &self.flush_pool {
+            Some(pool) => {
+                use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+                pool.install(|| {
+                    self.shards
+                        .par_iter()
+                        .map(|shard| self.flush_shard(shard))
+                        // Attempt every shard; surface the first error.
+                        .reduce(|| Ok(()), |a, b| a.and(b))
+                })
+            }
+            None => {
+                let mut first_err = Ok(());
+                for shard in self.shards.iter() {
+                    if let Err(e) = self.flush_shard(shard)
+                        && first_err.is_ok()
+                    {
+                        first_err = Err(e);
+                    }
+                }
+                first_err
+            }
+        }
     }
 }
 
@@ -885,6 +972,150 @@ mod tests {
         );
         // Dropping after an explicit stop must not panic / double-join.
         drop(cache);
+    }
+
+    #[test]
+    fn concurrent_write_during_flush_does_not_corrupt_snapshot() {
+        // CoW correctness: a write that mutates a block while that block's bytes
+        // are being flushed must not corrupt the in-flight snapshot. With the
+        // Arc<[u8]> payload, the dirty snapshot is a refcount bump and a writer
+        // that mutates the shared block replaces the Arc (copy-on-write) rather
+        // than scribbling over the buffer the flusher is reading.
+        //
+        // Inner device whose pwrite blocks on a barrier so a concurrent writer
+        // is guaranteed to interleave with an in-flight flush.
+        use std::sync::mpsc;
+
+        struct GatedDev {
+            inner: MemoryDevice,
+            // Sends the bytes observed by the flusher at pwrite time.
+            observed: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+            // The flusher blocks here until the test releases it.
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl BlockDevice for GatedDev {
+            fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+                self.inner.pread(buf, offset)
+            }
+            fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
+                // Report the bytes this flush is about to persist, then block so
+                // the test can mutate the same block before we return.
+                if let Some(tx) = self.observed.lock().take() {
+                    let _ = tx.send(buf.to_vec());
+                    let (m, cv) = &*self.release;
+                    let mut released = m.lock();
+                    while !*released {
+                        cv.wait(&mut released);
+                    }
+                }
+                self.inner.pwrite(buf, offset)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let dev = Arc::new(GatedDev {
+            inner: MemoryDevice::new((64 * BS) as u64, BS).unwrap(),
+            observed: Mutex::new(Some(tx)),
+            release: release.clone(),
+        });
+        // NEVER_MS so the only flush is the explicit sync() we drive from a
+        // helper thread; the test owns the interleaving.
+        let cache = Arc::new(CachingDevice::new(dev.clone(), 16 * BS, true, NEVER_MS));
+
+        // Dirty block 0 with 0xAA.
+        cache.pwrite(&ab(0xAA, BS), 0).unwrap();
+
+        // Flush in a helper thread; it will block inside GatedDev::pwrite.
+        let flusher = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.sync().unwrap())
+        };
+
+        // Wait until the flusher is mid-pwrite holding the 0xAA snapshot.
+        let observed = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            observed,
+            vec![0xAA; BS],
+            "flush observed the snapshot bytes at the moment of the write"
+        );
+
+        // Now mutate the SAME block while the flush is in flight. CoW must keep
+        // the flusher's snapshot intact (the assertion above already captured
+        // the bytes, but the cache must also not panic / alias).
+        cache.pwrite(&ab(0xBB, BS), 0).unwrap();
+        assert_eq!(
+            read_cache(&cache, 0, BS),
+            vec![0xBB; BS],
+            "the concurrent write is immediately visible through the cache"
+        );
+
+        // Release the flusher.
+        {
+            let (m, cv) = &*release;
+            *m.lock() = true;
+            cv.notify_all();
+        }
+        flusher.join().unwrap();
+
+        // The block was re-dirtied during the flush, so it must remain dirty
+        // (its bytes changed since the snapshot) and a subsequent sync persists
+        // the newest bytes.
+        assert_eq!(
+            dirty_count(&cache),
+            1,
+            "re-dirtied-during-flush block keeps its dirty flag (bytes changed)"
+        );
+        cache.sync().unwrap();
+        let mut got = AlignedBuf::new(BS, BS);
+        dev.inner.pread(&mut got[..], 0).unwrap();
+        assert_eq!(
+            got[..].to_vec(),
+            vec![0xBB; BS],
+            "final sync persists the newest bytes, not the stale snapshot"
+        );
+    }
+
+    #[test]
+    fn parallel_flush_drains_many_shards_correctly() {
+        // Exercise the parallel multi-shard flush path: write one block into
+        // every shard, then a single sync() must flush them all with correct
+        // bytes regardless of how the shard work is fanned out across workers.
+        let dev = CountingDev::new(4096 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 2048 * BS, true, NEVER_MS);
+        let sc = cache.state.shard_count;
+
+        // Block index `s` lands in shard `s % sc`; writing 0..sc covers them all.
+        for s in 0..sc {
+            let byte = (0x40 + (s & 0x3f)) as u8;
+            cache.pwrite(&ab(byte, BS), s * BS as u64).unwrap();
+        }
+        assert_eq!(
+            dirty_count(&cache),
+            sc as usize,
+            "every shard holds one dirty block before sync"
+        );
+
+        cache.sync().unwrap();
+        assert_eq!(dirty_count(&cache), 0, "sync cleared every shard");
+        for s in 0..sc {
+            let byte = (0x40 + (s & 0x3f)) as u8;
+            assert_eq!(
+                read_inner(&dev, s * BS as u64, BS),
+                vec![byte; BS],
+                "shard block {s} flushed with the correct bytes"
+            );
+        }
     }
 
     #[test]
