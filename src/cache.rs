@@ -173,7 +173,12 @@ impl CachingDevice {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let shard_count = (cores * 2).clamp(1, 64) as u64;
+        // Finer sharding lowers contention on the per-shard mutex, which under the
+        // high-concurrency chain workload is contended between the write-back flush
+        // threads (flush_block) and the serving read/write threads (pread/insert).
+        // Each shard is a small HashMap+Mutex, so a higher count is cheap; profiled
+        // as a remaining bottleneck after the fallocate fix.
+        let shard_count = (cores * 16).clamp(1, 1024) as u64;
         let total_blocks = (bytes / block_size).max(1);
         let per_shard_cap = (total_blocks / shard_count as usize).max(1);
         let shards = (0..shard_count)
