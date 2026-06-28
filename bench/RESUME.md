@@ -99,8 +99,8 @@ e100363 setMined RAM-index O(1) (Vec→HashSet height buckets) · f5cc761 E26 le
    git archive HEAD → build teraslab-server. rsync teranode-bench-wt EXCLUDING
    .git/data/bin (NOT test/ — util/test is needed!); fix go.mod replace →
    /home/ec2-user/teraslab/client/go; `go test -c -tags utxobench` → utxobench.test.
-   docker pull aerospike/aerospike-server:latest; conf = teranode-bench-wt/test/
-   aerospike/aerospike.conf with `memory-size` stripped, port 13000:3000.
+   pull the reference datastore's official container; its config lives in the
+   (out-of-repo) harness tree with `memory-size` stripped, mapped port 13000:3000.
 3. Format one NVMe ext4 → /data; both backends' data on /data (fair). TeraSlab
    native: bench/configs/teraslab-async.toml (device /data/d0.dat, device_split=4,
    placement=txid, buffered redo + writeback cache).

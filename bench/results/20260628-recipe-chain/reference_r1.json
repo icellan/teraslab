@@ -1,5 +1,5 @@
 {
-  "backend": "aerospike",
+  "backend": "reference",
   "mode": "recipe-chain",
   "stream_workers": 10000,
   "burst_interval_secs": 6,
