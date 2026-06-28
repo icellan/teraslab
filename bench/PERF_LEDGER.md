@@ -716,3 +716,41 @@ pre-sizing (the `with_capacity(...+64)` reallocs for >64B records); the ~19%
 background writeback CPU. Stacking these + a quiet host is the path to the
 reference's ~51µs/op (and, when CPU-bound with spare cores, to out-scaling its
 ~51k ceiling via device_split).
+
+## E18 — MILESTONE: TeraSlab beats the reference on throughput + p99 (only p99.9 left) (2026-06-28)
+
+Host quieted (external load killed by the user); pushed the harder CPU refactor:
+**Arc-ify `RedoOp::Create.record_bytes`** (Vec→Arc<[u8]>; committed 5d3757a). The
+dispatch create path now builds the record ONCE into an Arc and SHARES it
+(refcount bump) between the device write and the redo op — the per-create deep
+copy (the post-E17 encode hot spot, the `engine.rs:933` clone) is gone. On-disk
+byte-identical (golden-bytes + Arc::ptr_eq + recovery tests); cargo test --all
+2965/0.
+
+**Decisive head-to-head — FAIR matched config** (device_split=4, redo 256MB/store
+≈ 1GiB total ≈ reference 1024M cache, ring, buffered), 5 interleaved rounds @
+IF=512, **0 failed both sides**, host load ~2-4:
+| metric @ IF=512 | TeraSlab | reference | verdict |
+|---|---|---|---|
+| spend ops/s (median) | **14,095** | 13,013 | **TS +8.3% — PASS** (margin ~23σ; TS stdev 24) |
+| total ops/s | **47,014** | 43,453 | **TS +8.2%** |
+| spend p99 | **19,352µs** | 20,086µs | **TS wins + tighter** |
+| spend p99.9 | 28,980µs | **25,987µs** | TS +11.5% — **FAIL (only gate missed)** |
+| create/get/setMined ops/s | +8% each | — | guardrail PASS (TS faster on every op) |
+
+**TeraSlab is now the FASTER store on this workload** (throughput + p99 + every op,
+0 failed, huge margin). The strict 4/4 pass condition misses ONLY on spend p99.9,
+and that is NOISE-DRIVEN: TS had the BETTER p99.9 in 2/5 rounds; round 3 was a
+host-wide spike hitting both (TS 102ms, REF 58ms). The miss = rare ~100ms spend
+outliers (occasional checkpoint-snapshot / writeback / GC stall) vs the
+reference's smoother background work.
+
+At IF=1024 TS is past its knee (spend p99 144-168ms) and loses tput −8.5% — the
+reference scales better there; **IF=512 is TeraSlab's operating point and where it
+wins.**
+
+**LAST GATE = the rare spend p99.9 spike.** Next: diagnose the periodic background
+event causing the ~100ms outliers (fuzzy checkpoint index-snapshot is the prime
+suspect — at 256MB/store it fires ~once/25s and the full-index serialize competes;
+also writeback flush / tombstone GC), then smooth/incremental-ize it. Everything
+else already passes comfortably, so closing the p99.9 tail = a certifiable win.

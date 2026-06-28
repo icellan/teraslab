@@ -21,7 +21,7 @@ device_alignment = 4096
 # (partition-tree-sprigs 1024 on a single file): same physical disk, more in-process
 # write parallelism. Diagnostic + lever for the ~33k single-store lock-domain cap.
 device_split = 4
-redo_log_size = 1073741824  # 1 GiB. Matches the reference's max-write-cache (1024M):
+redo_log_size = 268435456   # 256 MiB/store x device_split=4 = ~1 GiB total, matching the reference 1024M write cache (fair). The ring reclaims continuously, so per-store 256 MiB is ample.
                             # both are the async-durability write buffer. A larger log
                             # gives the NON-blocking (fuzzy) checkpoint a wide
                             # high->emergency margin so it reclaims before the redo can
