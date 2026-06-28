@@ -458,31 +458,159 @@ mod tests {
 
     #[test]
     fn concurrent_commits_coalesce_and_get_distinct_ranges() {
-        const N: usize = 16;
-        let dev = CountingDev::new();
-        let gc = GroupCommit::new(open_log(dev.clone()));
-        let before = dev.syncs.load(Ordering::SeqCst);
-        let barrier = Arc::new(std::sync::Barrier::new(N));
+        // Deterministic coalescing proof — NO dependence on scheduler luck.
+        //
+        // The old version raced N committers from a barrier and asserted
+        // `fsyncs < N`; under heavy parallel test load too few writers overlapped
+        // a single flush window, fsyncs approached N, and it flaked. Here we pin
+        // the flush window open instead of hoping threads collide in it:
+        //
+        //   1. One committer becomes leader and PARKS inside its round-1 fsync
+        //      (the device blocks the `sync_data` until we release it). While
+        //      parked it holds `inner.flushing == true`, so every later committer
+        //      is FORCED to queue as a follower rather than flush itself.
+        //   2. While the leader is parked we submit M more commits and wait until
+        //      all M are observably enqueued in `pending` (no race — we read the
+        //      queue length, we do not guess from timing).
+        //   3. We release the fsync. The leader's loop then drains all M queued
+        //      followers in ONE `drain(..)` and flushes them in a SINGLE next
+        //      round.
+        //
+        // So the whole run costs EXACTLY TWO fsyncs: the leader's round 1, plus
+        // the one round that absorbs every follower. The count is exact, not a
+        // loose `<= N`: if coalescing regressed so each follower flushed itself
+        // (or the leader drained one-per-round) the count would be `M + 1`, which
+        // this assertion catches. Range-distinctness is verified on the same
+        // construction, so the test still fails if either coalescing OR
+        // range-assignment breaks.
+        use std::time::Duration;
+        const M: usize = 16; // followers coalesced into the leader's second round
 
-        let handles: Vec<_> = (0..N)
+        /// MemoryDevice that BOTH counts fsyncs (so the coalescing count is
+        /// exact) AND parks an armed `sync` until released (so the leader's flush
+        /// window is held open deterministically). `armed` is false during
+        /// `open()` so the initial header sync is counted but not parked.
+        struct CountingBlockingSyncDev {
+            inner: MemoryDevice,
+            syncs: AtomicUsize,
+            armed: AtomicBool,   // false during open() so the header sync passes
+            in_sync: AtomicBool, // true while the armed sync is parked
+            release: AtomicBool, // set true to let a parked sync return
+        }
+        impl CountingBlockingSyncDev {
+            fn sync_count_and_park(&self) {
+                self.syncs.fetch_add(1, Ordering::SeqCst);
+                if self.armed.load(Ordering::SeqCst) {
+                    self.in_sync.store(true, Ordering::SeqCst);
+                    while !self.release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    self.in_sync.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        impl BlockDevice for CountingBlockingSyncDev {
+            fn pread(&self, b: &mut [u8], o: u64) -> DevResult<usize> {
+                self.inner.pread(b, o)
+            }
+            fn pwrite(&self, b: &[u8], o: u64) -> DevResult<usize> {
+                self.inner.pwrite(b, o)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> DevResult<()> {
+                self.sync_count_and_park();
+                self.inner.sync()
+            }
+            fn sync_data(&self) -> DevResult<()> {
+                self.sync_count_and_park();
+                self.inner.sync_data()
+            }
+        }
+
+        let dev = Arc::new(CountingBlockingSyncDev {
+            inner: MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap(),
+            syncs: AtomicUsize::new(0),
+            armed: AtomicBool::new(false),
+            in_sync: AtomicBool::new(false),
+            release: AtomicBool::new(false),
+        });
+        let log = Arc::new(Mutex::new(
+            RedoLog::open(dev.clone() as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        let gc = GroupCommit::new(log); // strict durability (NOT buffered)
+
+        // open()'s header sync is done; arm so the next (leader round-1) sync parks.
+        let before = dev.syncs.load(Ordering::SeqCst);
+        dev.armed.store(true, Ordering::SeqCst);
+
+        // Leader: becomes leader, drains its own submission, enters the round-1
+        // flush, and parks inside the fsync holding `inner.flushing == true`.
+        let gc_leader = gc.clone();
+        let leader = std::thread::spawn(move || {
+            gc_leader
+                .commit(vec![delete_op(0)])
+                .expect("leader commit ok")
+                .expect("leader range")
+        });
+
+        // Wait until the leader is parked in its round-1 fsync. By this point it
+        // has already `drain(..)`-ed its own submission, so `pending` is empty.
+        let mut waited = 0;
+        while !dev.in_sync.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 5000, "leader never reached its round-1 fsync");
+        }
+
+        // Submit M followers. Each sees `flushing == true` and queues in `pending`
+        // (touching only the `inner` lock, never `log`, which the parked leader
+        // holds), then waits on the condvar.
+        let followers: Vec<_> = (1..=M)
             .map(|i| {
                 let gc = gc.clone();
-                let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    barrier.wait();
                     gc.commit(vec![delete_op(i as u8)])
-                        .expect("commit ok")
-                        .expect("range")
+                        .expect("follower commit ok")
+                        .expect("follower range")
                 })
             })
             .collect();
-        let mut ranges: Vec<(u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
+        // Race-free rendezvous: wait until ALL M followers are observably enqueued
+        // before releasing. `pending.len()` is read directly (child modules may
+        // access the parent module's private fields), so this is a real condition,
+        // not a timing guess. Only then is it GUARANTEED that the leader's next
+        // round drains all M at once.
+        let mut waited = 0;
+        while gc.inner.lock().pending.len() < M {
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+            assert!(waited < 5000, "followers never all enqueued in pending");
+        }
+
+        // Release the fsync. The leader finishes round 1, sees M queued, and
+        // drains+flushes all M in ONE second round (release stays set, so that
+        // round's fsync is counted but not parked).
+        dev.release.store(true, Ordering::SeqCst);
+
+        let leader_range = leader.join().unwrap();
+        let mut ranges: Vec<(u64, u64)> =
+            followers.into_iter().map(|h| h.join().unwrap()).collect();
+        ranges.push(leader_range);
+
+        // EXACTLY two fsyncs: leader round 1 + the single round absorbing all M
+        // followers. `M + 1` here would mean each follower flushed on its own —
+        // i.e. coalescing regressed. This is the deterministic coalescing signal.
         let fsyncs = dev.syncs.load(Ordering::SeqCst) - before;
-        assert!(fsyncs >= 1, "must flush at least once");
-        assert!(
-            fsyncs < N,
-            "group commit must coalesce: {N} concurrent commits used {fsyncs} fsyncs (expected < {N})"
+        assert_eq!(
+            fsyncs, 2,
+            "group commit must coalesce all {M} followers into ONE round: \
+             expected exactly 2 fsyncs (leader round 1 + the coalesced round), got {fsyncs}"
         );
 
         // Every committer got a distinct single-sequence range, and together they
@@ -494,11 +622,15 @@ mod tests {
                 assert_eq!(r.0, ranges[i - 1].0 + 1, "ranges contiguous, no dup/gap");
             }
         }
-        assert_eq!(ranges.len(), N);
+        assert_eq!(
+            ranges.len(),
+            M + 1,
+            "leader plus all {M} followers committed"
+        );
 
-        // All N entries are durable.
+        // All M + 1 entries are durable.
         let entries = gc.log().lock().recover().unwrap();
-        assert_eq!(entries.len(), N);
+        assert_eq!(entries.len(), M + 1);
     }
 
     #[test]
