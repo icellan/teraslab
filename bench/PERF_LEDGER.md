@@ -925,3 +925,35 @@ admin-gated; SVG output). % of the create subtree (~34% of server CPU):**
 Do NOT: abandon/bound O_DIRECT (core design; the data-device O_DIRECT is fine — the
 p99.9 issue is CPU starvation, not I/O freeze, in buffered mode). Do NOT pursue the
 unmined-intent drop (no-op here).
+
+## E22 — BytesMut realloc fixed (1020125); throughput win SOLID, p99.9 gap likely host-noise (2026-06-28)
+
+Linux/NVMe profile (LINUX_NVME_REPORT.md) → global dispatch funnel (~40-44k; the
+DispatchPool single `Mutex<VecDeque>`+Condvar queue, mod.rs:1407) + **31% of on-CPU
+wasted in `BytesMut::reserve_inner` memcpy** (pipelined read loop reallocated
+~256 KiB/frame). Commit **1020125** fixes the memcpy (reclaim-in-place, 13×/frame;
+2982 tests + clippy + fmt + client all green).
+
+Head-to-head re-measure (macOS Docker, fair async config, fixed build, 10 rounds,
+clean 1-6+9; host load ~5 — NOT idle):
+| op | TS ops/s | REF ops/s | Δ | TS p99.9 | REF p99.9 |
+|---|---|---|---|---|---|
+| create | 19272±149 | 17854±70 | +7.9% | 31.9±4.2 | 24.8±1.7 |
+| spend | 14451±109 | 13382±53 | +8.0% | 29.4±3.7 | 23.9±0.7 |
+| get | 9654±76 | 8931±34 | +8.1% | 26.4±5.5 | 21.9±0.9 |
+| setmined | 4844±35 | 4484±17 | +8.0% | 11.1±2.1 | 200.5±67 |
+
+0 fail both. Strict 4/4: **C1 spend-tput PASS, C4 margin PASS** (Δ1069 > 2σ=218 —
+solid), **C2 spend-p99.9 FAIL, C3 guardrail FAIL**. setMined p99.9 = crushing TS
+win (11 vs 200ms).
+
+KEY: the p99.9 loss is **likely host-noise, not fundamental** — TS p99.9 σ 3.7-5.5ms
+(CPU-contention-sensitive) vs reference σ 0.7-1.7ms (robust); on the QUIET EC2 box
+uncontended TS p999 was 13-24ms ≈ reference 24ms. macOS is never idle
+(WindowServer ~44%) so it can't settle this. Re-profile of the FIXED build (pprof,
+IF=512): memcpy gone; CPU spread over real op work, setMined-heavy (~20%: secondary-
+index removes); the ~48k cap is the off-CPU dispatch funnel.
+
+NEXT to settle/win: (1) quiet-host head-to-head (fresh spot Linux box, BOTH
+backends) — likely shows TS wins p99.9 too. (2) dispatch-sharding refactor
+(txid-last-byte per-store routing) for tail robustness + 10M scaling.
