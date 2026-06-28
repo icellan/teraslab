@@ -44,13 +44,35 @@ chain workload (the one the real node runs) TeraSlab loses badly. Full diagnosis
   serialization at ~35k store-ops/s**. Reference does 40.7k links/s (~163k
   store-ops/s) through ITS client — TeraSlab's adapter+client is ~4.5× slower.
 
-**REMAINING (next session) — pprof the Go client/adapter:** the ~35k cap is in the
-client stack (server has headroom). Prime suspect: the Teranode teraslab adapter's
-**go-batcher = ONE worker goroutine per batcher** (store/spend/get), and
-SetLocked+Delete not coalesced. Add pprof to the harness (or `go test -cpuprofile`),
-find the single-threaded hot path, parallelize (multiple batcher workers / shard
-the batcher). Then re-run chain h2h fresh-per-round, strict 4/4. Full detail +
-all measured tables: **bench/RECIPE_CHAIN_FINDINGS.md**.
+**PROFILED the client + a 3rd fix landed (committed, UNMEASURED — box reclaimed):**
+- pprof of the harness: client ~1 core, NOT CPU-bound, drowning in Go
+  scheduler/lock contention. create/spend WERE coalesced; **unlock(SetLocked) +
+  get(BatchDecorate) went to the wire as SINGLE-ITEM RPCs** (2 of 4 ops/link) →
+  the contention storm. (artifacts: bench/results/20260628-recipe-chain/client-*.prof/txt)
+- ✅ Fix #3 (teranode-bench-wt commit 8031f0bc8): **coalesce SetLocked +
+  BatchDecorate** into wire batches (modeled on spendBatcher; group SetLocked by
+  value, union decorate txids+masks). Matches production (user: the Teranode
+  adapter coalesces every op into a batch). 8 tests, builds clean. **NOT yet
+  measured** — the spot box was reclaimed by AWS before re-deploy.
+
+**REFERENCE CLIENT ANALYSIS (user directive, read-only inspiration) →
+bench/REFERENCE_CLIENT_ANALYSIS.md:** the reference sustains ~163k store-ops/s over
+a LIMITED pool because its client has NO central coordination: **sharded conn
+pool (sub-heaps, Poll/Offer by hint%N, ~100 conns), connection-per-command
+synchronous (no pipelining/no central batcher/no per-req demux), non-blocking
+acquire+async-grow+retry.** TeraSlab's client funnels everything through the
+adapter go-batcher's single channel+worker + a global pool mutex + per-req
+machinery → the ~1-core contention. **Redesign plan (in that doc): shard the
+teraslab client conn pool by hint; de-funnel the batcher (M lanes or lock-free
+accumulate); bounded pool + non-blocking acquire; consider simpler
+conn-per-request over a sharded pool.**
+
+**NEXT (needs a fresh spot box):** (1) re-provision spot NVMe box (see recipe
+above; i3en.6xlarge got reclaimed — try another type/AZ or accept reclaim risk);
+(2) deploy + MEASURE the coalescing fix (8031f0bc8) — does it move ~35k? (3)
+implement the client pool/batcher sharding from REFERENCE_CLIENT_ANALYSIS.md;
+(4) re-run chain h2h fresh-per-round, strict 4/4. Full measured tables:
+**bench/RECIPE_CHAIN_FINDINGS.md**.
 
 **EC2:** spot i-0c5a37ca745bdaac5 (us-east-1) UP, 6h self-terminate backstop;
 off-limits core-m-demo i-0dd1b439a6b470c4f untouched. Runners: /tmp/ts_run.sh
