@@ -10,9 +10,18 @@ throughput + p99.9 at minimum) under a **fair matched config**, proven by
 reproducible numbers. Constraint: never name/import the reference product anywhere
 in this repo — call it "the reference datastore" (grep confirms zero refs).
 
+**⚠ ON RESUME FIRST (compaction checkpoint, see PERF_LEDGER.md E21):** two CPU
+fixes are UNCOMMITTED in the tree (subagents were finishing when we compacted):
+(1) de-flake of `redo_group::tests::concurrent_commits_coalesce_and_get_distinct_
+ranges` (`src/redo_group.rs`), (2) SipHash→fast-hasher swap for the create-batch
+dedup (`src/server/mod.rs` + NEW `src/server/fast_hash.rs`, ~5% server CPU). Do
+`git diff` those 3 files (+ read the subagent .output files named in E21 if still
+present), run `cargo test --all` to gate, and commit if green. Then continue per
+E21 "NEXT". Do NOT git-reset/checkout (would lose the WIP).
+
 **Current (2026-06-28, after E13-E20): PRIMARY condition WON on this host. Read
-PERF_LEDGER.md E20 — latest (it SUPERSEDES the E18-E19 "needs Linux" conclusion,
-which was WRONG).** E20's buffered/async redo (commit f522556, config
+PERF_LEDGER.md E20-E21 — latest (E20 SUPERSEDES the E18-E19 "needs Linux"
+conclusion, which was WRONG).** E20's buffered/async redo (commit f522556, config
 `redo_buffered_io=true`) closed the spend p99.9 on macOS-Docker itself.
 FAIR config (device_split=4, redo 256MB/store ≈1GiB total ≈ ref 1024M cache, ring,
 buffered, redo_buffered_io=true, flush 50ms), disk, IF=512, 8 interleaved rounds,

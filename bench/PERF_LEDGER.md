@@ -873,3 +873,57 @@ ring-encode reuse + index single-probe → E18 Arc record_bytes → E20 buffered
 redo (closed spend p99.9). Commits ae33334, f28a96c, be6b29b, 0329d3a, 56884d3,
 a669244, 5d3757a, f522556 (+ ledger/RESUME commits). cargo test --all 2497-2965
 pass + the 1 known load-flake.
+
+## E21 — create-path CPU profile + in-flight CPU work (compaction checkpoint) (2026-06-28)
+
+After E20 (PRIMARY won on a quiet host), the lone strict-4/4 gate is create-p99.9
+(+12% on the clean h2h11 run) AND p99.9 fragility under host CPU load. DIAGNOSED:
+both are the **CPU-efficiency gap** — TS uses more CPU/op; under CPU starvation
+(e.g. GoLand at 99% on a core, which contaminated the h2h12 10-round run → TS spend
+p999 49-245ms vs ref's robust 24-37ms) TS queues worse; the leaner reference is
+robust. So the lever is reducing TS create-path CPU/op (host-independent). The
+clean h2h11 (8 rounds) remains the certification-quality data; h2h12 discarded.
+
+**CREATE-path CPU flamegraph (pprof `GET /debug/pprof/profile?seconds=&frequency=`,
+admin-gated; SVG output). % of the create subtree (~34% of server CPU):**
+- primary-index register ~21% (Robin-Hood `get_entry` probe + `insert_if_absent`)
+  — mostly inherent hash-table probe; hard.
+- locks (stripe + shard-write) ~12%.
+- record build (`build_create_record_bytes`/TxMetadata/UtxoSlot/cold) ~9%.
+- early dup-check `lookup_checked` + a metadata read ~8% (the create path probes the
+  index for a dup-check, THEN `register_new_with_shard_count` re-probes — redundant
+  for the all-unique-txid workload; the fused insert-if-absent already rejects dups).
+- **SipHash on the create-batch dedup `HashSet<[u8;32]>`/`bulk_by_store` map ~5%**
+  (std SipHash on already-random txids = pure waste).
+- unmined in-mem insert ~5.5%; CRC ~3.5%.
+- pwrite + RedoOp::Create redo append ≈ 0% (already coalesced — good).
+- **Unmined `SecondaryUnminedUpdate` redo intent = 0% here** (the in-memory unmined
+  backend appends NO intent; it's redb-only). The "drop the intent" idea is a no-op
+  in this config — DO NOT pursue it.
+
+**IN-FLIGHT WORK (uncommitted in the tree at compaction — ON RESUME: read the
+subagent .output files, gate with `cargo test --all`, commit if green):**
+1. **De-flake** `redo_group::tests::concurrent_commits_coalesce_and_get_distinct_
+   ranges` (load-flaky; make coalescing deterministic via BlockingSyncDev). Touches
+   `src/redo_group.rs`. Subagent output:
+   `…/tasks/ae6c089a9d3419ff6.output`.
+2. **SipHash→fast-hasher swap** for the create-batch dedup (~5% server CPU, zero
+   correctness risk). Touches `src/server/mod.rs` + NEW `src/server/fast_hash.rs`.
+   Subagent output: `…/tasks/a47f52d8ab747bd22.output`.
+   (tasks/ dir = /private/tmp/claude-501/-Users-siggioskarsson-gitcheckout-teraslab/
+   c3460642-d1fb-4c50-b79b-4096f3b4589e/tasks/ — may not survive; if gone, just
+   `git diff` the 3 files + gate + commit.)
+
+**NEXT (after committing the in-flight work):**
+1. Optional 2nd create-CPU cut: drop the redundant early dup-check `lookup_checked`
+   (~3-8%; rely on the authoritative insert-if-absent reject; risk = dup creates do
+   alloc+write+rollback, fine for no-dup workload). Higher risk than the SipHash swap.
+2. **Quiet-host 4/4 certification** (THE blocker): needs the box idle (GoLand off /
+   load <1/core) OR a Linux/NVMe host. Then a 10-round interleaved run with per-op
+   p99.9 + STDEVs to confirm create-p99.9 ≤ +10% (or within-noise) → strict 4/4.
+3. `bench/FINAL_REPORT.md` + green gate (`cargo test --all`, `clippy --all -D
+   warnings`, Docker e2e) + `git grep -i` opponent-name clean.
+
+Do NOT: abandon/bound O_DIRECT (core design; the data-device O_DIRECT is fine — the
+p99.9 issue is CPU starvation, not I/O freeze, in buffered mode). Do NOT pursue the
+unmined-intent drop (no-op here).
