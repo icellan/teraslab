@@ -76,6 +76,24 @@ conn-per-request over a sharded pool.**
   reference (40.7k links/s).** Both have idle cores → cap = client
   coordination+allocation, not compute.
 
+**⚠ GREEN-GATE TODO before any FINAL_REPORT:** the latest server changes
+(src/device.rs fallocate, src/cache.rs shard count) passed module tests on Linux
+(device 69/0, cache 13/0) but the FULL gate was NOT re-run with them — run
+`cargo test --all` + `cargo clippy --all -- -D warnings` + `cargo fmt --check` +
+`cargo test --manifest-path client/rust/Cargo.toml --all` (per memory
+feedback_rust_prepush_checks) before declaring a win.
+
+**NEXT LEVER (precise, needs a fresh profiled measurement — do NOT change redo
+blind):** ~1.4× gap (29.3k vs 40.7k) is `__futex_wait` lock contention; perf
+attributed it to the **per-store redo append Mutex** (`src/redo.rs` `append*` take
+`&mut self` → the RedoLog is behind a per-store lock, serializing all writes to a
+store; device_split=4 ⇒ only 4 locks for ~115k store-ops/s) + cache-coordination.
+Ruled out: cache shard count (+2%), device I/O (fixed by fallocate), device_split
+(4 optimal). Candidate fixes (profile-confirm each, preserve durability): encode
+the redo op OUTSIDE the append lock; shard/stripe the redo append; batch appends.
+Re-provision a box, perf the futex callers (`__x64_sys_futex` → user frame), fix,
+re-measure, then if it wins write FINAL_REPORT + run the green gate.
+
 **⭐⭐ 2026-06-29 BIGGEST WIN — fallocate device file → +110% (2×), gap 3×→1.4×:**
 Off-CPU+perf profiling showed the CPU-idle server's writes hit `ext4_mb_new_blocks`
 (ext4 block allocation) because the data file was SPARSE (`set_len`). Fix: fallocate
