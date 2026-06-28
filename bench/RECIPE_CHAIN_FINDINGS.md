@@ -212,6 +212,42 @@ this central coordination/alloc (sharded conn-per-command, fewer goroutines).
 Still ~3.4× behind the reference (40.7k links/s). Both client & server now have
 idle cores → the cap is client coordination+allocation, not compute.**
 
+### Update 6 — transport rewrite (REVERTED) + batcher goroutine fix (KEPT); gap is distributed
+
+Two more cycles, both measured on a fresh box:
+- **Synchronous conn-per-command transport** (full client rewrite, the "decisive
+  lever" hypothesis): measured **~0 gain** over the async-sharded client (12.4k vs
+  11.9k) AND broke at pool=512 (f=10000). Per the method (keep only if it helps and
+  breaks nothing) → **REVERTED** (git stash on feat/device-cache:
+  "synchronous conn-per-command transport experiment…"). Conclusion: **the client
+  transport MODEL is NOT the lever** — async-pipelined and synchronous both cap ~12k.
+- **`mergeBatchContexts` goroutine-skip** (teranode-bench-wt 2ed051abb): it spawned
+  one watcher goroutine per batched item per flush; for non-cancellable (Background)
+  contexts those can never fire — skip them. **Measured +9% (12.4k→13.5k)**, kept.
+
+**FINAL committed state (async-sharded client + coalescing + batcher fix), pool=256:
+~13.7k links/s, create p99 ~60ms, f=0.** Campaign net **8.7k → 13.7k (+57%), create
+p99 ~2000ms → 60ms (33× tighter)**. Server idle (~0.6 core) throughout.
+
+### Why the gap (~3×) is now distributed / structural — honest assessment
+Re-profile after the batcher fix: residual client CPU is **sha256 14% (tx-build,
+SHARED with the reference)** + **mallocgc 23%** + distributed **futex/lock2/selectgo
+~20%** — no single dominant hotspot left. Levers tried and their deltas:
+coalescing +33%, batcher-goroutine +9%, pool-sharding ~0, transport-rewrite ~0.
+The remaining gap is **death-by-a-thousand-cuts in the Go adapter+client stack**:
+context threading, per-batch allocations, the go-batcher coalescing machinery, and
+codec copies — overhead the mature reference client doesn't carry (user: "the
+reference has no context in its client calls"; it uses native batch ops + a lean
+sharded conn pool, no central go-batcher). Closing 3× is a sustained,
+many-small-cuts client/adapter optimization (or a leaner adapter that drops the
+go-batcher for a native-batch path), not a single fix — and part of it may be
+structural to driving teraslab through the generic Teranode utxo.Store + go-batcher
+layer vs the reference's purpose-built client.
+
+NOTE: pool=512 fails (f=10000) on BOTH the committed async-sharded and the
+synchronous client under bigconn caps — a separate high-pool client bug to fix;
+pool=256 is the stable working config.
+
 ### NEXT hypotheses — REPRIORITIZED after the cumulative profile
 
 The cum profile (`client-pprof-cum-allfixes.txt`) shows client CPU is dominated by
