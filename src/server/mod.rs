@@ -4,6 +4,7 @@
 //! Engine, and writes response frames. One thread per connection.
 
 pub mod dispatch;
+pub(crate) mod fast_hash;
 pub mod http;
 pub mod startup;
 

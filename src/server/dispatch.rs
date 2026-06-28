@@ -6234,7 +6234,17 @@ fn handle_create_batch(
     // DuplicateTxId — whose region is freed only IN MEMORY, leaving a durable
     // orphan region in the WAL/on device. Drop every occurrence after the first
     // here, before any reservation, so only one copy is ever materialized.
-    let mut seen_txids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    //
+    // Txids are uniformly random (double-SHA256), so std's SipHash buys no
+    // distribution here and is pure CPU (~5% of create CPU on a flamegraph).
+    // `FastTxHasher` (first 8 txid bytes) is correctness-neutral: `[u8; 32]`
+    // `Eq` is unchanged so any hash collision just probes, and the authoritative
+    // duplicate rejector is the index's `register_create_at_offset`, not this
+    // batch-local set. See `crate::server::fast_hash`.
+    let mut seen_txids: std::collections::HashSet<
+        [u8; 32],
+        std::hash::BuildHasherDefault<crate::server::fast_hash::FastTxHasher>,
+    > = std::collections::HashSet::default();
 
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -6560,8 +6570,14 @@ fn handle_create_batch(
     // index entries (register_create_at_offset).
     // (record_offset, slot_size, record_bytes) for one record's coalesced write.
     type BulkRecord<'a> = (u64, u64, &'a [u8]);
-    let mut bulk_by_store: std::collections::HashMap<u8, Vec<BulkRecord>> =
-        std::collections::HashMap::new();
+    // Keyed by store id (small dense u8) — std's SipHash is wasted on these
+    // keys. `FastU8Hasher` is an identity hash; grouping is byte-identical (only
+    // the bucket hash changes). See `crate::server::fast_hash`.
+    let mut bulk_by_store: std::collections::HashMap<
+        u8,
+        Vec<BulkRecord>,
+        std::hash::BuildHasherDefault<crate::server::fast_hash::FastU8Hasher>,
+    > = std::collections::HashMap::default();
     for v in &valid_items {
         bulk_by_store.entry(v.device_id).or_default().push((
             v.record_offset,
