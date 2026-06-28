@@ -164,6 +164,38 @@ impl PrimaryBackend {
         }
     }
 
+    /// Register an entry only if `key` is absent, without the inline mmap
+    /// resize. Returns `Ok(true)` if inserted (key was absent), `Ok(false)` if
+    /// the key was already present (the index is left unchanged — the existing
+    /// entry is NEVER overwritten).
+    ///
+    /// For the mmap-backed variants this is a single fused Robin Hood probe
+    /// (one walk does both the duplicate check and the placement), replacing a
+    /// separate `lookup` + re-probing `insert`. The redb variant has no fused
+    /// path, so it composes a `lookup` followed by a `register` only when
+    /// absent — behaviourally identical to the engine's previous
+    /// `lookup_checked` + `register_without_resize` under the same shard write
+    /// guard, so redb gains no race and loses no semantics.
+    pub(crate) fn register_without_resize_if_absent(
+        &mut self,
+        key: TxKey,
+        entry: TxIndexEntry,
+    ) -> Result<bool, IndexError> {
+        match self {
+            Self::InMemory(idx) | Self::FileBacked(idx) => {
+                idx.register_without_resize_if_absent(key, entry)
+            }
+            Self::OnDisk(redb) => {
+                if redb.lookup(&key)?.is_some() {
+                    Ok(false)
+                } else {
+                    redb.register(key, entry)?;
+                    Ok(true)
+                }
+            }
+        }
+    }
+
     /// Target capacity for a pending mmap hash-table resize, if this backend
     /// needs one. Redb does not use this path.
     pub(crate) fn resize_target_capacity(&self) -> Option<usize> {

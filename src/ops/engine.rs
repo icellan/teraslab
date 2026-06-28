@@ -2312,21 +2312,28 @@ impl Engine {
         // different shards overlap, so the high-water mark reflects real
         // sharded-create parallelism. Guard drops with the function scope.
         let _writer_gauge = crate::metrics::writer_enter();
-        // Reject-not-overwrite: the only safe insert-if-absent is a
-        // check under the same write lock that performs the insert.
-        if guard.lookup_checked(&key)?.is_some() {
+        // Reject-not-overwrite, in a SINGLE Robin Hood probe: the fused
+        // `register_without_resize_if_absent` walks the probe chain once,
+        // detecting an existing key inline and bailing without overwriting,
+        // or placing the new entry. This replaces the previous separate
+        // `lookup_checked` probe followed by a re-probing `insert` — the
+        // create hot path now does one index probe instead of two. The check
+        // and the insert still run under the same shard write guard, so
+        // check-then-insert cannot interleave with another writer on this
+        // shard (the atomicity the old separate-probe version relied on).
+        let len_before = guard.len();
+        let inserted = guard.register_without_resize_if_absent(key, entry)?;
+        if !inserted {
             return Ok(false);
         }
-        let len_before = guard.len();
-        guard.register_without_resize(key, entry)?;
         debug_assert!(
-            guard.len() > len_before,
-            "register_new_with_shard_count: insert did not grow the index \
-             despite the key being absent under the same write lock"
+            guard.len() == len_before + 1,
+            "register_new_with_shard_count: insert-if-absent reported inserted \
+             but the index did not grow by exactly one under the write lock"
         );
         // Counts are seeded eagerly at construction so this `fetch_add` runs
-        // unconditionally under the still-held write guard for the newly
-        // inserted key, preserving insert-then-count atomicity (fix #1).
+        // (only on an actual insert) under the still-held write guard for the
+        // newly inserted key, preserving insert-then-count atomicity (fix #1).
         self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
         // Resize UNDER the held guard (no drop-then-reacquire).
         guard.resize_if_needed()?;
@@ -15308,6 +15315,55 @@ mod tests {
             Err(CreateError::DuplicateTxId) => {}
             other => panic!("expected DuplicateTxId, got {other:?}"),
         }
+    }
+
+    /// The fused insert-if-absent on the create path must (a) accept a brand
+    /// new txid and grow that key's shard count by one, and (b) reject a
+    /// duplicate txid WITHOUT overwriting the existing index entry and WITHOUT
+    /// perturbing the shard count. A second create whose utxo_count (and hence
+    /// record_offset) differs would change the index entry if the rejected
+    /// insert ever overwrote — this asserts it does not.
+    #[test]
+    fn create_duplicate_txid_does_not_overwrite_or_change_shard_count() {
+        let engine = create_engine();
+
+        // (a) A new txid is accepted; its shard count grows by exactly one.
+        let (_, req_a) = make_create_req(9, 5);
+        let key = req_a.tx_key();
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+        let count_before = engine.shard_record_count(shard);
+        engine.create(&req_a).unwrap();
+        let count_after_insert = engine.shard_record_count(shard);
+        assert_eq!(
+            count_after_insert,
+            count_before + 1,
+            "a fresh txid must increment its shard count by exactly one",
+        );
+
+        let original = engine.lookup(&key).expect("created entry must exist");
+        assert_eq!(original.utxo_count, 5);
+
+        // (b) A duplicate txid with a DIFFERENT utxo_count is rejected and must
+        // not overwrite the original entry or change the shard count.
+        let (_, mut req_b) = make_create_req(9, 12);
+        // Same txid as req_a (n == 9), but a different record shape.
+        assert_eq!(req_b.tx_key(), key, "test setup: txids must match");
+        req_b.fee = 999; // make the rejected request visibly distinct
+        match engine.create(&req_b) {
+            Err(CreateError::DuplicateTxId) => {}
+            other => panic!("expected DuplicateTxId on overwrite attempt, got {other:?}"),
+        }
+
+        let after_reject = engine.lookup(&key).expect("entry must still exist");
+        assert_eq!(
+            after_reject, original,
+            "rejected duplicate create must leave the index entry byte-identical",
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            count_after_insert,
+            "a rejected duplicate create must not change the shard count",
+        );
     }
 
     // -- Allocation --

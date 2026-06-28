@@ -1057,6 +1057,113 @@ impl HashTable {
         }
     }
 
+    /// Insert `entry` under `key` only if `key` is not already present.
+    ///
+    /// Returns `Ok(true)` when the key was absent and the entry was inserted,
+    /// and `Ok(false)` when the key was already present — in which case the
+    /// table is left **completely unchanged** (the existing entry is NEVER
+    /// overwritten, and `len()` does not change).
+    ///
+    /// This is the single-probe fused form of the create path's old
+    /// check-then-insert: where a caller previously did a separate `get_entry`
+    /// (one Robin Hood probe) followed by [`Self::insert`] (which itself
+    /// re-probes for the existing key, then probes again to place), this walks
+    /// the probe chain exactly ONCE, detecting an existing key inline during
+    /// the Robin Hood placement and bailing without mutating anything.
+    ///
+    /// # Robin Hood correctness
+    ///
+    /// The duplicate check uses the same invariants as [`Self::get_entry`]:
+    /// while walking from the home bucket with an increasing probe distance,
+    /// the original `key` — if present — must appear before the first bucket
+    /// whose stored `probe_distance` is *less* than our current distance
+    /// (Robin Hood keeps richer entries earlier). So we look for the duplicate
+    /// only up to (and including) the bucket where the first displacement would
+    /// occur; once we begin carrying a displaced (distinct, already-present)
+    /// key, the original `key` cannot be further along the chain, so no
+    /// duplicate check is needed past that point. Placement, displacement,
+    /// `count`, and `max_probe` maintenance are otherwise identical to
+    /// [`Self::insert`]'s new-insert branch, preserving every back-shift /
+    /// probe-distance invariant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HashTableError::Full`] if the probe walks the entire table
+    /// without finding a free slot (should not happen while the load factor is
+    /// kept below 1.0 by the caller's resize policy).
+    pub fn insert_if_absent(&mut self, key: TxKey, entry: TxIndexEntry) -> Result<bool> {
+        let fp = txid_fingerprint(&key.txid);
+        let mut idx = bucket_index(&key, self.seed, self.mask);
+        let mut dist: usize = 0;
+        let mut cur_key = key;
+        let mut cur_entry = entry;
+        // True until the first Robin Hood displacement: while set, the original
+        // `key` could still be ahead on the probe chain, so each occupied
+        // bucket is checked for a duplicate. After a displacement the carried
+        // key is a distinct already-present entry and the original key cannot be
+        // further along, so the check is disabled (matching `get_entry`'s
+        // reachability invariant).
+        let mut may_contain_original = true;
+
+        loop {
+            let bucket = self.bucket(idx);
+            if bucket.is_empty() {
+                self.bucket_mut(idx)
+                    .set_entry(&cur_key, &cur_entry, cap_probe(dist));
+                self.count += 1;
+                if dist > self.max_probe {
+                    self.max_probe = dist;
+                }
+                #[cfg(debug_assertions)]
+                self.debug_assert_count_consistent();
+                return Ok(true);
+            }
+
+            // Duplicate detection — only meaningful before any displacement and
+            // only while Robin Hood early-termination has not ruled the key out.
+            if may_contain_original && bucket.is_occupied() {
+                // Same early-termination as `get_entry`: if our displacement
+                // already exceeds this (non-capped) bucket's, the original key
+                // cannot be present anywhere ahead — stop looking for a dup.
+                if (bucket.probe_distance as usize) < MAX_STORED_PROBE
+                    && dist > bucket.probe_distance as usize
+                {
+                    may_contain_original = false;
+                } else if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
+                    // Key already present — leave the table byte-identical.
+                    return Ok(false);
+                }
+            }
+
+            // Robin Hood: if our displacement is greater, swap. The first time
+            // this fires we begin carrying a displaced key, so the original key
+            // can no longer be ahead of us.
+            if bucket.is_occupied() && dist > bucket.probe_distance as usize {
+                let displaced_key = TxKey { txid: bucket.txid };
+                let displaced_entry = bucket.entry();
+                let displaced_dist: usize = bucket.probe_distance as usize;
+
+                self.bucket_mut(idx)
+                    .set_entry(&cur_key, &cur_entry, cap_probe(dist));
+
+                cur_key = displaced_key;
+                cur_entry = displaced_entry;
+                dist = displaced_dist;
+                may_contain_original = false;
+            }
+
+            idx = (idx + 1) & self.mask;
+            dist += 1;
+
+            if dist >= self.capacity {
+                return Err(HashTableError::Full {
+                    count: self.count,
+                    capacity: self.capacity,
+                });
+            }
+        }
+    }
+
     fn copy_entries_into(&self, new_table: &mut HashTable) -> Result<()> {
         for i in 0..self.capacity {
             let bucket = self.bucket(i);
@@ -1705,6 +1812,110 @@ mod tests {
         let got = t.get_entry(&key).unwrap();
         assert_eq!(got, e2);
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn insert_if_absent_inserts_when_absent_returns_true() {
+        let mut t = HashTable::new(16).unwrap();
+        let key = make_key(1);
+        let entry = make_entry(4096);
+
+        let inserted = t.insert_if_absent(key, entry).unwrap();
+        assert!(inserted, "insert_if_absent into an empty table must insert");
+        assert_eq!(t.get_entry(&key), Some(entry));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn insert_if_absent_rejects_present_returns_false_no_overwrite() {
+        let mut t = HashTable::new(16).unwrap();
+        let key = make_key(1);
+        let entry_a = make_entry(1000);
+        let entry_b = make_entry(2000);
+
+        assert!(t.insert_if_absent(key, entry_a).unwrap());
+
+        let inserted = t.insert_if_absent(key, entry_b).unwrap();
+        assert!(
+            !inserted,
+            "insert_if_absent of a present key must report not-inserted"
+        );
+        // The existing entry must be byte-identical — NEVER overwritten.
+        assert_eq!(
+            t.get_entry(&key),
+            Some(entry_a),
+            "insert_if_absent must not overwrite the present entry"
+        );
+        assert_eq!(t.len(), 1, "rejected insert must not change the count");
+    }
+
+    #[test]
+    fn insert_if_absent_preserves_robin_hood_lookups() {
+        // A small table forces a high load factor and long Robin Hood probe
+        // chains (displacement / back-shift), so this exercises the fused
+        // single-probe placement under real collisions.
+        let mut t = HashTable::new(64).unwrap();
+
+        // Insert a block of distinct keys, some deliberately colliding into
+        // the same home bucket so insertion must displace.
+        let n = 40u64;
+        for i in 0..n {
+            assert!(
+                t.insert_if_absent(make_key(i), make_entry(i * 4096))
+                    .unwrap(),
+                "first insert of key {i} must succeed"
+            );
+        }
+        // A run of colliding keys (all share txid[0..8] → same home bucket).
+        for seq in 0..8u64 {
+            let k = make_colliding_key(7, 1_000 + seq, t.mask);
+            assert!(
+                t.insert_if_absent(k, make_entry(900_000 + seq)).unwrap(),
+                "first insert of colliding key seq {seq} must succeed"
+            );
+        }
+
+        let expected_len = t.len();
+
+        // Interleave rejected duplicate insert_if_absent calls for a mix of
+        // colliding and non-colliding keys. None may overwrite or change len.
+        for i in [0u64, 5, 17, 39] {
+            assert!(
+                !t.insert_if_absent(make_key(i), make_entry(0xDEAD)).unwrap(),
+                "duplicate insert of key {i} must be rejected"
+            );
+        }
+        for seq in [0u64, 3, 7] {
+            let k = make_colliding_key(7, 1_000 + seq, t.mask);
+            assert!(
+                !t.insert_if_absent(k, make_entry(0xBEEF)).unwrap(),
+                "duplicate insert of colliding key seq {seq} must be rejected"
+            );
+        }
+
+        // EVERY inserted key still looks up to its ORIGINAL entry, and the
+        // count is exact (no entry lost, none overwritten).
+        for i in 0..n {
+            assert_eq!(
+                t.get_entry(&make_key(i)),
+                Some(make_entry(i * 4096)),
+                "non-colliding key {i} must still look up to its original entry"
+            );
+        }
+        for seq in 0..8u64 {
+            let k = make_colliding_key(7, 1_000 + seq, t.mask);
+            assert_eq!(
+                t.get_entry(&k),
+                Some(make_entry(900_000 + seq)),
+                "colliding key seq {seq} must still look up to its original entry"
+            );
+        }
+        assert_eq!(
+            t.len(),
+            expected_len,
+            "len must be exact after rejected dups"
+        );
+        assert!(t.validate_count_consistency());
     }
 
     #[test]

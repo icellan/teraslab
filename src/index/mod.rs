@@ -410,6 +410,23 @@ impl Index {
         Ok(())
     }
 
+    /// Register an entry only if `key` is absent, without an automatic resize.
+    ///
+    /// Single-probe fused check-then-insert: returns `Ok(true)` if the key was
+    /// absent and the entry was inserted, `Ok(false)` if the key was already
+    /// present (the index is left unchanged — the existing entry is NEVER
+    /// overwritten). Used by the create path so a duplicate-txid check and the
+    /// insert share ONE Robin Hood probe instead of a separate `lookup` probe
+    /// followed by an `insert` that re-probes. See
+    /// [`hashtable::HashTable::insert_if_absent`] for the correctness argument.
+    pub(crate) fn register_without_resize_if_absent(
+        &mut self,
+        key: TxKey,
+        entry: TxIndexEntry,
+    ) -> Result<bool> {
+        Ok(self.table.insert_if_absent(key, entry)?)
+    }
+
     pub(crate) fn resize_target_capacity(&self) -> Option<usize> {
         if self.table.load_factor() > self.resize_threshold {
             Some(self.table.capacity() * 2)
