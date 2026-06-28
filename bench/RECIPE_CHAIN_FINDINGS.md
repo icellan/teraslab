@@ -1,9 +1,39 @@
-# Recipe / chain-workload head-to-head — findings (2026-06-28)
+# Recipe / chain-workload head-to-head — findings (2026-06-28/29)
 
 **This OVERTURNS the un-batched `FINAL_REPORT.md` "win".** On the realistic,
 batched, high-concurrency chain workload (the one the real node runs), TeraSlab
-**loses to the reference by ~4–5×**. The earlier 4/4 win was on an un-batched,
+**loses to the reference by ~3×**. The earlier 4/4 win was on an un-batched,
 low-concurrency driver that masked this.
+
+## ⭐ DECISIVE ISOLATION (2026-06-29) — the bottleneck is the SERVER, not the client
+
+A mock-server isolation test (`teranode-bench-wt cmd/utxobench TestRecipeMockServer`,
+commit 7f27ecf80) runs the recipe loadgen through the REAL client+adapter
+(go-batcher, codec, conn pool, TCP) into an instant-success mock server. Result:
+
+| pipeline | links/s | store-ops/s | per-op p50 |
+|---|---|---|---|
+| **client + INSTANT mock** (mac 8-core) | **~303,000** | ~1.2M | 8 ms |
+| client + real teraslab server (EC2 24-core) | ~13,700 | ~55k | — |
+| client + reference server (EC2 24-core) | ~40,700 | ~163k | — |
+
+**The client pipeline has ~22× headroom — it is NOT the bottleneck.** This
+CORRECTS the earlier "client-bound" reading: a teraslab server that is CPU-idle
+(~0.6 core) yet services only ~55k store-ops/s is **latency/serialization-bound on
+the SERVER side**, not client-bound. The reference server does ~3× more on the same
+workload. The client-side work this campaign did (pool sharding, transport rewrite,
+batcher goroutine fix) gave only marginal gains precisely because the client was
+never the cap; the writeback fix (server) was the right kind of lever.
+
+**REFRAMED NEXT LEVER:** profile the teraslab SERVER's per-request latency under the
+chain workload — why does an idle (~0.6–3 core) server cap the closed-loop client at
+~55k store-ops/s? Suspects: dispatch-pool pickup latency / polling, redo
+group-commit or per-op redo wait (cf. the historical "200µs redo-sleep" note),
+writeback/checkpoint interaction, a per-op lock handoff, or batch-accumulation on
+the server. The earlier server perf profile (writeback) addressed one serialization;
+this one is a *latency* path (server idle but slow-to-respond). Needs a box +
+server-side latency profiling (per-op spans / `/metrics` histograms / perf with
+off-CPU/wakeup analysis since it is NOT on-CPU bound).
 
 ## The workload (now faithful to the real node)
 

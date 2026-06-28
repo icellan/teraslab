@@ -1,0 +1,77 @@
+2026/06/29 01:12:35 WARN: No local config file 'settings_local.conf'
+=== RUN   TestRecipeMockServer
+    mock_server_test.go:168: mock server listening at 127.0.0.1:52088
+    helpers.go:19: using temp data folder: /var/folders/rb/cmd9dcbx5s1fpgjmbffx2k3r0000gn/T/TestRecipeMockServer903808471/001
+UTXOBENCH_RESULT {
+  "backend": "teraslab",
+  "mode": "recipe-chain",
+  "stream_workers": 10000,
+  "burst_interval_secs": 6,
+  "measure_seconds": 15.00000125,
+  "results": [
+    {
+      "op": "create",
+      "ok_total": 5358742,
+      "failed_total": 0,
+      "latency_samples": 4549646,
+      "ops_sec": 303309.70805752435,
+      "p50_us": 8018,
+      "p99_us": 20359,
+      "p999_us": 26461
+    },
+    {
+      "op": "unlock",
+      "ok_total": 5358742,
+      "failed_total": 0,
+      "latency_samples": 4549924,
+      "ops_sec": 303328.2413893132,
+      "p50_us": 7556,
+      "p99_us": 19945,
+      "p999_us": 24432
+    },
+    {
+      "op": "spend",
+      "ok_total": 5348742,
+      "failed_total": 0,
+      "latency_samples": 4552753,
+      "ops_sec": 303516.8413735966,
+      "p50_us": 7797,
+      "p99_us": 19932,
+      "p999_us": 25151
+    },
+    {
+      "op": "get",
+      "ok_total": 5348742,
+      "failed_total": 0,
+      "latency_samples": 4548446,
+      "ops_sec": 303229.708064191,
+      "p50_us": 8309,
+      "p99_us": 20772,
+      "p999_us": 26991
+    },
+    {
+      "op": "delete",
+      "ok_total": 1024,
+      "failed_total": 0,
+      "latency_samples": 1024,
+      "ops_sec": 68.26666097777824,
+      "p50_us": 5741,
+      "p99_us": 15141,
+      "p999_us": 19499
+    }
+  ],
+  "burst": {
+    "op": "setmined",
+    "ok_total": 2,
+    "failed_total": 0,
+    "latency_samples": 1,
+    "ops_sec": 0.06666666111111157,
+    "p50_us": 9745820,
+    "p99_us": 9745820,
+    "p999_us": 9745820
+  }
+}
+    mock_server_test.go:170: mock server handled 47021 requests
+--- PASS: TestRecipeMockServer (22.07s)
+PASS
+ok  	github.com/bsv-blockchain/teranode/cmd/utxobench	22.852s

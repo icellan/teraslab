@@ -76,7 +76,21 @@ conn-per-request over a sharded pool.**
   reference (40.7k links/s).** Both have idle cores → cap = client
   coordination+allocation, not compute.
 
-**NEXT — DECISIVE lever (cum profile reprioritized this):** the client CPU is
+**⭐ 2026-06-29 ISOLATION TEST CORRECTS THE DIAGNOSIS — bottleneck is the SERVER:**
+A mock-server test (teranode-bench-wt `TestRecipeMockServer`, commit 7f27ecf80) runs
+the recipe loadgen through the REAL client+adapter into an instant-success mock.
+**Client pipeline ceiling = ~303k links/s (1.2M store-ops/s), p50 8ms** (mac 8-core)
+vs ~13.7k against the real teraslab server (24-core). **The client has ~22× headroom
+— it is NOT the bottleneck.** A CPU-idle (~0.6 core) teraslab server servicing only
+~55k store-ops/s is **SERVER-side latency/serialization-bound**. Reference server =
+~163k store-ops/s (~3×). So the client work (pool sharding/transport rewrite/batcher)
+was marginal because the client was never the cap; the writeback fix was right-kind.
+**REFRAMED NEXT LEVER: profile the SERVER's per-request latency (off-CPU/wakeup, NOT
+on-CPU) under the chain workload — why idle-but-slow? dispatch pickup, redo
+group-commit/per-op wait (cf 200µs redo-sleep), writeback/checkpoint, lock handoff.**
+See RECIPE_CHAIN_FINDINGS.md §DECISIVE ISOLATION. (Superhseded below kept for history.)
+
+**[SUPERSEDED] earlier (wrong) lever (cum profile reprioritized this):** the client CPU is
 dominated by SHARED harness tx-build (`makeSpendTx`) + GC-assist, which both
 backends pay equally — so cutting allocs / de-funneling won't close the gap (pool
 sharding already = 0). The differentiator is TeraSlab's transport runs far more
