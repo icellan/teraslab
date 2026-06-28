@@ -1011,3 +1011,34 @@ funnel (~40-48k cap, CPU 30% idle) → +13% tput + robust tail; built on the Byt
 realloc fix (1020125, -31% on-CPU) + txid placement (68c120f). Arc: E20 (buffered
 redo closed spend-p99.9 on macOS) → E22 (BytesMut) → E23 (sharding validated +13%)
 → E24 (WIN on quiet 24-core host).
+
+## E25 — Recipe loadgen (causal UTXO graph) + 2 server findings (2026-06-28)
+
+Reworked `teraslab-loadgen --recipe` to the realistic workload (utxo-db-benchmark-
+recipe.md + the user's causal model): **independent per-op tokio streams**
+(create/unlock/spend/read/delete) + a periodic setMined burst, driving a CAUSAL
+UTXO graph — create tx LOCKED w/ 1 output → unlock the just-created tx → spend a
+prior tx's output (1-in/1-out, check OK) → setMined all txids created since the
+last burst (every X min) → delete spent+mined; cold-start = create-only. Per-op
+batch sizes 488/329/291/488/1024; read = decorate the parent being spent. Commits
+8851997 (first cut — deadlocked on a "furthest-behind" scheduler) → **d1e64fa**
+(per-stream rebuild). 62 tests + clippy + fmt green. Steady `--saturate` ~300k
+rec/s aggregate, errors=0, causal chain verified, cold-start correct.
+
+FINDINGS surfaced by the realistic workload:
+1. **setMined-under-burst = THE bottleneck** (exactly the recipe's "block-found
+   burst is the stress point; SetMined is the dominant, most CPU-expensive server
+   category — a UDF storm"). One set_mined_batch over ~10k txs takes ~**3.76s** and
+   serializes against the write/fsync path → bursts stall create/unlock/delete to
+   multi-second p50. STEADY streams never stall (~300k rec/s, sub-10ms). So the #1
+   realistic-workload perf target is setMined under the block burst (the secondary-
+   index removes + write-path serialization; cf E21 setMined ~20% CPU).
+2. **Flag-namespace footgun (correctness)**: the create-WIRE flags byte decodes
+   locked=0x01/conflicting=0x02/frozen=0x04 (dispatch.rs:6341, receiver.rs:1783),
+   but persisted TxFlags has LOCKED=0x04 (record.rs:420) and the client `is_locked`
+   checks 0x04. A create sending wire-0x04 as "locked" actually FREEZES → spends
+   then fail FROZEN. The loadgen sends wire-0x01 (correct). Review/align the two
+   namespaces — may affect the Teranode-Go path if it uses the persisted bit on the wire.
+
+NEXT: (a) optimize setMined-under-burst (the recipe peak); (b) review the flag
+namespace; (c) full realistic benchmark on EC2 (24-core NVMe) for real capacity.
