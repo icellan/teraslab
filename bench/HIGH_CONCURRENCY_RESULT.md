@@ -59,8 +59,35 @@ dropping a third of the work.
 4. Then re-run interleaved fresh-per-round, apply METHODOLOGY pass condition,
    write FINAL_REPORT.
 
-## Status
-TeraSlab **beats the reference on throughput at production concurrency** (the
-headline win the campaign was chasing) — but the full pass condition (throughput +
-p99.9, proven + multi-round reproducible in FINAL_REPORT) is **not yet complete**:
-the p99.9 half needs the open-loop measurement above. Not declaring the suite won.
+## ⭐ OPEN-LOOP p99.9 TEST RUN — settles it: reference wins the tail
+Added a rate limiter to the recipe (`RECIPE_RATE_LINKS_SEC`, token-bucket gate per
+link) and ran BOTH backends OPEN-LOOP at a fixed **8,500 links/s (~34k store-ops/s,
+below both saturation)**, 20k workers, both **f0**:
+
+| op | TeraSlab p99.9 | reference p99.9 |
+|---|---|---|
+| spend | **113.9 ms** | **38.3 ms** |
+| create | 104.1 ms | 31.3 ms |
+| get | 133.3 ms | 7.8 ms |
+
+(raw: `teraslab_openloop_8500.json` / `reference_openloop_8500.json`.)
+
+**With the closed-loop confound removed, the reference has ~3× LOWER p99.9 at a
+given throughput.** So TeraSlab's higher per-op latency is real (more per-op work:
+write-back cache + redo + index + several locks vs the reference's tighter path),
+not a load-shedding artifact.
+
+## FINAL HONEST VERDICT
+- **Throughput CEILING / high-concurrency goodput: TeraSlab WINS** — 41–44k links/s
+  f0 at 100k–150k chains vs the reference's ~40.7k where it sheds 15–69k ops.
+- **p99.9 (per-op tail latency at a fair fixed rate): reference WINS** (~3× lower).
+- **Pass condition = "beats on Spend throughput AND p99.9": NOT met** — TeraSlab
+  loses the p99.9 half. **TeraSlab does NOT win the suite. FINAL_REPORT not written.**
+
+The remaining latency gap is the distributed per-op overhead (the same finding all
+along: each op takes the write-back-cache + redo + index + multiple brief locks).
+Closing it to also win p99.9 needs the per-op-overhead reduction = a ground-up
+lower-overhead path (lock-free / fewer per-op locks / lighter cache path) —
+a deliberate architecture project, the documented deep next step. The campaign got
+TeraSlab from ~4.7× behind to a throughput-ceiling win + a fairly-measured ~3×
+p99.9 deficit; the win condition is not satisfied.
