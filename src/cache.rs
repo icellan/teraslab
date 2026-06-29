@@ -94,6 +94,13 @@ struct Block {
 /// One lock-striped partition of the cache.
 struct Shard {
     blocks: std::collections::HashMap<u64, Block>,
+    /// Fast worklist of dirty block indices. Invariant (held under the shard
+    /// lock): this set contains EXACTLY the indices whose `Block.dirty == true`.
+    /// It is a worklist, not the authority — [`Block::dirty`] is the authority —
+    /// so `flush_shard` re-checks `b.dirty` under the lock and uses
+    /// [`Arc::ptr_eq`] to detect a concurrent re-dirty. Maintaining it lets the
+    /// flush path iterate O(dirty) instead of O(all cached blocks) per tick.
+    dirty: std::collections::HashSet<u64>,
     tick: u64,
     /// Max blocks this shard may hold (>= 1).
     cap: usize,
@@ -185,6 +192,7 @@ impl CachingDevice {
             .map(|_| {
                 Mutex::new(Shard {
                     blocks: std::collections::HashMap::new(),
+                    dirty: std::collections::HashSet::new(),
                     tick: 0,
                     cap: per_shard_cap,
                 })
@@ -342,11 +350,15 @@ impl CacheState {
                 .map(|(idx, _)| *idx);
             let Some(idx) = victim else { break };
             // Remove first; if the flush fails, re-insert so we don't lose the
-            // dirty bytes (the caller surfaces the error).
+            // dirty bytes (the caller surfaces the error). Keep the dirty set in
+            // lockstep: removing the block clears its entry, and a re-inserted
+            // dirty victim re-adds it.
             let block = shard.blocks.remove(&idx).expect("victim present");
+            shard.dirty.remove(&idx);
             if block.dirty
                 && let Err(e) = self.flush_block(idx, &block.data)
             {
+                shard.dirty.insert(idx);
                 shard.blocks.insert(idx, block);
                 return Err(e);
             }
@@ -463,6 +475,10 @@ impl CacheState {
                 b.last_used = t;
                 if self.writeback {
                     b.dirty = true;
+                    // Keep the dirty worklist in lockstep with `Block::dirty`.
+                    // (`b`'s borrow of `shard.blocks` ends here; `shard.dirty`
+                    // is a disjoint field so this is a fresh borrow.)
+                    shard.dirty.insert(block_idx);
                 }
             } else {
                 self.evict_if_full(&mut shard)?;
@@ -483,6 +499,10 @@ impl CacheState {
                         last_used: t,
                     },
                 );
+                // Inserting a dirty block (write-back) adds it to the worklist.
+                if self.writeback {
+                    shard.dirty.insert(block_idx);
+                }
             }
         }
         Ok(buf.len())
@@ -513,13 +533,22 @@ impl CacheState {
     /// `pwrite`, so this can never deadlock against
     /// `pread`/`pwrite`/`sync`/eviction.
     fn flush_shard(&self, shard: &Mutex<Shard>) -> Result<()> {
+        // Snapshot by iterating ONLY the dirty worklist — O(dirty), not O(all
+        // cached blocks). Look each index up in the map and keep `(idx, Arc)`
+        // for entries that are still genuinely dirty (the set is the worklist;
+        // `Block::dirty` is the authority, re-checked here under the lock).
         let dirty: Vec<(u64, Arc<[u8]>)> = {
             let shard = shard.lock();
             shard
-                .blocks
+                .dirty
                 .iter()
-                .filter(|(_, b)| b.dirty)
-                .map(|(idx, b)| (*idx, b.data.clone()))
+                .filter_map(|idx| {
+                    shard
+                        .blocks
+                        .get(idx)
+                        .filter(|b| b.dirty)
+                        .map(|b| (*idx, b.data.clone()))
+                })
                 .collect()
         };
         for (idx, data) in dirty {
@@ -528,9 +557,13 @@ impl CacheState {
             if let Some(b) = shard.blocks.get_mut(&idx) {
                 // Clear only if the stored Arc is byte-for-byte the snapshot we
                 // flushed. `Arc::ptr_eq` is exact and O(1): a concurrent write
-                // replaces the Arc (CoW), so a different pointer means re-dirtied.
+                // replaces the Arc (CoW), so a different pointer means re-dirtied
+                // — leave it dirty AND in the worklist for the next flush.
                 if Arc::ptr_eq(&b.data, &data) {
                     b.dirty = false;
+                    // `b`'s borrow of `shard.blocks` ends here; remove from the
+                    // disjoint `shard.dirty` worklist to keep them in lockstep.
+                    shard.dirty.remove(&idx);
                 }
             }
         }
@@ -851,6 +884,35 @@ mod tests {
             .sum()
     }
 
+    /// Assert the lockstep invariant across every shard: the `dirty` index set
+    /// contains EXACTLY the indices whose `Block.dirty == true`. Returns the
+    /// total size of the dirty index sets for convenience.
+    fn assert_dirty_index_consistent(cache: &CachingDevice) -> usize {
+        let mut total_set = 0usize;
+        for s in cache.state.shards.iter() {
+            let s = s.lock();
+            // Every index in the set is a resident, genuinely-dirty block.
+            for idx in s.dirty.iter() {
+                let b = s
+                    .blocks
+                    .get(idx)
+                    .unwrap_or_else(|| panic!("dirty index {idx} not resident in blocks map"));
+                assert!(b.dirty, "index {idx} in dirty set but Block.dirty == false");
+            }
+            // Every genuinely-dirty block is in the set.
+            for (idx, b) in s.blocks.iter() {
+                if b.dirty {
+                    assert!(
+                        s.dirty.contains(idx),
+                        "dirty block {idx} missing from the dirty index set"
+                    );
+                }
+            }
+            total_set += s.dirty.len();
+        }
+        total_set
+    }
+
     /// Poll `cond` until it returns true or `timeout` elapses; returns whether
     /// it became true. Used instead of a fixed sleep so the background-thread
     /// tests are not flaky under load.
@@ -1158,5 +1220,242 @@ mod tests {
 
         // stop() is a no-op and must not panic.
         cache.stop();
+    }
+
+    #[test]
+    fn flush_only_touches_dirty_blocks_and_index_matches() {
+        // (a) After writes, ONLY the dirty blocks are flushed and reach the
+        // inner device, and the dirty index exactly matches the dirty blocks.
+        let dev = CountingDev::new(1024 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 512 * BS, true, NEVER_MS);
+
+        // Make several blocks resident-but-CLEAN via reads (so flush would scan
+        // them under the old O(all-blocks) path but must NOT flush them now).
+        dev.inner.pwrite(&ab(0x00, BS), 10 * BS as u64).unwrap();
+        dev.inner.pwrite(&ab(0x00, BS), 11 * BS as u64).unwrap();
+        dev.inner.pwrite(&ab(0x00, BS), 12 * BS as u64).unwrap();
+        for i in 10..13u64 {
+            let _ = read_cache(&cache, i * BS as u64, BS);
+        }
+        let clean_reads = dev.reads.load(Ordering::Relaxed);
+
+        // Dirty exactly two blocks.
+        cache.pwrite(&ab(0xD1, BS), 0).unwrap();
+        cache.pwrite(&ab(0xD2, BS), BS as u64).unwrap();
+
+        // Index invariant + count == exactly the dirty blocks (the 3 clean
+        // resident blocks are NOT in the set).
+        assert_eq!(assert_dirty_index_consistent(&cache), 2);
+        assert_eq!(dirty_count(&cache), 2);
+
+        let writes_before = dev.writes.load(Ordering::Relaxed);
+        cache.sync().unwrap();
+        let flushed = dev.writes.load(Ordering::Relaxed) - writes_before;
+        assert_eq!(
+            flushed, 2,
+            "exactly the two dirty blocks were flushed (clean resident blocks were not)"
+        );
+        // No spurious inner reads from the flush path.
+        assert_eq!(
+            dev.reads.load(Ordering::Relaxed),
+            clean_reads,
+            "flush issues no inner reads"
+        );
+        // The dirty bytes reached the device.
+        assert_eq!(read_inner(&dev, 0, BS), vec![0xD1; BS]);
+        assert_eq!(read_inner(&dev, BS as u64, BS), vec![0xD2; BS]);
+        // Index now empty and still consistent.
+        assert_eq!(assert_dirty_index_consistent(&cache), 0);
+        assert_eq!(dirty_count(&cache), 0);
+    }
+
+    #[test]
+    fn write_during_inflight_flush_keeps_block_in_index() {
+        // (b) A write during an in-flight flush keeps the block dirty AND in the
+        // index (CoW re-dirty); a later sync persists the newest bytes. Drives
+        // the interleave with a gated inner device, asserting the index state.
+        use std::sync::mpsc;
+
+        struct GatedDev {
+            inner: MemoryDevice,
+            observed: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl BlockDevice for GatedDev {
+            fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+                self.inner.pread(buf, offset)
+            }
+            fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
+                if let Some(tx) = self.observed.lock().take() {
+                    let _ = tx.send(buf.to_vec());
+                    let (m, cv) = &*self.release;
+                    let mut released = m.lock();
+                    while !*released {
+                        cv.wait(&mut released);
+                    }
+                }
+                self.inner.pwrite(buf, offset)
+            }
+            fn alignment(&self) -> usize {
+                self.inner.alignment()
+            }
+            fn size(&self) -> u64 {
+                self.inner.size()
+            }
+            fn sync(&self) -> Result<()> {
+                self.inner.sync()
+            }
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let dev = Arc::new(GatedDev {
+            inner: MemoryDevice::new((64 * BS) as u64, BS).unwrap(),
+            observed: Mutex::new(Some(tx)),
+            release: release.clone(),
+        });
+        let cache = Arc::new(CachingDevice::new(dev.clone(), 16 * BS, true, NEVER_MS));
+
+        cache.pwrite(&ab(0xAA, BS), 0).unwrap();
+        assert_eq!(assert_dirty_index_consistent(&cache), 1);
+
+        let flusher = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.sync().unwrap())
+        };
+
+        // Flusher is mid-pwrite holding the 0xAA snapshot.
+        let observed = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(observed, vec![0xAA; BS]);
+
+        // Re-dirty the SAME block during the in-flight flush (CoW swaps the Arc).
+        cache.pwrite(&ab(0xBB, BS), 0).unwrap();
+        // Index must still contain the block (it was re-dirtied).
+        assert_eq!(
+            assert_dirty_index_consistent(&cache),
+            1,
+            "re-dirtied-during-flush block stays in the index"
+        );
+
+        // Release the flusher; ptr_eq fails (Arc was swapped) so it must NOT
+        // clear dirty and must NOT remove from the index.
+        {
+            let (m, cv) = &*release;
+            *m.lock() = true;
+            cv.notify_all();
+        }
+        flusher.join().unwrap();
+
+        assert_eq!(
+            assert_dirty_index_consistent(&cache),
+            1,
+            "block re-dirtied during flush remains dirty and in the index"
+        );
+        assert_eq!(dirty_count(&cache), 1);
+
+        // A later sync persists the NEWEST bytes via the index.
+        cache.sync().unwrap();
+        assert_eq!(assert_dirty_index_consistent(&cache), 0);
+        let mut got = AlignedBuf::new(BS, BS);
+        dev.inner.pread(&mut got[..], 0).unwrap();
+        assert_eq!(
+            got[..].to_vec(),
+            vec![0xBB; BS],
+            "later sync persists the newest bytes via the dirty index"
+        );
+    }
+
+    #[test]
+    fn eviction_of_dirty_victim_flushes_and_clears_index() {
+        // (c) Eviction of a dirty victim flushes it AND removes it from the
+        // index. Per-shard cap 1 forces eviction within a shard.
+        let dev = CountingDev::new(1024 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), BS, true, NEVER_MS);
+        let sc = cache.state.shard_count;
+
+        let idx_a = 0u64;
+        let idx_b = sc; // same shard as 0
+        cache.pwrite(&ab(0xA1, BS), idx_a * BS as u64).unwrap();
+        // The victim is dirty and in the index.
+        assert_eq!(assert_dirty_index_consistent(&cache), 1);
+
+        // Writing idx_b evicts idx_a (flushing it), then idx_b is the new dirty.
+        cache.pwrite(&ab(0xB2, BS), idx_b * BS as u64).unwrap();
+        assert_eq!(
+            read_inner(&dev, idx_a * BS as u64, BS),
+            vec![0xA1; BS],
+            "evicting a dirty victim flushes it to the inner device"
+        );
+        // idx_a is gone from the cache (and thus the index); only idx_b remains.
+        let total = assert_dirty_index_consistent(&cache);
+        assert_eq!(total, 1, "only the surviving dirty block is in the index");
+        // Confirm the surviving entry is idx_b, not the evicted idx_a.
+        let shard = cache.state.shard_of(idx_b).lock();
+        assert!(shard.dirty.contains(&idx_b), "surviving block in index");
+        assert!(
+            !shard.dirty.contains(&idx_a),
+            "evicted victim removed from index"
+        );
+    }
+
+    #[test]
+    fn sync_flushes_everything_via_index() {
+        // (d) sync() flushes all dirty blocks via the index, across many shards.
+        let dev = CountingDev::new(4096 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 2048 * BS, true, NEVER_MS);
+        let sc = cache.state.shard_count;
+
+        for s in 0..sc {
+            let byte = (0x40 + (s & 0x3f)) as u8;
+            cache.pwrite(&ab(byte, BS), s * BS as u64).unwrap();
+        }
+        assert_eq!(
+            assert_dirty_index_consistent(&cache),
+            sc as usize,
+            "every shard's index holds its one dirty block"
+        );
+
+        cache.sync().unwrap();
+        assert_eq!(
+            assert_dirty_index_consistent(&cache),
+            0,
+            "sync cleared every shard's index"
+        );
+        for s in 0..sc {
+            let byte = (0x40 + (s & 0x3f)) as u8;
+            assert_eq!(read_inner(&dev, s * BS as u64, BS), vec![byte; BS]);
+        }
+    }
+
+    #[test]
+    fn write_through_never_populates_dirty_index() {
+        // (e) Write-through is unchanged: no block is ever dirty and the index
+        // stays empty.
+        let dev = CountingDev::new(64 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 16 * BS, false, NEVER_MS);
+
+        cache.pwrite(&ab(0x44, BS), 0).unwrap();
+        cache.pwrite(&ab(0x55, BS), BS as u64).unwrap();
+        // Reads to make blocks resident must not add to the index either.
+        let _ = read_cache(&cache, 0, BS);
+
+        assert_eq!(
+            assert_dirty_index_consistent(&cache),
+            0,
+            "write-through never adds to the dirty index"
+        );
+        assert_eq!(dirty_count(&cache), 0);
+        // Bytes reached inner immediately (unchanged write-through semantics).
+        assert_eq!(read_inner(&dev, 0, BS), vec![0x44; BS]);
+        assert_eq!(read_inner(&dev, BS as u64, BS), vec![0x55; BS]);
+        // sync() over an empty index issues no flush writes, only the inner sync.
+        let writes_before = dev.writes.load(Ordering::Relaxed);
+        cache.sync().unwrap();
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            writes_before,
+            "write-through sync flushes nothing via the index"
+        );
     }
 }
