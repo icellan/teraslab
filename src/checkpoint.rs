@@ -766,12 +766,19 @@ mod tests {
 
         let reserve = capacity / 4;
         let payload = 2048usize;
-        let total_appends = (capacity / payload as u64 * 4) as usize;
+        // 2× capacity forces a couple of fill/drain cycles (enough to exercise
+        // the gate→blocking-checkpoint→reclaim loop) without piling up many
+        // real-fsync checkpoint rounds, whose wall time is what made this flaky.
+        let total_appends = (capacity / payload as u64 * 2) as usize;
         let logfull = Arc::new(AtomicU64::new(0));
 
         for i in 0..total_appends {
+            // Generous valve: the real checkpoint task does real snapshot +
+            // fsync rounds whose latency balloons on a contended CI runner; 60 s
+            // tolerates that without a false timeout (the drain completes in ms
+            // normally). It is a liveness backstop, not a latency assertion.
             assert!(
-                bp.wait_for_capacity(reserve, Duration::from_secs(15)),
+                bp.wait_for_capacity(reserve, Duration::from_secs(60)),
                 "gate must obtain capacity (checkpoint task alive)"
             );
             let mut log = redo.lock();

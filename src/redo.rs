@@ -2602,9 +2602,10 @@ impl RedoLog {
     /// partial batch and then hitting the per-op `LogFull` mid-way, which
     /// forces `poison()` (bricking the store's log until restart) because the
     /// already-buffered ops carry consumed global sequences that must never
-    /// flush. Footprint is measured by arithmetic ([`RedoOp::serialized_data_len`]),
-    /// not by serializing — so a hot create batch with fat `record_bytes` is
-    /// not cloned/serialized/CRC'd here just to read its length (N2).
+    /// flush. Footprint is measured by arithmetic (`RedoOp::serialized_data_len`,
+    /// a `pub(crate)` helper), not by serializing — so a hot create batch with
+    /// fat `record_bytes` is not cloned/serialized/CRC'd here just to read its
+    /// length (N2).
     pub fn would_fit(&self, ops: &[&RedoOp]) -> bool {
         if self.poisoned {
             return false;
