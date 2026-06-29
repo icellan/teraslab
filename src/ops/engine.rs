@@ -5584,22 +5584,11 @@ impl Engine {
                 detail: "device full for conflicting children".into(),
             })?;
 
-        let align = self.device_for(device_id).alignment();
-        let aligned_base = new_offset / align as u64 * align as u64;
-        let intra = (new_offset - aligned_base) as usize;
-        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
-        let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
-        for (i, child) in children.iter().enumerate() {
-            wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
-        }
-        if let Err(err) = self
-            .device_for(device_id)
-            .pwrite_all_at(&wbuf, aligned_base)
-        {
-            // pwrite failed — roll back the freshly-allocated extent so
+        if let Err(err) = self.write_children_block(device_id, new_offset, children) {
+            // write failed — roll back the freshly-allocated extent so
             // we don't leak it. If the rollback itself fails, surface
             // the leak via tracing (we still need to return the
-            // original pwrite error to the caller) so operators can
+            // original error to the caller) so operators can
             // correlate against the R-049 orphan-blob sweep.
             if let Err(free_err) =
                 self.free_conflicting_children_block(device_id, new_offset, children.len())
@@ -5610,14 +5599,12 @@ impl Engine {
                     kind = "conflicting_children_alloc_rollback",
                     offset = new_offset,
                     bytes = (children.len() * 32) as u64,
-                    pwrite_error = %err,
+                    write_error = %err,
                     free_error = %free_err,
-                    "rollback free after failed conflicting-children pwrite also failed; bytes leaked until R-049 sweep"
+                    "rollback free after failed conflicting-children write also failed; bytes leaked until R-049 sweep"
                 );
             }
-            return Err(SpendError::StorageError {
-                detail: format!("{err}"),
-            });
+            return Err(err);
         }
 
         Ok(new_offset)
@@ -5903,6 +5890,50 @@ impl Engine {
         }
     }
 
+    /// Write a children-list block (deleted- or conflicting-children) of `[u8;32]`
+    /// txids at `offset` on `device_id`, preserving any packed-neighbour bytes in
+    /// the same device block(s).
+    ///
+    /// In PACKED mode the allocator hands out sub-block (`RECORD_ALIGN`-granular)
+    /// offsets, so a children block can share a device block with another record.
+    /// A bare aligned write of `[aligned_base, aligned_base+write_len)` would zero
+    /// the neighbour's bytes → CRC mismatch when that neighbour is later read (the
+    /// packed-delete corruption observed via `prune_slot_if_spent_by_child`). So in
+    /// packed mode we read-modify-write: `pread` the aligned region first, overlay
+    /// only the children bytes, then write back — mirroring `write_metadata_fast`.
+    ///
+    /// In NON-PACKED mode every allocation is block-aligned and exclusive
+    /// (`intra == 0`, the block is the children block's own), so the RMW read is
+    /// unnecessary and skipped — byte-identical to the previous behaviour.
+    fn write_children_block(
+        &self,
+        device_id: u8,
+        offset: u64,
+        children: &[[u8; 32]],
+    ) -> Result<(), SpendError> {
+        let align = self.device_for(device_id).alignment();
+        let aligned_base = offset / align as u64 * align as u64;
+        let intra = (offset - aligned_base) as usize;
+        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
+        let mut buf = crate::device::AlignedBuf::new(write_len, align);
+        if self.store_is_packed(device_id) {
+            // Preserve packed neighbours: read the live block(s) before overlaying.
+            self.device_for(device_id)
+                .pread_exact_at(&mut buf, aligned_base)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                })?;
+        }
+        for (i, child) in children.iter().enumerate() {
+            buf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
+        }
+        self.device_for(device_id)
+            .pwrite_all_at(&buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })
+    }
+
     fn read_deleted_children_at(
         &self,
         device_id: u8,
@@ -5950,18 +5981,7 @@ impl Engine {
                 detail: "device full for deleted children".into(),
             })?;
 
-        let align = self.device_for(device_id).alignment();
-        let aligned_base = new_offset / align as u64 * align as u64;
-        let intra = (new_offset - aligned_base) as usize;
-        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
-        let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
-        for (i, child) in children.iter().enumerate() {
-            wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
-        }
-        if let Err(err) = self
-            .device_for(device_id)
-            .pwrite_all_at(&wbuf, aligned_base)
-        {
+        if let Err(err) = self.write_children_block(device_id, new_offset, children) {
             if let Err(free_err) =
                 self.free_deleted_children_block(device_id, new_offset, children.len())
             {
@@ -5971,14 +5991,12 @@ impl Engine {
                     kind = "deleted_children_alloc_rollback",
                     offset = new_offset,
                     bytes = (children.len() * 32) as u64,
-                    pwrite_error = %err,
+                    write_error = %err,
                     free_error = %free_err,
-                    "rollback free after failed deleted-children pwrite also failed; bytes leaked until R-049 sweep"
+                    "rollback free after failed deleted-children write also failed; bytes leaked until R-049 sweep"
                 );
             }
-            return Err(SpendError::StorageError {
-                detail: format!("{err}"),
-            });
+            return Err(err);
         }
 
         Ok(new_offset)
@@ -11293,6 +11311,50 @@ mod tests {
     /// transition still fires (verified separately by
     /// `prune_slot_if_spent_by_child_updates_counters_once`); this test
     /// pins the SECONDARY audit-trail invariant.
+    #[test]
+    fn packed_children_block_write_preserves_neighbour_record() {
+        // Regression for the pooled packed-delete corruption: in packed mode a
+        // children block shares a device block with a neighbour record, so the
+        // children-block write MUST read-modify-write to preserve the neighbour.
+        // A bare aligned write zeroes the neighbour → CRC mismatch on read (seen
+        // via prune_slot_if_spent_by_child: "record corruption: CRC mismatch").
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        alloc.set_packed(true);
+        let engine = Engine::new(
+            dev,
+            Index::new(100).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert!(engine.store_is_packed(0), "test requires a packed store");
+
+        // Fill block 0 with a sentinel standing in for a neighbour record.
+        let sentinel = 0xABu8;
+        let mut block = crate::device::AlignedBuf::new(4096, 4096);
+        block[..].fill(sentinel);
+        engine.device_for(0).pwrite_all_at(&block, 0).unwrap();
+
+        // Write a children block packed into the SAME block 0 at a sub-block
+        // offset past the neighbour. Pre-fix this zeroed [0,800) and [832,4096).
+        let child = [0x11u8; 32];
+        engine.write_children_block(0, 800, &[child]).unwrap();
+
+        let mut back = crate::device::AlignedBuf::new(4096, 4096);
+        engine.device_for(0).pread_exact_at(&mut back, 0).unwrap();
+        assert!(
+            back[..800].iter().all(|&b| b == sentinel),
+            "neighbour prefix must be preserved by RMW, not zeroed"
+        );
+        assert_eq!(&back[800..832], &child, "children written at the packed offset");
+        assert!(
+            back[832..4096].iter().all(|&b| b == sentinel),
+            "neighbour suffix must be preserved by RMW, not zeroed"
+        );
+    }
+
     #[test]
     fn prune_slot_if_spent_by_child_appends_to_deleted_children_list() {
         let h = TestHarness::new(3, TxFlags::empty());

@@ -93,4 +93,5 @@ writeback = true
 writeback_interval_ms = 50
 
 [storage]
+packed = true
 placement = "txid"
