@@ -1,0 +1,69 @@
+{
+  "backend": "teraslab",
+  "mode": "recipe-chain",
+  "stream_workers": 8000,
+  "burst_interval_secs": 6,
+  "measure_seconds": 20.000401092,
+  "results": [
+    {
+      "op": "create",
+      "ok_total": 44000,
+      "failed_total": 0,
+      "latency_samples": 29970,
+      "ops_sec": 1498.469948784565,
+      "p50_us": 3455,
+      "p99_us": 3753,
+      "p999_us": 15588
+    },
+    {
+      "op": "unlock",
+      "ok_total": 44000,
+      "failed_total": 0,
+      "latency_samples": 29970,
+      "ops_sec": 1498.469948784565,
+      "p50_us": 3433,
+      "p99_us": 3704,
+      "p999_us": 4018
+    },
+    {
+      "op": "spend",
+      "ok_total": 36000,
+      "failed_total": 0,
+      "latency_samples": 29970,
+      "ops_sec": 1498.469948784565,
+      "p50_us": 3383,
+      "p99_us": 3643,
+      "p999_us": 7883
+    },
+    {
+      "op": "get",
+      "ok_total": 36000,
+      "failed_total": 0,
+      "latency_samples": 29970,
+      "ops_sec": 1498.469948784565,
+      "p50_us": 3414,
+      "p99_us": 3714,
+      "p999_us": 11523
+    },
+    {
+      "op": "delete",
+      "ok_total": 5044,
+      "failed_total": 0,
+      "latency_samples": 5044,
+      "ops_sec": 252.1949423313095,
+      "p50_us": 51,
+      "p99_us": 123,
+      "p999_us": 176
+    }
+  ],
+  "burst": {
+    "op": "setmined",
+    "ok_total": 48,
+    "failed_total": 0,
+    "latency_samples": 47,
+    "ops_sec": 2.34995287263512,
+    "p50_us": 375309,
+    "p99_us": 581094,
+    "p999_us": 581094
+  }
+}

@@ -104,6 +104,35 @@ not a load-shedding artifact.
   ~0.35 ms CPU each but ~60 ms wall-clock in queue/handoffs). This is the SAME
   per-op-overhead conclusion, now localized to the server and quantified.
 
+### p99.9 ROOT CAUSE pinned to a fixed ~71ms SERVER per-op latency floor (idle)
+Re-tested at LOW offered rate to remove any saturation confound (the fixed-rate
+p99.9 test had run on a 12-core box where 8.5k links/s ≈ 60% util):
+
+| @1500 links/s (≈10% util, both f0) | TS p50 | TS p99.9 | REF p50 | REF p99.9 |
+|---|---|---|---|---|
+| spend | 71 ms | 114 ms | 33 ms | 83 ms |
+| create | 75 ms | 113 ms | 11 ms | 19 ms |
+| get | 80 ms | 110 ms | 1 ms | 3 ms |
+
+It is a **UNIFORM ~71 ms floor** (p50≈p99≈p99.9 — NOT a tail spike) on a near-idle
+server. Definitive client-vs-server isolation at the SAME rate:
+- **mock server (instant ack), same client, @1500: TS p50 = 3.4 ms.**
+- **real teraslab server @1500: TS p50 = 75 ms.**
+⇒ the ~71 ms is **the teraslab SERVER's per-op latency at idle**, not the client.
+
+Ruled OUT as the cause (each tested): client/harness (mock 3.4 ms), redo flush +
+writeback interval (5 ms → no change), TCP Nagle (server set_nodelay at
+mod.rs:602, client too), CPU saturation (~10% util at 1500 links/s),
+the adapter go-batcher (the create batcher is 3 ms yet create is 75 ms), the
+replication-fanout permit wait (replication-only).
+
+**Not yet pinned: which server stage adds the ~71 ms.** It is a per-op WAIT (low
+CPU), uniform, fixed. The decisive next diagnostic is **request-path timestamp
+instrumentation** in the server (stamp receive → dispatch-enqueue → worker-start →
+process-done → response-write per request) on one run to find the ~71 ms stage,
+then fix it. Winning p99.9 (and thus the suite, since throughput is already won)
+hinges on eliminating this fixed server per-op latency.
+
 The remaining latency gap is the distributed per-op overhead (the same finding all
 along: each op takes the write-back-cache + redo + index + multiple brief locks).
 Closing it to also win p99.9 needs the per-op-overhead reduction = a ground-up
