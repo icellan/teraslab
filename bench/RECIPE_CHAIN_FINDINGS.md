@@ -54,6 +54,15 @@ engineering effort, NOT a perf-tuning iteration — and must be prototyped + pro
 + measured carefully on durability-critical code (do not change blind).
 
 REFUTED levers (logged, method "keep only if it helps — else revert + log"):
+- **buffered redo group-commit batching** (apply the non-buffered leader/follower
+  coalescing to the buffered append path so concurrent commits share one locked
+  append instead of one `log.lock()` per commit): implemented + fully tested
+  (cargo test --all 0 failed, redo 215/0), but **same-box** A/B showed NO gain
+  (27.7k vs 27.5k HEAD). An earlier "+15%" reading was a FALSE cross-box signal
+  (a different, slower spot instance — METHOD LESSON: only compare same-box).
+  Confirms the per-store redo lock's O(1) hold is NOT the throughput cap →
+  reverted (git stash on feat/device-cache). Reinforces that NO single lock
+  dominates; the contention is genuinely distributed.
 - **write-through cache** (`[cache] writeback=false`): 3× WORSE (8.7k vs 24.7k
   write-back, same 12-core box; server went idle 0.5 core). Synchronous per-op
   O_DIRECT writes are far slower than batched write-back even WITH fallocate → the
