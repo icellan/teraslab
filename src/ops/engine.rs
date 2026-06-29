@@ -222,6 +222,12 @@ pub struct Engine {
     /// attach a single representative handle; the per-store routing helpers
     /// fall back to [`Self::redo_log_handle`] in that case.
     redo_logs: std::sync::OnceLock<Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>>,
+    /// One shared redo backpressure coordinator across all per-store logs,
+    /// built and injected in [`Self::set_redo_logs`]. The dispatch gate
+    /// ([`crate::redo::RedoBackpressure::wait_for_capacity`]) and the
+    /// checkpoint drainer read it; each store's log signals it on reclaim.
+    /// `None` until redo logs are attached (test / no-WAL paths).
+    redo_backpressure: std::sync::OnceLock<Arc<crate::redo::RedoBackpressure>>,
     /// Append-only on-device deletion-tombstone log (deletion-tombstone
     /// Phase 3). When attached AND [`Self::tombstones_enabled`] is true, the
     /// physical-delete path appends a [`crate::tombstone::Tombstone`] here
@@ -495,6 +501,7 @@ impl Engine {
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_logs: std::sync::OnceLock::new(),
+            redo_backpressure: std::sync::OnceLock::new(),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
             // Default ON (design §11.5). A delete still writes no tombstone
@@ -566,9 +573,34 @@ impl Engine {
     /// route each redo entry to the owning store's log via the private
     /// `redo_log_for_device` helper.
     pub fn set_redo_logs(&self, logs: Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>) {
+        // Build ONE backpressure coordinator over every store's space mirror,
+        // and inject it into each log so any store's reclaim wakes every gated
+        // appender. The coordinator's free signal is the MIN across stores, so
+        // the dispatch gate only admits a mutation when every store has
+        // headroom (a create batch shards across stores and the gate runs
+        // before the payload names a store). Disarmed until the checkpoint
+        // task arms it — without a drain there is nothing to reclaim a full
+        // log, so the gate must not block.
+        if !logs.is_empty() {
+            let atomics: Vec<_> = logs.iter().map(|l| l.lock().atomics()).collect();
+            let bp = crate::redo::RedoBackpressure::new(atomics);
+            for l in &logs {
+                l.lock().set_backpressure(bp.clone());
+            }
+            let _ = self.redo_backpressure.set(bp);
+        }
         if self.redo_logs.set(logs).is_err() {
             tracing::warn!("engine per-store redo logs already attached; ignoring replacement");
         }
+    }
+
+    /// The shared redo backpressure coordinator across all per-store logs.
+    ///
+    /// `None` until redo logs have been attached via [`Self::set_redo_logs`]
+    /// (test / no-WAL paths). The dispatch backpressure gate and the checkpoint
+    /// drainer use this handle.
+    pub fn redo_backpressure(&self) -> Option<Arc<crate::redo::RedoBackpressure>> {
+        self.redo_backpressure.get().cloned()
     }
 
     /// The redo log owning store `device_id`, for secondary-index two-phase
@@ -785,6 +817,24 @@ impl Engine {
                 return Ok(None);
             };
             let mut guard = log.lock();
+            // Pre-flight the WHOLE batch's footprint against this store's
+            // forward headroom BEFORE appending any op. An oversized batch (one
+            // whose redo footprint exceeds the store's free space — e.g. a fat
+            // cold-data create burst, or the residual where the pre-barrier gate
+            // admitted on stale free space) must fail CLEANLY here: append
+            // nothing, draw no sequence, return LogFull. Otherwise the per-op
+            // append below would buffer the leading ops (with consumed global
+            // sequences) and then fail mid-batch, forcing poison() — which
+            // bricks the store's log until restart. The dispatch caller treats
+            // this Err as a redo-full and rolls its in-memory reservations back.
+            if !guard.would_fit(store_ops) {
+                tracing::error!(
+                    store,
+                    ops = store_ops.len(),
+                    "redo batch exceeds store forward headroom; rejecting without append"
+                );
+                return Err("redo log append failed".to_string());
+            }
             let mut first = u64::MAX;
             let mut last = 0u64;
             let mut wrote = false;
@@ -796,16 +846,13 @@ impl Engine {
                         wrote = true;
                     }
                     Err(e) => {
-                        // A mid-batch append failure (e.g. LogFull) leaves the
-                        // EARLIER ops of this batch buffered with already-consumed
-                        // global sequences. If left as-is they would become
-                        // durable on the NEXT successful flush — even though the
-                        // caller treats this batch as failed and rolls its
-                        // in-memory reservations back — silently diverging durable
-                        // state from acknowledged state. Poison the log so the
-                        // residue can never flush (a poisoned `flush()` is a
-                        // no-op error) and no later write extends a partial batch.
-                        // Fail-closed, mirroring the flush-failure path below.
+                        // Defense in depth: with the would_fit pre-flight above,
+                        // a LogFull here is unreachable (capacity was verified
+                        // under this same lock). A real I/O/poison error still
+                        // lands here. A mid-batch failure leaves earlier ops
+                        // buffered with consumed global sequences that must
+                        // never flush, so poison the log (a poisoned flush() is
+                        // a no-op error) and fail closed.
                         guard.poison();
                         tracing::error!(err = %e, "redo log append failed; log poisoned");
                         return Err("redo log append failed".to_string());
@@ -1008,10 +1055,44 @@ impl Engine {
         let Some(log) = self.redo_log_for_device(device_id) else {
             return Ok(());
         };
-        log.lock()
-            .append(op.clone())
-            .map_err(|e| format!("replica redo append: {e}"))?;
+        // Capture the result so the per-store guard is dropped at the end of
+        // THIS statement, before `poison_all_redo_logs` below re-locks every
+        // log (including this one) — `parking_lot::Mutex` is not reentrant, so
+        // holding the guard across the poison would self-deadlock.
+        let append_result = log.lock().append(op.clone());
+        if let Err(e) = append_result {
+            // N1: fail closed, mirroring the master routed path
+            // (`append_redo_ops_routed`'s mid-batch `poison()`) and
+            // `flush_all_redo_logs`'s partial-flush handling. A mid-batch
+            // append failure leaves this batch's EARLIER ops buffered — across
+            // this AND other stores — with consumed global sequences. The
+            // receiver returns `STATUS_ERROR` BEFORE the once-per-batch
+            // `flush_all_redo_logs`, so without this the residue would be
+            // flushed durable by the NEXT replica batch even though the master
+            // NAK'd this one and will resend it — silently diverging the
+            // replica's durable redo from the master's acked state. Poison
+            // EVERY store's log (the residue can span stores) so no residue can
+            // ever flush; the node fences and recovery reconciles on restart.
+            self.poison_all_redo_logs();
+            tracing::error!(
+                err = %e,
+                device_id,
+                "replica redo append failed; poisoned all store logs (fail-closed)"
+            );
+            return Err(format!("replica redo append: {e}"));
+        }
         Ok(())
+    }
+
+    /// Poison every attached redo log, fencing the node so no further writes
+    /// (and no buffered residue) can become durable until a restart + recovery.
+    /// Used by the replica fail-closed paths.
+    fn poison_all_redo_logs(&self) {
+        if let Some(logs) = self.redo_logs.get() {
+            for log in logs {
+                log.lock().poison();
+            }
+        }
     }
 
     /// Flush every attached redo log (per-store, or the single representative
@@ -14126,20 +14207,21 @@ mod tests {
         );
     }
 
-    /// P1: a mid-batch append failure (LogFull) in `append_redo_ops_routed` must
-    /// fail closed AND poison the log. Earlier ops of the batch were buffered
-    /// with already-consumed global sequences; if the log stayed live they would
-    /// become durable on the next successful flush even though the caller treats
-    /// the batch as failed and rolls its reservations back — diverging durable
-    /// from acknowledged state. Pre-fix the `?` on `append` returned without
-    /// poisoning, leaving that residue live.
+    /// P1 (review): an OVERSIZED routed batch — one whose redo footprint
+    /// exceeds the store's forward headroom — must fail CLEANLY: return the
+    /// redo-full error, append nothing, and leave the log USABLE. It must NOT
+    /// poison/brick the store. The `would_fit` pre-flight in
+    /// `append_redo_ops_routed` rejects before any partial append, so no
+    /// consumed-sequence residue can diverge durable from acknowledged state —
+    /// which is what the old "append until LogFull mid-batch, then poison" path
+    /// did (bricking the store's log until restart on a merely-too-big batch).
     #[test]
-    fn append_redo_ops_routed_poisons_log_on_midbatch_append_failure() {
+    fn append_redo_ops_routed_rejects_oversized_batch_without_poison() {
         use crate::redo::{RedoLog, RedoOp};
 
         let engine = create_engine(); // single store
-        // Tiny log: a 4 KiB header block + ~4 KiB entries region holds ~100
-        // small ops, so a 2000-op batch overflows mid-append.
+        // Tiny log: a 4 KiB header block + ~4 KiB entries region; a 2000-op
+        // batch vastly exceeds it.
         let rdev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
         let log = RedoLog::open(rdev.clone(), 0, 8192).unwrap();
         let log_arc = Arc::new(parking_lot::Mutex::new(log));
@@ -14154,33 +14236,118 @@ mod tests {
             .collect();
         let err = engine
             .append_redo_ops_routed(&ops)
-            .expect_err("a mid-batch LogFull must fail closed");
+            .expect_err("an oversized batch must fail (redo full)");
         assert!(
             err.contains("redo log append failed"),
-            "expected the append-failure error, got: {err}"
+            "expected the redo-full error, got: {err}"
         );
 
-        // The log is poisoned: no later write can extend the partial batch.
+        // The log is NOT poisoned: a normal small append still succeeds, so the
+        // store is not bricked by a single oversized request.
         assert!(
-            matches!(
-                log_arc.lock().append(RedoOp::AllocateRegion {
+            log_arc
+                .lock()
+                .append(RedoOp::AllocateRegion {
                     device_id: 0,
                     offset: 0,
-                    size: 4096
-                }),
-                Err(crate::redo::RedoError::Poisoned)
-            ),
-            "log must be poisoned after a mid-batch append failure"
+                    size: 4096,
+                })
+                .is_ok(),
+            "log must remain usable after rejecting an oversized batch (no poison/brick)"
+        );
+        log_arc
+            .lock()
+            .flush()
+            .expect("flush of the small append must succeed");
+
+        // The rejected batch left NO residue: only the one post-reject append is
+        // durable (the oversized batch appended nothing, drew no sequence).
+        let fresh = RedoLog::open(rdev, 0, 8192).unwrap();
+        assert_eq!(
+            fresh.recover().unwrap().len(),
+            1,
+            "only the post-reject append is durable; the oversized batch left no residue"
+        );
+    }
+
+    /// N1 (review round 2): the REPLICA apply path must also fail closed. A
+    /// mid-batch replica append failure (op K hits `LogFull`) leaves this
+    /// batch's earlier ops buffered ACROSS stores with consumed global
+    /// sequences; the receiver returns `STATUS_ERROR` before the once-per-batch
+    /// flush, so without fail-closed handling the next replica batch would
+    /// flush that residue durable even though the master NAK'd and resends —
+    /// silent durable/acked divergence. `append_replica_redo_entry_to_store`
+    /// now poisons EVERY store's log on append failure, dropping the
+    /// cross-store residue so none of it can ever flush.
+    #[test]
+    fn replica_redo_append_failure_poisons_all_stores_and_drops_residue() {
+        use crate::redo::{RedoError, RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+        // Store 0: room for a small op (the residue). Store 1: tiny — a single
+        // fat op overflows it.
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 64 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 8192).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared);
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        let small = RedoOp::AllocateRegion {
+            device_id: 0,
+            offset: 4096,
+            size: 4096,
+        };
+        // Earlier op of the batch lands on store 0 and is buffered (residue).
+        engine
+            .append_replica_redo_entry_to_store(&small, 0)
+            .expect("small replica append fits store 0");
+        assert!(
+            log0_arc.lock().has_pending(),
+            "store 0 holds the buffered residue before the failure"
         );
 
-        // And NOTHING from the failed batch is durable: a fresh log over the same
-        // device recovers zero entries (the failed batch never flushed, and the
-        // poisoned buffer can never flush).
-        let fresh = RedoLog::open(rdev, 0, 8192).unwrap();
+        // A later op overflows store 1 mid-batch.
+        let fat = RedoOp::Create {
+            tx_key: TxKey { txid: [9u8; 32] },
+            device_id: 1,
+            record_offset: 4096,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: vec![0xEE; 8192],
+            parent_txids: Vec::new(),
+        };
+        let err = engine
+            .append_replica_redo_entry_to_store(&fat, 1)
+            .expect_err("oversized replica op must fail");
+        assert!(err.contains("replica redo append"), "got: {err}");
+
+        // Both stores are poisoned (residue can never flush) and store 0's
+        // buffered residue was dropped — no durable/acked divergence is possible.
         assert!(
-            fresh.recover().unwrap().is_empty(),
-            "no residue from the failed batch may be durable"
+            !log0_arc.lock().has_pending(),
+            "store 0's residue must be dropped by the fail-closed poison"
         );
+        assert!(
+            matches!(
+                log0_arc.lock().append(small.clone()),
+                Err(RedoError::Poisoned)
+            ),
+            "store 0 must be poisoned"
+        );
+        assert!(
+            matches!(log1_arc.lock().append(small), Err(RedoError::Poisoned)),
+            "store 1 must be poisoned"
+        );
+        // A subsequent batch flush makes nothing durable: store 0 recovers empty.
+        let _ = engine.flush_all_redo_logs();
     }
 
     #[test]

@@ -60,9 +60,10 @@
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::TxKey;
 use crate::metrics::redo_metrics;
+use parking_lot::{Condvar, Mutex as PlMutex};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -1011,6 +1012,59 @@ impl RedoOp {
         }
     }
 
+    /// Byte length `serialize_data` would push for this op, computed by pure
+    /// arithmetic over the fields — NO clone, serialize, or CRC.
+    ///
+    /// MUST stay byte-exact with [`Self::serialize_data`]; a `debug_assert` in
+    /// [`RedoEntry::serialize`] cross-checks it on every serialize so any
+    /// variant drift fails the test suite. Used by [`RedoLog::would_fit`] to
+    /// size a batch without re-serializing every op (Create carries fat
+    /// `record_bytes`, so the prior measure-by-serialize doubled the
+    /// clone/serialize/CRC of the whole hot create batch — N2).
+    pub(crate) fn serialized_data_len(&self) -> usize {
+        // Field widths: txid/[u8;32]=32, spending_data[u8;36]=36, u64=8,
+        // u32=4, u16=2, u8/bool=1.
+        match self {
+            RedoOp::Spend { .. } => 32 + 4 + 36 + 4,
+            RedoOp::SpendV2 { utxo_hash, .. } | RedoOp::UnspendV2 { utxo_hash, .. } => {
+                32 + 4 + 36 + 4 + 4 + 4 + 4 + 8 + if utxo_hash.is_some() { 32 } else { 0 }
+            }
+            RedoOp::Unspend { spending_data, .. } => {
+                32 + 4 + if spending_data.is_some() { 36 + 4 } else { 4 }
+            }
+            RedoOp::SetMined { .. } => 32 + 4 + 4 + 4 + 1,
+            RedoOp::Freeze { .. } | RedoOp::Unfreeze { .. } | RedoOp::PruneSlot { .. } => 32 + 4,
+            RedoOp::PruneSlotIfSpentBy { .. } => 32 + 4 + 32,
+            RedoOp::FreezeV2 { .. } | RedoOp::UnfreezeV2 { .. } => 32 + 4 + 32,
+            RedoOp::Reassign { .. } => 32 + 4 + 32 + 4 + 4,
+            RedoOp::ReassignV2 { .. } => 32 + 4 + 32 + 4 + 4 + 32,
+            RedoOp::ReplicaCreate { .. } => 32 + 1 + 8 + 4,
+            RedoOp::Create {
+                record_bytes,
+                parent_txids,
+                ..
+            } => 32 + 1 + 8 + 4 + 1 + 4 + record_bytes.len() + 2 + parent_txids.len() * 32,
+            RedoOp::Delete { .. } => 32 + 8 + 8,
+            RedoOp::SetConflicting { .. } => 32 + 1 + 4 + 4,
+            RedoOp::AppendConflictingChild { .. }
+            | RedoOp::RemoveConflictingChild { .. }
+            | RedoOp::AppendDeletedChild { .. } => 32 + 32,
+            RedoOp::SetLocked { .. } => 32 + 1,
+            RedoOp::PreserveUntil { .. } => 32 + 4,
+            RedoOp::MarkOnLongestChain { .. } => 32 + 1 + 4 + 4 + 4,
+            RedoOp::SecondaryUnminedUpdate { .. } | RedoOp::SecondaryDahUpdate { .. } => 32 + 4 + 4,
+            RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => 8 + 8 + 1,
+            RedoOp::HashtableResizeBegin { tmp_path_bytes, .. } => 8 + 4 + tmp_path_bytes.len(),
+            RedoOp::HashtableResizeCommit { .. } => 8,
+            RedoOp::CompensateUnsetMined { .. } => 32 + 4 + 4 + 4,
+            RedoOp::CompensateReassign { .. } => 32 + 4 + 32,
+            RedoOp::CompensatePrune { .. } => 32 + 4 + 1,
+            RedoOp::CompensateSetLocked { .. } => 32 + 1 + 4,
+            RedoOp::RecoveryProgress { .. } => 8,
+            RedoOp::Checkpoint => 0,
+        }
+    }
+
     /// Serialize op-specific data (without type byte, sequence, or length).
     fn serialize_data(&self, buf: &mut Vec<u8>) {
         match self {
@@ -1837,12 +1891,30 @@ const ENTRY_CHECKSUM_SIZE: usize = 4;
 const ENTRY_OVERHEAD: usize = ENTRY_SEQ_SIZE + ENTRY_TYPE_SIZE + ENTRY_CHECKSUM_SIZE;
 
 impl RedoEntry {
+    /// Total on-disk byte length of this entry, by arithmetic (no serialize).
+    /// `RedoEntry::serialize` produces `length(4) | seq(8) | type(1) | op_data |
+    /// crc(4)`, so the total is `ENTRY_HEADER_SIZE + ENTRY_OVERHEAD +
+    /// op.serialized_data_len()`.
+    fn serialized_len(&self) -> usize {
+        ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + self.op.serialized_data_len()
+    }
+
     /// Serialize this entry to bytes.
     fn serialize(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&self.sequence.to_le_bytes());
         payload.push(self.op.op_type());
         self.op.serialize_data(&mut payload);
+        // Byte-exactness guard (N2): the op data just written must match the
+        // arithmetic `serialized_data_len` that `would_fit` trusts. Any future
+        // variant whose `serialize_data` and `serialized_data_len` drift apart
+        // trips this in the test suite before it can cause a false would_fit.
+        debug_assert_eq!(
+            payload.len() - ENTRY_SEQ_SIZE - ENTRY_TYPE_SIZE,
+            self.op.serialized_data_len(),
+            "serialized_data_len drifted from serialize_data for {:?}",
+            self.op.op_type()
+        );
 
         let checksum = crc32fast::hash(&payload);
         payload.extend_from_slice(&checksum.to_le_bytes());
@@ -1851,6 +1923,7 @@ impl RedoEntry {
         let mut out = Vec::with_capacity(ENTRY_HEADER_SIZE + payload.len());
         out.extend_from_slice(&length.to_le_bytes());
         out.extend_from_slice(&payload);
+        debug_assert_eq!(out.len(), self.serialized_len(), "entry length drift");
         out
     }
 
@@ -1897,7 +1970,6 @@ impl RedoEntry {
 #[derive(Debug)]
 pub struct RedoAtomics {
     write_pos: AtomicU64,
-    logical_start: AtomicU64,
     entries_region_size: u64, // immutable after open
 }
 
@@ -1907,11 +1979,244 @@ impl RedoAtomics {
         self.write_pos.load(AtomicOrdering::Relaxed)
     }
 
-    /// Bytes available for new entries (mirrors `RedoLog::available_space`).
+    /// Bytes available for a NEW forward append — `entries_region_size −
+    /// write_pos` — mirroring [`RedoLog::available_space`] and the forward
+    /// `LogFull` predicate `append` enforces (`write_pos + buffer + bytes >
+    /// entries_region_size`).
+    ///
+    /// This is the PHYSICAL forward headroom, not logical free space. The redo
+    /// log is linear: `write_pos` advances monotonically toward the region end
+    /// and an append fails when it would cross the end, regardless of how much
+    /// of the `[0, logical_start)` prefix a compaction has logically reclaimed
+    /// (that prefix is only returned to forward use by a `reset` / front-gap
+    /// relocation, both of which rewind `write_pos`). Subtracting
+    /// `logical_start` here (the prior bug) over-reported headroom after a
+    /// past-tail fuzzy compaction, so the backpressure gate admitted bursts
+    /// that then hit `LogFull` — the failure this gate exists to prevent.
     pub fn available_space(&self) -> u64 {
-        let used = self.write_pos.load(AtomicOrdering::Relaxed)
-            - self.logical_start.load(AtomicOrdering::Relaxed);
-        self.entries_region_size.saturating_sub(used)
+        self.entries_region_size
+            .saturating_sub(self.write_pos.load(AtomicOrdering::Relaxed))
+    }
+
+    /// Total entries-region capacity in bytes (mirrors [`RedoLog::capacity`]).
+    pub fn capacity(&self) -> u64 {
+        self.entries_region_size
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RedoBackpressure
+// ---------------------------------------------------------------------------
+
+/// Coordinates redo-log backpressure between appenders and the drain
+/// (checkpoint) task so a write burst that fills the log **stalls** the writer
+/// instead of failing the mutation — which would reject a valid block and drop
+/// the sync peer.
+///
+/// ## Why backpressure is gated, not applied at the literal append
+///
+/// Blocking inside [`RedoLog::append`] when full would deadlock. The hottest
+/// appenders (the create / spend dispatch paths) hold the engine's *exclusive*
+/// mutation visibility barrier across the append, and the checkpoint drain
+/// needs that **same** exclusive barrier to reclaim space. A writer blocked at
+/// the append while holding the barrier waits forever for a drain that can
+/// never start. So appenders gate on [`RedoBackpressure::wait_for_capacity`]
+/// **before** acquiring the barrier: a full log stalls the writer (holding no
+/// barrier) until the drain frees space, then it proceeds.
+///
+/// ## Multi-store
+///
+/// Under per-store redo there are N logs sharing one global sequence. A single
+/// coordinator covers all of them: [`Self::available_space`] is the **minimum**
+/// free across every store, so the gate only admits a mutation when *every*
+/// store has headroom (a create batch shards across stores by txid, and the
+/// gate runs before the payload is decoded, so it cannot know which store the
+/// records will land in). The engine builds one shared coordinator over all
+/// stores and injects it into each log via [`RedoLog::set_backpressure`]; each
+/// log's reclaim paths call [`Self::note_reclaim`] to wake the waiters.
+///
+/// ## Armed
+///
+/// The gate is a no-op until [`Self::arm`] is called — done by the checkpoint
+/// task at startup. Without a running drain there is nothing to reclaim a full
+/// log, so blocking would hang; an unarmed coordinator lets a full-log append
+/// fall through to the historical `LogFull` → rollback → error path.
+pub struct RedoBackpressure {
+    /// Lock-free space mirrors of the stores this coordinator covers. The free
+    /// signal is the MINIMUM available across them.
+    atomics: Vec<Arc<RedoAtomics>>,
+    /// Mutex paired with both condvars below — held by waiters across the
+    /// predicate re-check so a `notify_all` can never land in the gap between
+    /// check and park (lost-wakeup-free). Guards no data: the authoritative
+    /// free-space read is the lock-free [`RedoAtomics`] and the starvation
+    /// signal is the `blocked` atomic, so there are no generation counters to
+    /// protect.
+    state: PlMutex<()>,
+    /// Notified after a reclaim frees space — wakes gated appenders.
+    space_freed: Condvar,
+    /// Notified when an appender starts waiting on a full log — wakes the
+    /// checkpoint thread to drain immediately instead of waiting out its poll.
+    drain_wanted: Condvar,
+    /// Number of appenders currently blocked waiting for capacity. The
+    /// checkpoint loop forces a *blocking* drain whenever this is non-zero; it
+    /// is the lost-wakeup-free correctness signal (the condvar trims latency).
+    blocked: AtomicUsize,
+    /// Whether a drain task is running. The gate blocks only when armed.
+    armed: AtomicBool,
+}
+
+impl std::fmt::Debug for RedoBackpressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedoBackpressure")
+            .field("stores", &self.atomics.len())
+            .field("available_space", &self.available_space())
+            .field("armed", &self.armed.load(AtomicOrdering::Relaxed))
+            .field("blocked", &self.blocked.load(AtomicOrdering::Relaxed))
+            .finish()
+    }
+}
+
+impl RedoBackpressure {
+    pub(crate) fn new(atomics: Vec<Arc<RedoAtomics>>) -> Arc<Self> {
+        Arc::new(Self {
+            atomics,
+            state: PlMutex::new(()),
+            space_freed: Condvar::new(),
+            drain_wanted: Condvar::new(),
+            blocked: AtomicUsize::new(0),
+            armed: AtomicBool::new(false),
+        })
+    }
+
+    /// Arm the gate (called by the checkpoint task at startup). Idempotent.
+    pub fn arm(&self) {
+        self.armed.store(true, AtomicOrdering::Relaxed);
+    }
+
+    /// Whether the gate is armed (a drain task is running).
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Minimum free bytes across every covered store (lock-free). The gate
+    /// admits a mutation only when this is at or above its reserve, so whatever
+    /// store the mutation's records shard onto has headroom.
+    pub fn available_space(&self) -> u64 {
+        self.atomics
+            .iter()
+            .map(|a| a.available_space())
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Minimum entries-region capacity across covered stores (lock-free). Used
+    /// to size the reserve.
+    pub fn capacity(&self) -> u64 {
+        self.atomics.iter().map(|a| a.capacity()).min().unwrap_or(0)
+    }
+
+    /// Number of appenders currently blocked waiting for capacity.
+    pub fn blocked_appenders(&self) -> usize {
+        self.blocked.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Wake gated appenders after a reclaim has freed space. Called by every
+    /// store's reclaim paths ([`RedoLog::reset`] /
+    /// [`RedoLog::compact_prefix_through`]).
+    pub fn note_reclaim(&self) {
+        // Take+drop the paired mutex so a waiter mid-predicate-recheck cannot
+        // miss this wake (it re-checks `available_space` under this same lock
+        // before parking). The freed space is already published to the atomics
+        // by the caller's `publish_atomics` before this runs.
+        drop(self.state.lock());
+        self.space_freed.notify_all();
+    }
+
+    /// Ask the checkpoint thread to drain now, without waiting for its poll.
+    fn request_drain(&self) {
+        drop(self.state.lock());
+        self.drain_wanted.notify_all();
+    }
+
+    /// Block until every covered store has at least `reserve` free bytes, or
+    /// `max_wait` elapses. Holds NO engine barrier — safe to call before
+    /// acquiring the exclusive mutation barrier.
+    ///
+    /// Returns `true` once the reserve is available (or the gate is not armed —
+    /// no drain to wait for), `false` if `max_wait` elapsed without it (a
+    /// safety valve so a genuinely stuck drain — snapshot device error, or
+    /// replicas pinning the log — degrades to the caller's own full-log
+    /// handling rather than hanging forever; in normal operation a drain frees
+    /// space in milliseconds and this returns `true`).
+    pub fn wait_for_capacity(&self, reserve: u64, max_wait: Duration) -> bool {
+        // Disarmed (no drain running) or already has headroom: never block, and
+        // never take the lock.
+        if !self.is_armed() || self.available_space() >= reserve {
+            return true;
+        }
+
+        const SLICE: Duration = Duration::from_millis(50);
+        // Absolute wall-clock deadline so the safety valve fires at ~max_wait
+        // regardless of how many non-timeout (reclaim) wakes interleave — a
+        // `waited`-accumulator that only advances on timed-out slices could run
+        // 1.5-2x over under reclaim churn.
+        let deadline = Instant::now() + max_wait;
+        self.blocked.fetch_add(1, AtomicOrdering::SeqCst);
+        // Kick the drainer immediately — an appender is now starved.
+        self.request_drain();
+
+        let mut guard = self.state.lock();
+        let result = loop {
+            if self.available_space() >= reserve {
+                break true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break false;
+            }
+            // Re-assert the drain request each slice (the previous one may have
+            // raced a checkpoint that finished a non-draining fuzzy pass).
+            self.drain_wanted.notify_all();
+            let slice = SLICE.min(deadline - now);
+            // A non-timeout wake means a reclaim landed; loop re-checks the
+            // predicate under this lock (lost-wakeup-free).
+            self.space_freed.wait_for(&mut guard, slice);
+        };
+        drop(guard);
+        self.blocked.fetch_sub(1, AtomicOrdering::SeqCst);
+        result
+    }
+
+    /// Park the checkpoint drainer until either a drain is requested by a
+    /// starved appender, an appender is already blocked, `total` elapses, or
+    /// `shutdown` is observed. Returns `false` only when `shutdown` is set
+    /// (the caller should exit its loop).
+    ///
+    /// Waits in `slice`-sized chunks so shutdown is observed promptly even when
+    /// `total` is a long exponential back-off.
+    pub fn park_drainer(&self, total: Duration, slice: Duration, shutdown: &AtomicBool) -> bool {
+        let slice = if slice.is_zero() { total } else { slice };
+        let mut remaining = total;
+        let mut guard = self.state.lock();
+        loop {
+            if shutdown.load(AtomicOrdering::Relaxed) {
+                return false;
+            }
+            // A blocked appender is the correctness signal: drain right now.
+            if self.blocked.load(AtomicOrdering::Relaxed) > 0 {
+                return true;
+            }
+            if remaining.is_zero() {
+                return !shutdown.load(AtomicOrdering::Relaxed);
+            }
+            let step = slice.min(remaining);
+            let outcome = self.drain_wanted.wait_for(&mut guard, step);
+            if !outcome.timed_out() {
+                // Drain explicitly requested.
+                return !shutdown.load(AtomicOrdering::Relaxed);
+            }
+            remaining = remaining.saturating_sub(step);
+        }
     }
 }
 
@@ -1984,6 +2289,12 @@ pub struct RedoLog {
     /// restart (the shared counter is restored as the max over all logs'
     /// headers at boot — see [`RedoLog::shared_sequence_floor`]).
     shared_seq: Option<Arc<AtomicU64>>,
+    /// Shared backpressure coordinator. Appenders gate on this before a write
+    /// burst can overflow the log; the reclaim paths signal it after freeing
+    /// space. Defaults to a single-store coordinator over this log's own
+    /// atomics; the engine replaces it with one shared across all per-store
+    /// logs via [`RedoLog::set_backpressure`]. See [`RedoBackpressure`].
+    backpressure: Arc<RedoBackpressure>,
 }
 
 impl RedoLog {
@@ -2058,11 +2369,16 @@ impl RedoLog {
             poisoned: false,
             atomics: Arc::new(RedoAtomics {
                 write_pos: AtomicU64::new(0),
-                logical_start: AtomicU64::new(0),
                 entries_region_size: log_size - header_block_size,
             }),
             shared_seq: None,
+            // Default single-store coordinator; the engine swaps in a shared
+            // multi-store one at boot via `set_backpressure`.
+            backpressure: RedoBackpressure::new(Vec::new()),
         };
+        // Build the default coordinator over this log's own atomics now that
+        // `atomics` exists.
+        log.backpressure = RedoBackpressure::new(vec![Arc::clone(&log.atomics)]);
 
         // Try to read the on-disk header. If the magic is absent
         // (region is freshly zeroed), initialise a fresh header below.
@@ -2109,13 +2425,10 @@ impl RedoLog {
             log.write_header()?;
         }
 
-        // Sync recovered write_pos/logical_start into the lock-free atomics.
+        // Sync the recovered forward write position into the lock-free mirror.
         log.atomics
             .write_pos
             .store(log.write_pos, AtomicOrdering::Relaxed);
-        log.atomics
-            .logical_start
-            .store(log.logical_start, AtomicOrdering::Relaxed);
         Ok(log)
     }
 
@@ -2278,6 +2591,30 @@ impl RedoLog {
             self.buffered_entries += 1;
         }
         Ok(seq)
+    }
+
+    /// Whether appending ALL of `ops` would fit in the current forward
+    /// headroom (no mutation, no sequence drawn).
+    ///
+    /// The per-store routed write ([`crate::ops::engine::Engine::append_redo_ops_routed`])
+    /// calls this BEFORE appending a batch so an oversized batch is rejected
+    /// CLEANLY — return `LogFull`, append nothing — instead of appending a
+    /// partial batch and then hitting the per-op `LogFull` mid-way, which
+    /// forces `poison()` (bricking the store's log until restart) because the
+    /// already-buffered ops carry consumed global sequences that must never
+    /// flush. Footprint is measured by arithmetic (`RedoOp::serialized_data_len`,
+    /// a `pub(crate)` helper), not by serializing — so a hot create batch with
+    /// fat `record_bytes` is not cloned/serialized/CRC'd here just to read its
+    /// length (N2).
+    pub fn would_fit(&self, ops: &[&RedoOp]) -> bool {
+        if self.poisoned {
+            return false;
+        }
+        let mut needed = self.write_pos + self.buffer.len() as u64;
+        for op in ops {
+            needed += (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64;
+        }
+        needed <= self.entries_region_size()
     }
 
     /// Flush the buffer to device, making all appended entries durable.
@@ -2571,6 +2908,13 @@ impl RedoLog {
         self.write_pos + self.buffer.len() as u64
     }
 
+    /// Test-only: the live-window start offset, for asserting a compaction took
+    /// the past-tail relocation branch (`logical_start > 0`).
+    #[cfg(test)]
+    pub(crate) fn logical_start_for_test(&self) -> u64 {
+        self.logical_start
+    }
+
     /// Space remaining in the entries region.
     pub fn available_space(&self) -> u64 {
         self.entries_region_size()
@@ -2603,14 +2947,27 @@ impl RedoLog {
         self.atomics
             .write_pos
             .store(self.write_pos, AtomicOrdering::Relaxed);
-        self.atomics
-            .logical_start
-            .store(self.logical_start, AtomicOrdering::Relaxed);
     }
 
     /// A cheap clonable handle to the lock-free space accounting.
     pub fn atomics(&self) -> Arc<RedoAtomics> {
         Arc::clone(&self.atomics)
+    }
+
+    /// A cheap clonable handle to the backpressure coordinator this log
+    /// signals on reclaim. Defaults to a single-store coordinator over this
+    /// log; the engine swaps in a shared multi-store one via
+    /// [`Self::set_backpressure`].
+    pub fn backpressure(&self) -> Arc<RedoBackpressure> {
+        Arc::clone(&self.backpressure)
+    }
+
+    /// Replace the backpressure coordinator with a shared one (the engine
+    /// installs a single coordinator across all per-store logs at boot). After
+    /// this, [`Self::reset`] / [`Self::compact_prefix_through`] wake appenders
+    /// gated on the shared coordinator.
+    pub fn set_backpressure(&mut self, backpressure: Arc<RedoBackpressure>) {
+        self.backpressure = backpressure;
     }
 
     /// Reset the log (after checkpoint + reclaim). Dangerous — only call
@@ -2654,7 +3011,10 @@ impl RedoLog {
         // F-G4-001: persist the new write_pos / next_sequence in the
         // header — the entries region is empty but `next_sequence` must
         // not roll back across restarts.
-        self.write_header()
+        self.write_header()?;
+        // Wake any appender gated on free space — the region is now empty.
+        self.backpressure.note_reclaim();
+        Ok(())
     }
 
     /// Reclaim entries whose effects are covered by a durable snapshot.
@@ -2792,6 +3152,8 @@ impl RedoLog {
         self.pending_entries.clear();
         self.buffered_entries = 0;
         self.write_header()?;
+        // Reclaiming the pre-fence prefix freed space; wake gated appenders.
+        self.backpressure.note_reclaim();
         Ok(())
     }
 
@@ -3074,6 +3436,512 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0] = n;
         TxKey { txid }
+    }
+
+    /// N2: `serialized_data_len` (arithmetic, used by `would_fit`) must match
+    /// the real `serialize_data` length for EVERY variant — a drift would let
+    /// `would_fit` under-count and re-admit a batch that overflows mid-append.
+    /// The `debug_assert` in `RedoEntry::serialize` also fires per-op here.
+    #[test]
+    fn serialized_len_matches_serialize_for_all_variants() {
+        let k = test_key(7);
+        let h = [0xABu8; 32];
+        let sd = [0xCDu8; 36];
+        let ops = vec![
+            RedoOp::Spend {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+            },
+            RedoOp::SpendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: None,
+            },
+            RedoOp::SpendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: Some(h),
+            },
+            RedoOp::Unspend {
+                tx_key: k,
+                offset: 1,
+                spending_data: None,
+                new_spent_count: 2,
+            },
+            RedoOp::Unspend {
+                tx_key: k,
+                offset: 1,
+                spending_data: Some(sd),
+                new_spent_count: 2,
+            },
+            RedoOp::UnspendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: None,
+            },
+            RedoOp::UnspendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: Some(h),
+            },
+            RedoOp::SetMined {
+                tx_key: k,
+                block_id: 1,
+                block_height: 2,
+                subtree_idx: 3,
+                unset: true,
+            },
+            RedoOp::Freeze {
+                tx_key: k,
+                offset: 1,
+            },
+            RedoOp::Unfreeze {
+                tx_key: k,
+                offset: 1,
+            },
+            RedoOp::PruneSlot {
+                tx_key: k,
+                offset: 1,
+            },
+            RedoOp::PruneSlotIfSpentBy {
+                tx_key: k,
+                offset: 1,
+                child_txid: h,
+            },
+            RedoOp::FreezeV2 {
+                tx_key: k,
+                offset: 1,
+                utxo_hash: h,
+            },
+            RedoOp::UnfreezeV2 {
+                tx_key: k,
+                offset: 1,
+                utxo_hash: h,
+            },
+            RedoOp::Reassign {
+                tx_key: k,
+                offset: 1,
+                new_hash: h,
+                block_height: 2,
+                spendable_after: 3,
+            },
+            RedoOp::ReassignV2 {
+                tx_key: k,
+                offset: 1,
+                new_hash: h,
+                block_height: 2,
+                spendable_after: 3,
+                prior_utxo_hash: h,
+            },
+            RedoOp::ReplicaCreate {
+                tx_key: k,
+                device_id: 1,
+                record_offset: 4096,
+                utxo_count: 2,
+            },
+            RedoOp::Create {
+                tx_key: k,
+                device_id: 1,
+                record_offset: 4096,
+                utxo_count: 2,
+                is_conflicting: false,
+                record_bytes: vec![0u8; 0],
+                parent_txids: vec![],
+            },
+            RedoOp::Create {
+                tx_key: k,
+                device_id: 1,
+                record_offset: 4096,
+                utxo_count: 2,
+                is_conflicting: true,
+                record_bytes: vec![1u8; 300],
+                parent_txids: vec![h, h, h],
+            },
+            RedoOp::Delete {
+                tx_key: k,
+                record_offset: 4096,
+                record_size: 256,
+            },
+            RedoOp::SetConflicting {
+                tx_key: k,
+                value: true,
+                current_block_height: 1,
+                block_height_retention: 2,
+            },
+            RedoOp::AppendConflictingChild {
+                parent_key: k,
+                child_txid: h,
+            },
+            RedoOp::RemoveConflictingChild {
+                parent_key: k,
+                child_txid: h,
+            },
+            RedoOp::AppendDeletedChild {
+                parent_key: k,
+                child_txid: h,
+            },
+            RedoOp::SetLocked {
+                tx_key: k,
+                value: true,
+            },
+            RedoOp::PreserveUntil {
+                tx_key: k,
+                block_height: 1,
+            },
+            RedoOp::MarkOnLongestChain {
+                tx_key: k,
+                on_longest_chain: true,
+                current_block_height: 1,
+                block_height_retention: 2,
+                generation: 3,
+            },
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key: k,
+                old_height: 1,
+                new_height: 2,
+            },
+            RedoOp::SecondaryDahUpdate {
+                tx_key: k,
+                old_height: 1,
+                new_height: 2,
+            },
+            RedoOp::AllocateRegion {
+                offset: 4096,
+                size: 4096,
+                device_id: 0,
+            },
+            RedoOp::FreeRegion {
+                offset: 4096,
+                size: 4096,
+                device_id: 0,
+            },
+            RedoOp::HashtableResizeBegin {
+                tmp_path_bytes: b"/tmp/x.idx".to_vec(),
+                new_capacity: 1024,
+            },
+            RedoOp::HashtableResizeCommit { new_capacity: 1024 },
+            RedoOp::CompensateUnsetMined {
+                tx_key: k,
+                block_id: 1,
+                block_height: 2,
+                subtree_idx: 3,
+            },
+            RedoOp::CompensateReassign {
+                tx_key: k,
+                offset: 1,
+                prior_utxo_hash: h,
+            },
+            RedoOp::CompensatePrune {
+                tx_key: k,
+                offset: 1,
+                prior_status: 2,
+            },
+            RedoOp::CompensateSetLocked {
+                tx_key: k,
+                prior_locked: true,
+                prior_delete_at_height: 5,
+            },
+            RedoOp::RecoveryProgress {
+                through_sequence: 9,
+            },
+            RedoOp::Checkpoint,
+        ];
+        for op in ops {
+            let entry = RedoEntry {
+                sequence: 0,
+                op: op.clone(),
+            };
+            let actual = entry.serialize().len();
+            let predicted = ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len();
+            assert_eq!(
+                actual,
+                predicted,
+                "serialized_data_len mismatch for {:?}: serialize()={actual} predicted={predicted}",
+                op.op_type()
+            );
+        }
+    }
+
+    /// A redo entry roughly `payload` bytes long, for filling the log fast.
+    fn fat_create(seq_seed: u8, payload: usize) -> RedoOp {
+        RedoOp::Create {
+            tx_key: test_key(seq_seed),
+            device_id: 0,
+            record_offset: 4096,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: vec![0xCD; payload],
+            parent_txids: Vec::new(),
+        }
+    }
+
+    /// Burst soak: a single producer appends MORE than the redo's capacity
+    /// worth of entries while a background drainer reclaims space. The drainer
+    /// reclaims ONLY when it observes a blocked appender — so this exercises
+    /// the real backpressure handshake (gate → request drain → reclaim →
+    /// wake), and asserts the burst NEVER produces a `LogFull` and always
+    /// completes. Mimics a 165K+ tx block whose createUtxos burst exceeds the
+    /// redo capacity: with backpressure the appends stall and proceed instead
+    /// of failing a valid block.
+    #[test]
+    fn backpressure_burst_exceeding_capacity_never_logfull() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(260 * 1024, 4096).unwrap());
+        let log = RedoLog::open(dev, 0, 260 * 1024).unwrap();
+        let capacity = log.capacity();
+        let bp = log.backpressure();
+        bp.arm(); // a drain is present (the drainer thread below)
+        let redo = Arc::new(parking_lot::Mutex::new(log));
+
+        let reserve = capacity / 4;
+        let payload = 2048usize;
+        let total_appends = (capacity / payload as u64 * 5) as usize;
+
+        let done = Arc::new(AtomicBool::new(false));
+        let logfull = Arc::new(AtomicU64::new(0));
+        let blocked_seen = Arc::new(AtomicBool::new(false));
+        let reclaims = Arc::new(AtomicU64::new(0));
+
+        // Drainer: reclaim ONLY when an appender is blocked. Without the gate
+        // engaging (raising `blocked_appenders`), this never fires and the log
+        // overflows — the RED behaviour the gate fixes.
+        let drainer = {
+            let redo = redo.clone();
+            let bp = bp.clone();
+            let done = done.clone();
+            let blocked_seen = blocked_seen.clone();
+            let reclaims = reclaims.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    if bp.blocked_appenders() > 0 {
+                        blocked_seen.store(true, Ordering::Relaxed);
+                        redo.lock().reset().expect("reset reclaims space");
+                        reclaims.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            })
+        };
+
+        for i in 0..total_appends {
+            let ok = bp.wait_for_capacity(reserve, Duration::from_secs(10));
+            assert!(
+                ok,
+                "gate must obtain capacity within the bound (drain alive)"
+            );
+            let mut log = redo.lock();
+            match log.append_and_flush(fat_create((i % 251) as u8 + 1, payload)) {
+                Ok(_) => {}
+                Err(RedoError::LogFull { .. }) => {
+                    logfull.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => panic!("unexpected redo error during burst: {e}"),
+            }
+        }
+
+        done.store(true, Ordering::Relaxed);
+        drainer.join().unwrap();
+
+        assert_eq!(
+            logfull.load(Ordering::Relaxed),
+            0,
+            "backpressure must convert a capacity-exceeding burst into stalls, not LogFull",
+        );
+        assert!(
+            blocked_seen.load(Ordering::Relaxed),
+            "the producer must actually have blocked on the gate (burst exceeded capacity)",
+        );
+        assert!(
+            reclaims.load(Ordering::Relaxed) > 0,
+            "the drainer must have reclaimed space at least once",
+        );
+    }
+
+    /// The gate releases promptly when a reclaim frees space: a writer blocked
+    /// with the log full proceeds as soon as `note_reclaim` fires.
+    #[test]
+    fn backpressure_gate_unblocks_on_reclaim() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(dev, 0, 132 * 1024).unwrap();
+        let capacity = log.capacity();
+        let bp = log.backpressure();
+        bp.arm();
+
+        let reserve = capacity / 2;
+        while log.available_space() >= reserve {
+            log.append_and_flush(fat_create(7, 2048)).unwrap();
+        }
+        let redo = Arc::new(parking_lot::Mutex::new(log));
+
+        let proceeded = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let bp = bp.clone();
+            let proceeded = proceeded.clone();
+            std::thread::spawn(move || {
+                let ok = bp.wait_for_capacity(reserve, Duration::from_secs(10));
+                proceeded.store(ok, Ordering::Relaxed);
+            })
+        };
+
+        // Spin (not a fixed sleep) until the waiter registers as blocked —
+        // deterministic under load, no thread-startup race.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while bp.blocked_appenders() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiter never blocked on the full log"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            bp.blocked_appenders(),
+            1,
+            "waiter must be blocked on a full log"
+        );
+        assert!(
+            !proceeded.load(Ordering::Relaxed),
+            "waiter must not have proceeded yet"
+        );
+
+        redo.lock().reset().unwrap();
+        waiter.join().unwrap();
+        assert!(
+            proceeded.load(Ordering::Relaxed),
+            "the gate must release once the reclaim frees space",
+        );
+        assert_eq!(
+            bp.blocked_appenders(),
+            0,
+            "no appender should remain blocked"
+        );
+    }
+
+    /// An UNARMED coordinator never blocks: without a drain running, the gate
+    /// is a pure no-op so a full-log append falls through to its own
+    /// `LogFull` handling instead of hanging forever.
+    #[test]
+    fn backpressure_gate_noop_when_unarmed() {
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let log = RedoLog::open(dev, 0, 132 * 1024).unwrap();
+        let capacity = log.capacity();
+        let bp = log.backpressure();
+        // Not armed. Even demanding more than the whole log returns immediately.
+        let start = std::time::Instant::now();
+        assert!(bp.wait_for_capacity(capacity * 2, Duration::from_secs(10)));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "unarmed gate must not block"
+        );
+        assert_eq!(bp.blocked_appenders(), 0);
+    }
+
+    /// S-P0 regression: the gate's free-space metric must be PHYSICAL forward
+    /// room (`capacity - write_pos`), matching the forward `LogFull` predicate
+    /// the append actually enforces — NOT logical free (`capacity - live`).
+    /// After a past-tail `compact_prefix_through`, `logical_start` jumps to the
+    /// old tail while `write_pos` stays near the physical end: a logical metric
+    /// reports the log nearly empty and the gate over-admits into `LogFull`,
+    /// which is the exact burst failure this branch exists to prevent.
+    #[test]
+    fn backpressure_available_space_is_physical_forward_room() {
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let mut log = RedoLog::open(dev, 0, 132 * 1024).unwrap();
+        let capacity = log.capacity();
+
+        // Fill past 60% so a past-tail relocation still fits beyond the tail.
+        while log.available_space() > capacity * 2 / 5 {
+            log.append_and_flush(fat_create(3, 2048)).unwrap();
+        }
+        // Retain only the final entry, forcing a past-tail relocation (not an
+        // empty-set reset): `logical_start` advances to the old tail.
+        let fence = log.current_sequence().saturating_sub(2);
+        log.compact_prefix_through(fence).unwrap();
+
+        let forward = capacity.saturating_sub(log.write_position());
+        assert!(
+            log.logical_start_for_test() > 0,
+            "test must exercise a past-tail relocation (logical_start advanced)"
+        );
+        let bp = log.backpressure();
+        assert_eq!(
+            bp.available_space(),
+            forward,
+            "coordinator must report PHYSICAL forward room (capacity - write_pos), \
+             not logical free space",
+        );
+        assert!(
+            bp.available_space() < capacity / 2,
+            "after near-full fill + compaction the gate must see the log is \
+             nearly physically full (forward room small), not nearly empty",
+        );
+    }
+
+    /// U-P2-2 regression: the `max_wait` timeout-degrade contract. An armed
+    /// gate with a never-satisfied reserve must return `false` after ~`max_wait`
+    /// (degrade to the caller's `LogFull` fallback) and leave `blocked` back at
+    /// 0 — the safety valve the PR relies on, previously only executed (by the
+    /// `park_drainer` test) but never asserted.
+    #[test]
+    fn backpressure_gate_times_out_and_degrades() {
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let log = RedoLog::open(dev, 0, 132 * 1024).unwrap();
+        let capacity = log.capacity();
+        let bp = log.backpressure();
+        bp.arm();
+
+        // Demand more than the whole log; no reclaim ever arrives.
+        let max_wait = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let ok = bp.wait_for_capacity(capacity + 1, max_wait);
+        let elapsed = start.elapsed();
+
+        assert!(
+            !ok,
+            "must return false on timeout (degrade to LogFull fallback)"
+        );
+        assert!(
+            elapsed >= max_wait,
+            "must actually wait out max_wait, not early-return: {elapsed:?}"
+        );
+        assert!(
+            elapsed < max_wait * 4,
+            "must fire near max_wait, not run far over: {elapsed:?}"
+        );
+        assert_eq!(
+            bp.blocked_appenders(),
+            0,
+            "blocked must be decremented back to 0 on the timeout path"
+        );
     }
 
     // -- Basic tests --

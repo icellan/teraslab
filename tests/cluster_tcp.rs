@@ -1003,24 +1003,41 @@ fn client_redirect_resends_to_new_node() {
     );
     assert_eq!(resp.status, STATUS_PARTIAL_ERROR, "should get redirect");
 
-    // Re-send the same create to node 2 → should succeed
-    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
-    stream2
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-
-    let resp = send_request(
-        &mut stream2,
-        &RequestFrame {
-            request_id: 2,
-            op_code: OP_CREATE_BATCH,
-            flags: 0,
-            payload: payload.into(),
-        },
-    );
+    // Re-send the same create to node 2 → should succeed. `wait_for_shard_split`
+    // observed node 1's view; node 2 may still be installing the committed shard
+    // table, in which case it also briefly redirects. Retry (reconnecting each
+    // attempt) until node 2 owns the shard and accepts the create. Exactly one
+    // create lands — every prior attempt redirected without creating, so there
+    // is no ALREADY_EXISTS. This tolerates the convergence window instead of
+    // racing a single shot (the prior single-shot assert flaked on slow CI).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut resp = None;
+    let mut request_id = 2u64;
+    while std::time::Instant::now() < deadline {
+        let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
+        stream2
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let r = send_request(
+            &mut stream2,
+            &RequestFrame {
+                request_id,
+                op_code: OP_CREATE_BATCH,
+                flags: 0,
+                payload: payload.clone().into(),
+            },
+        );
+        if r.status == STATUS_OK {
+            resp = Some(r);
+            break;
+        }
+        request_id += 1;
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert_eq!(
-        resp.status, STATUS_OK,
-        "create on the correct node should succeed"
+        resp.map(|r| r.status),
+        Some(STATUS_OK),
+        "create on the correct node should succeed once its shard table converges"
     );
 
     shutdown_node(&node1);
