@@ -180,6 +180,128 @@ pub(crate) struct Store {
     packed: bool,
 }
 
+/// One derived redb tombstone-index row: `(key, deletion_height, generation,
+/// shard, cause)` — exactly the argument tuple of
+/// [`crate::index::redb_tombstone::RedbTombstoneIndex::insert_many`].
+type TombstoneRow = (TxKey, u32, u32, u16, u8);
+
+/// Shared state between the delete producers and the single background indexer
+/// thread. A `Mutex<VecDeque> + Condvar` queue (the same shape as the dispatch
+/// pool) rather than an mpsc channel, so any number of dispatch worker threads
+/// can enqueue through `&self` without a per-thread sender.
+struct TombstoneIndexerInner {
+    queue: parking_lot::Mutex<TombstoneIndexerQueue>,
+    /// Signalled when rows are enqueued or shutdown is requested (worker waits).
+    work_ready: parking_lot::Condvar,
+    /// Signalled when the worker finishes a drain (flushers wait).
+    drained: parking_lot::Condvar,
+    /// The derived index the worker writes into (shared with read consumers).
+    index: Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
+}
+
+struct TombstoneIndexerQueue {
+    rows: std::collections::VecDeque<TombstoneRow>,
+    /// The worker is currently inside `insert_many` (rows drained but not yet
+    /// committed). Flush must wait for this too.
+    processing: bool,
+    shutdown: bool,
+}
+
+/// Background populator for the derived redb tombstone index. Owns the worker
+/// thread; enqueue is lock-cheap and the redb B-tree work happens off the delete
+/// hot path. See [`Engine::tombstone_indexer`].
+struct TombstoneIndexer {
+    inner: Arc<TombstoneIndexerInner>,
+    handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl TombstoneIndexer {
+    fn start(
+        index: Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
+    ) -> Self {
+        let inner = Arc::new(TombstoneIndexerInner {
+            queue: parking_lot::Mutex::new(TombstoneIndexerQueue {
+                rows: std::collections::VecDeque::new(),
+                processing: false,
+                shutdown: false,
+            }),
+            work_ready: parking_lot::Condvar::new(),
+            drained: parking_lot::Condvar::new(),
+            index,
+        });
+        let worker_inner = Arc::clone(&inner);
+        let handle = std::thread::Builder::new()
+            .name("tombstone-indexer".into())
+            .spawn(move || Self::run(&worker_inner))
+            .expect("spawn tombstone-indexer thread");
+        Self {
+            inner,
+            handle: parking_lot::Mutex::new(Some(handle)),
+        }
+    }
+
+    /// Worker loop: drain ALL pending rows into one `insert_many` per wakeup
+    /// (coalescing bursts), commit, then signal flushers. Exits when `shutdown`
+    /// is set and the queue is empty.
+    fn run(inner: &TombstoneIndexerInner) {
+        loop {
+            let batch: Vec<TombstoneRow> = {
+                let mut q = inner.queue.lock();
+                while q.rows.is_empty() && !q.shutdown {
+                    inner.work_ready.wait(&mut q);
+                }
+                if q.rows.is_empty() && q.shutdown {
+                    return;
+                }
+                q.processing = true;
+                q.rows.drain(..).collect()
+            };
+            // Commit off the hot path. A failure is non-fatal: the durable
+            // tombstone log carries every row and recovery re-derives the index.
+            if let Err(e) = inner.index.lock().insert_many(&batch) {
+                tracing::warn!(
+                    err = %e,
+                    rows = batch.len(),
+                    "background tombstone-index insert failed; log carries the \
+                     tombstones and recovery will re-derive the index rows",
+                );
+            }
+            let mut q = inner.queue.lock();
+            q.processing = false;
+            inner.drained.notify_all();
+        }
+    }
+
+    fn enqueue(&self, rows: &[TombstoneRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut q = self.inner.queue.lock();
+        q.rows.extend(rows.iter().copied());
+        self.inner.work_ready.notify_one();
+    }
+
+    /// Block until every row enqueued before this call has been committed.
+    fn flush(&self) {
+        let mut q = self.inner.queue.lock();
+        while !q.rows.is_empty() || q.processing {
+            self.inner.drained.wait(&mut q);
+        }
+    }
+
+    /// Drain remaining rows, stop the worker, and join it.
+    fn shutdown(&self) {
+        {
+            let mut q = self.inner.queue.lock();
+            q.shutdown = true;
+            self.inner.work_ready.notify_one();
+        }
+        if let Some(h) = self.handle.lock().take() {
+            let _ = h.join();
+        }
+    }
+}
+
 pub struct Engine {
     /// Every store backing this engine, indexed by `device_id` (store 0 first).
     /// Each holds its own device + raw device pointer + allocator. Route by
@@ -283,6 +405,18 @@ pub struct Engine {
     tombstone_index: std::sync::OnceLock<
         Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
     >,
+    /// Optional background writer that populates [`Self::tombstone_index`] OFF
+    /// the delete hot path. When started ([`Self::start_tombstone_indexer`],
+    /// done by the server at boot), [`Self::record_tombstone_index_batch`]
+    /// enqueues the derived rows and returns immediately instead of doing the
+    /// redb B-tree inserts inline (the dominant per-delete cost). The redb index
+    /// is a DERIVED structure rebuilt from the durable tombstone log on recovery
+    /// (see `recovery::recover_tombstones`), so a bounded population lag loses no
+    /// durability. Consumers that need a current index
+    /// ([`Self::flush_tombstone_index`]) flush first; the only correctness-
+    /// sensitive one is migration reconcile, which already fences deletes.
+    /// `None` (the default, e.g. in tests) keeps the inline synchronous insert.
+    tombstone_indexer: std::sync::OnceLock<TombstoneIndexer>,
     /// Master switch for the deletion-tombstone feature (design §11.5).
     ///
     /// Defaults to `true`. When `false`, the delete path writes NO tombstone
@@ -561,6 +695,7 @@ impl Engine {
             redo_buffered: std::sync::atomic::AtomicBool::new(false),
             tombstone_log: std::sync::OnceLock::new(),
             tombstone_index: std::sync::OnceLock::new(),
+            tombstone_indexer: std::sync::OnceLock::new(),
             // Default ON (design §11.5). A delete still writes no tombstone
             // until a log + index are attached, so this is inert until the
             // server wires the storage in.
@@ -6966,20 +7101,34 @@ impl Engine {
     /// is logged but NOT fatal — the durable tombstone log already carries every
     /// tombstone, so recovery `rebuild_from` reconstructs any missing index row
     /// (same contract as the per-item insert it replaces).
+    ///
+    /// When a background indexer is running ([`Self::start_tombstone_indexer`])
+    /// the rows are ENQUEUED and this returns immediately, moving the redb
+    /// B-tree work off the delete hot path; otherwise (tests / unstarted) it
+    /// inserts inline in one transaction. Consumers needing a current index call
+    /// [`Self::flush_tombstone_index`] first.
     pub fn record_tombstone_index_batch(&self, rows: &[(TxKey, u32, u32, u8)]) {
         if rows.is_empty() {
             return;
         }
-        let Some(idx) = self.tombstone_index.get() else {
-            return;
-        };
-        let redb_rows: Vec<(TxKey, u32, u32, u16, u8)> = rows
+        let redb_rows: Vec<TombstoneRow> = rows
             .iter()
             .map(|&(key, deletion_height, generation, cause)| {
                 let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
                 (key, deletion_height, generation, shard, cause)
             })
             .collect();
+
+        // Off-hot-path: hand the rows to the background indexer thread.
+        if let Some(indexer) = self.tombstone_indexer.get() {
+            indexer.enqueue(&redb_rows);
+            return;
+        }
+
+        // Inline fallback (no background indexer started): one transaction.
+        let Some(idx) = self.tombstone_index.get() else {
+            return;
+        };
         if let Err(e) = idx.lock().insert_many(&redb_rows) {
             tracing::warn!(
                 err = %e,
@@ -6987,6 +7136,48 @@ impl Engine {
                 "batched delete: tombstone redb-index insert failed; log carries the \
                  tombstones and recovery will re-derive the index rows",
             );
+        }
+    }
+
+    /// Start the background tombstone-index writer (idempotent; no-op if a
+    /// tombstone index is not attached or the writer is already running).
+    ///
+    /// The server calls this once at boot, AFTER `set_tombstone_index` and after
+    /// recovery has rebuilt the index from the log, so that runtime deletes
+    /// populate the index off the hot path. Tests that want the synchronous
+    /// inline path simply never call it.
+    pub fn start_tombstone_indexer(&self) {
+        // Already running — do NOT spawn another worker (the spawn happens
+        // before `OnceLock::set`, so an unconditional set would leak the new
+        // thread when the slot is already filled).
+        if self.tombstone_indexer.get().is_some() {
+            return;
+        }
+        let Some(idx) = self.tombstone_index.get() else {
+            return;
+        };
+        let _ = self
+            .tombstone_indexer
+            .set(TombstoneIndexer::start(Arc::clone(idx)));
+    }
+
+    /// Block until every tombstone-index row enqueued so far has been committed
+    /// to redb. A no-op when no background indexer is running (the inline path is
+    /// already synchronous). Called by consumers that must observe a current
+    /// index — chiefly migration reconcile, which has already fenced deletes.
+    pub fn flush_tombstone_index(&self) {
+        if let Some(indexer) = self.tombstone_indexer.get() {
+            indexer.flush();
+        }
+    }
+
+    /// Stop and join the background tombstone-index writer, draining any pending
+    /// rows first. Called on graceful shutdown so the persisted redb index is
+    /// current (a crash instead is safe: recovery rebuilds from the log). A
+    /// no-op when no indexer is running.
+    pub fn shutdown_tombstone_indexer(&self) {
+        if let Some(indexer) = self.tombstone_indexer.get() {
+            indexer.shutdown();
         }
     }
 
@@ -17853,6 +18044,56 @@ mod tests {
             );
             assert_eq!(v.cause, crate::tombstone::TombstoneCause::Admin.as_u8());
         }
+    }
+
+    #[test]
+    fn background_tombstone_indexer_persists_after_flush_then_shuts_down() {
+        // With the background indexer started, record_tombstone_index_batch
+        // ENQUEUES rows (returns before the redb work); flush_tombstone_index
+        // blocks until the worker has committed them; shutdown drains + joins and
+        // is idempotent.
+        let engine = create_engine();
+        let (_log, idx, _dir) = wire_tombstones(&engine);
+        engine.start_tombstone_indexer();
+        // Idempotent: a second start is a no-op (OnceLock already set).
+        engine.start_tombstone_indexer();
+
+        let mut rows: Vec<(TxKey, u32, u32, u8)> = Vec::new();
+        let mut keys = Vec::new();
+        for n in [160u8, 161] {
+            let (_, req) = make_create_req(n, 2);
+            let key = req.tx_key();
+            engine.create(&req).unwrap();
+            let info = engine
+                .delete_returning_tombstone_deferred(&DeleteRequest {
+                    tx_key: key,
+                    due_guard: None,
+                })
+                .unwrap()
+                .expect("tombstone written → Some(info)");
+            rows.push((
+                key,
+                info.deletion_height,
+                info.generation,
+                info.cause.as_u8(),
+            ));
+            keys.push(key);
+        }
+
+        // Enqueued to the background worker (may or may not be visible yet).
+        engine.record_tombstone_index_batch(&rows);
+        // Flush makes every enqueued row observable.
+        engine.flush_tombstone_index();
+        assert_eq!(idx.lock().len(), 2, "all rows committed after flush");
+        for key in &keys {
+            assert!(idx.lock().is_tombstoned(key));
+        }
+
+        // Clean stop, and idempotent.
+        engine.shutdown_tombstone_indexer();
+        engine.shutdown_tombstone_indexer();
+        // Flush after shutdown is a no-op that does not hang.
+        engine.flush_tombstone_index();
     }
 
     /// Build an engine whose DATA device, REDO device, and TOMBSTONE-log device

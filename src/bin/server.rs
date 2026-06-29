@@ -1418,10 +1418,17 @@ fn main() {
 
         engine.set_tombstone_log(Arc::new(Mutex::new(tombstone_log)));
         engine.set_tombstone_index(Arc::new(Mutex::new(tombstone_index)));
+        // Populate the derived redb tombstone index OFF the delete hot path: a
+        // background thread does the redb B-tree inserts (the dominant per-delete
+        // cost) while the delete request returns as soon as the durable
+        // tombstone log is written. The index is rebuilt from the log on
+        // recovery, so a bounded population lag is safe; started here, AFTER the
+        // recovery rebuild + max_deletion_height read above.
+        engine.start_tombstone_indexer();
         tracing::info!(
             path = %tombstone_path.display(),
             size_mib = config.tombstone_region_size / (1024 * 1024),
-            "deletion-tombstone log + index attached (enabled)",
+            "deletion-tombstone log + index attached (enabled, background indexer)",
         );
     } else {
         tracing::info!("deletion tombstones disabled (tombstones_enabled = false)");
@@ -2199,6 +2206,13 @@ impl ServerWithShutdown {
             self.tombstone_gc_handle.lock().take(),
             std::time::Duration::from_secs(5),
         );
+
+        // Drain + join the background tombstone-index writer so the persisted
+        // redb index reflects every committed delete before the snapshot below.
+        // A crash that skipped this is still safe — recovery rebuilds the index
+        // from the durable tombstone log.
+        self.engine.shutdown_tombstone_indexer();
+        tracing::info!("tombstone indexer stopped");
 
         // On shutdown: stop cluster, sync device
         if let Some(ref cluster) = self.cluster {

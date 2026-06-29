@@ -4959,6 +4959,12 @@ fn relax_superset_manifest(engine: &Engine, entries: &[(TxKey, u32)]) -> Vec<(Tx
     let Some(idx) = engine.tombstone_index() else {
         return entries.to_vec();
     };
+    // The redb tombstone index may be populated by a background writer
+    // (`Engine::record_tombstone_index_batch`), so flush it before reading: this
+    // is the one correctness-sensitive consumer (a missed tombstone would keep a
+    // deleted key in the superset demand). Migration has already fenced + drained
+    // client deletes, so no new tombstone rows arrive during the flush.
+    engine.flush_tombstone_index();
     let guard = idx.lock();
     entries
         .iter()
