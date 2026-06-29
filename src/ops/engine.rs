@@ -6648,23 +6648,9 @@ impl Engine {
     /// sweep the blob remains on the blob store (orphaned but harmless — no
     /// index entry references it). This keeps the delete hot path off the
     /// blob-store I/O path and lets the sweep batch unlinks.
-    ///
-    /// # Deletion tombstone (deletion-tombstone Phase 3)
-    ///
-    /// When the feature is active (`Self::tombstone_write_active`) this
-    /// path also writes a durable [`crate::tombstone::Tombstone`] so the
-    /// cluster's physical removal is self-describing across a restart /
-    /// rejoin. The tombstone is made durable BEFORE the primary-index
-    /// removal (design §9.1 #4), so a crash can never leave "deletion
-    /// durably committed but tombstone lost." The redb tombstone-index
-    /// insert is a derived index (rebuilt from the log on recovery) and is
-    /// NOT separately fsynced on this hot path.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        // The hot path passes `tolerate_already_free = false`: a double-free
-        // here is a real bug. (Recovery's R2 self-purge uses
-        // `delete_for_purge`, which tolerates an already-free region.)
-        self.delete_inner(req, false)
+        self.delete_inner(req)
     }
 
     /// Local prune-delete: remove a fully-spent record locally with NO redo and
@@ -6680,40 +6666,20 @@ impl Engine {
     /// distinct name documents the pruner's intent at the call site. Returns
     /// `Ok(())` on success or when the record is already gone (idempotent).
     pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, false)
+        self.delete_inner(req)
     }
 
     /// Internal delete.
     ///
-    /// `write_tombstone` is the public delete path's
-    /// [`Self::tombstone_write_active`] result for normal deletes, and
-    /// `false` for the recovery R2 self-purge (the tombstone already exists;
-    /// re-writing one would be redundant — see [`Self::delete_for_purge`]).
+    /// # Ordering (F-G2-001)
     ///
-    /// # Ordering (F-G2-001 + deletion-tombstone §9.1 #4)
-    ///
-    /// 1. (tombstone path only) build the [`crate::tombstone::Tombstone`]
-    ///    from the record's generation-at-deletion + deletion_height + cause,
-    ///    append it to the [`crate::tombstone::TombstoneLog`], and make it
-    ///    durable — so the tombstone is on stable storage BEFORE the
-    ///    deletion is durably committed.
-    /// 2. Zero the on-device metadata header (rebuild skip-guard).
-    /// 3. `sync()` the data device so the zeroed header is durable before any
+    /// 1. Zero the on-device metadata header (rebuild skip-guard).
+    /// 2. `sync()` the data device so the zeroed header is durable before any
     ///    future overwrite of the freed region.
-    /// 4. Unregister the key from the primary index. This MUST follow the
-    ///    tombstone durability (step 1) so a crash between them yields at
-    ///    worst "tombstone present, record present" (R2 purges on recovery),
-    ///    never "record gone, tombstone lost."
-    /// 5. Return the region to the allocator (after the primary-index removal,
+    /// 3. Unregister the key from the primary index.
+    /// 4. Return the region to the allocator (after the primary-index removal,
     ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
-    /// 6. (tombstone path only) insert the derived redb tombstone row. Not
-    ///    fsynced here; a crash after the log append but before this insert
-    ///    is re-derived by recovery's `rebuild_from`.
-    fn delete_inner(
-        &self,
-        req: &DeleteRequest,
-        tolerate_already_free: bool,
-    ) -> Result<(), SpendError> {
+    fn delete_inner(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
@@ -6800,67 +6766,13 @@ impl Engine {
         // the offset can be handed out to a future `create`/`create_at_offset`.
         // Because step 4 already removed the primary-index entry, no
         // reader can reach this offset via `lookup(req.tx_key)` any longer.
-        //
-        // `tolerate_already_free` is set ONLY by the recovery R2 self-purge
-        // path ([`Self::delete_for_purge`]). Recovery can encounter an
-        // index/allocator inconsistency where the primary index resurrected a
-        // record at an offset the allocator's recovered free-list already
-        // freed (see `recover_tombstones`). For that path a region that the
-        // allocator already considers fully free is BENIGN — the free-list is
-        // authoritative that the region is dead, and R2's job is only to drop
-        // the stale index entry (step 4, already done above). Freeing it again
-        // would (correctly) raise `DoubleFree`, so we skip the free instead.
-        //
-        // CRITICAL SAFETY: this tolerance is restricted to the case where the
-        // record's `[offset, offset + record_size)` is FULLY CONTAINED in a
-        // single already-free region. A PARTIAL overlap (the record range
-        // extends past the free region into space that may be allocated/live)
-        // is real corruption and is NOT tolerated even on the purge path — the
-        // `free` error is propagated so it keeps surfacing. The normal
-        // spend/delete hot path (`tolerate_already_free == false`) ALWAYS
-        // propagates any allocator error: a double-free there is a genuine bug
-        // that must never be hidden.
         {
             let mut alloc = self.allocator_for(entry.device_id).lock();
-            if tolerate_already_free && !alloc.is_allocated_range(entry.record_offset, record_size)
-            {
-                // Region is not fully allocated. Only tolerate the fully
-                // contained case; anything else is a partial overlap (or an
-                // out-of-bounds range) and must error.
-                let contained = alloc
-                    .free_region_containing(entry.record_offset)
-                    .is_some_and(|(free_offset, free_size)| {
-                        let region_end = entry.record_offset.saturating_add(record_size);
-                        let free_end = free_offset.saturating_add(free_size);
-                        entry.record_offset >= free_offset && region_end <= free_end
-                    });
-                if contained {
-                    // Benign: the region is already, correctly, free. The stale
-                    // index entry has been removed (step 4). Nothing more to do.
-                    tracing::debug!(
-                        offset = entry.record_offset,
-                        size = record_size,
-                        "delete_for_purge: region already free (resurrected \
-                         index/allocator inconsistency); index entry removed, \
-                         skipping redundant free",
-                    );
-                } else {
-                    // Partial overlap or out-of-bounds — real corruption.
-                    // Attempt the free so the allocator produces its precise
-                    // `DoubleFree`/`InvalidFree` error, then propagate it.
-                    alloc.free(entry.record_offset, record_size).map_err(|e| {
-                        SpendError::StorageError {
-                            detail: format!("{e}"),
-                        }
-                    })?;
-                }
-            } else {
-                alloc.free(entry.record_offset, record_size).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("{e}"),
-                    }
+            alloc
+                .free(entry.record_offset, record_size)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
                 })?;
-            }
         }
 
         // Clean up secondary indexes with two-phase durability.
@@ -6891,91 +6803,6 @@ impl Engine {
         }
 
         Ok(())
-    }
-
-    /// Delete a record WITHOUT writing a new deletion tombstone.
-    ///
-    /// Used exclusively by the recovery R2 self-purge (design §5.2): the key
-    /// already has a durable tombstone (that is *why* it is being purged), so
-    /// re-tombstoning would be redundant and could mask a generation race.
-    /// All other delete semantics (header zero, fsync, primary-index removal,
-    /// region free, secondary cleanup) are identical to [`Self::delete`], so
-    /// re-running recovery is idempotent.
-    ///
-    /// # Already-free tolerance (resurrected index/allocator inconsistency)
-    ///
-    /// This path passes `tolerate_already_free = true` to [`Self::delete_inner`].
-    /// Recovery can resurrect a primary-index entry pointing at a `record_offset`
-    /// the allocator's recovered free-list ALREADY freed (an index/allocator
-    /// inconsistency — see [`crate::recovery::recover_tombstones`]). For such a
-    /// key the index-entry removal is the only work R2 needs: the allocator
-    /// free-list is already authoritative that the region is dead, so the
-    /// otherwise-correct `free` of step 5 would raise [`DoubleFree`] and wrongly
-    /// fail an operation that, in fact, completed. When the region is fully
-    /// contained in an existing free region the free is skipped (benign) and
-    /// this returns `Ok(())`; a PARTIAL overlap is still surfaced as a
-    /// [`SpendError::StorageError`] (real corruption — never silently tolerated).
-    ///
-    /// The normal client/sweep delete path keeps the strict behavior
-    /// (`tolerate_already_free = false`): a double-free there is a genuine bug.
-    ///
-    /// [`DoubleFree`]: crate::allocator::AllocatorError::DoubleFree
-    pub(crate) fn delete_for_purge(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, true)
-    }
-
-    /// Discard ALL local records for `shard` WITHOUT writing tombstones, for
-    /// the Phase 4 full-resync path (deletion-tombstone design §4.3).
-    ///
-    /// When the rejoin gate refuses an incremental rejoin (the node is too
-    /// stale and may hold a stale live copy of a key whose tombstone is
-    /// already GC'd), the node must DISCARD its local copy of the shards it is
-    /// about to re-receive and pull fresh baselines. This is a LOCAL discard,
-    /// NOT a cluster delete: it must NOT write tombstones (a tombstone would
-    /// wrongly mark the key deleted cluster-wide), so it routes through
-    /// `Self::delete_for_purge` (`write_tombstone = false`), which otherwise
-    /// performs the identical, audited header-zero → fsync → primary-index
-    /// removal → region-free → secondary-cleanup sequence.
-    ///
-    /// The freshly-cleared shard is then repopulated by the normal inbound
-    /// migration baseline push from the shard's master after the catch-up
-    /// installs the active routing snapshot — so no stale extra survives the
-    /// resync, which is precisely what the §4.3 proof requires.
-    ///
-    /// Returns the number of records discarded. Per-key failures are logged
-    /// and skipped (best-effort): a record that fails to discard is simply
-    /// re-evaluated on the next baseline apply (idempotent), and the count
-    /// reflects only successful discards.
-    ///
-    /// # Warning
-    /// This is a destructive bulk-local operation reachable ONLY from the
-    /// Phase 4 full-resync path, which is gated behind `tombstone_gc_enabled`
-    /// (default OFF). It is not on any client path.
-    pub fn discard_shard_records(&self, shard: u16) -> usize {
-        let keys = self.keys_for_shard(shard);
-        let mut discarded = 0usize;
-        for key in keys {
-            let req = DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            };
-            match self.delete_for_purge(&req) {
-                Ok(()) => discarded += 1,
-                // TX_NOT_FOUND can occur if a concurrent op already removed the
-                // key — benign for a discard. Anything else is logged and the
-                // key is left for the next baseline apply to reconcile.
-                Err(SpendError::TxNotFound) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        shard,
-                        err = %e,
-                        "full-resync discard: failed to drop a local record; \
-                         baseline re-apply will reconcile it",
-                    );
-                }
-            }
-        }
-        discarded
     }
 
     /// Expire a preservation whose `preserve_until` height has been reached.
@@ -18916,29 +18743,6 @@ mod tests {
         e.observe_block_height(42);
         e.persist_last_durable_height()
             .expect("no-op persist must succeed");
-    }
-
-    #[test]
-    fn discard_shard_records_drops_local_copy_without_tombstone() {
-        // The full-resync local discard removes the shard's records and writes
-        // NO tombstone (it is a local drop, not a cluster delete).
-        let h = TestHarness::new(10, TxFlags::empty());
-        let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
-
-        // Precondition: the seeded record is present in its shard.
-        assert_eq!(h.engine.keys_for_shard(shard).len(), 1);
-
-        let discarded = h.engine.discard_shard_records(shard);
-        assert_eq!(discarded, 1, "the one seeded record should be discarded");
-        assert!(
-            h.engine.keys_for_shard(shard).is_empty(),
-            "shard must be empty after discard"
-        );
-
-        // No tombstone attached in this harness, so nothing to assert there;
-        // the key being gone from the index is the local-discard outcome.
-        // Discarding an already-empty shard is a harmless no-op.
-        assert_eq!(h.engine.discard_shard_records(shard), 0);
     }
 
     #[test]

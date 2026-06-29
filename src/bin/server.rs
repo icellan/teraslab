@@ -1468,10 +1468,6 @@ fn main() {
             migration_batch_size: config.migration_batch_size,
             persisted_incarnation: topo_state.incarnation,
             cluster_id: resolved_cluster_id,
-            // Phase 4 rejoin gate (deletion-tombstone design §4.3). Shares the
-            // GC master switch; default OFF → gate inert.
-            tombstone_gc_enabled: config.tombstone_gc_enabled,
-            rejoin_grace_blocks: config.rejoin_grace_blocks,
         };
         if initial_peak > 1 {
             tracing::info!(

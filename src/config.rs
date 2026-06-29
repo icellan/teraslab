@@ -456,15 +456,6 @@ pub struct IndexConfig {
     /// Only used when `backend = "redb"`.
     pub redb_unmined_path: PathBuf,
 
-    /// Path for the redb deletion-tombstone lookup index database.
-    ///
-    /// Unlike the other redb paths this is used regardless of the primary
-    /// `backend` (tombstones are a cluster-correctness feature independent of
-    /// the primary-index storage mode). The on-device tombstone log is the
-    /// durable source of truth; this redb file is a derived index rebuilt
-    /// from the log on recovery.
-    pub redb_tombstone_path: PathBuf,
-
     /// redb page cache size in bytes. Default: 256 MiB.
     /// Only applies to the redb backend.
     pub redb_cache_size: usize,
@@ -488,7 +479,6 @@ impl Default for IndexConfig {
             redb_path: PathBuf::from("teraslab-index.redb"),
             redb_dah_path: PathBuf::from("teraslab-dah.redb"),
             redb_unmined_path: PathBuf::from("teraslab-unmined.redb"),
-            redb_tombstone_path: PathBuf::from("teraslab-tombstone.redb"),
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
             file_backed_path: PathBuf::from("teraslab-index.dat"),
             index_shards: 256,
@@ -683,22 +673,6 @@ pub struct ServerConfig {
     /// path by appending `.redo`.
     pub redo_log_path: Option<PathBuf>,
 
-    /// Size of the on-device deletion-tombstone log region in bytes.
-    ///
-    /// The tombstone log ([`crate::tombstone::TombstoneLog`]) is append-only
-    /// and — unlike the redo log — is NOT reset on checkpoint; it is bounded
-    /// only by GC compaction below the safe-rejoin horizon (a later phase).
-    /// The region must hold roughly `deletion_rate × horizon_window × 56 B`
-    /// worth of tombstones; the default matches the redo region until the GC
-    /// horizon tuning (deletion-tombstone design §3.3/§4.5) lands.
-    pub tombstone_region_size: u64,
-
-    /// Path for the on-device deletion-tombstone log file. If not set,
-    /// derived from the first device path by appending `.tombstone`. The
-    /// tombstone log lives in its own file (mirroring the redo log's
-    /// `.redo` sibling file) at region offset 0.
-    pub tombstone_log_path: Option<PathBuf>,
-
     /// Path for the tiny durable node-height file that persists the engine's
     /// `last_durable_height` across restarts (deletion-tombstone design §4,
     /// height subsystem). If not set, derived from the index snapshot path by
@@ -706,94 +680,12 @@ pub struct ServerConfig {
     ///
     /// The file holds a single fsynced, CRC-protected `u32` written
     /// atomically (temp + rename) by the checkpoint task and on graceful
-    /// shutdown, sibling to the allocator persist. It is ALWAYS maintained
-    /// (independent of `tombstones_enabled` / `tombstone_gc_enabled`); on
+    /// shutdown, sibling to the allocator persist. It is ALWAYS maintained; on
     /// recovery the value is restored and then bounded below by a
     /// record-derived floor so the height can never regress (monotonicity).
     /// A missing or corrupt file simply falls back to the record-derived
     /// floor — never a hard failure.
     pub last_durable_height_path: Option<PathBuf>,
-
-    /// Whether the engine writes a durable deletion tombstone on every
-    /// physical record delete, and whether recovery reconstructs the
-    /// tombstone index and runs the R2 self-purge pass.
-    ///
-    /// Default `true`. When `false`, the delete path behaves exactly as it
-    /// did before tombstones existed (no tombstone append, no extra work),
-    /// and recovery skips the tombstone rebuild + self-purge — the
-    /// conservative fallback per deletion-tombstone design §11.5.
-    pub tombstones_enabled: bool,
-
-    /// Whether tombstone-driven migration reconciliation is enabled
-    /// (deletion-tombstone Phase 8, design §7/§11.5).
-    ///
-    /// Default `false` — the conservative, soak-pending state. When `false`,
-    /// `OP_MIGRATION_COMPLETE`, the completion-frame builder, the superset
-    /// proof, and the failed-handoff disposition behave EXACTLY as on the
-    /// pre-Phase-8 path (Fix B superset-accept + #29 prune gate): no tombstone
-    /// frame section is emitted or decoded and no tombstone-driven drop occurs.
-    /// When `true`, a rejoinee classifies its migration over-count against the
-    /// source's tombstone manifest (§7) — dropping authoritatively-deleted keys
-    /// while transferring never-received keys up — and the superset proof
-    /// relaxes to the source's non-tombstoned keys. Enable only after CI soak
-    /// validates convergence + no-loss + no-resurrection (design §11.3).
-    pub tombstone_reconciliation_enabled: bool,
-
-    /// Whether bounded-retention tombstone garbage collection (Phase 5) and
-    /// its load-bearing rejoin-eligibility gate (Phase 4) are active
-    /// (deletion-tombstone design §4).
-    ///
-    /// Default `false` — the conservative, soak-pending state. The Phase 4
-    /// rejoin gate and the Phase 5 GC daemon are the §4.3 coupled pair: the
-    /// gate is what makes GC sound (a node stale enough to need a GC'd
-    /// tombstone is refused incremental rejoin and full-resynced), so they
-    /// share this single switch. When `false`:
-    ///
-    /// - The rejoin-eligibility gate is INERT: a catching-up node is admitted
-    ///   exactly as it is today (no staleness refusal, no forced full resync).
-    /// - The GC daemon performs NO tombstone range-delete and NO log
-    ///   compaction — tombstones are retained unboundedly (bounded only by the
-    ///   operational outage length), byte-identical to the pre-Phase-4/5 path.
-    ///
-    /// The always-on node-height tracking ([`crate::ops::engine::Engine::last_durable_height`])
-    /// and the [`crate::protocol::opcodes::OP_GET_NODE_HEIGHT`] query are
-    /// purely additive and are NOT gated by this flag (they only track and
-    /// answer a number; nothing acts on it unless GC is enabled).
-    ///
-    /// Enable only after CI soak validates the cross-node min-finalized-height
-    /// horizon, GC firing, and a laggard rejoining right at the grace boundary
-    /// being full-resynced rather than incrementally admitted (design §11.3).
-    pub tombstone_gc_enabled: bool,
-
-    /// Maximum staleness (in block heights) a rejoining node may carry before
-    /// it is refused an incremental rejoin and forced into a full-baseline
-    /// resync (deletion-tombstone design §4.2/§4.5).
-    ///
-    /// This is the load-bearing coupling bound shared by the Phase 4 rejoin
-    /// gate and the Phase 5 GC horizon: a tombstone is GC-eligible once
-    /// `min_member_finalized_height − deletion_height ≥ rejoin_grace_blocks`,
-    /// and a node more than `rejoin_grace_blocks` behind the cluster tip is
-    /// refused incremental rejoin. Because both use the SAME bound, any node
-    /// stale enough to still need a GC'd tombstone is — by the §4.3 proof —
-    /// too stale to be admitted incrementally and is instead full-resynced
-    /// (which discards its stale copy).
-    ///
-    /// Default `100_000` — a finality-scale value (design §4.5: tie to
-    /// finality, not to a generous outage window). Only consulted when
-    /// [`Self::tombstone_gc_enabled`] is `true`.
-    pub rejoin_grace_blocks: u32,
-
-    /// Cadence in milliseconds at which the background tombstone-GC daemon
-    /// (Phase 5) evaluates the GC horizon (deletion-tombstone design §4.6).
-    ///
-    /// Each tick — only when [`Self::tombstone_gc_enabled`] is `true` — the
-    /// daemon computes the committed-member min finalized height, derives the
-    /// safe horizon, range-deletes redb tombstone rows below it, and compacts
-    /// the on-device log prefix. A missing member height makes the daemon skip
-    /// the round (conservative; never GC on incomplete info). Sized like the
-    /// checkpoint cadence; a slow cadence only delays reclamation, never
-    /// affects correctness. Default `60_000` (one minute).
-    pub tombstone_gc_poll_interval_ms: u64,
 
     /// Path for the index snapshot file.
     pub index_snapshot_path: PathBuf,
@@ -1255,19 +1147,7 @@ impl Default for ServerConfig {
             device_split: 1,
             redo_log_size: 64 * 1024 * 1024, // 64 MiB
             redo_log_path: None,
-            tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
-            tombstone_log_path: None,
             last_durable_height_path: None,
-            tombstones_enabled: true,
-            tombstone_reconciliation_enabled: false,
-            // Phase 4+5 (rejoin gate + GC daemon) ship DISABLED. The enabled
-            // path awaits CI soak (design §11.5); until then there is no
-            // rejoin refusal and no tombstone GC — byte-identical behavior.
-            tombstone_gc_enabled: false,
-            // Finality-scale default (design §4.5). Only consulted when
-            // `tombstone_gc_enabled` is true.
-            rejoin_grace_blocks: 100_000,
-            tombstone_gc_poll_interval_ms: 60_000,
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
             expected_records: 100_000,
             lock_stripes: 65536,
@@ -1451,29 +1331,6 @@ impl ServerConfig {
                     .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
                 let mut p = base.into_os_string();
                 p.push(".redo");
-                PathBuf::from(p)
-            }
-        }
-    }
-
-    /// Resolve the deletion-tombstone log file path. Uses
-    /// `tombstone_log_path` if explicitly set, otherwise derives it from the
-    /// first device path by appending `.tombstone`.
-    ///
-    /// Same fallback story as [`Self::resolved_redo_log_path`] when
-    /// `tombstone_log_path` is `None` and `device_paths` is empty —
-    /// `validate_safe_defaults` is the gate.
-    pub fn resolved_tombstone_log_path(&self) -> PathBuf {
-        match &self.tombstone_log_path {
-            Some(p) => p.clone(),
-            None => {
-                let base = self
-                    .device_paths
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
-                let mut p = base.into_os_string();
-                p.push(".tombstone");
                 PathBuf::from(p)
             }
         }
@@ -1997,7 +1854,6 @@ impl ServerConfig {
         }
         nonzero_u64("device_size", self.device_size)?;
         nonzero_u64("redo_log_size", self.redo_log_size)?;
-        nonzero_u64("tombstone_region_size", self.tombstone_region_size)?;
         nonzero_usize("expected_records", self.expected_records)?;
         nonzero_u32("max_batch_size", self.max_batch_size)?;
         nonzero_usize("max_connections", self.max_connections)?;
@@ -2062,13 +1918,6 @@ impl ServerConfig {
         nonzero_u64(
             "checkpoint_poll_interval_ms",
             self.checkpoint_poll_interval_ms,
-        )?;
-        // The tombstone-GC daemon polls on this cadence (Phase 5). A zero
-        // interval would busy-spin the daemon thread; require it non-zero
-        // even though the daemon only acts when `tombstone_gc_enabled`.
-        nonzero_u64(
-            "tombstone_gc_poll_interval_ms",
-            self.tombstone_gc_poll_interval_ms,
         )?;
 
         // device_size must be large enough to hold at least one record's

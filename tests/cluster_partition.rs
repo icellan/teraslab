@@ -131,8 +131,6 @@ fn create_proxied_node(
         migration_batch_size: 100,
         persisted_incarnation: 0,
         cluster_id: TEST_CLUSTER_ID,
-        tombstone_gc_enabled: false,
-        rejoin_grace_blocks: 100_000,
     };
 
     let coordinator = ClusterCoordinator::new(cluster_config, 1);
