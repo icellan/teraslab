@@ -506,6 +506,10 @@ fn cmd_memory(http: &HttpClient, json: bool) -> Result<(), CliError> {
         "Unmined index entries",
         &fmt_num(as_u64(&data["unmined_index_entries"])),
     ]);
+    table.add_row(vec![
+        "Preserve index entries",
+        &fmt_num(as_u64(&data["preserve_index_entries"])),
+    ]);
     println!("{table}");
     Ok(())
 }
@@ -531,6 +535,10 @@ fn cmd_records(http: &HttpClient, json: bool) -> Result<(), CliError> {
     table.add_row(vec![
         "Unmined count",
         &fmt_num(as_u64(&data["unmined_count"])),
+    ]);
+    table.add_row(vec![
+        "Preserve count",
+        &fmt_num(as_u64(&data["preserve_count"])),
     ]);
     println!("{table}");
     Ok(())
@@ -587,6 +595,10 @@ fn cmd_index(http: &HttpClient, json: bool, secondary: bool) -> Result<(), CliEr
         table.add_row(vec![
             "Unmined index entries",
             &fmt_num(as_u64(&status["records"]["unmined_index"])),
+        ]);
+        table.add_row(vec![
+            "Preserve index entries",
+            &fmt_num(as_u64(&status["records"]["preserve_index"])),
         ]);
     }
     println!("{table}");

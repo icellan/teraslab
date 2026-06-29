@@ -1418,6 +1418,16 @@ fn reconcile_secondary_indexes_from_metadata_multi(
         match io::read_metadata(*dev, entry.record_offset) {
             Ok(meta) => {
                 let dah_height = { meta.delete_at_height };
+                // Verbatim rebuild from the authoritative device state. A record
+                // can legitimately carry a non-zero delete_at_height while being
+                // transiently not-due (e.g. all-spent but unmined after a reorg)
+                // and MUST stay in the DAH index, re-evaluated each sweep. The
+                // immortal-entry concern (#25) is addressed at the SOURCE —
+                // `expire_preservation_set_dah` no longer PLANTS a DAH on a
+                // non-sweepable record — not by filtering this rebuild, which
+                // would wrongly drop legitimate transient entries (pre-existing
+                // REASSIGNED-with-DAH corpus from an in-place upgrade is a
+                // separate, deferred scrub concern).
                 if dah_height != 0 {
                     dah_pairs.push((dah_height, key));
                 }

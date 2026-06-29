@@ -90,6 +90,33 @@ impl DahIndex {
         result
     }
 
+    /// Like [`Self::range_query`] but stops after collecting `limit` keys.
+    ///
+    /// Returns at most `limit` txids with `delete_at_height` in
+    /// `[0, current_height]`, in ascending height order — the lowest-height
+    /// (oldest-due) entries first. The DAH sweep (`handle_process_expired`)
+    /// uses this to bound per-call work: during a catch-up sync the full
+    /// due-set can reach the entire UTXO set, and processing it in one request
+    /// both pegged a core (per-candidate under-lock re-validation) and built a
+    /// delete batch larger than the delete handler accepts (`max_batch`),
+    /// which failed every call so the index never drained. With the cap the
+    /// remaining due records drain on the pruner's subsequent per-block calls.
+    pub fn range_query_limited(&self, current_height: u32, limit: usize) -> Vec<TxKey> {
+        let mut result = Vec::new();
+        if limit == 0 {
+            return result;
+        }
+        for (_, keys) in self.by_height.range(..=current_height) {
+            for &key in keys {
+                result.push(key);
+                if result.len() >= limit {
+                    return result;
+                }
+            }
+        }
+        result
+    }
+
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
         self.by_txid.len()
@@ -262,5 +289,31 @@ mod tests {
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
         assert!(idx.range_query(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn range_query_limited_caps_lowest_height_first() {
+        let mut idx = DahIndex::new();
+        idx.insert(10, key(1));
+        idx.insert(10, key(2));
+        idx.insert(20, key(3));
+        idx.insert(20, key(4));
+        idx.insert(30, key(5));
+
+        // limit 0 → empty.
+        assert!(idx.range_query_limited(100, 0).is_empty());
+
+        // limit < total → exactly `limit` keys, drawn from the lowest heights
+        // first (both height-10 keys before any height-20 key).
+        let r = idx.range_query_limited(100, 3);
+        assert_eq!(r.len(), 3);
+        assert!(r.contains(&key(1)) && r.contains(&key(2)));
+
+        // limit >= total → all due keys (same as range_query).
+        assert_eq!(idx.range_query_limited(100, 99).len(), 5);
+
+        // current_height bound still applies under the cap.
+        assert_eq!(idx.range_query_limited(20, 99).len(), 4);
+        assert_eq!(idx.range_query_limited(20, 3).len(), 3);
     }
 }

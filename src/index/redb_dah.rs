@@ -254,7 +254,17 @@ impl RedbDahIndex {
     /// The return type stays `Vec<TxKey>` to avoid churning every caller;
     /// the operator-visible log line is the load-bearing change.
     pub fn range_query(&self, current_height: u32) -> Vec<TxKey> {
+        self.range_query_limited(current_height, usize::MAX)
+    }
+
+    /// Like [`Self::range_query`] but stops after collecting `limit` keys
+    /// (lowest-`delete_at_height` first). Bounds the DAH sweep's per-call work;
+    /// see [`crate::index::dah_index::DahIndex::range_query_limited`].
+    pub fn range_query_limited(&self, current_height: u32, limit: usize) -> Vec<TxKey> {
         let mut result = Vec::new();
+        if limit == 0 {
+            return result;
+        }
         let txn = match self.db.begin_read() {
             Ok(t) => t,
             Err(e) => {
@@ -288,6 +298,9 @@ impl RedbDahIndex {
                     let mut txid = [0u8; 32];
                     txid.copy_from_slice(&composite[4..36]);
                     result.push(TxKey { txid });
+                    if result.len() >= limit {
+                        break;
+                    }
                 }
             }
             Err(e) => {

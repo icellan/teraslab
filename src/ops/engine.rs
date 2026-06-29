@@ -5,7 +5,9 @@
 
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
-use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend};
+use crate::index::{
+    DahBackend, PreserveBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
+};
 use crate::io;
 use crate::locks::StripedLocks;
 use crate::ops::create::*;
@@ -188,6 +190,16 @@ pub struct Engine {
     locks: StripedLocks,
     dah_index: parking_lot::Mutex<DahBackend>,
     unmined_index: parking_lot::Mutex<UnminedBackend>,
+    /// Secondary index mapping `preserve_until` → txids, serving the
+    /// expired-preservation sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`) in
+    /// O(expired) instead of an O(index-size) primary walk (issue #25).
+    ///
+    /// In-memory only and NOT journaled to the redo log — the same crash-safety
+    /// class as the conflicting index: re-derived at startup from each record's
+    /// authoritative on-device `preserve_until` via
+    /// [`Self::rebuild_preserve_index_from_device`], then kept current by
+    /// [`Self::update_preserve_index`] on every preserve mutation.
+    preserve_index: parking_lot::Mutex<PreserveBackend>,
     /// In-memory set of CONFLICTING transactions, backing the
     /// `OP_QUERY_CONFLICTING` query. No redo/redb durability: rebuilt at
     /// startup from the primary index via [`Self::rebuild_conflicting_index`].
@@ -498,6 +510,11 @@ impl Engine {
             locks,
             dah_index: parking_lot::Mutex::new(dah_index),
             unmined_index: parking_lot::Mutex::new(unmined_index),
+            // Preserve index is unconditionally in-memory (no constructor
+            // param): recovery re-derives it from authoritative device metadata
+            // via `rebuild_preserve_index_from_device`. Boots empty; populated
+            // before serving traffic.
+            preserve_index: parking_lot::Mutex::new(PreserveBackend::new_in_memory()),
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
             dispatch_visibility_barrier: parking_lot::RwLock::new(()),
             redo_logs: std::sync::OnceLock::new(),
@@ -1533,6 +1550,44 @@ impl Engine {
         Ok(())
     }
 
+    /// Update the preserve secondary index for a `preserve_until` transition.
+    ///
+    /// The delete-side mirror of [`Self::update_dah_index`], with one
+    /// deliberate divergence: it passes `None` for the redo log. The preserve
+    /// index is NOT journaled (in-memory, re-derived from on-device metadata on
+    /// recovery — see the field doc and
+    /// [`Self::rebuild_preserve_index_from_device`]), so routing a redo
+    /// intent would be wrong. `old == new` is a no-op; `new == 0` removes the
+    /// entry (the compensation-UNDO and expiry-clear cases), `old == 0` is a
+    /// pure insert.
+    fn update_preserve_index(
+        &self,
+        key: &TxKey,
+        old_preserve: u32,
+        new_preserve: u32,
+    ) -> Result<(), SpendError> {
+        if old_preserve == new_preserve {
+            return Ok(());
+        }
+        let mut preserve = self.preserve_index.lock();
+        let _writer_gauge = crate::metrics::writer_enter();
+        if old_preserve != 0 {
+            preserve
+                .remove(key, None)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("preserve secondary remove: {e}"),
+                })?;
+        }
+        if new_preserve != 0 {
+            preserve
+                .insert(new_preserve, *key, None)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("preserve secondary insert: {e}"),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Apply a combined DAH + unmined update with a single redo fsync.
     ///
     /// When both secondary indexes change in the same operation (e.g.
@@ -1833,6 +1888,7 @@ impl Engine {
         // cleanly rather than leaking a stale index entry.
         let old_unmined = { meta.unmined_since };
         let old_dah = { meta.delete_at_height };
+        let old_preserve = { meta.preserve_until };
 
         meta.generation = generation;
         meta.updated_at = updated_at;
@@ -1849,7 +1905,13 @@ impl Engine {
             delete_at_height,
             old_unmined,
             unmined_since,
-        )
+        )?;
+        // The atomic helper handles primary cache + DAH + unmined; preserve is
+        // not journaled (in-memory model) so it is updated separately here.
+        // THE migration / replica-create choke point — without this a migrated
+        // preserved record is invisible to this node's expiry sweep until the
+        // next restart's `rebuild_preserve_index_from_device`.
+        self.update_preserve_index(key, old_preserve, preserve_until)
     }
 
     /// Refresh the cached wall-clock time from the system clock.
@@ -2594,24 +2656,6 @@ impl Engine {
     /// a read lock briefly and collects all keys into a Vec.
     pub fn all_keys(&self) -> Vec<TxKey> {
         self.index.all_keys()
-    }
-
-    /// Scan the primary index for records whose preservation has expired.
-    ///
-    /// Returns the keys of records with an active `preserve_until` in
-    /// `[1, current_height]` — i.e. preservations whose window has elapsed
-    /// and which the caller should now schedule for deletion via
-    /// [`Self::expire_preservation_set_dah`] (KO-1 / spec §3.18 Phase 3).
-    ///
-    /// There is no dedicated `preserve_until` secondary index; this filters
-    /// the primary index by the cached `HAS_PRESERVE_UNTIL` discriminant and
-    /// the `dah_or_preserve` field (which holds `preserve_until` while that
-    /// bit is set), so it never touches the device. The returned keys are a
-    /// point-in-time snapshot; the caller re-validates each under the stripe
-    /// lock, so a `preserve_until` cleared or pushed forward after this scan
-    /// is handled correctly there.
-    pub fn scan_expired_preservations(&self, current_height: u32) -> Vec<TxKey> {
-        self.index.scan_expired_preservations(current_height)
     }
 
     /// Return keys belonging to a specific shard.
@@ -6492,6 +6536,10 @@ impl Engine {
 
         let mut meta = self.read_metadata_fast(device_id, ro)?;
         let old_dah = { meta.delete_at_height };
+        // Capture the prior preserve height BEFORE the overwrite so the
+        // preserve-index transition (old -> new) below evicts a stale bucket
+        // when a record is re-preserved at a different height.
+        let old_preserve = { meta.preserve_until };
 
         meta.delete_at_height = 0;
         meta.preserve_until = req.block_height;
@@ -6512,6 +6560,13 @@ impl Engine {
         if old_dah != 0 {
             self.update_dah_index(&req.tx_key, old_dah, 0)?;
         }
+        // Transition the record into (or out of) the preserve index. A
+        // `block_height` of 0 (the replication-compensation UNDO path,
+        // dispatch.rs `handle_request`) removes the entry; a non-zero value
+        // inserts/moves it. DAH and preserve are mutually exclusive, so the
+        // DAH removal above plus this insert move the record between the two
+        // secondary indexes.
+        self.update_preserve_index(&req.tx_key, old_preserve, req.block_height)?;
 
         let signal = if meta.flags.contains(TxFlags::EXTERNAL) {
             Signal::Preserve
@@ -6550,12 +6605,39 @@ impl Engine {
         if dah == 0 || dah > current_block_height {
             return false;
         }
+        Self::sweep_eligible(meta)
+    }
+
+    /// Height-independent DAH-sweep eligibility: whether the record would be
+    /// deletable by the sweep ONCE its `delete_at_height` arrives.
+    ///
+    /// - CONFLICTING → due unconditionally (KO-2): `setConflicting` DAH's
+    ///   double-spend losers regardless of spent / longest-chain state.
+    /// - REASSIGNED → never due (LP-3): a reassigned record is retained for the
+    ///   audit trail and is never all-spent by design.
+    /// - otherwise the normal mined-record path: all-spent ∧ on-longest-chain.
+    ///
+    /// Used by two callers: [`Self::record_due_for_sweep`] (which adds the
+    /// preserve / dah-height gates) and `expire_preservation_set_dah` (which
+    /// gates whether to plant a DAH on preservation expiry). Gating expiry on
+    /// it means the live mutation paths never PLANT a DAH on a
+    /// permanently-ineligible record (REASSIGNED, or never-all-spent) — such an
+    /// entry is immortal and, under the per-call sweep cap (#25), accumulates at
+    /// low heights and starves the cap.
+    ///
+    /// NOTE the recovery secondary reconcile (`reconcile_secondary_indexes_*`)
+    /// and the migration lifecycle restore (`restore_migrated_lifecycle`) do
+    /// NOT gate on this — they rebuild the DAH index verbatim from the
+    /// authoritative on-device `delete_at_height` (a record can legitimately
+    /// carry a DAH while transiently not-due, e.g. all-spent but unmined after
+    /// a reorg, and must stay indexed). So this does not by itself guarantee
+    /// the DAH index holds only drainable entries; a node upgraded in-place
+    /// from a build with unconditional expiry can still carry pre-existing
+    /// immortal entries until a separate scrub remediates them.
+    pub(crate) fn sweep_eligible(meta: &TxMetadata) -> bool {
         if meta.flags.contains(TxFlags::CONFLICTING) {
             return true;
         }
-        // LP-3: a reassigned record is never all-spent (it is retained for the
-        // audit trail), so it is never due via the mined-record path. The
-        // CONFLICTING branch above still applies.
         if meta.flags.contains(TxFlags::REASSIGNED) {
             return false;
         }
@@ -6744,7 +6826,7 @@ impl Engine {
         // recheck reads metadata the unguarded path reads anyway, so the cost
         // is one extra `TxFlags` test. Direct client deletes
         // (`due_guard == None`) skip this and stay unconditional (spec §3.18).
-        let record_size = {
+        let (record_size, device_preserve, device_dah, device_unmined) = {
             let meta =
                 self.read_metadata_for_key(entry.device_id, &req.tx_key, entry.record_offset)?;
             if let Some(current_height) = req.due_guard
@@ -6752,7 +6834,22 @@ impl Engine {
             {
                 return Err(SpendError::NotDue);
             }
-            ({ meta.record_size }) as u64
+            // Capture the AUTHORITATIVE on-device secondary-index heights for the
+            // cleanup below. The cached index entry (`entry.*`) lags the device
+            // after a redo replay — SecondaryDahUpdate / PreserveUntil replay
+            // and the recovery reconcile rebuild the secondary BACKENDS from the
+            // device but never refresh the primary index cache — so trusting the
+            // cache here skips the removal and leaks the backend entry (the
+            // preserve leak fixed for P1-B had an identical DAH twin). The
+            // device is the single source of truth, so gate every removal off
+            // it. Mutual exclusion guarantees at most one of dah/preserve is
+            // non-zero.
+            (
+                ({ meta.record_size }) as u64,
+                { meta.preserve_until },
+                { meta.delete_at_height },
+                { meta.unmined_since },
+            )
         };
 
         // Step 1 (deletion-tombstone §9.1 #4): build and durably record the
@@ -6919,23 +7016,23 @@ impl Engine {
             );
         }
 
-        // Clean up secondary indexes with two-phase durability.
-        // The cached entry captured before unregister carries the heights we
-        // must transition from. Whether or not each was set, `update_*_index`
-        // is a no-op when old == new.
-        let has_preserve =
-            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
-        let old_dah = if has_preserve {
-            0
-        } else {
-            entry.dah_or_preserve
-        };
-        let old_unmined = entry.unmined_since;
-        if old_dah != 0 {
-            self.update_dah_index(&req.tx_key, old_dah, 0)?;
+        // Clean up secondary indexes with two-phase durability, gated off the
+        // AUTHORITATIVE on-device heights (captured above), NOT the cached index
+        // entry. The cache lags the device after a redo replay (the backends are
+        // rebuilt from the device but the primary cache is not refreshed), so a
+        // cache-gated removal leaks the backend entry — both for DAH (the
+        // checkpoint+live-DAH-set+crash case) and preserve (the PreserveUntil
+        // replay case). `update_*_index` is a no-op when old == new, and a
+        // record is in the DAH index XOR the preserve index, so at most one of
+        // these performs a real removal.
+        if device_dah != 0 {
+            self.update_dah_index(&req.tx_key, device_dah, 0)?;
         }
-        if old_unmined != 0 {
-            self.update_unmined_index(&req.tx_key, old_unmined, 0)?;
+        if device_unmined != 0 {
+            self.update_unmined_index(&req.tx_key, device_unmined, 0)?;
+        }
+        if device_preserve != 0 {
+            self.update_preserve_index(&req.tx_key, device_preserve, 0)?;
         }
 
         // Drop any conflicting-index entry for the deleted record. The cached
@@ -7008,28 +7105,36 @@ impl Engine {
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("aliased-entry index unregister failed: {e}"),
                 })?;
-        let Some(entry) = removed else {
+        if removed.is_none() {
             return Ok(false);
-        };
+        }
 
-        // Clean up the secondary indexes derived from the (foreign-seeded)
-        // cached heights, mirroring `delete_inner`'s secondary cleanup. These
-        // remove `key` from the DAH / unmined indexes; `update_*_index` is a
-        // no-op when the old height is 0.
-        let has_preserve =
-            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
-        let old_dah = if has_preserve {
-            0
-        } else {
-            entry.dah_or_preserve
-        };
-        let old_unmined = entry.unmined_since;
-        if old_dah != 0 {
-            self.update_dah_index(key, old_dah, 0)?;
-        }
-        if old_unmined != 0 {
-            self.update_unmined_index(key, old_unmined, 0)?;
-        }
+        // Remove `key` from ALL THREE secondary indexes UNCONDITIONALLY by key.
+        // This purge path holds NO authoritative device metadata (it is dropping
+        // a stale/aliased primary-index entry whose device footer belongs to a
+        // DIFFERENT record), and the cached heights can be stale after a redo
+        // replay, so neither can decide membership. `remove` is a no-op when the
+        // key is absent, so unconditional removal is safe and closes the
+        // stale-cache leak for DAH / unmined / preserve alike (the cache-gated
+        // version leaked whenever the cache lagged the backend — the same class
+        // as the `delete_inner` fix).
+        let log_arc = self.redo_log_for_key(key);
+        let log_ref = log_arc.as_deref();
+        self.dah_index()
+            .remove(key, log_ref)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("dah secondary remove (purge): {e}"),
+            })?;
+        self.unmined_index()
+            .remove(key, log_ref)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("unmined secondary remove (purge): {e}"),
+            })?;
+        self.preserve_index()
+            .remove(key, None)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("preserve secondary remove (purge): {e}"),
+            })?;
         Ok(true)
     }
 
@@ -7275,19 +7380,20 @@ impl Engine {
     /// Mirror of the Aerospike pruner's `ProcessExpiredPreservations`
     /// (`teranode/stores/utxo/aerospike/aerospike.go:999-1100`) and spec
     /// §3.18 Phase 3 ("Expired preservation processing"): for a record whose
-    /// `preserve_until` is in `[1, current_height]`, schedule deletion by
-    /// setting `delete_at_height = current_height + block_height_retention`
-    /// and clearing `preserve_until`. The record then becomes a normal DAH
-    /// candidate and is deleted `block_height_retention` blocks later by the
-    /// sweep.
+    /// `preserve_until` is in `[1, current_height]`, clear `preserve_until` and
+    /// — only if the record is sweep-eligible — schedule deletion by setting
+    /// `delete_at_height = current_height + block_height_retention`, after
+    /// which it is deleted `block_height_retention` blocks later by the sweep.
     ///
-    /// This deliberately does NOT re-run `evaluate_delete_at_height`: the Go
-    /// pruner sets DAH unconditionally on expiry (the all-spent /
-    /// on-longest-chain gating does not apply to an expired preservation —
-    /// the preservation window having elapsed is itself the signal that the
-    /// record may be reclaimed). The record's spent/unmined/conflicting state
-    /// is irrelevant at this point; the parent it protected has had its full
-    /// `ParentPreservationBlocks` window.
+    /// The DAH is set CONDITIONALLY on `sweep_eligible` (#25 follow-up),
+    /// NOT unconditionally as the original Go pruner did. The Rust Phase-2
+    /// sweep declines to delete a record that is not all-spent / not on the
+    /// longest chain / REASSIGNED (KO-2/KO-3), so DAH-ing such a record on
+    /// expiry only plants an immortal entry the sweep can never drain — which,
+    /// under the per-call cap, starves the cap. An ineligible expired record
+    /// therefore just has its `preserve_until` cleared (dah left 0) and reverts
+    /// to the normal lifecycle: it re-acquires a DAH via spend / setMined once
+    /// it actually becomes deletable.
     ///
     /// Runs under the per-tx stripe lock and re-reads the on-device metadata,
     /// so a `preserve_until` that was pushed forward (a fresh
@@ -7295,9 +7401,9 @@ impl Engine {
     /// if the re-read `preserve_until` is 0 or still in the future, this is a
     /// no-op and returns `Ok(false)`.
     ///
-    /// Returns `Ok(true)` if the preservation was expired and DAH scheduled,
-    /// `Ok(false)` if the record no longer qualifies (preserve cleared,
-    /// pushed forward, or record gone).
+    /// Returns `Ok(true)` if the preservation was EXPIRED (i.e. `preserve_until`
+    /// cleared) — whether or not a DAH was scheduled — and `Ok(false)` if the
+    /// record no longer qualifies (preserve cleared, pushed forward, or gone).
     ///
     /// # Errors
     ///
@@ -7337,16 +7443,41 @@ impl Engine {
             return Ok(false);
         }
 
-        let new_dah = current_block_height
-            .checked_add(block_height_retention)
-            .ok_or(SpendError::DahOverflow {
-                current_height: current_block_height,
-                retention: block_height_retention,
-            })?;
+        // Only SCHEDULE deletion (set a DAH) when the record is actually
+        // sweep-eligible — i.e. it would pass `record_due_for_sweep` once its
+        // DAH height arrives. A record with unspent outputs, an unmined record,
+        // or a REASSIGNED record is NOT deletable (the sweep would reject it
+        // forever via the same predicate), so DAH-ing it unconditionally just
+        // plants an immortal, never-draining entry in the DAH index. Before the
+        // per-call sweep cap (#25) those merely wasted re-validation every call;
+        // WITH the cap a buildup of ≥ max_batch such entries at low heights
+        // starves the cap (every capped query returns only them, `owned_due`
+        // empty, genuinely-due higher-height records never reached → unbounded
+        // DAH growth, the exact #25 stall class). Mirror the sweep predicate
+        // here so the index only ever holds drainable entries. A non-eligible
+        // record simply reverts to the normal lifecycle: `preserve_until` is
+        // cleared and, when it later becomes all-spent / mined, the spend /
+        // set_mined path sets its DAH then.
+        //
+        // (CONFLICTING records are due unconditionally — KO-2 — so they remain
+        // eligible here even when not all-spent.)
+        let eligible = Self::sweep_eligible(&meta);
+
+        let new_dah = if eligible {
+            current_block_height
+                .checked_add(block_height_retention)
+                .ok_or(SpendError::DahOverflow {
+                    current_height: current_block_height,
+                    retention: block_height_retention,
+                })?
+        } else {
+            0
+        };
 
         // While `preserve_until` is set the record carries no DAH index entry
         // (see `preserve_until`, which removes any prior DAH entry), so there
-        // is no stale entry to remove here — the transition is 0 → new_dah.
+        // is no stale entry to remove here — the transition is 0 → new_dah
+        // (and new_dah is 0 for a non-eligible record, i.e. no DAH at all).
         meta.preserve_until = 0;
         meta.delete_at_height = new_dah;
         meta.generation = { meta.generation }.wrapping_add(1);
@@ -7354,7 +7485,14 @@ impl Engine {
 
         self.write_metadata_fast(device_id, ro, &meta)?;
         self.sync_index_cache(key, &meta)?;
-        self.update_dah_index(key, 0, new_dah)?;
+        // Mutual-exclusion transition preserve -> DAH. Remove from the preserve
+        // index BEFORE inserting into DAH so a concurrent reader range-querying
+        // both indexes sees the key in NEITHER transiently (never BOTH),
+        // matching the order the SET path uses (remove-DAH then insert-preserve).
+        self.update_preserve_index(key, preserve, 0)?;
+        if new_dah != 0 {
+            self.update_dah_index(key, 0, new_dah)?;
+        }
 
         Ok(true)
     }
@@ -7436,6 +7574,93 @@ impl Engine {
     /// Get the unmined index (for testing).
     pub fn unmined_index(&self) -> parking_lot::MutexGuard<'_, UnminedBackend> {
         self.unmined_index.lock()
+    }
+
+    /// Get the preserve index (backs the expired-preservation sweep; also used
+    /// in tests).
+    pub fn preserve_index(&self) -> parking_lot::MutexGuard<'_, PreserveBackend> {
+        self.preserve_index.lock()
+    }
+
+    /// Rebuild the in-memory preserve index from authoritative device metadata.
+    ///
+    /// Called once at startup after recovery has reconstructed the primary
+    /// index (alongside [`Self::rebuild_conflicting_index`]). For every primary
+    /// entry it reads the record's on-device `preserve_until` and, when
+    /// non-zero, inserts `(preserve_until, key)`. Idempotent: clears first, so
+    /// re-running is safe.
+    ///
+    /// **Why it reads the device, not the index cache.**
+    /// [`TxFlags::HAS_PRESERVE_UNTIL`] is an index-only flag — it is NOT
+    /// persisted to the device footer (see `record.rs`). The cached
+    /// `tx_flags` / `dah_or_preserve` are set by `sync_index_cache` on the
+    /// LIVE mutation path, but the recovery paths that write `preserve_until`
+    /// to the device do NOT touch the cache: the `RedoOp::PreserveUntil` redo
+    /// replay and the `ReplicaCreate` replay update the footer only, and the
+    /// post-replay secondary reconcile rebuilds the DAH/unmined backends from
+    /// the device without updating the primary cache. (The DAH sweep tolerates
+    /// the same lag because `is_due_for_sweep` re-reads the device.) So after a
+    /// crash + redo replay the cached preserve discriminant is stale; only the
+    /// device footer is authoritative. Reading it here is the one correct
+    /// source. This is the single O(store) preserve scan at boot — replacing
+    /// the old O(index) walk that ran on EVERY sweep (issue #25).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] if a device metadata read or a
+    /// backend insert/clear fails.
+    pub fn rebuild_preserve_index_from_device(&self) -> Result<(), SpendError> {
+        // Snapshot the record locations under the index read lock (no I/O held
+        // under the lock), then read each footer and build the preserve set.
+        let mut locs: Vec<(u8, u64, TxKey)> = Vec::new();
+        self.index.for_each(|key, entry| {
+            locs.push((entry.device_id, entry.record_offset, key));
+        });
+        let mut pairs: Vec<(u32, TxKey)> = Vec::with_capacity(locs.len());
+        for (device_id, offset, key) in locs {
+            // `read_metadata_for_key` validates `meta.tx_id == key.txid`
+            // (F-G2-001), so a delete+reuse race surfaces as TxNotFound rather
+            // than reading an unrelated record's preserve_until.
+            let meta = match self.read_metadata_for_key(device_id, &key, offset) {
+                Ok(m) => m,
+                // P1-C: skip + warn on ANY read failure, never abort the boot.
+                // A record that vanished/aliased surfaces as TxNotFound; a torn
+                // / CRC-failed footer surfaces as StorageError. Either way the
+                // record is unreadable, so it carries no indexable preservation
+                // this boot — skip it. Aborting (the previous behaviour) turned
+                // a single corrupt footer into a fatal boot loop, a brand-new
+                // failure mode the sibling `rebuild_conflicting_index`
+                // (cache-only, infallible) never had. A missing preserve entry
+                // only delays that record's expiry transition, which is
+                // harmless and self-heals once the record is read cleanly
+                // (recovery/scrub) or rewritten.
+                Err(e) => {
+                    tracing::warn!(
+                        txid = ?key.txid,
+                        err = %e,
+                        "rebuild_preserve_index: footer unreadable; skipping (preserve \
+                         entry, if any, will be missing until the record is read cleanly)",
+                    );
+                    continue;
+                }
+            };
+            let preserve = { meta.preserve_until };
+            if preserve != 0 {
+                pairs.push((preserve, key));
+            }
+        }
+        let mut preserve = self.preserve_index.lock();
+        preserve.clear().map_err(|e| SpendError::StorageError {
+            detail: format!("preserve index rebuild clear: {e}"),
+        })?;
+        for (height, key) in pairs {
+            preserve
+                .insert(height, key, None)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("preserve index rebuild insert: {e}"),
+                })?;
+        }
+        Ok(())
     }
 
     /// Get the conflicting index (backs `OP_QUERY_CONFLICTING`; also used in tests).
@@ -7839,6 +8064,7 @@ impl Engine {
     pub fn flush_index_durable(&self) -> crate::index::Result<()> {
         self.index.flush_durable()?;
         self.dah_index.lock().flush_durable()?;
+        self.preserve_index.lock().flush_durable()?;
         self.unmined_index.lock().flush_durable()
     }
 }
@@ -16641,6 +16867,448 @@ mod tests {
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.preserve_until }, 5000);
         assert_eq!({ meta.delete_at_height }, 0); // DAH cleared
+    }
+
+    // ------------------------------------------------------------------
+    // Preserve secondary index (#25): wiring + mutual-exclusion + rebuild.
+    // ------------------------------------------------------------------
+
+    /// `preserve_until` inserts the record into the preserve index at its
+    /// preserve height and evicts any DAH entry (mutual exclusion).
+    #[test]
+    fn preserve_until_inserts_into_preserve_index() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(120, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        // Seed a DAH entry first so we can prove preserve evicts it.
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        assert!(
+            !engine.dah_index().range_query(u32::MAX).is_empty(),
+            "set_conflicting should have created a DAH entry"
+        );
+
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
+
+        // In the preserve index at 5000, not before it.
+        assert!(engine.preserve_index().range_query(4999).is_empty());
+        assert_eq!(engine.preserve_index().range_query(5000), vec![key]);
+        // And the DAH entry is gone (mutual exclusion).
+        assert!(
+            engine.dah_index().range_query(u32::MAX).is_empty(),
+            "preserve_until must evict the DAH entry"
+        );
+    }
+
+    /// `preserve_until(block_height = 0)` — the replication-compensation UNDO
+    /// path — removes the record from the preserve index.
+    #[test]
+    fn preserve_until_zero_removes_from_preserve_index() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(121, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
+        assert_eq!(engine.preserve_index().range_query(5000), vec![key]);
+
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 0,
+            })
+            .unwrap();
+        assert!(
+            engine.preserve_index().range_query(u32::MAX).is_empty(),
+            "preserve_until(0) must remove the preserve entry"
+        );
+    }
+
+    /// `expire_preservation_set_dah` moves a SWEEP-ELIGIBLE record out of the
+    /// preserve index and into the DAH index in one transition (spec §3.18
+    /// Phase 3). Here eligibility comes from the CONFLICTING branch (KO-2).
+    #[test]
+    fn expire_preservation_moves_preserve_to_dah() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(122, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        // Make it CONFLICTING → sweep-eligible regardless of spent state. This
+        // also sets a DAH, which preserve_until then clears.
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
+        assert_eq!(engine.preserve_index().range_query(5000), vec![key]);
+        assert!(engine.dah_index().range_query(u32::MAX).is_empty());
+
+        // Expire at height 5000 with retention 288 -> DAH = 5288.
+        let expired = engine.expire_preservation_set_dah(&key, 5000, 288).unwrap();
+        assert!(expired, "a due preservation must expire");
+
+        // Out of the preserve index, into the DAH index.
+        assert!(
+            engine.preserve_index().range_query(u32::MAX).is_empty(),
+            "expiry must remove the preserve entry"
+        );
+        assert!(engine.dah_index().range_query(5287).is_empty());
+        assert_eq!(engine.dah_index().range_query(5288), vec![key]);
+    }
+
+    /// #25-followup (P1-A): expiry of a NON-eligible record (unspent outputs,
+    /// not conflicting) must clear `preserve_until` but set NO DAH — otherwise
+    /// it plants an immortal, never-draining DAH entry that the per-call sweep
+    /// cap can be starved by. The record reverts to the normal lifecycle (it
+    /// gets a DAH only once it later becomes all-spent + mined).
+    #[test]
+    fn expire_non_eligible_record_clears_preserve_without_setting_dah() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(140, 2); // 2 unspent UTXOs → not all-spent
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
+        assert_eq!(engine.preserve_index().range_query(5000), vec![key]);
+
+        let expired = engine.expire_preservation_set_dah(&key, 5000, 288).unwrap();
+        assert!(expired, "the preservation was due and must be cleared");
+
+        // preserve cleared on device + index...
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.preserve_until }, 0, "preserve_until must be cleared");
+        assert!(
+            engine.preserve_index().range_query(u32::MAX).is_empty(),
+            "preserve index entry must be removed",
+        );
+        // ...but NO DAH was scheduled (record is not deletable while unspent).
+        assert_eq!(
+            { meta.delete_at_height },
+            0,
+            "a non-eligible record must not be scheduled for deletion",
+        );
+        assert!(
+            engine.dah_index().range_query(u32::MAX).is_empty(),
+            "no immortal DAH entry may be planted for a non-sweepable record",
+        );
+    }
+
+    /// Deleting a preserved record removes it from the preserve index (the leak
+    /// the pre-#25 code left: a preserved record carried no DAH entry, so the
+    /// existing secondary cleanup removed nothing).
+    #[test]
+    fn delete_removes_preserved_record_from_preserve_index() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(123, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
+        assert_eq!(engine.preserve_index().range_query(5000), vec![key]);
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+        assert!(
+            engine.preserve_index().range_query(u32::MAX).is_empty(),
+            "delete must remove the preserve entry"
+        );
+    }
+
+    /// The recovery path: `rebuild_preserve_index_from_device` repopulates
+    /// the preserve index from the primary index cache alone (the authoritative
+    /// `tx_flags`/`dah_or_preserve`), with no device metadata read — proving the
+    /// in-memory index is correctly re-derivable after a crash.
+    #[test]
+    fn rebuild_preserve_index_from_device_repopulates() {
+        let engine = create_engine();
+        let (_, req_a) = make_create_req(124, 1);
+        let (_, req_b) = make_create_req(125, 1);
+        let key_a = req_a.tx_key();
+        let key_b = req_b.tx_key();
+        engine.create(&req_a).unwrap();
+        engine.create(&req_b).unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key_a,
+                block_height: 5000,
+            })
+            .unwrap();
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key_b,
+                block_height: 6000,
+            })
+            .unwrap();
+
+        // Simulate the post-crash empty index (recovery boots with an empty
+        // preserve index before the rebuild runs).
+        engine.preserve_index().clear().unwrap();
+        assert!(engine.preserve_index().range_query(u32::MAX).is_empty());
+
+        engine.rebuild_preserve_index_from_device().unwrap();
+
+        // Both preservations are back, at their correct heights.
+        assert!(engine.preserve_index().range_query(4999).is_empty());
+        assert_eq!(engine.preserve_index().range_query(5000), vec![key_a]);
+        let both = engine.preserve_index().range_query(6000);
+        assert_eq!(both.len(), 2);
+        assert!(both.contains(&key_a));
+        assert!(both.contains(&key_b));
+    }
+
+    /// The recovery-correctness guard for the redo-replay / ReplicaCreate case:
+    /// `HAS_PRESERVE_UNTIL` is an index-only flag and the redo replay writes
+    /// `preserve_until` to the DEVICE without updating the index cache, so a
+    /// cache-based rebuild would MISS such records. This test reproduces a
+    /// stale cache (device footer preserved, cache discriminant clear) and
+    /// proves the device-reading rebuild still finds the record.
+    #[test]
+    fn rebuild_preserve_index_reads_device_not_stale_cache() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(127, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Write preserve_until to the device footer ONLY, exactly as the
+        // `RedoOp::PreserveUntil` recovery replay does (device write, no
+        // `sync_index_cache`). The primary index cache therefore keeps
+        // HAS_PRESERVE_UNTIL clear and dah_or_preserve == 0 — the stale state.
+        let entry = engine.lookup(&key).expect("record exists");
+        let mut meta = engine
+            .read_metadata_fast(entry.device_id, entry.record_offset)
+            .unwrap();
+        meta.preserve_until = 7000;
+        meta.delete_at_height = 0;
+        engine
+            .write_metadata_fast(entry.device_id, entry.record_offset, &meta)
+            .unwrap();
+
+        // Sanity: the cache is stale, so no live update populated the index.
+        assert!(
+            engine.preserve_index().range_query(u32::MAX).is_empty(),
+            "precondition: device preserved but index not yet rebuilt"
+        );
+
+        // The device-reading rebuild must find it (a cache-reading rebuild
+        // would not, because HAS_PRESERVE_UNTIL is index-only and unset here).
+        engine.rebuild_preserve_index_from_device().unwrap();
+        assert_eq!(
+            engine.preserve_index().range_query(7000),
+            vec![key],
+            "rebuild must read the authoritative device footer, not the cache"
+        );
+    }
+
+    /// P1-B: deleting a record that is preserved ON DEVICE but whose cache
+    /// discriminant is stale (the post-`PreserveUntil`-replay state) must still
+    /// remove its preserve-index entry. Pre-fix the removal was gated on the
+    /// cached HAS_PRESERVE_UNTIL flag, so this delete skipped it and leaked the
+    /// `(preserve_until, txid)` entry forever.
+    #[test]
+    fn delete_removes_preserve_entry_when_cache_is_stale() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(141, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Plant the stale-cache state: device footer preserved, cache clear
+        // (exactly as a PreserveUntil redo replay leaves it).
+        let entry = engine.lookup(&key).expect("record exists");
+        let mut meta = engine
+            .read_metadata_fast(entry.device_id, entry.record_offset)
+            .unwrap();
+        meta.preserve_until = 7000;
+        meta.delete_at_height = 0;
+        engine
+            .write_metadata_fast(entry.device_id, entry.record_offset, &meta)
+            .unwrap();
+        engine.rebuild_preserve_index_from_device().unwrap();
+        assert_eq!(engine.preserve_index().range_query(7000), vec![key]);
+        // The cache still shows no preservation (the leak's precondition).
+        let cached = engine.lookup(&key).unwrap();
+        assert!(
+            !TxFlags::from_bits_truncate(cached.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL),
+            "precondition: cache discriminant is stale (clear)",
+        );
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        assert!(
+            engine.preserve_index().range_query(u32::MAX).is_empty(),
+            "delete must remove the preserve entry off the authoritative device \
+             preserve_until, not the stale cache flag",
+        );
+    }
+
+    /// Blocker (the DAH twin of `delete_removes_preserve_entry_when_cache_is_stale`,
+    /// missed in the first round): deleting a record whose DAH lives in the
+    /// backend but whose primary-cache `dah_or_preserve` is stale-0 (the
+    /// post-crash state — SecondaryDahUpdate replay / reconcile rebuild the
+    /// backend but never refresh the cache) must still remove the DAH backend
+    /// entry. Pre-fix the removal was gated on the cached height, so it no-op'd
+    /// (update_dah_index(key,0,0)) and leaked the backend entry — orphans that
+    /// clog the per-call sweep cap (#25 stall, different cause).
+    #[test]
+    fn delete_removes_dah_entry_when_cache_is_stale() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(142, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Plant the stale state: device footer carries a DAH and the DAH
+        // backend holds (H, key), but the primary cache still shows
+        // dah_or_preserve == 0 (no sync_index_cache — exactly what a
+        // SecondaryDahUpdate replay + reconcile leave behind).
+        let entry = engine.lookup(&key).expect("record exists");
+        let mut meta = engine
+            .read_metadata_fast(entry.device_id, entry.record_offset)
+            .unwrap();
+        meta.delete_at_height = 9000;
+        engine
+            .write_metadata_fast(entry.device_id, entry.record_offset, &meta)
+            .unwrap();
+        engine
+            .dah_index()
+            .insert(9000, key, None)
+            .expect("seed DAH backend");
+        assert_eq!(engine.dah_index().range_query(u32::MAX), vec![key]);
+        let cached = engine.lookup(&key).unwrap();
+        assert_eq!(
+            { cached.dah_or_preserve },
+            0,
+            "precondition: primary cache is stale-0 for the DAH height",
+        );
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        assert!(
+            engine.dah_index().range_query(u32::MAX).is_empty(),
+            "delete must remove the DAH entry off the authoritative device \
+             delete_at_height, not the stale cache",
+        );
+    }
+
+    /// `purge_aliased_index_entry` must remove the key from ALL THREE secondary
+    /// backends unconditionally by key — it holds no device meta (the footer
+    /// belongs to a different record), so it cannot trust the cache. Without a
+    /// test, a future revert to cache-gated removal in the purge path would
+    /// pass the whole suite while re-introducing the leak.
+    #[test]
+    fn purge_aliased_entry_removes_stale_secondary_backend_entries() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(143, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        // Seed backend entries WITHOUT sync_index_cache — the post-recovery
+        // state where the backends hold entries the primary cache does not
+        // reflect (the leak's precondition).
+        engine.dah_index().insert(8000, key, None).unwrap();
+        engine.preserve_index().insert(8000, key, None).unwrap();
+        engine.unmined_index().insert(500, key, None).unwrap();
+
+        let removed = engine.purge_aliased_index_entry(&key).unwrap();
+        assert!(removed, "the primary-index entry must have been purged");
+
+        assert!(
+            engine.dah_index().range_query(u32::MAX).is_empty(),
+            "purge must remove the DAH backend entry by key",
+        );
+        assert!(
+            engine.preserve_index().range_query(u32::MAX).is_empty(),
+            "purge must remove the preserve backend entry by key",
+        );
+        assert!(
+            engine.unmined_index().range_query(u32::MAX).is_empty(),
+            "purge must remove the unmined backend entry by key",
+        );
+    }
+
+    /// A record is in the DAH index XOR the preserve index, never both/neither
+    /// across the full preserve→DAH→expire lifecycle.
+    #[test]
+    fn dah_preserve_mutual_exclusion() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(126, 1);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let in_dah = |e: &Engine| e.dah_index().range_query(u32::MAX).contains(&key);
+        let in_preserve = |e: &Engine| e.preserve_index().range_query(u32::MAX).contains(&key);
+
+        // 1. set_conflicting -> DAH only.
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .unwrap();
+        assert!(in_dah(&engine) && !in_preserve(&engine), "after DAH set");
+
+        // 2. preserve_until -> preserve only.
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .unwrap();
+        assert!(
+            !in_dah(&engine) && in_preserve(&engine),
+            "after preserve_until"
+        );
+
+        // 3. expire -> DAH only again.
+        engine.expire_preservation_set_dah(&key, 5000, 288).unwrap();
+        assert!(in_dah(&engine) && !in_preserve(&engine), "after expiry");
     }
 
     #[test]

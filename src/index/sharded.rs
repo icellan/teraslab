@@ -599,24 +599,6 @@ impl ShardedIndex {
         keys
     }
 
-    /// Scan for records whose preservation window has expired.
-    ///
-    /// Returns the keys of entries whose `HAS_PRESERVE_UNTIL` flag is set
-    /// and whose `dah_or_preserve` value is non-zero and `<= current_height`.
-    /// Mirrors `Engine::scan_expired_preservations` — filters the primary
-    /// index; never touches the device.
-    pub fn scan_expired_preservations(&self, current_height: u32) -> Vec<TxKey> {
-        let mut keys = Vec::new();
-        self.for_each(|k, e| {
-            let has_preserve =
-                TxFlags::from_bits_truncate(e.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL);
-            if has_preserve && e.dah_or_preserve != 0 && e.dah_or_preserve <= current_height {
-                keys.push(k);
-            }
-        });
-        keys
-    }
-
     /// Return keys belonging to a specific cluster shard.
     ///
     /// Iterates all index shards and filters entries by

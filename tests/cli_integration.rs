@@ -4,8 +4,19 @@
 //! verifying output format and exit codes.
 
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+use std::sync::{Arc, Mutex};
+
+/// Serializes the WHOLE suite: each test holds this for its entire duration, so
+/// at most one test HTTP server (a multi-thread tokio runtime) and one CLI
+/// subprocess are alive at a time. `cargo test` otherwise runs these ~17 tests
+/// concurrently, and on a 2-core CI runner that many simultaneous server
+/// runtimes + subprocesses starve each other so badly that a server's runtime
+/// can't begin serving within the readiness timeout — the macOS flake. It also
+/// subsumes the earlier startup-only serialization (the bind→drop→rebind
+/// ephemeral-port TOCTOU). The tests are individually sub-second, so serial
+/// execution costs only a few seconds total.
+static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -22,7 +33,17 @@ static CLI_HISTOGRAMS: ThreadHistograms = ThreadHistograms::new();
 /// test. R-056 makes the gated `/admin/*` and `/debug/*` routes require it.
 const CLI_TEST_ADMIN_TOKEN: &str = "cli-integration-test-token";
 
-fn start_test_server() -> u16 {
+/// Start a test HTTP server and return its port together with a serialization
+/// guard. The CALLER MUST bind the guard (`let (port, _g) = start_test_server();`)
+/// and hold it for the whole test — that is what serializes the suite (see
+/// [`TEST_SERIAL`]). Dropping it immediately would defeat the purpose. (The
+/// returned `MutexGuard` is itself `#[must_use]`, so a bare call warns.)
+fn start_test_server() -> (u16, std::sync::MutexGuard<'static, ()>) {
+    // Take the suite-wide serial lock FIRST and hold it for the whole test (the
+    // returned guard). Recover from a poisoned lock — a panic in another test
+    // must not cascade-fail every later one.
+    let serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1_000).unwrap();
@@ -55,14 +76,63 @@ fn start_test_server() -> u16 {
     });
 
     let addr = format!("127.0.0.1:{port}");
+    let server_addr = addr.clone();
     std::thread::spawn(move || {
         // CLI integration covers /admin/* + /debug/* paths — register them.
         // R-056: gated routes need a bearer token; the CLI under test passes
         // the matching `--admin-token` so every command authenticates.
-        start_http_server(addr, state, true, Some(CLI_TEST_ADMIN_TOKEN.to_string()));
+        start_http_server(
+            server_addr,
+            state,
+            true,
+            Some(CLI_TEST_ADMIN_TOKEN.to_string()),
+        );
     });
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    port
+    // Poll until the spawned server actually SERVES an HTTP request, rather
+    // than a fixed sleep or a bare TCP connect. A 200 ms sleep flaked when the
+    // server thread had not bound the port yet; a bare `TcpStream::connect`
+    // also flaked because the kernel completes the TCP handshake from the
+    // listen backlog BEFORE axum's accept loop is running — so the connect
+    // succeeds while the first real HTTP request still races the (contended,
+    // on macOS) runtime startup and gets a reset / no response, and the CLI
+    // exits non-zero. Doing a full HTTP round-trip here proves axum is
+    // processing requests before the test's CLI runs. `/health` is
+    // unauthenticated; ANY HTTP status line (even an error) means the server
+    // is serving.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if http_server_responds(&addr) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test HTTP server did not serve an HTTP response on {addr} within 10s",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    (port, serial)
+}
+
+/// Open a connection, send a minimal HTTP/1.1 GET, and return `true` once a
+/// status line (`HTTP/…`) comes back — i.e. axum is actually serving, not just
+/// bound. Any failure (connect, write, read, timeout, non-HTTP bytes) is
+/// `false` so the caller keeps polling.
+fn http_server_responds(addr: &str) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = std::net::TcpStream::connect(addr) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+    let req = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => buf[..n].starts_with(b"HTTP/"),
+        _ => false,
+    }
 }
 
 fn cli_bin() -> String {
@@ -96,7 +166,7 @@ fn run_cli(port: u16, args: &[&str]) -> (String, String, i32) {
 
 #[test]
 fn cli_status_returns_overview() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["status"]);
     assert_eq!(code, 0);
     assert!(
@@ -108,7 +178,7 @@ fn cli_status_returns_overview() {
 
 #[test]
 fn cli_status_json_is_valid() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["--json", "status"]);
     assert_eq!(code, 0);
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
@@ -119,7 +189,7 @@ fn cli_status_json_is_valid() {
 
 #[test]
 fn cli_nodes_lists_nodes() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["nodes"]);
     assert_eq!(code, 0);
     assert!(
@@ -130,7 +200,7 @@ fn cli_nodes_lists_nodes() {
 
 #[test]
 fn cli_storage_shows_utilization() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["storage"]);
     assert_eq!(code, 0);
     assert!(
@@ -141,7 +211,7 @@ fn cli_storage_shows_utilization() {
 
 #[test]
 fn cli_memory_shows_breakdown() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["memory"]);
     assert_eq!(code, 0);
     assert!(
@@ -152,7 +222,7 @@ fn cli_memory_shows_breakdown() {
 
 #[test]
 fn cli_records_shows_inventory() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["records"]);
     assert_eq!(code, 0);
     assert!(
@@ -163,7 +233,7 @@ fn cli_records_shows_inventory() {
 
 #[test]
 fn cli_record_not_found() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let txid = "0000000000000000000000000000000000000000000000000000000000000000";
     let (_, stderr, code) = run_cli(port, &["record", txid]);
     assert_ne!(code, 0);
@@ -175,7 +245,7 @@ fn cli_record_not_found() {
 
 #[test]
 fn cli_index_shows_stats() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["index"]);
     assert_eq!(code, 0);
     assert!(
@@ -190,7 +260,7 @@ fn cli_index_shows_stats() {
 
 #[test]
 fn cli_replication_shows_status() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["replication"]);
     assert_eq!(code, 0);
     assert!(
@@ -201,7 +271,7 @@ fn cli_replication_shows_status() {
 
 #[test]
 fn cli_redo_shows_info() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["redo"]);
     assert_eq!(code, 0);
     assert!(
@@ -212,7 +282,7 @@ fn cli_redo_shows_info() {
 
 #[test]
 fn cli_log_level_get() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["log-level"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("info"), "stdout: {stdout}");
@@ -220,7 +290,7 @@ fn cli_log_level_get() {
 
 #[test]
 fn cli_log_level_set() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["log-level", "debug"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("debug"), "stdout: {stdout}");
@@ -228,7 +298,7 @@ fn cli_log_level_set() {
 
 #[test]
 fn cli_healthcheck_returns_zero_exit_code() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let (stdout, _, code) = run_cli(port, &["healthcheck"]);
     assert_eq!(code, 0, "healthcheck should succeed, stdout: {stdout}");
 }
@@ -281,7 +351,7 @@ fn cli_removed_noop_flags_are_rejected() {
 
 #[test]
 fn cli_all_commands_json_valid() {
-    let port = start_test_server();
+    let (port, _serial) = start_test_server();
     let commands = vec![
         vec!["status"],
         vec!["nodes"],
