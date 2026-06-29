@@ -34,6 +34,7 @@ pub mod recovery;
 pub mod redo;
 pub mod redo_group;
 pub mod replication;
+pub mod segment_allocator;
 pub mod server;
 pub mod storage;
 pub mod subdevice;

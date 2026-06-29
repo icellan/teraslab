@@ -11318,7 +11318,8 @@ mod tests {
         // children-block write MUST read-modify-write to preserve the neighbour.
         // A bare aligned write zeroes the neighbour → CRC mismatch on read (seen
         // via prune_slot_if_spent_by_child: "record corruption: CRC mismatch").
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
         alloc.set_packed(true);
         let engine = Engine::new(
@@ -11348,7 +11349,11 @@ mod tests {
             back[..800].iter().all(|&b| b == sentinel),
             "neighbour prefix must be preserved by RMW, not zeroed"
         );
-        assert_eq!(&back[800..832], &child, "children written at the packed offset");
+        assert_eq!(
+            &back[800..832],
+            &child,
+            "children written at the packed offset"
+        );
         assert!(
             back[832..4096].iter().all(|&b| b == sentinel),
             "neighbour suffix must be preserved by RMW, not zeroed"
