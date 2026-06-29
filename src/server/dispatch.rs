@@ -8051,6 +8051,16 @@ fn handle_delete_batch(
         key: TxKey,
         offset: u32,
     }
+    // The per-record compensation snapshot (extra read_metadata + read_slots +
+    // blob fetch per item) is ONLY consumed to roll a delete back when a
+    // REPLICATION fan-out fails. On a single node — or a clustered node with
+    // replication_factor == 1 and no migration in flight — no replication runs,
+    // so the snapshot can never be used. Skip building it there: that removes
+    // two device reads (and a possible blob fetch) per deleted item from the hot
+    // path. (Mirrors the rf>1/migration predicate used elsewhere in dispatch.)
+    let needs_snapshot = cluster.is_some_and(|c| {
+        c.shard_table().read().replication_factor() > 1 || c.migration_pressure_active()
+    });
     let mut valid_items: Vec<ValidDelete> = Vec::new();
     'items: for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
@@ -8059,11 +8069,14 @@ fn handle_delete_batch(
         }
         let key = TxKey { txid: *txid };
         let record_offset = engine.lookup(&key).map(|e| e.record_offset).unwrap_or(0);
-        let record_size = if record_offset == 0 {
-            0
+        // Read the record metadata ONCE — it yields the record_size, the
+        // EXTERNAL flag (for the always-on blob guard below), and the base for
+        // the compensation snapshot — instead of reading it twice.
+        let meta = if record_offset == 0 {
+            None
         } else {
             match engine.read_metadata(&key) {
-                Ok(meta) => ({ meta.record_size }) as u64,
+                Ok(m) => Some(m),
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
@@ -8074,12 +8087,46 @@ fn handle_delete_batch(
                 }
             }
         };
-        // Snapshot the record for compensation. Read metadata + every
-        // slot's full state (hash + status + spending_data). R-007: a
-        // partial snapshot — utxo_hashes only — meant a compensation
-        // recreated previously-spent slots as UNSPENT, allowing a
-        // double-spend immediately after a failed delete.
-        let snapshot = if let Ok(meta) = engine.read_metadata(&key) {
+        let record_size = meta
+            .as_ref()
+            .map(|m| ({ m.record_size }) as u64)
+            .unwrap_or(0);
+        let is_external = meta
+            .as_ref()
+            .map(|m| m.flags.contains(crate::record::TxFlags::EXTERNAL))
+            .unwrap_or(false);
+
+        // External-blob guard — enforced ALWAYS, independent of replication: a
+        // delete must never remove an external record whose cold blob is
+        // missing (the record would be unrecoverable). For external records we
+        // fetch the blob here; it doubles as the compensation snapshot's
+        // `cold_data` when replication is active. Non-external records (the
+        // common path) pay nothing.
+        let cold_data = if is_external {
+            engine
+                .blob_store()
+                .and_then(|bs| bs.get(&key.txid).ok().flatten())
+        } else {
+            None
+        };
+        if is_external && cold_data.is_none() {
+            errors.push(BatchItemError {
+                item_index: i as u32,
+                error_code: ERR_STORAGE_IO,
+                error_data: b"delete external blob snapshot missing".to_vec(),
+            });
+            continue;
+        }
+
+        // Compensation snapshot (metadata bytes + every slot's full state +
+        // cold blob) for replication rollback. R-007: a partial snapshot —
+        // utxo_hashes only — recreated previously-spent slots as UNSPENT on
+        // rollback, opening a double-spend window; capture full per-slot state.
+        // Built ONLY when replication can roll back (`needs_snapshot`); on the
+        // single-node path the slot read would be pure waste.
+        let snapshot = if !needs_snapshot {
+            None
+        } else if let Some(meta) = meta.as_ref() {
             let slots = match engine.read_slots(&key) {
                 Ok(slots) => slots
                     .into_iter()
@@ -8122,14 +8169,6 @@ fn handle_delete_batch(
             meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
             meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
-            let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
-                engine
-                    .blob_store()
-                    .and_then(|bs| bs.get(&key.txid).ok().flatten())
-            } else {
-                None
-            };
-
             if slots.len() != meta.utxo_count as usize {
                 None
             } else {
@@ -8138,24 +8177,12 @@ fn handle_delete_batch(
                     master_generation: { meta.generation },
                     slots,
                     cold_data,
-                    is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
+                    is_external,
                 })
             }
         } else {
             None
         };
-
-        if snapshot
-            .as_ref()
-            .is_some_and(|snap| snap.is_external && snap.cold_data.is_none())
-        {
-            errors.push(BatchItemError {
-                item_index: i as u32,
-                error_code: ERR_STORAGE_IO,
-                error_data: b"delete external blob snapshot missing".to_vec(),
-            });
-            continue;
-        }
 
         // R-119: deleting a child transaction must first make every
         // parent slot spent by that child terminal (`PRUNED`), replacing
@@ -8248,6 +8275,12 @@ fn handle_delete_batch(
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
     let mut deleted_snapshots: Vec<(TxKey, DeleteSnapshot)> = Vec::new();
+    // Derived redb tombstone-index rows for the whole batch, committed in ONE
+    // redb transaction after the apply loop (see `record_tombstone_index_batch`)
+    // instead of one commit per deleted item — the dominant per-delete cost
+    // profiling exposed once the fsyncs were gone. `(key, deletion_height,
+    // generation, cause)`; the engine derives the shard.
+    let mut tombstone_index_rows: Vec<(TxKey, u32, u32, u8)> = Vec::new();
     for v in valid_items.iter() {
         let mut item_prune_ops: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
         let mut item_prune_before: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
@@ -8298,13 +8331,24 @@ fn handle_delete_batch(
         if item_failed {
             continue;
         }
-        match engine.delete_returning_tombstone(&DeleteRequest {
+        match engine.delete_returning_tombstone_deferred(&DeleteRequest {
             tx_key: v.key,
             due_guard: sweep_due_height,
         }) {
             Ok(tombstone_info) => {
                 repl_ops_by_key.extend(item_prune_ops);
                 before_images_by_key.extend(item_prune_before);
+                // Accumulate the derived redb tombstone-index row for the
+                // single batched commit below (the per-item insert was deferred
+                // by `delete_returning_tombstone_deferred`).
+                if let Some(info) = tombstone_info.as_ref() {
+                    tombstone_index_rows.push((
+                        v.key,
+                        info.deletion_height,
+                        info.generation,
+                        info.cause.as_u8(),
+                    ));
+                }
                 // Deletion-tombstone §6: emit `DeleteV2` carrying the SAME
                 // tombstone fields the master's own delete recorded, so the
                 // replica writes a matching tombstone and self-purges on its
@@ -8342,6 +8386,12 @@ fn handle_delete_batch(
             }
         }
     }
+    // Fold every successfully-deleted record's derived tombstone-index row into
+    // ONE redb write transaction (instead of one commit per item inside the
+    // apply loop). The redb index is derived from the durable tombstone log, so
+    // this batched, deferred population changes no durability guarantee.
+    engine.record_tombstone_index_batch(&tombstone_index_rows);
+
     // Collect snapshots for successfully deleted records.
     for v in valid_items {
         if let Some(snap) = v.snapshot

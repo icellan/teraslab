@@ -6905,7 +6905,7 @@ impl Engine {
         // so it never re-tombstones a key whose tombstone already exists and
         // tolerates an already-free region. The hot path passes
         // `tolerate_already_free = false`: a double-free here is a real bug.
-        self.delete_inner(req, self.tombstone_write_active(), false)
+        self.delete_inner(req, self.tombstone_write_active(), false, false)
             .map(|_| ())
     }
 
@@ -6927,7 +6927,67 @@ impl Engine {
         &self,
         req: &DeleteRequest,
     ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
-        self.delete_inner(req, self.tombstone_write_active(), false)
+        self.delete_inner(req, self.tombstone_write_active(), false, false)
+    }
+
+    /// Like [`Self::delete_returning_tombstone`] but DEFERS the derived redb
+    /// tombstone-index insert: everything else (durable tombstone-log append,
+    /// header tombstoning, primary-index removal, allocator free) happens
+    /// exactly as in the non-deferred path, but the redb row is NOT written
+    /// here. The batch delete path uses this so a whole batch's tombstone rows
+    /// can be folded into ONE redb write transaction via
+    /// [`Self::record_tombstone_index_batch`] instead of one commit per item
+    /// (the dominant per-delete cost after the fsyncs were removed).
+    ///
+    /// The caller reconstructs the redb row from the returned
+    /// [`DeleteTombstoneInfo`] plus the key (the shard is derived from the key,
+    /// identical to what the non-deferred path computes), so deferring loses no
+    /// information. The redb index is a DERIVED structure (rebuilt from the
+    /// durable tombstone log on recovery), so deferring its population to a
+    /// post-apply batch commit changes no durability guarantee.
+    ///
+    /// # Errors
+    /// Same as [`Self::delete_returning_tombstone`].
+    pub fn delete_returning_tombstone_deferred(
+        &self,
+        req: &DeleteRequest,
+    ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
+        self.delete_inner(req, self.tombstone_write_active(), false, true)
+    }
+
+    /// Batch-insert the derived redb tombstone-index rows for a completed delete
+    /// batch in a SINGLE redb write transaction.
+    ///
+    /// `rows` are `(key, deletion_height, generation, cause)` for each
+    /// successfully deleted record (as returned by
+    /// [`Self::delete_returning_tombstone_deferred`]). The shard is derived from
+    /// the key here, matching [`Self::append_delete_tombstone`]'s computation.
+    /// A no-op when no tombstone index is attached or `rows` is empty. A failure
+    /// is logged but NOT fatal — the durable tombstone log already carries every
+    /// tombstone, so recovery `rebuild_from` reconstructs any missing index row
+    /// (same contract as the per-item insert it replaces).
+    pub fn record_tombstone_index_batch(&self, rows: &[(TxKey, u32, u32, u8)]) {
+        if rows.is_empty() {
+            return;
+        }
+        let Some(idx) = self.tombstone_index.get() else {
+            return;
+        };
+        let redb_rows: Vec<(TxKey, u32, u32, u16, u8)> = rows
+            .iter()
+            .map(|&(key, deletion_height, generation, cause)| {
+                let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+                (key, deletion_height, generation, shard, cause)
+            })
+            .collect();
+        if let Err(e) = idx.lock().insert_many(&redb_rows) {
+            tracing::warn!(
+                err = %e,
+                rows = redb_rows.len(),
+                "batched delete: tombstone redb-index insert failed; log carries the \
+                 tombstones and recovery will re-derive the index rows",
+            );
+        }
     }
 
     /// Internal delete with explicit tombstone control.
@@ -6961,6 +7021,7 @@ impl Engine {
         req: &DeleteRequest,
         write_tombstone: bool,
         tolerate_already_free: bool,
+        defer_index: bool,
     ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
@@ -7156,7 +7217,14 @@ impl Engine {
         // reconstruct the missing row. Failing the whole delete after the
         // primary-index removal already committed would leave the caller a
         // spurious error for an operation that did, in fact, complete.
-        if let Some((key, value)) = tombstone_to_index
+        //
+        // DEFERRED PATH: when `defer_index` is set (batch delete), the caller
+        // folds every row into one redb transaction via
+        // `record_tombstone_index_batch` after the apply loop, so skip the
+        // per-item insert here. The returned `DeleteTombstoneInfo` carries the
+        // fields the caller needs to rebuild the row.
+        if !defer_index
+            && let Some((key, value)) = tombstone_to_index
             && let Some(idx) = self.tombstone_index.get()
             && let Err(e) = idx.lock().insert(
                 key,
@@ -7231,7 +7299,7 @@ impl Engine {
     ///
     /// [`DoubleFree`]: crate::allocator::AllocatorError::DoubleFree
     pub(crate) fn delete_for_purge(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, false, true).map(|_| ())
+        self.delete_inner(req, false, true, false).map(|_| ())
     }
 
     /// BUG-1 fix #4: drop a CORRUPT, aliased primary-index entry whose
@@ -17717,6 +17785,74 @@ mod tests {
         assert!(engine.lookup(&key).is_none(), "record still removed");
         assert!(!idx.lock().is_tombstoned(&key));
         assert!(log.lock().scan().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deferred_delete_defers_redb_index_then_batch_populates_it() {
+        // Batched-delete fix: `delete_returning_tombstone_deferred` does the full
+        // durable delete (tombstone-log append + record removal) but SKIPS the
+        // per-item redb index insert; the handler then folds every row into one
+        // `record_tombstone_index_batch` commit. Assert: (1) the index row is
+        // NOT present immediately after the deferred delete, (2) the durable log
+        // DID record it and the record is gone, (3) the batch call populates the
+        // index with the exact fields (generation + key-derived shard).
+        let engine = create_engine();
+        let (log, idx, _dir) = wire_tombstones(&engine);
+
+        let mut rows: Vec<(TxKey, u32, u32, u8)> = Vec::new();
+        let mut expected: Vec<(TxKey, u32)> = Vec::new();
+        for n in [150u8, 151] {
+            let (_, req) = make_create_req(n, 3);
+            let key = req.tx_key();
+            engine.create(&req).unwrap();
+            let generation = engine.lookup(&key).unwrap().generation;
+            let info = engine
+                .delete_returning_tombstone_deferred(&DeleteRequest {
+                    tx_key: key,
+                    due_guard: None,
+                })
+                .unwrap()
+                .expect("tombstone written → Some(info)");
+            // Deferred: redb row not written yet ...
+            assert!(
+                !idx.lock().is_tombstoned(&key),
+                "redb index insert is deferred to the batch commit"
+            );
+            // ... but the durable log recorded it and the record is gone.
+            assert!(engine.lookup(&key).is_none(), "record removed");
+            rows.push((
+                key,
+                info.deletion_height,
+                info.generation,
+                info.cause.as_u8(),
+            ));
+            expected.push((key, generation));
+        }
+        assert_eq!(
+            log.lock().scan().unwrap().len(),
+            2,
+            "durable log (source of truth) carries both tombstones pre-batch"
+        );
+        assert_eq!(
+            idx.lock().len(),
+            0,
+            "index still empty before the batch commit"
+        );
+
+        // One batched commit populates the index with the exact fields.
+        engine.record_tombstone_index_batch(&rows);
+        assert_eq!(idx.lock().len(), 2);
+        for (key, generation) in expected {
+            assert!(idx.lock().is_tombstoned(&key));
+            let v = idx.lock().get(&key).expect("row present after batch");
+            assert_eq!(v.generation, generation);
+            assert_eq!(
+                v.shard,
+                crate::cluster::shards::ShardTable::shard_for_key(&key),
+                "shard derived from the key, matching the per-item path"
+            );
+            assert_eq!(v.cause, crate::tombstone::TombstoneCause::Admin.as_u8());
+        }
     }
 
     /// Build an engine whose DATA device, REDO device, and TOMBSTONE-log device

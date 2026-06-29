@@ -156,14 +156,36 @@ impl RedbTombstoneIndex {
         shard: u16,
         cause: u8,
     ) -> Result<(), TombstoneIndexError> {
-        let value = TombstoneIndexValue {
-            deletion_height,
-            generation,
-            shard,
-            cause,
-        };
+        self.insert_many(&[(key, deletion_height, generation, shard, cause)])
+    }
+
+    /// Insert (or overwrite) many tombstone rows in a SINGLE write transaction.
+    ///
+    /// This is the batched form of [`Self::insert`]: it opens one redb write
+    /// transaction, applies every `(key, deletion_height, generation, shard,
+    /// cause)` row, and commits once — instead of one transaction+commit per
+    /// row. The deletion hot path uses it to fold a whole delete batch's
+    /// tombstone-index rows into one commit (≈N× fewer redb commits per batch),
+    /// which `sample`-profiling showed was the dominant remaining delete cost
+    /// once the per-delete fsyncs were removed. Per-row semantics are identical
+    /// to [`Self::insert`]: idempotent on `key` (re-inserting replaces the prior
+    /// value and fixes the height-forward entry), and the cached count
+    /// increments only for keys not already present (reads-your-writes within
+    /// the transaction makes a duplicate key inside `rows` a no-op for the
+    /// count). A no-op for an empty slice.
+    ///
+    /// # Errors
+    /// [`TombstoneIndexError::Redb`] on any redb failure; the transaction is
+    /// dropped (rolled back) so the index is unchanged on error.
+    pub fn insert_many(
+        &mut self,
+        rows: &[(TxKey, u32, u32, u16, u8)],
+    ) -> Result<(), TombstoneIndexError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let txn = self.begin_write().map_err(|e| redb_err("begin", e))?;
-        let mut was_new = false;
+        let mut added = 0usize;
         {
             let mut table = txn
                 .open_table(TOMBSTONES)
@@ -172,29 +194,36 @@ impl RedbTombstoneIndex {
                 .open_table(TOMBSTONES_BY_HEIGHT)
                 .map_err(|e| redb_err("table", e))?;
 
-            // Remove any stale height-forward entry if the key already exists
-            // at a different height.
-            if let Some(prev) = table.get(key.txid).map_err(|e| redb_err("get", e))? {
-                let prev_val = TombstoneIndexValue::decode(&prev.value());
-                drop(prev);
-                by_height
-                    .remove(make_height_key(prev_val.deletion_height, &key))
-                    .map_err(|e| redb_err("remove", e))?;
-            } else {
-                was_new = true;
-            }
+            for &(key, deletion_height, generation, shard, cause) in rows {
+                let value = TombstoneIndexValue {
+                    deletion_height,
+                    generation,
+                    shard,
+                    cause,
+                };
+                // Remove any stale height-forward entry if the key already
+                // exists at a different height (reads-your-writes within the
+                // txn, so an earlier row in this same batch counts as present).
+                if let Some(prev) = table.get(key.txid).map_err(|e| redb_err("get", e))? {
+                    let prev_val = TombstoneIndexValue::decode(&prev.value());
+                    drop(prev);
+                    by_height
+                        .remove(make_height_key(prev_val.deletion_height, &key))
+                        .map_err(|e| redb_err("remove", e))?;
+                } else {
+                    added += 1;
+                }
 
-            table
-                .insert(key.txid, value.encode())
-                .map_err(|e| redb_err("insert", e))?;
-            by_height
-                .insert(make_height_key(deletion_height, &key), ())
-                .map_err(|e| redb_err("insert", e))?;
+                table
+                    .insert(key.txid, value.encode())
+                    .map_err(|e| redb_err("insert", e))?;
+                by_height
+                    .insert(make_height_key(deletion_height, &key), ())
+                    .map_err(|e| redb_err("insert", e))?;
+            }
         }
         txn.commit().map_err(|e| redb_err("commit", e))?;
-        if was_new {
-            self.count += 1;
-        }
+        self.count += added;
         Ok(())
     }
 
@@ -508,6 +537,59 @@ mod tests {
         assert_eq!(v.shard, 3);
         assert_eq!(v.cause, TombstoneCause::SpentDah.as_u8());
         assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn insert_many_round_trips_counts_and_is_idempotent() {
+        let (_dir, mut idx) = open_temp();
+        // One batched transaction with three distinct keys.
+        idx.insert_many(&[
+            (key(1), 100, 1, 3, TombstoneCause::SpentDah.as_u8()),
+            (key(2), 110, 2, 3, TombstoneCause::Admin.as_u8()),
+            (key(3), 120, 3, 4, TombstoneCause::SpentDah.as_u8()),
+        ])
+        .unwrap();
+        assert_eq!(idx.len(), 3, "three new keys counted once each");
+        for (k, h, g) in [(key(1), 100u32, 1u32), (key(2), 110, 2), (key(3), 120, 3)] {
+            let v = idx.get(&k).expect("row present after batch insert");
+            assert_eq!(v.deletion_height, h);
+            assert_eq!(v.generation, g);
+        }
+        // Equivalent to per-row inserts: max height reflects the batch, and a
+        // height-forward GC below 115 removes exactly the two rows < 115.
+        assert_eq!(idx.max_deletion_height().unwrap(), Some(120));
+
+        // Re-inserting an existing key in a batch overwrites (no count change),
+        // and a duplicate key WITHIN the batch is counted once (reads-your-
+        // writes inside the transaction).
+        idx.insert_many(&[
+            (key(2), 999, 9, 3, TombstoneCause::Admin.as_u8()), // overwrite existing
+            (key(4), 130, 4, 5, TombstoneCause::Admin.as_u8()), // new
+            (key(4), 131, 5, 5, TombstoneCause::SpentDah.as_u8()), // dup-in-batch
+        ])
+        .unwrap();
+        assert_eq!(
+            idx.len(),
+            4,
+            "one new key (key4); key2 overwrite + dup not double-counted"
+        );
+        assert_eq!(
+            idx.get(&key(2)).unwrap().deletion_height,
+            999,
+            "overwrite applied"
+        );
+        assert_eq!(
+            idx.get(&key(4)).unwrap().deletion_height,
+            131,
+            "last dup wins"
+        );
+    }
+
+    #[test]
+    fn insert_many_empty_is_noop() {
+        let (_dir, mut idx) = open_temp();
+        idx.insert_many(&[]).unwrap();
+        assert!(idx.is_empty());
     }
 
     #[test]
