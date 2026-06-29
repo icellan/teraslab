@@ -339,25 +339,46 @@ impl CacheState {
         Ok(Arc::from(&buf[..len]))
     }
 
-    /// Evict the least-recently-used block from a full shard, flushing it first
-    /// if it is dirty (write-back). Caller holds the shard lock.
+    /// Evict the least-recently-used block from a full shard. Caller holds the
+    /// shard lock.
+    ///
+    /// PREFER-CLEAN: a clean block can be dropped with no device I/O, so the LRU
+    /// **clean** block is evicted first. Only when every resident block is dirty
+    /// (the background writeback flusher has not yet drained any block in this
+    /// shard) does eviction fall back to flushing the LRU dirty victim — a
+    /// synchronous `pwrite` under the shard lock. This keeps the common eviction
+    /// off the device-write path, so a read or write inserting into a full shard
+    /// no longer stalls every other op on that shard behind a flush (the per-op
+    /// tail source profiled in bench/results/20260629-local-profile). Eviction is
+    /// a pure performance heuristic, so preferring clean over strictly-oldest is
+    /// always safe.
     fn evict_if_full(&self, shard: &mut Shard) -> Result<()> {
         while shard.blocks.len() >= shard.cap {
+            // Fast path: drop the LRU CLEAN block — no flush, no device I/O.
+            let clean_victim = shard
+                .blocks
+                .iter()
+                .filter(|(_, b)| !b.dirty)
+                .min_by_key(|(_, b)| b.last_used)
+                .map(|(idx, _)| *idx);
+            if let Some(idx) = clean_victim {
+                // Clean block: not in the dirty worklist, nothing to flush.
+                shard.blocks.remove(&idx);
+                continue;
+            }
+            // Every resident block is dirty — flush the LRU dirty victim under
+            // the lock. Remove first; if the flush fails, re-insert so we don't
+            // lose the dirty bytes (the caller surfaces the error). Keep the
+            // dirty set in lockstep.
             let victim = shard
                 .blocks
                 .iter()
                 .min_by_key(|(_, b)| b.last_used)
                 .map(|(idx, _)| *idx);
             let Some(idx) = victim else { break };
-            // Remove first; if the flush fails, re-insert so we don't lose the
-            // dirty bytes (the caller surfaces the error). Keep the dirty set in
-            // lockstep: removing the block clears its entry, and a re-inserted
-            // dirty victim re-adds it.
             let block = shard.blocks.remove(&idx).expect("victim present");
             shard.dirty.remove(&idx);
-            if block.dirty
-                && let Err(e) = self.flush_block(idx, &block.data)
-            {
+            if let Err(e) = self.flush_block(idx, &block.data) {
                 shard.dirty.insert(idx);
                 shard.blocks.insert(idx, block);
                 return Err(e);
@@ -722,6 +743,132 @@ mod tests {
         let mut b = AlignedBuf::new(len, BS);
         cache.pread(&mut b[..], off).unwrap();
         b[..].to_vec()
+    }
+
+    /// Build a bare single-shard `CacheState` (no background flusher, no flush
+    /// pool) so eviction policy can be exercised deterministically — the
+    /// production `shard_count` is `cores*16`, which makes per-shard placement
+    /// non-deterministic in a test.
+    fn one_shard_state(inner: Arc<dyn BlockDevice>, cap: usize, writeback: bool) -> CacheState {
+        CacheState {
+            inner,
+            block_size: BS,
+            writeback,
+            shards: vec![Mutex::new(Shard {
+                blocks: std::collections::HashMap::new(),
+                dirty: std::collections::HashSet::new(),
+                tick: 0,
+                cap,
+            })]
+            .into_boxed_slice(),
+            shard_count: 1,
+            flush_pool: None,
+        }
+    }
+
+    fn put_block(shard: &mut Shard, idx: u64, byte: u8, dirty: bool, last_used: u64) {
+        let data: Arc<[u8]> = vec![byte; BS].into();
+        shard.blocks.insert(
+            idx,
+            Block {
+                data,
+                dirty,
+                last_used,
+            },
+        );
+        if dirty {
+            shard.dirty.insert(idx);
+        }
+    }
+
+    #[test]
+    fn evict_prefers_clean_victim_over_older_dirty_no_flush_under_lock() {
+        // A full shard holding one dirty (LRU/oldest) + one clean (newer) block.
+        // Pure-LRU would evict+FLUSH the dirty block under the lock; the fix must
+        // instead evict the CLEAN block with NO device write.
+        let dev = CountingDev::new(64 * BS, BS);
+        let state = one_shard_state(dev.clone(), 2, true);
+        let mut shard = state.shards[0].lock();
+        put_block(&mut shard, 0, 0xAA, true, 1); // dirty, oldest
+        put_block(&mut shard, 1, 0xBB, false, 2); // clean, newer
+        state.evict_if_full(&mut shard).unwrap();
+        assert!(
+            shard.blocks.contains_key(&0),
+            "dirty block must be retained (not flushed/evicted)"
+        );
+        assert!(
+            !shard.blocks.contains_key(&1),
+            "clean block must be the eviction victim"
+        );
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            0,
+            "no device write under the shard lock when a clean victim exists"
+        );
+        assert!(
+            shard.dirty.contains(&0),
+            "dirty worklist still tracks the retained dirty block"
+        );
+    }
+
+    #[test]
+    fn evict_flushes_lru_dirty_victim_when_no_clean_block_exists() {
+        // Fallback: every resident block is dirty → eviction MUST flush the LRU
+        // dirty victim under the lock (correctness preserved), exactly once.
+        let dev = CountingDev::new(64 * BS, BS);
+        let state = one_shard_state(dev.clone(), 2, true);
+        let mut shard = state.shards[0].lock();
+        put_block(&mut shard, 0, 0xAA, true, 1); // dirty, oldest
+        put_block(&mut shard, 1, 0xBB, true, 2); // dirty, newer
+        state.evict_if_full(&mut shard).unwrap();
+        assert!(
+            !shard.blocks.contains_key(&0),
+            "LRU dirty victim is evicted when no clean block is available"
+        );
+        assert!(
+            shard.blocks.contains_key(&1),
+            "newer dirty block is retained"
+        );
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            1,
+            "exactly one device write to flush the dirty victim"
+        );
+        assert_eq!(
+            read_inner(&dev, 0, BS),
+            vec![0xAA; BS],
+            "the victim's dirty bytes were flushed to the device (no data loss)"
+        );
+        assert!(
+            !shard.dirty.contains(&0),
+            "flushed victim is removed from the dirty worklist"
+        );
+    }
+
+    #[test]
+    fn clean_eviction_then_reread_reloads_correct_bytes() {
+        // cap=1 single shard: reading a second block evicts the first (clean,
+        // read-only) block with no flush; re-reading it reloads correct bytes.
+        let dev = CountingDev::new(64 * BS, BS);
+        dev.inner.pwrite(&ab(0x11, BS), 0).unwrap();
+        dev.inner.pwrite(&ab(0x22, BS), BS as u64).unwrap();
+        let state = one_shard_state(dev.clone(), 1, true);
+        let mut b = AlignedBuf::new(BS, BS);
+        state.pread(&mut b[..], 0).unwrap();
+        assert_eq!(b[..].to_vec(), vec![0x11; BS]);
+        state.pread(&mut b[..], BS as u64).unwrap(); // evicts clean block 0
+        assert_eq!(b[..].to_vec(), vec![0x22; BS]);
+        assert_eq!(
+            dev.writes.load(Ordering::Relaxed),
+            0,
+            "evicting clean read-only blocks needs no device write"
+        );
+        state.pread(&mut b[..], 0).unwrap(); // block 0 was evicted → reload
+        assert_eq!(
+            b[..].to_vec(),
+            vec![0x11; BS],
+            "evicted clean block reloads correct bytes from the device"
+        );
     }
 
     #[test]
