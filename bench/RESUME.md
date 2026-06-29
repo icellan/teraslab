@@ -89,7 +89,22 @@ HashSet (lockstep w/ Block.dirty, invariant-tested). Server flush CPU 6.5→3.4
 cores; throughput NEUTRAL (~28k, cap is locks not flush-CPU). cargo test --all 0
 failed. Kept for efficiency/headroom.
 
-**NEXT LEVER — the ~1.4× gap is LOCK CONTENTION (futex), profiled.** futex-caller
+**CORRECTION (read the code): the "encode-under-lock" hypothesis is WRONG — redo
+encode is ALREADY outside the lock (E7 optimization in `redo_group.rs::commit`:
+`pre_encode` runs lock-free, only an O(1) finalize/memcpy runs under the per-store
+log lock).** So the futex wait is on the per-store redo log lock ITSELF (only 4
+locks for ~115k writes/s; device_split>4 tested WORSE) + distributed index/cache
+locks on the read path (`handle_get_batch` waits on futex with NO redo involved →
+index/cache lock, not redo). The remaining ~1.4× is **distributed lock contention
+across a write/read path whose individual locks are ALREADY optimized** (redo E7,
+index lock_stripes=65536, cache sharded cores*16 + dirty-index). No single cheap
+fix remains; closing it likely needs deeper architecture — lock-free / per-thread
+redo append buffers merged at flush, or reducing the number of distinct locks each
+op takes (index+redo+cache+allocator per create). Treat as a DEEP change: prototype
++ profile + measure carefully; the gap is not yet proven fundamental but the easy
+levers are exhausted.
+
+**[earlier, now corrected] NEXT LEVER — the ~1.4× gap is LOCK CONTENTION (futex), profiled.** futex-caller
 profile (bench/results/20260628-recipe-chain/futex-callers.txt) ranks the contended
 sites: dispatch `handle_request`/`handle_create_batch`/`handle_get_batch`/
 `handle_spend_batch` + **redo** (`RedoOp::serialize_data`, `RedoEntry::pre_encode`,
