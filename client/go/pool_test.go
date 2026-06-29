@@ -335,3 +335,36 @@ func TestCheckHealthSkipsConnWithInflight(t *testing.T) {
 		t.Fatal("in-flight request did not complete")
 	}
 }
+
+// TestRecordProbeRequiresConsecutiveFailures is the regression test for the
+// pooled-path GET-failure race (bench/results/20260629-local-profile/
+// GET_FAILURE_ROOTCAUSE.md): a single transient health-probe timeout — which
+// happens when an "idle" connection is handed a burst of pipelined requests
+// right as the health checker pings it — must NOT mark the connection dead.
+// Killing it on one false timeout closed the connection out from under those
+// just-dispatched requests, failing their in-flight GetRecordBatch.
+func TestRecordProbeRequiresConsecutiveFailures(t *testing.T) {
+	c := &pipeConn{}
+	if c.recordProbe(false) {
+		t.Fatal("a single probe failure must NOT mark the connection dead (transient timeout under load)")
+	}
+	if !c.recordProbe(false) {
+		t.Fatalf("two consecutive probe failures must mark the connection dead (threshold=%d)", probeFailThreshold)
+	}
+
+	// A success resets the streak: a conn that fails once, recovers, then fails
+	// once more must not be killed (the two failures were not consecutive).
+	r := &pipeConn{}
+	if r.recordProbe(false) {
+		t.Fatal("first failure must not be dead")
+	}
+	if r.recordProbe(true) {
+		t.Fatal("a successful probe must never report dead")
+	}
+	if r.recordProbe(false) {
+		t.Fatal("after a success reset, a lone failure must not be dead again")
+	}
+	if !r.recordProbe(false) {
+		t.Fatal("two consecutive failures after the reset must mark dead")
+	}
+}

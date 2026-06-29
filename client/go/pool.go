@@ -481,9 +481,16 @@ func (p *connPool) checkShardHealth(s *poolShard) {
 		resp, err := c.roundTrip(ctx, OpPing, 0, nil)
 		cancel()
 		if err != nil || resp.Status != StatusOK {
-			dead[c] = struct{}{}
+			// Only mark dead after CONSECUTIVE probe failures: a single timeout is
+			// usually a false positive (the idle conn got a request burst right as
+			// we pinged it), and killing it here closes it out from under those
+			// just-dispatched requests. See recordProbe / probeFailThreshold.
+			if c.recordProbe(false) {
+				dead[c] = struct{}{}
+			}
 			continue
 		}
+		c.recordProbe(true)
 		recyclePayload(resp.Payload)
 	}
 
