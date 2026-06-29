@@ -33,6 +33,19 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::device::{AlignedBuf, BlockDevice, Result};
 
+/// Upper bound on the size of a single coalesced write-back flush, in bytes.
+///
+/// Contiguous dirty blocks are merged into one sequential `pwrite` (see
+/// [`CacheState::flush_all_dirty_coalesced`]) to turn the scattered 4 KiB
+/// per-block writes into large sequential I/O. This cap bounds the size of the
+/// aligned bounce buffer a single merged write allocates and keeps each device
+/// write to a sequential-friendly size; a contiguous run longer than this is
+/// split into successive capped writes. 256 KiB is large enough to collapse
+/// ~64 contiguous 4 KiB blocks into one syscall while keeping the transient
+/// bounce-buffer allocation modest. Must be a multiple of every supported block
+/// size (it is a power of two >= any device alignment).
+const MAX_COALESCE_BYTES: usize = 256 * 1024;
+
 /// Shutdown coordination for the background writeback thread: a flag plus a
 /// condition variable so [`CachingDevice::stop`] can wake the thread out of its
 /// inter-tick wait *immediately*, instead of blocking the join until the next
@@ -97,7 +110,7 @@ struct Shard {
     /// Fast worklist of dirty block indices. Invariant (held under the shard
     /// lock): this set contains EXACTLY the indices whose `Block.dirty == true`.
     /// It is a worklist, not the authority — [`Block::dirty`] is the authority —
-    /// so `flush_shard` re-checks `b.dirty` under the lock and uses
+    /// so the flush sweep re-checks `b.dirty` under the lock and uses
     /// [`Arc::ptr_eq`] to detect a concurrent re-dirty. Maintaining it lets the
     /// flush path iterate O(dirty) instead of O(all cached blocks) per tick.
     dirty: std::collections::HashSet<u64>,
@@ -539,88 +552,81 @@ impl CacheState {
         self.inner.sync_data()
     }
 
-    /// Flush every dirty block in a single shard to the inner device.
-    ///
-    /// Locking discipline (identical to the eviction path so it can never lose
-    /// or clobber a concurrent write): collect the dirty `(idx, Arc<bytes>)`
-    /// snapshot under the shard lock — a cheap refcount bump, NOT a `memcpy` —
-    /// perform the device `pwrite` OUTSIDE the lock, then re-acquire the lock and
-    /// clear the dirty flag ONLY IF the cached `Arc` is still the exact one we
-    /// snapshotted. A concurrent write goes through [`Arc::make_mut`], which
-    /// swaps in a fresh allocation while a flusher holds the old `Arc`, so the
-    /// pointer identity check ([`Arc::ptr_eq`]) cleanly detects "re-written since
-    /// snapshot": such a block keeps its dirty flag and is flushed again on the
-    /// next tick / `sync()`. The shard lock is never held across a device
-    /// `pwrite`, so this can never deadlock against
-    /// `pread`/`pwrite`/`sync`/eviction.
-    fn flush_shard(&self, shard: &Mutex<Shard>) -> Result<()> {
-        // Snapshot by iterating ONLY the dirty worklist — O(dirty), not O(all
-        // cached blocks). Look each index up in the map and keep `(idx, Arc)`
-        // for entries that are still genuinely dirty (the set is the worklist;
-        // `Block::dirty` is the authority, re-checked here under the lock).
-        let dirty: Vec<(u64, Arc<[u8]>)> = {
-            let shard = shard.lock();
-            shard
-                .dirty
-                .iter()
-                .filter_map(|idx| {
-                    shard
-                        .blocks
-                        .get(idx)
-                        .filter(|b| b.dirty)
-                        .map(|b| (*idx, b.data.clone()))
-                })
-                .collect()
-        };
-        for (idx, data) in dirty {
-            self.flush_block(idx, &data)?;
-            let mut shard = shard.lock();
-            if let Some(b) = shard.blocks.get_mut(&idx) {
-                // Clear only if the stored Arc is byte-for-byte the snapshot we
-                // flushed. `Arc::ptr_eq` is exact and O(1): a concurrent write
-                // replaces the Arc (CoW), so a different pointer means re-dirtied
-                // — leave it dirty AND in the worklist for the next flush.
-                if Arc::ptr_eq(&b.data, &data) {
-                    b.dirty = false;
-                    // `b`'s borrow of `shard.blocks` ends here; remove from the
-                    // disjoint `shard.dirty` worklist to keep them in lockstep.
-                    shard.dirty.remove(&idx);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Flush every dirty block across all shards to the inner device (write-back).
+    /// Flush every dirty block across all shards to the inner device (write-back),
+    /// COALESCING contiguous dirty blocks into single large sequential writes.
     /// A no-op in write-through mode (no block is ever dirty).
     ///
-    /// Shards are independent (disjoint locks, disjoint device ranges), so they
-    /// are flushed concurrently across the dedicated [`CacheState::flush_pool`]
-    /// when present — this is what breaks the old single-thread, one-core
-    /// writeback ceiling. Each shard still obeys the per-shard locking discipline
-    /// in [`CacheState::flush_shard`]. Falls back to a serial flush on the
-    /// calling thread if no pool was built (single-core host, or pool-build
-    /// failure). The first shard error is returned; remaining shards are still
-    /// attempted so a single bad block does not strand the rest dirty.
+    /// Why a global sweep, not the old per-shard flush: `shard_of(block_idx) =
+    /// block_idx % shard_count`, so contiguous device blocks land in DIFFERENT
+    /// shards. A per-shard flush therefore can never see two adjacent blocks
+    /// together and degrades into one scattered 4 KiB `pwrite` per dirty block —
+    /// the measured 104k-IOPS / 5.6 KB-avg pathology. This sweep instead gathers
+    /// the dirty `(block_idx, Arc<bytes>)` snapshot from ALL shards, sorts by
+    /// `block_idx`, merges adjacent indices into runs, and issues ONE `pwrite`
+    /// per run (capped at [`MAX_COALESCE_BYTES`], so a long run splits into
+    /// bounded sequential writes), turning scattered small writes into large
+    /// sequential ones.
+    ///
+    /// Locking discipline (PRESERVED — same snapshot-under-lock then
+    /// pwrite-outside-lock then ptr_eq-clear pattern the eviction path uses):
+    /// the snapshot for each shard is taken under that shard's lock — a cheap
+    /// refcount bump, NOT a `memcpy` — and the lock is released before any device
+    /// I/O. Every `pwrite` happens OUTSIDE all shard locks. Dirty-bit clearing
+    /// re-acquires the owning shard's lock per block and clears ONLY if the
+    /// cached `Arc` is still byte-for-byte the snapshot we flushed
+    /// ([`Arc::ptr_eq`]) — a concurrent write swaps the `Arc` (CoW), so a
+    /// mismatch means "re-dirtied since snapshot": the block keeps its dirty flag
+    /// and worklist entry for the next flush. The first run error is returned;
+    /// remaining runs are still attempted so one bad block does not strand the
+    /// rest dirty.
     fn flush_all_dirty(&self) -> Result<()> {
         if !self.writeback {
             return Ok(());
         }
+        // 1) Snapshot dirty (idx, Arc) from every shard under its own lock, then
+        //    release. Sorting all of them globally is what lets contiguous blocks
+        //    living in different shards merge into one run.
+        let mut snapshot: Vec<(u64, Arc<[u8]>)> = Vec::new();
+        for shard in self.shards.iter() {
+            let shard = shard.lock();
+            snapshot.reserve(shard.dirty.len());
+            for idx in shard.dirty.iter() {
+                if let Some(b) = shard.blocks.get(idx).filter(|b| b.dirty) {
+                    snapshot.push((*idx, b.data.clone()));
+                }
+            }
+        }
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+        // 2) Sort by block index and merge adjacent indices into contiguous runs,
+        //    splitting a run once it would exceed MAX_COALESCE_BYTES. A run is
+        //    contiguous iff each block immediately follows the previous one
+        //    (idx == prev_idx + 1). Only the device's final block may be a short
+        //    tail (< block_size); since it is the last block, it can only ever
+        //    end a run, so a run is always block_size-aligned in length except
+        //    possibly its tail — always legal for an aligned `pwrite`.
+        snapshot.sort_unstable_by_key(|(idx, _)| *idx);
+        let runs = self.merge_into_runs(snapshot);
+
+        // 3) Write each run as one sequential pwrite (outside all locks), then
+        //    clear the dirty bits per block under the owning shard lock with the
+        //    Arc::ptr_eq re-check. Independent runs touch disjoint device ranges
+        //    and (mostly) disjoint shards, so they fan out across the flush pool
+        //    when present; the per-block dirty-clear re-locks each shard.
         match &self.flush_pool {
             Some(pool) => {
                 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
                 pool.install(|| {
-                    self.shards
-                        .par_iter()
-                        .map(|shard| self.flush_shard(shard))
-                        // Attempt every shard; surface the first error.
+                    runs.par_iter()
+                        .map(|run| self.flush_run(run))
                         .reduce(|| Ok(()), |a, b| a.and(b))
                 })
             }
             None => {
                 let mut first_err = Ok(());
-                for shard in self.shards.iter() {
-                    if let Err(e) = self.flush_shard(shard)
+                for run in &runs {
+                    if let Err(e) = self.flush_run(run)
                         && first_err.is_ok()
                     {
                         first_err = Err(e);
@@ -630,6 +636,76 @@ impl CacheState {
             }
         }
     }
+
+    /// Merge a block-index-sorted dirty snapshot into contiguous runs, each
+    /// capped at [`MAX_COALESCE_BYTES`]. Adjacent device blocks (`idx ==
+    /// prev + 1`) join one run; a gap, or reaching the byte cap, starts a new
+    /// run. The input MUST be sorted ascending by block index.
+    fn merge_into_runs(&self, snapshot: Vec<(u64, Arc<[u8]>)>) -> Vec<FlushRun> {
+        let mut runs: Vec<FlushRun> = Vec::new();
+        for (idx, data) in snapshot {
+            let len = data.len();
+            match runs.last_mut() {
+                // Extend the current run iff this block immediately follows the
+                // last one AND adding it stays within the coalesce cap.
+                Some(run)
+                    if idx == run.start + run.blocks.len() as u64
+                        && run.bytes + len <= MAX_COALESCE_BYTES =>
+                {
+                    run.bytes += len;
+                    run.blocks.push((idx, data));
+                }
+                _ => runs.push(FlushRun {
+                    start: idx,
+                    bytes: len,
+                    blocks: vec![(idx, data)],
+                }),
+            }
+        }
+        runs
+    }
+
+    /// Write one contiguous run as a single sequential `pwrite`, then clear the
+    /// dirty bit of each block it covered (under the owning shard lock, with the
+    /// [`Arc::ptr_eq`] concurrent-redirty re-check). No shard lock is held across
+    /// the device write.
+    fn flush_run(&self, run: &FlushRun) -> Result<()> {
+        // Concatenate the run's block bytes into one aligned bounce buffer and
+        // issue a single sequential pwrite at the run's device offset. The base
+        // offset is block-aligned (start * block_size) and the buffer base is
+        // alignment-aligned, so the inner O_DIRECT write is legal.
+        let run_base = run.start * self.block_size as u64;
+        let mut buf = AlignedBuf::new(run.bytes, self.block_size);
+        let mut off = 0usize;
+        for (_, data) in &run.blocks {
+            buf[off..off + data.len()].copy_from_slice(data);
+            off += data.len();
+        }
+        self.inner.pwrite_all_at(&buf[..run.bytes], run_base)?;
+
+        // Clear the dirty bit per block under its shard lock, only if the cached
+        // Arc is still the exact snapshot we just flushed (CoW re-dirty check).
+        for (idx, data) in &run.blocks {
+            let mut shard = self.shard_of(*idx).lock();
+            if let Some(b) = shard.blocks.get_mut(idx)
+                && Arc::ptr_eq(&b.data, data)
+            {
+                b.dirty = false;
+                shard.dirty.remove(idx);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One contiguous run of dirty blocks to be flushed as a single sequential
+/// `pwrite`. `start` is the device block index of the first block; `blocks`
+/// holds `(block_idx, Arc<bytes>)` in ascending, contiguous order; `bytes` is
+/// the total payload length (sum of the block lengths, `<= MAX_COALESCE_BYTES`).
+struct FlushRun {
+    start: u64,
+    bytes: usize,
+    blocks: Vec<(u64, Arc<[u8]>)>,
 }
 
 impl BlockDevice for CachingDevice {
@@ -1083,7 +1159,13 @@ mod tests {
         // is the background drain (no sync(), no eviction).
         let cache = CachingDevice::new(dev.clone(), 512 * BS, true, FAST_MS);
 
-        // Write several distinct blocks across (likely) several shards.
+        // Write several distinct blocks. Indices 0..8 are CONTIGUOUS, so the
+        // coalescing flush merges them into a single sequential pwrite — the
+        // background drain therefore issues far fewer than 8 inner writes (1 with
+        // full coalescing), while still landing every block's bytes. We assert
+        // the drain happened (>= 1 write) and verify every block byte-for-byte
+        // below; the exact coalesced count is asserted by the dedicated
+        // coalescing tests.
         for i in 0..8u64 {
             cache
                 .pwrite(&ab(0xC0 + i as u8, BS), i * BS as u64)
@@ -1102,8 +1184,8 @@ mod tests {
             "background writeback must clear the dirty set without an explicit sync()"
         );
         assert!(
-            dev.writes.load(Ordering::Relaxed) >= 8,
-            "background writeback issued the inner writes (got {})",
+            dev.writes.load(Ordering::Relaxed) >= 1,
+            "background writeback issued the (coalesced) inner write(s) (got {})",
             dev.writes.load(Ordering::Relaxed)
         );
 
@@ -1386,9 +1468,13 @@ mod tests {
         }
         let clean_reads = dev.reads.load(Ordering::Relaxed);
 
-        // Dirty exactly two blocks.
+        // Dirty exactly two blocks. Use NON-contiguous indices (0 and 2) so the
+        // coalescing flush keeps them as two separate runs → two pwrites, making
+        // the "exactly the two dirty blocks were flushed" count deterministic and
+        // unaffected by run-merging (contiguous coalescing is covered by its own
+        // tests).
         cache.pwrite(&ab(0xD1, BS), 0).unwrap();
-        cache.pwrite(&ab(0xD2, BS), BS as u64).unwrap();
+        cache.pwrite(&ab(0xD2, BS), 2 * BS as u64).unwrap();
 
         // Index invariant + count == exactly the dirty blocks (the 3 clean
         // resident blocks are NOT in the set).
@@ -1400,7 +1486,7 @@ mod tests {
         let flushed = dev.writes.load(Ordering::Relaxed) - writes_before;
         assert_eq!(
             flushed, 2,
-            "exactly the two dirty blocks were flushed (clean resident blocks were not)"
+            "exactly the two (non-contiguous) dirty blocks were flushed (clean resident blocks were not)"
         );
         // No spurious inner reads from the flush path.
         assert_eq!(
@@ -1410,7 +1496,7 @@ mod tests {
         );
         // The dirty bytes reached the device.
         assert_eq!(read_inner(&dev, 0, BS), vec![0xD1; BS]);
-        assert_eq!(read_inner(&dev, BS as u64, BS), vec![0xD2; BS]);
+        assert_eq!(read_inner(&dev, 2 * BS as u64, BS), vec![0xD2; BS]);
         // Index now empty and still consistent.
         assert_eq!(assert_dirty_index_consistent(&cache), 0);
         assert_eq!(dirty_count(&cache), 0);
@@ -1572,6 +1658,175 @@ mod tests {
         for s in 0..sc {
             let byte = (0x40 + (s & 0x3f)) as u8;
             assert_eq!(read_inner(&dev, s * BS as u64, BS), vec![byte; BS]);
+        }
+    }
+
+    #[test]
+    fn contiguous_dirty_blocks_flush_as_one_coalesced_pwrite() {
+        // N contiguous dirty blocks (block indices 0..N) live in N DIFFERENT
+        // shards (shard_of = idx % shard_count), yet a single sync() must
+        // coalesce them into ONE sequential pwrite — not N scattered 4 KiB
+        // writes — because the flush gathers dirty blocks ACROSS shards, sorts
+        // by block_idx, and merges adjacent runs. With N*BS <= MAX_COALESCE the
+        // whole run is one pwrite.
+        let n: u64 = 16;
+        assert!(
+            (n as usize) * BS <= MAX_COALESCE_BYTES,
+            "test run must fit one coalesced write"
+        );
+        let dev = CountingDev::new(1024 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 512 * BS, true, NEVER_MS);
+
+        for i in 0..n {
+            cache
+                .pwrite(&ab(0x10 + i as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        assert_eq!(
+            dirty_count(&cache),
+            n as usize,
+            "every contiguous block starts dirty"
+        );
+
+        let writes_before = dev.writes.load(Ordering::Relaxed);
+        cache.sync().unwrap();
+        let pwrites = dev.writes.load(Ordering::Relaxed) - writes_before;
+        assert_eq!(
+            pwrites, 1,
+            "N={n} contiguous dirty blocks must coalesce into ONE pwrite, got {pwrites}"
+        );
+        // Integrity: every block's exact bytes reached the device.
+        for i in 0..n {
+            assert_eq!(
+                read_inner(&dev, i * BS as u64, BS),
+                vec![0x10 + i as u8; BS],
+                "coalesced block {i} has the correct bytes on the device"
+            );
+        }
+        assert_eq!(dirty_count(&cache), 0, "all blocks clean after flush");
+        assert_eq!(assert_dirty_index_consistent(&cache), 0);
+    }
+
+    #[test]
+    fn noncontiguous_dirty_blocks_flush_as_separate_runs() {
+        // Three dirty blocks at indices 0, 5, 10 (gaps between them) form three
+        // separate runs → exactly three pwrites, one per run.
+        let dev = CountingDev::new(1024 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 512 * BS, true, NEVER_MS);
+
+        for &i in &[0u64, 5, 10] {
+            cache
+                .pwrite(&ab(0x20 + i as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        assert_eq!(dirty_count(&cache), 3);
+
+        let writes_before = dev.writes.load(Ordering::Relaxed);
+        cache.sync().unwrap();
+        let pwrites = dev.writes.load(Ordering::Relaxed) - writes_before;
+        assert_eq!(
+            pwrites, 3,
+            "three non-contiguous dirty blocks are three runs → three pwrites, got {pwrites}"
+        );
+        for &i in &[0u64, 5, 10] {
+            assert_eq!(
+                read_inner(&dev, i * BS as u64, BS),
+                vec![0x20 + i as u8; BS],
+                "non-contiguous block {i} flushed correctly"
+            );
+        }
+        assert_eq!(dirty_count(&cache), 0);
+    }
+
+    #[test]
+    fn mixed_runs_coalesce_per_contiguous_group() {
+        // Blocks {0,1,2} contiguous, {7,8} contiguous, {15} alone → 3 runs.
+        let dev = CountingDev::new(1024 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 512 * BS, true, NEVER_MS);
+
+        let idxs = [0u64, 1, 2, 7, 8, 15];
+        for &i in &idxs {
+            cache
+                .pwrite(&ab(0x30 + i as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        let writes_before = dev.writes.load(Ordering::Relaxed);
+        cache.sync().unwrap();
+        let pwrites = dev.writes.load(Ordering::Relaxed) - writes_before;
+        assert_eq!(
+            pwrites, 3,
+            "runs {{0,1,2}},{{7,8}},{{15}} → 3 coalesced pwrites, got {pwrites}"
+        );
+        for &i in &idxs {
+            assert_eq!(
+                read_inner(&dev, i * BS as u64, BS),
+                vec![0x30 + i as u8; BS],
+                "block {i} flushed correctly across coalesced runs"
+            );
+        }
+    }
+
+    #[test]
+    fn long_contiguous_run_is_split_at_max_coalesce_cap() {
+        // A contiguous run longer than MAX_COALESCE_BYTES must be split into
+        // bounded pwrites of at most MAX_COALESCE_BYTES each — never one giant
+        // unbounded write. Choose N so the run spans > 1 cap-sized chunk.
+        let cap_blocks = MAX_COALESCE_BYTES / BS;
+        let n = (cap_blocks as u64) * 2 + 3; // > 2 full caps → 3 pwrites
+        let expected = n.div_ceil(cap_blocks as u64);
+        // The budget must hold the whole contiguous run resident so NO block is
+        // evicted (and flushed individually) during the write loop — an early
+        // eviction would fragment the run and inflate the pwrite count. Blocks i
+        // and i+shard_count collide in one shard, so a generous total budget
+        // (large per-shard cap) keeps the run resident regardless of the
+        // production `cores*16` shard count.
+        let dev = CountingDev::new(4096 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 2048 * BS, true, NEVER_MS);
+
+        for i in 0..n {
+            cache
+                .pwrite(&ab((i & 0xff) as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        let writes_before = dev.writes.load(Ordering::Relaxed);
+        cache.sync().unwrap();
+        let pwrites = (dev.writes.load(Ordering::Relaxed) - writes_before) as u64;
+        assert_eq!(
+            pwrites, expected,
+            "a {n}-block contiguous run must split into {expected} capped pwrites \
+             (cap = {cap_blocks} blocks), got {pwrites}"
+        );
+        // Integrity across the split boundaries.
+        for i in 0..n {
+            assert_eq!(
+                read_inner(&dev, i * BS as u64, BS),
+                vec![(i & 0xff) as u8; BS],
+                "block {i} correct across a split coalesced write"
+            );
+        }
+        assert_eq!(dirty_count(&cache), 0);
+    }
+
+    #[test]
+    fn coalesced_flush_integrity_reading_every_block_back() {
+        // Data integrity at scale: a dense run of contiguous dirty blocks, each
+        // with distinct bytes, all read back bypassing the cache after a single
+        // coalesced sync().
+        let n: u64 = 64;
+        let dev = CountingDev::new(1024 * BS, BS);
+        let cache = CachingDevice::new(dev.clone(), 512 * BS, true, NEVER_MS);
+        for i in 0..n {
+            cache
+                .pwrite(&ab((i & 0xff) as u8, BS), i * BS as u64)
+                .unwrap();
+        }
+        cache.sync().unwrap();
+        for i in 0..n {
+            assert_eq!(
+                read_inner(&dev, i * BS as u64, BS),
+                vec![(i & 0xff) as u8; BS],
+                "every coalesced block reads back correctly bypassing the cache"
+            );
         }
     }
 
