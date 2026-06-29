@@ -4551,10 +4551,23 @@ fn needs_exclusive_visibility_barrier(op: u16) -> bool {
 /// concurrently while a read of key K is still excluded from a mutation of K
 /// (batch-atomic per key). All OTHER mutation opcodes keep the coarse global
 /// exclusive guard for now (correct, just not yet parallelized).
+///
+/// `OP_DELETE_BATCH` is fine-grained too: `handle_delete_batch` acquires
+/// `engine.visibility().mutation(&keys)` over the deleted txids AND the
+/// parent-prune keys it touches, after Phase-1 validation has discovered the
+/// parents. Pre-fix delete took the coarse global EXCLUSIVE guard, so every
+/// delete serialized against every other mutation and read and blocked on
+/// in-flight readers draining — the dominant component of the delete-latency
+/// tail once the per-delete fsyncs were removed.
 fn manages_own_visibility(op: u16) -> bool {
     matches!(
         op,
-        OP_SPEND_BATCH | OP_SET_MINED_BATCH | OP_CREATE_BATCH | OP_GET_BATCH | OP_GET_SPEND_BATCH
+        OP_SPEND_BATCH
+            | OP_SET_MINED_BATCH
+            | OP_CREATE_BATCH
+            | OP_GET_BATCH
+            | OP_GET_SPEND_BATCH
+            | OP_DELETE_BATCH
     )
 }
 
@@ -7990,6 +8003,34 @@ fn handle_delete_batch(
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
+    // Fine-grained visibility for the whole delete batch (Phase-1 snapshot
+    // through Phase-3 apply), released before the Phase-4 replication
+    // round-trip (C-1). Delete is in `manages_own_visibility`, so
+    // `handle_request` took NO coarse guard; here we take the per-key WRITE
+    // side over the deleted txids plus the global SHARED side (so a checkpoint
+    // still excludes us). Disjoint-key deletes/reads now run concurrently
+    // instead of serializing on the global EXCLUSIVE barrier — the dominant
+    // delete-tail cost once the per-delete fsyncs were removed.
+    //
+    // Acquired BEFORE Phase 1 so the compensation pre-image snapshot is read
+    // under the same per-key exclusion the coarse guard used to provide: once
+    // we hold `mutation(deleted_keys)`, no concurrent mutation of those keys
+    // can land between the snapshot read and the apply, so the snapshot stays
+    // a faithful pre-delete image. Parent-prune records are NOT in this set:
+    // `append_deleted_child` updates parent metadata atomically under the
+    // engine's own per-record io/stripe locks (a reader sees pre- or
+    // post-prune, never torn) and each prune is independent and idempotent, so
+    // they need no batch-level visibility.
+    //
+    // GATED on `barrier.is_none()`: the DAH-sweep caller
+    // (`handle_process_expired`) forwards its EXCLUSIVE global guard via
+    // `barrier`; taking `global.read()` here on the same thread would
+    // self-deadlock and is unnecessary (that guard already excludes everyone).
+    let visibility_guard = barrier.is_none().then(|| {
+        let keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
+        engine.visibility().mutation(&keys)
+    });
+
     // Phase 1: Validate ownership, lookup record_offset (read-only), build redo ops.
     // Also snapshot each record BEFORE deletion so we can restore on replication failure.
     struct ValidDelete {
@@ -8309,6 +8350,13 @@ fn handle_delete_batch(
             deleted_snapshots.push((v.key, snap));
         }
     }
+
+    // C-1: release the per-key visibility BEFORE the replication network
+    // round-trip — local apply + redo durability are done, so holding the
+    // reader-excluding stripes across the slow network phase is unnecessary.
+    // (`barrier` is `None` for the client delete path now that delete manages
+    // its own visibility; it remains in the signature for the coarse callers.)
+    drop(visibility_guard);
 
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops_with_barrier(
@@ -18002,6 +18050,31 @@ mod tests {
         assert!(
             tracker.pending().is_empty(),
             "the recovered intent must be committed/cleared after successful fan-out to the OTHER holder",
+        );
+    }
+
+    #[test]
+    fn delete_batch_manages_own_fine_grained_visibility() {
+        // Async-delete fix: OP_DELETE_BATCH was moved into
+        // `manages_own_visibility`, so `handle_request` must take NO coarse
+        // guard for it (the handler acquires per-key `visibility().mutation`
+        // itself). Pre-fix delete took the coarse global EXCLUSIVE barrier,
+        // serializing every delete against all reads/mutations. A COLD mutation
+        // (OP_FREEZE_BATCH) still takes the exclusive guard — the contrast that
+        // proves delete is genuinely on the fine-grained path now.
+        assert!(
+            manages_own_visibility(OP_DELETE_BATCH),
+            "delete must manage its own per-key visibility"
+        );
+        let engine = Arc::new(DispatchTestHarness::new().engine);
+        assert!(
+            acquire_dispatch_visibility_guard(engine.as_ref(), OP_DELETE_BATCH, 0).is_none(),
+            "delete must take no coarse dispatch visibility guard"
+        );
+        let cold = acquire_dispatch_visibility_guard(engine.as_ref(), OP_FREEZE_BATCH, 0);
+        assert!(
+            matches!(cold, Some(DispatchVisibilityGuard::Exclusive(_))),
+            "a cold mutation still takes the coarse exclusive guard"
         );
     }
 
