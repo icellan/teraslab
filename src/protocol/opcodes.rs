@@ -589,37 +589,6 @@ pub const FLAG_MIGRATION_ABORT: u16 = 0x0008;
 /// prune, no commit, no inbound clear), so a mismatch is harmless.
 pub const FLAG_MIGRATION_SUPERSET_OK: u16 = 0x0010;
 
-/// Request flag on `OP_MIGRATION_COMPLETE`: the frame carries an appended
-/// TOMBSTONE section for tombstone-driven migration reconciliation
-/// (deletion-tombstone Phase 8, design §7). Set ONLY by a source whose
-/// `tombstone_reconciliation_enabled` config is true.
-///
-/// # Wire layout (appended AFTER the `from_node:u64`)
-///
-/// ```text
-///   [tombstone_section_version:1]   = TOMBSTONE_SECTION_VERSION (1)
-///   [tombstone_count (M):4]         u32 LE
-///   [M × 36 bytes]                  per entry: txid:[u8;32] || generation:u32 LE
-/// ```
-///
-/// # Back-compat (load-bearing)
-///
-/// A receiver that does not understand this flag — or whose own
-/// `tombstone_reconciliation_enabled` is false — IGNORES the flag and the
-/// appended bytes entirely: every existing decode (`record_count`,
-/// `manifest_hash`, exact entries, `from_node`) reads from FIXED offsets that
-/// the tombstone section follows, so a flagless/older receiver parses the frame
-/// EXACTLY as today and the trailing tombstone bytes are simply not read. The
-/// section is version-prefixed so a future layout change is detectable; an
-/// unknown version is treated as "no tombstone section" (degrades to the
-/// never-received TRANSFER decision, which is no-loss).
-pub const FLAG_MIGRATION_TOMBSTONES: u16 = 0x0020;
-
-/// On-wire version byte for the `OP_MIGRATION_COMPLETE` tombstone section
-/// (deletion-tombstone Phase 8). Bumped if the per-entry layout changes; a
-/// receiver that sees an unrecognized version treats the section as absent.
-pub const TOMBSTONE_SECTION_VERSION: u8 = 1;
-
 /// Maximum frame payload size (16 MiB) for normal client/server traffic.
 ///
 /// BSV mainnet has transactions exceeding 300 MB, but those payloads are

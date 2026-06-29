@@ -990,27 +990,11 @@ pub(crate) fn handle_request(
                 (None, None)
             };
 
-            // Phase 8 (deletion-tombstone §7): decode the optional TOMBSTONE
-            // section. ONLY when reconciliation is enabled on THIS node AND the
-            // source set FLAG_MIGRATION_TOMBSTONES. The section is appended after
-            // the `from_node:u64` at `needed + 8`; a flagless / disabled receiver
-            // never reads past `from_node`, so the off-path decode is
-            // byte-identical to today (the trailing bytes are simply ignored).
-            //
-            // Wire: [version:1][count(M):4][M × (txid:32 || generation:4)].
-            // An unrecognized version, a short/truncated section, or a malformed
-            // count degrades to `None` (no tombstone section) — which makes the
-            // §7 classify treat every extra local key as never-received and
-            // TRANSFER it (no-loss), never a spurious drop.
             // Deletion-tombstone migration reconciliation has been removed: each
-            // node prunes its own fully-spent records independently, so there is
-            // no tombstone section to decode and no reconciliation to run. The
-            // handler therefore always takes the pre-Phase-8 (#29) path — exactly
-            // the byte-identical behavior the reconciliation feature defaulted to
-            // (it was never enabled). These two bindings stay so the gated
-            // branches below resolve to that OFF path with no structural churn.
-            let source_tombstones: Option<Vec<(TxKey, u32)>> = None;
-            let reconcile_active = false;
+            // node prunes its own fully-spent records independently, so the
+            // OP_MIGRATION_COMPLETE handler always takes the pre-Phase-8 (#29)
+            // path — the byte-identical behavior the (never-enabled) feature
+            // defaulted to.
 
             // Reject migrations from very stale topology epochs.
             // Allow 2 epochs of slack to accommodate re-activation cycles
@@ -1153,14 +1137,8 @@ pub(crate) fn handle_request(
             // let a stale source clear inbound state for a non-empty shard
             // without proving the target's contents.
             //
-            // Phase 8: when reconciliation is active the TOMBSTONE section is
-            // itself authoritative manifest evidence (the source proved which
-            // keys it deleted), so a tombstone-only completion (empty live set)
-            // is admissible. This OR is gated on `reconcile_active`, so the
-            // off-path R-219 requirement is unchanged.
-            let has_manifest_evidence = source_manifest.is_some()
-                || source_entries.as_ref().is_some_and(|e| !e.is_empty())
-                || (reconcile_active && source_tombstones.is_some());
+            let has_manifest_evidence =
+                source_manifest.is_some() || source_entries.as_ref().is_some_and(|e| !e.is_empty());
             if !has_manifest_evidence {
                 return error_response(
                     request.request_id,
@@ -1431,7 +1409,7 @@ pub(crate) fn handle_request(
             let actual = engine.shard_record_count(shard);
             let count_ok = if expected_records == 0 && completion_epoch_current {
                 true
-            } else if exact_entries_verified && (completion_epoch_current || reconcile_active) {
+            } else if exact_entries_verified && completion_epoch_current {
                 actual >= expected_records
             } else {
                 actual == expected_records
@@ -1451,16 +1429,7 @@ pub(crate) fn handle_request(
             // verification already confirmed every key's generation — the
             // manifest hash would recompute the same result.
             //
-            // Phase 8: also skip when reconciliation is active. The rejoinee
-            // LEGITIMATELY holds extra keys (the over-count being reconciled),
-            // so the whole-shard hash fold would never match the source's
-            // (smaller) live-set hash. The §7 classify is the authoritative
-            // reconciliation instead. Gated on `reconcile_active`, so the
-            // off-path hash check is unchanged.
-            if !reconcile_active
-                && !exact_entries_verified
-                && let Some(expected_hash) = source_manifest
-            {
+            if !exact_entries_verified && let Some(expected_hash) = source_manifest {
                 let mut local_manifest = crate::cluster::coordinator::ManifestHasher::new();
                 for key in engine.keys_for_shard(shard) {
                     let meta = match engine.read_metadata(&key) {
@@ -1532,32 +1501,6 @@ pub(crate) fn handle_request(
                 // for the shard (BUG4 fix (c)): a non-master/replica target never
                 // applies the union (the commit gate below requires master), so
                 // accumulating there would only leak entries.
-                let prospective_target_master = {
-                    let shard_table = cluster.shard_table();
-                    let table = shard_table.read();
-                    table.target_assignment(shard).master == cluster.self_id()
-                };
-                if reconcile_active && prospective_target_master {
-                    let live = source_entries
-                        .as_ref()
-                        .map(|e| e.iter().map(|(k, _)| *k).collect::<Vec<_>>())
-                        .unwrap_or_default();
-                    // Only an epoch-current source's tombstones may drive drops.
-                    let tombstones = if completion_epoch_current {
-                        source_tombstones.clone().unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    cluster.accumulate_reconcile_manifest(
-                        shard,
-                        crate::cluster::coordinator::SourceReconcileManifest {
-                            live,
-                            tombstones,
-                            epoch: migration_epoch,
-                        },
-                    );
-                }
-
                 if let Some(from_node) = completion_from_node {
                     cluster.mark_inbound_complete_from_source(shard, from_node);
                 } else {

@@ -5713,10 +5713,6 @@ fn run_migration_batch(
                             }
                         };
                         let manifest_hash = compute_manifest_for_entries(&manifest_entries);
-                        // Deletion-tombstone migration reconciliation removed:
-                        // never attach a tombstone section (each node prunes
-                        // independently). Frame is the pre-Phase-8 shape.
-                        let shard_tombstones: Option<Vec<(TxKey, u32)>> = None;
                         if let Err(e) = send_migration_complete(
                             addr,
                             task.shard,
@@ -5729,7 +5725,6 @@ fn run_migration_batch(
                             &manifest_entries,
                             true,
                             auth_secret,
-                            shard_tombstones.as_deref(),
                         ) {
                             tracing::warn!(shard = task.shard, err = %e, "cluster: shard completion failed");
                             send_migration_abort_completion_best_effort(
@@ -6434,34 +6429,6 @@ fn stream_shard_baseline(
 /// If `stream` is Some, reuses it (avoids a new TCP connection).
 /// Otherwise opens a fresh connection.
 #[allow(clippy::too_many_arguments)]
-/// Append the Phase 8 tombstone section to a completion payload and return the
-/// `FLAG_MIGRATION_TOMBSTONES` bit to OR into the frame flags (deletion-
-/// tombstone §7).
-///
-/// `tombstone_entries == None` appends NOTHING and returns 0, so the off-path
-/// frame is byte-identical to the pre-Phase-8 wire. `Some(entries)` (including
-/// an empty slice) appends `[version:1][count:4][entries…]` and returns the
-/// flag bit — an empty section authoritatively says "this source has no
-/// tombstones for the shard."
-fn append_tombstone_section(
-    payload: &mut Vec<u8>,
-    tombstone_entries: Option<&[(TxKey, u32)]>,
-) -> u16 {
-    match tombstone_entries {
-        None => 0,
-        Some(entries) => {
-            payload.push(TOMBSTONE_SECTION_VERSION);
-            payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-            for (key, generation) in entries {
-                payload.extend_from_slice(&key.txid);
-                payload.extend_from_slice(&generation.to_le_bytes());
-            }
-            FLAG_MIGRATION_TOMBSTONES
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn send_migration_complete(
     target_addr: SocketAddr,
     shard: u16,
@@ -6474,10 +6441,6 @@ fn send_migration_complete(
     manifest_entries: &[(TxKey, u32)],
     verify_only: bool,
     auth_secret: Option<&[u8]>,
-    // Phase 8 (§7): the source's tombstones for the shard. `Some(..)` only when
-    // `tombstone_reconciliation_enabled`; appends the versioned section + sets
-    // `FLAG_MIGRATION_TOMBSTONES`. `None` → byte-identical pre-Phase-8 frame.
-    tombstone_entries: Option<&[(TxKey, u32)]>,
 ) -> std::result::Result<(), String> {
     // Use existing stream or create new one.
     let mut owned;
@@ -6515,19 +6478,15 @@ fn send_migration_complete(
         payload.extend_from_slice(&generation.to_le_bytes());
     }
     payload.extend_from_slice(&from_node.0.to_le_bytes());
-    // Phase 8 (§7): append the tombstone section AFTER from_node. Off-path
-    // (`tombstone_entries == None`) this appends nothing and returns 0 flags,
-    // keeping the frame byte-identical.
-    let tombstone_flag = append_tombstone_section(&mut payload, tombstone_entries);
 
     let request = RequestFrame {
         request_id: shard as u64,
         op_code: OP_MIGRATION_COMPLETE,
-        flags: (if verify_only {
+        flags: if verify_only {
             FLAG_MIGRATION_VERIFY_ONLY
         } else {
             0
-        }) | tombstone_flag,
+        },
         payload: payload.into(),
     };
     let response = exchange_frame(s, &request, auth_secret)?;
@@ -8123,14 +8082,6 @@ pub enum MasterQueryResult {
     },
 }
 
-/// One source's per-shard reconciliation manifest for the multi-source UNION
-/// drop rule (deletion-tombstone Phase 8, design §9.1 #1).
-///
-/// Re-exported from [`crate::cluster::migration`], where it lives alongside the
-/// accumulator and inbound state so EVERY inbound-clear path drops its matching
-/// accumulated entries (BUG4 fix (b)).
-pub use crate::cluster::migration::SourceReconcileManifest;
-
 pub struct RunningCluster {
     self_id: NodeId,
     self_addr: SocketAddr,
@@ -8457,39 +8408,6 @@ impl RunningCluster {
         }
     }
 
-    /// Accumulate one source's per-shard reconciliation manifest for the
-    /// multi-source union (deletion-tombstone Phase 8, design §9.1 #1).
-    ///
-    /// Called once per `OP_MIGRATION_COMPLETE` arrival on the
-    /// `tombstone_reconciliation_enabled` path. The manifests are unioned and
-    /// the deferred drops applied at the commit gate via
-    /// [`Self::take_reconcile_accumulator`]. No-op semantics off-path: nothing
-    /// else reads this map unless reconciliation is enabled.
-    pub fn accumulate_reconcile_manifest(&self, shard: u16, manifest: SourceReconcileManifest) {
-        self.migration
-            .lock()
-            .accumulate_reconcile_manifest(shard, manifest);
-    }
-
-    /// Remove and return all accumulated source manifests for `shard`.
-    ///
-    /// Called at the commit gate to compute the union (`live` / `tombstone`
-    /// sets across every pending source) before applying the deferred drops.
-    /// Returns an empty vec if nothing was accumulated (e.g. reconciliation
-    /// disabled, or a source sent no tombstone section). Delegates to the
-    /// [`MigrationManager`], where the accumulator lives co-located with the
-    /// inbound state (BUG4 fix (b)).
-    pub fn take_reconcile_accumulator(&self, shard: u16) -> Vec<SourceReconcileManifest> {
-        self.migration.lock().take_reconcile_accumulator(shard)
-    }
-
-    /// Discard any accumulated source manifests for `shard` without applying
-    /// them — used on abort so a non-committing handoff does not leak
-    /// accumulator entries.
-    pub fn clear_reconcile_accumulator(&self, shard: u16) {
-        self.migration.lock().clear_reconcile_accumulator(shard);
-    }
-
     pub fn mark_inbound_complete_many_from_source(&self, shards: &[u16], from_node: NodeId) {
         if shards.is_empty() {
             return;
@@ -8520,10 +8438,6 @@ impl RunningCluster {
     ///
     /// Returns `true` if a pending inbound entry was cleared.
     pub fn abort_inbound_migration(&self, shard: u16) -> bool {
-        // Phase 8: discard any accumulated reconciliation manifests so an
-        // aborted (non-committing) handoff does not leak accumulator entries or
-        // apply a stale union later. No-op off-path (map is empty).
-        self.clear_reconcile_accumulator(shard);
         let mgr = &mut self.migration.lock();
         let shards = std::collections::HashSet::from([shard]);
         let removed = mgr.clear_pending_inbound_for_shards(&shards);
