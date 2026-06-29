@@ -81,23 +81,51 @@ fn start_test_server() -> u16 {
             Some(CLI_TEST_ADMIN_TOKEN.to_string()),
         );
     });
-    // Poll until the spawned server is actually accepting connections, rather
-    // than a fixed sleep. A 200 ms sleep flaked on contended CI runners: the
-    // server thread had not yet bound the port when the CLI connected, so the
-    // CLI got a connection refusal and exited non-zero. Connect-polling waits
-    // exactly as long as needed (a few ms normally) with a generous backstop.
+    // Poll until the spawned server actually SERVES an HTTP request, rather
+    // than a fixed sleep or a bare TCP connect. A 200 ms sleep flaked when the
+    // server thread had not bound the port yet; a bare `TcpStream::connect`
+    // also flaked because the kernel completes the TCP handshake from the
+    // listen backlog BEFORE axum's accept loop is running — so the connect
+    // succeeds while the first real HTTP request still races the (contended,
+    // on macOS) runtime startup and gets a reset / no response, and the CLI
+    // exits non-zero. Doing a full HTTP round-trip here proves axum is
+    // processing requests before the test's CLI runs. `/health` is
+    // unauthenticated; ANY HTTP status line (even an error) means the server
+    // is serving.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if std::net::TcpStream::connect(&addr).is_ok() {
+        if http_server_responds(&addr) {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "test HTTP server did not accept connections on {addr} within 10s",
+            "test HTTP server did not serve an HTTP response on {addr} within 10s",
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     port
+}
+
+/// Open a connection, send a minimal HTTP/1.1 GET, and return `true` once a
+/// status line (`HTTP/…`) comes back — i.e. axum is actually serving, not just
+/// bound. Any failure (connect, write, read, timeout, non-HTTP bytes) is
+/// `false` so the caller keeps polling.
+fn http_server_responds(addr: &str) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = std::net::TcpStream::connect(addr) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+    let req = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => buf[..n].starts_with(b"HTTP/"),
+        _ => false,
+    }
 }
 
 fn cli_bin() -> String {
