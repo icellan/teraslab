@@ -583,16 +583,6 @@ impl MigrationManager {
         self.reconcile_accumulator.remove(&shard);
     }
 
-    /// Number of accumulated source manifests for `shard` (test-only peek that
-    /// does NOT drain — used to assert the BUG4 accumulate-lifecycle).
-    #[cfg(test)]
-    pub(crate) fn reconcile_accumulator_len_for_test(&self, shard: u16) -> usize {
-        self.reconcile_accumulator
-            .get(&shard)
-            .map(|v| v.len())
-            .unwrap_or(0)
-    }
-
     /// Drop accumulator entries for every shard that is no longer
     /// pending-inbound (BUG4 fix (b)).
     ///

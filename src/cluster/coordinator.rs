@@ -4924,63 +4924,6 @@ fn collect_manifest_entries(
     Ok(entries)
 }
 
-/// Relax a superset-probe manifest to self's NON-TOMBSTONED keys (deletion-
-/// tombstone Phase 8, design §7 — the superset-proof relaxation).
-///
-/// When reconciliation is enabled, a relinquishing source no longer needs the
-/// target to hold a superset of EVERYTHING — only of self's non-tombstoned
-/// keys; self's tombstoned keys are allowed to be absent on the target (the
-/// target authoritatively deleted them). So this drops from `entries` any key
-/// that self's OWN tombstone index marks tombstoned AT-OR-AHEAD of the live
-/// generation: self must not demand the target still hold a version self itself
-/// knows is deleted.
-///
-/// GENERATION-AWARE (the create-after-delete defense, design §8.4): a boolean
-/// `is_tombstoned` is WRONG here. After a key is deleted at gen `g` (tombstone
-/// written) and then re-created LIVE at gen `g+1` (the create path does NOT
-/// remove the stale tombstone row), `is_tombstoned` is still `true`. A boolean
-/// filter would EXCLUDE that live key from the probe, so a draining source
-/// uniquely holding `k@g+1` would never have the target checked for it, would
-/// wrongly relinquish, and would drop `k` → DATA LOSS (the never-received
-/// re-creation, the no-loss Transfer case). So a key is excluded ONLY when the
-/// tombstone's generation is at-or-ahead of the live entry's generation —
-/// mirroring [`classify_reconcile`]'s row-2/row-4 split
-/// ([`crate::record::generation_at_or_ahead`]). A tombstone for an OLDER
-/// generation than the live entry means the live entry is a newer re-creation
-/// and is KEPT in the demand.
-///
-/// Gated on `engine.tombstone_reconciliation_enabled()`: when OFF this returns
-/// `entries` UNCHANGED (clone), so the disabled superset proof is byte-identical
-/// to today. No-op when no tombstone index is attached (no key is tombstoned).
-fn relax_superset_manifest(engine: &Engine, entries: &[(TxKey, u32)]) -> Vec<(TxKey, u32)> {
-    if !engine.tombstone_reconciliation_enabled() {
-        return entries.to_vec();
-    }
-    let Some(idx) = engine.tombstone_index() else {
-        return entries.to_vec();
-    };
-    // The redb tombstone index may be populated by a background writer
-    // (`Engine::record_tombstone_index_batch`), so flush it before reading: this
-    // is the one correctness-sensitive consumer (a missed tombstone would keep a
-    // deleted key in the superset demand). Migration has already fenced + drained
-    // client deletes, so no new tombstone rows arrive during the flush.
-    engine.flush_tombstone_index();
-    let guard = idx.lock();
-    entries
-        .iter()
-        .filter(|(k, live_gen)| match guard.get(k) {
-            // Excluded (target need not hold it) ONLY when the tombstone covers
-            // this live version or a newer one. KEPT (demand it) when the local
-            // live generation is newer than the tombstone — a re-creation
-            // (§8.4) the target must still hold to be a valid superset.
-            Some(v) => !crate::record::generation_at_or_ahead(v.generation, *live_gen),
-            // No tombstone for this key → demand it (normal superset case).
-            None => true,
-        })
-        .copied()
-        .collect()
-}
-
 fn compute_manifest_for_entries(entries: &[(TxKey, u32)]) -> [u8; 32] {
     let mut manifest = ManifestHasher::new();
     for (key, generation) in entries {
@@ -5593,11 +5536,9 @@ fn run_migration_batch(
                             // rolls back to self (no-loss) and the next re-drive
                             // retries.
                             let probe_keys = engine.keys_for_shard(task.shard);
-                            let probe_manifest = relax_superset_manifest(
-                                &engine,
-                                &collect_manifest_entries(&engine, task.shard, &probe_keys)
-                                    .unwrap_or_default(),
-                            );
+                            let probe_manifest =
+                                collect_manifest_entries(&engine, task.shard, &probe_keys)
+                                    .unwrap_or_default();
                             let probe = || {
                                 if probe_manifest.is_empty() {
                                     return false;
@@ -5772,17 +5713,10 @@ fn run_migration_batch(
                             }
                         };
                         let manifest_hash = compute_manifest_for_entries(&manifest_entries);
-                        // Phase 8 (§7): when reconciliation is enabled, attach
-                        // this shard's tombstones so the target can drop exactly
-                        // the authoritatively-deleted keys (and transfer the
-                        // never-received ones). Off (default) → `None` → frame
-                        // byte-identical to today.
-                        let shard_tombstones: Option<Vec<(TxKey, u32)>> =
-                            if engine.tombstone_reconciliation_enabled() {
-                                Some(engine.tombstones_for_shard(task.shard))
-                            } else {
-                                None
-                            };
+                        // Deletion-tombstone migration reconciliation removed:
+                        // never attach a tombstone section (each node prunes
+                        // independently). Frame is the pre-Phase-8 shape.
+                        let shard_tombstones: Option<Vec<(TxKey, u32)>> = None;
                         if let Err(e) = send_migration_complete(
                             addr,
                             task.shard,
@@ -5817,11 +5751,7 @@ fn run_migration_batch(
                             // fails or is inconclusive, the non-empty copy rolls
                             // back to self exactly as before.
                             let _ = &e;
-                            // Phase 8 (§7): relax the probe to self's
-                            // non-tombstoned keys when reconciliation is enabled
-                            // (no-op clone otherwise).
-                            let manifest_for_probe =
-                                relax_superset_manifest(&engine, &manifest_entries);
+                            let manifest_for_probe = manifest_entries.clone();
                             let probe = || {
                                 confirm_target_holds_superset(
                                     addr,
@@ -8623,15 +8553,6 @@ impl RunningCluster {
             &std::collections::HashSet::new(),
         );
         self.inbound_atomic.load_from(mgr.inbound_bitmap());
-    }
-
-    /// Number of source manifests currently accumulated for `shard` (test-only
-    /// peek that does NOT drain, used to assert the BUG4 accumulate-lifecycle).
-    #[cfg(test)]
-    pub(crate) fn reconcile_accumulator_len(&self, shard: u16) -> usize {
-        self.migration
-            .lock()
-            .reconcile_accumulator_len_for_test(shard)
     }
 
     /// Register a shard as actively receiving inbound migration data.
@@ -16023,99 +15944,4 @@ mod tests {
     // source uniquely holding it would never have the target checked for it,
     // would wrongly relinquish, and would lose the re-creation.
     // -----------------------------------------------------------------------
-
-    /// Attach a real (in-memory device + temp redb) tombstone index to `engine`
-    /// and enable reconciliation, returning the index handle (+ TempDir keeping
-    /// the redb alive).
-    fn engine_with_tombstone_index(
-        engine: &Engine,
-    ) -> (
-        Arc<Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
-        tempfile::TempDir,
-    ) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let idx = Arc::new(Mutex::new(
-            crate::index::redb_tombstone::RedbTombstoneIndex::open(
-                &dir.path().join("tombstone.redb"),
-                16 * 1024 * 1024,
-            )
-            .unwrap(),
-        ));
-        engine.set_tombstone_index(idx.clone());
-        engine.set_tombstone_reconciliation_enabled(true);
-        (idx, dir)
-    }
-
-    #[test]
-    fn relax_superset_manifest_off_path_is_unchanged_clone() {
-        // Reconciliation DISABLED (default): the manifest is returned UNCHANGED
-        // even with a tombstone index that would otherwise exclude a key.
-        let engine = test_engine();
-        let (idx, _dir) = {
-            let dir = tempfile::TempDir::new().unwrap();
-            let idx = Arc::new(Mutex::new(
-                crate::index::redb_tombstone::RedbTombstoneIndex::open(
-                    &dir.path().join("t.redb"),
-                    16 * 1024 * 1024,
-                )
-                .unwrap(),
-            ));
-            engine.set_tombstone_index(idx.clone());
-            // Do NOT enable reconciliation.
-            (idx, dir)
-        };
-        let shard = 7u16;
-        let k = tx_key_for_shard(shard, 1);
-        // Tombstone at a gen >= the live gen would normally exclude k.
-        idx.lock().insert(k, 100, 5, shard, 0).unwrap();
-        let entries = vec![(k, 5u32)];
-        let out = relax_superset_manifest(&engine, &entries);
-        assert_eq!(out, entries, "off-path returns entries unchanged");
-    }
-
-    #[test]
-    fn relax_superset_manifest_excludes_key_tombstoned_at_or_ahead() {
-        // Tombstone gen == live gen → EXCLUDED (the target authoritatively
-        // deleted this exact version; self must not demand it).
-        let engine = test_engine();
-        let (idx, _dir) = engine_with_tombstone_index(&engine);
-        let shard = 8u16;
-        let k_eq = tx_key_for_shard(shard, 1); // tombstone gen == live gen
-        let k_ahead = tx_key_for_shard(shard, 2); // tombstone gen > live gen
-        let k_clean = tx_key_for_shard(shard, 3); // no tombstone
-        idx.lock().insert(k_eq, 100, 4, shard, 0).unwrap();
-        idx.lock().insert(k_ahead, 100, 9, shard, 0).unwrap();
-        let entries = vec![(k_eq, 4u32), (k_ahead, 4u32), (k_clean, 4u32)];
-        let out = relax_superset_manifest(&engine, &entries);
-        // k_eq and k_ahead excluded; only the clean key remains demanded.
-        assert_eq!(
-            out,
-            vec![(k_clean, 4u32)],
-            "tombstone at-or-ahead of live gen excludes the key; clean key kept"
-        );
-    }
-
-    #[test]
-    fn relax_superset_manifest_keeps_key_live_newer_than_tombstone() {
-        // The §8.4 create-after-delete defense: tombstone at gen 5, the key is
-        // LIVE at gen 6 → the key must be KEPT in the demand (a boolean
-        // `is_tombstoned` would wrongly EXCLUDE it → DATA LOSS of the
-        // re-creation). This is the exact BUG1 no-loss case.
-        let engine = test_engine();
-        let (idx, _dir) = engine_with_tombstone_index(&engine);
-        let shard = 9u16;
-        let k = tx_key_for_shard(shard, 1);
-        // Stale tombstone from the gen-5 deletion; key re-created live at gen 6.
-        idx.lock().insert(k, 100, 5, shard, 0).unwrap();
-        assert!(
-            idx.lock().is_tombstoned(&k),
-            "boolean is_tombstoned is still true after re-creation (the trap)"
-        );
-        let entries = vec![(k, 6u32)];
-        let out = relax_superset_manifest(&engine, &entries);
-        assert_eq!(
-            out, entries,
-            "key live at a generation NEWER than the tombstone is KEPT (no-loss)"
-        );
-    }
 }

@@ -34,8 +34,8 @@ use teraslab::server::startup::{
     AllocatorOrigin, SecondaryLoadOutcome, apply_packed_mode, check_replay_tolerance_with_cap,
     fallback_dah_index, fallback_unmined_index, load_primary_index_file_backed,
     load_primary_index_redb, load_sharded_index_in_memory, load_sharded_index_in_memory_multi,
-    open_mandatory_redo_log, open_tombstone_log, rebuild_in_memory_secondaries,
-    recover_or_create_allocator, secondaries_from_pair,
+    open_mandatory_redo_log, rebuild_in_memory_secondaries, recover_or_create_allocator,
+    secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -1321,118 +1321,8 @@ fn main() {
 
     let engine = Arc::new(engine);
 
-    // 4c. Deletion tombstones (deletion-tombstone Phase 3 + 7).
-    //
-    // Open the on-device tombstone log (its own `.tombstone` device file,
-    // mirroring the redo log's `.redo` sibling) and the redb tombstone
-    // lookup index, attach both to the engine, then run the tombstone
-    // recovery pass: R1 rebuilds the redb index from the durable log, R2
-    // self-purges any record this node resurrected for a key the cluster
-    // authoritatively deleted (design §5). All gated on `tombstones_enabled`
-    // (default true); when off, the delete path and recovery behave exactly
-    // as before tombstones existed (design §11.5).
-    //
-    // Kept alive for the process lifetime (like `_redo_log_device`) so the
-    // shared fd survives. A failure to open the log/index is fatal — a
-    // partially-wired tombstone subsystem would silently drop the
-    // deletion-evidence the cluster relies on.
-    engine.set_tombstones_enabled(config.tombstones_enabled);
-    // Phase 8 (design §7/§11.5): tombstone-driven migration reconciliation.
-    // Default OFF; awaits CI soak. When OFF, OP_MIGRATION_COMPLETE / the
-    // completion-frame builder / the superset proof / the failed-handoff
-    // disposition are byte-identical to the pre-Phase-8 Fix-B/#29 path. The
-    // enabled path additionally needs the tombstone index attached (below) to
-    // observe a non-empty source tombstone set; with reconciliation on but
-    // tombstones off, the source presents an empty tombstone section and the
-    // path degrades to the never-received TRANSFER decision (no-loss).
-    engine.set_tombstone_reconciliation_enabled(config.tombstone_reconciliation_enabled);
-    if config.tombstone_reconciliation_enabled {
-        tracing::info!(
-            "tombstone-driven migration reconciliation ENABLED (Phase 8) — \
-             enabled path is NOT docker-validated; awaiting CI soak",
-        );
-    }
-    // Height floor for the height subsystem (design §4), populated from the
-    // tombstone index when tombstones are enabled; `None` otherwise.
-    let mut tombstone_height_floor: Option<u32> = None;
-    if config.tombstones_enabled {
-        let tombstone_path = config.resolved_tombstone_log_path();
-        let (tombstone_device, tombstone_log) = match open_tombstone_log(
-            &tombstone_path,
-            config.tombstone_region_size,
-            config.device_alignment,
-        ) {
-            Ok(parts) => parts,
-            Err(e) => {
-                tracing::error!(
-                    path = %tombstone_path.display(),
-                    err = %e,
-                    "FATAL: deletion-tombstone log unavailable — cannot start with \
-                     tombstones enabled (set tombstones_enabled = false to fall back)",
-                );
-                std::process::exit(1);
-            }
-        };
-        let _tombstone_device: Arc<dyn BlockDevice> = tombstone_device;
-
-        let mut tombstone_index = match teraslab::index::redb_tombstone::RedbTombstoneIndex::open(
-            &config.index.redb_tombstone_path,
-            config.index.redb_cache_size,
-        ) {
-            Ok(idx) => idx,
-            Err(e) => {
-                tracing::error!(
-                    path = %config.index.redb_tombstone_path.display(),
-                    err = %e,
-                    "FATAL: deletion-tombstone redb index unavailable",
-                );
-                std::process::exit(1);
-            }
-        };
-
-        // R1 + R2: reconstruct the index from the log and self-purge.
-        match teraslab::recovery::recover_tombstones(&engine, &tombstone_log, &mut tombstone_index)
-        {
-            Ok(stats) => {
-                tracing::info!(
-                    reconstructed = stats.tombstones_reconstructed,
-                    self_purged = stats.records_self_purged,
-                    kept_newer_generation = stats.kept_newer_generation,
-                    "deletion-tombstone recovery complete (R1 reconstruct + R2 self-purge)",
-                );
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "FATAL: deletion-tombstone recovery failed");
-                std::process::exit(1);
-            }
-        }
-
-        // Height-subsystem floor (design §4): the max tombstone deletion
-        // height is a sound, free lower bound for the node's last-durable
-        // height (a tombstone's deletion_height ≤ the chain tip the node saw
-        // when it applied that delete). Read it before the index is moved.
-        tombstone_height_floor = tombstone_index.max_deletion_height().unwrap_or_else(|e| {
-            tracing::warn!(err = %e, "could not read tombstone max deletion height for height floor");
-            None
-        });
-
-        engine.set_tombstone_log(Arc::new(Mutex::new(tombstone_log)));
-        engine.set_tombstone_index(Arc::new(Mutex::new(tombstone_index)));
-        // Populate the derived redb tombstone index OFF the delete hot path: a
-        // background thread does the redb B-tree inserts (the dominant per-delete
-        // cost) while the delete request returns as soon as the durable
-        // tombstone log is written. The index is rebuilt from the log on
-        // recovery, so a bounded population lag is safe; started here, AFTER the
-        // recovery rebuild + max_deletion_height read above.
-        engine.start_tombstone_indexer();
-        tracing::info!(
-            path = %tombstone_path.display(),
-            size_mib = config.tombstone_region_size / (1024 * 1024),
-            "deletion-tombstone log + index attached (enabled, background indexer)",
-        );
-    } else {
-        tracing::info!("deletion tombstones disabled (tombstones_enabled = false)");
-    }
+    // Deletion tombstones removed: deletes are independent-node prune GC (no
+    // tombstone log/index, no replication, no migration reconciliation).
 
     // Height subsystem (deletion-tombstone design §4): attach the durable
     // height file and restore the node's last-durable height. ALWAYS-ON and
@@ -1455,9 +1345,7 @@ fn main() {
     // Persistence keeps the value monotone across restarts.
     let height_path = config.resolved_last_durable_height_path();
     let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
-    let record_floor = tombstone_height_floor
-        .unwrap_or(0)
-        .max(recovery_height_floor);
+    let record_floor = recovery_height_floor;
     engine.set_last_durable_height_path(height_path.clone());
     let restored_height = engine.restore_last_durable_height(persisted_height, record_floor);
     tracing::info!(
@@ -1977,40 +1865,6 @@ fn main() {
         None
     };
 
-    // Phase 5 — spawn the tombstone-GC daemon (deletion-tombstone design §4.6),
-    // sibling to the checkpoint / blob-gc tasks. It is spawned only in
-    // clustered mode (it needs the committed-membership view to compute the
-    // min finalized height) and ticks on `tombstone_gc_poll_interval_ms`. The
-    // daemon is GATED INTERNALLY on `tombstone_gc_enabled` (default OFF): when
-    // disabled it wakes, sees the flag is off, and does nothing — no horizon
-    // query, no range-delete, no log compaction. With GC off, this is a
-    // dormant thread and behavior is byte-identical to before Phase 5.
-    let tombstone_gc_handle: Option<std::thread::JoinHandle<()>> = match &cluster {
-        Some(c) => {
-            let gc_cfg = teraslab::tombstone_gc::TombstoneGcConfig {
-                enabled: config.tombstone_gc_enabled,
-                rejoin_grace_blocks: config.rejoin_grace_blocks,
-                poll_interval: std::time::Duration::from_millis(
-                    config.tombstone_gc_poll_interval_ms,
-                ),
-            };
-            if config.tombstone_gc_enabled {
-                tracing::warn!(
-                    rejoin_grace_blocks = config.rejoin_grace_blocks,
-                    "tombstone GC ENABLED (Phase 4+5) — the enabled path is NOT \
-                     docker-validated; awaiting CI soak (design §11.5)",
-                );
-            }
-            Some(teraslab::tombstone_gc::spawn_tombstone_gc_task(
-                gc_cfg,
-                engine.clone(),
-                c.clone(),
-                shutdown_flag.clone(),
-            ))
-        }
-        None => None,
-    };
-
     // R-038 (D-01): spawn the replica-lag monitor when:
     //   (a) we are clustered (RF > 1, so `init_ack_tracker` has been
     //       called and the static is populated), AND
@@ -2110,7 +1964,6 @@ fn main() {
         blob_gc_handle: Mutex::new(blob_gc_handle),
         redo_flush_handle: Mutex::new(redo_flush_handle),
         lag_monitor_handle: Mutex::new(lag_monitor_handle),
-        tombstone_gc_handle: Mutex::new(tombstone_gc_handle),
     };
 
     // F-G10-001 + F-G10-002: install the SIGINT/SIGTERM handler now. The
@@ -2160,9 +2013,6 @@ struct ServerWithShutdown {
     redo_flush_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the replica-lag monitor thread. See F-G10-022.
     lag_monitor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Join handle for the Phase 5 tombstone-GC daemon thread (gated off by
-    /// default). See deletion-tombstone design §4.6.
-    tombstone_gc_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerWithShutdown {
@@ -2201,18 +2051,6 @@ impl ServerWithShutdown {
             self.lag_monitor_handle.lock().take(),
             std::time::Duration::from_secs(5),
         );
-        Self::join_with_timeout(
-            "tombstone_gc",
-            self.tombstone_gc_handle.lock().take(),
-            std::time::Duration::from_secs(5),
-        );
-
-        // Drain + join the background tombstone-index writer so the persisted
-        // redb index reflects every committed delete before the snapshot below.
-        // A crash that skipped this is still safe — recovery rebuilds the index
-        // from the durable tombstone log.
-        self.engine.shutdown_tombstone_indexer();
-        tracing::info!("tombstone indexer stopped");
 
         // On shutdown: stop cluster, sync device
         if let Some(ref cluster) = self.cluster {

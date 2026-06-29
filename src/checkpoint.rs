@@ -635,15 +635,6 @@ where
     engine
         .sync_all_store_devices()
         .map_err(|e| format!("data device sync: {e}"))?;
-    // Deletion tombstones: under buffered durability `delete_inner` appends the
-    // tombstone without a per-delete fsync, so make the tombstone log durable
-    // HERE — before the fence/reclaim below — so a tombstone whose `DeleteV2`
-    // redo entry is about to be reclaimed is on stable storage first
-    // (deletion-tombstone §9.1 #4). A no-op under strict durability (already
-    // synced per delete) and when no tombstone log is attached.
-    engine
-        .sync_tombstone_logs()
-        .map_err(|e| format!("tombstone log sync: {e}"))?;
 
     // 4. Fence recovery at the sequence covered by the snapshot. This is not
     //    a Checkpoint marker: recovery must still replay post-fence entries

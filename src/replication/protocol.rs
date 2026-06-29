@@ -105,28 +105,12 @@ const OP_PRUNE_SLOT_IF_SPENT_BY: u8 = 15;
 /// old redo/receive replay) and is emitted unchanged when tombstones are
 /// disabled. Mirrors the `Create`/`SpendV2` versioning precedent: new tag,
 /// old tag retained.
-const OP_DELETE_V2: u8 = 16;
 /// Remove a child txid from a parent's conflicting-children list. Replicated
 /// so receivers (and migration targets) apply the same removal — there is no
 /// re-derivation path for a removal the way an append is re-derived from a
 /// child's Create/SetConflicting. Idempotent, keyed on (parent, child); no
-/// generation token (like [`OP_DELETE`]/[`OP_DELETE_V2`]).
+/// generation token (like [`OP_DELETE`]).
 const OP_REMOVE_CONFLICTING_CHILD: u8 = 17;
-
-/// Fixed wire payload of a [`ReplicaOp::DeleteV2`] op, AFTER the 1-byte
-/// [`OP_DELETE_V2`] tag. `#[repr(C, packed)]` pins the on-wire byte order to
-/// declaration order with no compiler padding, matching the manual
-/// little-endian encode/decode below. All multi-byte fields are stored
-/// little-endian; the compile-time assertion guards the 41-byte size.
-#[repr(C, packed)]
-struct DeleteV2Wire {
-    txid: [u8; 32],
-    deletion_height: u32,
-    generation: u32,
-    cause: u8,
-}
-
-const _: () = assert!(core::mem::size_of::<DeleteV2Wire>() == 41);
 
 /// A single replication operation sent from master to replica.
 /// A mutation operation to be replicated from master to replica.
@@ -240,12 +224,6 @@ pub enum ReplicaOp {
     /// deletion), a first-class tombstone field, not the replication ordering
     /// token. `master_generation()` therefore returns `None` for this op,
     /// exactly as for [`Self::Delete`].
-    DeleteV2 {
-        tx_key: TxKey,
-        deletion_height: u32,
-        generation: u32,
-        cause: u8,
-    },
     PruneSlot {
         tx_key: TxKey,
         offset: u32,
@@ -289,7 +267,6 @@ impl ReplicaOp {
             | Self::PreserveUntil { tx_key, .. }
             | Self::Create { tx_key, .. }
             | Self::Delete { tx_key, .. }
-            | Self::DeleteV2 { tx_key, .. }
             | Self::PruneSlot { tx_key, .. }
             | Self::PruneSlotIfSpentBy { tx_key, .. }
             | Self::MarkLongestChain { tx_key, .. } => *tx_key,
@@ -337,12 +314,7 @@ impl ReplicaOp {
                 master_generation, ..
             } => Some(*master_generation),
             Self::Create { metadata_bytes, .. } => create_embedded_generation(metadata_bytes),
-            // DeleteV2's `generation` is the tombstone's own field, NOT the
-            // replication ordering token — it is an idempotent remove keyed on
-            // `tx_key`, exactly like `Delete`. So it carries no
-            // `master_generation`.
             Self::Delete { .. }
-            | Self::DeleteV2 { .. }
             | Self::PruneSlot { .. }
             | Self::PruneSlotIfSpentBy { .. }
             // RemoveConflictingChild is an idempotent (parent, child) remove,
@@ -536,20 +508,6 @@ impl ReplicaOp {
             ReplicaOp::Delete { tx_key } => {
                 buf.push(OP_DELETE);
                 buf.extend_from_slice(&tx_key.txid);
-            }
-            ReplicaOp::DeleteV2 {
-                tx_key,
-                deletion_height,
-                generation,
-                cause,
-            } => {
-                // Layout mirrors `DeleteV2Wire` (txid | dh | gen | cause), all
-                // little-endian, 41 payload bytes after the tag.
-                buf.push(OP_DELETE_V2);
-                buf.extend_from_slice(&tx_key.txid);
-                buf.extend_from_slice(&deletion_height.to_le_bytes());
-                buf.extend_from_slice(&generation.to_le_bytes());
-                buf.push(*cause);
             }
             ReplicaOp::PruneSlot { tx_key, offset } => {
                 buf.push(OP_PRUNE_SLOT);
@@ -808,19 +766,6 @@ impl ReplicaOp {
                         tx_key: read_key(rest),
                     },
                     33,
-                ))
-            }
-            OP_DELETE_V2 => {
-                // 32(txid) + 4(deletion_height) + 4(generation) + 1(cause) = 41.
-                need(rest, 41)?;
-                Ok((
-                    ReplicaOp::DeleteV2 {
-                        tx_key: read_key(rest),
-                        deletion_height: r_u32(rest, 32),
-                        generation: r_u32(rest, 36),
-                        cause: rest[40],
-                    },
-                    42,
                 ))
             }
             OP_PRUNE_SLOT => {
@@ -1191,6 +1136,116 @@ impl ReplicaAck {
 
 #[cfg(test)]
 mod tests {
+    // (restored) round-trips every ReplicaOp variant (DeleteV2 removed).
+    #[test]
+    fn all_variants_round_trip() {
+        let ops = vec![
+            ReplicaOp::Spend {
+                tx_key: key(1),
+                offset: 0,
+                spending_data: [0x11; 36],
+                current_block_height: 700_000,
+                block_height_retention: 144,
+                master_generation: 0,
+            },
+            ReplicaOp::Unspend {
+                tx_key: key(2),
+                offset: 1,
+                spending_data: [0x22; 36],
+                current_block_height: 700_001,
+                block_height_retention: 145,
+                master_generation: 0,
+            },
+            ReplicaOp::SetMined {
+                tx_key: key(3),
+                block_id: 100,
+                block_height: 800000,
+                subtree_idx: 7,
+                on_longest_chain: true,
+                current_block_height: 800010,
+                block_height_retention: 288,
+                master_generation: 0,
+            },
+            ReplicaOp::UnsetMined {
+                tx_key: key(4),
+                block_id: 200,
+                current_block_height: 800020,
+                block_height_retention: 288,
+                master_generation: 0,
+            },
+            ReplicaOp::Freeze {
+                tx_key: key(5),
+                offset: 3,
+                master_generation: 0,
+            },
+            ReplicaOp::Unfreeze {
+                tx_key: key(6),
+                offset: 4,
+                master_generation: 0,
+            },
+            ReplicaOp::Reassign {
+                tx_key: key(7),
+                offset: 5,
+                new_hash: [0xCC; 32],
+                block_height: 1000,
+                spendable_after: 100,
+                master_generation: 0,
+            },
+            ReplicaOp::SetConflicting {
+                tx_key: key(8),
+                value: true,
+                current_block_height: 500,
+                retention: 288,
+                master_generation: 0,
+            },
+            ReplicaOp::RemoveConflictingChild {
+                tx_key: key(8),
+                child_txid: [0xC1; 32],
+            },
+            ReplicaOp::SetLocked {
+                tx_key: key(9),
+                value: false,
+                master_generation: 0,
+            },
+            ReplicaOp::PreserveUntil {
+                tx_key: key(10),
+                block_height: 5000,
+                master_generation: 0,
+            },
+            ReplicaOp::Create {
+                tx_key: key(11),
+                metadata_bytes: vec![0x42; 100],
+                utxo_hashes: vec![[0xAA; 32], [0xBB; 32]],
+                cold_data: Some(vec![0xDD; 50]),
+                is_external: false,
+            },
+            ReplicaOp::Delete { tx_key: key(12) },
+            ReplicaOp::PruneSlot {
+                tx_key: key(13),
+                offset: 99,
+            },
+            ReplicaOp::PruneSlotIfSpentBy {
+                tx_key: key(15),
+                offset: 100,
+                child_txid: [0xC1; 32],
+            },
+            ReplicaOp::MarkLongestChain {
+                tx_key: key(14),
+                on_longest_chain: true,
+                current_block_height: 800_000,
+                block_height_retention: 288,
+                master_generation: 7,
+            },
+        ];
+
+        for op in &ops {
+            let bytes = op.serialize();
+            let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+            assert_eq!(&decoded, op, "round-trip failed for {op:?}");
+            assert_eq!(consumed, bytes.len());
+        }
+    }
+
     use super::*;
     use crate::record::TxFlags;
 
@@ -1285,196 +1340,6 @@ mod tests {
         let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
         assert_eq!(decoded, op);
         assert_eq!(consumed, bytes.len());
-    }
-
-    #[test]
-    fn delete_v2_round_trip_all_fields() {
-        // Deletion-tombstone §6: DeleteV2 carries the tombstone fields. Cover
-        // a non-zero deletion_height + generation + each cause discriminant.
-        for cause in [
-            crate::tombstone::TombstoneCause::SpentDah,
-            crate::tombstone::TombstoneCause::Admin,
-            crate::tombstone::TombstoneCause::MigrationPrune,
-        ] {
-            let op = ReplicaOp::DeleteV2 {
-                tx_key: key(7),
-                deletion_height: 0x0123_4567,
-                generation: 0x89AB_CDEF,
-                cause: cause.as_u8(),
-            };
-            let bytes = op.serialize();
-            // 1 (tag) + 32 (txid) + 4 (dh) + 4 (gen) + 1 (cause) = 42 bytes.
-            assert_eq!(bytes.len(), 42, "DeleteV2 wire size");
-            assert_eq!(bytes[0], OP_DELETE_V2, "DeleteV2 op tag is 16");
-            let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
-            assert_eq!(decoded, op, "DeleteV2 round-trip failed for {cause:?}");
-            assert_eq!(consumed, bytes.len());
-            // Verify the decoded fields explicitly (packed → local copies).
-            match decoded {
-                ReplicaOp::DeleteV2 {
-                    tx_key,
-                    deletion_height,
-                    generation,
-                    cause: got_cause,
-                } => {
-                    assert_eq!(tx_key, key(7));
-                    assert_eq!(deletion_height, 0x0123_4567);
-                    assert_eq!(generation, 0x89AB_CDEF);
-                    assert_eq!(got_cause, cause.as_u8());
-                }
-                other => panic!("expected DeleteV2, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn delete_v2_wire_struct_is_41_bytes() {
-        // Guards the fixed payload size the manual encode/decode mirrors.
-        assert_eq!(core::mem::size_of::<DeleteV2Wire>(), 41);
-    }
-
-    #[test]
-    fn delete_v2_does_not_carry_master_generation() {
-        // Like V1 Delete, DeleteV2 is an idempotent remove keyed on tx_key —
-        // its `generation` is the tombstone field, NOT the replication
-        // ordering token, so `master_generation()` must be None.
-        let op = ReplicaOp::DeleteV2 {
-            tx_key: key(3),
-            deletion_height: 10,
-            generation: 99,
-            cause: crate::tombstone::TombstoneCause::Admin.as_u8(),
-        };
-        assert_eq!(op.master_generation(), None);
-        assert_eq!(op.tx_key(), key(3));
-    }
-
-    #[test]
-    fn v1_delete_still_decodes_unchanged() {
-        // Back-compat: the V1 Delete op (tag 12, 33 bytes) must still encode
-        // and decode exactly as before DeleteV2 was added.
-        let op = ReplicaOp::Delete { tx_key: key(5) };
-        let bytes = op.serialize();
-        assert_eq!(bytes.len(), 33, "V1 Delete wire size unchanged");
-        assert_eq!(bytes[0], OP_DELETE, "V1 Delete tag is 12");
-        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
-        assert_eq!(decoded, op);
-        assert_eq!(consumed, 33);
-        assert_eq!(decoded.master_generation(), None);
-    }
-
-    #[test]
-    fn all_variants_round_trip() {
-        let ops = vec![
-            ReplicaOp::Spend {
-                tx_key: key(1),
-                offset: 0,
-                spending_data: [0x11; 36],
-                current_block_height: 700_000,
-                block_height_retention: 144,
-                master_generation: 0,
-            },
-            ReplicaOp::Unspend {
-                tx_key: key(2),
-                offset: 1,
-                spending_data: [0x22; 36],
-                current_block_height: 700_001,
-                block_height_retention: 145,
-                master_generation: 0,
-            },
-            ReplicaOp::SetMined {
-                tx_key: key(3),
-                block_id: 100,
-                block_height: 800000,
-                subtree_idx: 7,
-                on_longest_chain: true,
-                current_block_height: 800010,
-                block_height_retention: 288,
-                master_generation: 0,
-            },
-            ReplicaOp::UnsetMined {
-                tx_key: key(4),
-                block_id: 200,
-                current_block_height: 800020,
-                block_height_retention: 288,
-                master_generation: 0,
-            },
-            ReplicaOp::Freeze {
-                tx_key: key(5),
-                offset: 3,
-                master_generation: 0,
-            },
-            ReplicaOp::Unfreeze {
-                tx_key: key(6),
-                offset: 4,
-                master_generation: 0,
-            },
-            ReplicaOp::Reassign {
-                tx_key: key(7),
-                offset: 5,
-                new_hash: [0xCC; 32],
-                block_height: 1000,
-                spendable_after: 100,
-                master_generation: 0,
-            },
-            ReplicaOp::SetConflicting {
-                tx_key: key(8),
-                value: true,
-                current_block_height: 500,
-                retention: 288,
-                master_generation: 0,
-            },
-            ReplicaOp::RemoveConflictingChild {
-                tx_key: key(8),
-                child_txid: [0xC1; 32],
-            },
-            ReplicaOp::SetLocked {
-                tx_key: key(9),
-                value: false,
-                master_generation: 0,
-            },
-            ReplicaOp::PreserveUntil {
-                tx_key: key(10),
-                block_height: 5000,
-                master_generation: 0,
-            },
-            ReplicaOp::Create {
-                tx_key: key(11),
-                metadata_bytes: vec![0x42; 100],
-                utxo_hashes: vec![[0xAA; 32], [0xBB; 32]],
-                cold_data: Some(vec![0xDD; 50]),
-                is_external: false,
-            },
-            ReplicaOp::Delete { tx_key: key(12) },
-            ReplicaOp::DeleteV2 {
-                tx_key: key(16),
-                deletion_height: 812_345,
-                generation: 9,
-                cause: crate::tombstone::TombstoneCause::SpentDah.as_u8(),
-            },
-            ReplicaOp::PruneSlot {
-                tx_key: key(13),
-                offset: 99,
-            },
-            ReplicaOp::PruneSlotIfSpentBy {
-                tx_key: key(15),
-                offset: 100,
-                child_txid: [0xC1; 32],
-            },
-            ReplicaOp::MarkLongestChain {
-                tx_key: key(14),
-                on_longest_chain: true,
-                current_block_height: 800_000,
-                block_height_retention: 288,
-                master_generation: 7,
-            },
-        ];
-
-        for op in &ops {
-            let bytes = op.serialize();
-            let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
-            assert_eq!(&decoded, op, "round-trip failed for {op:?}");
-            assert_eq!(consumed, bytes.len());
-        }
     }
 
     /// R-052: explicit byte-layout round-trip for `MarkLongestChain`.

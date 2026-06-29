@@ -12,7 +12,6 @@ pub mod hashtable;
 pub mod migration;
 pub mod redb_dah;
 pub mod redb_primary;
-pub mod redb_tombstone;
 pub mod redb_unmined;
 pub mod secondary_backend;
 pub mod sharded;

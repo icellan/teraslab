@@ -1412,9 +1412,7 @@ pub fn apply_op_journal(
     // while the `Create` lives in store N's can replay out of order and
     // resurrect the deleted record. `None` (key absent locally) routes normally.
     let pre_delete_device_id: Option<u8> = match op {
-        ReplicaOp::Delete { tx_key } | ReplicaOp::DeleteV2 { tx_key, .. } => {
-            engine.lookup(tx_key).map(|e| e.device_id)
-        }
+        ReplicaOp::Delete { tx_key } => engine.lookup(tx_key).map(|e| e.device_id),
         _ => None,
     };
 
@@ -1890,42 +1888,6 @@ pub fn apply_op_journal(
                 Err(e) => Err(format!("delete: {e}")),
             }
         }
-        ReplicaOp::DeleteV2 {
-            tx_key,
-            deletion_height,
-            generation,
-            cause,
-        } => {
-            // Deletion-tombstone §6 receiver apply. Ordering: remove the record
-            // FIRST, then write the tombstone — a crash between leaves "record
-            // gone, tombstone pending," which recovery R2 re-derives harmlessly
-            // (never "record live but cluster-dead").
-            //
-            // The record removal uses `delete_for_purge` (no engine-derived
-            // tombstone): we must record the MASTER's exact
-            // `deletion_height`/`generation`/`cause` via
-            // `apply_replicated_tombstone`, not the local-record-derived fields
-            // `engine.delete()` would compute. A missing record (`TxNotFound`)
-            // is fine and still proceeds to the tombstone write — the §6
-            // "pre-arm" for a key this replica never held.
-            //
-            // Idempotent on `tx_key`: re-applying finds the record already gone
-            // (TxNotFound, treated as success) and the tombstone row already
-            // present (`apply_replicated_tombstone` no-ops), so a re-sent batch
-            // is a true no-op with no error and no duplicate log append.
-            let req = DeleteRequest {
-                tx_key: *tx_key,
-                due_guard: None,
-            };
-            match engine.delete_for_purge(&req) {
-                Ok(()) => {}
-                Err(crate::ops::error::SpendError::TxNotFound) => {}
-                Err(e) => return Err(format!("delete_v2 record removal: {e}")),
-            }
-            engine
-                .apply_replicated_tombstone(tx_key, *deletion_height, *generation, *cause)
-                .map_err(|e| format!("delete_v2 tombstone write: {e}"))
-        }
         ReplicaOp::PruneSlot { tx_key, offset } => {
             // C-4: route through the stripe-locked `engine.prune_slot` instead
             // of a raw `io::read_utxo_slot` → mutate → `io::write_utxo_slot`
@@ -2280,21 +2242,6 @@ fn build_post_apply_redo_op(
                 record_size: 0,
             }))
         }
-        ReplicaOp::DeleteV2 { tx_key, .. } => {
-            // The redo entry only needs to re-remove the RECORD on replica
-            // recovery replay — the tombstone is durable in its own log
-            // (`apply_replicated_tombstone` → `append_synced`) and the redb
-            // tombstone index is rebuilt from that log at recovery
-            // (deletion-tombstone R1, §5.1), independently of this redo log.
-            // So a plain `RedoOp::Delete` (no tombstone field) suffices and no
-            // `RedoOp::DeleteV2` is needed. Same sentinel-zeros rationale as
-            // the `Delete` arm above.
-            Ok(Some(RedoOp::Delete {
-                tx_key: *tx_key,
-                record_offset: 0,
-                record_size: 0,
-            }))
-        }
         ReplicaOp::PruneSlot { tx_key, offset } => Ok(Some(RedoOp::PruneSlot {
             tx_key: *tx_key,
             offset: *offset,
@@ -2389,31 +2336,6 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ))
-    }
-
-    /// Attach a tombstone log + redb index to an engine for the DeleteV2
-    /// receiver-apply tests (deletion-tombstone §6). Returns the handles so a
-    /// test can assert exactly what landed on the durable log and the index.
-    fn wire_tombstones(
-        engine: &Engine,
-    ) -> (
-        Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>,
-        Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
-        tempfile::TempDir,
-    ) {
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
-        let log = crate::tombstone::TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
-        let log = Arc::new(parking_lot::Mutex::new(log));
-        let dir = tempfile::tempdir().unwrap();
-        let idx = crate::index::redb_tombstone::RedbTombstoneIndex::open(
-            &dir.path().join("tombstone.redb"),
-            16 * 1024 * 1024,
-        )
-        .unwrap();
-        let idx = Arc::new(parking_lot::Mutex::new(idx));
-        engine.set_tombstone_log(log.clone());
-        engine.set_tombstone_index(idx.clone());
-        (log, idx, dir)
     }
 
     fn make_engine_with_blob_store(
@@ -3680,141 +3602,6 @@ mod tests {
 
         apply_op(&engine, &ReplicaOp::Delete { tx_key: k }).unwrap();
         assert!(engine.lookup(&k).is_none());
-    }
-
-    #[test]
-    fn apply_delete_v1_unchanged_back_compat() {
-        // Back-compat: the V1 Delete handler is UNCHANGED — it routes through
-        // `engine.delete`, exactly as before DeleteV2 was added. With the
-        // tombstone feature disabled (the byte-identical fallback) it removes
-        // the record and writes NO tombstone.
-        let engine = make_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        engine.set_tombstones_enabled(false);
-        let k = key(60);
-        create_record(&engine, k, 2);
-
-        apply_op(&engine, &ReplicaOp::Delete { tx_key: k }).unwrap();
-
-        assert!(engine.lookup(&k).is_none(), "record removed");
-        assert!(
-            !idx.lock().is_tombstoned(&k),
-            "disabled V1 Delete writes no tombstone (fallback)",
-        );
-        assert!(log.lock().scan().unwrap().is_empty());
-    }
-
-    #[test]
-    fn apply_delete_v1_uses_engine_derived_tombstone_when_enabled() {
-        // The V1 Delete handler is unchanged: it calls `engine.delete`, which
-        // (post deletion-tombstone Phase 3) writes an ENGINE-DERIVED tombstone
-        // when the feature is enabled — cause=Admin, generation=local record's,
-        // deletion_height=observed tip (0). DeleteV2 differs by carrying the
-        // MASTER's exact fields; this test pins the V1 path's existing
-        // behavior so a future change cannot silently diverge it.
-        let engine = make_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        let k = key(65);
-        create_record(&engine, k, 2);
-        let gen_before = engine.lookup(&k).unwrap().generation;
-
-        apply_op(&engine, &ReplicaOp::Delete { tx_key: k }).unwrap();
-
-        assert!(engine.lookup(&k).is_none(), "record removed");
-        assert!(idx.lock().is_tombstoned(&k));
-        let v = idx.lock().get(&k).unwrap();
-        assert_eq!(v.cause, crate::tombstone::TombstoneCause::Admin.as_u8());
-        assert_eq!(v.generation, gen_before);
-        assert_eq!(v.deletion_height, 0);
-        assert_eq!(log.lock().scan().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn apply_delete_v2_removes_record_and_writes_tombstone() {
-        // Deletion-tombstone §6: DeleteV2 removes the record AND writes a
-        // tombstone carrying the master's exact fields.
-        let engine = make_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        let k = key(61);
-        create_record(&engine, k, 2);
-
-        apply_op(
-            &engine,
-            &ReplicaOp::DeleteV2 {
-                tx_key: k,
-                deletion_height: 700_111,
-                generation: 5,
-                cause: crate::tombstone::TombstoneCause::SpentDah.as_u8(),
-            },
-        )
-        .unwrap();
-
-        assert!(engine.lookup(&k).is_none(), "record removed");
-        assert!(idx.lock().is_tombstoned(&k), "tombstone written");
-        let v = idx.lock().get(&k).unwrap();
-        assert_eq!(v.deletion_height, 700_111);
-        assert_eq!(v.generation, 5);
-        assert_eq!(v.cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
-        assert_eq!(
-            v.shard,
-            crate::cluster::shards::ShardTable::shard_for_key(&k),
-        );
-        assert_eq!(log.lock().scan().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn apply_delete_v2_prearms_absent_key() {
-        // §6 pre-arm: DeleteV2 for a key this replica never held still records
-        // the tombstone (so a later resurrecting source self-purges).
-        let engine = make_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        let k = key(62);
-        assert!(engine.lookup(&k).is_none(), "key never created");
-
-        apply_op(
-            &engine,
-            &ReplicaOp::DeleteV2 {
-                tx_key: k,
-                deletion_height: 42,
-                generation: 3,
-                cause: crate::tombstone::TombstoneCause::Admin.as_u8(),
-            },
-        )
-        .unwrap();
-
-        assert!(idx.lock().is_tombstoned(&k), "pre-arm tombstone written");
-        let v = idx.lock().get(&k).unwrap();
-        assert_eq!(v.deletion_height, 42);
-        assert_eq!(v.generation, 3);
-        assert_eq!(v.cause, crate::tombstone::TombstoneCause::Admin.as_u8());
-        assert_eq!(log.lock().scan().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn apply_delete_v2_is_idempotent() {
-        // Re-applying DeleteV2 (re-sent batch / redo replay): record stays
-        // gone, single tombstone row, single durable log entry, no error.
-        let engine = make_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        let k = key(63);
-        create_record(&engine, k, 2);
-
-        let op = ReplicaOp::DeleteV2 {
-            tx_key: k,
-            deletion_height: 900,
-            generation: 1,
-            cause: crate::tombstone::TombstoneCause::SpentDah.as_u8(),
-        };
-        apply_op(&engine, &op).unwrap();
-        apply_op(&engine, &op).unwrap();
-
-        assert!(engine.lookup(&k).is_none());
-        assert_eq!(idx.lock().len(), 1, "single tombstone row");
-        assert_eq!(
-            log.lock().scan().unwrap().len(),
-            1,
-            "no duplicate log append on re-apply",
-        );
     }
 
     #[test]
@@ -6556,59 +6343,6 @@ mod tests {
                 assert_eq!(*target_generation, 10);
             }
             other => panic!("entry[0] should be SpendV2, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn delete_v2_post_apply_redo_is_plain_delete_and_replays() {
-        // Deletion-tombstone §6: the receiver's post-apply redo entry for
-        // DeleteV2 is a plain `RedoOp::Delete` (record removal only). The
-        // tombstone is durable via its own log (rebuilt at recovery,
-        // independent of redo), so no `RedoOp::DeleteV2` is needed. On replica
-        // restart, replaying the redo re-removes the record and the tombstone
-        // row survives in the redb index.
-        let engine = make_engine();
-        let log_arc = attach_redo_log(&engine);
-        let (tlog, tidx, _dir) = wire_tombstones(&engine);
-
-        let k = key(64);
-        create_record(&engine, k, 2);
-        let pre_seq = log_arc.lock().current_sequence();
-
-        apply_op(
-            &engine,
-            &ReplicaOp::DeleteV2 {
-                tx_key: k,
-                deletion_height: 555,
-                generation: 4,
-                cause: crate::tombstone::TombstoneCause::SpentDah.as_u8(),
-            },
-        )
-        .unwrap();
-        flush_replica_redo_log(&engine).expect("redo log flush");
-
-        // Record gone, tombstone present (durable log + index).
-        assert!(engine.lookup(&k).is_none());
-        assert!(tidx.lock().is_tombstoned(&k));
-        assert_eq!(tlog.lock().scan().unwrap().len(), 1);
-
-        // The post-apply redo entry is a plain Delete, not a DeleteV2.
-        let entries = log_arc
-            .lock()
-            .read_from_sequence(pre_seq)
-            .expect("redo replay");
-        let delete_entries: Vec<_> = entries
-            .iter()
-            .filter(|e| matches!(e.op, crate::redo::RedoOp::Delete { .. }))
-            .collect();
-        assert_eq!(
-            delete_entries.len(),
-            1,
-            "exactly one RedoOp::Delete for the DeleteV2 record removal",
-        );
-        match &delete_entries[0].op {
-            crate::redo::RedoOp::Delete { tx_key, .. } => assert_eq!(*tx_key, k),
-            other => panic!("expected RedoOp::Delete, got {other:?}"),
         }
     }
 
