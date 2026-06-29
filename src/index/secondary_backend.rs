@@ -158,6 +158,17 @@ impl DahBackend {
         }
     }
 
+    /// Return at most `limit` txids with delete_at_height in
+    /// `[0, current_height]`, lowest-height first. Bounds the DAH sweep's
+    /// per-call work (issue #25 follow-up — the unbounded query + delete batch
+    /// failed every pruner call once the due-set exceeded `max_batch`).
+    pub fn range_query_limited(&self, current_height: u32, limit: usize) -> Vec<TxKey> {
+        match self {
+            Self::InMemory(idx) => idx.range_query_limited(current_height, limit),
+            Self::OnDisk(redb) => redb.range_query_limited(current_height, limit),
+        }
+    }
+
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
         match self {

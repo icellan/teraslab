@@ -9334,15 +9334,20 @@ fn handle_process_expired(
     // Range-query the preserve secondary index for records whose preservation
     // window has elapsed (preserve_until in [1, current_height]) and schedule
     // them for deletion (set DAH = current + retention, clear preserve_until).
-    // This is O(expired), mirroring the Phase-2 DAH query
-    // (`dah_index().range_query`) below — it replaces the former
-    // O(index-size) primary-index walk that pinned a core during sync (#25).
-    // Each match is re-validated under the stripe lock inside
+    // This is O(expired), mirroring the Phase-2 DAH query below — it replaces
+    // the former O(index-size) primary-index walk that pinned a core during
+    // sync (#25). Each match is re-validated under the stripe lock inside
     // `expire_preservation_set_dah`, so a preserve_until cleared or pushed
     // forward since the query is handled correctly there. Skipped entirely
     // when retention is 0 (legacy 4-byte payload).
+    //
+    // Bounded to `max_batch` per call (lowest-`preserve_until` first) so a
+    // large catch-up backlog can't peg a core in one request; the pruner fires
+    // on every persisted block, so the remainder drains on subsequent calls.
     if block_height_retention != 0 {
-        let expired_candidates = engine.preserve_index().range_query(current_height);
+        let expired_candidates = engine
+            .preserve_index()
+            .range_query_limited(current_height, max_batch as usize);
         for key in &expired_candidates {
             // Ownership: only the master schedules expiry for its records.
             if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
@@ -9365,14 +9370,31 @@ fn handle_process_expired(
         }
     }
 
-    // Query DAH index for transactions due for deletion. The DAH index
+    // Query the DAH index for transactions due for deletion. The DAH index
     // is per-node and reflects only records this node knows about, so
     // it is already (mostly) ownership-filtered when running in cluster
     // mode — but we still re-check ownership explicitly below because
     // (a) DAH may transiently include non-master records during
     // migration, and (b) the index can lag behind the on-device
     // metadata.
-    let candidates = engine.dah_index().range_query(current_height);
+    //
+    // BOUNDED at `max_batch` candidates per call (#25 follow-up). The full
+    // due-set can reach the entire UTXO set during a catch-up sync. Processing
+    // it in one request was doubly broken: (1) it built a single
+    // OP_DELETE_BATCH bigger than the delete handler's own `max_batch` limit,
+    // so the batch was rejected with PAYLOAD_MALFORMED and NOTHING was ever
+    // deleted — the index could only grow; (2) the per-candidate under-lock
+    // re-validation below pegged a core over the whole due-set. Capping the
+    // query (lowest-`delete_at_height` first) fixes both: `owned_due` can never
+    // exceed `max_batch`, so the single delete dispatch below always fits (no
+    // chunking needed, and the C-1 barrier hand-off stays a single move), and
+    // the re-validation loop is bounded. The pruner fires on every persisted
+    // block, so the remaining due records drain on subsequent calls — the
+    // response's count reflects only what THIS call handled, so the caller
+    // converges across calls.
+    let candidates = engine
+        .dah_index()
+        .range_query_limited(current_height, max_batch as usize);
 
     // Phase 1: filter by ownership + re-validate against current metadata.
     // A DAH entry is a hint; the metadata is authoritative. The
@@ -11828,6 +11850,72 @@ mod tests {
         let meta = h.engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.preserve_until }, 100);
         assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    /// #25 follow-up (DAH-sweep cap): with more than `max_batch` DAH-due
+    /// records, a single OP_PROCESS_EXPIRED_PRESERVATIONS call must succeed
+    /// (NOT fail with PAYLOAD_MALFORMED from an oversized delete batch),
+    /// delete a slice capped at `max_batch`, and repeated per-block calls must
+    /// drain the DAH index to zero. Pre-fix the sweep built one delete batch
+    /// of the entire due-set, which the delete handler rejected once it
+    /// exceeded `max_batch` — so nothing was ever deleted and the index only
+    /// grew, stalling a live teratestnet sync.
+    #[test]
+    fn process_expired_dah_sweep_caps_batch_and_converges() {
+        let h = DispatchTestHarness::new();
+        let max_batch = 4u32;
+        let retention = 10u32;
+        let n = 11usize; // > 2 * max_batch → needs at least 3 capped calls
+
+        for i in 0..n {
+            let txid = DispatchTestHarness::make_txid(50 + i as u8);
+            assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+            // set_mined at height 50 + spend-all at height 100 with `retention`
+            // → DAH = 100 + 10 = 110, all-spent, on-longest-chain → due.
+            make_record_dah_eligible(&h, txid, retention);
+        }
+        assert_eq!(
+            h.engine.dah_index().range_query(u32::MAX).len(),
+            n,
+            "all seeded records must be in the DAH index",
+        );
+
+        // Sweep at a height past the DAH (110) with a small `max_batch` so the
+        // cap engages well below the seeded count.
+        let mut calls = 0u32;
+        while !h.engine.dah_index().range_query(u32::MAX).is_empty() {
+            let resp = h.request_with_max_batch(
+                OP_PROCESS_EXPIRED_PRESERVATIONS,
+                process_expired_payload(200, retention),
+                max_batch,
+            );
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "DAH sweep must succeed without PAYLOAD_MALFORMED (status {})",
+                resp.status,
+            );
+            let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+            assert!(
+                deleted <= max_batch,
+                "per-call deletes {deleted} must be capped at max_batch {max_batch}",
+            );
+            assert!(deleted > 0, "a call with due records must make progress");
+            calls += 1;
+            assert!(
+                calls <= n as u32 + 2,
+                "sweep must converge, not loop forever"
+            );
+        }
+
+        assert!(
+            h.engine.dah_index().range_query(u32::MAX).is_empty(),
+            "repeated capped sweeps must drain the DAH index to zero",
+        );
+        let min_calls = (n as u32).div_ceil(max_batch);
+        assert!(
+            calls >= min_calls,
+            "draining {n} records at <= {max_batch}/call needs >= {min_calls} calls; took {calls}",
+        );
     }
 
     /// Backward-compat: the legacy 4-byte payload (no retention) skips the

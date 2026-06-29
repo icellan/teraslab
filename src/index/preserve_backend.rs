@@ -114,6 +114,16 @@ impl PreserveBackend {
         }
     }
 
+    /// Return at most `limit` txids whose `preserve_until` is in
+    /// `[1, current_height]`, lowest-height first. Bounds the expiry sweep's
+    /// per-call work; see
+    /// [`crate::index::preserve_index::PreserveIndex::range_query_limited`].
+    pub fn range_query_limited(&self, current_height: u32, limit: usize) -> Vec<TxKey> {
+        match self {
+            Self::InMemory(idx) => idx.range_query_limited(current_height, limit),
+        }
+    }
+
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
         match self {

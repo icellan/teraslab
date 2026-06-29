@@ -100,6 +100,27 @@ impl PreserveIndex {
         result
     }
 
+    /// Like [`Self::range_query`] but stops after collecting `limit` keys
+    /// (lowest-`preserve_until` first). Bounds the expiry sweep's per-call work
+    /// the same way the DAH sweep is bounded — see
+    /// [`crate::index::dah_index::DahIndex::range_query_limited`]. The preserve
+    /// set is normally small, but a pathological backlog must not peg a core.
+    pub fn range_query_limited(&self, current_height: u32, limit: usize) -> Vec<TxKey> {
+        let mut result = Vec::new();
+        if limit == 0 || current_height == 0 {
+            return result;
+        }
+        for (_, keys) in self.by_height.range(1..=current_height) {
+            for &key in keys {
+                result.push(key);
+                if result.len() >= limit {
+                    return result;
+                }
+            }
+        }
+        result
+    }
+
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
         self.by_txid.len()
@@ -244,6 +265,24 @@ mod tests {
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
         assert!(idx.range_query(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn range_query_limited_caps_and_excludes_height_zero() {
+        let mut idx = PreserveIndex::new();
+        idx.insert(10, key(1));
+        idx.insert(10, key(2));
+        idx.insert(20, key(3));
+
+        // limit 0 → empty; height-0 query → empty (and the 1..=0 range never
+        // panics under the cap either).
+        assert!(idx.range_query_limited(100, 0).is_empty());
+        assert!(idx.range_query_limited(0, 10).is_empty());
+
+        // capped to the lowest preserve heights first.
+        assert_eq!(idx.range_query_limited(100, 2).len(), 2);
+        // limit >= total → all.
+        assert_eq!(idx.range_query_limited(100, 99).len(), 3);
     }
 
     #[test]
