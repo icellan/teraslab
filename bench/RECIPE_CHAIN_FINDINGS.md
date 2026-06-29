@@ -25,6 +25,38 @@ workload. The client-side work this campaign did (pool sharding, transport rewri
 batcher goroutine fix) gave only marginal gains precisely because the client was
 never the cap; the writeback fix (server) was the right kind of lever.
 
+## CONCLUSION (2026-06-29) — profile-guided tuning levers EXHAUSTED; remaining ~1.4× is architectural
+
+After driving the loop to convergence, **every individual hotspot the profiler
+flagged is now optimized**, and the remaining gap (~28–29k vs ~40.7k links/s,
+~1.4×) is distributed micro-contention, not a single fixable spot:
+
+| profiled hotspot | status |
+|---|---|
+| device I/O — sparse file → ext4 block alloc on write | **FIXED: fallocate (2×, the big win)** |
+| cache write-back flush CPU — O(all blocks) scan/tick | **FIXED: per-shard dirty-index → O(dirty)** |
+| cache shard lock held across device I/O | already correct (miss loads OUTSIDE the lock; 384 shards) |
+| redo encode under the append lock | already OUTSIDE the lock (E7: pre_encode lock-free, O(1) finalize under lock) |
+| redo per-store lock count | device_split=4 optimal (8/12 measured WORSE) |
+| index lock contention | heavily striped (lock_stripes=65536) |
+| whole client pipeline | NOT the cap — 303k links/s ceiling (mock-isolation proven, 22× headroom) |
+
+So the remaining ~1.4× is **distributed lock/coordination micro-contention**: each
+op takes several already-brief locks (index + redo + cache + allocator + dispatch);
+at ~115k store-ops/s the aggregate futex traffic + the inherent serialization
+points cap throughput at ~28–29k links/s on this hardware, while the mature C
+reference has lower per-op overhead. This is **as close to "the gap is fundamental
+to the current architecture" as the evidence supports** — no cheap/medium
+profile-guided fix remains. Closing it requires a **ground-up lower-contention
+redesign** (lock-free or per-thread/per-connection redo + index + cache append
+paths, or collapsing the per-op lock count), which is a major multi-cycle
+engineering effort, NOT a perf-tuning iteration — and must be prototyped + profiled
++ measured carefully on durability-critical code (do not change blind).
+
+Net this campaign: realistic chain workload **8.7k → ~28–29k links/s (~3.3×)**,
+gap to reference closed from **~4.7× → ~1.4×**, headline win = fallocate (2×).
+TeraSlab still does not beat the reference on this workload (honest: not won).
+
 ## ⭐⭐ BIGGEST WIN (2026-06-29) — fallocate the device file: +110% (server lever)
 
 Off-CPU + perf profiling of the server (commit 5b82b2e): the CPU-idle server's
