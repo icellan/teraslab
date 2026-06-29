@@ -898,11 +898,23 @@ Point read of a single UTXO slot plus the record's locktime. Used for double-spe
      pinned a core during sync, issue #25; the *semantics* below are unchanged,
      only how the expired records are found.) Each candidate is re-validated
      under the per-tx stripe lock before its transition.
-   - For each: set `delete_at_height = current_height + BlockHeightRetention`
-     and clear `preserve_until` (unconditional, matching the Aerospike pruner
-     `ProcessExpiredPreservations`; the elapsed preservation window is itself
-     the signal that the record may be reclaimed). The record is then deleted
-     `BlockHeightRetention` blocks later by the Phase 2 sweep.
+   - For each: clear `preserve_until`, and set
+     `delete_at_height = current_height + BlockHeightRetention` **only if the
+     record is sweep-eligible** — i.e. it would pass the Phase-2 due predicate
+     once that height arrives: CONFLICTING, or (all-spent ∧ on-longest-chain ∧
+     not REASSIGNED). The elapsed preservation window signals the record *may*
+     be reclaimed, but a record with unspent outputs / unmined / reassigned is
+     not deletable (Phase 2 would reject it forever), so scheduling a DAH for it
+     would plant an immortal, never-draining DAH-index entry — which, under the
+     per-call Phase-2 cap (#25), can starve the sweep (≥ `max_batch` such
+     low-height entries → every capped query returns only them → genuinely-due
+     records never reached). A non-eligible record therefore just reverts to the
+     normal lifecycle: it acquires a DAH later, via the spend / setMined path,
+     once it actually becomes deletable. (This refines the original
+     "unconditional, matching the Aerospike pruner" behaviour; the Rust Phase-2
+     sweep already declines to delete non-all-spent records — KO-2/KO-3 — so the
+     unconditional DAH only ever produced entries Phase 2 rejected.) Eligible
+     records are deleted `BlockHeightRetention` blocks later by the Phase 2 sweep.
    - **Wire payload:** `OP_PROCESS_EXPIRED_PRESERVATIONS` takes
      `[current_height:4]` (legacy: expiry pre-pass skipped) or
      `[current_height:4][block_height_retention:4]` (the 8-byte form supplies
