@@ -720,18 +720,27 @@ mod tests {
         (engine, redo, dir)
     }
 
-    /// End-to-end: a live checkpoint task must keep a write burst that exceeds
-    /// the redo capacity flowing WITHOUT a single `LogFull`. The producer gates
-    /// before each append (mirroring the dispatch pre-barrier gate) via the
-    /// engine's shared coordinator; when it starves on a full log the
-    /// checkpoint task — armed at startup, woken via `park_drainer`, forced
-    /// blocking by `blocked_appenders > 0` — drains and frees space, and the
-    /// producer proceeds. Regression for block 269's
-    /// "redo log full: 1073737727/1073737728 bytes used" cascade.
+    /// End-to-end: the gate (which admits a mutation only when the reserve is
+    /// free) plus a draining blocking checkpoint must keep a write burst that
+    /// exceeds the redo capacity flowing WITHOUT a single `LogFull`. Regression
+    /// for block 269's "redo log full: 1073737727/1073737728 bytes used"
+    /// cascade.
+    ///
+    /// Driven DETERMINISTICALLY rather than by racing a spawned checkpoint task
+    /// on a wall clock. The prior version spawned the live task and asserted a
+    /// per-append `wait_for_capacity` valve (15 s, then 60 s); it flaked on
+    /// CPU-contended CI runners. The drain is logically prompt (a `MemoryDevice`
+    /// "fsync" is trivial), but under parallel `cargo test` on a 2-core runner
+    /// the background checkpoint thread can be starved of a core, so a
+    /// wall-clock valve is the wrong shape — bumping it only postpones the
+    /// flake. Here the producer performs the SAME blocking checkpoint the live
+    /// task runs on starvation (`blocked_appenders > 0`), inline, whenever the
+    /// gate reports the reserve is unavailable — no background thread, no
+    /// wall-clock dependency. The live task's wake-on-starvation path
+    /// (`park_drainer` / `blocked_appenders` raising a drain) is covered by the
+    /// dedicated coordinator test in `redo.rs`.
     #[test]
-    fn checkpoint_task_keeps_burst_flowing_without_logfull() {
-        use std::sync::atomic::AtomicU64;
-
+    fn checkpoint_drain_keeps_burst_flowing_without_logfull() {
         let dir = tempfile::tempdir().unwrap();
         let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
@@ -750,37 +759,37 @@ mod tests {
         let capacity = log.capacity();
         let redo = Arc::new(Mutex::new(log));
         // Attach so the engine builds + injects the shared backpressure
-        // coordinator (the gate and the checkpoint loop both read it).
+        // coordinator (the gate reads it); arm it as the live task would at
+        // startup.
         engine.set_redo_log(redo.clone());
         let bp = engine
             .redo_backpressure()
             .expect("coordinator built on attach");
+        bp.arm();
 
-        let mut cfg = CheckpointConfig::new(dir.path().join("burst.snap"));
-        cfg.high_water = 0.5;
-        cfg.low_water = 0.1;
-        cfg.emergency_high_water = 0.8;
-        cfg.poll_interval = Duration::from_millis(20);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let handle = spawn_checkpoint_task(cfg, engine.clone(), redo.clone(), shutdown.clone());
-
+        let cfg = CheckpointConfig::new(dir.path().join("burst.snap"));
         let reserve = capacity / 4;
         let payload = 2048usize;
-        // 2× capacity forces a couple of fill/drain cycles (enough to exercise
-        // the gate→blocking-checkpoint→reclaim loop) without piling up many
-        // real-fsync checkpoint rounds, whose wall time is what made this flaky.
+        // 2× capacity forces several fill/drain cycles through the
+        // gate → blocking-checkpoint → reclaim loop.
         let total_appends = (capacity / payload as u64 * 2) as usize;
-        let logfull = Arc::new(AtomicU64::new(0));
+        let mut logfull = 0u64;
 
         for i in 0..total_appends {
-            // Generous valve: the real checkpoint task does real snapshot +
-            // fsync rounds whose latency balloons on a contended CI runner; 60 s
-            // tolerates that without a false timeout (the drain completes in ms
-            // normally). It is a liveness backstop, not a latency assertion.
-            assert!(
-                bp.wait_for_capacity(reserve, Duration::from_secs(60)),
-                "gate must obtain capacity (checkpoint task alive)"
-            );
+            // The dispatch pre-barrier gate admits a mutation only when at least
+            // `reserve` bytes are free. When the burst has consumed that
+            // headroom, drain with the SAME blocking checkpoint the live task
+            // runs on `blocked_appenders > 0`. No replicas here, so the reset
+            // guard always allows a full reclaim, which deterministically frees
+            // the reserve — no wall-clock wait, no thread-scheduling race.
+            if bp.available_space() < reserve {
+                perform_blocking_checkpoint_with_reset_guard(&cfg, &engine, &redo, |_| true)
+                    .expect("blocking checkpoint drains the log");
+                assert!(
+                    bp.available_space() >= reserve,
+                    "a blocking checkpoint with no replica hold must free the reserve",
+                );
+            }
             let mut log = redo.lock();
             match log.append_and_flush(RedoOp::Create {
                 tx_key: crate::index::TxKey {
@@ -795,19 +804,16 @@ mod tests {
             }) {
                 Ok(_) => {}
                 Err(crate::redo::RedoError::LogFull { .. }) => {
-                    logfull.fetch_add(1, Ordering::Relaxed);
+                    logfull += 1;
                 }
                 Err(e) => panic!("unexpected redo error: {e}"),
             }
         }
 
-        shutdown.store(true, Ordering::Relaxed);
-        handle.join().unwrap();
-
         assert_eq!(
-            logfull.load(Ordering::Relaxed),
-            0,
-            "a live checkpoint task must keep a capacity-exceeding burst flowing without LogFull"
+            logfull, 0,
+            "the gate + a draining blocking checkpoint must keep a \
+             capacity-exceeding burst flowing without LogFull",
         );
     }
 
