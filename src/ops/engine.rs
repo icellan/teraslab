@@ -7090,6 +7090,23 @@ impl Engine {
         self.delete_inner(req, self.tombstone_write_active(), false, true)
     }
 
+    /// Local prune-delete: remove a fully-spent record with NO tombstone, NO
+    /// redo, and NO replication.
+    ///
+    /// Deletes are independent-node GC of records that are fully spent and no
+    /// longer needed, NOT part of normal client operation. Durability is
+    /// unnecessary: a crash before the physical cleanup just leaves the record
+    /// present (and consistent — record + parent-spent slots + allocated region
+    /// all still agree), and the pruner re-deletes it on its next pass
+    /// (self-healing). So this writes no tombstone and the caller writes no redo
+    /// / does no replication. Physically it does the same RAM-index unregister +
+    /// header zero (write-back cache) + region free as [`Self::delete`], minus
+    /// the tombstone. Returns `Ok(())` on success or when the record is already
+    /// gone (idempotent), mirroring the re-prune contract.
+    pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(req, false, false, false).map(|_| ())
+    }
+
     /// Batch-insert the derived redb tombstone-index rows for a completed delete
     /// batch in a SINGLE redb write transaction.
     ///

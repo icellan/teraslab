@@ -25,9 +25,7 @@ use crate::record::{ExternalRef, METADATA_SIZE, TxFlags};
 use crate::redo::{RedoLog, RedoOp};
 use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
-use crate::replication::receiver::{
-    DEFAULT_STREAM_KEY, handle_replica_batch, handle_replica_batch_with_tracker,
-};
+use crate::replication::receiver::{DEFAULT_STREAM_KEY, handle_replica_batch_with_tracker};
 use crate::replication::tcp_transport::TcpReplicaTransport;
 use crate::storage::blobstore::BlobStore;
 use parking_lot::Mutex;
@@ -3483,17 +3481,6 @@ fn before_images_match_repl_ops(
             .all(|((op_key, ops), (before_key, images))| {
                 op_key == before_key && ops.len() == images.len()
             })
-}
-
-fn push_repl_with_before_image(
-    repl_ops: &mut Vec<(TxKey, Vec<ReplicaOp>)>,
-    before_images: &mut Vec<(TxKey, Vec<BeforeImage>)>,
-    key: TxKey,
-    op: ReplicaOp,
-    before: BeforeImage,
-) {
-    repl_ops.push((key, vec![op]));
-    before_images.push((key, vec![before]));
 }
 
 /// Compensate for a replication failure by reversing locally-applied mutations.
@@ -7870,123 +7857,17 @@ fn handle_preserve_until_batch(
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
-/// One snapshotted UTXO slot. Used by the delete-batch compensation
-/// path (R-007 — Codex F1) to restore the exact pre-delete slot
-/// state (status + spending_data + hash) when a replication failure
-/// forces the master to undo a delete.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SnapshotSlot {
-    pub hash: [u8; 32],
-    pub status: u8,
-    pub spending_data: [u8; 36],
-}
-
-/// Full pre-delete snapshot of one transaction record. See
-/// [`build_delete_compensation_ops`] for how this is replayed into
-/// `ReplicaOp` form when replication fails.
-#[derive(Debug, Clone)]
-pub(crate) struct DeleteSnapshot {
-    pub metadata_bytes: Vec<u8>,
-    /// Generation captured from the metadata at snapshot time. Used
-    /// as the `master_generation` on the per-slot Spend/Freeze
-    /// compensation ops so the receiver applies them as a coherent
-    /// view of the pre-delete state (matches the
-    /// `stream_shard_baseline` migration replay pattern).
-    pub master_generation: u32,
-    pub slots: Vec<SnapshotSlot>,
-    pub cold_data: Option<Vec<u8>>,
-    pub is_external: bool,
-}
-
-/// Build the sequence of `ReplicaOp` ops that, when applied in order,
-/// re-establish the exact pre-delete state of `key`. The Create op
-/// restores the metadata + utxo_hashes; subsequent Spend / Freeze /
-/// PruneSlot ops re-stamp slots that were not in the default UNSPENT
-/// state.
-///
-/// R-007 / Codex F1: pre-fix the compensation only emitted Create,
-/// which left every slot UNSPENT regardless of pre-delete state. A
-/// previously-spent slot could then be spent again by a different
-/// transaction. The fix uses the same Create + per-slot replay
-/// pattern that `stream_shard_baseline` uses for migration baselines.
-pub(crate) fn build_delete_compensation_ops(key: &TxKey, snap: &DeleteSnapshot) -> Vec<ReplicaOp> {
-    let mut ops: Vec<ReplicaOp> = Vec::with_capacity(1 + snap.slots.len());
-    ops.push(ReplicaOp::Create {
-        tx_key: *key,
-        metadata_bytes: snap.metadata_bytes.clone(),
-        utxo_hashes: snap.slots.iter().map(|s| s.hash).collect(),
-        cold_data: snap.cold_data.clone(),
-        is_external: snap.is_external,
-    });
-    for (v, slot) in snap.slots.iter().enumerate() {
-        let offset = v as u32;
-        match slot.status {
-            crate::record::UTXO_SPENT => {
-                ops.push(ReplicaOp::Spend {
-                    tx_key: *key,
-                    offset,
-                    spending_data: slot.spending_data,
-                    // Delete compensation first restores lifecycle metadata
-                    // through Create; these slot restamps must not re-evaluate
-                    // DAH and move the snapshotted pruning target.
-                    current_block_height: 0,
-                    block_height_retention: 0,
-                    master_generation: snap.master_generation,
-                });
-            }
-            crate::record::UTXO_FROZEN => {
-                ops.push(ReplicaOp::Freeze {
-                    tx_key: *key,
-                    offset,
-                    master_generation: snap.master_generation,
-                });
-            }
-            crate::record::UTXO_PRUNED => {
-                ops.push(ReplicaOp::PruneSlot {
-                    tx_key: *key,
-                    offset,
-                });
-            }
-            _ => {
-                // UTXO_UNSPENT and any other byte: nothing to replay
-                // — Create already produces an unspent slot.
-            }
-        }
-    }
-    ops
-}
-
-/// Choose the master→replica delete op (deletion-tombstone §6).
-///
-/// When the master's own delete wrote a tombstone (`info` is `Some`), emit
-/// `DeleteV2` carrying those exact `deletion_height` / `generation` / `cause`
-/// values so the replica records a matching tombstone and self-purges on its
-/// own restart. When no tombstone was written (`info` is `None` — tombstones
-/// disabled or no log attached), fall back to the V1 `Delete`, keeping the
-/// `tombstones_enabled = false` behavior byte-identical to the pre-tombstone
-/// path.
-fn delete_replica_op_for(
-    key: TxKey,
-    info: Option<crate::ops::engine::DeleteTombstoneInfo>,
-) -> ReplicaOp {
-    match info {
-        Some(info) => ReplicaOp::DeleteV2 {
-            tx_key: key,
-            deletion_height: info.deletion_height,
-            generation: info.generation,
-            cause: info.cause.as_u8(),
-        },
-        None => ReplicaOp::Delete { tx_key: key },
-    }
-}
-
 fn handle_delete_batch(
     req: &RequestFrame,
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
-    redo_log: Option<&Mutex<RedoLog>>,
-    // C-1: exclusive visibility barrier, released before replication.
+    // Deletes are local prune GC — not durable, not replicated — so the redo
+    // handle is unused here (kept in the signature for call-site symmetry with
+    // the other batch handlers; removed in a later cleanup).
+    _redo_log: Option<&Mutex<RedoLog>>,
+    // Forwarded coarse exclusive guard from the DAH-sweep caller; when `Some`
+    // this handler does NOT take its own per-key visibility (would self-deadlock).
     barrier: Option<MutationBarrier<'_>>,
     // KO-3: when `Some(current_height)` this batch originated from the DAH
     // sweep (`handle_process_expired`), and every `engine.delete` is gated by
@@ -8001,82 +7882,40 @@ fn handle_delete_batch(
     };
     let total_items = txids.len() as u64;
     let mut errors = Vec::new();
-    let mut redo_ops: Vec<RedoOp> = Vec::new();
 
-    // Fine-grained visibility for the whole delete batch (Phase-1 snapshot
-    // through Phase-3 apply), released before the Phase-4 replication
-    // round-trip (C-1). Delete is in `manages_own_visibility`, so
-    // `handle_request` took NO coarse guard; here we take the per-key WRITE
-    // side over the deleted txids plus the global SHARED side (so a checkpoint
-    // still excludes us). Disjoint-key deletes/reads now run concurrently
-    // instead of serializing on the global EXCLUSIVE barrier — the dominant
-    // delete-tail cost once the per-delete fsyncs were removed.
-    //
-    // Acquired BEFORE Phase 1 so the compensation pre-image snapshot is read
-    // under the same per-key exclusion the coarse guard used to provide: once
-    // we hold `mutation(deleted_keys)`, no concurrent mutation of those keys
-    // can land between the snapshot read and the apply, so the snapshot stays
-    // a faithful pre-delete image. Parent-prune records are NOT in this set:
-    // `append_deleted_child` updates parent metadata atomically under the
-    // engine's own per-record io/stripe locks (a reader sees pre- or
-    // post-prune, never torn) and each prune is independent and idempotent, so
-    // they need no batch-level visibility.
-    //
-    // GATED on `barrier.is_none()`: the DAH-sweep caller
-    // (`handle_process_expired`) forwards its EXCLUSIVE global guard via
-    // `barrier`; taking `global.read()` here on the same thread would
-    // self-deadlock and is unnecessary (that guard already excludes everyone).
+    // Fine-grained visibility for the batch: per-key WRITE over the deleted
+    // txids + global SHARED (so a checkpoint still excludes us). GATED on
+    // `barrier.is_none()`: the DAH-sweep caller forwards its EXCLUSIVE global
+    // guard via `barrier`; re-taking `global.read()` here on the same thread
+    // would self-deadlock.
     let visibility_guard = barrier.is_none().then(|| {
         let keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
         engine.visibility().mutation(&keys)
     });
 
-    // Phase 1: Validate ownership, lookup record_offset (read-only), build redo ops.
-    // Also snapshot each record BEFORE deletion so we can restore on replication failure.
-    struct ValidDelete {
-        idx: usize,
-        key: TxKey,
-        parent_prunes: Vec<ParentPrune>,
-        /// Full record snapshot for compensation. Contains the metadata
-        /// bytes AND per-slot state (hash + status + spending_data) so
-        /// the compensation path can rebuild not just an empty record
-        /// but the exact pre-delete slot states. R-007 (Codex F1) — the
-        /// previous version captured only `utxo_hashes`, so a compensation
-        /// after replication failure recreated previously-spent slots as
-        /// UNSPENT, opening a double-spend window.
-        snapshot: Option<DeleteSnapshot>,
-    }
-    #[derive(Clone, Copy)]
-    struct ParentPrune {
-        key: TxKey,
-        offset: u32,
-    }
-    // The per-record compensation snapshot (extra read_metadata + read_slots +
-    // blob fetch per item) is ONLY consumed to roll a delete back when a
-    // REPLICATION fan-out fails. On a single node — or a clustered node with
-    // replication_factor == 1 and no migration in flight — no replication runs,
-    // so the snapshot can never be used. Skip building it there: that removes
-    // two device reads (and a possible blob fetch) per deleted item from the hot
-    // path. (Mirrors the rf>1/migration predicate used elsewhere in dispatch.)
-    let needs_snapshot = cluster.is_some_and(|c| {
-        c.shard_table().read().replication_factor() > 1 || c.migration_pressure_active()
-    });
-    let mut valid_items: Vec<ValidDelete> = Vec::new();
+    // LOCAL PRUNE. Deletes are independent-node GC of fully-spent records that
+    // are no longer needed — NOT part of normal client operation. They are NOT
+    // durable, NOT replicated, and write NO tombstone: a crash before the
+    // physical cleanup just leaves the record present (and consistent — record +
+    // parent-spent slots + allocated region all still agree), and the pruner
+    // re-deletes it next pass (self-healing). Each item:
+    //   1. validate shard ownership + (external records) the cold-blob guard,
+    //   2. mark every parent slot this child spent as PRUNED (UTXO correctness),
+    //   3. remove the record locally (`engine.prune_delete`: RAM-index
+    //      unregister + header zero via the write-back cache + region free).
     'items: for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        let record_offset = engine.lookup(&key).map(|e| e.record_offset).unwrap_or(0);
-        // Read the record metadata ONCE — it yields the record_size, the
-        // EXTERNAL flag (for the always-on blob guard below), and the base for
-        // the compensation snapshot — instead of reading it twice.
-        let meta = if record_offset == 0 {
-            None
-        } else {
-            match engine.read_metadata(&key) {
-                Ok(m) => Some(m),
+
+        // External-blob guard: never remove an external record whose cold blob
+        // is missing (it would be unrecoverable). Reads metadata once; an absent
+        // record (already gone) skips to the idempotent prune below.
+        let is_external = match engine.lookup(&key) {
+            Some(_) => match engine.read_metadata(&key) {
+                Ok(m) => m.flags.contains(crate::record::TxFlags::EXTERNAL),
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
@@ -8085,115 +7924,29 @@ fn handle_delete_batch(
                     });
                     continue;
                 }
-            }
+            },
+            None => false,
         };
-        let record_size = meta
-            .as_ref()
-            .map(|m| ({ m.record_size }) as u64)
-            .unwrap_or(0);
-        let is_external = meta
-            .as_ref()
-            .map(|m| m.flags.contains(crate::record::TxFlags::EXTERNAL))
-            .unwrap_or(false);
-
-        // External-blob guard — enforced ALWAYS, independent of replication: a
-        // delete must never remove an external record whose cold blob is
-        // missing (the record would be unrecoverable). For external records we
-        // fetch the blob here; it doubles as the compensation snapshot's
-        // `cold_data` when replication is active. Non-external records (the
-        // common path) pay nothing.
-        let cold_data = if is_external {
-            engine
+        if is_external
+            && engine
                 .blob_store()
                 .and_then(|bs| bs.get(&key.txid).ok().flatten())
-        } else {
-            None
-        };
-        if is_external && cold_data.is_none() {
+                .is_none()
+        {
             errors.push(BatchItemError {
                 item_index: i as u32,
                 error_code: ERR_STORAGE_IO,
-                error_data: b"delete external blob snapshot missing".to_vec(),
+                error_data: b"delete external blob missing".to_vec(),
             });
             continue;
         }
 
-        // Compensation snapshot (metadata bytes + every slot's full state +
-        // cold blob) for replication rollback. R-007: a partial snapshot —
-        // utxo_hashes only — recreated previously-spent slots as UNSPENT on
-        // rollback, opening a double-spend window; capture full per-slot state.
-        // Built ONLY when replication can roll back (`needs_snapshot`); on the
-        // single-node path the slot read would be pure waste.
-        let snapshot = if !needs_snapshot {
-            None
-        } else if let Some(meta) = meta.as_ref() {
-            let slots = match engine.read_slots(&key) {
-                Ok(slots) => slots
-                    .into_iter()
-                    .map(|slot| SnapshotSlot {
-                        hash: slot.hash,
-                        status: slot.status,
-                        spending_data: slot.spending_data,
-                    })
-                    .collect::<Vec<_>>(),
-                Err(e) => {
-                    // R-007 / IJK-19: do NOT silently substitute a
-                    // zero hash here. A read failure means we cannot
-                    // produce a faithful pre-delete snapshot; if
-                    // replication later fails we would compensate with
-                    // a corrupted view.
-                    tracing::error!(
-                        txid = ?key.txid,
-                        err = ?e,
-                        "delete snapshot: slot-region read failed; skipping snapshot",
-                    );
-                    Vec::new()
-                }
-            };
-            // Build the metadata bytes in the same format as migrate_shard.
-            let mut meta_buf = Vec::with_capacity(70);
-            meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
-            let (is_coinbase, wire_flags) =
-                crate::replication::protocol::create_metadata_flag_bytes(meta.flags);
-            meta_buf.push(is_coinbase);
-            meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
-            meta_buf.push(wire_flags);
-            meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
-
-            if slots.len() != meta.utxo_count as usize {
-                None
-            } else {
-                Some(DeleteSnapshot {
-                    metadata_bytes: meta_buf,
-                    master_generation: { meta.generation },
-                    slots,
-                    cold_data,
-                    is_external,
-                })
-            }
-        } else {
-            None
-        };
-
-        // R-119: deleting a child transaction must first make every
-        // parent slot spent by that child terminal (`PRUNED`), replacing
-        // Lua's `deletedChildren` map with the Rust slot status. This
-        // local path is intentionally fail-closed in cluster mode when a
-        // parent belongs to another shard master; a distributed
-        // master-to-master prune transaction is still required for that
-        // topology.
-        let mut parent_prunes = Vec::new();
+        // Parent prune: mark each parent slot spent by THIS child terminal
+        // (`UTXO_PRUNED`). Local + idempotent; on a clustered node a parent on
+        // another shard master is fail-closed (a distributed prune is required
+        // for that topology).
         let parent_txids = match engine.parent_txids_for_child(&key) {
-            Ok(parent_txids) => parent_txids,
+            Ok(p) => p,
             Err(e) => {
                 errors.push(BatchItemError {
                     item_index: i as u32,
@@ -8217,13 +7970,8 @@ fn handle_delete_batch(
                 continue 'items;
             }
             let parent_key = TxKey { txid: parent_txid };
-            match engine.slots_spent_by_child(&parent_key, key.txid) {
-                Ok(offsets) => {
-                    parent_prunes.extend(offsets.into_iter().map(|offset| ParentPrune {
-                        key: parent_key,
-                        offset,
-                    }));
-                }
+            let offsets = match engine.slots_spent_by_child(&parent_key, key.txid) {
+                Ok(o) => o,
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
@@ -8232,329 +7980,32 @@ fn handle_delete_batch(
                     });
                     continue 'items;
                 }
+            };
+            for offset in offsets {
+                if let Err(err) = engine.prune_slot_if_spent_by_child(&parent_key, offset, key.txid)
+                {
+                    errors.push(spend_error_to_batch_error(i as u32, &err));
+                    continue 'items;
+                }
             }
         }
 
-        for prune in &parent_prunes {
-            redo_ops.push(RedoOp::PruneSlotIfSpentBy {
-                tx_key: prune.key,
-                offset: prune.offset,
-                child_txid: key.txid,
-            });
-        }
-        redo_ops.push(RedoOp::Delete {
+        // Remove the record locally (no tombstone, no redo, no replication).
+        if let Err(err) = engine.prune_delete(&DeleteRequest {
             tx_key: key,
-            record_offset,
-            record_size,
-        });
-
-        valid_items.push(ValidDelete {
-            idx: i,
-            key,
-            parent_prunes,
-            snapshot,
-        });
-    }
-
-    // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
-        Ok(range) => range,
-        Err(e) => {
-            // M-01: nothing has applied yet — classify every non-redirected
-            // item as ErrStorage-failed before the early return.
-            if let Some(m) = DISPATCH_METRICS.get() {
-                use crate::metrics::OpCode;
-                let failed = tally_storage_abort(m, OpCode::Delete, total_items, 0, 0, &errors);
-                m.deletes_failed.inc_by(failed);
-            }
-            return error_response(req.request_id, ERR_STORAGE_IO, &e);
-        }
-    };
-
-    // Phase 3: Apply engine mutations and build repl ops.
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
-    let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
-    let mut deleted_snapshots: Vec<(TxKey, DeleteSnapshot)> = Vec::new();
-    // Derived redb tombstone-index rows for the whole batch, committed in ONE
-    // redb transaction after the apply loop (see `record_tombstone_index_batch`)
-    // instead of one commit per deleted item — the dominant per-delete cost
-    // profiling exposed once the fsyncs were gone. `(key, deletion_height,
-    // generation, cause)`; the engine derives the shard.
-    let mut tombstone_index_rows: Vec<(TxKey, u32, u32, u8)> = Vec::new();
-    for v in valid_items.iter() {
-        let mut item_prune_ops: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
-        let mut item_prune_before: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
-        let mut item_failed = false;
-        for prune in &v.parent_prunes {
-            match engine.prune_slot_if_spent_by_child(&prune.key, prune.offset, v.key.txid) {
-                Ok(applied) => {
-                    if applied {
-                        push_repl_with_before_image(
-                            &mut item_prune_ops,
-                            &mut item_prune_before,
-                            prune.key,
-                            ReplicaOp::PruneSlotIfSpentBy {
-                                tx_key: prune.key,
-                                offset: prune.offset,
-                                child_txid: v.key.txid,
-                            },
-                            BeforeImage::Prune {
-                                prior_status: crate::record::UTXO_SPENT,
-                            },
-                        );
-                    }
-                }
-                Err(err) => {
-                    if !item_prune_ops.is_empty() {
-                        match compensate_replication_failure(
-                            engine,
-                            &item_prune_ops,
-                            &item_prune_before,
-                            redo_log,
-                        ) {
-                            // Engine-op (prune) failure before any replication
-                            // was attempted: local rollback only, no replica
-                            // could have seen these ops, so the comp range is
-                            // discarded.
-                            Ok(_) => {}
-                            Err(e) => {
-                                return error_response(req.request_id, ERR_INTERNAL, &e);
-                            }
-                        }
-                    }
-                    errors.push(spend_error_to_batch_error(v.idx as u32, &err));
-                    item_failed = true;
-                    break;
-                }
-            }
-        }
-        if item_failed {
-            continue;
-        }
-        match engine.delete_returning_tombstone_deferred(&DeleteRequest {
-            tx_key: v.key,
             due_guard: sweep_due_height,
         }) {
-            Ok(tombstone_info) => {
-                repl_ops_by_key.extend(item_prune_ops);
-                before_images_by_key.extend(item_prune_before);
-                // Accumulate the derived redb tombstone-index row for the
-                // single batched commit below (the per-item insert was deferred
-                // by `delete_returning_tombstone_deferred`).
-                if let Some(info) = tombstone_info.as_ref() {
-                    tombstone_index_rows.push((
-                        v.key,
-                        info.deletion_height,
-                        info.generation,
-                        info.cause.as_u8(),
-                    ));
-                }
-                // Deletion-tombstone §6: emit `DeleteV2` carrying the SAME
-                // tombstone fields the master's own delete recorded, so the
-                // replica writes a matching tombstone and self-purges on its
-                // own restart. `tombstone_info` is `Some` exactly when a
-                // tombstone was written (feature on AND log attached); when
-                // it is `None` (tombstones disabled / no log) we emit the V1
-                // `Delete`, keeping that fallback byte-identical to the
-                // pre-tombstone behavior.
-                let delete_op = delete_replica_op_for(v.key, tombstone_info);
-                push_repl_with_before_image(
-                    &mut repl_ops_by_key,
-                    &mut before_images_by_key,
-                    v.key,
-                    delete_op,
-                    BeforeImage::None,
-                );
-            }
-            Err(err) => {
-                if !item_prune_ops.is_empty() {
-                    match compensate_replication_failure(
-                        engine,
-                        &item_prune_ops,
-                        &item_prune_before,
-                        redo_log,
-                    ) {
-                        // Engine-op (delete) failure before replication:
-                        // local rollback only, comp range discarded.
-                        Ok(_) => {}
-                        Err(e) => {
-                            return error_response(req.request_id, ERR_INTERNAL, &e);
-                        }
-                    }
-                }
-                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
-            }
-        }
-    }
-    // Fold every successfully-deleted record's derived tombstone-index row into
-    // ONE redb write transaction (instead of one commit per item inside the
-    // apply loop). The redb index is derived from the durable tombstone log, so
-    // this batched, deferred population changes no durability guarantee.
-    engine.record_tombstone_index_batch(&tombstone_index_rows);
-
-    // Collect snapshots for successfully deleted records.
-    for v in valid_items {
-        if let Some(snap) = v.snapshot
-            && repl_ops_by_key.iter().any(|(k, _)| *k == v.key)
-        {
-            deleted_snapshots.push((v.key, snap));
+            errors.push(spend_error_to_batch_error(i as u32, &err));
         }
     }
 
-    // C-1: release the per-key visibility BEFORE the replication network
-    // round-trip — local apply + redo durability are done, so holding the
-    // reader-excluding stripes across the slow network phase is unnecessary.
-    // (`barrier` is `None` for the client delete path now that delete manages
-    // its own visibility; it remains in the signature for the coarse callers.)
     drop(visibility_guard);
-
-    // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops_with_barrier(
-        cluster,
-        &repl_ops_by_key,
-        redo_range,
-        &[redo_range],
-        barrier,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            // Compensate: re-create deleted records from snapshots, then
-            // replay per-slot state so a previously-spent / frozen /
-            // pruned slot is restored to that exact state. R-007: this
-            // is the fix for Codex F1 — without the per-slot replay,
-            // the recreated record would have all slots in the default
-            // UNSPENT state, opening a double-spend window for any
-            // outputs that were already spent before the delete.
-            //
-            // R-007 / R-035 also drops the `let _ = handle_replica_batch`
-            // and `let _ = write_redo_ops` swallows: a compensation
-            // failure must surface as ERR_INTERNAL so the operator can
-            // intervene; silently clearing the replication intent on
-            // top of a half-restored state is exactly the divergence
-            // BC-62 / F9 warned about.
-            // F-G5-023 (maintainability hazard): this in-process
-            // compensation path hand-constructs an OP_REPLICA_BATCH frame
-            // and feeds it back through `handle_replica_batch`. That
-            // bypasses every check the network path applies (HMAC, the
-            // cluster_key gate, sequence-number dedupe) — intentional
-            // because the inputs are trusted-by-construction, but the
-            // network path and the compensation path will drift apart if
-            // a future security gate is added to one and not the other.
-            // The structural fix is to extract a pure `apply_replica_ops`
-            // function in `src/replication/receiver.rs` (G7 territory)
-            // and call it from both sites; for now the synthesised-frame
-            // approach is wired so the rollback semantics stay correct.
-            let mut compensation_failed: Option<String> = None;
-            for (key, snap) in &deleted_snapshots {
-                let ops = build_delete_compensation_ops(key, snap);
-
-                let create_req = crate::protocol::frame::RequestFrame {
-                    request_id: 0,
-                    op_code: OP_REPLICA_BATCH,
-                    flags: 0,
-                    payload: ReplicaBatch {
-                        first_sequence: 0,
-                        ops,
-                        trace_ctx: None,
-                        source_node_id: None,
-                        // Self-compensation path: applies through the
-                        // ungated `handle_replica_batch` so cluster_key
-                        // gating does not apply. The wire field is
-                        // therefore left as the V1-compat sentinel `0`.
-                        cluster_key: 0,
-                    }
-                    .serialize()
-                    .into(),
-                };
-                let resp = handle_replica_batch(
-                    &create_req,
-                    engine,
-                    &std::sync::atomic::AtomicU64::new(0),
-                );
-                if resp.status != STATUS_OK {
-                    compensation_failed = Some(format!(
-                        "delete compensation failed for txid {:?}: status={}",
-                        key.txid, resp.status,
-                    ));
-                    break;
-                }
-                // Append a Create redo entry for crash recovery.
-                let entry = match engine.lookup(key) {
-                    Some(e) => e,
-                    None => {
-                        compensation_failed = Some(format!(
-                            "delete compensation: re-created record disappeared for txid {:?}",
-                            key.txid
-                        ));
-                        break;
-                    }
-                };
-                if let Err(e) = write_redo_ops(
-                    engine,
-                    redo_log,
-                    &[RedoOp::ReplicaCreate {
-                        tx_key: *key,
-                        device_id: entry.device_id,
-                        record_offset: entry.record_offset,
-                        utxo_count: snap.slots.len() as u32,
-                    }],
-                ) {
-                    compensation_failed = Some(format!(
-                        "delete compensation redo append failed for txid {:?}: {e}",
-                        key.txid
-                    ));
-                    break;
-                }
-            }
-            if let Some(cause) = compensation_failed {
-                tracing::error!(cause = %cause, "delete compensation aborted; node is in degraded state");
-                return error_response(req.request_id, ERR_INTERNAL, &cause);
-            }
-            // Also compensate any non-delete ops in the same batch. `DeleteV2`
-            // counts as a delete here (it is the tombstone-carrying form this
-            // handler now emits) so it is NOT re-compensated as a "non-delete".
-            let non_delete: Vec<_> = repl_ops_by_key
-                .iter()
-                .filter(|(_, ops)| {
-                    !ops.iter()
-                        .any(|o| matches!(o, ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. }))
-                })
-                .cloned()
-                .collect();
-            let non_delete_before: Vec<_> = repl_ops_by_key
-                .iter()
-                .zip(before_images_by_key.iter())
-                .filter(|((_, ops), _)| {
-                    !ops.iter()
-                        .any(|o| matches!(o, ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. }))
-                })
-                .map(|(_, before)| before.clone())
-                .collect();
-            if !non_delete.is_empty() {
-                if let Some(resp) = compensate_replication_failure_or_error(
-                    req.request_id,
-                    cluster,
-                    engine,
-                    &non_delete,
-                    &non_delete_before,
-                    redo_log,
-                    &[redo_range],
-                ) {
-                    return resp;
-                }
-            } else {
-                clear_replication_intents_after_compensation(&[redo_range]);
-            }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-        }
-    };
 
     let failed_total = errors.len() as u64;
     let succeeded_total = total_items.saturating_sub(failed_total);
     if let Some(m) = DISPATCH_METRICS.get() {
         m.deletes_succeeded.inc_by(succeeded_total);
         m.deletes_failed.inc_by(failed_total);
-        // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
         m.operations
             .inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
@@ -8564,7 +8015,19 @@ fn handle_delete_batch(
         }
     }
 
-    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
+    if errors.is_empty() {
+        ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_OK,
+            payload: vec![],
+        }
+    } else {
+        ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_PARTIAL_ERROR,
+            payload: encode_sparse_errors(&errors),
+        }
+    }
 }
 
 fn handle_mark_longest_chain_batch(
@@ -13333,10 +12796,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].item_index, 0);
         assert_eq!(errors[0].error_code, ERR_STORAGE_IO);
-        assert!(
-            String::from_utf8_lossy(&errors[0].error_data)
-                .contains("external blob snapshot missing")
-        );
+        assert!(String::from_utf8_lossy(&errors[0].error_data).contains("external blob missing"));
 
         let resp = h.request(
             OP_GET_BATCH,
@@ -22615,75 +22075,6 @@ mod tests {
         assert_eq!(after_fail - before_fail, 1, "freezes_failed += 1");
     }
 
-    /// Delete items should tick deletes_succeeded / deletes_failed per item.
-    #[test]
-    fn master_emit_delete_v2_when_tombstone_written() {
-        // Deletion-tombstone §6 master emit gating: a written tombstone →
-        // DeleteV2 carrying the exact fields; no tombstone → V1 Delete.
-        let k = TxKey { txid: [0x44; 32] };
-
-        let v2 = delete_replica_op_for(
-            k,
-            Some(crate::ops::engine::DeleteTombstoneInfo {
-                deletion_height: 700_222,
-                generation: 13,
-                cause: crate::tombstone::TombstoneCause::SpentDah,
-            }),
-        );
-        match v2 {
-            ReplicaOp::DeleteV2 {
-                tx_key,
-                deletion_height,
-                generation,
-                cause,
-            } => {
-                assert_eq!(tx_key, k);
-                assert_eq!(deletion_height, 700_222);
-                assert_eq!(generation, 13);
-                assert_eq!(cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
-            }
-            other => panic!("expected DeleteV2, got {other:?}"),
-        }
-
-        // tombstones disabled / no log → V1 Delete fallback.
-        let v1 = delete_replica_op_for(k, None);
-        assert_eq!(v1, ReplicaOp::Delete { tx_key: k });
-    }
-
-    #[test]
-    fn master_delete_writes_tombstone_end_to_end() {
-        // The full master delete-batch dispatch writes a tombstone when the
-        // feature is active — the precondition that makes the emit a DeleteV2.
-        let h = DispatchTestHarness::new();
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
-        let log = crate::tombstone::TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
-        let log = Arc::new(Mutex::new(log));
-        let dir = TempDir::new().unwrap();
-        let idx = crate::index::redb_tombstone::RedbTombstoneIndex::open(
-            &dir.path().join("tombstone.redb"),
-            16 * 1024 * 1024,
-        )
-        .unwrap();
-        let idx = Arc::new(Mutex::new(idx));
-        h.engine.set_tombstone_log(log.clone());
-        h.engine.set_tombstone_index(idx.clone());
-
-        let txid = DispatchTestHarness::make_txid(95);
-        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
-
-        let payload = encode_txid_batch(&[txid], &[]);
-        let resp = h.request(OP_DELETE_BATCH, payload);
-        assert_eq!(resp.status, STATUS_OK);
-
-        let k = TxKey { txid };
-        assert!(h.engine.lookup(&k).is_none(), "record removed");
-        assert!(
-            idx.lock().is_tombstoned(&k),
-            "master delete wrote a tombstone (DeleteV2 precondition)",
-        );
-        assert_eq!(log.lock().scan().unwrap().len(), 1);
-    }
-
     #[test]
     fn handle_delete_batch_ticks_outcome_counters() {
         let m = test_metrics();
@@ -24467,140 +23858,6 @@ mod tests {
         assert!(
             slot.is_unspent(),
             "durable comp Unspend ⇒ recovery lands the slot UNSPENT (compensated, single-valued)"
-        );
-    }
-
-    /// R-007 (Codex F1): the `build_delete_compensation_ops` helper
-    /// must reproduce per-slot state after Create — a previously-spent
-    /// slot must be re-stamped with its original `spending_data`, a
-    /// frozen slot must be re-frozen, a pruned slot must be re-pruned,
-    /// and unspent slots stay default. Pre-fix the compensation only
-    /// emitted Create with `utxo_hashes`, leaving every slot UNSPENT
-    /// regardless of pre-delete state and opening a double-spend
-    /// window after a failed delete-batch replication.
-    #[test]
-    fn delete_compensation_ops_restore_per_slot_state() {
-        let mut txid = [0u8; 32];
-        txid[0] = 0xC0;
-        let key = TxKey { txid };
-
-        // Synthesize a snapshot with one slot of each interesting status.
-        let mut spend_a = [0u8; 36];
-        spend_a[0..4].copy_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]);
-        let mut spend_b = [0u8; 36];
-        spend_b[0..4].copy_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB]);
-        let snap = DeleteSnapshot {
-            metadata_bytes: vec![0u8; 70],
-            master_generation: 7,
-            slots: vec![
-                // 0: unspent (no replay op expected)
-                SnapshotSlot {
-                    hash: [0x10; 32],
-                    status: crate::record::UTXO_UNSPENT,
-                    spending_data: [0u8; 36],
-                },
-                // 1: spent with spend_a
-                SnapshotSlot {
-                    hash: [0x11; 32],
-                    status: crate::record::UTXO_SPENT,
-                    spending_data: spend_a,
-                },
-                // 2: frozen
-                SnapshotSlot {
-                    hash: [0x12; 32],
-                    status: crate::record::UTXO_FROZEN,
-                    spending_data: [0u8; 36],
-                },
-                // 3: pruned
-                SnapshotSlot {
-                    hash: [0x13; 32],
-                    status: crate::record::UTXO_PRUNED,
-                    spending_data: [0u8; 36],
-                },
-                // 4: spent with spend_b
-                SnapshotSlot {
-                    hash: [0x14; 32],
-                    status: crate::record::UTXO_SPENT,
-                    spending_data: spend_b,
-                },
-            ],
-            cold_data: None,
-            is_external: false,
-        };
-
-        let ops = build_delete_compensation_ops(&key, &snap);
-
-        // First op MUST be Create with the snapshotted hashes.
-        match &ops[0] {
-            ReplicaOp::Create {
-                tx_key,
-                utxo_hashes,
-                is_external,
-                ..
-            } => {
-                assert_eq!(*tx_key, key);
-                assert_eq!(utxo_hashes.len(), 5);
-                assert_eq!(utxo_hashes[1], [0x11; 32]);
-                assert!(!*is_external);
-            }
-            other => panic!("expected Create as first op, got {other:?}"),
-        }
-
-        // Subsequent ops must restore non-default slot states. Order
-        // doesn't matter for correctness as long as Create is first.
-        let tail = &ops[1..];
-        let spent_a = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::Spend { tx_key, offset: 1, spending_data, master_generation, .. }
-                if *tx_key == key && *spending_data == spend_a && *master_generation == 7
-            )
-        });
-        assert!(
-            spent_a.is_some(),
-            "compensation must re-stamp slot 1 with the original spending_data; got {ops:?}"
-        );
-
-        let spent_b = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::Spend { tx_key, offset: 4, spending_data, master_generation, .. }
-                if *tx_key == key && *spending_data == spend_b && *master_generation == 7
-            )
-        });
-        assert!(
-            spent_b.is_some(),
-            "compensation must re-stamp slot 4 with the original spending_data"
-        );
-
-        let frozen = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::Freeze { tx_key, offset: 2, master_generation }
-                if *tx_key == key && *master_generation == 7
-            )
-        });
-        assert!(frozen.is_some(), "compensation must re-freeze slot 2");
-
-        let pruned = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::PruneSlot { tx_key, offset: 3 }
-                if *tx_key == key
-            )
-        });
-        assert!(pruned.is_some(), "compensation must re-prune slot 3");
-
-        // Slot 0 was UNSPENT — it should NOT have a replay op, since
-        // Create defaults to UNSPENT and an extra op would over-bump
-        // generation on the receiver.
-        let no_extras = tail.iter().any(|op| {
-            matches!(
-                op,
-                ReplicaOp::Spend { offset: 0, .. }
-                    | ReplicaOp::Freeze { offset: 0, .. }
-                    | ReplicaOp::PruneSlot { offset: 0, .. }
-            )
-        });
-        assert!(
-            !no_extras,
-            "compensation must NOT emit a replay op for slot 0 (UNSPENT)"
         );
     }
 
