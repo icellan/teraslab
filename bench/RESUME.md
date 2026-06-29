@@ -83,16 +83,28 @@ conn-per-request over a sharded pool.**
 `cargo test --manifest-path client/rust/Cargo.toml --all` (per memory
 feedback_rust_prepush_checks) before declaring a win.
 
-**NEXT LEVER (precise, needs a fresh profiled measurement — do NOT change redo
-blind):** ~1.4× gap (29.3k vs 40.7k) is `__futex_wait` lock contention; perf
-attributed it to the **per-store redo append Mutex** (`src/redo.rs` `append*` take
-`&mut self` → the RedoLog is behind a per-store lock, serializing all writes to a
-store; device_split=4 ⇒ only 4 locks for ~115k store-ops/s) + cache-coordination.
-Ruled out: cache shard count (+2%), device I/O (fixed by fallocate), device_split
-(4 optimal). Candidate fixes (profile-confirm each, preserve durability): encode
-the redo op OUTSIDE the append lock; shard/stripe the redo append; batch appends.
-Re-provision a box, perf the futex callers (`__x64_sys_futex` → user frame), fix,
-re-measure, then if it wins write FINAL_REPORT + run the green gate.
+**ALSO DONE (commit d9d1c65): cache dirty-index** — flush_shard was ~45% on-CPU
+(Vec::from_iter scanning all blocks/tick); now O(dirty) via a per-shard dirty
+HashSet (lockstep w/ Block.dirty, invariant-tested). Server flush CPU 6.5→3.4
+cores; throughput NEUTRAL (~28k, cap is locks not flush-CPU). cargo test --all 0
+failed. Kept for efficiency/headroom.
+
+**NEXT LEVER — the ~1.4× gap is LOCK CONTENTION (futex), profiled.** futex-caller
+profile (bench/results/20260628-recipe-chain/futex-callers.txt) ranks the contended
+sites: dispatch `handle_request`/`handle_create_batch`/`handle_get_batch`/
+`handle_spend_batch` + **redo** (`RedoOp::serialize_data`, `RedoEntry::pre_encode`,
+`RedoEntry::serialize`, `append_preencoded_atomic`, `redo_group::GroupCommit::commit`)
++ cache. Strong hypothesis: the **per-store redo append Mutex** serializes writes —
+and redo ENCODE (serialize/pre_encode) may be happening UNDER that lock; moving the
+encode OUTSIDE the lock (lock only covers the ring memcpy) should cut hold time.
+Confirmed NOT the cap: device I/O (fallocate fixed it), cache flush-scan CPU
+(dirty-index removed it, no throughput change), cache shard count (+2%), device_split
+(4 optimal), the whole client pipeline (303k ceiling). DO NOT change redo blind —
+re-provision, perf the futex callers at high res, confirm the encode-under-lock
+hypothesis (read src/redo.rs append_preencoded_atomic + engine.rs journal path +
+redo_group GroupCommit), make the smallest durability-safe change (encode outside
+lock / stripe append), re-measure. If it wins: write FINAL_REPORT + run the green
+gate (cargo test --all + clippy + fmt + client/rust tests).
 
 **⭐⭐ 2026-06-29 BIGGEST WIN — fallocate device file → +110% (2×), gap 3×→1.4×:**
 Off-CPU+perf profiling showed the CPU-idle server's writes hit `ext4_mb_new_blocks`
