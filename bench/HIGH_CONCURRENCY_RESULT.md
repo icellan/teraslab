@@ -84,6 +84,26 @@ not a load-shedding artifact.
 - **Pass condition = "beats on Spend throughput AND p99.9": NOT met** — TeraSlab
   loses the p99.9 half. **TeraSlab does NOT win the suite. FINAL_REPORT not written.**
 
+### p99.9 gap localized + hypotheses ruled out (open-loop @8.5k links/s, all f0)
+| path | spend p50 | spend p99.9 |
+|---|---|---|
+| TS via **mock server** (same client, instant ack) | **3.8 ms** | 18 ms |
+| TS via **real server**, default intervals | 65 ms | 108 ms |
+| TS via real server, **flush+writeback=5ms** | ~65 ms | 103 ms (no change) |
+| **reference** | 4.5 ms | 38–49 ms |
+
+- The client/harness is fast (mock 3.8 ms) → **the ~61 ms is the REAL SERVER's
+  per-op latency**, not the client/batcher/rate-limiter.
+- Ruled OUT as the cause: redo flush + writeback interval (fastiv 5ms → no change);
+  TCP Nagle (server DOES `set_nodelay` on the accept path, src/server/mod.rs:602;
+  client sets it too).
+- Little's law: 34k ops/s × 61 ms ≈ **~2000 requests in flight** on the real server
+  vs ~130 via the mock → the server QUEUES ~1900 requests even at this low offered
+  rate. Its effective per-op concurrency/latency is the limit — the distributed
+  per-op overhead (write-back cache + redo + index + several brief locks + dispatch
+  ~0.35 ms CPU each but ~60 ms wall-clock in queue/handoffs). This is the SAME
+  per-op-overhead conclusion, now localized to the server and quantified.
+
 The remaining latency gap is the distributed per-op overhead (the same finding all
 along: each op takes the write-back-cache + redo + index + multiple brief locks).
 Closing it to also win p99.9 needs the per-op-overhead reduction = a ground-up
