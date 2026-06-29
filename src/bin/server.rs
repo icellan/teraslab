@@ -666,6 +666,16 @@ fn main() {
     // allocation); a RECOVERED device keeps its on-disk format (device wins,
     // mismatch logged). Done per store so every store is consistent.
     apply_packed_mode(&mut allocator, allocator_origin, config.storage.packed, 0);
+    // Append-only placement (Phase 1 log-structured write lever): pure runtime
+    // policy, not an on-disk format, so config always wins regardless of origin.
+    allocator.set_append_only(config.storage.append_only);
+    if config.storage.append_only {
+        tracing::warn!(
+            "storage.append_only = true: freed regions are never reused (records stay \
+             sequential for log-structured write-back coalescing). Space is NOT reclaimed — \
+             the device grows unbounded. Intended for benchmarks, not unbounded production."
+        );
+    }
     store_allocators.push(allocator);
     for (i, sdev) in store_devices.iter().enumerate().skip(1) {
         let (mut alloc, origin) = match recover_or_create_allocator(sdev.clone()) {
@@ -682,6 +692,7 @@ fn main() {
         };
         alloc.set_redo_device_id(i as u8);
         apply_packed_mode(&mut alloc, origin, config.storage.packed, i);
+        alloc.set_append_only(config.storage.append_only);
         store_allocators.push(alloc);
     }
 

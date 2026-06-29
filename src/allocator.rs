@@ -319,6 +319,20 @@ pub struct SlotAllocator {
     /// alignment`) stay device-block-granular and block-aligned. See
     /// [`Self::set_packed`] and `docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.1.
     packed: bool,
+    /// Append-only allocation mode (default `false`).
+    ///
+    /// When `true`, [`Self::reserve_aligned`] never consults the freelist —
+    /// every allocation extends the high-water mark, so records are placed
+    /// strictly sequentially even as deletes free regions. Freed regions are
+    /// still journaled and inserted into the freelist (so recovery replay and
+    /// accounting are unchanged) but are NEVER handed back out. This is the
+    /// Phase 1 log-structured write lever; see [`Self::set_append_only`] and
+    /// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+    ///
+    /// Unlike [`Self::packed`], this is a pure placement policy: it does not
+    /// affect the on-disk format and is NOT persisted in the header — a device
+    /// can be reopened in either mode.
+    append_only: bool,
     /// Test/fault-injection only: fail the next [`SlotAllocator::persist`]
     /// call with [`AllocatorError::PersistFaultInjected`], then auto-clear.
     ///
@@ -606,6 +620,7 @@ impl SlotAllocator {
             redo_log: None,
             redo_device_id: 0,
             packed: false,
+            append_only: false,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_persist: std::cell::Cell::new(false),
         })
@@ -669,6 +684,24 @@ impl SlotAllocator {
     /// [`Self::set_packed`].
     pub fn is_packed(&self) -> bool {
         self.packed
+    }
+
+    /// Enable or disable append-only allocation mode.
+    ///
+    /// Default is `false` (best-fit freelist reuse, unchanged behavior). When
+    /// `true`, [`Self::reserve_aligned`] never consults the freelist; every
+    /// allocation extends the high-water mark, keeping records sequential even
+    /// as deletes free space. Frees are still journaled and tracked but never
+    /// reused, so the device grows unbounded (no reclamation). Set once at
+    /// startup. See the field docs and the Phase 1 log-structured design.
+    pub fn set_append_only(&mut self, append_only: bool) {
+        self.append_only = append_only;
+    }
+
+    /// Whether append-only allocation mode is currently enabled. See
+    /// [`Self::set_append_only`].
+    pub fn is_append_only(&self) -> bool {
+        self.append_only
     }
 
     /// Allocate a contiguous region of at least `size` bytes.
@@ -1002,9 +1035,16 @@ impl SlotAllocator {
         } else {
             None
         };
-        if let Some((region_offset, region_size)) =
+        // Append-only mode skips freelist reuse entirely so every allocation
+        // extends the high-water mark — records stay strictly sequential even
+        // after deletes (whose freed regions remain in the freelist for
+        // accounting/recovery but are never handed back out).
+        let from_freelist = if self.append_only {
+            None
+        } else {
             self.freelist.best_fit(aligned_size, block_constraint)
-        {
+        };
+        if let Some((region_offset, region_size)) = from_freelist {
             // best_fit already removed/split the region in the freelist.
             self.freelist.maybe_demote();
             Ok((
@@ -1711,6 +1751,10 @@ impl SlotAllocator {
             redo_log: None,
             redo_device_id: 0,
             packed,
+            // Append-only is a runtime placement policy, not an on-disk format;
+            // it is never persisted, so a recovered allocator starts in the
+            // default (best-fit) mode until the caller re-applies config.
+            append_only: false,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_persist: std::cell::Cell::new(false),
         })
@@ -1959,6 +2003,70 @@ mod tests {
         alloc.free(o1, 4096).unwrap();
         let o2 = alloc.allocate(4096).unwrap();
         assert_eq!(o1, o2); // Reused the freed region
+    }
+
+    #[test]
+    fn append_only_defaults_off() {
+        let dev = test_device(16);
+        let alloc = SlotAllocator::new(dev).unwrap();
+        assert!(!alloc.is_append_only());
+    }
+
+    #[test]
+    fn append_only_does_not_reuse_freed_region() {
+        // Contrast with `free_and_reuse`: in append-only mode a freed region is
+        // NOT handed back out — the next allocation extends the high-water mark.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_append_only(true);
+        assert!(alloc.is_append_only());
+
+        let o1 = alloc.allocate(4096).unwrap();
+        let o2 = alloc.allocate(4096).unwrap();
+        assert_eq!(o2, o1 + 4096);
+        alloc.free(o1, 4096).unwrap();
+
+        let o3 = alloc.allocate(4096).unwrap();
+        // Best-fit mode would return o1 here; append-only extends past o2.
+        assert_ne!(o3, o1);
+        assert_eq!(o3, o2 + 4096);
+    }
+
+    #[test]
+    fn append_only_still_tracks_frees_for_accounting() {
+        // Frees must still be journaled/tracked (recovery + accounting) even
+        // though allocation never reuses them.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_append_only(true);
+        let o1 = alloc.allocate(4096).unwrap();
+        let _o2 = alloc.allocate(4096).unwrap();
+        assert_eq!(alloc.free_region_count(), 0);
+        alloc.free(o1, 4096).unwrap();
+        assert_eq!(alloc.free_region_count(), 1);
+        // The freed region sits in the freelist but is not reused.
+        let o3 = alloc.allocate(4096).unwrap();
+        assert_ne!(o3, o1);
+        assert_eq!(alloc.free_region_count(), 1);
+    }
+
+    #[test]
+    fn append_only_composes_with_packed() {
+        // Packed + append-only: small records pack sequentially at RECORD_ALIGN
+        // within a block, and freed records are never reused.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        alloc.set_append_only(true);
+        let o0 = alloc.allocate(600).unwrap();
+        let o1 = alloc.allocate(600).unwrap();
+        // Packed: 600 is already 8-aligned, so o1 packs immediately after o0.
+        assert_eq!(o1, o0 + 600);
+        alloc.free(o0, 600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        // Append-only: o0's hole is not reused; o2 extends past o1.
+        assert_ne!(o2, o0);
+        assert_eq!(o2, o1 + 600);
     }
 
     #[test]

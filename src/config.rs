@@ -603,6 +603,28 @@ pub struct StorageConfig {
     /// readable; only NEW records follow the new strategy.
     #[serde(deserialize_with = "deserialize_placement")]
     pub placement: crate::subdevice::PlacementStrategy,
+
+    /// Append-only allocation: never reuse freed regions; every new record
+    /// extends the high-water mark (`false`, default, is the unchanged best-fit
+    /// freelist behavior).
+    ///
+    /// This is the Phase 1 log-structured write lever (see
+    /// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`): under the UTXO
+    /// recipe the create-then-delete churn fills the freelist, and best-fit
+    /// reuse then scatters new records into the freed holes — defeating the
+    /// write-back cache's sequential-flush coalescing. With `append_only`, frees
+    /// are still journaled and tracked (for recovery + accounting) but never
+    /// handed back out, so creates stay strictly sequential and coalesce into
+    /// large sequential write-backs like a log-structured store.
+    ///
+    /// Trade-off: NO space reclamation — the device grows unbounded (the
+    /// freelist accumulates and `persist` will eventually hit
+    /// `FreelistOverflow`). Intended for bounded benchmark runs and as the
+    /// precursor to the full segment engine (defrag-based reclaim, Phase 3), not
+    /// for unbounded production use. Unlike `packed`, this is a pure runtime
+    /// placement policy: it does not change the on-disk format and is NOT
+    /// persisted, so a device can be reopened in either mode safely.
+    pub append_only: bool,
 }
 
 /// Deserialize the `[storage] placement` key into a [`PlacementStrategy`].
