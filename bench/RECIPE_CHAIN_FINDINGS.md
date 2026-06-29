@@ -45,9 +45,18 @@ So the remaining ~1.4× is **distributed lock/coordination micro-contention**: e
 op takes several already-brief locks (index + redo + cache + allocator + dispatch);
 at ~115k store-ops/s the aggregate futex traffic + the inherent serialization
 points cap throughput at ~28–29k links/s on this hardware, while the mature C
-reference has lower per-op overhead. This is **as close to "the gap is fundamental
-to the current architecture" as the evidence supports** — no cheap/medium
-profile-guided fix remains. Closing it requires a **ground-up lower-contention
+reference has lower per-op overhead.
+
+**STRONGEST evidence the gap is fundamental to THIS architecture:** a targeted
+attempt to remove an entire lock's acquisition cost — coalescing the buffered redo
+appends so concurrent commits share ONE `log.lock()` instead of one-per-commit
+(implemented + fully tested) — moved throughput by **0% in a same-box A/B** (27.7k
+vs 27.5k). If any single lock were the cap, that would have helped. It didn't →
+**no single lock dominates**; the cost is the AGGREGATE of many per-op locks. The
+only thing that would close it is a ground-up redesign that reduces the NUMBER of
+locks each op takes (lock-free index + redo + cache, or a different per-op execution
+model) — a multi-cycle architecture project, not a profile-guided tuning fix. No
+cheap/medium profile-guided fix remains. Closing it requires a **ground-up lower-contention
 redesign** (lock-free or per-thread/per-connection redo + index + cache append
 paths, or collapsing the per-op lock count), which is a major multi-cycle
 engineering effort, NOT a perf-tuning iteration — and must be prototyped + profiled
