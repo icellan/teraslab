@@ -6617,15 +6617,23 @@ impl Engine {
     ///   audit trail and is never all-spent by design.
     /// - otherwise the normal mined-record path: all-spent ∧ on-longest-chain.
     ///
-    /// This is the shared predicate behind [`Self::record_due_for_sweep`]
-    /// (which adds the preserve / dah-height gates) AND every path that DECIDES
-    /// to plant a DAH-index entry — `expire_preservation_set_dah`, the recovery
-    /// secondary reconcile, and the migration lifecycle restore. Gating those
-    /// on it keeps the DAH index holding ONLY drainable entries: a DAH entry on
-    /// a permanently-ineligible record (REASSIGNED, or never-all-spent) is an
-    /// immortal entry that, under the per-call sweep cap (#25), accumulates at
-    /// low heights and starves the cap — the exact stall the cap was added to
-    /// fix, via a different cause.
+    /// Used by two callers: [`Self::record_due_for_sweep`] (which adds the
+    /// preserve / dah-height gates) and `expire_preservation_set_dah` (which
+    /// gates whether to plant a DAH on preservation expiry). Gating expiry on
+    /// it means the live mutation paths never PLANT a DAH on a
+    /// permanently-ineligible record (REASSIGNED, or never-all-spent) — such an
+    /// entry is immortal and, under the per-call sweep cap (#25), accumulates at
+    /// low heights and starves the cap.
+    ///
+    /// NOTE the recovery secondary reconcile (`reconcile_secondary_indexes_*`)
+    /// and the migration lifecycle restore (`restore_migrated_lifecycle`) do
+    /// NOT gate on this — they rebuild the DAH index verbatim from the
+    /// authoritative on-device `delete_at_height` (a record can legitimately
+    /// carry a DAH while transiently not-due, e.g. all-spent but unmined after
+    /// a reorg, and must stay indexed). So this does not by itself guarantee
+    /// the DAH index holds only drainable entries; a node upgraded in-place
+    /// from a build with unconditional expiry can still carry pre-existing
+    /// immortal entries until a separate scrub remediates them.
     pub(crate) fn sweep_eligible(meta: &TxMetadata) -> bool {
         if meta.flags.contains(TxFlags::CONFLICTING) {
             return true;
@@ -7372,19 +7380,20 @@ impl Engine {
     /// Mirror of the Aerospike pruner's `ProcessExpiredPreservations`
     /// (`teranode/stores/utxo/aerospike/aerospike.go:999-1100`) and spec
     /// §3.18 Phase 3 ("Expired preservation processing"): for a record whose
-    /// `preserve_until` is in `[1, current_height]`, schedule deletion by
-    /// setting `delete_at_height = current_height + block_height_retention`
-    /// and clearing `preserve_until`. The record then becomes a normal DAH
-    /// candidate and is deleted `block_height_retention` blocks later by the
-    /// sweep.
+    /// `preserve_until` is in `[1, current_height]`, clear `preserve_until` and
+    /// — only if the record is sweep-eligible — schedule deletion by setting
+    /// `delete_at_height = current_height + block_height_retention`, after
+    /// which it is deleted `block_height_retention` blocks later by the sweep.
     ///
-    /// This deliberately does NOT re-run `evaluate_delete_at_height`: the Go
-    /// pruner sets DAH unconditionally on expiry (the all-spent /
-    /// on-longest-chain gating does not apply to an expired preservation —
-    /// the preservation window having elapsed is itself the signal that the
-    /// record may be reclaimed). The record's spent/unmined/conflicting state
-    /// is irrelevant at this point; the parent it protected has had its full
-    /// `ParentPreservationBlocks` window.
+    /// The DAH is set CONDITIONALLY on `sweep_eligible` (#25 follow-up),
+    /// NOT unconditionally as the original Go pruner did. The Rust Phase-2
+    /// sweep declines to delete a record that is not all-spent / not on the
+    /// longest chain / REASSIGNED (KO-2/KO-3), so DAH-ing such a record on
+    /// expiry only plants an immortal entry the sweep can never drain — which,
+    /// under the per-call cap, starves the cap. An ineligible expired record
+    /// therefore just has its `preserve_until` cleared (dah left 0) and reverts
+    /// to the normal lifecycle: it re-acquires a DAH via spend / setMined once
+    /// it actually becomes deletable.
     ///
     /// Runs under the per-tx stripe lock and re-reads the on-device metadata,
     /// so a `preserve_until` that was pushed forward (a fresh
@@ -7392,9 +7401,9 @@ impl Engine {
     /// if the re-read `preserve_until` is 0 or still in the future, this is a
     /// no-op and returns `Ok(false)`.
     ///
-    /// Returns `Ok(true)` if the preservation was expired and DAH scheduled,
-    /// `Ok(false)` if the record no longer qualifies (preserve cleared,
-    /// pushed forward, or record gone).
+    /// Returns `Ok(true)` if the preservation was EXPIRED (i.e. `preserve_until`
+    /// cleared) — whether or not a DAH was scheduled — and `Ok(false)` if the
+    /// record no longer qualifies (preserve cleared, pushed forward, or gone).
     ///
     /// # Errors
     ///

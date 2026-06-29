@@ -19,9 +19,11 @@
 //! in the same crash-safety class as [`DahIndex`](crate::index::dah_index)
 //! (NOT the unmined "critical" class): it is NOT journaled to the redo log and
 //! carries NO `replay_redo` path. It is re-derived after a crash from each
-//! record's authoritative cached `preserve_until` via
-//! [`crate::ops::engine::Engine::rebuild_preserve_index_from_device`],
-//! exactly as the conflicting index is rebuilt from its cached flag.
+//! record's authoritative on-device `preserve_until` via
+//! [`crate::ops::engine::Engine::rebuild_preserve_index_from_device`] — which
+//! reads the device footer, not the index cache (the `HAS_PRESERVE_UNTIL`
+//! cache discriminant lags after a redo replay), in the same spirit as the
+//! conflicting index being rebuilt from each record's flag at startup.
 
 use crate::index::TxKey;
 use std::collections::{BTreeMap, HashMap};
