@@ -89,7 +89,69 @@ HashSet (lockstep w/ Block.dirty, invariant-tested). Server flush CPU 6.5→3.4
 cores; throughput NEUTRAL (~28k, cap is locks not flush-CPU). cargo test --all 0
 failed. Kept for efficiency/headroom.
 
-**⚠⚠ DIAGNOSIS REOPENED (2026-06-29 latest): the cap is probably NOT lock
+**⭐⭐⭐ BREAKTHROUGH (2026-06-29 latest) — TeraSlab BEATS the reference on THROUGHPUT
+at production concurrency.** The whole campaign benchmarked at 10k chains; the user
+said the real workload is 100k+ threads. At 100k+ chains (fair 32GiB device both —
+4GiB filled at high conc for both): **TS spend 41k/s f0 > REF 40.6k/s (23k fails);
+150k → TS 43-44k f0 > REF 40.4k (24-69k fails).** TS throughput CLIMBS with
+concurrency + stays f0; REF saturates ~40.7k and sheds load above ~30k chains.
+Reproduced 3× at 100k. Full detail: **bench/HIGH_CONCURRENCY_RESULT.md**; raw:
+bench/results/20260629-highconc-h2h/.
+- **Pass condition: THROUGHPUT half MET. p99.9 half NOT yet** — TS p99.9 ~1.3s vs
+  REF ~0.18s, but that's a CLOSED-LOOP overload artifact (TS queues+completes all;
+  REF fail-fast sheds ~30% so its survivors look fast). Not a fair tail metric.
+- **DECISIVE REMAINING STEP for a clean FINAL_REPORT win: OPEN-LOOP fixed-rate
+  test** — rate-limit the recipe to ~35-38k/s offered (below saturation) for BOTH
+  backends, compare p99.9 + failures fairly. If TS p99.9 ≤ REF at that rate with
+  f0 both → throughput-ceiling win + tail parity = defensible win → FINAL_REPORT.
+  Needs a rate-controlled variant of runRecipe (token bucket per worker / global
+  ticker) — focused Go harness change. ALSO fix multi-round flakiness (24M
+  expected_records → per-round init exceeds 40s health timeout under load; raise
+  timeout or lower re-init) and the redb-wipe-between-rounds (now patched in
+  /tmp/h2h_recipe.sh but verify).
+
+**p99.9 INVESTIGATION — state at 2026-06-29 PM (the open blocker to the suite win):**
+Open-loop fixed-rate tests settled the tail question: with the closed-loop confound
+removed the **reference wins p99.9 by ~3×** (TS spend p99.9 114ms vs REF 38ms @8.5k
+links/s; both f0). Localized to a **uniform ~71ms TeraSlab SERVER per-op latency
+floor even at idle** (1500 links/s ≈ 10% util): mock-server-via-same-client = 3.4ms,
+real server = 75ms ⇒ the floor is server-side, NOT the Go client/batcher/rate-limiter.
+**GET (read-only, no redo/no writeback/no fsync) is also ~80ms** — so the floor is in
+the COMMON request path, not the write path.
+- **REFUTED levers (each tested, no p99.9 change):** redo flush + writeback interval
+  (5ms → no change); TCP Nagle (server set_nodelay mod.rs:602, client too); CPU
+  saturation (~10% util at 1500 links/s); the Go create-batcher (3ms yet create
+  75ms); replication-fanout permit wait (replication-only); **mimalloc global
+  allocator (STASHED stash@{0}, same-box NO improvement — the count-based futex
+  profile that flagged glibc malloc-arena was misleading: it counts frequent-short
+  malloc locks + idle-worker condvar parks, not the one long ~71ms per-op wait).**
+- **NEW — RULED OUT BY CODE-READ (2026-06-29):** the connection read loop
+  (mod.rs:940), the sharded `DispatchPool` (submit→notify_one→recv, mod.rs:1588/1598),
+  `ConnInFlight` backpressure, `write_response` (direct `write_all`), and
+  `group_commit_window` (= `Duration::ZERO`, dispatch.rs:2208) are ALL clean: condvar
+  wakes are immediate, no timed waits, no per-op sleep. **The ~71ms is NOT in the
+  server plumbing layer.** Remaining suspects (untested): the engine per-op path
+  itself (index lookup + writeback-cache read/`get` path + visibility barrier
+  `RwLock` read-guard acquisition under the rayon read fan-out) — i.e. the GET path
+  specifically, since GET also shows the floor.
+- **DECISIVE NEXT DIAGNOSTIC (box-free):** add per-stage wall-clock timestamps to the
+  server request path (receive → decode → dispatch-enqueue → worker-start →
+  engine-process-done → response-write), behind an env flag, then **reproduce LOCALLY**
+  — in-code timestamps work on any OS, so this needs NO EC2 box. Drive with
+  `teraslab-loadgen --recipe` (in-repo) or the Go RECIPE=1 harness against a local
+  server at 1500 links/s. If the ~71ms reproduces locally → pin the stage on this
+  machine and fix it. If it does NOT reproduce locally (Linux/NVMe-only) → it's an
+  fsync/scheduler artifact of the device path and needs an NVMe box.
+- **EC2 ACCESS IS BROKEN (action needed):** the `teraslab-test-user` IAM key in
+  `.aws/ec-credentials` lacks ec2:DescribeInstances / ec2:TerminateInstances, and the
+  SSH key `~/.ssh/teraslab-perftest-key.pem` is now REJECTED by 44.201.221.186 (port
+  22 open but publickey denied — likely the box hit its 120-min shutdown backstop and
+  AWS recycled the public IP to another tenant). **Last launched perftest box:
+  i-07116114bc43684bd (i3en.3xlarge, us-east-1).** Cannot verify/terminate it from
+  here — manual check via the AWS console recommended. core-m-demo
+  (i-0dd1b439a6b470c4f) must stay untouched.
+
+**⚠⚠ [superseded by the breakthrough above] DIAGNOSIS REOPENED (2026-06-29): the cap is probably NOT lock
 contention.** Buffered redo group-commit batching (coalesce concurrent commits →
 one log.lock() instead of per-commit; fully implemented + tested, STASHED) gave
 **0% same-box** (27.7k vs 27.5k HEAD). If cutting ~512 redo lock acquisitions/batch
