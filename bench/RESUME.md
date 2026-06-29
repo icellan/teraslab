@@ -125,23 +125,49 @@ the COMMON request path, not the write path.
   allocator (STASHED stash@{0}, same-box NO improvement — the count-based futex
   profile that flagged glibc malloc-arena was misleading: it counts frequent-short
   malloc locks + idle-worker condvar parks, not the one long ~71ms per-op wait).**
-- **NEW — RULED OUT BY CODE-READ (2026-06-29):** the connection read loop
-  (mod.rs:940), the sharded `DispatchPool` (submit→notify_one→recv, mod.rs:1588/1598),
-  `ConnInFlight` backpressure, `write_response` (direct `write_all`), and
-  `group_commit_window` (= `Duration::ZERO`, dispatch.rs:2208) are ALL clean: condvar
-  wakes are immediate, no timed waits, no per-op sleep. **The ~71ms is NOT in the
-  server plumbing layer.** Remaining suspects (untested): the engine per-op path
-  itself (index lookup + writeback-cache read/`get` path + visibility barrier
-  `RwLock` read-guard acquisition under the rayon read fan-out) — i.e. the GET path
-  specifically, since GET also shows the floor.
-- **DECISIVE NEXT DIAGNOSTIC (box-free):** add per-stage wall-clock timestamps to the
-  server request path (receive → decode → dispatch-enqueue → worker-start →
-  engine-process-done → response-write), behind an env flag, then **reproduce LOCALLY**
-  — in-code timestamps work on any OS, so this needs NO EC2 box. Drive with
-  `teraslab-loadgen --recipe` (in-repo) or the Go RECIPE=1 harness against a local
-  server at 1500 links/s. If the ~71ms reproduces locally → pin the stage on this
-  machine and fix it. If it does NOT reproduce locally (Linux/NVMe-only) → it's an
-  fsync/scheduler artifact of the device path and needs an NVMe box.
+- **RULED OUT BY CODE-READ:** the connection read loop (mod.rs:940), the sharded
+  `DispatchPool` (submit→notify_one→recv, mod.rs:1588/1598), `ConnInFlight`
+  backpressure, `write_response` (direct `write_all`), and `group_commit_window`
+  (= `Duration::ZERO`, dispatch.rs:2208) are ALL clean. The floor is NOT in the
+  server plumbing layer.
+
+**★ ROOT CAUSE PINNED LOCALLY (2026-06-29, box-free, native macOS) ★**
+Reproduced the floor on a native macOS server with the Go RECIPE=1 harness (no EC2):
+`/tmp/ts-local/` (config + `run_probe.sh`). Server build runs on darwin.
+- **The floor is NOT uniform — it is the DELETE op.** Closed-loop, NO rate limiter,
+  256 workers: create/spend/get/unlock **p50 = 3–4 ms** (= mock-server ceiling), but
+  **delete p50 = 447 ms**, and the other ops' **p99 ≈ 450 ms** (queued behind a
+  delete stall). In the rate-limited 1:1:1:1 recipe the constant deletes SMEAR the
+  stall across every op → on EC2 it *looked* like a uniform ~71 ms floor. macOS
+  447 ms / NVMe ~71 ms is the slow-fsync ratio.
+- **Why delete is slow: the DELETE path is synchronous + uncached while create/spend
+  are async (write-back cache).** Three distinct per-delete costs, confirmed by
+  experiment (gating each under buffered) + `sample`(1) of the server under load:
+  1. **data-device `device.sync()`** — `delete_inner` step 3, engine.rs:7007. A full
+     fsync per delete. Gating it under `redo_buffered()` dropped 447→~340 ms.
+     *Safe to defer:* the checkpoint barrier already fsyncs the data device before
+     redo reclaim (checkpoint.rs:637), exactly like create/spend.
+  2. **tombstone `append_synced`** — `append_delete_tombstone`, engine.rs:7346. A
+     second fsync (tombstone-log device). Gating to the unsynced `append` dropped to
+     ~245 ms. *NOT safe to defer alone:* the checkpoint barrier does NOT currently
+     fsync the tombstone log — deferring needs a matching tombstone-log sync added to
+     the checkpoint barrier (else a crash loses tombstones the reclaimed redo no
+     longer carries).
+  3. **`append_deleted_child` (parent-prune) direct device I/O** — engine.rs:5965,
+     the remaining ~245 ms. `sample` showed it dominates: per deleted child it does
+     `allocate_deleted_children_block` → **direct O_DIRECT/F_NOCACHE `pwrite`** of a
+     fresh children block + `write_metadata_fast` + a per-child redo
+     `append_and_flush` (engine.rs:6018) — none routed through the write-back cache.
+     Skipping redb (step 6, already `Durability::Eventual`) changed nothing → redb is
+     NOT a factor.
+- **THE FIX (durability-critical, multi-part — needs the careful TDD pass):** make
+  the delete path async like create/spend: (1) defer data-device sync under buffered
+  [safe today]; (2) defer tombstone fsync under buffered AND add a tombstone-log sync
+  to the checkpoint barrier; (3) route `append_deleted_child`'s block + metadata
+  writes through the write-back cache and use a buffered (no-flush) redo append under
+  buffered mode. Expected result: delete → ~4 ms like create/spend → the p99.9 floor
+  disappears → likely wins the tail. Experiments reverted (incomplete/unsafe as-is);
+  tree clean.
 - **EC2 ACCESS IS BROKEN (action needed):** the `teraslab-test-user` IAM key in
   `.aws/ec-credentials` lacks ec2:DescribeInstances / ec2:TerminateInstances, and the
   SSH key `~/.ssh/teraslab-perftest-key.pem` is now REJECTED by 44.201.221.186 (port
