@@ -287,7 +287,12 @@ fn run_checkpoint_loop(
         // appender wakes us immediately (and `blocked_appenders > 0` is checked
         // inside), so a write burst that fills the log triggers a drain within
         // ~one slice rather than waiting out the full poll interval.
-        if !backpressure.park_drainer(poll + backoff, responsive_poll, &shutdown) {
+        //
+        // Park on `poll` only — NOT `poll + backoff`. The exponential back-off
+        // after a failed checkpoint is applied once, in the Err branch's
+        // throttle sleep below; adding it here too would double-count it
+        // (effective idle wait `poll + 2*backoff` on a failing device).
+        if !backpressure.park_drainer(poll, responsive_poll, &shutdown) {
             break;
         }
 
@@ -415,7 +420,15 @@ fn run_checkpoint_loop(
                 // safety valve still releases the appender meanwhile.
                 let mut remaining = backoff;
                 while remaining > Duration::ZERO && !shutdown.load(Ordering::Relaxed) {
-                    let step = responsive_poll.min(remaining);
+                    // Zero-step guard (mirrors `park_drainer`): a zero
+                    // `responsive_poll` would otherwise leave `step == 0`, never
+                    // decrement `remaining`, and busy-spin. Collapse to the full
+                    // remaining wait in one sleep.
+                    let step = if responsive_poll.is_zero() {
+                        remaining
+                    } else {
+                        responsive_poll.min(remaining)
+                    };
                     std::thread::sleep(step);
                     remaining = remaining.saturating_sub(step);
                 }

@@ -1012,6 +1012,59 @@ impl RedoOp {
         }
     }
 
+    /// Byte length `serialize_data` would push for this op, computed by pure
+    /// arithmetic over the fields — NO clone, serialize, or CRC.
+    ///
+    /// MUST stay byte-exact with [`Self::serialize_data`]; a `debug_assert` in
+    /// [`RedoEntry::serialize`] cross-checks it on every serialize so any
+    /// variant drift fails the test suite. Used by [`RedoLog::would_fit`] to
+    /// size a batch without re-serializing every op (Create carries fat
+    /// `record_bytes`, so the prior measure-by-serialize doubled the
+    /// clone/serialize/CRC of the whole hot create batch — N2).
+    pub(crate) fn serialized_data_len(&self) -> usize {
+        // Field widths: txid/[u8;32]=32, spending_data[u8;36]=36, u64=8,
+        // u32=4, u16=2, u8/bool=1.
+        match self {
+            RedoOp::Spend { .. } => 32 + 4 + 36 + 4,
+            RedoOp::SpendV2 { utxo_hash, .. } | RedoOp::UnspendV2 { utxo_hash, .. } => {
+                32 + 4 + 36 + 4 + 4 + 4 + 4 + 8 + if utxo_hash.is_some() { 32 } else { 0 }
+            }
+            RedoOp::Unspend { spending_data, .. } => {
+                32 + 4 + if spending_data.is_some() { 36 + 4 } else { 4 }
+            }
+            RedoOp::SetMined { .. } => 32 + 4 + 4 + 4 + 1,
+            RedoOp::Freeze { .. } | RedoOp::Unfreeze { .. } | RedoOp::PruneSlot { .. } => 32 + 4,
+            RedoOp::PruneSlotIfSpentBy { .. } => 32 + 4 + 32,
+            RedoOp::FreezeV2 { .. } | RedoOp::UnfreezeV2 { .. } => 32 + 4 + 32,
+            RedoOp::Reassign { .. } => 32 + 4 + 32 + 4 + 4,
+            RedoOp::ReassignV2 { .. } => 32 + 4 + 32 + 4 + 4 + 32,
+            RedoOp::ReplicaCreate { .. } => 32 + 1 + 8 + 4,
+            RedoOp::Create {
+                record_bytes,
+                parent_txids,
+                ..
+            } => 32 + 1 + 8 + 4 + 1 + 4 + record_bytes.len() + 2 + parent_txids.len() * 32,
+            RedoOp::Delete { .. } => 32 + 8 + 8,
+            RedoOp::SetConflicting { .. } => 32 + 1 + 4 + 4,
+            RedoOp::AppendConflictingChild { .. }
+            | RedoOp::RemoveConflictingChild { .. }
+            | RedoOp::AppendDeletedChild { .. } => 32 + 32,
+            RedoOp::SetLocked { .. } => 32 + 1,
+            RedoOp::PreserveUntil { .. } => 32 + 4,
+            RedoOp::MarkOnLongestChain { .. } => 32 + 1 + 4 + 4 + 4,
+            RedoOp::SecondaryUnminedUpdate { .. } | RedoOp::SecondaryDahUpdate { .. } => 32 + 4 + 4,
+            RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => 8 + 8 + 1,
+            RedoOp::HashtableResizeBegin { tmp_path_bytes, .. } => 8 + 4 + tmp_path_bytes.len(),
+            RedoOp::HashtableResizeCommit { .. } => 8,
+            RedoOp::CompensateUnsetMined { .. } => 32 + 4 + 4 + 4,
+            RedoOp::CompensateReassign { .. } => 32 + 4 + 32,
+            RedoOp::CompensatePrune { .. } => 32 + 4 + 1,
+            RedoOp::CompensateSetLocked { .. } => 32 + 1 + 4,
+            RedoOp::RecoveryProgress { .. } => 8,
+            RedoOp::Checkpoint => 0,
+        }
+    }
+
     /// Serialize op-specific data (without type byte, sequence, or length).
     fn serialize_data(&self, buf: &mut Vec<u8>) {
         match self {
@@ -1838,12 +1891,30 @@ const ENTRY_CHECKSUM_SIZE: usize = 4;
 const ENTRY_OVERHEAD: usize = ENTRY_SEQ_SIZE + ENTRY_TYPE_SIZE + ENTRY_CHECKSUM_SIZE;
 
 impl RedoEntry {
+    /// Total on-disk byte length of this entry, by arithmetic (no serialize).
+    /// `RedoEntry::serialize` produces `length(4) | seq(8) | type(1) | op_data |
+    /// crc(4)`, so the total is `ENTRY_HEADER_SIZE + ENTRY_OVERHEAD +
+    /// op.serialized_data_len()`.
+    fn serialized_len(&self) -> usize {
+        ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + self.op.serialized_data_len()
+    }
+
     /// Serialize this entry to bytes.
     fn serialize(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&self.sequence.to_le_bytes());
         payload.push(self.op.op_type());
         self.op.serialize_data(&mut payload);
+        // Byte-exactness guard (N2): the op data just written must match the
+        // arithmetic `serialized_data_len` that `would_fit` trusts. Any future
+        // variant whose `serialize_data` and `serialized_data_len` drift apart
+        // trips this in the test suite before it can cause a false would_fit.
+        debug_assert_eq!(
+            payload.len() - ENTRY_SEQ_SIZE - ENTRY_TYPE_SIZE,
+            self.op.serialized_data_len(),
+            "serialized_data_len drifted from serialize_data for {:?}",
+            self.op.op_type()
+        );
 
         let checksum = crc32fast::hash(&payload);
         payload.extend_from_slice(&checksum.to_le_bytes());
@@ -1852,6 +1923,7 @@ impl RedoEntry {
         let mut out = Vec::with_capacity(ENTRY_HEADER_SIZE + payload.len());
         out.extend_from_slice(&length.to_le_bytes());
         out.extend_from_slice(&payload);
+        debug_assert_eq!(out.len(), self.serialized_len(), "entry length drift");
         out
     }
 
@@ -2530,20 +2602,16 @@ impl RedoLog {
     /// partial batch and then hitting the per-op `LogFull` mid-way, which
     /// forces `poison()` (bricking the store's log until restart) because the
     /// already-buffered ops carry consumed global sequences that must never
-    /// flush. Entry byte length is independent of the sequence value (fixed
-    /// 8-byte field), so a seq-0 dry serialize measures the real footprint.
+    /// flush. Footprint is measured by arithmetic ([`RedoOp::serialized_data_len`]),
+    /// not by serializing — so a hot create batch with fat `record_bytes` is
+    /// not cloned/serialized/CRC'd here just to read its length (N2).
     pub fn would_fit(&self, ops: &[&RedoOp]) -> bool {
         if self.poisoned {
             return false;
         }
         let mut needed = self.write_pos + self.buffer.len() as u64;
         for op in ops {
-            needed += RedoEntry {
-                sequence: 0,
-                op: (*op).clone(),
-            }
-            .serialize()
-            .len() as u64;
+            needed += (ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len()) as u64;
         }
         needed <= self.entries_region_size()
     }
@@ -3367,6 +3435,256 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0] = n;
         TxKey { txid }
+    }
+
+    /// N2: `serialized_data_len` (arithmetic, used by `would_fit`) must match
+    /// the real `serialize_data` length for EVERY variant — a drift would let
+    /// `would_fit` under-count and re-admit a batch that overflows mid-append.
+    /// The `debug_assert` in `RedoEntry::serialize` also fires per-op here.
+    #[test]
+    fn serialized_len_matches_serialize_for_all_variants() {
+        let k = test_key(7);
+        let h = [0xABu8; 32];
+        let sd = [0xCDu8; 36];
+        let ops = vec![
+            RedoOp::Spend {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+            },
+            RedoOp::SpendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: None,
+            },
+            RedoOp::SpendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: Some(h),
+            },
+            RedoOp::Unspend {
+                tx_key: k,
+                offset: 1,
+                spending_data: None,
+                new_spent_count: 2,
+            },
+            RedoOp::Unspend {
+                tx_key: k,
+                offset: 1,
+                spending_data: Some(sd),
+                new_spent_count: 2,
+            },
+            RedoOp::UnspendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: None,
+            },
+            RedoOp::UnspendV2 {
+                tx_key: k,
+                offset: 1,
+                spending_data: sd,
+                new_spent_count: 2,
+                current_block_height: 3,
+                block_height_retention: 4,
+                target_generation: 5,
+                updated_at: 6,
+                utxo_hash: Some(h),
+            },
+            RedoOp::SetMined {
+                tx_key: k,
+                block_id: 1,
+                block_height: 2,
+                subtree_idx: 3,
+                unset: true,
+            },
+            RedoOp::Freeze {
+                tx_key: k,
+                offset: 1,
+            },
+            RedoOp::Unfreeze {
+                tx_key: k,
+                offset: 1,
+            },
+            RedoOp::PruneSlot {
+                tx_key: k,
+                offset: 1,
+            },
+            RedoOp::PruneSlotIfSpentBy {
+                tx_key: k,
+                offset: 1,
+                child_txid: h,
+            },
+            RedoOp::FreezeV2 {
+                tx_key: k,
+                offset: 1,
+                utxo_hash: h,
+            },
+            RedoOp::UnfreezeV2 {
+                tx_key: k,
+                offset: 1,
+                utxo_hash: h,
+            },
+            RedoOp::Reassign {
+                tx_key: k,
+                offset: 1,
+                new_hash: h,
+                block_height: 2,
+                spendable_after: 3,
+            },
+            RedoOp::ReassignV2 {
+                tx_key: k,
+                offset: 1,
+                new_hash: h,
+                block_height: 2,
+                spendable_after: 3,
+                prior_utxo_hash: h,
+            },
+            RedoOp::ReplicaCreate {
+                tx_key: k,
+                device_id: 1,
+                record_offset: 4096,
+                utxo_count: 2,
+            },
+            RedoOp::Create {
+                tx_key: k,
+                device_id: 1,
+                record_offset: 4096,
+                utxo_count: 2,
+                is_conflicting: false,
+                record_bytes: vec![0u8; 0],
+                parent_txids: vec![],
+            },
+            RedoOp::Create {
+                tx_key: k,
+                device_id: 1,
+                record_offset: 4096,
+                utxo_count: 2,
+                is_conflicting: true,
+                record_bytes: vec![1u8; 300],
+                parent_txids: vec![h, h, h],
+            },
+            RedoOp::Delete {
+                tx_key: k,
+                record_offset: 4096,
+                record_size: 256,
+            },
+            RedoOp::SetConflicting {
+                tx_key: k,
+                value: true,
+                current_block_height: 1,
+                block_height_retention: 2,
+            },
+            RedoOp::AppendConflictingChild {
+                parent_key: k,
+                child_txid: h,
+            },
+            RedoOp::RemoveConflictingChild {
+                parent_key: k,
+                child_txid: h,
+            },
+            RedoOp::AppendDeletedChild {
+                parent_key: k,
+                child_txid: h,
+            },
+            RedoOp::SetLocked {
+                tx_key: k,
+                value: true,
+            },
+            RedoOp::PreserveUntil {
+                tx_key: k,
+                block_height: 1,
+            },
+            RedoOp::MarkOnLongestChain {
+                tx_key: k,
+                on_longest_chain: true,
+                current_block_height: 1,
+                block_height_retention: 2,
+                generation: 3,
+            },
+            RedoOp::SecondaryUnminedUpdate {
+                tx_key: k,
+                old_height: 1,
+                new_height: 2,
+            },
+            RedoOp::SecondaryDahUpdate {
+                tx_key: k,
+                old_height: 1,
+                new_height: 2,
+            },
+            RedoOp::AllocateRegion {
+                offset: 4096,
+                size: 4096,
+                device_id: 0,
+            },
+            RedoOp::FreeRegion {
+                offset: 4096,
+                size: 4096,
+                device_id: 0,
+            },
+            RedoOp::HashtableResizeBegin {
+                tmp_path_bytes: b"/tmp/x.idx".to_vec(),
+                new_capacity: 1024,
+            },
+            RedoOp::HashtableResizeCommit { new_capacity: 1024 },
+            RedoOp::CompensateUnsetMined {
+                tx_key: k,
+                block_id: 1,
+                block_height: 2,
+                subtree_idx: 3,
+            },
+            RedoOp::CompensateReassign {
+                tx_key: k,
+                offset: 1,
+                prior_utxo_hash: h,
+            },
+            RedoOp::CompensatePrune {
+                tx_key: k,
+                offset: 1,
+                prior_status: 2,
+            },
+            RedoOp::CompensateSetLocked {
+                tx_key: k,
+                prior_locked: true,
+                prior_delete_at_height: 5,
+            },
+            RedoOp::RecoveryProgress {
+                through_sequence: 9,
+            },
+            RedoOp::Checkpoint,
+        ];
+        for op in ops {
+            let entry = RedoEntry {
+                sequence: 0,
+                op: op.clone(),
+            };
+            let actual = entry.serialize().len();
+            let predicted = ENTRY_HEADER_SIZE + ENTRY_OVERHEAD + op.serialized_data_len();
+            assert_eq!(
+                actual,
+                predicted,
+                "serialized_data_len mismatch for {:?}: serialize()={actual} predicted={predicted}",
+                op.op_type()
+            );
+        }
     }
 
     /// A redo entry roughly `payload` bytes long, for filling the log fast.

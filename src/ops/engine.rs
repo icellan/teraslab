@@ -1055,10 +1055,44 @@ impl Engine {
         let Some(log) = self.redo_log_for_device(device_id) else {
             return Ok(());
         };
-        log.lock()
-            .append(op.clone())
-            .map_err(|e| format!("replica redo append: {e}"))?;
+        // Capture the result so the per-store guard is dropped at the end of
+        // THIS statement, before `poison_all_redo_logs` below re-locks every
+        // log (including this one) — `parking_lot::Mutex` is not reentrant, so
+        // holding the guard across the poison would self-deadlock.
+        let append_result = log.lock().append(op.clone());
+        if let Err(e) = append_result {
+            // N1: fail closed, mirroring the master routed path
+            // (`append_redo_ops_routed`'s mid-batch `poison()`) and
+            // `flush_all_redo_logs`'s partial-flush handling. A mid-batch
+            // append failure leaves this batch's EARLIER ops buffered — across
+            // this AND other stores — with consumed global sequences. The
+            // receiver returns `STATUS_ERROR` BEFORE the once-per-batch
+            // `flush_all_redo_logs`, so without this the residue would be
+            // flushed durable by the NEXT replica batch even though the master
+            // NAK'd this one and will resend it — silently diverging the
+            // replica's durable redo from the master's acked state. Poison
+            // EVERY store's log (the residue can span stores) so no residue can
+            // ever flush; the node fences and recovery reconciles on restart.
+            self.poison_all_redo_logs();
+            tracing::error!(
+                err = %e,
+                device_id,
+                "replica redo append failed; poisoned all store logs (fail-closed)"
+            );
+            return Err(format!("replica redo append: {e}"));
+        }
         Ok(())
+    }
+
+    /// Poison every attached redo log, fencing the node so no further writes
+    /// (and no buffered residue) can become durable until a restart + recovery.
+    /// Used by the replica fail-closed paths.
+    fn poison_all_redo_logs(&self) {
+        if let Some(logs) = self.redo_logs.get() {
+            for log in logs {
+                log.lock().poison();
+            }
+        }
     }
 
     /// Flush every attached redo log (per-store, or the single representative
@@ -14234,6 +14268,86 @@ mod tests {
             1,
             "only the post-reject append is durable; the oversized batch left no residue"
         );
+    }
+
+    /// N1 (review round 2): the REPLICA apply path must also fail closed. A
+    /// mid-batch replica append failure (op K hits `LogFull`) leaves this
+    /// batch's earlier ops buffered ACROSS stores with consumed global
+    /// sequences; the receiver returns `STATUS_ERROR` before the once-per-batch
+    /// flush, so without fail-closed handling the next replica batch would
+    /// flush that residue durable even though the master NAK'd and resends —
+    /// silent durable/acked divergence. `append_replica_redo_entry_to_store`
+    /// now poisons EVERY store's log on append failure, dropping the
+    /// cross-store residue so none of it can ever flush.
+    #[test]
+    fn replica_redo_append_failure_poisons_all_stores_and_drops_residue() {
+        use crate::redo::{RedoError, RedoLog, RedoOp};
+        use std::sync::atomic::AtomicU64;
+
+        let engine = create_two_store_engine();
+        // Store 0: room for a small op (the residue). Store 1: tiny — a single
+        // fat op overflows it.
+        let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
+        let mut log0 = RedoLog::open(rdev0, 0, 64 * 1024).unwrap();
+        let mut log1 = RedoLog::open(rdev1, 0, 8192).unwrap();
+        let shared = Arc::new(AtomicU64::new(RedoLog::shared_sequence_floor(&[
+            &log0, &log1,
+        ])));
+        log0.attach_shared_sequence(shared.clone());
+        log1.attach_shared_sequence(shared);
+        let log0_arc = Arc::new(parking_lot::Mutex::new(log0));
+        let log1_arc = Arc::new(parking_lot::Mutex::new(log1));
+        engine.set_redo_logs(vec![log0_arc.clone(), log1_arc.clone()]);
+
+        let small = RedoOp::AllocateRegion {
+            device_id: 0,
+            offset: 4096,
+            size: 4096,
+        };
+        // Earlier op of the batch lands on store 0 and is buffered (residue).
+        engine
+            .append_replica_redo_entry_to_store(&small, 0)
+            .expect("small replica append fits store 0");
+        assert!(
+            log0_arc.lock().has_pending(),
+            "store 0 holds the buffered residue before the failure"
+        );
+
+        // A later op overflows store 1 mid-batch.
+        let fat = RedoOp::Create {
+            tx_key: TxKey { txid: [9u8; 32] },
+            device_id: 1,
+            record_offset: 4096,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: vec![0xEE; 8192],
+            parent_txids: Vec::new(),
+        };
+        let err = engine
+            .append_replica_redo_entry_to_store(&fat, 1)
+            .expect_err("oversized replica op must fail");
+        assert!(err.contains("replica redo append"), "got: {err}");
+
+        // Both stores are poisoned (residue can never flush) and store 0's
+        // buffered residue was dropped — no durable/acked divergence is possible.
+        assert!(
+            !log0_arc.lock().has_pending(),
+            "store 0's residue must be dropped by the fail-closed poison"
+        );
+        assert!(
+            matches!(
+                log0_arc.lock().append(small.clone()),
+                Err(RedoError::Poisoned)
+            ),
+            "store 0 must be poisoned"
+        );
+        assert!(
+            matches!(log1_arc.lock().append(small), Err(RedoError::Poisoned)),
+            "store 1 must be poisoned"
+        );
+        // A subsequent batch flush makes nothing durable: store 0 recovers empty.
+        let _ = engine.flush_all_redo_logs();
     }
 
     #[test]

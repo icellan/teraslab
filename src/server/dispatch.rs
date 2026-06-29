@@ -21944,25 +21944,91 @@ mod tests {
     /// against `engine` (with its checkpoint task already running and the
     /// backpressure coordinator armed), returning the count of `ERR_STORAGE_IO`
     /// responses. Zero means backpressure kept the burst flowing.
-    fn run_create_burst(engine: &Engine, redo_log: &Arc<Mutex<RedoLog>>, batches: usize) -> u32 {
+    /// Drive a create burst through the dispatch gate with a
+    /// DRAIN-ONLY-WHEN-BLOCKED reclaimer; returns (storage_io_failures,
+    /// peak_blocked, created_txids).
+    ///
+    /// The reclaimer thread resets `drain_logs` ONLY while an appender is
+    /// stalled on the gate (`blocked_appenders() > 0`). So forward progress
+    /// REQUIRES the gate to block: if the gate degraded to a no-op the producer
+    /// would never stall, the reclaimer would never fire, the log would fill,
+    /// and `storage_io` would be > 0 — i.e. `storage_io == 0` alone proves the
+    /// gate is load-bearing, and `peak_blocked > 0` confirms it. This is
+    /// deterministic and machine-independent, unlike asserting a peak against a
+    /// free-running timed checkpoint (whose drain rate races the producer). The
+    /// gate is armed directly here (production arms it when the checkpoint task
+    /// spawns).
+    fn run_create_burst(
+        engine: &Engine,
+        dispatch_log: &Arc<Mutex<RedoLog>>,
+        drain_logs: &[Arc<Mutex<RedoLog>>],
+        batches: usize,
+    ) -> (u32, usize, Vec<[u8; 32]>) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let bp = engine
+            .redo_backpressure()
+            .expect("coordinator built on redo-log attach");
+        bp.arm();
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reclaimer = {
+            let bp = bp.clone();
+            let peak = peak.clone();
+            let stop = stop.clone();
+            let logs: Vec<_> = drain_logs.to_vec();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let blocked = bp.blocked_appenders();
+                    peak.fetch_max(blocked, Ordering::Relaxed);
+                    if blocked > 0 {
+                        // The stalled producer holds no log lock (the gate is
+                        // before the barrier), so reclaiming here is safe. reset
+                        // frees the whole region and wakes the gate.
+                        for log in &logs {
+                            let _ = log.lock().reset();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+
         let mut cs = crate::server::ConnectionState::new();
         let mut storage_io = 0u32;
+        let mut txids = Vec::with_capacity(batches * 8);
         for b in 0..batches {
             let items = burst_create_items(b as u8, 8, 2048);
+            txids.extend(items.iter().map(|it| it.txid));
             let req = RequestFrame {
                 request_id: (b as u64) + 1,
                 op_code: OP_CREATE_BATCH,
                 flags: 0,
                 payload: encode_create_batch(&items).into(),
             };
-            let resp = handle_request(&req, engine, 8192, None, Some(redo_log), &mut cs, None);
+            let resp = handle_request(&req, engine, 8192, None, Some(dispatch_log), &mut cs, None);
             if resp.status == STATUS_ERROR
                 && matches!(decode_error_payload(&resp.payload), Some((c, _)) if c == ERR_STORAGE_IO)
             {
                 storage_io += 1;
             }
         }
-        storage_io
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = reclaimer.join();
+        (storage_io, peak.load(Ordering::Relaxed), txids)
+    }
+
+    /// Assert every created txid is retrievable from the engine index (the
+    /// burst's writes actually landed, not just "didn't error").
+    fn assert_all_retrievable(engine: &Engine, txids: &[[u8; 32]]) {
+        for txid in txids {
+            assert!(
+                matches!(engine.lookup_checked(&TxKey { txid: *txid }), Ok(Some(_))),
+                "created txid must be retrievable after the burst"
+            );
+        }
     }
 
     /// Block 269 regression at the dispatch layer: a create burst that writes
@@ -21984,42 +22050,29 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ));
-        // 512 KiB log → gate reserve = capacity/8 ≈ 63 KiB, comfortably above a
-        // single batch's footprint here (~20 KiB if all 8 creates cluster on
-        // the store), so the gate stalls the burst rather than over-admitting.
-        // (Production default is a 64 MiB log → 8 MiB reserve; a batch larger
-        // than the reserve is caught CLEANLY by the would_fit pre-flight in
-        // append_redo_ops_routed, not bricked.)
-        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(512 * 1024, 4096).unwrap());
-        let redo_log = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 512 * 1024).unwrap()));
+        // Small 132 KiB log (reserve = capacity/8 ≈ 16 KiB) so the burst's redo
+        // (≈ one 4 KiB block per batch) fills it well past the reserve within
+        // the run, forcing the gate to stall (the reclaimer then frees it).
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let redo_log = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 132 * 1024).unwrap()));
         engine.set_redo_log(redo_log.clone());
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = crate::checkpoint::CheckpointConfig::new(dir.path().join("burst.snap"));
-        cfg.high_water = 0.5;
-        cfg.low_water = 0.1;
-        cfg.emergency_high_water = 0.8;
-        cfg.poll_interval = Duration::from_millis(10);
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ckpt = crate::checkpoint::spawn_checkpoint_task(
-            cfg,
-            engine.clone(),
-            redo_log.clone(),
-            shutdown.clone(),
-        );
-
-        // 60 batches × 8 creates × ~2 KiB ≈ 1 MiB of redo through a 512 KiB log:
-        // it must drain-and-stall, never fail.
-        let storage_io = run_create_burst(&engine, &redo_log, 60);
-
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        ckpt.join().unwrap();
+        // 60 batches >> the ~28 it takes to fill past the reserve; the
+        // drain-only-when-blocked reclaimer guarantees the gate must stall.
+        let (storage_io, peak_blocked, txids) =
+            run_create_burst(&engine, &redo_log, std::slice::from_ref(&redo_log), 60);
 
         assert_eq!(
             storage_io, 0,
             "backpressure must keep a capacity-exceeding create burst flowing — \
              no create may fail with ERR_STORAGE from a full redo log",
         );
+        assert!(
+            peak_blocked > 0,
+            "the gate must have stalled at least one appender during the burst — \
+             a zero peak means the gate degraded to a no-op",
+        );
+        assert_all_retrievable(&engine, &txids);
     }
 
     /// Same guarantee under PR23's per-store redo: a 2-store engine with a
@@ -22048,12 +22101,11 @@ mod tests {
         ));
         assert_eq!(engine.store_count(), 2);
 
-        // 512 KiB per-store logs → per-store reserve ≈ 63 KiB, well above a
-        // single batch's per-store footprint even when records cluster on one
-        // store, so the min-available gate admits only batches that fit.
+        // Small 132 KiB per-store logs (reserve ≈ 16 KiB) so each store fills
+        // past its reserve during the burst and the min-available gate stalls.
         let mk_redo = || -> Arc<Mutex<RedoLog>> {
-            let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(512 * 1024, 4096).unwrap());
-            Arc::new(Mutex::new(RedoLog::open(dev, 0, 512 * 1024).unwrap()))
+            let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+            Arc::new(Mutex::new(RedoLog::open(dev, 0, 132 * 1024).unwrap()))
         };
         let log0 = mk_redo();
         let log1 = mk_redo();
@@ -22064,34 +22116,24 @@ mod tests {
         log1.lock().attach_shared_sequence(shared);
         engine.set_redo_logs(vec![log0.clone(), log1.clone()]);
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut cfg = crate::checkpoint::CheckpointConfig::new(dir.path().join("burst-ms.snap"));
-        cfg.high_water = 0.5;
-        cfg.low_water = 0.1;
-        cfg.emergency_high_water = 0.8;
-        cfg.poll_interval = Duration::from_millis(10);
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // One task, multi-store-aware drain (store 0's log is the representative
-        // handle; the loop drains all stores via the engine helpers).
-        let ckpt = crate::checkpoint::spawn_checkpoint_task(
-            cfg,
-            engine.clone(),
-            log0.clone(),
-            shutdown.clone(),
-        );
-
         // 100 batches sharded across 2 stores easily exceeds a 512 KiB per-store
-        // log, forcing repeated drains.
-        let storage_io = run_create_burst(&engine, &log0, 100);
-
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        ckpt.join().unwrap();
+        // log; the drain-only-when-blocked reclaimer (resetting BOTH stores)
+        // makes the min-available gate's stall deterministic regardless of how
+        // the round-robin placement splits the batch across stores.
+        let (storage_io, peak_blocked, txids) =
+            run_create_burst(&engine, &log0, &[log0.clone(), log1.clone()], 100);
 
         assert_eq!(
             storage_io, 0,
             "per-store backpressure must keep a multi-store create burst flowing — \
              no create may fail with ERR_STORAGE from any store's full redo log",
         );
+        assert!(
+            peak_blocked > 0,
+            "the gate must have stalled at least one appender during the burst — \
+             a zero peak means the gate degraded to a no-op",
+        );
+        assert_all_retrievable(&engine, &txids);
     }
 
     /// Issue #14: with the atomic `AllocateRegion`+`Create` batch, a create
