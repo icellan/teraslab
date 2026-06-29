@@ -2122,6 +2122,29 @@ impl Engine {
         })
     }
 
+    /// Make the deletion-tombstone log durable.
+    ///
+    /// Under buffered durability `delete_inner` appends tombstones to the log
+    /// WITHOUT a per-delete fsync (the per-delete tombstone fsync was part of
+    /// the delete-latency floor). The checkpoint barrier calls this before it
+    /// reclaims any redo prefix, so every tombstone whose `DeleteV2` redo entry
+    /// is about to be reclaimed is on stable storage first — preserving the
+    /// "tombstone durable before the deletion is durably committed" invariant
+    /// (deletion-tombstone §9.1 #4) at buffered granularity. A no-op when no
+    /// tombstone log is attached; under strict durability the tombstone was
+    /// already `append_synced`, so this is a redundant (cheap) fsync.
+    ///
+    /// # Errors
+    /// Returns the tombstone log's sync error as a `String`.
+    pub fn sync_tombstone_logs(&self) -> std::result::Result<(), String> {
+        if let Some(log) = self.tombstone_log.get() {
+            log.lock()
+                .sync()
+                .map_err(|e| format!("tombstone log sync failed: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Verify every index entry's `device_id` is within the configured store
     /// count.
     ///
@@ -6012,16 +6035,31 @@ impl Engine {
             // primary — UTXO_PRUNED remains the primary defense).
             if !intent_logged {
                 // Per-store redo: route the intent to the parent record's
-                // store (its `device_id`, resolved above).
+                // store (its `device_id`, resolved above). Under BUFFERED
+                // durability append WITHOUT flushing — the per-child fsync this
+                // `append_and_flush` used to force was part of the delete
+                // latency floor; the background flusher + checkpoint barrier make
+                // the AppendDeletedChild entry durable, and the data device
+                // (children block + parent metadata) is fsynced by the same
+                // barrier before this redo prefix is reclaimed, so a crash
+                // before the barrier loses the prune the same way buffered
+                // create/spend can lose an un-checkpointed mutation (the relaxed
+                // durability contract). Strict durability keeps the per-call
+                // flush so the intent is durable before the block write.
+                let op = crate::redo::RedoOp::AppendDeletedChild {
+                    parent_key: *parent_key,
+                    child_txid,
+                };
                 if let Some(log) = self.redo_log_for_device(device_id) {
-                    log.lock()
-                        .append_and_flush(crate::redo::RedoOp::AppendDeletedChild {
-                            parent_key: *parent_key,
-                            child_txid,
-                        })
-                        .map_err(|e| SpendError::StorageError {
-                            detail: format!("append deleted child redo: {e}"),
-                        })?;
+                    let mut guard = log.lock();
+                    let r = if self.redo_buffered() {
+                        guard.append(op).map(|_| ())
+                    } else {
+                        guard.append_and_flush(op).map(|_| ())
+                    };
+                    r.map_err(|e| SpendError::StorageError {
+                        detail: format!("append deleted child redo: {e}"),
+                    })?;
                 }
                 intent_logged = true;
             }
@@ -7005,11 +7043,24 @@ impl Engine {
         // just its first alignment block (multi-block boot-loop fix).
         self.write_zeroed_metadata_header(entry.device_id, entry.record_offset, record_size)?;
         // Step 3: Sync so the zeroed header is durable before any reuse.
-        self.device_for(entry.device_id)
-            .sync()
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("delete tombstone sync failed: {e}"),
-            })?;
+        //
+        // Under BUFFERED (relaxed) durability we skip this synchronous fsync on
+        // the hot path: the zeroed-header write has already landed in the
+        // write-back cache, the delete is journalled to the (buffered) redo log
+        // below, and the checkpoint barrier fsyncs every store's data device
+        // before it reclaims any redo prefix (src/checkpoint.rs
+        // `sync_all_store_devices` precedes the fence/reclaim). So durability is
+        // DEFERRED to the same barrier buffered create/spend rely on, not
+        // dropped. Pre-fix this per-delete fsync was the dominant component of
+        // the delete-latency floor (the p99.9 blocker). Strict durability keeps
+        // the synchronous sync exactly as before.
+        if !self.redo_buffered() {
+            self.device_for(entry.device_id)
+                .sync()
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("delete tombstone sync failed: {e}"),
+                })?;
+        }
 
         // Step 4: Remove from primary index AND decrement shard_counts in
         // the same critical section so the two can never drift (H2
@@ -7337,16 +7388,29 @@ impl Engine {
             0,
         );
 
-        // Append + make durable on the tombstone device BEFORE returning, so
-        // the tombstone is durable before the caller proceeds to the
-        // primary-index removal.
+        // Append the tombstone to its log. Under STRICT durability we make it
+        // durable immediately (`append_synced`), preserving the invariant that
+        // the tombstone is on stable storage before the deletion is durably
+        // committed. Under BUFFERED durability we APPEND WITHOUT fsync
+        // (`append`): the bytes land in the tombstone device's write-back cache
+        // and are made durable by the checkpoint barrier
+        // (`sync_tombstone_logs`, called before the redo prefix carrying this
+        // delete's `DeleteV2` is reclaimed — src/checkpoint.rs). The §9.1 #4
+        // ordering (tombstone durable before the deletion is *durably
+        // committed*) therefore holds at buffered granularity: both become
+        // durable at the same barrier, tombstone-sync strictly before
+        // redo-reclaim. The per-delete tombstone fsync was the second half of
+        // the delete-latency floor (the p99.9 blocker).
         {
             let mut guard = log.lock();
-            guard
-                .append_synced(&tombstone)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("tombstone log append failed: {e}"),
-                })?;
+            let r = if self.redo_buffered() {
+                guard.append(&tombstone)
+            } else {
+                guard.append_synced(&tombstone)
+            };
+            r.map_err(|e| SpendError::StorageError {
+                detail: format!("tombstone log append failed: {e}"),
+            })?;
         }
 
         let value = crate::index::redb_tombstone::TombstoneIndexValue {
@@ -17653,6 +17717,175 @@ mod tests {
         assert!(engine.lookup(&key).is_none(), "record still removed");
         assert!(!idx.lock().is_tombstoned(&key));
         assert!(log.lock().scan().unwrap().is_empty());
+    }
+
+    /// Build an engine whose DATA device, REDO device, and TOMBSTONE-log device
+    /// are each wrapped in a `SyncCountingDevice`, so a test can assert exactly
+    /// which `sync()`s a delete issues. `buffered` selects relaxed (async) vs
+    /// strict durability. Returns the engine, the three sync counters (data,
+    /// redo, tombstone), and the tempdir backing the redb tombstone index.
+    fn sync_counted_delete_engine(
+        buffered: bool,
+    ) -> (
+        Arc<Engine>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+        tempfile::TempDir,
+    ) {
+        let data_inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (data_dev, data_syncs) = SyncCountingDevice::new(data_inner);
+        let data_dev = data_dev as Arc<dyn BlockDevice>;
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Arc::new(Engine::new(
+            data_dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        let redo_inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let (redo_dev, redo_syncs) = SyncCountingDevice::new(redo_inner);
+        let log = crate::redo::RedoLog::open(redo_dev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024)
+            .unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+
+        let tomb_inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let (tomb_dev, tomb_syncs) = SyncCountingDevice::new(tomb_inner);
+        let tlog = crate::tombstone::TombstoneLog::create(
+            tomb_dev as Arc<dyn BlockDevice>,
+            0,
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        engine.set_tombstone_log(Arc::new(parking_lot::Mutex::new(tlog)));
+        let dir = tempfile::tempdir().unwrap();
+        let idx = crate::index::redb_tombstone::RedbTombstoneIndex::open(
+            &dir.path().join("tombstone.redb"),
+            16 * 1024 * 1024,
+        )
+        .unwrap();
+        engine.set_tombstone_index(Arc::new(parking_lot::Mutex::new(idx)));
+
+        engine.set_buffered_durability(buffered);
+        (engine, data_syncs, redo_syncs, tomb_syncs, dir)
+    }
+
+    #[test]
+    fn buffered_delete_issues_no_synchronous_device_or_tombstone_sync() {
+        // Async-delete fix (p99.9 floor): under buffered durability a delete must
+        // NOT fsync the data device (delete_inner step 3) nor fsync the tombstone
+        // log (append_synced) on the hot path. Durability is deferred to the
+        // background flusher + checkpoint barrier, exactly like buffered
+        // create/spend. Pre-fix each delete forced two synchronous fsyncs — the
+        // root cause of the ~71ms (NVMe) / ~450ms (macOS) delete latency floor.
+        let (engine, data_syncs, _redo_syncs, tomb_syncs, _dir) = sync_counted_delete_engine(true);
+
+        let (_, req) = make_create_req(70, 3);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let data_base = data_syncs.load(Ordering::SeqCst);
+        let tomb_base = tomb_syncs.load(Ordering::SeqCst);
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            data_syncs.load(Ordering::SeqCst) - data_base,
+            0,
+            "buffered delete must not synchronously fsync the data device"
+        );
+        assert_eq!(
+            tomb_syncs.load(Ordering::SeqCst) - tomb_base,
+            0,
+            "buffered delete must not synchronously fsync the tombstone log"
+        );
+        // Durability is DEFERRED, not dropped: the record is gone and the
+        // tombstone bytes are appended to the log (made durable later by the
+        // checkpoint barrier / background flusher).
+        assert!(engine.lookup(&key).is_none(), "record removed");
+        assert_eq!(
+            engine.tombstone_log().unwrap().lock().scan().unwrap().len(),
+            1,
+            "tombstone appended (durability deferred to checkpoint)"
+        );
+    }
+
+    #[test]
+    fn strict_delete_still_fsyncs_data_and_tombstone() {
+        // Counterpart: with strict durability the synchronous fsyncs REMAIN, so
+        // the relaxed path above is the only behavior change.
+        let (engine, data_syncs, _redo_syncs, tomb_syncs, _dir) = sync_counted_delete_engine(false);
+
+        let (_, req) = make_create_req(71, 3);
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let data_base = data_syncs.load(Ordering::SeqCst);
+        let tomb_base = tomb_syncs.load(Ordering::SeqCst);
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .unwrap();
+
+        assert!(
+            data_syncs.load(Ordering::SeqCst) - data_base >= 1,
+            "strict delete fsyncs the data device"
+        );
+        assert!(
+            tomb_syncs.load(Ordering::SeqCst) - tomb_base >= 1,
+            "strict delete fsyncs the tombstone log"
+        );
+    }
+
+    #[test]
+    fn buffered_append_deleted_child_does_not_flush_redo() {
+        // Async-delete fix part 3: the parent-prune `append_deleted_child` logs an
+        // AppendDeletedChild redo intent. Under buffered durability that append
+        // must NOT flush the redo (no per-child fsync); under strict it does.
+        let (engine, _data, redo_syncs, _tomb, _dir) = sync_counted_delete_engine(true);
+
+        let (_, preq) = make_create_req(72, 4);
+        let parent_key = preq.tx_key();
+        engine.create(&preq).unwrap();
+
+        let base = redo_syncs.load(Ordering::SeqCst);
+        let child_txid = [0xABu8; 32];
+        engine
+            .append_deleted_child(&parent_key, child_txid)
+            .unwrap();
+
+        assert_eq!(
+            redo_syncs.load(Ordering::SeqCst) - base,
+            0,
+            "buffered append_deleted_child must not flush (fsync) the redo per child"
+        );
+
+        // Strict counterpart flushes.
+        let (engine2, _d2, redo2, _t2, _dir2) = sync_counted_delete_engine(false);
+        let (_, preq2) = make_create_req(73, 4);
+        let pk2 = preq2.tx_key();
+        engine2.create(&preq2).unwrap();
+        let base2 = redo2.load(Ordering::SeqCst);
+        engine2.append_deleted_child(&pk2, child_txid).unwrap();
+        assert!(
+            redo2.load(Ordering::SeqCst) - base2 >= 1,
+            "strict append_deleted_child flushes the redo intent"
+        );
     }
 
     #[test]

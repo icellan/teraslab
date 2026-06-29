@@ -160,14 +160,35 @@ Reproduced the floor on a native macOS server with the Go RECIPE=1 harness (no E
      `append_and_flush` (engine.rs:6018) — none routed through the write-back cache.
      Skipping redb (step 6, already `Durability::Eventual`) changed nothing → redb is
      NOT a factor.
-- **THE FIX (durability-critical, multi-part — needs the careful TDD pass):** make
-  the delete path async like create/spend: (1) defer data-device sync under buffered
-  [safe today]; (2) defer tombstone fsync under buffered AND add a tombstone-log sync
-  to the checkpoint barrier; (3) route `append_deleted_child`'s block + metadata
-  writes through the write-back cache and use a buffered (no-flush) redo append under
-  buffered mode. Expected result: delete → ~4 ms like create/spend → the p99.9 floor
-  disappears → likely wins the tail. Experiments reverted (incomplete/unsafe as-is);
-  tree clean.
+**★ FIX IMPLEMENTED + TESTED (2026-06-29, TDD) — async delete under buffered durability ★**
+3 parts, all under `if self.redo_buffered()` (strict durability unchanged); TDD
+tests in src/ops/engine.rs (`buffered_delete_issues_no_synchronous_device_or_tombstone_sync`,
+`strict_delete_still_fsyncs_data_and_tombstone`,
+`buffered_append_deleted_child_does_not_flush_redo` — all use the `SyncCountingDevice`
+harness to assert exact fsync counts):
+  1. `delete_inner` step 3 data-device `device.sync()` → skipped under buffered
+     (checkpoint barrier `sync_all_store_devices` covers it before redo reclaim).
+  2. `append_delete_tombstone` → `append` (unsynced) under buffered; NEW
+     `Engine::sync_tombstone_logs()` added to the checkpoint barrier
+     (src/checkpoint.rs, right after `sync_all_store_devices`, before fence/reclaim)
+     so tombstones are durable before their `DeleteV2` redo is reclaimed (§9.1 #4).
+  3. `append_deleted_child` redo `append_and_flush` → buffered `append` (no per-child
+     flush) under buffered.
+- **Measured (local macOS, closed-loop, no rate limiter): delete p50 447 → 85–166 ms**
+  (create/spend/get unchanged at ~3–4 ms; all ops' p99 ~450 → ~200 ms). The fsync
+  floor is GONE.
+- **Residual on macOS (delete still 85 ms @4 workers):** `sample` now shows (a)
+  `append_deleted_child` **direct F_NOCACHE device reads/writes** of the children
+  block — a **macOS-only artifact; Linux uses the mmap device pointer (fast)**, so
+  this residual should NOT exist on the NVMe target — and (b) DELETE takes the COARSE
+  GLOBAL **EXCLUSIVE** visibility barrier (it is NOT in `manages_own_visibility`,
+  dispatch.rs:4555, unlike spend/create/get which take fine-grained per-key
+  visibility). A fast (Linux) delete holds that barrier only briefly, so the smear
+  should largely resolve; making delete fine-grained per-key is a possible **Part 4**
+  if the Linux re-test still shows a tail.
+- **STILL NEEDS A LINUX BOX to PROVE the p99.9 win** (macOS can't, no mmap). Re-run
+  the open-loop fixed-rate p99.9 test (TS vs reference, ~8.5k links/s, both f0) on an
+  NVMe box with this build; if TS p99.9 ≤ reference → suite won → FINAL_REPORT.
 - **EC2 ACCESS IS BROKEN (action needed):** the `teraslab-test-user` IAM key in
   `.aws/ec-credentials` lacks ec2:DescribeInstances / ec2:TerminateInstances, and the
   SSH key `~/.ssh/teraslab-perftest-key.pem` is now REJECTED by 44.201.221.186 (port
