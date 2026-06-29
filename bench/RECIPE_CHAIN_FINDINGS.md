@@ -53,6 +53,15 @@ paths, or collapsing the per-op lock count), which is a major multi-cycle
 engineering effort, NOT a perf-tuning iteration — and must be prototyped + profiled
 + measured carefully on durability-critical code (do not change blind).
 
+REFUTED levers (logged, method "keep only if it helps — else revert + log"):
+- **write-through cache** (`[cache] writeback=false`): 3× WORSE (8.7k vs 24.7k
+  write-back, same 12-core box; server went idle 0.5 core). Synchronous per-op
+  O_DIRECT writes are far slower than batched write-back even WITH fallocate → the
+  write-back cache is necessary + already-optimized, NOT net-negative. This was
+  the last untried cheap config lever.
+- device_split 8/12 (worse than 4), client transport rewrite (~0), client pool
+  sharding (~0), finer cache shards (+2%), redo/writeback interval (minor).
+
 Net this campaign: realistic chain workload **8.7k → ~28–29k links/s (~3.3×)**,
 gap to reference closed from **~4.7× → ~1.4×**, headline win = fallocate (2×).
 TeraSlab still does not beat the reference on this workload (honest: not won).
