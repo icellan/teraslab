@@ -47,16 +47,34 @@ at ~115k store-ops/s the aggregate futex traffic + the inherent serialization
 points cap throughput at ~28–29k links/s on this hardware, while the mature C
 reference has lower per-op overhead.
 
-**STRONGEST evidence the gap is fundamental to THIS architecture:** a targeted
-attempt to remove an entire lock's acquisition cost — coalescing the buffered redo
-appends so concurrent commits share ONE `log.lock()` instead of one-per-commit
-(implemented + fully tested) — moved throughput by **0% in a same-box A/B** (27.7k
-vs 27.5k). If any single lock were the cap, that would have helped. It didn't →
-**no single lock dominates**; the cost is the AGGREGATE of many per-op locks. The
-only thing that would close it is a ground-up redesign that reduces the NUMBER of
-locks each op takes (lock-free index + redo + cache, or a different per-op execution
-model) — a multi-cycle architecture project, not a profile-guided tuning fix. No
-cheap/medium profile-guided fix remains. Closing it requires a **ground-up lower-contention
+**⚠ DIAGNOSIS REOPENED — the cap is probably NOT lock-acquisition contention.**
+A targeted attempt to remove an entire lock's per-op acquisition cost — coalescing
+the buffered redo appends so concurrent commits share ONE `log.lock()` instead of
+one-per-commit (implemented + fully tested) — moved throughput **0% in a same-box
+A/B** (27.7k vs 27.5k). That is strong evidence that **redo lock acquisition was
+never costing throughput**, which undercuts the "distributed lock contention"
+reading: if cutting ~512 redo acquisitions/batch does nothing, lock-acquisition
+COUNT is not the cap. The `__futex_wait` samples are therefore likely dominated by
+**parked-idle dispatch workers** (closed-loop: the client only has a few requests
+in flight because each op's response is slow), NOT lock contention.
+
+So the true cap is **per-op SERVER latency limiting the closed-loop offered
+concurrency** — the server uses only ~5–6 of 24 cores and is NOT CPU-bound, NOT
+device-bound (fallocate fixed it), NOT lock-acquisition-bound (redo-batching 0%),
+NOT client-bound (303k mock ceiling). What's unaccounted: where each op spends its
+~30–90 ms of wall-clock on an idle server.
+
+**NEXT DIAGNOSTIC (not a blind fix) — off-CPU WAKEUP profiling.** Re-provision and
+run `offcputime`/`perf sched`/bpftrace (or `perf record -e sched:sched_switch
+--call-graph dwarf`) on the server under load to answer: are the dispatch workers
+parked waiting for the NEXT REQUEST (⇒ the limiter is upstream — connection read /
+dispatch enqueue / the client's closed-loop in-flight depth), or parked waiting on
+a specific server-side dependency (a condvar, a flush, a barrier)? That single
+measurement redirects the whole remaining effort. Do NOT make more blind lock
+changes — the redo-batching 0% proves that's the wrong tree.
+
+(Earlier wording "no single lock dominates → needs lock-free redesign" is
+superseded by this: the evidence now says it may not be a locking problem at all.) Closing it requires a **ground-up lower-contention
 redesign** (lock-free or per-thread/per-connection redo + index + cache append
 paths, or collapsing the per-op lock count), which is a major multi-cycle
 engineering effort, NOT a perf-tuning iteration — and must be prototyped + profiled

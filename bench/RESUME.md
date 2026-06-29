@@ -89,6 +89,22 @@ HashSet (lockstep w/ Block.dirty, invariant-tested). Server flush CPU 6.5→3.4
 cores; throughput NEUTRAL (~28k, cap is locks not flush-CPU). cargo test --all 0
 failed. Kept for efficiency/headroom.
 
+**⚠⚠ DIAGNOSIS REOPENED (2026-06-29 latest): the cap is probably NOT lock
+contention.** Buffered redo group-commit batching (coalesce concurrent commits →
+one log.lock() instead of per-commit; fully implemented + tested, STASHED) gave
+**0% same-box** (27.7k vs 27.5k HEAD). If cutting ~512 redo lock acquisitions/batch
+does nothing, lock-acquisition COUNT is not the cap → the `__futex_wait` samples are
+likely PARKED-IDLE workers (closed-loop, few requests in flight because each op's
+response is slow), not contention. True cap = per-op SERVER latency limiting offered
+concurrency (server uses ~5-6 of 24 cores; NOT cpu/device/lock-count/client bound).
+**NEXT = off-CPU WAKEUP profiling** (offcputime / perf sched / `perf record -e
+sched:sched_switch --call-graph dwarf`) to learn what the parked workers wait for:
+the next REQUEST (limiter upstream: conn read / dispatch enqueue / client in-flight
+depth) vs a server-side dependency (condvar/flush/barrier). Do NOT make more blind
+lock changes (redo-batching 0% proves it's the wrong tree). See
+RECIPE_CHAIN_FINDINGS.md §DIAGNOSIS REOPENED. (Older lock-contention next-levers
+below are superseded.)
+
 **CORRECTION (read the code): the "encode-under-lock" hypothesis is WRONG — redo
 encode is ALREADY outside the lock (E7 optimization in `redo_group.rs::commit`:
 `pre_encode` runs lock-free, only an O(1) finalize/memcpy runs under the per-store
