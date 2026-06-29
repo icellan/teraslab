@@ -4,8 +4,17 @@
 //! verifying output format and exit codes.
 
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
+use std::sync::{Arc, Mutex};
+
+/// Serializes the racy "pick an ephemeral port, drop the probe listener, let
+/// the server re-bind it" window across the suite's parallel tests. Without it
+/// two tests can pick the SAME just-freed ephemeral port in their
+/// bind→drop→rebind gap, and the loser's server bind fails — a port-collision
+/// flake that scales with test parallelism (hence worse on many-core CI). Held
+/// through the readiness poll so the port is firmly owned by this test's server
+/// before the next test starts.
+static SERVER_STARTUP: Mutex<()> = Mutex::new(());
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
@@ -35,6 +44,11 @@ fn start_test_server() -> u16 {
         UnminedIndex::new(),
     ));
 
+    // Serialize port selection + server bind + readiness across parallel tests
+    // (see SERVER_STARTUP). Recover from a poisoned lock — a panic in another
+    // test's startup must not cascade-fail every later test.
+    let _startup = SERVER_STARTUP.lock().unwrap_or_else(|e| e.into_inner());
+
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -55,13 +69,34 @@ fn start_test_server() -> u16 {
     });
 
     let addr = format!("127.0.0.1:{port}");
+    let server_addr = addr.clone();
     std::thread::spawn(move || {
         // CLI integration covers /admin/* + /debug/* paths — register them.
         // R-056: gated routes need a bearer token; the CLI under test passes
         // the matching `--admin-token` so every command authenticates.
-        start_http_server(addr, state, true, Some(CLI_TEST_ADMIN_TOKEN.to_string()));
+        start_http_server(
+            server_addr,
+            state,
+            true,
+            Some(CLI_TEST_ADMIN_TOKEN.to_string()),
+        );
     });
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Poll until the spawned server is actually accepting connections, rather
+    // than a fixed sleep. A 200 ms sleep flaked on contended CI runners: the
+    // server thread had not yet bound the port when the CLI connected, so the
+    // CLI got a connection refusal and exited non-zero. Connect-polling waits
+    // exactly as long as needed (a few ms normally) with a generous backstop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test HTTP server did not accept connections on {addr} within 10s",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     port
 }
 
