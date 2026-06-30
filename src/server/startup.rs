@@ -367,7 +367,10 @@ pub fn recover_or_create_boxed_allocator(
                         .map_err(crate::allocator::AllocatorError::from)?;
                     Ok((Box::new(alloc), AllocatorOrigin::Fresh))
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => {
+                    tracing::error!(detail = %e, "segment allocator recover failed");
+                    Err(e.into())
+                }
             }
         }
     }
