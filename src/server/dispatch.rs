@@ -4922,10 +4922,11 @@ fn handle_spend_batch(
         .flatten()
     {
         Some(pool) => {
-            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
             pool.install(|| {
                 groups
                     .par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
                     .map(|&(txid, group)| validate_group(txid, group))
                     .collect()
             })
@@ -5523,9 +5524,10 @@ fn handle_set_mined_batch(
         .flatten()
     {
         Some(pool) => {
-            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
             pool.install(|| {
                 keys.par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
                     .map(|k| engine.set_mined_inner(k, &engine_params))
                     .collect()
             })
@@ -7967,6 +7969,16 @@ fn handle_mark_longest_chain_batch(
 /// went 72.8k -> 89.7k ops/s (+23%) and create p99 125 -> 68 ms (-46%).
 const READ_FANOUT_THRESHOLD: usize = 512;
 
+/// Minimum items per rayon job when a batch DOES fan out. `par_iter()` otherwise
+/// splits recursively down to single elements, and the RAM-disk profile showed
+/// `rayon_core::join::join_context` (the recursive split-join) dominating even
+/// the batches above [`READ_FANOUT_THRESHOLD`] — the splitting overhead, not the
+/// per-item work. `with_min_len` caps the split depth so a fanned batch becomes a
+/// handful of coarse jobs (~`batch / 64`, i.e. roughly one per core for a
+/// threshold-sized batch) instead of hundreds of tiny ones, keeping the
+/// parallelism while cutting the join churn.
+const FANOUT_MIN_LEN: usize = 64;
+
 /// Dedicated work-stealing pool for intra-batch read fan-out. `None` if the
 /// pool failed to build (then reads serve serially — correct, just single-core
 /// for that path). Sized to the host's parallelism; isolated from any other
@@ -8458,10 +8470,11 @@ fn handle_get_batch(
         .flatten()
     {
         Some(pool) => {
-            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
             pool.install(|| {
                 txids
                     .par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
                     .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
                     .collect()
             })
@@ -9120,10 +9133,11 @@ fn handle_get_spend_batch(
         .flatten()
     {
         Some(pool) => {
-            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
             pool.install(|| {
                 items
                     .par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
                     .map(|item| decorate_get_spend_item(item, engine, local_read, cluster))
                     .collect()
             })
