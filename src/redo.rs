@@ -516,6 +516,18 @@ const OP_REASSIGN_V2: u8 = 38;
 /// §4 and [`RedoOp::CreateV2`].
 const OP_CREATE_V2: u8 = 39;
 
+/// Record relocation (segment / log-structured engine): the record for a tx was
+/// rewritten at a NEW append-cursor offset (carrying a mutation baked into the
+/// fresh bytes — e.g. a spend), the index re-points to it, and the old extent is
+/// dead. Like [`OP_CREATE_V2`] it embeds no record bytes — recovery reads the
+/// authoritative image back from the data device at the new `record_offset`
+/// (CRC/tx_id verified; a buffered-tail loss keeps the pre-relocation record,
+/// which is still intact because append-only never overwrites the old extent
+/// until defrag). Recovery-only: the segment engine is non-clustered in v1, so a
+/// relocate never needs op-based replication conversion (a logical spend op
+/// would; design §0.x). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+const OP_RELOCATE: u8 = 40;
+
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `Create` redo entry. Bitcoin transactions in practice rarely have
 /// more than a handful of conflicting parents; a wire-controlled
@@ -733,6 +745,24 @@ pub enum RedoOp {
         /// Parent txids whose conflicting-child lists must receive `tx_key.txid`.
         /// Empty when `is_conflicting` is false.
         parent_txids: Vec<[u8; 32]>,
+    },
+    /// Record relocation (segment engine): the record for `tx_key` is now at
+    /// `record_offset` (a fresh append-cursor offset, carrying a baked-in
+    /// mutation), the index must re-point there, and the previous extent is dead.
+    /// No embedded bytes — recovery reads the record back from the device. See
+    /// [`OP_RELOCATE`].
+    ///
+    /// Wire layout (after the type byte): `tx_key[32] | device_id[1] |
+    /// record_offset[8 LE] | utxo_count[4 LE]` (45 bytes).
+    Relocate {
+        /// Primary key of the relocated transaction.
+        tx_key: TxKey,
+        /// Store the record lives on (unchanged by relocation — within a store).
+        device_id: u8,
+        /// NEW device byte offset where the record now starts.
+        record_offset: u64,
+        /// Number of UTXO slots in the record.
+        utxo_count: u32,
     },
     Delete {
         tx_key: TxKey,
@@ -1029,6 +1059,7 @@ impl RedoOp {
             RedoOp::ReplicaCreate { .. } => OP_REPLICA_CREATE,
             RedoOp::Create { .. } => OP_CREATE,
             RedoOp::CreateV2 { .. } => OP_CREATE_V2,
+            RedoOp::Relocate { .. } => OP_RELOCATE,
             RedoOp::Delete { .. } => OP_DELETE,
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
             RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
@@ -1073,6 +1104,7 @@ impl RedoOp {
             | RedoOp::ReplicaCreate { tx_key, .. }
             | RedoOp::Create { tx_key, .. }
             | RedoOp::CreateV2 { tx_key, .. }
+            | RedoOp::Relocate { tx_key, .. }
             | RedoOp::Delete { tx_key, .. }
             | RedoOp::SetConflicting { tx_key, .. }
             | RedoOp::SetLocked { tx_key, .. }
@@ -1149,6 +1181,7 @@ impl RedoOp {
             | RedoOp::ReplicaCreate { .. }
             | RedoOp::Create { .. }
             | RedoOp::CreateV2 { .. }
+            | RedoOp::Relocate { .. }
             | RedoOp::Delete { .. }
             | RedoOp::AppendConflictingChild { .. }
             | RedoOp::RemoveConflictingChild { .. }
@@ -1368,6 +1401,17 @@ impl RedoOp {
                 for ptx in parent_txids {
                     buf.extend_from_slice(ptx);
                 }
+            }
+            RedoOp::Relocate {
+                tx_key,
+                device_id,
+                record_offset,
+                utxo_count,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.push(*device_id);
+                buf.extend_from_slice(&record_offset.to_le_bytes());
+                buf.extend_from_slice(&utxo_count.to_le_bytes());
             }
             RedoOp::Delete {
                 tx_key,
@@ -1841,6 +1885,17 @@ impl RedoOp {
                     utxo_count,
                     is_conflicting,
                     parent_txids,
+                })
+            }
+            OP_RELOCATE if data.len() >= 45 => {
+                // Layout: tx_key(32) + device_id(1) + record_offset(8) + utxo_count(4)
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                Some(RedoOp::Relocate {
+                    tx_key: TxKey { txid },
+                    device_id: data[32],
+                    record_offset: u64::from_le_bytes(data[33..41].try_into().unwrap()),
+                    utxo_count: u32::from_le_bytes(data[41..45].try_into().unwrap()),
                 })
             }
             OP_DELETE if data.len() >= 48 => {
@@ -5673,6 +5728,21 @@ mod tests {
         };
         assert_ne!(v2.op_type(), v1.op_type());
         assert_eq!(v2.op_type(), OP_CREATE_V2);
+    }
+
+    /// Increment 4: the segment-engine record relocation op round-trips and uses
+    /// its own opcode.
+    #[test]
+    fn round_trip_relocate() {
+        let op = RedoOp::Relocate {
+            tx_key: make_txid(0x96),
+            device_id: 5,
+            record_offset: 0x0000_BEEF_0000,
+            utxo_count: 17,
+        };
+        assert_eq!(op.op_type(), OP_RELOCATE);
+        assert_ne!(op.op_type(), OP_CREATE_V2);
+        assert_round_trip(op);
     }
 
     /// PERF: `RedoOp::Create.record_bytes` was changed from `Vec<u8>` to

@@ -972,6 +972,29 @@ fn replay_one_recovery_entry(
                 )
             }
         }
+        RedoOp::Relocate {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+        } => {
+            let range_len = TxMetadata::record_size_for(*utxo_count);
+            if let Some(alloc) = allocator.as_deref()
+                && !alloc.is_allocated_range(*record_offset, range_len)
+            {
+                ReplayResult::Failed(ReplayCause::LogicError)
+            } else {
+                replay_relocate(
+                    device,
+                    *device_id,
+                    index,
+                    offset_owners,
+                    tx_key,
+                    *record_offset,
+                    *utxo_count,
+                )
+            }
+        }
         RedoOp::CompensateUnsetMined {
             tx_key,
             block_id,
@@ -1684,6 +1707,20 @@ fn replay_entry(
             *utxo_count,
             *is_conflicting,
             parent_txids,
+        ),
+        RedoOp::Relocate {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+        } => replay_relocate(
+            device,
+            *device_id,
+            index,
+            offset_owners,
+            tx_key,
+            *record_offset,
+            *utxo_count,
         ),
         RedoOp::Delete {
             tx_key,
@@ -2801,6 +2838,57 @@ fn replay_create_v2(
     // `replay_create` — keep the fields bound so the contract is explicit.
     let _ = (is_conflicting, parent_txids);
 
+    ReplayResult::Applied
+}
+
+/// Replay a record relocation ([`RedoOp::Relocate`]) — segment engine. The
+/// record for `tx_key` was rewritten at a new append-cursor `record_offset`
+/// (carrying a baked-in mutation), so the index must re-point there and the old
+/// extent becomes dead. Like [`replay_create_v2`] the bytes are read back from
+/// the device, not the WAL.
+///
+/// Differs from `replay_create_v2` in two ways: (1) the record must ALREADY be
+/// indexed — a relocation of a tx that was never (durably) created is moot, so
+/// an absent key is `Skipped`, not inserted; (2) it REPLACES the existing entry
+/// (new offset + cached fields read from the relocated record, which reflect the
+/// baked-in mutation). A buffered-tail loss (unreadable / tx_id-or-utxo_count
+/// mismatch at the new offset) means the relocation did not land — the
+/// pre-relocation record is still intact (append-only never overwrites the old
+/// extent until defrag), so we keep it and `Skip` rather than repoint to garbage.
+#[allow(clippy::too_many_arguments)]
+fn replay_relocate(
+    device: &dyn BlockDevice,
+    device_id: u8,
+    index: &ShardedIndex,
+    offset_owners: &mut OffsetOwners,
+    tx_key: &TxKey,
+    record_offset: u64,
+    utxo_count: u32,
+) -> ReplayResult {
+    if index.lookup(tx_key).is_none() {
+        return ReplayResult::Skipped;
+    }
+    let meta = match crate::io::read_metadata(device, record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Skipped,
+    };
+    if { meta.tx_id } != tx_key.txid || { meta.utxo_count } != utxo_count {
+        return ReplayResult::Skipped;
+    }
+    let entry = TxIndexEntry {
+        device_id,
+        record_offset,
+        utxo_count,
+        block_entry_count: meta.block_entry_count,
+        tx_flags: meta.flags.bits(),
+        spent_utxos: { meta.spent_utxos },
+        dah_or_preserve: { meta.delete_at_height },
+        unmined_since: { meta.unmined_since },
+        generation: { meta.generation },
+    };
+    if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
+        return ReplayResult::Failed(ReplayCause::LogicError);
+    }
     ReplayResult::Applied
 }
 
@@ -4841,6 +4929,182 @@ mod tests {
             ie.generation, 9,
             "cached fields must come from the device read"
         );
+    }
+
+    /// Increment 4: `RedoOp::Relocate` re-points an EXISTING index entry to the
+    /// record's new append-cursor offset, rebuilding the cached fields from the
+    /// relocated (mutated) record.
+    #[test]
+    fn relocate_replay_repoints_index_to_new_offset() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x60;
+        let key = TxKey { txid };
+        let write_rec = |h: &mut RecoveryTestHarness, generation: u32, spent: u32| -> u64 {
+            let offset = h
+                .alloc
+                .allocate(TxMetadata::record_size_for(utxo_count))
+                .unwrap();
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.generation = generation;
+            meta.spent_utxos = spent;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut hh = [0u8; 32];
+                    hh[0] = i as u8;
+                    UtxoSlot::new_unspent(hh)
+                })
+                .collect();
+            io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+            offset
+        };
+
+        // Pre-relocation record at off1 (registered in the index, generation 1).
+        let off1 = write_rec(&mut h, 1, 0);
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off1,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        // Relocated record at off2 (generation 2, one output spent baked in).
+        let off2 = write_rec(&mut h, 2, 1);
+        assert_ne!(off1, off2);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Relocate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off2,
+            utxo_count,
+        })
+        .unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+        let ie = h.index.lookup(&key).unwrap();
+        assert_eq!(
+            ie.record_offset, off2,
+            "index must re-point to the relocated offset"
+        );
+        assert_eq!(
+            ie.generation, 2,
+            "cached fields come from the relocated record"
+        );
+        assert_eq!(ie.spent_utxos, 1);
+    }
+
+    /// A relocation of a tx that is NOT (durably) indexed is moot — recovery
+    /// must skip it, never register the tx from a relocate alone.
+    #[test]
+    fn relocate_replay_skips_when_key_absent() {
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x61;
+        let key = TxKey { txid };
+        let off = h.alloc.allocate(TxMetadata::record_size_for(3)).unwrap();
+        let mut meta = TxMetadata::new(3);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..3)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, off, &meta, &slots).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Relocate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off,
+            utxo_count: 3,
+        })
+        .unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert!(
+            h.index.lookup(&key).is_none(),
+            "relocate of an unindexed tx must not register it"
+        );
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(stats.entries_failed, 0);
+    }
+
+    /// A relocation whose new bytes did NOT land (buffered-tail loss) must keep
+    /// the intact pre-relocation record — append-only never overwrote the old
+    /// extent, so the index stays on the old offset (relocation dropped).
+    #[test]
+    fn relocate_replay_keeps_old_offset_on_buffered_loss() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x62;
+        let key = TxKey { txid };
+        let off1 = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.generation = 1;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, off1, &meta, &slots).unwrap();
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off1,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        // Allocate off2 but write NOTHING there (the relocated bytes were lost).
+        let off2 = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Relocate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off2,
+            utxo_count,
+        })
+        .unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        let ie = h.index.lookup(&key).unwrap();
+        assert_eq!(
+            ie.record_offset, off1,
+            "buffered-lost relocation must keep the intact pre-relocation record"
+        );
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(stats.entries_failed, 0);
     }
 
     /// Phase 1 log-structured: a `CreateV2` whose data write did NOT land (the

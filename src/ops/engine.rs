@@ -701,6 +701,7 @@ impl Engine {
         match op {
             RedoOp::Create { device_id, .. }
             | RedoOp::CreateV2 { device_id, .. }
+            | RedoOp::Relocate { device_id, .. }
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
@@ -727,6 +728,7 @@ impl Engine {
         match op {
             RedoOp::Create { device_id, .. }
             | RedoOp::CreateV2 { device_id, .. }
+            | RedoOp::Relocate { device_id, .. }
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
@@ -809,6 +811,9 @@ impl Engine {
                         tx_key, device_id, ..
                     }
                     | crate::redo::RedoOp::CreateV2 {
+                        tx_key, device_id, ..
+                    }
+                    | crate::redo::RedoOp::Relocate {
                         tx_key, device_id, ..
                     }
                     | crate::redo::RedoOp::ReplicaCreate {
