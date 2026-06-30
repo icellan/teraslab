@@ -35,7 +35,7 @@
 //! matches. Replaying an already-applied operation is therefore safe
 //! across multiple recovery passes (e.g. crash mid-replay).
 
-use crate::allocator::SlotAllocator;
+use crate::allocator::{BoxedAllocator, SlotAllocator};
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::index::{
     DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
@@ -3483,6 +3483,49 @@ fn replay_compensate_set_locked(
     ReplayResult::Applied
 }
 
+/// Recompute each store's append frontier from the rebuilt index so a segment
+/// allocator (which journals no `AllocateRegion` ops) does not overwrite records
+/// created after the last checkpoint.
+///
+/// For each store, finds the highest-offset live record, reads its on-device
+/// `record_size`, and advances that store's allocator frontier past it (rounded
+/// up to a device block — a safe over-estimate). The highest-offset live record
+/// has the highest end offset because records are packed contiguously without
+/// overlap, so a single read per store suffices. No-op for the in-place
+/// [`crate::allocator::SlotAllocator`] (its `recover_frontier_at_least` default
+/// does nothing — it re-derives its high-water mark from replayed `AllocateRegion`
+/// ops). Call AFTER the index is fully rebuilt/recovered and BEFORE accepting
+/// writes; `devices[i]` and `allocators[i]` are store `i`.
+///
+/// # Errors
+/// Propagates a device error if the highest-offset record's metadata cannot be
+/// read (a corrupt frontier record fails recovery closed rather than risking an
+/// under-advanced cursor that could overwrite live data).
+pub fn recover_allocator_frontiers(
+    index: &ShardedIndex,
+    devices: &[std::sync::Arc<dyn BlockDevice>],
+    allocators: &mut [BoxedAllocator],
+) -> std::result::Result<(), DeviceError> {
+    // Highest record offset per store (one O(index) pass, no device reads).
+    let mut max_off: Vec<Option<u64>> = vec![None; allocators.len()];
+    index.for_each(|_key, e| {
+        let s = e.device_id as usize;
+        if s < max_off.len() && max_off[s].is_none_or(|m| e.record_offset > m) {
+            max_off[s] = Some(e.record_offset);
+        }
+    });
+    for (s, off) in max_off.iter().enumerate() {
+        let Some(off) = *off else { continue };
+        let meta = io::read_metadata(&*devices[s], off)?;
+        let align = devices[s].alignment() as u64;
+        // End rounded up to a device block: a safe over-estimate (the cursor must
+        // be strictly PAST the record's bytes; never under).
+        let end = (off + meta.record_size as u64).div_ceil(align) * align;
+        allocators[s].recover_frontier_at_least(end);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -4832,6 +4875,101 @@ mod tests {
         assert_eq!(
             stats.entries_failed, 0,
             "buffered-tail loss is Skipped, not Failed"
+        );
+    }
+
+    /// Increment 3b — the segment-engine recovery cursor-recompute. The segment
+    /// allocator journals no `AllocateRegion` ops, so after a crash its header
+    /// cursor is the last-CHECKPOINT value, BEHIND records created after the
+    /// checkpoint. `recover_allocator_frontiers` must advance the frontier past
+    /// the highest live record so a fresh allocation cannot overwrite it.
+    #[test]
+    fn segment_recovery_advances_frontier_past_post_checkpoint_records() {
+        use crate::segment_allocator::SegmentAllocator;
+
+        let device: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let primary = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(primary);
+
+        // Create a record: allocate from the segment cursor, write it, register it.
+        let make = |seg: &mut SegmentAllocator, n: u8| -> u64 {
+            let utxo_count = 2u32;
+            let mut txid = [0u8; 32];
+            txid[0] = n;
+            let key = TxKey { txid };
+            let offset = seg
+                .allocate(TxMetadata::record_size_for(utxo_count))
+                .unwrap();
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut hh = [0u8; 32];
+                    hh[0] = i as u8;
+                    UtxoSlot::new_unspent(hh)
+                })
+                .collect();
+            io::write_full_record(&*device, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        utxo_count,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+            offset
+        };
+
+        let mut seg = SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap();
+        // Three records, then a "checkpoint" (persist the header).
+        make(&mut seg, 1);
+        make(&mut seg, 2);
+        make(&mut seg, 3);
+        seg.persist().unwrap();
+        let checkpoint_cursor = seg.cursor();
+        // Two MORE records created AFTER the checkpoint.
+        make(&mut seg, 4);
+        let o5 = make(&mut seg, 5);
+        let live_frontier = seg.cursor(); // past record 5
+        assert!(o5 >= checkpoint_cursor);
+
+        // Crash + recover the allocator from its header: the cursor is the stale
+        // checkpoint value, BEHIND records 4 and 5.
+        let recovered: BoxedAllocator =
+            Box::new(SegmentAllocator::recover(device.clone()).unwrap());
+        assert_eq!(
+            recovered.next_offset(),
+            checkpoint_cursor,
+            "recovered cursor is the stale checkpoint value"
+        );
+        assert!(recovered.next_offset() < live_frontier);
+
+        // Drive the frontier recompute from the rebuilt index.
+        let devices = vec![device.clone()];
+        let mut allocs = vec![recovered];
+        recover_allocator_frontiers(&index, &devices, &mut allocs).unwrap();
+
+        // The frontier now covers every live record; the next allocation cannot
+        // overwrite record 5.
+        let recovered = &mut allocs[0];
+        assert!(
+            recovered.next_offset() >= live_frontier,
+            "frontier must advance past all live records"
+        );
+        let next = recovered.allocate(TxMetadata::record_size_for(2)).unwrap();
+        assert!(
+            next >= live_frontier,
+            "next allocation must not overwrite a post-checkpoint record"
         );
     }
 

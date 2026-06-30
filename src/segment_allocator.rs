@@ -569,18 +569,47 @@ impl SegmentAllocator {
         Ok(out)
     }
 
-    /// Whether `[offset, offset+size)` lies within allocated (below-cursor) space.
-    /// The segment allocator has no freelist; dead records are still "allocated"
-    /// bytes until defrag, so this is purely a bounds check against the cursor.
+    /// Whether `[offset, offset+size)` is a valid in-device record region.
+    ///
+    /// Recovery uses this to gate replayed creates against a stale offset that
+    /// was freed and re-handed to a DIFFERENT record (the in-place SlotAllocator
+    /// hazard). The append-cursor segment allocator NEVER reuses an offset in
+    /// place, so that hazard does not exist — and crucially, during recovery the
+    /// cursor is still at the last-checkpoint value while replayed post-checkpoint
+    /// creates land BEYOND it (the cursor is recomputed AFTER replay via
+    /// [`Self::set_cursor_at_least`]). Gating on the cursor would therefore falsely
+    /// reject every post-checkpoint create. So this is a pure in-device bounds
+    /// check; legitimacy is already guaranteed by the checkpoint fence (only
+    /// post-fence entries are replayed).
     fn is_allocated_range_impl(&self, offset: u64, size: u64) -> bool {
         let aligned = self.align_reservation(size);
         let Some(end) = offset.checked_add(aligned) else {
             return false;
         };
-        aligned != 0
-            && offset >= self.data_region_start
-            && end <= self.cursor
-            && end <= self.device_size
+        aligned != 0 && offset >= self.data_region_start && end <= self.device_size
+    }
+
+    /// Recovery: advance the append cursor so it is at least `end` (the end
+    /// offset of the highest live record), so post-checkpoint records are never
+    /// overwritten by a fresh allocation. The open segment is re-derived from the
+    /// new cursor. A no-op if `end` is already at or below the cursor. `end` is
+    /// clamped to the device size (a corrupt larger value just wedges allocation
+    /// at full rather than reading out of bounds).
+    ///
+    /// The segment allocator journals no `AllocateRegion` ops (unlike the
+    /// SlotAllocator, whose `replay_redo` re-derives its frontier), so this is how
+    /// its frontier is restored after a crash (design §3.2).
+    pub fn set_cursor_at_least(&mut self, end: u64) {
+        if end <= self.cursor {
+            return;
+        }
+        let end = end.min(self.device_size);
+        if end <= self.cursor {
+            return;
+        }
+        self.cursor = end;
+        let idx = end.saturating_sub(self.data_region_start) / self.segment_size;
+        self.open_segment = (idx as u32).min(self.segment_count.saturating_sub(1));
     }
 
     /// The device identity formatted as a 32-character lowercase hex string.
@@ -991,6 +1020,9 @@ impl RecordAllocator for SegmentAllocator {
     fn is_append_only(&self) -> bool {
         true
     }
+    fn recover_frontier_at_least(&mut self, end: u64) {
+        self.set_cursor_at_least(end);
+    }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {
         // No fault-injection hook on the segment allocator (yet); no-op so the
@@ -1340,7 +1372,11 @@ mod tests {
         assert_eq!(a.next_offset(), o0 + 4096); // non-packed rounds to a block
         assert_eq!(a.data_region_start(), DATA_REGION_OFFSET);
         assert!(a.is_allocated_range(o0, 600));
-        assert!(!a.is_allocated_range(a.next_offset(), 4096)); // beyond cursor
+        // In-device bounds check (NOT cursor-gated — see is_allocated_range_impl):
+        // an in-device offset above the cursor is still "valid" (recovery needs
+        // this); an offset before the data region or past the device is not.
+        assert!(a.is_allocated_range(a.next_offset(), 4096)); // in-device, above cursor
+        assert!(!a.is_allocated_range(0, 4096)); // before the data region
         a.free(o0, 600).unwrap();
         let s = a.stats();
         assert_eq!(s.next_offset, a.next_offset());
@@ -1348,6 +1384,47 @@ mod tests {
         assert_eq!(s.free_region_count, 0); // no freelist
         assert!(a.is_append_only());
         assert_eq!(a.free_region_containing(o0), None);
+    }
+
+    #[test]
+    fn set_cursor_at_least_advances_and_rederives_open_segment() {
+        let seg = 2 * ALIGN as u64; // 8 KiB, 2 blocks/segment
+        let mut a = alloc(64, seg);
+        assert_eq!(a.open_segment(), 0);
+        // Advance into segment 3 (data_region + 3 segments + 1 block).
+        let target = a.data_region_start() + 3 * seg + ALIGN as u64;
+        a.set_cursor_at_least(target);
+        assert_eq!(a.cursor(), target);
+        assert_eq!(a.open_segment(), 3);
+        // A subsequent allocate appends from the recovered cursor.
+        let o = a.allocate(4096).unwrap();
+        assert_eq!(o, target);
+    }
+
+    #[test]
+    fn set_cursor_at_least_is_monotonic_and_clamped() {
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        a.allocate(4096).unwrap();
+        let c = a.cursor();
+        a.set_cursor_at_least(c - 1); // below cursor: no-op
+        assert_eq!(a.cursor(), c);
+        a.set_cursor_at_least(0); // way below: no-op
+        assert_eq!(a.cursor(), c);
+        // Past the device end: clamped to device_size.
+        a.set_cursor_at_least(u64::MAX);
+        assert_eq!(a.cursor(), a.stats().device_size);
+    }
+
+    #[test]
+    fn recover_frontier_via_trait_advances_segment_cursor() {
+        use crate::allocator::RecordAllocator;
+        let mut a: Box<dyn RecordAllocator> = Box::new(alloc(64, 8 * 1024 * 1024));
+        let target = DATA_REGION_OFFSET + 5 * 4096;
+        a.recover_frontier_at_least(target);
+        assert_eq!(a.next_offset(), target);
+        // Append resumes from the recovered frontier (no overwrite of [.., target)).
+        let o = a.allocate(4096).unwrap();
+        assert_eq!(o, target);
     }
 
     #[test]

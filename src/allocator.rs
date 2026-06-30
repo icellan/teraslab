@@ -2040,6 +2040,16 @@ pub trait RecordAllocator: Send {
     /// Whether append-only mode is enabled.
     fn is_append_only(&self) -> bool;
 
+    /// Recovery: ensure the allocation frontier is at least `end` (the end offset
+    /// of the highest live record), so post-checkpoint records are not overwritten
+    /// by a fresh allocation. Default no-op: the in-place [`SlotAllocator`]
+    /// re-derives its high-water mark from replayed `AllocateRegion` ops. The
+    /// append-cursor segment allocator overrides this (it journals no region ops,
+    /// so its cursor is recomputed from the index after replay — design §3.2).
+    fn recover_frontier_at_least(&mut self, end: u64) {
+        let _ = end;
+    }
+
     /// Test/fault-injection only: arm the next persist to fail once. On the trait
     /// so checkpoint crash tests can trigger it through the engine's boxed
     /// allocator. Compiled out of production builds.
