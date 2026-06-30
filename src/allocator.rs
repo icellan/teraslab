@@ -248,10 +248,35 @@ pub struct PendingBatchAllocation {
     /// Per-input result in `sizes` order: `Some(region)` when reserved, `None`
     /// when the device was full for that size.
     pub regions: Vec<Option<AllocatedRegion>>,
-    /// In-memory reservation handles kept so `rollback_pending` can undo them.
-    reservations: Vec<(u64, Reservation)>,
+    /// In-memory rollback handle so `rollback_pending` can undo the reservation.
+    /// Variant determined by the producing allocator (each allocator only ever
+    /// receives back a `PendingBatchAllocation` it produced). `pub(crate)` so the
+    /// segment allocator (a sibling module) can build/destructure it.
+    pub(crate) rollback: BatchRollback,
     /// `AllocateRegion` redo entries the caller must journal before committing.
-    alloc_redo_ops: Vec<RedoOp>,
+    /// Empty for the segment allocator (which recovers its cursor from the index,
+    /// so it journals no region ops — see `segment_allocator`).
+    pub(crate) alloc_redo_ops: Vec<RedoOp>,
+}
+
+/// The allocator-specific in-memory rollback handle carried by a
+/// [`PendingBatchAllocation`]. The in-place [`SlotAllocator`] undoes each
+/// reservation individually (freelist re-insert or high-water reset); the
+/// append-cursor [`crate::segment_allocator::SegmentAllocator`] restores a single
+/// pre-batch cursor snapshot (the open segment is derivable from the cursor).
+pub(crate) enum BatchRollback {
+    /// In-place: per-reservation undo tokens, undone in reverse order.
+    Slot(Vec<(u64, Reservation)>),
+    /// Append-cursor: restore the cursor + the open segment's `used` to their
+    /// pre-batch values (the open segment index is derivable from the cursor).
+    Segment {
+        /// Cursor before the batch.
+        pre_cursor: u64,
+        /// Open segment before the batch.
+        pre_open_segment: u32,
+        /// `used` of `pre_open_segment` before the batch.
+        pre_open_used: u64,
+    },
 }
 
 impl PendingBatchAllocation {
@@ -361,8 +386,9 @@ enum FreelistBackend {
 
 // Source of an in-memory reservation. Kept so redo failures can roll the
 // allocator state back before the caller observes an unjournaled offset.
+// `pub(crate)` because it appears in the `pub(crate)` [`BatchRollback::Slot`].
 #[derive(Debug, Clone, Copy)]
-enum Reservation {
+pub(crate) enum Reservation {
     FromFreelist {
         /// The allocation's returned offset (= region start).
         alloc_offset: u64,
@@ -880,7 +906,7 @@ impl SlotAllocator {
 
         Ok(PendingBatchAllocation {
             regions,
-            reservations,
+            rollback: BatchRollback::Slot(reservations),
             alloc_redo_ops,
         })
     }
@@ -890,8 +916,13 @@ impl SlotAllocator {
     /// in the freelist, so this only records allocation metrics and drops the
     /// rollback handles.
     pub fn commit_pending(&mut self, pending: PendingBatchAllocation) {
-        let count = pending.reservations.len() as u64;
-        let bytes: u64 = pending.reservations.iter().map(|(sz, _)| *sz).sum();
+        let BatchRollback::Slot(reservations) = &pending.rollback else {
+            // A SlotAllocator only ever receives back a PendingBatchAllocation it
+            // produced (the engine routes commit to the same store's allocator).
+            unreachable!("SlotAllocator::commit_pending given a non-Slot rollback handle");
+        };
+        let count = reservations.len() as u64;
+        let bytes: u64 = reservations.iter().map(|(sz, _)| *sz).sum();
         self.record_allocation_metrics(count, bytes);
     }
 
@@ -901,7 +932,10 @@ impl SlotAllocator {
     /// durable to compensate, so this needs no redo write (and works even when
     /// the redo log is full — the condition that motivated it).
     pub fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
-        for (aligned_size, reservation) in pending.reservations.into_iter().rev() {
+        let BatchRollback::Slot(reservations) = pending.rollback else {
+            unreachable!("SlotAllocator::rollback_pending given a non-Slot rollback handle");
+        };
+        for (aligned_size, reservation) in reservations.into_iter().rev() {
             self.rollback_reservation(aligned_size, reservation);
         }
     }

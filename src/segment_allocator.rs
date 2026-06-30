@@ -23,7 +23,12 @@
 //! device address, and `segment_of(offset)` derives the segment id. See the
 //! design doc §0.1.
 
+use crate::allocator::{
+    AllocatedRegion, AllocatorStats, BatchRollback, PendingBatchAllocation, RecordAllocator,
+};
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
+use crate::redo::{RedoLog, RedoOp};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -233,6 +238,14 @@ pub struct SegmentAllocator {
     /// Packed mode (records packed at [`RECORD_ALIGN`] within a device block).
     /// Persisted; the device's format wins over config across restarts.
     packed: bool,
+    /// Optional redo log handle. Unlike [`crate::allocator::SlotAllocator`], the
+    /// segment allocator journals NO region ops on allocate/free — its cursor is
+    /// recomputed from the index at recovery (design §3.2), so there is no
+    /// `AllocateRegion`/orphan window. The handle is retained for the relocate
+    /// path (increment 4, `OP_RELOCATE`). Not persisted.
+    redo_log: Option<Arc<Mutex<RedoLog>>>,
+    /// Store tag stamped on this allocator's future redo entries (relocate).
+    redo_device_id: u8,
 }
 
 impl std::fmt::Debug for SegmentAllocator {
@@ -286,6 +299,8 @@ impl SegmentAllocator {
             open_segment: 0,
             cursor: data_region_start,
             packed: false,
+            redo_log: None,
+            redo_device_id: 0,
         })
     }
 
@@ -448,6 +463,135 @@ impl SegmentAllocator {
         };
         self.segments[seg as usize].dead += aligned_size;
         Ok(())
+    }
+
+    // -- batch reservation (orphan-prevention parity with SlotAllocator) -----
+
+    /// Reserve a batch of regions IN MEMORY from the append cursor, deferring
+    /// durable journaling to the caller (issue #14 parity). The segment allocator
+    /// journals NO `AllocateRegion` ops — its cursor is recomputed from the index
+    /// at recovery, so an un-journaled reservation simply leaves the cursor where
+    /// it was on rollback and there is no durable orphan to compensate. The
+    /// returned [`PendingBatchAllocation`] therefore has empty
+    /// `allocate_region_redo_ops`; the caller must still pass it to
+    /// [`Self::commit_pending`] or [`Self::rollback_pending`].
+    pub fn reserve_batch(
+        &mut self,
+        sizes: &[u64],
+    ) -> crate::allocator::Result<PendingBatchAllocation> {
+        let pre_cursor = self.cursor;
+        let pre_open_segment = self.open_segment;
+        let pre_open_used = self.segments[pre_open_segment as usize].used;
+        let mut regions = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            match self.allocate(*size) {
+                Ok(offset) => {
+                    let aligned = self.align_reservation(*size);
+                    regions.push(Some(AllocatedRegion {
+                        offset,
+                        size: aligned,
+                    }));
+                }
+                Err(SegmentAllocatorError::DeviceFull { .. }) => regions.push(None),
+                Err(e) => {
+                    // Undo the whole batch in memory, then surface the error.
+                    self.restore_cursor(pre_cursor, pre_open_segment, pre_open_used);
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(PendingBatchAllocation {
+            regions,
+            rollback: BatchRollback::Segment {
+                pre_cursor,
+                pre_open_segment,
+                pre_open_used,
+            },
+            alloc_redo_ops: Vec::new(),
+        })
+    }
+
+    /// Finalize a reservation (no durable region op to confirm; nothing to do
+    /// beyond consuming the handle).
+    pub fn commit_pending(&mut self, pending: PendingBatchAllocation) {
+        debug_assert!(
+            matches!(pending.rollback, BatchRollback::Segment { .. }),
+            "SegmentAllocator::commit_pending given a non-Segment rollback handle"
+        );
+        drop(pending);
+    }
+
+    /// Roll back a reservation: restore the append cursor + the open segment's
+    /// `used` to their pre-batch values (the open segment index is implied by the
+    /// cursor). Any segment opened during the batch is reset to empty.
+    pub fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
+        let BatchRollback::Segment {
+            pre_cursor,
+            pre_open_segment,
+            pre_open_used,
+            ..
+        } = pending.rollback
+        else {
+            unreachable!("SegmentAllocator::rollback_pending given a non-Segment rollback handle");
+        };
+        self.restore_cursor(pre_cursor, pre_open_segment, pre_open_used);
+    }
+
+    /// Restore the cursor/open-segment/used to a pre-batch snapshot. Segments
+    /// opened during the batch (`> pre_open_segment`) had no prior allocations,
+    /// so their `used` resets to 0; `pre_open_segment`'s `used` is restored.
+    fn restore_cursor(&mut self, pre_cursor: u64, pre_open_segment: u32, pre_open_used: u64) {
+        for seg in (pre_open_segment + 1)..=self.open_segment {
+            self.segments[seg as usize].used = 0;
+        }
+        self.segments[pre_open_segment as usize].used = pre_open_used;
+        self.open_segment = pre_open_segment;
+        self.cursor = pre_cursor;
+    }
+
+    /// Allocate multiple regions (no deferred journaling). Returns one slot per
+    /// requested size: `Some` when reserved, `None` when it did not fit.
+    pub fn allocate_batch(
+        &mut self,
+        sizes: &[u64],
+    ) -> crate::allocator::Result<Vec<Option<AllocatedRegion>>> {
+        let mut out = Vec::with_capacity(sizes.len());
+        for size in sizes {
+            match self.allocate(*size) {
+                Ok(offset) => out.push(Some(AllocatedRegion {
+                    offset,
+                    size: self.align_reservation(*size),
+                })),
+                Err(SegmentAllocatorError::DeviceFull { .. }) => out.push(None),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `[offset, offset+size)` lies within allocated (below-cursor) space.
+    /// The segment allocator has no freelist; dead records are still "allocated"
+    /// bytes until defrag, so this is purely a bounds check against the cursor.
+    fn is_allocated_range_impl(&self, offset: u64, size: u64) -> bool {
+        let aligned = self.align_reservation(size);
+        let Some(end) = offset.checked_add(aligned) else {
+            return false;
+        };
+        aligned != 0
+            && offset >= self.data_region_start
+            && end <= self.cursor
+            && end <= self.device_size
+    }
+
+    /// The device identity formatted as a 32-character lowercase hex string.
+    fn device_id_hex_impl(&self) -> String {
+        self.device_id
+            .iter()
+            .fold(String::with_capacity(32), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            })
     }
 
     // -- accessors ----------------------------------------------------------
@@ -700,6 +844,8 @@ impl SegmentAllocator {
             open_segment,
             cursor,
             packed,
+            redo_log: None,
+            redo_device_id: 0,
         })
     }
 
@@ -711,6 +857,144 @@ impl SegmentAllocator {
     fn __test_set_open_segment(&mut self, open_segment: u32) {
         self.open_segment = open_segment;
         self.cursor = self.segment_start(open_segment);
+    }
+}
+
+/// Map a segment-allocator error into the common [`crate::allocator::AllocatorError`]
+/// used by the [`RecordAllocator`] trait. Only the variants reachable from the
+/// trait's `Result`-returning methods (allocate/free/persist/reserve) need a
+/// precise mapping; constructor-only variants fall back to `CorruptedHeader`.
+impl From<SegmentAllocatorError> for crate::allocator::AllocatorError {
+    fn from(e: SegmentAllocatorError) -> Self {
+        use crate::allocator::AllocatorError as A;
+        match e {
+            SegmentAllocatorError::DeviceFull { requested, .. } => A::DeviceFull {
+                requested,
+                largest_free: 0,
+            },
+            SegmentAllocatorError::InvalidFree { offset, size } => A::InvalidFree { offset, size },
+            SegmentAllocatorError::Device(d) => A::Device(d),
+            SegmentAllocatorError::Getrandom(g) => A::Getrandom(g),
+            SegmentAllocatorError::NoPersistedState => A::NoPersistedState,
+            SegmentAllocatorError::HeaderCorruption { expected, actual } => {
+                A::HeaderCorruption { expected, actual }
+            }
+            SegmentAllocatorError::UnsupportedVersion(v) => A::UnsupportedVersion(v),
+            SegmentAllocatorError::SegmentTableOverflow { entries, max } => {
+                A::FreelistOverflow { entries, max }
+            }
+            SegmentAllocatorError::InvalidSegmentSize { .. }
+            | SegmentAllocatorError::CorruptedHeader(_) => A::CorruptedHeader,
+        }
+    }
+}
+
+impl RecordAllocator for SegmentAllocator {
+    fn allocate(&mut self, size: u64) -> crate::allocator::Result<u64> {
+        Ok(SegmentAllocator::allocate(self, size)?)
+    }
+    fn allocate_batch(
+        &mut self,
+        sizes: &[u64],
+    ) -> crate::allocator::Result<Vec<Option<AllocatedRegion>>> {
+        SegmentAllocator::allocate_batch(self, sizes)
+    }
+    fn reserve_batch(&mut self, sizes: &[u64]) -> crate::allocator::Result<PendingBatchAllocation> {
+        SegmentAllocator::reserve_batch(self, sizes)
+    }
+    fn commit_pending(&mut self, pending: PendingBatchAllocation) {
+        SegmentAllocator::commit_pending(self, pending)
+    }
+    fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
+        SegmentAllocator::rollback_pending(self, pending)
+    }
+    fn free(&mut self, offset: u64, size: u64) -> crate::allocator::Result<()> {
+        Ok(SegmentAllocator::free(self, offset, size)?)
+    }
+    fn persist(&self) -> crate::allocator::Result<()> {
+        Ok(SegmentAllocator::persist(self)?)
+    }
+    fn persist_header_no_sync(&self) -> crate::allocator::Result<()> {
+        Ok(SegmentAllocator::persist_header_no_sync(self)?)
+    }
+    fn replay_redo(&mut self, _op: &RedoOp) -> bool {
+        // The segment allocator journals no region ops (cursor is recomputed from
+        // the index at recovery); the relocate op arrives in increment 4.
+        false
+    }
+    fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
+        self.is_allocated_range_impl(offset, size)
+    }
+    fn free_region_containing(&self, _offset: u64) -> Option<(u64, u64)> {
+        // No freelist; dead records are reclaimed by defrag, not tracked as holes.
+        None
+    }
+    fn free_region_count(&self) -> usize {
+        0
+    }
+    fn stats(&self) -> AllocatorStats {
+        let s = SegmentAllocator::stats(self);
+        let data_capacity = s.device_size.saturating_sub(s.data_region_start);
+        AllocatorStats {
+            data_region_start: s.data_region_start,
+            next_offset: s.cursor,
+            device_size: s.device_size,
+            alignment: self.alignment,
+            free_region_count: 0,
+            total_free_bytes: s.dead_bytes,
+            largest_free_region: 0,
+            used_bytes: s.live_bytes,
+            utilization: if data_capacity > 0 {
+                s.live_bytes as f64 / data_capacity as f64
+            } else {
+                0.0
+            },
+        }
+    }
+    fn next_offset(&self) -> u64 {
+        self.cursor
+    }
+    fn data_region_start(&self) -> u64 {
+        self.data_region_start
+    }
+    fn device_alignment(&self) -> usize {
+        self.alignment
+    }
+    fn device_id(&self) -> [u8; 16] {
+        self.device_id
+    }
+    fn device_id_hex(&self) -> String {
+        self.device_id_hex_impl()
+    }
+    fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>) {
+        self.redo_log = Some(redo_log);
+    }
+    fn set_redo_device_id(&mut self, device_id: u8) {
+        self.redo_device_id = device_id;
+    }
+    fn redo_device_id(&self) -> u8 {
+        self.redo_device_id
+    }
+    fn has_redo_log(&self) -> bool {
+        self.redo_log.is_some()
+    }
+    fn set_packed(&mut self, packed: bool) {
+        SegmentAllocator::set_packed(self, packed)
+    }
+    fn is_packed(&self) -> bool {
+        SegmentAllocator::is_packed(self)
+    }
+    fn set_append_only(&mut self, _append_only: bool) {
+        // The segment allocator is inherently append-only (records are placed at
+        // the cursor and never reused in place); the flag is a no-op.
+    }
+    fn is_append_only(&self) -> bool {
+        true
+    }
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn arm_fail_next_persist(&self) {
+        // No fault-injection hook on the segment allocator (yet); no-op so the
+        // trait object can be used uniformly in tests.
     }
 }
 
@@ -1002,5 +1286,83 @@ mod tests {
             e,
             SegmentAllocatorError::SegmentTableOverflow { .. }
         ));
+    }
+
+    // -- RecordAllocator trait surface (increment 3) ------------------------
+
+    #[test]
+    fn reserve_batch_commit_advances_cursor_sequentially() {
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        let pending = a.reserve_batch(&[600, 600, 4096]).unwrap();
+        let regions: Vec<_> = pending.regions.iter().flatten().copied().collect();
+        assert_eq!(regions.len(), 3);
+        // Non-packed: each rounds to a 4 KiB block, contiguous.
+        assert_eq!(regions[0].offset, DATA_REGION_OFFSET);
+        assert_eq!(regions[1].offset, regions[0].offset + 4096);
+        assert_eq!(regions[2].offset, regions[1].offset + 4096);
+        // No region redo ops (segment recovers its cursor from the index).
+        assert!(pending.allocate_region_redo_ops().is_empty());
+        let cursor_after = a.cursor();
+        a.commit_pending(pending);
+        assert_eq!(a.cursor(), cursor_after, "commit does not move the cursor");
+    }
+
+    #[test]
+    fn reserve_batch_rollback_restores_state_across_segment_boundary() {
+        // 2 blocks per segment; pre-allocate 1 block, then a 3-block batch that
+        // fills segment 0 and crosses into segment 1.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        a.allocate(4096).unwrap(); // seg0 block0
+        let pre_cursor = a.cursor();
+        let pre_open = a.open_segment();
+        let pre_stats = a.stats();
+        let pending = a.reserve_batch(&[4096, 4096, 4096]).unwrap();
+        assert!(
+            a.open_segment() > pre_open,
+            "batch must have crossed a segment boundary"
+        );
+        a.rollback_pending(pending);
+        assert_eq!(a.cursor(), pre_cursor);
+        assert_eq!(a.open_segment(), pre_open);
+        assert_eq!(a.stats(), pre_stats, "used accounting fully restored");
+        // The cursor is reusable: the next allocate lands where the batch did.
+        let o = a.allocate(4096).unwrap();
+        assert_eq!(o, pre_cursor);
+    }
+
+    #[test]
+    fn trait_object_allocate_free_stats() {
+        use crate::allocator::RecordAllocator;
+        let mut a: Box<dyn RecordAllocator> = Box::new(alloc(64, 8 * 1024 * 1024));
+        let o0 = a.allocate(600).unwrap();
+        assert_eq!(o0, DATA_REGION_OFFSET);
+        assert_eq!(a.next_offset(), o0 + 4096); // non-packed rounds to a block
+        assert_eq!(a.data_region_start(), DATA_REGION_OFFSET);
+        assert!(a.is_allocated_range(o0, 600));
+        assert!(!a.is_allocated_range(a.next_offset(), 4096)); // beyond cursor
+        a.free(o0, 600).unwrap();
+        let s = a.stats();
+        assert_eq!(s.next_offset, a.next_offset());
+        assert_eq!(s.total_free_bytes, 4096); // freed block counted as dead
+        assert_eq!(s.free_region_count, 0); // no freelist
+        assert!(a.is_append_only());
+        assert_eq!(a.free_region_containing(o0), None);
+    }
+
+    #[test]
+    fn trait_device_full_maps_to_allocator_error() {
+        use crate::allocator::{AllocatorError, RecordAllocator};
+        // 9 MiB device, 8 MiB segment → exactly one segment.
+        let mut a: Box<dyn RecordAllocator> = Box::new(alloc(9, 8 * 1024 * 1024));
+        let blocks = 8 * 1024 * 1024u64 / 4096;
+        for _ in 0..blocks {
+            a.allocate(4096).unwrap();
+        }
+        let e = a.allocate(4096).unwrap_err();
+        assert!(
+            matches!(e, AllocatorError::DeviceFull { .. }),
+            "segment DeviceFull must map to AllocatorError::DeviceFull, got {e:?}"
+        );
     }
 }
