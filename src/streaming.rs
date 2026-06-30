@@ -22,18 +22,23 @@
 //! # Write cases
 //! For a block-aligned write of `bytes` at `offset` (buffer covers
 //! `[base, base+buf.len())`):
-//! - **append / extend** — `offset == base + buf.len()`, or the buffer is empty:
-//!   the common hot path; appended to the tail and the head flushed once the
-//!   buffer crosses [`StreamingWriteDevice::flush_threshold`].
-//! - **in-place overwrite** — `[offset, offset+len) ⊆ [base, base+buf.len())`:
-//!   a re-write of a still-buffered block (e.g. a packed record's RMW updating a
-//!   block other records share, or a setMined footer write before the block has
-//!   flushed); copied into the buffer in place.
+//! - **contiguous (append / overwrite / straddle-extend)** — `base <= offset <=
+//!   base + buf.len()`: the hot path. Overwrite the overlapping prefix in place,
+//!   append the remainder. This one case covers a pure append (`offset == end`,
+//!   zero overlap), a pure in-place overwrite of a still-buffered block (a packed
+//!   record's RMW, or a setMined footer write before the block flushed), AND —
+//!   critically for packed placement — a STRADDLE where a record spanning block
+//!   N→N+1 arrives as the 2-block image `[N, N+2)` while only block N is buffered
+//!   (overwrite N, append N+1). Mis-classifying that straddle as discontiguous
+//!   flushed + restarted on nearly every packed record and destroyed coalescing.
+//!   The head is flushed once the buffer crosses
+//!   [`StreamingWriteDevice::flush_threshold`].
 //! - **already-flushed write** — `offset + len <= base`: a mutation of a record
 //!   that has left the buffer (in-place setMined/freeze on an older segment
 //!   record); written through to the inner device.
-//! - **discontiguous** — a gap above the tail (segment-boundary cursor jump) or a
-//!   straddle: the buffer is flushed and a fresh buffer is started at `offset`.
+//! - **discontiguous** — a gap above the tail (a segment-boundary cursor jump) or
+//!   a backward straddle below `base`: the buffer is flushed and a fresh buffer is
+//!   started at `offset`.
 //!
 //! # Durability
 //! [`StreamingWriteDevice::sync`] flushes the whole buffer to the inner device
@@ -181,18 +186,29 @@ impl BlockDevice for StreamingWriteDevice {
             // Start a fresh buffer at this offset.
             st.base = offset;
             st.buf.extend_from_slice(buf);
-        } else if offset == end {
-            // Contiguous append — the hot path.
-            st.buf.extend_from_slice(buf);
-        } else if offset >= st.base && offset + len as u64 <= end {
-            // In-place overwrite of a still-buffered region.
+        } else if offset >= st.base && offset <= end {
+            // Contiguous with the buffer: the write overlaps the buffered tail
+            // and/or extends it. Overwrite the overlapping prefix in place, then
+            // append the remainder. This ONE branch subsumes a pure append
+            // (`offset == end`, zero overlap), a pure in-place overwrite
+            // (`offset + len <= end`, full overlap), and — critically for packed
+            // placement — a STRADDLE where a record spanning block N→N+1 is
+            // written as the 2-block image `[N, N+2)` while only block N is
+            // buffered: the old code mis-classified that as discontiguous and
+            // flushed + restarted on nearly every packed record, destroying all
+            // coalescing (measured: ~4.3 KB writes, half throughput).
             let at = (offset - st.base) as usize;
-            st.buf[at..at + len].copy_from_slice(buf);
+            let overlap = ((end - offset) as usize).min(len);
+            st.buf[at..at + overlap].copy_from_slice(&buf[..overlap]);
+            if len > overlap {
+                st.buf.extend_from_slice(&buf[overlap..]);
+            }
         } else if offset + len as u64 <= st.base {
             // Mutation of an already-flushed record — write through.
             self.inner.pwrite_all_at(buf, offset)?;
         } else {
-            // Discontiguous (segment-boundary jump or straddle): flush what we
+            // Genuinely discontiguous (a gap above the tail = segment-boundary
+            // cursor jump, or a backward straddle below `base`): flush what we
             // have, then start a fresh buffer at `offset`.
             self.flush_head(&mut st, true)?;
             st.base = offset;
@@ -447,6 +463,47 @@ mod tests {
             "flushed-region write must pass through to inner"
         );
         assert_eq!(read(&dev, 0, BS), blk(99));
+    }
+
+    #[test]
+    fn packed_straddle_writes_keep_coalescing() {
+        // Reproduces the packed-record pattern that broke coalescing: a record in
+        // block N is buffered, then the next record spans block N→N+1 and arrives
+        // as the 2-block image [N, N+2) (write_image_rmw rounds out to whole
+        // blocks). This must EXTEND the buffer (overwrite block N, append N+1),
+        // not flush+restart. With a 1 MiB threshold the whole run stays buffered
+        // until sync and flushes as ONE write.
+        let counting = Arc::new(CountingDevice::new(8 * 1024 * 1024, BS));
+        let dev = StreamingWriteDevice::new(counting.clone(), 1024 * 1024, 1024 * 1024);
+        // Simulate 20 straddling records, each re-writing the current block and
+        // extending one block forward: write [i, i+2) for i = 0..20.
+        for i in 0..20u64 {
+            let mut two = AlignedBuf::new(2 * BS, BS);
+            two[..BS].fill((i as u8).wrapping_add(1)); // block i (overwrite)
+            two[BS..].fill((i as u8).wrapping_add(2)); // block i+1 (append/overwrite)
+            write(&dev, i * BS as u64, &two);
+        }
+        assert_eq!(
+            counting.writes.load(Ordering::Relaxed),
+            0,
+            "straddle writes must stay buffered (no flush+restart per record)"
+        );
+        dev.sync().unwrap();
+        assert_eq!(
+            counting.writes.load(Ordering::Relaxed),
+            1,
+            "the whole straddling run must flush as ONE coalesced write"
+        );
+        // Each block i ended up holding the LAST writer's value: block i is
+        // written by record i-1 (as its +1 block) then record i (as its block).
+        for i in 0..20u64 {
+            assert_eq!(read(&dev, i * BS as u64, BS), blk(i as u8 + 1), "block {i}");
+        }
+        assert_eq!(
+            read(&dev, 20 * BS as u64, BS),
+            blk(21),
+            "final appended block"
+        );
     }
 
     #[test]
