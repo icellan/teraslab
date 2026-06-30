@@ -1522,6 +1522,22 @@ impl ServerConfig {
     /// — the runtime signal emitted when RF > 1 best-effort is *not* in use
     /// but individual best-effort paths fall back because replicas ACK-failed.
     pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
+        // The log-structured segment engine is NON-CLUSTERED in v1: its spends
+        // relocate the record (a physical move) rather than journaling a logical
+        // op, so the redo entries cannot be converted to replica ops. Refuse to
+        // start a clustered / replicated node on the segment engine rather than
+        // silently dropping replication. (See increment 4 / the design doc.)
+        if self.storage.engine == StorageEngine::Segment
+            && (self.is_clustered() || self.replication_factor > 1)
+        {
+            return Err(format!(
+                "storage.engine = \"segment\" is not supported with clustering \
+                 (node_id = {}, replication_factor = {}): the log-structured engine \
+                 is non-clustered in v1. Use storage.engine = \"in_place\" for clustered \
+                 nodes, or run this node standalone (node_id = 0, replication_factor = 1).",
+                self.node_id, self.replication_factor,
+            ));
+        }
         match self.ack_policy.as_str() {
             "auto" | "write_all" | "write_majority" | "best_effort" => {}
             other => {
@@ -2385,6 +2401,34 @@ backend = ""
             toml::from_str("[storage]\nengine = \"in_place\"\nsegment_size = 16777216\n").unwrap();
         assert_eq!(cfg.storage.engine, StorageEngine::InPlace);
         assert_eq!(cfg.storage.segment_size, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn segment_engine_rejected_with_clustering() {
+        // node_id > 0 → clustered → segment engine must be refused.
+        let mut cfg = ServerConfig {
+            node_id: 1,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::Segment;
+        let err = cfg
+            .validate_cluster_safety()
+            .expect_err("segment engine on a clustered node must be refused");
+        assert!(
+            err.contains("segment") && err.contains("clustering"),
+            "error must explain the conflict: {err}",
+        );
+    }
+
+    #[test]
+    fn segment_engine_allowed_standalone() {
+        // node_id = 0, replication_factor = 1 → standalone → segment engine OK.
+        let mut cfg = ServerConfig::default();
+        cfg.storage.engine = StorageEngine::Segment;
+        assert_eq!(cfg.node_id, 0);
+        assert_eq!(cfg.replication_factor, 1);
+        cfg.validate_cluster_safety()
+            .expect("segment engine must be allowed on a standalone node");
     }
 
     #[test]
