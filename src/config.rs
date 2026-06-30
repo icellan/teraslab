@@ -1538,6 +1538,26 @@ impl ServerConfig {
                 self.node_id, self.replication_factor,
             ));
         }
+        // The segment engine's spend journals its `Relocate` intent AFTER writing
+        // the relocated record (not WAL-first): the new append-cursor offset is
+        // only known once allocated during apply. Crash safety therefore relies on
+        // BUFFERED durability — the checkpoint barrier fsyncs every store's data
+        // device before reclaiming any redo prefix, so the relocated image, its
+        // `Relocate` redo, and the old-extent dead-mark become durable together (a
+        // crash before the barrier loses all three and leaves the pre-relocation
+        // record intact). Under STRICT durability that ordering is not guaranteed,
+        // so refuse to start rather than silently weaken the crash contract.
+        if self.storage.engine == StorageEngine::Segment && !self.redo_buffered_effective() {
+            return Err(
+                "storage.engine = \"segment\" requires buffered redo durability: set \
+                 redo_buffered = true (or redo_buffered_io = true). The log-structured \
+                 spend journals its Relocate intent after writing the relocated record, \
+                 so crash safety depends on the checkpoint barrier fsyncing the data \
+                 device before reclaiming the redo — a guarantee strict durability does \
+                 not provide."
+                    .to_string(),
+            );
+        }
         match self.ack_policy.as_str() {
             "auto" | "write_all" | "write_majority" | "best_effort" => {}
             other => {
@@ -2422,13 +2442,32 @@ backend = ""
 
     #[test]
     fn segment_engine_allowed_standalone() {
-        // node_id = 0, replication_factor = 1 → standalone → segment engine OK.
+        // node_id = 0, replication_factor = 1, buffered durability → segment OK.
         let mut cfg = ServerConfig::default();
         cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = true;
         assert_eq!(cfg.node_id, 0);
         assert_eq!(cfg.replication_factor, 1);
         cfg.validate_cluster_safety()
-            .expect("segment engine must be allowed on a standalone node");
+            .expect("segment engine must be allowed on a standalone buffered node");
+    }
+
+    #[test]
+    fn segment_engine_rejected_under_strict_durability() {
+        // Standalone but STRICT durability → segment engine must be refused: its
+        // spend journals the Relocate after the data write (not WAL-first), so
+        // crash safety needs the buffered checkpoint barrier.
+        let mut cfg = ServerConfig::default();
+        cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = false;
+        cfg.redo_buffered_io = false;
+        let err = cfg
+            .validate_cluster_safety()
+            .expect_err("segment engine under strict durability must be refused");
+        assert!(
+            err.contains("segment") && err.contains("buffered"),
+            "error must explain the durability requirement: {err}",
+        );
     }
 
     #[test]

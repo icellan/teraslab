@@ -1902,10 +1902,9 @@ impl Engine {
     /// of an in-place RMW. Cached at construction (no allocator lock). See
     /// [`crate::allocator::RecordAllocator::is_log_structured`].
     ///
-    /// Staged groundwork: the spend hot path branches on this in increment 4c
-    /// (relocate-on-spend wiring). Allowed-unused until then.
+    /// The spend hot path branches on this (relocate vs in-place RMW) in
+    /// [`PreparedSpend::apply_locked`] and the dispatch redo-emission gate.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn store_is_log_structured(&self, device_id: u8) -> bool {
         self.stores[device_id as usize].log_structured
     }
@@ -4681,10 +4680,6 @@ impl Engine {
     /// [`SpendError::TxNotFound`] if the key is absent; [`SpendError::StorageError`]
     /// on a slot-mutation offset out of range, device-full, or any device/index
     /// I/O failure.
-    ///
-    /// Staged groundwork: the segment spend path calls this in increment 4c.
-    /// Allowed-unused (exercised by unit tests) until then.
-    #[allow(dead_code)]
     fn relocate_record(
         &self,
         device_id: u8,
@@ -7796,6 +7791,14 @@ impl PreparedSpend {
             ));
         }
 
+        // Segment (log-structured) engine: the spend RELOCATES the record to a
+        // fresh append-cursor offset rather than RMW-ing slots + metadata in
+        // place. The spent slots and the updated metadata are folded into ONE
+        // sequential image written below (step 9, `relocate_record`), so the
+        // in-place slot writes here are skipped — writing them at the old offset
+        // would scatter exactly the I/O the segment engine exists to eliminate.
+        let log_structured = engine.store_is_log_structured(device_id);
+
         // 6. Batch write all valid slot mutations (zero-alloc when direct).
         // R-004: stop on first write failure and propagate it. Continuing
         // through the batch and pretending success on partial-write would
@@ -7804,8 +7807,10 @@ impl PreparedSpend {
         // covering "spent_utxos == count(slots in SPENT state)" would
         // break, premature pruning would follow, and a follow-up spend on
         // the same UTXO with different spending_data would succeed.
-        for &(offset, ref new_slot) in &valid_spends {
-            engine.write_slot_fast(device_id, record_offset, offset, new_slot)?;
+        if !log_structured {
+            for &(offset, ref new_slot) in &valid_spends {
+                engine.write_slot_fast(device_id, record_offset, offset, new_slot)?;
+            }
         }
 
         crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterDataPwrite);
@@ -7851,22 +7856,38 @@ impl PreparedSpend {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 9. Write metadata (targeted spend footer when direct, full otherwise).
-        // R-004: propagate the write error.
-        let device_ptr = engine.device_ptr_for(device_id);
-        if !device_ptr.is_null() {
-            // SAFETY: `device_ptr` is non-null (checked above) and is store
-            // `device_id`'s live device base; `record_offset` is
-            // allocator-valid for that store. This spend `apply` still holds
-            // the record's stripe lock (`_guard`, captured at prepare time);
-            // `write_metadata_direct` takes the per-offset `io_locks()` write
-            // side for torn-read-safe publication.
-            unsafe { io::write_metadata_direct(device_ptr, record_offset, &metadata) };
+        // 9. Persist the mutation.
+        if log_structured {
+            // Segment engine: append the full record (spent slots + updated
+            // metadata baked in) at a fresh cursor offset, re-point the index,
+            // journal a buffered `Relocate`, and dead-mark the old extent — all
+            // under the stripe lock the caller holds. `relocate_record` sets the
+            // index entry in full (identically to recovery), so NO subsequent
+            // `sync_index_cache` is needed (or wanted — it would update the old
+            // key's cached fields without moving the offset). The Relocate redo
+            // is journaled here, AFTER the WAL-first flush of this RPC, which is
+            // why the segment engine requires BUFFERED durability (enforced at
+            // boot): image + redo + dead-mark become durable together at the
+            // checkpoint barrier; a crash before it keeps the old record intact.
+            engine.relocate_record(device_id, &tx_key, &metadata, &valid_spends)?;
         } else {
-            engine.write_metadata_fast(device_id, record_offset, &metadata)?;
-        }
+            // In-place RMW: targeted spend footer when direct, full otherwise.
+            // R-004: propagate the write error.
+            let device_ptr = engine.device_ptr_for(device_id);
+            if !device_ptr.is_null() {
+                // SAFETY: `device_ptr` is non-null (checked above) and is store
+                // `device_id`'s live device base; `record_offset` is
+                // allocator-valid for that store. This spend `apply` still holds
+                // the record's stripe lock (`_guard`, captured at prepare time);
+                // `write_metadata_direct` takes the per-offset `io_locks()` write
+                // side for torn-read-safe publication.
+                unsafe { io::write_metadata_direct(device_ptr, record_offset, &metadata) };
+            } else {
+                engine.write_metadata_fast(device_id, record_offset, &metadata)?;
+            }
 
-        engine.sync_index_cache(&tx_key, &metadata)?;
+            engine.sync_index_cache(&tx_key, &metadata)?;
+        }
 
         // 10. Update the DAH secondary index (two-phase durable). When the
         // caller asked to defer (batched spend path), return the transition so
@@ -10397,6 +10418,89 @@ mod tests {
             }
             other => panic!("expected StorageError, got {other:?}"),
         }
+    }
+
+    /// Increment 4c: a spend on the segment engine, driven through the PRODUCTION
+    /// apply path (`spend_multi` → `ValidatedSpend::apply` → `apply_locked`),
+    /// relocates the record instead of mutating it in place.
+    #[test]
+    fn segment_spend_relocates_record_through_apply_path() {
+        use crate::redo::RedoLog;
+
+        let (engine, dev, key, _meta, slots, old_offset) = seg_engine_with_record();
+
+        // Attach a buffered redo log — the segment spend journals a Relocate at
+        // apply time and requires buffered durability.
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
+        engine.set_redo_log(Arc::new(parking_lot::Mutex::new(log)));
+        engine.set_buffered_durability(true);
+
+        let spending_data = [0x9Au8; 36];
+        let req = SpendMultiRequest {
+            tx_key: key,
+            spends: vec![SpendItem {
+                offset: 0,
+                utxo_hash: slots[0].hash,
+                spending_data,
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+
+        let resp = engine.spend_multi(&req).unwrap();
+        assert_eq!(resp.spent_count, 1);
+
+        // The record RELOCATED: the index now points at a fresh offset.
+        let entry = engine.lookup(&key).unwrap();
+        assert_ne!(
+            entry.record_offset, old_offset,
+            "segment spend must relocate the record to a new offset"
+        );
+        let new_offset = entry.record_offset;
+        assert_eq!(entry.spent_utxos, 1);
+
+        // The spend landed at the NEW offset: slot 0 SPENT, others untouched.
+        let s = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        assert_eq!(s[0].status, UTXO_SPENT);
+        assert_eq!(s[0].spending_data, spending_data);
+        assert_eq!(s[1].status, UTXO_UNSPENT);
+        let m = io::read_metadata(&*dev, new_offset).unwrap();
+        assert_eq!({ m.spent_utxos }, 1);
+
+        // Reading back THROUGH the engine (index → new offset) observes the spend.
+        let via_engine = engine.read_slot(&key, 0).unwrap();
+        assert_eq!(via_engine.status, UTXO_SPENT);
+
+        // A second spend of a different vout relocates again and accumulates.
+        let req2 = SpendMultiRequest {
+            tx_key: key,
+            spends: vec![SpendItem {
+                offset: 1,
+                utxo_hash: slots[1].hash,
+                spending_data: [0x9Bu8; 36],
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let resp2 = engine.spend_multi(&req2).unwrap();
+        assert_eq!(resp2.spent_count, 1);
+        let entry2 = engine.lookup(&key).unwrap();
+        assert_ne!(
+            entry2.record_offset, new_offset,
+            "second spend relocates again"
+        );
+        assert_eq!(entry2.spent_utxos, 2);
+        // Both spends are visible at the latest offset.
+        assert_eq!(engine.read_slot(&key, 0).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&key, 1).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&key, 2).unwrap().status, UTXO_UNSPENT);
     }
 
     #[test]

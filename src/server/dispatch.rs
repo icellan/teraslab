@@ -4855,6 +4855,17 @@ fn handle_spend_batch(
         let transition_offsets: std::collections::HashSet<u32> =
             prepared.transitions().iter().map(|(off, _)| *off).collect();
 
+        // Segment (log-structured) store: the spend RELOCATES the record, and
+        // `PreparedSpend::apply_locked` journals a single `RedoOp::Relocate` for
+        // the whole group at apply time (buffered, carrying the new append-cursor
+        // offset that is only known once allocated). So this store must NOT also
+        // emit the in-place per-slot `SpendV2` WAL-first redo — replaying a
+        // `SpendV2` against a relocated record would RMW the stale (now-dead)
+        // offset. Replication is likewise skipped: the segment engine is
+        // non-clustered in v1 (`validate_cluster_safety`), so there are no
+        // replicas to feed. The in-place store keeps the exact prior behaviour.
+        let log_structured = engine.store_is_log_structured(prepared.device_id);
+
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
         for &(i, item) in group {
@@ -4863,27 +4874,29 @@ fn handle_spend_batch(
                 // re-spends do not emit redo/replication or bump generation;
                 // they match the single-spend no-op contract.
                 running_count = running_count.wrapping_add(1);
-                out.redo_ops.push(RedoOp::SpendV2 {
-                    tx_key: key,
-                    offset: item.vout,
-                    spending_data: item.spending_data,
-                    new_spent_count: running_count,
-                    current_block_height: params.current_block_height,
-                    block_height_retention: params.block_height_retention,
-                    target_generation: post_generation,
-                    updated_at: engine.now_millis(),
-                    // B-5: carry the validated slot hash so recovery can
-                    // rebuild a CRC-failing spent slot from this intent.
-                    utxo_hash: Some(item.utxo_hash),
-                });
-                key_repl_ops.push(ReplicaOp::Spend {
-                    tx_key: key,
-                    offset: item.vout,
-                    spending_data: item.spending_data,
-                    current_block_height: params.current_block_height,
-                    block_height_retention: params.block_height_retention,
-                    master_generation: post_generation,
-                });
+                if !log_structured {
+                    out.redo_ops.push(RedoOp::SpendV2 {
+                        tx_key: key,
+                        offset: item.vout,
+                        spending_data: item.spending_data,
+                        new_spent_count: running_count,
+                        current_block_height: params.current_block_height,
+                        block_height_retention: params.block_height_retention,
+                        target_generation: post_generation,
+                        updated_at: engine.now_millis(),
+                        // B-5: carry the validated slot hash so recovery can
+                        // rebuild a CRC-failing spent slot from this intent.
+                        utxo_hash: Some(item.utxo_hash),
+                    });
+                    key_repl_ops.push(ReplicaOp::Spend {
+                        tx_key: key,
+                        offset: item.vout,
+                        spending_data: item.spending_data,
+                        current_block_height: params.current_block_height,
+                        block_height_retention: params.block_height_retention,
+                        master_generation: post_generation,
+                    });
+                }
             }
         }
 
