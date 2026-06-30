@@ -941,6 +941,37 @@ fn replay_one_recovery_entry(
                 )
             }
         }
+        // CreateV2 carries no payload (like ReplicaCreate), so gate it on the
+        // SAME is_allocated_range check — a stale CreateV2 whose offset was freed
+        // and re-handed to another record must not register an aliasing entry.
+        // Range length derived from utxo_count via record_size_for.
+        RedoOp::CreateV2 {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+            is_conflicting,
+            parent_txids,
+        } => {
+            let range_len = TxMetadata::record_size_for(*utxo_count);
+            if let Some(alloc) = allocator.as_deref()
+                && !alloc.is_allocated_range(*record_offset, range_len)
+            {
+                ReplayResult::Failed(ReplayCause::LogicError)
+            } else {
+                replay_create_v2(
+                    device,
+                    *device_id,
+                    index,
+                    offset_owners,
+                    tx_key,
+                    *record_offset,
+                    *utxo_count,
+                    *is_conflicting,
+                    parent_txids,
+                )
+            }
+        }
         RedoOp::CompensateUnsetMined {
             tx_key,
             block_id,
@@ -1634,6 +1665,24 @@ fn replay_entry(
             *utxo_count,
             *is_conflicting,
             record_bytes,
+            parent_txids,
+        ),
+        RedoOp::CreateV2 {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+            is_conflicting,
+            parent_txids,
+        } => replay_create_v2(
+            device,
+            *device_id,
+            index,
+            offset_owners,
+            tx_key,
+            *record_offset,
+            *utxo_count,
+            *is_conflicting,
             parent_txids,
         ),
         RedoOp::Delete {
@@ -2681,6 +2730,75 @@ fn replay_create(
     // recovery collects those entries and drains them after constructing
     // the engine. Keep these Create fields bound so old entries still
     // round-trip exactly.
+    let _ = (is_conflicting, parent_txids);
+
+    ReplayResult::Applied
+}
+
+/// Replay an index-only create ([`RedoOp::CreateV2`]) — the buffered-durability
+/// counterpart to [`replay_create`].
+///
+/// Unlike [`replay_create`], the record bytes are NOT carried in the WAL: they
+/// were written to the data device at `record_offset` and flushed on the same
+/// buffered cadence as this redo entry. So this path READS the record back
+/// instead of rewriting it. The durability contract (see [`crate::redo::OP_CREATE_V2`]):
+/// a `CreateV2` entry only survives in the redo if it passed the redo CRC scan,
+/// but its matching data write may NOT have landed if the crash fell between the
+/// two buffered flushes. That is a CONSISTENT buffered-tail loss, not corruption,
+/// so every "didn't land" signal — unreadable/CRC-failing metadata, a `tx_id`
+/// that belongs to a different (older, offset-reused) record, or a `utxo_count`
+/// mismatch — resolves to [`ReplayResult::Skipped`], NOT `Failed`. The create is
+/// simply dropped (the caller re-submits, exactly as for a lost buffered tail).
+#[allow(clippy::too_many_arguments)]
+fn replay_create_v2(
+    device: &dyn BlockDevice,
+    device_id: u8,
+    index: &ShardedIndex,
+    offset_owners: &mut OffsetOwners,
+    tx_key: &TxKey,
+    record_offset: u64,
+    utxo_count: u32,
+    is_conflicting: bool,
+    parent_txids: &[[u8; 32]],
+) -> ReplayResult {
+    // Idempotent: already registered (e.g. a later checkpoint covered it).
+    if index.lookup(tx_key).is_some() {
+        return ReplayResult::Skipped;
+    }
+
+    // Read the record's metadata back from the device. Under buffered durability
+    // a missing/torn data write means this create's bytes were lost on the same
+    // tail this redo entry's flush did NOT cover → drop it (Skipped).
+    let meta = match crate::io::read_metadata(device, record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Skipped,
+    };
+
+    // The on-device record must be THIS create's: a mismatched tx_id means the
+    // data write never landed and the offset still holds an older (since-freed,
+    // reused) record's bytes; a mismatched utxo_count means a partial/torn
+    // write. Either way the create did not durably land → Skipped.
+    if { meta.tx_id } != tx_key.txid || { meta.utxo_count } != utxo_count {
+        return ReplayResult::Skipped;
+    }
+
+    let entry = TxIndexEntry {
+        device_id,
+        record_offset,
+        utxo_count,
+        block_entry_count: meta.block_entry_count,
+        tx_flags: meta.flags.bits(),
+        spent_utxos: { meta.spent_utxos },
+        dah_or_preserve: { meta.delete_at_height },
+        unmined_since: { meta.unmined_since },
+        generation: { meta.generation },
+    };
+    if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
+        return ReplayResult::Failed(ReplayCause::LogicError);
+    }
+
+    // Conflicting-child links are drained post-engine-construction, same as
+    // `replay_create` — keep the fields bound so the contract is explicit.
     let _ = (is_conflicting, parent_txids);
 
     ReplayResult::Applied
@@ -4621,6 +4739,100 @@ mod tests {
 
         let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
         assert_eq!(stats.entries_skipped, 1); // Already in index
+    }
+
+    /// Phase 1 log-structured: `RedoOp::CreateV2` carries NO record bytes —
+    /// replay must READ the record back from the data device and register a
+    /// correctly-populated index entry. The `generation` assertion proves the
+    /// cached fields came from the device metadata (the redo entry has no
+    /// generation), i.e. the device was actually read, not fabricated.
+    #[test]
+    fn create_v2_replay_reads_record_from_device() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 5u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x77;
+        let key = TxKey { txid };
+
+        // Write the record to the device WITHOUT registering it in the index —
+        // simulates the data write having landed while the index was lost, so
+        // recovery must rebuild the entry from the device read.
+        let offset = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.generation = 9;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+        assert!(h.index.lookup(&key).is_none());
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset,
+            utxo_count,
+            is_conflicting: false,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+        let ie = h
+            .index
+            .lookup(&key)
+            .expect("CreateV2 must register the entry read back from the device");
+        assert_eq!(ie.record_offset, offset);
+        assert_eq!(ie.utxo_count, utxo_count);
+        assert_eq!(
+            ie.generation, 9,
+            "cached fields must come from the device read"
+        );
+    }
+
+    /// Phase 1 log-structured: a `CreateV2` whose data write did NOT land (the
+    /// device region is absent/zeroed) is a CONSISTENT buffered-tail loss — it
+    /// must be SKIPPED (the create is dropped, caller re-submits), NOT failed,
+    /// and must NOT register an index entry pointing at garbage.
+    #[test]
+    fn create_v2_replay_skips_when_device_record_absent() {
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x78;
+        let key = TxKey { txid };
+        // Allocate an offset but write NOTHING there (zeroed device region).
+        let offset = h.alloc.allocate(TxMetadata::record_size_for(3)).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset,
+            utxo_count: 3,
+            is_conflicting: false,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert!(
+            h.index.lookup(&key).is_none(),
+            "absent device record must not register an index entry"
+        );
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(
+            stats.entries_failed, 0,
+            "buffered-tail loss is Skipped, not Failed"
+        );
     }
 
     /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md) part 4:

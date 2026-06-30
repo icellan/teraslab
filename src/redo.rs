@@ -502,6 +502,20 @@ const OP_REMOVE_CONFLICTING_CHILD: u8 = 37;
 /// it. Legacy V1 entries remain decodable.
 const OP_REASSIGN_V2: u8 = 38;
 
+/// Index-only create (Phase 1 log-structured write lever): a create whose
+/// authoritative record bytes are NOT embedded in the redo entry — recovery
+/// reads them back from the data device at `record_offset`. Used ONLY under
+/// buffered redo durability, where the data-device write and the redo entry are
+/// flushed on the same cadence so a surviving (CRC-valid) `CreateV2` entry whose
+/// data write did not land is detected on replay (CRC / tx_id mismatch) and
+/// dropped as a consistent buffered-tail loss. Under STRICT durability the
+/// engine keeps emitting the embedding [`OP_CREATE`] (the data write is not
+/// fsynced before ack, so the redo embed is the only durable copy). Eliminates
+/// the create double-write (record bytes written to both the device and the
+/// WAL) under buffered mode. See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`
+/// §4 and [`RedoOp::CreateV2`].
+const OP_CREATE_V2: u8 = 39;
+
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `Create` redo entry. Bitcoin transactions in practice rarely have
 /// more than a handful of conflicting parents; a wire-controlled
@@ -685,6 +699,39 @@ pub enum RedoOp {
         record_bytes: Arc<[u8]>,
         /// Parent transaction IDs whose conflicting-child lists must
         /// receive `tx_key.txid`. Empty when `is_conflicting` is false.
+        parent_txids: Vec<[u8; 32]>,
+    },
+    /// Index-only create (no embedded record bytes) — the buffered-durability
+    /// counterpart to [`Self::Create`]. Carries everything needed to rebuild the
+    /// index entry EXCEPT the record image: recovery reads the record back from
+    /// the data device at `record_offset` (verifying CRC + `tx_id`) instead of
+    /// rewriting it from the WAL. See [`OP_CREATE_V2`] for the durability
+    /// contract.
+    ///
+    /// Wire layout (after the type byte):
+    /// ```text
+    /// [tx_key:32]
+    /// [device_id:1]
+    /// [record_offset:8 LE]
+    /// [utxo_count:4 LE]
+    /// [is_conflicting:1]
+    /// [parent_txids_count:2 LE]
+    /// [parent_txids:32 * parent_txids_count]
+    /// ```
+    CreateV2 {
+        /// Primary key of the new transaction.
+        tx_key: TxKey,
+        /// Store (device) the new record was placed on.
+        device_id: u8,
+        /// Device byte offset where the record starts (recovery reads it back).
+        record_offset: u64,
+        /// Number of UTXO slots in the record.
+        utxo_count: u32,
+        /// Whether this create marks the tx as CONFLICTING (controls parent
+        /// conflicting-child link replay).
+        is_conflicting: bool,
+        /// Parent txids whose conflicting-child lists must receive `tx_key.txid`.
+        /// Empty when `is_conflicting` is false.
         parent_txids: Vec<[u8; 32]>,
     },
     Delete {
@@ -981,6 +1028,7 @@ impl RedoOp {
             RedoOp::PruneSlotIfSpentBy { .. } => OP_PRUNE_SLOT_IF_SPENT_BY,
             RedoOp::ReplicaCreate { .. } => OP_REPLICA_CREATE,
             RedoOp::Create { .. } => OP_CREATE,
+            RedoOp::CreateV2 { .. } => OP_CREATE_V2,
             RedoOp::Delete { .. } => OP_DELETE,
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
             RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
@@ -1024,6 +1072,7 @@ impl RedoOp {
             | RedoOp::PruneSlotIfSpentBy { tx_key, .. }
             | RedoOp::ReplicaCreate { tx_key, .. }
             | RedoOp::Create { tx_key, .. }
+            | RedoOp::CreateV2 { tx_key, .. }
             | RedoOp::Delete { tx_key, .. }
             | RedoOp::SetConflicting { tx_key, .. }
             | RedoOp::SetLocked { tx_key, .. }
@@ -1099,6 +1148,7 @@ impl RedoOp {
             | RedoOp::PruneSlotIfSpentBy { .. }
             | RedoOp::ReplicaCreate { .. }
             | RedoOp::Create { .. }
+            | RedoOp::CreateV2 { .. }
             | RedoOp::Delete { .. }
             | RedoOp::AppendConflictingChild { .. }
             | RedoOp::RemoveConflictingChild { .. }
@@ -1294,6 +1344,25 @@ impl RedoOp {
                 let record_len = record_bytes.len() as u32;
                 buf.extend_from_slice(&record_len.to_le_bytes());
                 buf.extend_from_slice(record_bytes);
+                let parents = parent_txids.len() as u16;
+                buf.extend_from_slice(&parents.to_le_bytes());
+                for ptx in parent_txids {
+                    buf.extend_from_slice(ptx);
+                }
+            }
+            RedoOp::CreateV2 {
+                tx_key,
+                device_id,
+                record_offset,
+                utxo_count,
+                is_conflicting,
+                parent_txids,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.push(*device_id);
+                buf.extend_from_slice(&record_offset.to_le_bytes());
+                buf.extend_from_slice(&utxo_count.to_le_bytes());
+                buf.push(if *is_conflicting { 1 } else { 0 });
                 let parents = parent_txids.len() as u16;
                 buf.extend_from_slice(&parents.to_le_bytes());
                 for ptx in parent_txids {
@@ -1734,6 +1803,43 @@ impl RedoOp {
                     utxo_count,
                     is_conflicting,
                     record_bytes,
+                    parent_txids,
+                })
+            }
+            OP_CREATE_V2 if data.len() >= 48 => {
+                // Layout: tx_key(32) + device_id(1) + record_offset(8)
+                //       + utxo_count(4) + is_conflicting(1)
+                //       + parents_count(2) + parents(32*M)
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let device_id = data[32];
+                let record_offset = u64::from_le_bytes(data[33..41].try_into().unwrap());
+                let utxo_count = u32::from_le_bytes(data[41..45].try_into().unwrap());
+                let is_conflicting = data[45] != 0;
+                let parents_count_raw =
+                    u16::from_le_bytes(data[46..48].try_into().unwrap()) as usize;
+                let parents_end = 48usize.checked_add(parents_count_raw.checked_mul(32)?)?;
+                if data.len() < parents_end {
+                    return None;
+                }
+                // Same bound as OP_CREATE (F-G4-006): cap parents so a corrupt
+                // entry cannot pre-allocate unbounded [u8; 32] slots.
+                if parents_count_raw > MAX_CREATE_PARENTS {
+                    return None;
+                }
+                let mut parent_txids: Vec<[u8; 32]> = Vec::with_capacity(parents_count_raw);
+                for i in 0..parents_count_raw {
+                    let off = 48 + i * 32;
+                    let mut ptx = [0u8; 32];
+                    ptx.copy_from_slice(&data[off..off + 32]);
+                    parent_txids.push(ptx);
+                }
+                Some(RedoOp::CreateV2 {
+                    tx_key: TxKey { txid },
+                    device_id,
+                    record_offset,
+                    utxo_count,
+                    is_conflicting,
                     parent_txids,
                 })
             }
@@ -5515,6 +5621,58 @@ mod tests {
             record_bytes: big.into(),
             parent_txids: vec![[0xEE; 32]; 3],
         });
+    }
+
+    /// Phase 1 log-structured: the index-only `RedoOp::CreateV2` (no embedded
+    /// record bytes) must round-trip with all fields intact.
+    #[test]
+    fn round_trip_create_index_only_minimal() {
+        assert_round_trip(RedoOp::CreateV2 {
+            tx_key: make_txid(0x93),
+            device_id: 2,
+            record_offset: 0x4000,
+            utxo_count: 1,
+            is_conflicting: false,
+            parent_txids: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn round_trip_create_index_only_with_conflicting_parents() {
+        let parents: Vec<[u8; 32]> = (10..16u8).map(make_txid).map(|k| k.txid).collect();
+        assert_round_trip(RedoOp::CreateV2 {
+            tx_key: make_txid(0x94),
+            device_id: 7,
+            record_offset: 0xDEAD_0000,
+            utxo_count: 42,
+            is_conflicting: true,
+            parent_txids: parents,
+        });
+    }
+
+    /// CreateV2 and Create must use DISTINCT opcodes (the recovery path routes
+    /// them to different replay handlers).
+    #[test]
+    fn create_v2_opcode_differs_from_create() {
+        let v2 = RedoOp::CreateV2 {
+            tx_key: make_txid(0x95),
+            device_id: 0,
+            record_offset: 0x5000,
+            utxo_count: 3,
+            is_conflicting: false,
+            parent_txids: Vec::new(),
+        };
+        let v1 = RedoOp::Create {
+            tx_key: make_txid(0x95),
+            device_id: 0,
+            record_offset: 0x5000,
+            utxo_count: 3,
+            is_conflicting: false,
+            record_bytes: vec![0u8; 100].into(),
+            parent_txids: Vec::new(),
+        };
+        assert_ne!(v2.op_type(), v1.op_type());
+        assert_eq!(v2.op_type(), OP_CREATE_V2);
     }
 
     /// PERF: `RedoOp::Create.record_bytes` was changed from `Vec<u8>` to

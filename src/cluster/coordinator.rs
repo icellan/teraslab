@@ -6513,7 +6513,9 @@ pub fn redo_entry_to_replica_op(
                 child_txid: *child_txid,
             })
         }
-        RedoOp::ReplicaCreate { tx_key, .. } | RedoOp::Create { tx_key, .. } => {
+        RedoOp::ReplicaCreate { tx_key, .. }
+        | RedoOp::Create { tx_key, .. }
+        | RedoOp::CreateV2 { tx_key, .. } => {
             // A record created after the baseline snapshot must be sent as a
             // delta, otherwise the target never receives it. We read the full
             // current record state from the engine (metadata, UTXOs, cold data)
@@ -6756,6 +6758,7 @@ fn shard_membership_changed_in_window(
         .any(|e| match &e.op {
             RedoOp::ReplicaCreate { tx_key, .. }
             | RedoOp::Create { tx_key, .. }
+            | RedoOp::CreateV2 { tx_key, .. }
             | RedoOp::Delete { tx_key, .. } => ShardTable::shard_for_key(tx_key) == shard,
             _ => false,
         }))

@@ -557,7 +557,7 @@ impl Engine {
     /// `true` => append the secondary intent without an ack-path fsync and let
     /// the background flusher / checkpoint coalesce it durable; `false` (strict)
     /// => fsync the intent before the redb commit, per round.
-    fn redo_buffered(&self) -> bool {
+    pub(crate) fn redo_buffered(&self) -> bool {
         self.redo_buffered
             .load(std::sync::atomic::Ordering::Acquire)
     }
@@ -700,6 +700,7 @@ impl Engine {
         use crate::redo::RedoOp;
         match op {
             RedoOp::Create { device_id, .. }
+            | RedoOp::CreateV2 { device_id, .. }
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
@@ -725,6 +726,7 @@ impl Engine {
         use crate::redo::RedoOp;
         match op {
             RedoOp::Create { device_id, .. }
+            | RedoOp::CreateV2 { device_id, .. }
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
@@ -804,6 +806,9 @@ impl Engine {
             for op in ops {
                 match op {
                     crate::redo::RedoOp::Create {
+                        tx_key, device_id, ..
+                    }
+                    | crate::redo::RedoOp::CreateV2 {
                         tx_key, device_id, ..
                     }
                     | crate::redo::RedoOp::ReplicaCreate {

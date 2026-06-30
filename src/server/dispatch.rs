@@ -6203,6 +6203,9 @@ fn handle_create_batch(
         h.create_reserve_latency.record_since(reserve_start);
     }
 
+    // Snapshot the durability mode once for the batch: buffered → index-only
+    // CreateV2 redo (read device on replay); strict → embedding Create.
+    let create_redo_buffered = engine.redo_buffered();
     for (pos, pending) in pending_items.into_iter().enumerate() {
         let Some(region) = region_by_pos[pos].take() else {
             errors.push(BatchItemError {
@@ -6221,21 +6224,40 @@ fn handle_create_batch(
         } else {
             Vec::new()
         };
-        redo_ops.push(RedoOp::Create {
-            tx_key: key,
-            device_id,
-            record_offset: region.offset,
-            utxo_count: pending.utxo_count,
-            is_conflicting: pending.create_req.conflicting,
-            // PERF: `record_bytes` is `Arc<[u8]>`, so this clone is a refcount
-            // bump — NOT a record copy. The same allocation is retained on
-            // ValidCreate (moved below) for the coalesced bulk device write
-            // (Phase 2b). The redo append still serializes its own bytes into
-            // the log buffer; the per-op CLONE the journaling path does
-            // (engine `append_redo_ops_routed`, `pending_entries`) is now O(1).
-            record_bytes: std::sync::Arc::clone(&pending.record_bytes),
-            parent_txids,
-        });
+        // Phase 1 log-structured lever: under BUFFERED redo durability the data
+        // device write and the redo entry are flushed on the same cadence, so the
+        // redo need not embed the record bytes — recovery reads them back from the
+        // device (replay_create_v2). This drops the create double-write (bytes
+        // written to both device and WAL). Under STRICT durability the data write
+        // is not fsynced before ack, so the WAL embed is the only durable copy —
+        // keep emitting RedoOp::Create. The device write happens either way
+        // (record_bytes is moved into ValidCreate below for the coalesced write).
+        if create_redo_buffered {
+            redo_ops.push(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id,
+                record_offset: region.offset,
+                utxo_count: pending.utxo_count,
+                is_conflicting: pending.create_req.conflicting,
+                parent_txids,
+            });
+        } else {
+            redo_ops.push(RedoOp::Create {
+                tx_key: key,
+                device_id,
+                record_offset: region.offset,
+                utxo_count: pending.utxo_count,
+                is_conflicting: pending.create_req.conflicting,
+                // PERF: `record_bytes` is `Arc<[u8]>`, so this clone is a refcount
+                // bump — NOT a record copy. The same allocation is retained on
+                // ValidCreate (moved below) for the coalesced bulk device write
+                // (Phase 2b). The redo append still serializes its own bytes into
+                // the log buffer; the per-op CLONE the journaling path does
+                // (engine `append_redo_ops_routed`, `pending_entries`) is now O(1).
+                record_bytes: std::sync::Arc::clone(&pending.record_bytes),
+                parent_txids,
+            });
+        }
         valid_items.push(ValidCreate {
             idx: pending.idx,
             create_req: pending.create_req,
