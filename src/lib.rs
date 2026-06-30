@@ -37,5 +37,6 @@ pub mod replication;
 pub mod segment_allocator;
 pub mod server;
 pub mod storage;
+pub mod streaming;
 pub mod subdevice;
 pub mod visibility;
