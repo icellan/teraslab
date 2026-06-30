@@ -2040,6 +2040,16 @@ pub trait RecordAllocator: Send {
     /// Whether append-only mode is enabled.
     fn is_append_only(&self) -> bool;
 
+    /// Whether this is the LOG-STRUCTURED (segment) allocator, whose records are
+    /// relocated to a new append-cursor offset on mutation (relocate-on-spend)
+    /// rather than updated in place. Default `false` (the in-place
+    /// [`SlotAllocator`]); the segment allocator overrides it. The engine caches
+    /// this per store (like packed-ness) to branch the spend write path without
+    /// locking the allocator on the hot path.
+    fn is_log_structured(&self) -> bool {
+        false
+    }
+
     /// Recovery: ensure the allocation frontier is at least `end` (the end offset
     /// of the highest live record), so post-checkpoint records are not overwritten
     /// by a fresh allocation. Default no-op: the in-place [`SlotAllocator`]
@@ -2145,6 +2155,9 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn is_append_only(&self) -> bool {
         (**self).is_append_only()
+    }
+    fn is_log_structured(&self) -> bool {
+        (**self).is_log_structured()
     }
     fn recover_frontier_at_least(&mut self, end: u64) {
         (**self).recover_frontier_at_least(end)

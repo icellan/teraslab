@@ -1020,6 +1020,9 @@ impl RecordAllocator for SegmentAllocator {
     fn is_append_only(&self) -> bool {
         true
     }
+    fn is_log_structured(&self) -> bool {
+        true
+    }
     fn recover_frontier_at_least(&mut self, end: u64) {
         self.set_cursor_at_least(end);
     }

@@ -104,6 +104,12 @@ pub(crate) struct Store {
     /// (gate #2: pad to `RECORD_ALIGN` in packed mode, full block otherwise)
     /// without locking the allocator mutex on every write.
     packed: bool,
+    /// Cached log-structured-ness (the segment engine), snapshotted at
+    /// construction. When `true`, the spend write path RELOCATES the record to a
+    /// new append-cursor offset instead of an in-place RMW. Like `packed`, fixed
+    /// for the store's lifetime, so the hot path branches on it without locking
+    /// the allocator. See [`crate::allocator::RecordAllocator::is_log_structured`].
+    log_structured: bool,
 }
 
 pub struct Engine {
@@ -378,11 +384,13 @@ impl Engine {
             .map(|(device, allocator)| {
                 let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
                 let packed = allocator.is_packed();
+                let log_structured = allocator.is_log_structured();
                 Store {
                     device,
                     device_ptr,
                     allocator: parking_lot::Mutex::new(allocator),
                     packed,
+                    log_structured,
                 }
             })
             .collect();
@@ -419,6 +427,7 @@ impl Engine {
         // lock table so the two granularities line up.
         let visibility = crate::visibility::VisibilityBarrier::new(locks.stripe_count());
         let store0_packed = allocator.is_packed();
+        let store0_log_structured = allocator.is_log_structured();
         // Shard both secondary indexes at the SAME count as the primary index so
         // a key routes to the same shard number everywhere. `shard_in_memory`
         // re-shards the (already recovered/reconciled) single in-memory backend
@@ -435,6 +444,7 @@ impl Engine {
                 device_ptr,
                 allocator: parking_lot::Mutex::new(allocator),
                 packed: store0_packed,
+                log_structured: store0_log_structured,
             }],
             placer,
             index,
@@ -1885,6 +1895,19 @@ impl Engine {
     #[inline]
     pub(crate) fn store_is_packed(&self, device_id: u8) -> bool {
         self.stores[device_id as usize].packed
+    }
+
+    /// Whether store `device_id` uses the LOG-STRUCTURED (segment) engine, in
+    /// which a spend RELOCATES the record to a new append-cursor offset instead
+    /// of an in-place RMW. Cached at construction (no allocator lock). See
+    /// [`crate::allocator::RecordAllocator::is_log_structured`].
+    ///
+    /// Staged groundwork: the spend hot path branches on this in increment 4c
+    /// (relocate-on-spend wiring). Allowed-unused until then.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn store_is_log_structured(&self, device_id: u8) -> bool {
+        self.stores[device_id as usize].log_structured
     }
 
     /// Fsync the data device of EVERY store.
@@ -9950,6 +9973,41 @@ mod tests {
                 .all(|payload| *payload == winning_spending_data),
             "every AlreadySpent error must return the winning spending_data"
         );
+    }
+
+    /// Increment 4b-1: the engine caches per-store log-structured-ness from the
+    /// allocator so the spend path can branch (relocate vs in-place) without
+    /// locking the allocator on the hot path.
+    #[test]
+    fn store_log_structured_reflects_the_allocator_engine() {
+        // Segment allocator → log-structured store.
+        let seg_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg = crate::segment_allocator::SegmentAllocator::new(seg_dev.clone(), 8 * 1024 * 1024)
+            .unwrap();
+        let seg_engine = Engine::new(
+            seg_dev,
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert!(seg_engine.store_is_log_structured(0));
+
+        // In-place (SlotAllocator) → NOT log-structured.
+        let slot_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let slot = SlotAllocator::new(slot_dev.clone()).unwrap();
+        let slot_engine = Engine::new(
+            slot_dev,
+            Index::new(64).unwrap(),
+            slot,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert!(!slot_engine.store_is_log_structured(0));
     }
 
     #[test]
