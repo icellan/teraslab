@@ -7948,8 +7948,24 @@ fn handle_mark_longest_chain_batch(
 // ---------------------------------------------------------------------------
 
 /// Batch sizes at or above this fan out across the read pool; smaller batches
-/// stay serial to avoid pool-dispatch overhead dominating a trivial lookup.
-const READ_FANOUT_THRESHOLD: usize = 8;
+/// stay serial.
+///
+/// PERF (2026-07-01, RAM-disk profile): this was `8`, which fanned nearly every
+/// batch into the rayon read pool. But the dispatch pool already runs
+/// `cores * 8` (~96) workers processing RPCs CONCURRENTLY, so under realistic
+/// high-connection load each RPC's rayon fan-out nests a second layer of
+/// parallelism on top — `cores`-sized read pool, contended by ~96 dispatch
+/// workers — and the rayon join/steal/sleep machinery (`bridge_producer_consumer`,
+/// `join_context`, `Sleep::sleep`) DOMINATED the on-CPU profile (the
+/// "CPU/dispatch-coordination cap"). Cross-RPC parallelism from the dispatch pool
+/// already keeps the cores busy, so the within-RPC fan-out was pure
+/// oversubscription overhead for typical (tens-to-hundreds-item) batches.
+/// Raising the threshold to 512 keeps fan-out only for the genuinely huge batches
+/// (a big block's GET) where intra-batch parallelism pays even with the overhead,
+/// and lets everything else run serially on its already-parallel dispatch worker.
+/// Measured on a RAM disk (I/O removed, coordination-bound): saturating recipe
+/// went 72.8k -> 89.7k ops/s (+23%) and create p99 125 -> 68 ms (-46%).
+const READ_FANOUT_THRESHOLD: usize = 512;
 
 /// Dedicated work-stealing pool for intra-batch read fan-out. `None` if the
 /// pool failed to build (then reads serve serially — correct, just single-core
