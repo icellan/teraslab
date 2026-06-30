@@ -42,13 +42,14 @@ use teraslab::replication::durable::{ReplicationIntentRange, ReplicationIntentTr
 fn fresh_state() -> (
     Arc<MemoryDevice>,
     Arc<MemoryDevice>,
-    SlotAllocator,
+    teraslab::allocator::BoxedAllocator,
     ShardedIndex,
     RedoLog,
 ) {
     let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-    let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+    let alloc: teraslab::allocator::BoxedAllocator =
+        Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
     let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let redo = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 1024 * 1024).unwrap();
     (data_dev, redo_dev, alloc, index, redo)
@@ -669,7 +670,7 @@ fn inline_block_ids(meta: &TxMetadata) -> Vec<u32> {
 /// Append Create for a fresh record plus `n` SetMined entries
 /// (block_ids 1..=n) to the WAL. Returns (key, record_offset).
 fn wal_create_plus_set_mined(
-    alloc: &mut SlotAllocator,
+    alloc: &mut teraslab::allocator::BoxedAllocator,
     redo: &mut RedoLog,
     txid_byte: u8,
     n: u32,
@@ -913,7 +914,8 @@ fn boundary_compensate_unset_mined_skips_overflow_resident_duplicate() {
 fn boundary_set_mined_overflow_realloc_does_not_clobber_neighbor() {
     let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 512).unwrap());
     let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 512).unwrap());
-    let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+    let mut alloc: teraslab::allocator::BoxedAllocator =
+        Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
     let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut redo =
         RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();

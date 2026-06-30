@@ -29,6 +29,7 @@ pub use sharded::ShardedIndex;
 pub use sharded_secondary::{ShardedDahIndex, ShardedSecondary, ShardedUnminedIndex};
 pub use unmined_index::{UnminedIndex, UnminedRedoEntry};
 
+#[cfg(test)]
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::record::{DeletedRecordMarker, METADATA_MAGIC, METADATA_SIZE, TxMetadata};
@@ -694,7 +695,7 @@ impl Index {
     /// Returns `(DahIndex, UnminedIndex)` populated from record metadata.
     pub fn rebuild_secondary(
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn crate::allocator::RecordAllocator,
     ) -> Result<(DahIndex, UnminedIndex)> {
         let mut dah = DahIndex::new();
         let mut unmined = UnminedIndex::new();

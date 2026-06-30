@@ -308,7 +308,8 @@ impl SimulatedNode {
         let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100_000).unwrap());
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
-        let mut alloc = SlotAllocator::new(self.device.clone()).unwrap();
+        let mut alloc: teraslab::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(self.device.clone()).unwrap());
 
         let stats = recover_all_with_allocator(
             &*self.device,

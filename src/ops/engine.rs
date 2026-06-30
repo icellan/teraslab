@@ -344,7 +344,7 @@ impl Engine {
         Self::new_inner(
             device,
             index,
-            allocator,
+            Box::new(allocator),
             locks,
             dah_index.into(),
             unmined_index.into(),
@@ -358,7 +358,7 @@ impl Engine {
     /// index entry's `device_id`. Single-device callers use [`Engine::new`].
     pub fn new_multi_store(
         primary_device: Arc<dyn BlockDevice>,
-        primary_allocator: impl RecordAllocator + 'static,
+        primary_allocator: BoxedAllocator,
         aux: Vec<(Arc<dyn BlockDevice>, BoxedAllocator)>,
         index: ShardedIndex,
         locks: StripedLocks,
@@ -402,7 +402,7 @@ impl Engine {
     fn new_inner(
         device: Arc<dyn BlockDevice>,
         index: ShardedIndex,
-        allocator: impl RecordAllocator + 'static,
+        allocator: BoxedAllocator,
         locks: StripedLocks,
         dah_index: DahBackend,
         unmined_index: UnminedBackend,
@@ -433,7 +433,7 @@ impl Engine {
             stores: vec![Store {
                 device,
                 device_ptr,
-                allocator: parking_lot::Mutex::new(Box::new(allocator) as BoxedAllocator),
+                allocator: parking_lot::Mutex::new(allocator),
                 packed: store0_packed,
             }],
             placer,
@@ -8413,7 +8413,7 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         let engine = Engine::new_multi_store(
             dev0.clone(),
-            alloc0,
+            Box::new(alloc0),
             vec![(
                 dev1.clone(),
                 Box::new(alloc1) as crate::allocator::BoxedAllocator,
@@ -13276,7 +13276,7 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         Arc::new(Engine::new_multi_store(
             dev0,
-            alloc0,
+            Box::new(alloc0),
             vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
@@ -13377,7 +13377,7 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         let mut engine = Engine::new_multi_store(
             dev0.clone(),
-            alloc0,
+            Box::new(alloc0),
             vec![(
                 dev1.clone(),
                 Box::new(alloc1) as crate::allocator::BoxedAllocator,
@@ -13467,7 +13467,7 @@ mod tests {
         let a0 = SlotAllocator::recover(dev0.clone()).unwrap();
         let a1 = SlotAllocator::recover(dev1.clone()).unwrap();
         let devices: Vec<Arc<dyn BlockDevice>> = vec![dev0.clone(), dev1.clone()];
-        let allocators = vec![a0, a1];
+        let allocators: Vec<crate::allocator::BoxedAllocator> = vec![Box::new(a0), Box::new(a1)];
         let rebuilt =
             ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16, 0).unwrap();
 
@@ -13483,7 +13483,7 @@ mod tests {
         let alloc1 = SlotAllocator::recover(devices[1].clone()).unwrap();
         let engine2 = Engine::new_multi_store(
             devices[0].clone(),
-            alloc0,
+            Box::new(alloc0),
             vec![(
                 devices[1].clone(),
                 Box::new(alloc1) as crate::allocator::BoxedAllocator,
@@ -13777,7 +13777,7 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         let engine = Engine::new_multi_store(
             dev0,
-            alloc0,
+            Box::new(alloc0),
             vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),

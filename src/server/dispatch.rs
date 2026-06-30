@@ -10290,7 +10290,7 @@ mod tests {
             let index = crate::index::ShardedIndex::from_single(Index::new(10000).unwrap().into());
             let engine = Engine::new_multi_store(
                 dev0,
-                alloc0,
+                Box::new(alloc0),
                 aux_stores,
                 index,
                 StripedLocks::new(1024),
@@ -22324,7 +22324,8 @@ mod tests {
             let redo_log =
                 crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, redo_size)
                     .unwrap();
-            let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+            let mut alloc: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap());
             let primary: PrimaryBackend = Index::new(10000).unwrap().into();
             let index = crate::index::ShardedIndex::from_single(primary);
             let mut dah = DahBackend::new_in_memory();

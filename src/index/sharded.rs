@@ -27,7 +27,6 @@ use std::sync::OnceLock;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::allocator::SlotAllocator;
 use crate::cluster::shards::ShardTable;
 use crate::device::BlockDevice;
 use crate::index::backend::PrimaryBackend;
@@ -1263,7 +1262,7 @@ impl ShardedIndex {
     /// (hash-table allocation failure when routing entries to shards).
     pub fn rebuild_in_memory(
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn crate::allocator::RecordAllocator,
         shard_count: usize,
         expected_records: usize,
     ) -> Result<Self, IndexError> {
@@ -1304,7 +1303,7 @@ impl ShardedIndex {
     /// still allocates steady-state capacity and avoids a resize storm.
     pub fn rebuild_in_memory_multi_store(
         devices: &[std::sync::Arc<dyn BlockDevice>],
-        allocators: &[SlotAllocator],
+        allocators: &[crate::allocator::BoxedAllocator],
         shard_count: usize,
         expected_records: usize,
     ) -> Result<Self, IndexError> {
@@ -1317,7 +1316,7 @@ impl ShardedIndex {
         let mut singles = Vec::with_capacity(devices.len());
         let mut total = 0usize;
         for (dev, alloc) in devices.iter().zip(allocators.iter()) {
-            let single = PrimaryBackend::rebuild(&**dev, alloc)?;
+            let single = PrimaryBackend::rebuild(&**dev, &**alloc)?;
             total += single.len();
             singles.push(single);
         }
@@ -2863,7 +2862,8 @@ mod tests {
         let (dev1, alloc1, keys1) = seed(20, 1);
 
         let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![dev0, dev1];
-        let allocators = vec![alloc0, alloc1];
+        let allocators: Vec<crate::allocator::BoxedAllocator> =
+            vec![Box::new(alloc0), Box::new(alloc1)];
         let sharded =
             ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16, 0).unwrap();
 

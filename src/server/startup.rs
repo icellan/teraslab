@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::allocator::{AllocatorError, SlotAllocator};
-use crate::config::IndexConfig;
+use crate::allocator::{AllocatorError, BoxedAllocator, RecordAllocator, SlotAllocator};
+use crate::config::{IndexConfig, StorageEngine};
 use crate::device::BlockDevice;
 use crate::index::{
     DahBackend, DahIndex, IndexError, PrimaryBackend, ShardedIndex, UnminedBackend, UnminedIndex,
@@ -334,6 +334,45 @@ pub fn recover_or_create_allocator(
     }
 }
 
+/// Recover-or-create the per-store allocator for the configured storage engine,
+/// returning it boxed as a [`BoxedAllocator`] so the engine can hold either the
+/// in-place [`SlotAllocator`] or the log-structured
+/// [`crate::segment_allocator::SegmentAllocator`].
+///
+/// Each engine stamps a distinct on-disk header magic, so opening a device with
+/// the wrong engine fails closed ([`AllocatorError::CorruptedHeader`]) rather
+/// than misreading it. `NoPersistedState` (all-zero header) is the only "fresh"
+/// signal; every other recover error propagates so a corrupt/foreign header
+/// refuses to start.
+pub fn recover_or_create_boxed_allocator(
+    device: Arc<dyn BlockDevice>,
+    engine: StorageEngine,
+    segment_size: u64,
+) -> Result<(BoxedAllocator, AllocatorOrigin), AllocatorError> {
+    match engine {
+        StorageEngine::InPlace => {
+            let (alloc, origin) = recover_or_create_allocator(device)?;
+            Ok((Box::new(alloc), origin))
+        }
+        StorageEngine::Segment => {
+            use crate::segment_allocator::SegmentAllocator;
+            match SegmentAllocator::recover(device.clone()) {
+                Ok(alloc) => Ok((Box::new(alloc), AllocatorOrigin::Recovered)),
+                Err(crate::segment_allocator::SegmentAllocatorError::NoPersistedState) => {
+                    tracing::info!(
+                        "segment allocator header region is all zeros — fresh device, \
+                         creating a new segment allocator"
+                    );
+                    let alloc = SegmentAllocator::new(device, segment_size)
+                        .map_err(crate::allocator::AllocatorError::from)?;
+                    Ok((Box::new(alloc), AllocatorOrigin::Fresh))
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+}
+
 /// Reconcile a store's allocator packed-ness with the configured `packed`
 /// flag, honoring the rule that the DEVICE's on-disk format always wins.
 ///
@@ -351,7 +390,7 @@ pub fn recover_or_create_allocator(
 ///
 /// `store` is the store index, used only for log context.
 pub fn apply_packed_mode(
-    alloc: &mut SlotAllocator,
+    alloc: &mut dyn RecordAllocator,
     origin: AllocatorOrigin,
     config_packed: bool,
     store: usize,
@@ -408,7 +447,7 @@ pub fn apply_packed_mode(
 pub fn load_primary_index_redb(
     config: &IndexConfig,
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
     if crate::index::migration::import_in_progress(config) {
         let sentinel_path = crate::index::migration::import_sentinel_path(&config.redb_path);
@@ -459,7 +498,7 @@ pub fn load_primary_index_file_backed(
     path: &Path,
     expected_records: usize,
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
     let restore_suffix = if path.exists() {
         match PrimaryBackend::restore_file_backed(path, expected_records) {
@@ -495,7 +534,7 @@ pub fn load_primary_index_file_backed(
 /// error rather than starting with an empty index.
 pub fn load_primary_index_in_memory(
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
     PrimaryBackend::rebuild(device, allocator).map_err(|e| RebuildError::InMemoryPrimary {
         rebuild_err: format!("{e}"),
@@ -527,7 +566,7 @@ pub fn load_primary_index_in_memory(
 /// underlying [`IndexError`].
 pub fn load_sharded_index_in_memory(
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
     shard_count: usize,
     expected_records: usize,
 ) -> Result<ShardedIndex, RebuildError> {
@@ -557,7 +596,7 @@ pub fn load_sharded_index_in_memory(
 /// routing fails.
 pub fn load_sharded_index_in_memory_multi(
     devices: &[std::sync::Arc<dyn BlockDevice>],
-    allocators: &[SlotAllocator],
+    allocators: &[BoxedAllocator],
     shard_count: usize,
     expected_records: usize,
 ) -> Result<ShardedIndex, RebuildError> {
@@ -575,7 +614,7 @@ pub fn load_sharded_index_in_memory_multi(
 /// then rejects endpoints that depend on the missing data.
 pub fn rebuild_in_memory_secondaries(
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> SecondaryLoadOutcome {
     match PrimaryBackend::rebuild_secondary(device, allocator) {
         Ok((dah, unmined)) => SecondaryLoadOutcome {

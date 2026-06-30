@@ -2594,7 +2594,7 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         let mut engine = Engine::new_multi_store(
             dev0,
-            alloc0,
+            Box::new(alloc0),
             vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             ShardedIndex::from_single(Index::new(1024).unwrap().into()),
             StripedLocks::new(64),

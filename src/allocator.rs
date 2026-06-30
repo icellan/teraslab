@@ -2062,6 +2062,99 @@ pub trait RecordAllocator: Send {
 /// in-place or the log-structured allocator.
 pub type BoxedAllocator = Box<dyn RecordAllocator>;
 
+/// Blanket impl so a `Box<dyn RecordAllocator>` is itself a [`RecordAllocator`].
+/// Lets a [`BoxedAllocator`] be passed anywhere an `impl RecordAllocator` is
+/// expected (e.g. the `Engine` constructors) and a `&[BoxedAllocator]` satisfy
+/// generic allocator-slice bounds — forwarding every call to the inner trait
+/// object.
+impl RecordAllocator for BoxedAllocator {
+    fn allocate(&mut self, size: u64) -> Result<u64> {
+        (**self).allocate(size)
+    }
+    fn allocate_batch(&mut self, sizes: &[u64]) -> Result<Vec<Option<AllocatedRegion>>> {
+        (**self).allocate_batch(sizes)
+    }
+    fn reserve_batch(&mut self, sizes: &[u64]) -> Result<PendingBatchAllocation> {
+        (**self).reserve_batch(sizes)
+    }
+    fn commit_pending(&mut self, pending: PendingBatchAllocation) {
+        (**self).commit_pending(pending)
+    }
+    fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
+        (**self).rollback_pending(pending)
+    }
+    fn free(&mut self, offset: u64, size: u64) -> Result<()> {
+        (**self).free(offset, size)
+    }
+    fn persist(&self) -> Result<()> {
+        (**self).persist()
+    }
+    fn persist_header_no_sync(&self) -> Result<()> {
+        (**self).persist_header_no_sync()
+    }
+    fn replay_redo(&mut self, op: &RedoOp) -> bool {
+        (**self).replay_redo(op)
+    }
+    fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
+        (**self).is_allocated_range(offset, size)
+    }
+    fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)> {
+        (**self).free_region_containing(offset)
+    }
+    fn free_region_count(&self) -> usize {
+        (**self).free_region_count()
+    }
+    fn stats(&self) -> AllocatorStats {
+        (**self).stats()
+    }
+    fn next_offset(&self) -> u64 {
+        (**self).next_offset()
+    }
+    fn data_region_start(&self) -> u64 {
+        (**self).data_region_start()
+    }
+    fn device_alignment(&self) -> usize {
+        (**self).device_alignment()
+    }
+    fn device_id(&self) -> [u8; 16] {
+        (**self).device_id()
+    }
+    fn device_id_hex(&self) -> String {
+        (**self).device_id_hex()
+    }
+    fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>) {
+        (**self).set_redo_log(redo_log)
+    }
+    fn set_redo_device_id(&mut self, device_id: u8) {
+        (**self).set_redo_device_id(device_id)
+    }
+    fn redo_device_id(&self) -> u8 {
+        (**self).redo_device_id()
+    }
+    fn has_redo_log(&self) -> bool {
+        (**self).has_redo_log()
+    }
+    fn set_packed(&mut self, packed: bool) {
+        (**self).set_packed(packed)
+    }
+    fn is_packed(&self) -> bool {
+        (**self).is_packed()
+    }
+    fn set_append_only(&mut self, append_only: bool) {
+        (**self).set_append_only(append_only)
+    }
+    fn is_append_only(&self) -> bool {
+        (**self).is_append_only()
+    }
+    fn recover_frontier_at_least(&mut self, end: u64) {
+        (**self).recover_frontier_at_least(end)
+    }
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn arm_fail_next_persist(&self) {
+        (**self).arm_fail_next_persist()
+    }
+}
+
 impl RecordAllocator for SlotAllocator {
     fn allocate(&mut self, size: u64) -> Result<u64> {
         SlotAllocator::allocate(self, size)

@@ -35,7 +35,7 @@
 //! matches. Replaying an already-applied operation is therefore safe
 //! across multiple recovery passes (e.g. crash mid-replay).
 
-use crate::allocator::{BoxedAllocator, SlotAllocator};
+use crate::allocator::BoxedAllocator;
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::index::{
     DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
@@ -506,7 +506,7 @@ pub fn recover_all_with_allocator(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
 ) -> Result<RecoveryStats, RecoveryError> {
     let (stats, _, _) = recover_all_with_allocator_collecting_pending_conflicts(
         device, redo_log, index, dah, unmined, allocator,
@@ -523,7 +523,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
 ) -> Result<
     (
         RecoveryStats,
@@ -564,7 +564,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
     full_secondary_rebuild: bool,
 ) -> Result<
     (
@@ -605,7 +605,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
 #[allow(clippy::too_many_arguments)]
 pub fn recover_all_multi_store(
     devices: &[std::sync::Arc<dyn BlockDevice>],
-    allocators: &mut [SlotAllocator],
+    allocators: &mut [BoxedAllocator],
     redo_logs: &mut [RedoLog],
     index: &ShardedIndex,
     dah: &mut DahBackend,
@@ -777,7 +777,7 @@ pub fn recover_all_multi_store(
 #[allow(clippy::too_many_arguments)]
 fn replay_one_recovery_entry(
     device: &dyn BlockDevice,
-    mut allocator: Option<&mut SlotAllocator>,
+    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
@@ -1016,7 +1016,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    mut allocator: Option<&mut SlotAllocator>,
+    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     mut progress: Option<(&mut RedoLog, u64)>,
     secondary_reconcile: SecondaryReconcile,
 ) -> Result<
@@ -2024,7 +2024,7 @@ fn replay_set_mined(
 fn replay_set_mined_with_allocator(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
-    mut allocator: Option<&mut SlotAllocator>,
+    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -3100,7 +3100,7 @@ fn replay_compensate_unset_mined(
 fn replay_compensate_unset_mined_with_allocator(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -3240,7 +3240,7 @@ enum RecoveryOverflowError {
 
 fn append_recovery_overflow_block_entry(
     device: &dyn BlockDevice,
-    allocator: &mut SlotAllocator,
+    allocator: &mut crate::allocator::BoxedAllocator,
     metadata: &mut TxMetadata,
     entry: BlockEntry,
 ) -> std::result::Result<(), RecoveryOverflowError> {
@@ -3271,7 +3271,7 @@ fn append_recovery_overflow_block_entry(
 /// `block_entry_count` reflect `entries`.
 fn write_recovery_overflow_entries(
     device: &dyn BlockDevice,
-    allocator: &mut SlotAllocator,
+    allocator: &mut crate::allocator::BoxedAllocator,
     metadata: &mut TxMetadata,
     entries: &[BlockEntry],
 ) -> std::result::Result<(), RecoveryOverflowError> {
@@ -3549,14 +3549,15 @@ mod tests {
         data_dev: Arc<MemoryDevice>,
         redo_dev: Arc<MemoryDevice>,
         index: ShardedIndex,
-        alloc: SlotAllocator,
+        alloc: crate::allocator::BoxedAllocator,
     }
 
     impl RecoveryTestHarness {
         fn new() -> Self {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+            let alloc: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
             let primary = PrimaryBackend::new_in_memory(1000).unwrap();
             let index = ShardedIndex::from_single(primary);
             Self {
@@ -4995,12 +4996,16 @@ mod tests {
         // one global sequence counter (as boot wires it).
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         // Build a record's bytes + allocate its region on the given store.
-        let build = |txid_byte: u8, alloc: &mut SlotAllocator| -> (TxKey, u64, Vec<u8>) {
+        let build = |txid_byte: u8,
+                     alloc: &mut crate::allocator::BoxedAllocator|
+         -> (TxKey, u64, Vec<u8>) {
             let utxo_count: u32 = 3;
             let mut txid = [0u8; 32];
             txid[0] = txid_byte;
@@ -5127,8 +5132,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         // Write a real on-device record on STORE 1 (as the replica's
@@ -5216,8 +5223,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         // Boot wiring: each store's allocator is tagged with its store index.
         alloc0.set_redo_device_id(0);
         alloc1.set_redo_device_id(1);
@@ -5364,8 +5373,10 @@ mod tests {
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
             let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-            let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-            let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+            let mut alloc0: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+            let mut alloc1: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(dev1.clone()).unwrap());
             alloc0.set_redo_device_id(0);
             alloc1.set_redo_device_id(1);
             // The original incarnation's region on store 0, the re-create's on store 1.
@@ -5487,8 +5498,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         alloc0.set_redo_device_id(0);
         alloc1.set_redo_device_id(1);
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
@@ -5638,11 +5651,11 @@ mod tests {
         const PER_STORE: u32 = 40;
 
         let mut devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
-        let mut allocators: Vec<SlotAllocator> = Vec::new();
+        let mut allocators: Vec<crate::allocator::BoxedAllocator> = Vec::new();
         for _ in 0..STORES {
             let dev: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            allocators.push(SlotAllocator::new(dev.clone()).unwrap());
+            allocators.push(Box::new(SlotAllocator::new(dev.clone()).unwrap()));
             devices.push(dev);
         }
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(8192).unwrap());
@@ -5773,8 +5786,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let dev1: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         // Write a record on `dev`/`alloc`, register it on store `device_id`, set
@@ -5782,7 +5797,7 @@ mod tests {
         let make = |txid_byte: u8,
                     device_id: u8,
                     dev: &Arc<dyn BlockDevice>,
-                    alloc: &mut SlotAllocator,
+                    alloc: &mut crate::allocator::BoxedAllocator,
                     dah_h: u32,
                     unmined_h: u32|
          -> TxKey {
@@ -5868,9 +5883,9 @@ mod tests {
         let mut unmined_full = UnminedBackend::new_in_memory();
         {
             let devices = [dev0.clone(), dev1.clone()];
-            let mut allocators = [
-                SlotAllocator::new(dev0.clone()).unwrap(),
-                SlotAllocator::new(dev1.clone()).unwrap(),
+            let mut allocators: [crate::allocator::BoxedAllocator; 2] = [
+                Box::new(SlotAllocator::new(dev0.clone()).unwrap()),
+                Box::new(SlotAllocator::new(dev1.clone()).unwrap()),
             ];
             let mut logs = build_logs();
             recover_all_multi_store(
@@ -5903,9 +5918,9 @@ mod tests {
         unmined_touch.insert(850, d, None).unwrap();
         {
             let devices = [dev0.clone(), dev1.clone()];
-            let mut allocators = [
-                SlotAllocator::new(dev0.clone()).unwrap(),
-                SlotAllocator::new(dev1.clone()).unwrap(),
+            let mut allocators: [crate::allocator::BoxedAllocator; 2] = [
+                Box::new(SlotAllocator::new(dev0.clone()).unwrap()),
+                Box::new(SlotAllocator::new(dev1.clone()).unwrap()),
             ];
             let mut logs = build_logs();
             recover_all_multi_store(
@@ -5968,14 +5983,16 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let dev1: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let make = |txid_byte: u8,
                     device_id: u8,
                     dev: &Arc<dyn BlockDevice>,
-                    alloc: &mut SlotAllocator,
+                    alloc: &mut crate::allocator::BoxedAllocator,
                     dah_h: u32,
                     unmined_h: u32|
          -> TxKey {
@@ -6058,7 +6075,8 @@ mod tests {
         // append a Create redo entry and recover.
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -6174,7 +6192,8 @@ mod tests {
     fn recover_all_rejects_create_offset_not_owned_by_allocator() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6234,7 +6253,7 @@ mod tests {
     /// names this offset, which now holds B's record.
     fn write_record_b_then_free_in_allocator(
         data_dev: &MemoryDevice,
-        alloc: &mut SlotAllocator,
+        alloc: &mut crate::allocator::BoxedAllocator,
         b_txid: [u8; 32],
         utxo_count: u32,
     ) -> u64 {
@@ -6266,7 +6285,8 @@ mod tests {
     fn recover_all_rejects_legacy_create_offset_not_owned_by_allocator() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6323,7 +6343,8 @@ mod tests {
     fn recover_all_legacy_create_tx_id_guard_rejects_alias() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6392,7 +6413,8 @@ mod tests {
     fn recover_offset_uniqueness_evicts_preexisting_snapshot_alias_via_reverse_map() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6502,7 +6524,8 @@ mod tests {
     fn replay_create_idempotent_on_double_recovery() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -6570,7 +6593,8 @@ mod tests {
     fn legacy_replay_create_populates_cached_fields_from_metadata() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -6652,7 +6676,8 @@ mod tests {
     fn legacy_replay_create_fails_closed_on_missing_record_bytes() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -7830,7 +7855,8 @@ mod tests {
         .unwrap();
 
         // Rebuild the allocator from snapshot.
-        let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut recovered: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         assert_eq!(recovered.free_region_count(), 0, "snapshot lacks the free");
 
         let mut dah = DahBackend::new_in_memory();
@@ -7871,7 +7897,8 @@ mod tests {
         })
         .unwrap();
 
-        let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut recovered: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         let before_next = recovered.next_offset();
 
         let mut dah = DahBackend::new_in_memory();
@@ -7924,7 +7951,8 @@ mod tests {
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
 
-        let mut once = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut once: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         recover_all_with_allocator(
             &*h.data_dev,
             &redo,
@@ -7935,7 +7963,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut twice = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut twice: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         for _ in 0..2 {
             recover_all_with_allocator(
                 &*h.data_dev,
@@ -8265,7 +8294,8 @@ mod tests {
 
         let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
 
         // 16-shard in-memory index. Enough capacity to avoid resizes.
         let index = ShardedIndex::new_in_memory(1024, 16).unwrap();
@@ -8365,7 +8395,8 @@ mod tests {
 
         let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
         let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
 
         // Two-shard index: every shard selection is a single bit flip under the
         // runtime seed, so there are exactly two shards.

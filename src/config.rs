@@ -625,6 +625,57 @@ pub struct StorageConfig {
     /// placement policy: it does not change the on-disk format and is NOT
     /// persisted, so a device can be reopened in either mode safely.
     pub append_only: bool,
+
+    /// Storage engine: `"in_place"` (default) uses the best-fit `SlotAllocator`;
+    /// `"segment"` uses the log-structured append-cursor `SegmentAllocator`
+    /// (creates append to a moving cursor; sequential writes; relocate + defrag in
+    /// later phases). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+    ///
+    /// The engine determines the on-disk allocator header format (distinct
+    /// magics), so a device formatted by one engine cannot be opened by the
+    /// other — switching engines requires a fresh device.
+    #[serde(deserialize_with = "deserialize_storage_engine")]
+    pub engine: StorageEngine,
+
+    /// Segment size in bytes for the `"segment"` engine (ignored by `"in_place"`).
+    /// Default 8 MiB. Must be a positive multiple of `device_alignment` and fit
+    /// the per-store data region.
+    #[serde(default = "default_segment_size")]
+    pub segment_size: u64,
+}
+
+/// Default segment size (8 MiB) for the segment storage engine.
+const fn default_segment_size() -> u64 {
+    8 * 1024 * 1024
+}
+
+/// On-disk storage engine selection (`[storage] engine`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StorageEngine {
+    /// Best-fit freelist allocator (records placed at home offsets, updated in
+    /// place). The historical default.
+    #[default]
+    InPlace,
+    /// Log-structured append-cursor allocator (creates append sequentially).
+    Segment,
+}
+
+/// Deserialize the `[storage] engine` key into a [`StorageEngine`].
+/// Accepts `"in_place"` (or empty) and `"segment"`; rejects anything else loudly.
+fn deserialize_storage_engine<'de, D>(
+    deserializer: D,
+) -> std::result::Result<StorageEngine, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    match s.as_str() {
+        "in_place" | "" => Ok(StorageEngine::InPlace),
+        "segment" => Ok(StorageEngine::Segment),
+        other => Err(serde::de::Error::custom(format!(
+            "unknown storage engine: {other:?} (expected \"in_place\" or \"segment\")"
+        ))),
+    }
 }
 
 /// Deserialize the `[storage] placement` key into a [`PlacementStrategy`].
@@ -2311,6 +2362,38 @@ backend = ""
         let err = result.expect_err("unknown placement strategy must fail to parse");
         assert!(
             err.to_string().contains("unknown placement strategy"),
+            "error must name the bad key: {err}",
+        );
+    }
+
+    #[test]
+    fn storage_engine_defaults_to_in_place() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.storage.engine, StorageEngine::InPlace);
+    }
+
+    #[test]
+    fn storage_engine_segment_parses_with_segment_size_default() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nengine = \"segment\"\n").unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
+        assert_eq!(cfg.storage.segment_size, 8 * 1024 * 1024, "default 8 MiB");
+    }
+
+    #[test]
+    fn storage_engine_in_place_and_custom_segment_size_parse() {
+        let cfg: ServerConfig =
+            toml::from_str("[storage]\nengine = \"in_place\"\nsegment_size = 16777216\n").unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::InPlace);
+        assert_eq!(cfg.storage.segment_size, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn storage_engine_unknown_value_is_rejected() {
+        let result: std::result::Result<ServerConfig, _> =
+            toml::from_str("[storage]\nengine = \"lsm\"\n");
+        let err = result.expect_err("unknown storage engine must fail to parse");
+        assert!(
+            err.to_string().contains("unknown storage engine"),
             "error must name the bad key: {err}",
         );
     }

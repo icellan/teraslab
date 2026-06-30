@@ -3,7 +3,7 @@
 //! Uses enum dispatch (not trait objects) so the in-memory variant has zero
 //! overhead — the compiler inlines through match arms.
 
-use crate::allocator::SlotAllocator;
+use crate::allocator::RecordAllocator;
 use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::hashtable::{TxIndexEntry, TxKey};
@@ -608,7 +608,7 @@ impl PrimaryBackend {
     pub fn rebuild_redb(
         config: &IndexConfig,
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn RecordAllocator,
     ) -> Result<Self, IndexError> {
         let mut primary = RedbPrimary::open(&config.redb_path, config.redb_cache_size)?;
 
@@ -723,7 +723,7 @@ impl PrimaryBackend {
     pub fn rebuild_file_backed(
         path: &std::path::Path,
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn RecordAllocator,
     ) -> Result<Self, IndexError> {
         let _ = std::fs::remove_file(path);
 
@@ -822,7 +822,7 @@ impl PrimaryBackend {
     /// Rebuild secondary indexes by scanning all records on the device.
     pub fn rebuild_secondary(
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn RecordAllocator,
     ) -> Result<(DahIndex, UnminedIndex), IndexError> {
         Index::rebuild_secondary(device, allocator)
     }

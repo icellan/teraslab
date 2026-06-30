@@ -1361,8 +1361,10 @@ mod tests {
 
         // Restart: allocator from its header, index from the snapshot,
         // then redo replay (empty — the fence covers everything).
-        let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
-            .expect("allocator header must be durable after checkpoint");
+        let mut alloc2: crate::allocator::BoxedAllocator = Box::new(
+            SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
+                .expect("allocator header must be durable after checkpoint"),
+        );
         let (primary2, dah2, unmined2, _flags) =
             PrimaryBackend::restore_all(&snap_path).expect("snapshot must restore");
         let index2 = crate::index::ShardedIndex::from_single(primary2);
@@ -1558,8 +1560,10 @@ mod tests {
             2,
             "no fence may exist — both entries must still be replayable"
         );
-        let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
-            .expect("allocator persist (fsynced) preceded the crash point");
+        let mut alloc2: crate::allocator::BoxedAllocator = Box::new(
+            SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
+                .expect("allocator persist (fsynced) preceded the crash point"),
+        );
         let index2 =
             crate::index::ShardedIndex::from_single(PrimaryBackend::new_in_memory(128).unwrap());
         let mut dah_b = DahBackend::new_in_memory();
@@ -1603,19 +1607,20 @@ mod tests {
         redo_capacity: u64,
     ) -> (
         crate::index::ShardedIndex,
-        crate::allocator::SlotAllocator,
+        crate::allocator::BoxedAllocator,
         usize,
     ) {
         use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, UnminedBackend};
         use crate::recovery::recover_all_with_allocator;
 
-        let mut alloc = match SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>) {
+        let alloc = match SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>) {
             Ok(a) => a,
             Err(crate::allocator::AllocatorError::NoPersistedState) => {
                 SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap()
             }
             Err(e) => panic!("allocator recover failed unexpectedly: {e:?}"),
         };
+        let mut alloc: crate::allocator::BoxedAllocator = Box::new(alloc);
 
         let (primary, dah, unmined) = if snap_path.exists() {
             let (idx, dah, unmined, _flags) =
