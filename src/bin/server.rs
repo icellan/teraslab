@@ -524,14 +524,23 @@ fn main() {
     // safety. When enabled, every store gets its own cache; the engine uses it
     // transparently as a `BlockDevice`, and write-back stays WAL-safe because
     // the checkpoint's data-device barrier flushes dirty blocks via `sync()`.
+    // The streaming write buffer owns write coalescing for the segment engine, so
+    // the underlying data cache must be WRITE-THROUGH under it — a write-back cache
+    // would re-scatter the streaming flushes through its own eviction path,
+    // defeating the point. Streaming is segment-only (in_place writes are in-place
+    // RMW, not appends).
+    let use_streaming = config.storage.engine == teraslab::config::StorageEngine::Segment
+        && config.storage.streaming;
+    let cache_writeback = config.cache.writeback && !use_streaming;
     let store_devices: Vec<Arc<dyn BlockDevice>> = if config.cache.is_enabled() {
         tracing::info!(
             bytes = config.cache.bytes,
-            mode = if config.cache.writeback {
+            mode = if cache_writeback {
                 "write-back"
             } else {
                 "write-through"
             },
+            forced_write_through = use_streaming && config.cache.writeback,
             stores = store_devices.len(),
             "interposing in-RAM data-device cache"
         );
@@ -541,9 +550,33 @@ fn main() {
                 Arc::new(teraslab::cache::CachingDevice::new(
                     d,
                     config.cache.bytes,
-                    config.cache.writeback,
+                    cache_writeback,
                     config.cache.writeback_interval_ms,
                 )) as Arc<dyn BlockDevice>
+            })
+            .collect()
+    } else {
+        store_devices
+    };
+
+    // Interpose the per-store streaming write buffer for the segment engine. It
+    // buffers the append tail and flushes it as large sequential writes; the
+    // checkpoint barrier's `sync()` flushes it before any redo prefix is reclaimed,
+    // so buffered durability is unchanged. The allocator header (offset 0) and any
+    // in-place mutation of an already-flushed record pass straight through to the
+    // cache/device — see `StreamingWriteDevice`.
+    let store_devices: Vec<Arc<dyn BlockDevice>> = if use_streaming {
+        tracing::info!(
+            stores = store_devices.len(),
+            flush_threshold = teraslab::streaming::DEFAULT_FLUSH_THRESHOLD,
+            flush_chunk = teraslab::streaming::DEFAULT_FLUSH_CHUNK,
+            "interposing per-store streaming write buffer (segment engine)"
+        );
+        store_devices
+            .into_iter()
+            .map(|d| {
+                Arc::new(teraslab::streaming::StreamingWriteDevice::with_defaults(d))
+                    as Arc<dyn BlockDevice>
             })
             .collect()
     } else {

@@ -642,6 +642,22 @@ pub struct StorageConfig {
     /// the per-store data region.
     #[serde(default = "default_segment_size")]
     pub segment_size: u64,
+
+    /// Interpose the per-store streaming write buffer
+    /// ([`crate::streaming::StreamingWriteDevice`]) in front of each segment
+    /// store's device. Buffers the sequential append tail and flushes it as large
+    /// sequential pwrites (the reference datastore's streaming model), instead of
+    /// letting the random-access write-back cache re-scatter the appends into ~6 KB
+    /// writes (measured in `bench/results/20260630-ec2-segment`).
+    ///
+    /// Only meaningful with `engine = "segment"` (it has no effect on
+    /// `"in_place"`, whose writes are in-place RMW, not appends). When enabled the
+    /// underlying data cache is forced WRITE-THROUGH so the streaming flush — not
+    /// the cache's eviction path — owns write coalescing. Default `false`
+    /// (opt-in); the segment engine works without it (just with the scattered
+    /// write pattern the EC2 A/B measured).
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 /// Default segment size (8 MiB) for the segment storage engine.
@@ -2450,6 +2466,16 @@ backend = ""
         assert_eq!(cfg.replication_factor, 1);
         cfg.validate_cluster_safety()
             .expect("segment engine must be allowed on a standalone buffered node");
+    }
+
+    #[test]
+    fn storage_streaming_defaults_off_and_parses() {
+        let def: ServerConfig = toml::from_str("[storage]\nengine = \"segment\"\n").unwrap();
+        assert!(!def.storage.streaming, "streaming defaults off");
+        let on: ServerConfig =
+            toml::from_str("[storage]\nengine = \"segment\"\nstreaming = true\n").unwrap();
+        assert!(on.storage.streaming, "streaming = true must parse");
+        assert_eq!(on.storage.engine, StorageEngine::Segment);
     }
 
     #[test]
