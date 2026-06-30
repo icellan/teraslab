@@ -1929,6 +1929,166 @@ impl SlotAllocator {
 }
 
 // ---------------------------------------------------------------------------
+// RecordAllocator trait — the storage-engine seam
+// ---------------------------------------------------------------------------
+
+/// The device-space allocator interface the engine, recovery, index-rebuild, and
+/// checkpoint paths depend on, so a store can be backed by either the in-place
+/// [`SlotAllocator`] (best-fit freelist) or the log-structured
+/// [`crate::segment_allocator::SegmentAllocator`] (append cursor + defrag).
+///
+/// This is the increment-2 abstraction of the log-structured engine build (see
+/// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`). The engine holds
+/// `Box<dyn RecordAllocator>` per store; callers route by `device_id`.
+///
+/// The common error is [`AllocatorError`]; a segment allocator maps its own
+/// errors into it. Test/fault-injection hooks (`arm_fail_next_persist`,
+/// `__test_force_push_free_region`) are intentionally NOT on the trait — tests
+/// that need them construct the concrete [`SlotAllocator`].
+///
+/// `Send` is required because the allocator lives in `Mutex<Box<dyn RecordAllocator>>`
+/// inside an `Arc<Engine>` shared across worker threads.
+pub trait RecordAllocator: Send {
+    /// Allocate a contiguous region of at least `size` bytes; see
+    /// [`SlotAllocator::allocate`].
+    fn allocate(&mut self, size: u64) -> Result<u64>;
+    /// Allocate multiple regions with a single redo flush; see
+    /// [`SlotAllocator::allocate_batch`].
+    fn allocate_batch(&mut self, sizes: &[u64]) -> Result<Vec<Option<AllocatedRegion>>>;
+    /// Reserve a batch in memory, deferring the durable journaling to the caller
+    /// (orphan prevention); see [`SlotAllocator::reserve_batch`].
+    fn reserve_batch(&mut self, sizes: &[u64]) -> Result<PendingBatchAllocation>;
+    /// Finalize a reservation whose redo ops the caller has journaled.
+    fn commit_pending(&mut self, pending: PendingBatchAllocation);
+    /// Roll back a reservation whose redo batch could not be journaled.
+    fn rollback_pending(&mut self, pending: PendingBatchAllocation);
+    /// Return a region; see [`SlotAllocator::free`].
+    fn free(&mut self, offset: u64, size: u64) -> Result<()>;
+    /// Persist allocator state to the device header and fsync.
+    fn persist(&self) -> Result<()>;
+    /// Write the header without the durability fsync (checkpoint hoists the sync).
+    fn persist_header_no_sync(&self) -> Result<()>;
+    /// Apply an allocator-relevant redo entry during recovery; returns whether
+    /// state changed. See [`SlotAllocator::replay_redo`].
+    fn replay_redo(&mut self, op: &RedoOp) -> bool;
+    /// Whether `[offset, offset+size)` is allocated (inside high-water, not free).
+    fn is_allocated_range(&self, offset: u64, size: u64) -> bool;
+    /// The free region containing `offset`, if any.
+    fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)>;
+    /// Number of free regions (diagnostics).
+    fn free_region_count(&self) -> usize;
+    /// Observability snapshot.
+    fn stats(&self) -> AllocatorStats;
+    /// Current high-water mark.
+    fn next_offset(&self) -> u64;
+    /// Start of the data region.
+    fn data_region_start(&self) -> u64;
+    /// Device I/O alignment.
+    fn device_alignment(&self) -> usize;
+    /// 128-bit device identity.
+    fn device_id(&self) -> [u8; 16];
+    /// Device identity as lowercase hex.
+    fn device_id_hex(&self) -> String;
+    /// Attach a redo log for journaling allocate/free.
+    fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>);
+    /// Tag this allocator's store for redo routing.
+    fn set_redo_device_id(&mut self, device_id: u8);
+    /// The store tag stamped on this allocator's redo entries.
+    fn redo_device_id(&self) -> u8;
+    /// Whether a redo log is attached.
+    fn has_redo_log(&self) -> bool;
+    /// Enable/disable packed allocation mode.
+    fn set_packed(&mut self, packed: bool);
+    /// Whether packed mode is enabled.
+    fn is_packed(&self) -> bool;
+    /// Enable/disable append-only allocation mode.
+    fn set_append_only(&mut self, append_only: bool);
+    /// Whether append-only mode is enabled.
+    fn is_append_only(&self) -> bool;
+}
+
+impl RecordAllocator for SlotAllocator {
+    fn allocate(&mut self, size: u64) -> Result<u64> {
+        SlotAllocator::allocate(self, size)
+    }
+    fn allocate_batch(&mut self, sizes: &[u64]) -> Result<Vec<Option<AllocatedRegion>>> {
+        SlotAllocator::allocate_batch(self, sizes)
+    }
+    fn reserve_batch(&mut self, sizes: &[u64]) -> Result<PendingBatchAllocation> {
+        SlotAllocator::reserve_batch(self, sizes)
+    }
+    fn commit_pending(&mut self, pending: PendingBatchAllocation) {
+        SlotAllocator::commit_pending(self, pending)
+    }
+    fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
+        SlotAllocator::rollback_pending(self, pending)
+    }
+    fn free(&mut self, offset: u64, size: u64) -> Result<()> {
+        SlotAllocator::free(self, offset, size)
+    }
+    fn persist(&self) -> Result<()> {
+        SlotAllocator::persist(self)
+    }
+    fn persist_header_no_sync(&self) -> Result<()> {
+        SlotAllocator::persist_header_no_sync(self)
+    }
+    fn replay_redo(&mut self, op: &RedoOp) -> bool {
+        SlotAllocator::replay_redo(self, op)
+    }
+    fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
+        SlotAllocator::is_allocated_range(self, offset, size)
+    }
+    fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)> {
+        SlotAllocator::free_region_containing(self, offset)
+    }
+    fn free_region_count(&self) -> usize {
+        SlotAllocator::free_region_count(self)
+    }
+    fn stats(&self) -> AllocatorStats {
+        SlotAllocator::stats(self)
+    }
+    fn next_offset(&self) -> u64 {
+        SlotAllocator::next_offset(self)
+    }
+    fn data_region_start(&self) -> u64 {
+        SlotAllocator::data_region_start(self)
+    }
+    fn device_alignment(&self) -> usize {
+        SlotAllocator::device_alignment(self)
+    }
+    fn device_id(&self) -> [u8; 16] {
+        SlotAllocator::device_id(self)
+    }
+    fn device_id_hex(&self) -> String {
+        SlotAllocator::device_id_hex(self)
+    }
+    fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>) {
+        SlotAllocator::set_redo_log(self, redo_log)
+    }
+    fn set_redo_device_id(&mut self, device_id: u8) {
+        SlotAllocator::set_redo_device_id(self, device_id)
+    }
+    fn redo_device_id(&self) -> u8 {
+        SlotAllocator::redo_device_id(self)
+    }
+    fn has_redo_log(&self) -> bool {
+        SlotAllocator::has_redo_log(self)
+    }
+    fn set_packed(&mut self, packed: bool) {
+        SlotAllocator::set_packed(self, packed)
+    }
+    fn is_packed(&self) -> bool {
+        SlotAllocator::is_packed(self)
+    }
+    fn set_append_only(&mut self, append_only: bool) {
+        SlotAllocator::set_append_only(self, append_only)
+    }
+    fn is_append_only(&self) -> bool {
+        SlotAllocator::is_append_only(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
