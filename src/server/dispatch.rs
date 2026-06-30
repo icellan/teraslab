@@ -10278,12 +10278,13 @@ mod tests {
             let dev0: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-            let aux_stores: Vec<(Arc<dyn BlockDevice>, SlotAllocator)> = (0..aux)
+            let aux_stores: Vec<(Arc<dyn BlockDevice>, crate::allocator::BoxedAllocator)> = (0
+                ..aux)
                 .map(|_| {
                     let dev: Arc<dyn BlockDevice> =
                         Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
                     let alloc = SlotAllocator::new(dev.clone()).unwrap();
-                    (dev, alloc)
+                    (dev, Box::new(alloc) as crate::allocator::BoxedAllocator)
                 })
                 .collect();
             let index = crate::index::ShardedIndex::from_single(Index::new(10000).unwrap().into());

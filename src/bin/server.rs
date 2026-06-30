@@ -1193,8 +1193,14 @@ fn main() {
     let primary_allocator = alloc_iter
         .next()
         .expect("at least one store allocator (validated >= 1 store)");
-    let aux_stores: Vec<(Arc<dyn BlockDevice>, SlotAllocator)> =
-        store_devices[1..].iter().cloned().zip(alloc_iter).collect();
+    // Aux allocators are boxed as `dyn RecordAllocator` so the engine store can
+    // hold either the in-place or the log-structured allocator (increment 2).
+    let aux_stores: Vec<(Arc<dyn BlockDevice>, teraslab::allocator::BoxedAllocator)> =
+        store_devices[1..]
+            .iter()
+            .cloned()
+            .zip(alloc_iter.map(|a| Box::new(a) as teraslab::allocator::BoxedAllocator))
+            .collect();
     let mut engine = Engine::new_multi_store(
         store_devices[0].clone(),
         primary_allocator,

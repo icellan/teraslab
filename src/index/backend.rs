@@ -595,7 +595,7 @@ impl PrimaryBackend {
     /// Rebuild the primary index by scanning all records on the device.
     pub fn rebuild(
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn crate::allocator::RecordAllocator,
     ) -> Result<Self, IndexError> {
         Ok(Self::InMemory(Index::rebuild(device, allocator)?))
     }

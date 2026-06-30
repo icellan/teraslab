@@ -3183,7 +3183,7 @@ mod tests {
         let engine = Arc::new(Engine::new_multi_store(
             dev0,
             alloc0,
-            vec![(dev1, alloc1)],
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             crate::index::sharded::ShardedIndex::from_single(Index::new(10_000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),

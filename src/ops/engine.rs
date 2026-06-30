@@ -3,7 +3,7 @@
 //! Owns the index, device, locks, and secondary indexes. Provides the
 //! spend/unspend methods that are the public API for this phase.
 
-use crate::allocator::SlotAllocator;
+use crate::allocator::{BoxedAllocator, RecordAllocator};
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::{
     DahBackend, PrimaryBackend, ShardedDahIndex, ShardedIndex, ShardedUnminedIndex, TxIndexEntry,
@@ -96,7 +96,7 @@ pub(crate) struct Store {
     /// path. `null_mut()` when the device does not support direct access (file /
     /// raw O_DIRECT), in which case I/O falls back to `pread`/`pwrite`.
     device_ptr: *mut u8,
-    allocator: parking_lot::Mutex<SlotAllocator>,
+    allocator: parking_lot::Mutex<BoxedAllocator>,
     /// Cached copy of this store's allocator packed-ness, snapshotted at
     /// construction. Packed-ness is set once at startup (fresh device from
     /// config, recovered device from the header) and never toggled afterwards,
@@ -305,7 +305,7 @@ impl Engine {
     pub fn new(
         device: Arc<dyn BlockDevice>,
         index: impl Into<PrimaryBackend>,
-        allocator: SlotAllocator,
+        allocator: impl RecordAllocator + 'static,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
         unmined_index: impl Into<UnminedBackend>,
@@ -336,7 +336,7 @@ impl Engine {
     pub fn new_with_sharded_index(
         device: Arc<dyn BlockDevice>,
         index: ShardedIndex,
-        allocator: SlotAllocator,
+        allocator: impl RecordAllocator + 'static,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
         unmined_index: impl Into<UnminedBackend>,
@@ -358,8 +358,8 @@ impl Engine {
     /// index entry's `device_id`. Single-device callers use [`Engine::new`].
     pub fn new_multi_store(
         primary_device: Arc<dyn BlockDevice>,
-        primary_allocator: SlotAllocator,
-        aux: Vec<(Arc<dyn BlockDevice>, SlotAllocator)>,
+        primary_allocator: impl RecordAllocator + 'static,
+        aux: Vec<(Arc<dyn BlockDevice>, BoxedAllocator)>,
         index: ShardedIndex,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
@@ -402,7 +402,7 @@ impl Engine {
     fn new_inner(
         device: Arc<dyn BlockDevice>,
         index: ShardedIndex,
-        allocator: SlotAllocator,
+        allocator: impl RecordAllocator + 'static,
         locks: StripedLocks,
         dah_index: DahBackend,
         unmined_index: UnminedBackend,
@@ -433,7 +433,7 @@ impl Engine {
             stores: vec![Store {
                 device,
                 device_ptr,
-                allocator: parking_lot::Mutex::new(allocator),
+                allocator: parking_lot::Mutex::new(Box::new(allocator) as BoxedAllocator),
                 packed: store0_packed,
             }],
             placer,
@@ -1855,7 +1855,7 @@ impl Engine {
     ///
     /// Used by the dispatch layer to free pre-allocated space when a redo
     /// flush fails after [`Self::pre_allocate_create`] succeeded.
-    pub fn allocator(&self) -> &parking_lot::Mutex<SlotAllocator> {
+    pub fn allocator(&self) -> &parking_lot::Mutex<BoxedAllocator> {
         &self.stores[0].allocator
     }
 
@@ -1969,7 +1969,7 @@ impl Engine {
 
     /// The allocator for store `device_id`.
     #[inline]
-    pub fn allocator_for(&self, device_id: u8) -> &parking_lot::Mutex<SlotAllocator> {
+    pub fn allocator_for(&self, device_id: u8) -> &parking_lot::Mutex<BoxedAllocator> {
         &self.stores[device_id as usize].allocator
     }
 
@@ -7958,7 +7958,7 @@ fn overflow_block_size(metadata: &TxMetadata, alignment: usize) -> usize {
 fn write_overflow_entries(
     device: &dyn BlockDevice,
     record_offset: u64,
-    allocator: &parking_lot::Mutex<SlotAllocator>,
+    allocator: &parking_lot::Mutex<BoxedAllocator>,
     metadata: &mut TxMetadata,
     entries: &[BlockEntry],
 ) -> Result<(), crate::device::DeviceError> {
@@ -8414,7 +8414,10 @@ mod tests {
         let engine = Engine::new_multi_store(
             dev0.clone(),
             alloc0,
-            vec![(dev1.clone(), alloc1)],
+            vec![(
+                dev1.clone(),
+                Box::new(alloc1) as crate::allocator::BoxedAllocator,
+            )],
             ShardedIndex::from_single(Index::new(100).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -13274,7 +13277,7 @@ mod tests {
         Arc::new(Engine::new_multi_store(
             dev0,
             alloc0,
-            vec![(dev1, alloc1)],
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -13375,7 +13378,10 @@ mod tests {
         let mut engine = Engine::new_multi_store(
             dev0.clone(),
             alloc0,
-            vec![(dev1.clone(), alloc1)],
+            vec![(
+                dev1.clone(),
+                Box::new(alloc1) as crate::allocator::BoxedAllocator,
+            )],
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -13478,7 +13484,10 @@ mod tests {
         let engine2 = Engine::new_multi_store(
             devices[0].clone(),
             alloc0,
-            vec![(devices[1].clone(), alloc1)],
+            vec![(
+                devices[1].clone(),
+                Box::new(alloc1) as crate::allocator::BoxedAllocator,
+            )],
             rebuilt,
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -13769,7 +13778,7 @@ mod tests {
         let engine = Engine::new_multi_store(
             dev0,
             alloc0,
-            vec![(dev1, alloc1)],
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -16926,7 +16935,8 @@ mod tests {
             })
             .unwrap();
 
-        let rebuilt = PrimaryBackend::rebuild(engine.device(), &engine.allocator().lock()).unwrap();
+        let rebuilt =
+            PrimaryBackend::rebuild(engine.device(), &**engine.allocator().lock()).unwrap();
         assert!(
             rebuilt.lookup(&key).is_none(),
             "rebuild must ignore freed records whose metadata was tombstoned",

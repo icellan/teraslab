@@ -2005,7 +2005,18 @@ pub trait RecordAllocator: Send {
     fn set_append_only(&mut self, append_only: bool);
     /// Whether append-only mode is enabled.
     fn is_append_only(&self) -> bool;
+
+    /// Test/fault-injection only: arm the next persist to fail once. On the trait
+    /// so checkpoint crash tests can trigger it through the engine's boxed
+    /// allocator. Compiled out of production builds.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn arm_fail_next_persist(&self);
 }
+
+/// A heap-allocated, dynamically-dispatched [`RecordAllocator`] — the concrete
+/// type a [`crate::ops::Engine`] store holds so it can be backed by either the
+/// in-place or the log-structured allocator.
+pub type BoxedAllocator = Box<dyn RecordAllocator>;
 
 impl RecordAllocator for SlotAllocator {
     fn allocate(&mut self, size: u64) -> Result<u64> {
@@ -2085,6 +2096,10 @@ impl RecordAllocator for SlotAllocator {
     }
     fn is_append_only(&self) -> bool {
         SlotAllocator::is_append_only(self)
+    }
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn arm_fail_next_persist(&self) {
+        SlotAllocator::arm_fail_next_persist(self)
     }
 }
 

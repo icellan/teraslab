@@ -593,7 +593,10 @@ impl Index {
     /// This is the cold-start path when no snapshot exists. Reads every
     /// record header between `allocator.data_region_start()` and
     /// `allocator.next_offset()`, checking for valid magic numbers.
-    pub fn rebuild(device: &dyn BlockDevice, allocator: &SlotAllocator) -> Result<Self> {
+    pub fn rebuild(
+        device: &dyn BlockDevice,
+        allocator: &dyn crate::allocator::RecordAllocator,
+    ) -> Result<Self> {
         let mut index = Self::new(1024)?;
         let align = allocator.device_alignment();
         let start = allocator.data_region_start();
