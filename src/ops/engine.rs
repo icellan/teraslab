@@ -4640,6 +4640,207 @@ impl Engine {
         Ok(())
     }
 
+    /// Relocate `tx_key`'s record to a freshly-appended segment offset, baking in
+    /// `metadata` + `slot_mutations`, re-pointing the index, journaling a
+    /// [`RedoOp::Relocate`], and dead-marking the old extent. Returns the new
+    /// device offset. The LOG-STRUCTURED (segment) engine's spend primitive — it
+    /// converts an in-place RMW (scattered write at the record's home offset) into
+    /// a sequential append at the allocator cursor.
+    ///
+    /// # Preconditions
+    /// - The caller MUST hold `tx_key`'s stripe lock (this performs read-old →
+    ///   write-new → repoint → free as one logical mutation; the lock excludes any
+    ///   other writer of this record).
+    /// - The store MUST be log-structured ([`Self::store_is_log_structured`]) so
+    ///   `free` dead-marks rather than returning the extent to a reuse freelist,
+    ///   and append-only never overwrites the old extent before defrag.
+    /// - Crash safety relies on BUFFERED durability: the new image, the `Relocate`
+    ///   redo, and the dead-mark all become durable together at the checkpoint
+    ///   barrier (which fsyncs the data device before reclaiming any redo prefix).
+    ///   A crash before that barrier loses all three together and leaves the
+    ///   pre-relocation record intact at the old offset — the buffered-tail-loss
+    ///   contract `replay_relocate` enforces. Do NOT use under strict durability:
+    ///   journaling happens AFTER the data write, not WAL-first.
+    ///
+    /// # Ordering (consensus-critical)
+    /// allocate → write new image → journal `Relocate` → repoint index → free old.
+    /// A lock-free reader that grabbed the old offset before the repoint still
+    /// reads valid bytes: the old extent stays intact (append-only never reuses a
+    /// freed offset until defrag), and the index swap is atomic. The repoint
+    /// precedes the free so no reader can reach the old offset via the index once
+    /// it is dead-marked.
+    ///
+    /// The new index entry is rebuilt from `metadata` IDENTICALLY to
+    /// [`crate::recovery::replay_relocate`] (offset + all cached fields), so the
+    /// live index after this call is byte-equal to the index recovery would
+    /// reconstruct from the relocated record — there is no live-vs-recovered
+    /// divergence to reconcile, and the caller does NOT additionally
+    /// `sync_index_cache` for the relocated key.
+    ///
+    /// # Errors
+    /// [`SpendError::TxNotFound`] if the key is absent; [`SpendError::StorageError`]
+    /// on a slot-mutation offset out of range, device-full, or any device/index
+    /// I/O failure.
+    ///
+    /// Staged groundwork: the segment spend path calls this in increment 4c.
+    /// Allowed-unused (exercised by unit tests) until then.
+    #[allow(dead_code)]
+    fn relocate_record(
+        &self,
+        device_id: u8,
+        tx_key: &TxKey,
+        metadata: &TxMetadata,
+        slot_mutations: &[(u32, UtxoSlot)],
+    ) -> Result<u64, SpendError> {
+        let old_entry = self
+            .index
+            .lookup_checked(tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        let old_offset = old_entry.record_offset;
+        let record_size = { metadata.record_size } as u64;
+        let utxo_count = { metadata.utxo_count };
+
+        // Reservation size for the relocated image — IDENTICAL rule to
+        // `write_full_record_with_cold` / the allocator's `align_reservation`, so
+        // the bytes we read, the bytes we write, and the extent we free all agree.
+        let align = self.device_for(device_id).alignment();
+        let reservation = if self.store_is_packed(device_id) {
+            (record_size as usize).div_ceil(crate::allocator::RECORD_ALIGN as usize)
+                * crate::allocator::RECORD_ALIGN as usize
+        } else {
+            (record_size as usize).div_ceil(align) * align
+        };
+
+        // Slot-mutation offsets must land within the record's own reservation —
+        // surface an out-of-range vout as a typed error instead of a slice panic.
+        let slot_region_end = METADATA_SIZE + utxo_count as usize * UTXO_SLOT_SIZE;
+        if slot_region_end > reservation {
+            return Err(SpendError::StorageError {
+                detail: format!(
+                    "relocate: slot region {slot_region_end} exceeds reservation {reservation}",
+                ),
+            });
+        }
+        for &(vout, _) in slot_mutations {
+            if vout >= utxo_count {
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "relocate: slot mutation vout {vout} >= utxo_count {utxo_count}",
+                    ),
+                });
+            }
+        }
+
+        // 1. Read the FULL current record image (metadata + every slot + inline
+        // cold data) so cold bytes are carried VERBATIM through the move — the
+        // segment spend changes only the metadata footer + the spent slots, never
+        // the cold tail. Honor the (possibly packed, mid-block) base offset.
+        let aligned_base = old_offset / align as u64 * align as u64;
+        let intra = (old_offset - aligned_base) as usize;
+        let read_len = io::align_up(intra + reservation, align);
+        let mut read_buf = AlignedBuf::new(read_len, align);
+        self.device_for(device_id)
+            .pread_exact_at(&mut read_buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("relocate: read old image: {e}"),
+            })?;
+        // The write buffer must be device-aligned (O_DIRECT), so copy the record
+        // span into a fresh `AlignedBuf` rather than re-slicing the (arbitrarily
+        // aligned) heap read into a `Vec`.
+        let mut image = AlignedBuf::new(reservation, align);
+        image[..reservation].copy_from_slice(&read_buf[intra..intra + reservation]);
+
+        // 2. Overlay the baked-in mutation: the new metadata header...
+        let mut meta_bytes = [0u8; METADATA_SIZE];
+        metadata.to_bytes(&mut meta_bytes);
+        image[..METADATA_SIZE].copy_from_slice(&meta_bytes);
+        // ...and each mutated slot (CRC re-stamped by `to_bytes`).
+        for &(vout, ref slot) in slot_mutations {
+            let off = METADATA_SIZE + vout as usize * UTXO_SLOT_SIZE;
+            let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
+            slot.to_bytes(&mut slot_bytes);
+            image[off..off + UTXO_SLOT_SIZE].copy_from_slice(&slot_bytes);
+        }
+
+        // 3. Allocate the new (sequential, append-cursor) offset.
+        let new_offset = {
+            let mut alloc = self.allocator_for(device_id).lock();
+            alloc
+                .allocate(record_size)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("relocate: allocate new offset: {e}"),
+                })?
+        };
+
+        // 4. Write the relocated image at the new offset (RMW-safe for packed
+        // sub-block records, holding every covered block's write guard).
+        io::write_record_bytes(&**self.device_for(device_id), new_offset, &image).map_err(|e| {
+            // Roll the speculative allocation back so a write failure does not leak
+            // the cursor advance.
+            let mut alloc = self.allocator_for(device_id).lock();
+            let _ = alloc.free(new_offset, record_size);
+            SpendError::StorageError {
+                detail: format!("relocate: write new image: {e}"),
+            }
+        })?;
+
+        // 5. Journal the relocation intent (BUFFERED — see preconditions). No
+        // embedded bytes: recovery reads the record back from `new_offset`.
+        if let Some(log) = self.redo_log_for_device(device_id) {
+            log.lock()
+                .append(crate::redo::RedoOp::Relocate {
+                    tx_key: *tx_key,
+                    device_id,
+                    record_offset: new_offset,
+                    utxo_count,
+                })
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("relocate: journal Relocate: {e}"),
+                })?;
+        }
+
+        // 6. Re-point the index to the new offset, rebuilding ALL cached fields
+        // from `metadata` so the live entry equals what `replay_relocate` would
+        // reconstruct. `ShardedIndex::register` OVERWRITES the existing key on its
+        // owning shard WITHOUT touching `shard_record_count` (txid is unchanged →
+        // same shard, same count), so this is a pure offset+fields re-point, not a
+        // new insertion.
+        let new_entry = TxIndexEntry {
+            device_id,
+            record_offset: new_offset,
+            utxo_count,
+            block_entry_count: { metadata.block_entry_count },
+            tx_flags: { metadata.flags }.bits(),
+            spent_utxos: { metadata.spent_utxos },
+            dah_or_preserve: { metadata.delete_at_height },
+            unmined_since: { metadata.unmined_since },
+            generation: { metadata.generation },
+        };
+        self.index
+            .register(*tx_key, new_entry)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("relocate: index re-point: {e}"),
+            })?;
+
+        // 7. Dead-mark the old extent. Under the segment allocator this only
+        // updates live/dead accounting (recomputed from the index on recovery);
+        // the bytes stay readable until defrag, so no concurrent reader holding
+        // the old offset can observe a torn or reused record.
+        {
+            let mut alloc = self.allocator_for(device_id).lock();
+            alloc
+                .free(old_offset, record_size)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("relocate: free old extent: {e}"),
+                })?;
+        }
+
+        Ok(new_offset)
+    }
+
     /// Read cold data from a record.
     ///
     /// If cold data is stored inline on the device, reads it directly.
@@ -10008,6 +10209,206 @@ mod tests {
             UnminedIndex::new(),
         );
         assert!(!slot_engine.store_is_log_structured(0));
+    }
+
+    // ---- Increment 4b-2: the `relocate_record` primitive (segment engine) ----
+
+    /// Build a segment-engine `Engine` with one seeded 4-UTXO record (all
+    /// unspent), returning `(engine, device, key, metadata, slots, old_offset)`.
+    fn seg_engine_with_record() -> (
+        Arc<Engine>,
+        Arc<dyn BlockDevice>,
+        TxKey,
+        TxMetadata,
+        Vec<UtxoSlot>,
+        u64,
+    ) {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg =
+            crate::segment_allocator::SegmentAllocator::new(dev.clone(), 8 * 1024 * 1024).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        assert!(engine.store_is_log_structured(0));
+
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0xAB;
+        let key = TxKey { txid };
+
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i as u8) + 1;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+
+        (engine, dev, key, meta, slots, offset)
+    }
+
+    #[test]
+    fn relocate_record_moves_record_verbatim() {
+        let (engine, dev, key, meta, slots, old_offset) = seg_engine_with_record();
+
+        // Pure move: no baked-in mutation.
+        let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
+        assert_ne!(
+            new_offset, old_offset,
+            "append-cursor must hand out a fresh offset"
+        );
+
+        // Index now points at the new offset.
+        let entry = engine
+            .lookup(&key)
+            .expect("key still indexed after relocate");
+        assert_eq!(entry.record_offset, new_offset);
+        assert_eq!(entry.utxo_count, 4);
+
+        // The relocated image is byte-faithful: metadata identity + every slot.
+        let m2 = io::read_metadata(&*dev, new_offset).unwrap();
+        assert_eq!({ m2.tx_id }, key.txid);
+        assert_eq!({ m2.utxo_count }, 4);
+        let s2 = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        for (i, orig) in slots.iter().enumerate() {
+            assert_eq!(s2[i].hash, orig.hash, "slot {i} hash preserved");
+            assert_eq!(s2[i].status, UTXO_UNSPENT, "slot {i} status preserved");
+        }
+
+        // The old extent is dead-marked but its bytes stay intact (append-only
+        // never overwrites until defrag), so a lock-free reader that still holds
+        // the old offset reads a valid record rather than garbage.
+        let m_old = io::read_metadata(&*dev, old_offset).unwrap();
+        assert_eq!({ m_old.tx_id }, key.txid);
+    }
+
+    #[test]
+    fn relocate_record_bakes_in_slot_and_metadata_mutation() {
+        let (engine, dev, key, meta, slots, _old) = seg_engine_with_record();
+
+        // Mutate metadata (spend bookkeeping) + flip slot 1 to SPENT — the exact
+        // shape the segment spend path will hand the primitive in 4c.
+        let mut new_meta = meta;
+        new_meta.spent_utxos = 1;
+        new_meta.generation = 7;
+        let spending_data = [0x42u8; 36];
+        let spent_slot = UtxoSlot::new_spent(slots[1].hash, spending_data);
+
+        let new_offset = engine
+            .relocate_record(0, &key, &new_meta, &[(1, spent_slot.clone())])
+            .unwrap();
+
+        // Baked-in metadata landed.
+        let m = io::read_metadata(&*dev, new_offset).unwrap();
+        assert_eq!({ m.spent_utxos }, 1);
+        assert_eq!({ m.generation }, 7);
+
+        // Slot 1 is SPENT with the new spending data; the others are untouched.
+        let s = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        assert_eq!(s[1].status, UTXO_SPENT);
+        assert_eq!(s[1].spending_data, spending_data);
+        assert_eq!(s[1].hash, slots[1].hash);
+        assert_eq!(s[0].status, UTXO_UNSPENT);
+        assert_eq!(s[2].status, UTXO_UNSPENT);
+        assert_eq!(s[3].status, UTXO_UNSPENT);
+
+        // The index cached fields are rebuilt from the new metadata — identical to
+        // what `replay_relocate` reconstructs from the device (live == recovered).
+        let entry = engine.lookup(&key).unwrap();
+        assert_eq!(entry.record_offset, new_offset);
+        assert_eq!(entry.spent_utxos, 1);
+        assert_eq!(entry.generation, 7);
+    }
+
+    #[test]
+    fn relocate_record_journals_relocate_intent() {
+        use crate::redo::{RedoLog, RedoOp};
+
+        let (engine, _dev, key, meta, _slots, _old) = seg_engine_with_record();
+
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
+        engine.set_redo_log(Arc::new(parking_lot::Mutex::new(log)));
+
+        let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
+
+        // Buffered append: flush so a fresh reopen can recover it.
+        engine.redo_log().unwrap().lock().flush().unwrap();
+
+        let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::Relocate { tx_key, device_id, record_offset, utxo_count }
+                    if *tx_key == key
+                        && *device_id == 0
+                        && *record_offset == new_offset
+                        && *utxo_count == 4
+            )),
+            "a Relocate intent for the new offset must be journaled"
+        );
+    }
+
+    #[test]
+    fn relocate_record_rejects_out_of_range_vout() {
+        let (engine, _dev, key, meta, slots, _old) = seg_engine_with_record();
+
+        // vout 4 is out of range for a 4-UTXO record (valid: 0..=3).
+        let err = engine
+            .relocate_record(0, &key, &meta, &[(4, slots[0].clone())])
+            .unwrap_err();
+        match err {
+            SpendError::StorageError { detail } => {
+                assert!(detail.contains("vout 4"), "got: {detail}");
+            }
+            other => panic!("expected StorageError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relocate_record_absent_key_is_tx_not_found() {
+        let (engine, _dev, _key, meta, _slots, _old) = seg_engine_with_record();
+        let mut other = [0u8; 32];
+        other[0] = 0xFF;
+        let missing = TxKey { txid: other };
+        match engine.relocate_record(0, &missing, &meta, &[]) {
+            Err(SpendError::TxNotFound) => {}
+            other => panic!("expected TxNotFound, got {other:?}"),
+        }
     }
 
     #[test]
