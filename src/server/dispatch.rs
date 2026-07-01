@@ -7640,6 +7640,8 @@ fn handle_delete_batch(
     };
     let total_items = txids.len() as u64;
     let mut errors = Vec::new();
+    // Deletes of already-absent keys (idempotent GC no-ops) — not failures.
+    let mut idempotent_total: u64 = 0;
 
     // Fine-grained visibility for the batch: per-key WRITE over the deleted
     // txids + global SHARED (so a checkpoint still excludes us). GATED on
@@ -7763,24 +7765,42 @@ fn handle_delete_batch(
         }
 
         // Remove the record locally (no tombstone, no redo, no replication).
-        if let Err(err) = engine.prune_delete(&DeleteRequest {
+        match engine.prune_delete(&DeleteRequest {
             tx_key: key,
             due_guard: sweep_due_height,
         }) {
-            errors.push(spend_error_to_batch_error(i as u32, &err));
+            Ok(()) => {}
+            // Idempotent GC: the record is already gone — a concurrent or
+            // duplicate delete won the race, or it was never present. The
+            // delete's post-condition (record absent) already holds, so this is
+            // success, not a failure. The three steps above (external-blob
+            // guard, parent lookup, parent-slot scan) already tolerate this
+            // exact race; the final prune must agree, matching the reference's
+            // idempotent delete. Tracked as `Outcome::Idempotent` so the
+            // no-op stays distinguishable from a real removal in metrics.
+            Err(SpendError::TxNotFound) => idempotent_total += 1,
+            Err(err) => errors.push(spend_error_to_batch_error(i as u32, &err)),
         }
     }
 
     drop(visibility_guard);
 
     let failed_total = errors.len() as u64;
-    let succeeded_total = total_items.saturating_sub(failed_total);
+    let succeeded_total = total_items
+        .saturating_sub(failed_total)
+        .saturating_sub(idempotent_total);
     if let Some(m) = DISPATCH_METRICS.get() {
-        m.deletes_succeeded.inc_by(succeeded_total);
+        // Idempotent no-ops did not fail, so they count toward the coarse
+        // succeeded counter; the operations matrix keeps them in their own
+        // `Idempotent` bucket.
+        m.deletes_succeeded
+            .inc_by(succeeded_total + idempotent_total);
         m.deletes_failed.inc_by(failed_total);
         use crate::metrics::{OpCode, Outcome};
         m.operations
             .inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::Delete, Outcome::Idempotent, idempotent_total);
         for e in &errors {
             m.operations
                 .inc(OpCode::Delete, classify_wire_error_code(e.error_code));
@@ -20792,6 +20812,7 @@ mod tests {
 
     #[test]
     fn handle_delete_batch_ticks_outcome_counters() {
+        use crate::metrics::{OpCode, Outcome};
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -20803,16 +20824,39 @@ mod tests {
         let payload = encode_txid_batch(&[txid_a, txid_missing], &[]);
         let before_succ = m.deletes_succeeded.get();
         let before_fail = m.deletes_failed.get();
+        let before_ok = m.operations.get(OpCode::Delete, Outcome::Ok);
+        let before_idem = m.operations.get(OpCode::Delete, Outcome::Idempotent);
         let resp = h.request(OP_DELETE_BATCH, payload);
         let after_succ = m.deletes_succeeded.get();
         let after_fail = m.deletes_failed.get();
-        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let after_ok = m.operations.get(OpCode::Delete, Outcome::Ok);
+        let after_idem = m.operations.get(OpCode::Delete, Outcome::Idempotent);
+
+        // Delete is idempotent GC: deleting an already-absent txid is not a
+        // failure — its post-condition (record absent) already holds — so the
+        // whole batch succeeds and no per-item error is emitted.
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "no partial error: missing is idempotent"
+        );
+        assert_eq!(
+            after_fail - before_fail,
+            0,
+            "deletes_failed unchanged (absent key is not a failure)"
+        );
         assert_eq!(
             after_succ - before_succ,
-            1,
-            "deletes_succeeded += 1 (A deleted)"
+            2,
+            "deletes_succeeded += 2 (A removed + missing idempotent)"
         );
-        assert_eq!(after_fail - before_fail, 1, "deletes_failed += 1 (missing)");
+        // The operations matrix still distinguishes a real removal (Ok) from an
+        // idempotent no-op (Idempotent) so observability is preserved.
+        assert_eq!(after_ok - before_ok, 1, "Delete/Ok += 1 (A removed)");
+        assert_eq!(
+            after_idem - before_idem,
+            1,
+            "Delete/Idempotent += 1 (missing no-op)"
+        );
     }
 
     // -----------------------------------------------------------------------
