@@ -1,0 +1,34 @@
+# Single-node single-store config with per-connection request pipelining
+# enabled (pipeline_depth = 16). Drive with the loadgen sharing few
+# connections, e.g. CONNS=16 WORKERS=256 VARIANTS=pipe16 run_bench.sh, so
+# each connection carries ~16 concurrent in-flight requests that the
+# server dispatches in parallel. Compare against bench-1store.toml
+# (pipeline_depth defaults to 1 = serial per connection).
+node_id = 1
+listen_addr = "0.0.0.0:3300"
+http_listen_addr = "0.0.0.0:9100"
+swim_port = 3301
+seed_nodes = []
+replication_factor = 1
+
+# ONE store.
+device_paths = ["/data/d0.dat"]
+device_size = 1073741824
+device_alignment = 4096
+redo_log_size = 67108864
+index_snapshot_path = "/data/index.snap"
+expected_records = 2000000
+lock_stripes = 65536
+max_batch_size = 8192
+max_connections = 1024
+block_height_retention = 288
+pipeline_depth = 16
+
+# Standalone bench: no inter-node auth. Admin/debug routes stay off (the bench
+# only needs the unauthenticated /metrics, /health, /status surface).
+strict_auth = false
+enable_remote_bind = true
+enable_admin_endpoints = false
+
+[index]
+backend = "memory"

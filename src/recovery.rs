@@ -35,7 +35,7 @@
 //! matches. Replaying an already-applied operation is therefore safe
 //! across multiple recovery passes (e.g. crash mid-replay).
 
-use crate::allocator::SlotAllocator;
+use crate::allocator::BoxedAllocator;
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::index::{
     DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
@@ -76,14 +76,6 @@ pub enum RecoveryError {
     /// Index error.
     #[error("index error: {0}")]
     Index(#[from] crate::index::IndexError),
-
-    /// Deletion-tombstone log error (R1 reconstruct, design §5.1).
-    #[error("tombstone log error: {0}")]
-    Tombstone(#[from] crate::tombstone::TombstoneError),
-
-    /// Deletion-tombstone redb index error (R1 reconstruct).
-    #[error("tombstone index error: {0}")]
-    TombstoneIndex(#[from] crate::index::redb_tombstone::TombstoneIndexError),
 }
 
 /// Cause classification for a single entry that could not be replayed.
@@ -341,227 +333,6 @@ pub fn recover(
     Ok(stats)
 }
 
-/// Statistics from the deletion-tombstone recovery pass
-/// ([`recover_tombstones`]).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct TombstoneRecoveryStats {
-    /// R1: number of tombstone entries reconstructed into the redb index
-    /// from the on-device log (after CRC validation + torn-tail drop).
-    pub tombstones_reconstructed: usize,
-    /// R2: number of live primary-index records purged because an
-    /// authoritative tombstone (generation at-or-ahead of the live record)
-    /// existed for them.
-    pub records_self_purged: usize,
-    /// R2: number of tombstoned keys left in place because the live record
-    /// had a STRICTLY HIGHER generation than the tombstone (a legitimate
-    /// post-deletion re-creation — design §8.4). These are NOT over-purged.
-    pub kept_newer_generation: usize,
-}
-
-/// Reconstruct the deletion-tombstone index from the on-device log (R1) and
-/// run the R2 self-purge pass (deletion-tombstone design §5).
-///
-/// This runs once at boot, AFTER redo replay + primary-index load + the redb
-/// tombstone index has been opened, and AFTER the engine is constructed (R2
-/// routes record removal through the engine's delete primitive).
-///
-/// ## R1 — durability across restart (design §5.1)
-///
-/// Scans the durable, never-reset tombstone log and rebuilds the redb
-/// tombstone index from it via
-/// [`crate::index::redb_tombstone::RedbTombstoneIndex::rebuild_from`]. CRC
-/// validation and torn-tail dropping are handled by the log's
-/// [`crate::tombstone::TombstoneLog::scan`]; a half-written final entry is
-/// dropped exactly like a torn redo tail.
-///
-/// ## R2 — self-purge (design §5.2 — the critical correctness step)
-///
-/// For every tombstone key, if the primary index STILL holds that key AND the
-/// tombstone's generation is at-or-ahead of the live record's generation
-/// (wrapping comparison, [`crate::record::generation_at_or_ahead`]), the
-/// record is removed locally via `crate::ops::engine::Engine::delete_for_purge`
-/// (which does NOT write a new tombstone — the tombstone already exists). This
-/// collapses any record the node resurrected from its own redo/device load of
-/// a key the cluster authoritatively deleted, making the node safe even before
-/// it rejoins.
-///
-/// Generation guard (design §8.4): a record whose live generation is STRICTLY
-/// HIGHER than the tombstone's is a legitimate post-deletion re-creation and is
-/// KEPT — the tombstone only authorizes dropping the version it recorded or an
-/// older one.
-///
-/// ## Index/allocator inconsistency the R2 purge must tolerate
-///
-/// The record R2 finds "live" is one this node resurrected from its OWN durable
-/// state (redo replay + on-device record load) for a key the cluster
-/// authoritatively deleted. That resurrection can leave the primary index and
-/// the allocator's recovered free-list DISAGREEING about the record's region:
-/// the index entry points at `record_offset`, but the allocator's recovered
-/// free-list ALREADY considers `[record_offset, record_offset + record_size)`
-/// free (the deletion freed it pre-crash and that free was journaled, while the
-/// stale index entry was re-derived from an older redo/record image). The two
-/// recovered structures are rebuilt from independent durable sources, so this
-/// skew is expected, not corruption.
-///
-/// Consequently R2's removal cannot blindly free the region: the allocator's
-/// free-list is AUTHORITATIVE that the region is dead, and a second `free` of an
-/// already-free range is (correctly) rejected as a double-free. R2's actual
-/// goal is narrower — drop the stale primary-index entry so the resurrected key
-/// is gone. `crate::ops::engine::Engine::delete_for_purge` therefore tolerates
-/// an already-free region: it removes the index entry (durably, via the redb
-/// primary index `commit`, so the key cannot reappear on the next restart — no
-/// per-restart purge loop) and SKIPS the redundant free when the region is fully
-/// contained in an existing free region. A PARTIAL overlap (the record range
-/// extending past the free region into possibly-live space) is NOT tolerated and
-/// still surfaces as an error. This makes the already-free case a SUCCESSFUL
-/// purge (counted, no warning), because the record is gone from the index (R2's
-/// goal) and the region is correctly free.
-///
-/// ## Idempotency
-///
-/// Re-running yields the same state: `rebuild_from` is a deterministic
-/// clear-and-repopulate, and R2 only purges keys still live + tombstoned, so a
-/// second run finds the purged keys absent and does nothing.
-///
-/// Gated by the caller on `tombstones_enabled` — when the feature is off this
-/// is not called at all.
-///
-/// # Errors
-/// * [`RecoveryError::Tombstone`] if scanning the log fails (a torn TAIL is
-///   tolerated by the scan and is NOT an error; only a device read failure
-///   propagates).
-/// * [`RecoveryError::TombstoneIndex`] if the redb rebuild fails.
-///
-/// An R2 purge that fails for a single key is logged and counted but does NOT
-/// abort the pass — a transient per-key delete error must not wedge boot; the
-/// next restart re-derives the index and retries the purge (idempotent).
-pub fn recover_tombstones(
-    engine: &crate::ops::engine::Engine,
-    log: &crate::tombstone::TombstoneLog,
-    index: &mut crate::index::redb_tombstone::RedbTombstoneIndex,
-) -> Result<TombstoneRecoveryStats, RecoveryError> {
-    let mut stats = TombstoneRecoveryStats::default();
-
-    // R1: rebuild the redb tombstone index from the durable log.
-    let entries = log.scan()?;
-    stats.tombstones_reconstructed = entries.len();
-    index.rebuild_from(entries.iter().copied())?;
-
-    // R2: self-purge. Iterate the reconstructed tombstone entries (the log
-    // is the source of truth; the redb index we just rebuilt mirrors it).
-    // For a key that appears multiple times in the log, the LAST entry is
-    // authoritative — that matches `rebuild_from`'s last-writer-wins, so we
-    // also fold to the last generation seen per key to avoid an earlier,
-    // lower-generation entry wrongly purging a key the redb index now records
-    // at a higher generation.
-    let mut latest: std::collections::HashMap<[u8; 32], u32> = std::collections::HashMap::new();
-    for t in &entries {
-        let txid = t.txid;
-        let generation = t.generation;
-        latest
-            .entry(txid)
-            .and_modify(|g| {
-                // Keep the generation that is at-or-ahead under wrapping
-                // order (the authoritative latest tombstone for the key).
-                if crate::record::generation_at_or_ahead(generation, *g) {
-                    *g = generation;
-                }
-            })
-            .or_insert(generation);
-    }
-
-    for (txid, tombstone_gen) in latest {
-        let key = TxKey { txid };
-        // Read the live primary-index entry. A read error is surfaced (we
-        // must not collapse a backend error into "absent" and skip a purge
-        // that is actually needed).
-        let live = engine.lookup_checked(&key).map_err(RecoveryError::Index)?;
-        let Some(entry) = live else {
-            // Not resurrected — nothing to purge.
-            continue;
-        };
-        let live_gen = entry.generation;
-
-        // BUG-1 fix #4: the generation keep-guard below trusts that the
-        // live entry's cached `generation` belongs to THIS key. That is only
-        // true if the on-device record at the entry's offset is actually
-        // this key's record. An aliased entry (index A→offset but the offset
-        // holds record B) carries B's `generation`, so the keep-guard would
-        // compare the tombstone against a FOREIGN generation and could
-        // wrongly "keep" the corrupt alias. Verify ownership by reading the
-        // on-device metadata: `read_metadata` returns `TxNotFound` precisely
-        // when `meta.tx_id != key.txid`. Only a clean `TxNotFound` proves
-        // the alias; any other error (transient device/backend read) is
-        // ambiguous, so we conservatively treat the entry as owning its
-        // offset and fall back to the normal generation keep-guard rather
-        // than force a removal on an unclear read.
-        let is_alias = matches!(
-            engine.read_metadata(&key),
-            Err(crate::ops::error::SpendError::TxNotFound)
-        );
-
-        if is_alias {
-            // The resurrected entry points at a record that belongs to a
-            // DIFFERENT transaction — pure corruption. Remove the stale index
-            // row UNCONDITIONALLY (no generation guard: its generation is
-            // foreign). This MUST go through the index-only purge: the normal
-            // `delete_for_purge` would itself reject on the tx_id mismatch
-            // (its `read_metadata_for_key` returns `TxNotFound`) and leave the
-            // alias in place. The on-device bytes are left intact — they are
-            // the rightful owner's record, not this key's.
-            match engine.purge_aliased_index_entry(&key) {
-                Ok(true) => stats.records_self_purged += 1,
-                // Already gone (raced away / concurrently removed) — benign.
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        txid = ?&txid[..4],
-                        err = %e,
-                        "tombstone recovery: R2 aliased-entry purge failed; will \
-                         retry on next restart (idempotent)",
-                    );
-                }
-            }
-            continue;
-        }
-
-        // Generation guard (design §8.4): purge only when the tombstone is
-        // at-or-ahead of the live record. A strictly-higher live generation
-        // is a legitimate re-creation post-deletion — keep it.
-        if !crate::record::generation_at_or_ahead(tombstone_gen, live_gen) {
-            stats.kept_newer_generation += 1;
-            continue;
-        }
-
-        // The record was resurrected from this node's own durable state for a
-        // key the cluster authoritatively deleted. Purge it WITHOUT writing a
-        // new tombstone (the tombstone already exists). `due_guard: None` so
-        // the purge is unconditional — we are not re-validating a DAH
-        // predicate, we are enforcing an existing authoritative deletion.
-        let req = crate::ops::remaining::DeleteRequest {
-            tx_key: key,
-            due_guard: None,
-        };
-        match engine.delete_for_purge(&req) {
-            Ok(()) => stats.records_self_purged += 1,
-            Err(crate::ops::error::SpendError::TxNotFound) => {
-                // Raced away between the lookup and the delete (e.g. a
-                // concurrent op) — already gone, nothing to do.
-            }
-            Err(e) => {
-                tracing::warn!(
-                    txid = ?&txid[..4],
-                    err = %e,
-                    "tombstone recovery: R2 self-purge failed for a key; will retry \
-                     on next restart (idempotent)",
-                );
-            }
-        }
-    }
-
-    Ok(stats)
-}
-
 /// Outcome of an offline [`repair_torn_slots`] pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RepairReport {
@@ -735,7 +506,7 @@ pub fn recover_all_with_allocator(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
 ) -> Result<RecoveryStats, RecoveryError> {
     let (stats, _, _) = recover_all_with_allocator_collecting_pending_conflicts(
         device, redo_log, index, dah, unmined, allocator,
@@ -752,7 +523,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
 ) -> Result<
     (
         RecoveryStats,
@@ -793,7 +564,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
     full_secondary_rebuild: bool,
 ) -> Result<
     (
@@ -834,7 +605,7 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
 #[allow(clippy::too_many_arguments)]
 pub fn recover_all_multi_store(
     devices: &[std::sync::Arc<dyn BlockDevice>],
-    allocators: &mut [SlotAllocator],
+    allocators: &mut [BoxedAllocator],
     redo_logs: &mut [RedoLog],
     index: &ShardedIndex,
     dah: &mut DahBackend,
@@ -1006,7 +777,7 @@ pub fn recover_all_multi_store(
 #[allow(clippy::too_many_arguments)]
 fn replay_one_recovery_entry(
     device: &dyn BlockDevice,
-    mut allocator: Option<&mut SlotAllocator>,
+    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
@@ -1170,6 +941,60 @@ fn replay_one_recovery_entry(
                 )
             }
         }
+        // CreateV2 carries no payload (like ReplicaCreate), so gate it on the
+        // SAME is_allocated_range check — a stale CreateV2 whose offset was freed
+        // and re-handed to another record must not register an aliasing entry.
+        // Range length derived from utxo_count via record_size_for.
+        RedoOp::CreateV2 {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+            is_conflicting,
+            parent_txids,
+        } => {
+            let range_len = TxMetadata::record_size_for(*utxo_count);
+            if let Some(alloc) = allocator.as_deref()
+                && !alloc.is_allocated_range(*record_offset, range_len)
+            {
+                ReplayResult::Failed(ReplayCause::LogicError)
+            } else {
+                replay_create_v2(
+                    device,
+                    *device_id,
+                    index,
+                    offset_owners,
+                    tx_key,
+                    *record_offset,
+                    *utxo_count,
+                    *is_conflicting,
+                    parent_txids,
+                )
+            }
+        }
+        RedoOp::Relocate {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+        } => {
+            let range_len = TxMetadata::record_size_for(*utxo_count);
+            if let Some(alloc) = allocator.as_deref()
+                && !alloc.is_allocated_range(*record_offset, range_len)
+            {
+                ReplayResult::Failed(ReplayCause::LogicError)
+            } else {
+                replay_relocate(
+                    device,
+                    *device_id,
+                    index,
+                    offset_owners,
+                    tx_key,
+                    *record_offset,
+                    *utxo_count,
+                )
+            }
+        }
         RedoOp::CompensateUnsetMined {
             tx_key,
             block_id,
@@ -1214,7 +1039,7 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     index: &ShardedIndex,
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
-    mut allocator: Option<&mut SlotAllocator>,
+    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     mut progress: Option<(&mut RedoLog, u64)>,
     secondary_reconcile: SecondaryReconcile,
 ) -> Result<
@@ -1875,6 +1700,38 @@ fn replay_entry(
             record_bytes,
             parent_txids,
         ),
+        RedoOp::CreateV2 {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+            is_conflicting,
+            parent_txids,
+        } => replay_create_v2(
+            device,
+            *device_id,
+            index,
+            offset_owners,
+            tx_key,
+            *record_offset,
+            *utxo_count,
+            *is_conflicting,
+            parent_txids,
+        ),
+        RedoOp::Relocate {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+        } => replay_relocate(
+            device,
+            *device_id,
+            index,
+            offset_owners,
+            tx_key,
+            *record_offset,
+            *utxo_count,
+        ),
         RedoOp::Delete {
             tx_key,
             record_offset,
@@ -2214,7 +2071,7 @@ fn replay_set_mined(
 fn replay_set_mined_with_allocator(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
-    mut allocator: Option<&mut SlotAllocator>,
+    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -2925,6 +2782,126 @@ fn replay_create(
     ReplayResult::Applied
 }
 
+/// Replay an index-only create ([`RedoOp::CreateV2`]) — the buffered-durability
+/// counterpart to [`replay_create`].
+///
+/// Unlike [`replay_create`], the record bytes are NOT carried in the WAL: they
+/// were written to the data device at `record_offset` and flushed on the same
+/// buffered cadence as this redo entry. So this path READS the record back
+/// instead of rewriting it. The durability contract (see [`crate::redo::OP_CREATE_V2`]):
+/// a `CreateV2` entry only survives in the redo if it passed the redo CRC scan,
+/// but its matching data write may NOT have landed if the crash fell between the
+/// two buffered flushes. That is a CONSISTENT buffered-tail loss, not corruption,
+/// so every "didn't land" signal — unreadable/CRC-failing metadata, a `tx_id`
+/// that belongs to a different (older, offset-reused) record, or a `utxo_count`
+/// mismatch — resolves to [`ReplayResult::Skipped`], NOT `Failed`. The create is
+/// simply dropped (the caller re-submits, exactly as for a lost buffered tail).
+#[allow(clippy::too_many_arguments)]
+fn replay_create_v2(
+    device: &dyn BlockDevice,
+    device_id: u8,
+    index: &ShardedIndex,
+    offset_owners: &mut OffsetOwners,
+    tx_key: &TxKey,
+    record_offset: u64,
+    utxo_count: u32,
+    is_conflicting: bool,
+    parent_txids: &[[u8; 32]],
+) -> ReplayResult {
+    // Idempotent: already registered (e.g. a later checkpoint covered it).
+    if index.lookup(tx_key).is_some() {
+        return ReplayResult::Skipped;
+    }
+
+    // Read the record's metadata back from the device. Under buffered durability
+    // a missing/torn data write means this create's bytes were lost on the same
+    // tail this redo entry's flush did NOT cover → drop it (Skipped).
+    let meta = match crate::io::read_metadata(device, record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Skipped,
+    };
+
+    // The on-device record must be THIS create's: a mismatched tx_id means the
+    // data write never landed and the offset still holds an older (since-freed,
+    // reused) record's bytes; a mismatched utxo_count means a partial/torn
+    // write. Either way the create did not durably land → Skipped.
+    if { meta.tx_id } != tx_key.txid || { meta.utxo_count } != utxo_count {
+        return ReplayResult::Skipped;
+    }
+
+    let entry = TxIndexEntry {
+        device_id,
+        record_offset,
+        utxo_count,
+        block_entry_count: meta.block_entry_count,
+        tx_flags: meta.flags.bits(),
+        spent_utxos: { meta.spent_utxos },
+        dah_or_preserve: { meta.delete_at_height },
+        unmined_since: { meta.unmined_since },
+        generation: { meta.generation },
+    };
+    if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
+        return ReplayResult::Failed(ReplayCause::LogicError);
+    }
+
+    // Conflicting-child links are drained post-engine-construction, same as
+    // `replay_create` — keep the fields bound so the contract is explicit.
+    let _ = (is_conflicting, parent_txids);
+
+    ReplayResult::Applied
+}
+
+/// Replay a record relocation ([`RedoOp::Relocate`]) — segment engine. The
+/// record for `tx_key` was rewritten at a new append-cursor `record_offset`
+/// (carrying a baked-in mutation), so the index must re-point there and the old
+/// extent becomes dead. Like [`replay_create_v2`] the bytes are read back from
+/// the device, not the WAL.
+///
+/// Differs from `replay_create_v2` in two ways: (1) the record must ALREADY be
+/// indexed — a relocation of a tx that was never (durably) created is moot, so
+/// an absent key is `Skipped`, not inserted; (2) it REPLACES the existing entry
+/// (new offset + cached fields read from the relocated record, which reflect the
+/// baked-in mutation). A buffered-tail loss (unreadable / tx_id-or-utxo_count
+/// mismatch at the new offset) means the relocation did not land — the
+/// pre-relocation record is still intact (append-only never overwrites the old
+/// extent until defrag), so we keep it and `Skip` rather than repoint to garbage.
+#[allow(clippy::too_many_arguments)]
+fn replay_relocate(
+    device: &dyn BlockDevice,
+    device_id: u8,
+    index: &ShardedIndex,
+    offset_owners: &mut OffsetOwners,
+    tx_key: &TxKey,
+    record_offset: u64,
+    utxo_count: u32,
+) -> ReplayResult {
+    if index.lookup(tx_key).is_none() {
+        return ReplayResult::Skipped;
+    }
+    let meta = match crate::io::read_metadata(device, record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Skipped,
+    };
+    if { meta.tx_id } != tx_key.txid || { meta.utxo_count } != utxo_count {
+        return ReplayResult::Skipped;
+    }
+    let entry = TxIndexEntry {
+        device_id,
+        record_offset,
+        utxo_count,
+        block_entry_count: meta.block_entry_count,
+        tx_flags: meta.flags.bits(),
+        spent_utxos: { meta.spent_utxos },
+        dah_or_preserve: { meta.delete_at_height },
+        unmined_since: { meta.unmined_since },
+        generation: { meta.generation },
+    };
+    if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
+        return ReplayResult::Failed(ReplayCause::LogicError);
+    }
+    ReplayResult::Applied
+}
+
 fn replay_metadata_op(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
@@ -3221,7 +3198,7 @@ fn replay_compensate_unset_mined(
 fn replay_compensate_unset_mined_with_allocator(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
-    allocator: Option<&mut SlotAllocator>,
+    allocator: Option<&mut crate::allocator::BoxedAllocator>,
     tx_key: &TxKey,
     block_id: u32,
     block_height: u32,
@@ -3361,7 +3338,7 @@ enum RecoveryOverflowError {
 
 fn append_recovery_overflow_block_entry(
     device: &dyn BlockDevice,
-    allocator: &mut SlotAllocator,
+    allocator: &mut crate::allocator::BoxedAllocator,
     metadata: &mut TxMetadata,
     entry: BlockEntry,
 ) -> std::result::Result<(), RecoveryOverflowError> {
@@ -3392,7 +3369,7 @@ fn append_recovery_overflow_block_entry(
 /// `block_entry_count` reflect `entries`.
 fn write_recovery_overflow_entries(
     device: &dyn BlockDevice,
-    allocator: &mut SlotAllocator,
+    allocator: &mut crate::allocator::BoxedAllocator,
     metadata: &mut TxMetadata,
     entries: &[BlockEntry],
 ) -> std::result::Result<(), RecoveryOverflowError> {
@@ -3604,6 +3581,59 @@ fn replay_compensate_set_locked(
     ReplayResult::Applied
 }
 
+/// Recompute each store's append frontier from the rebuilt index so a segment
+/// allocator (which journals no `AllocateRegion` ops) does not overwrite records
+/// created after the last checkpoint.
+///
+/// For each store, finds the highest-offset live record, reads its on-device
+/// `record_size`, and advances that store's allocator frontier past it (rounded
+/// up to a device block — a safe over-estimate). The highest-offset live record
+/// has the highest end offset because records are packed contiguously without
+/// overlap, so a single read per store suffices. No-op for the in-place
+/// [`crate::allocator::SlotAllocator`] (its `recover_frontier_at_least` default
+/// does nothing — it re-derives its high-water mark from replayed `AllocateRegion`
+/// ops). Call AFTER the index is fully rebuilt/recovered and BEFORE accepting
+/// writes; `devices[i]` and `allocators[i]` are store `i`.
+///
+/// # Errors
+/// Propagates a device error if the highest-offset record's metadata cannot be
+/// read (a corrupt frontier record fails recovery closed rather than risking an
+/// under-advanced cursor that could overwrite live data).
+pub fn recover_allocator_frontiers(
+    index: &ShardedIndex,
+    devices: &[std::sync::Arc<dyn BlockDevice>],
+    allocators: &mut [BoxedAllocator],
+) -> std::result::Result<(), DeviceError> {
+    // Collect every LIVE record offset per store in one O(index) pass. The full
+    // offset list (not just the max) is needed by the segment engine's defrag
+    // reconciliation, which rebuilds the reclaimed-segment free list from the set
+    // of segments that still hold a live record (design §3.2). The in-place
+    // SlotAllocator ignores the list (its `reconcile_recovered_free_list` is a
+    // no-op) and only uses the frontier.
+    let n = allocators.len();
+    let mut live_offsets: Vec<Vec<u64>> = vec![Vec::new(); n];
+    index.for_each(|_key, e| {
+        let s = e.device_id as usize;
+        if s < n {
+            live_offsets[s].push(e.record_offset);
+        }
+    });
+    for s in 0..n {
+        // 1) Advance the frontier past the highest live record so a fresh
+        //    allocation cannot overwrite it (over-estimate, block-rounded).
+        if let Some(&max) = live_offsets[s].iter().max() {
+            let meta = io::read_metadata(&*devices[s], max)?;
+            let align = devices[s].alignment() as u64;
+            let end = (max + meta.record_size as u64).div_ceil(align) * align;
+            allocators[s].recover_frontier_at_least(end);
+        }
+        // 2) Segment engine: rebuild the reuse free list from the live set (so a
+        //    defragged bounded-growth layout survives the crash). No-op in-place.
+        allocators[s].reconcile_recovered_free_list(&live_offsets[s]);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3627,14 +3657,15 @@ mod tests {
         data_dev: Arc<MemoryDevice>,
         redo_dev: Arc<MemoryDevice>,
         index: ShardedIndex,
-        alloc: SlotAllocator,
+        alloc: crate::allocator::BoxedAllocator,
     }
 
     impl RecoveryTestHarness {
         fn new() -> Self {
             let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-            let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+            let alloc: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
             let primary = PrimaryBackend::new_in_memory(1000).unwrap();
             let index = ShardedIndex::from_single(primary);
             Self {
@@ -3688,28 +3719,6 @@ mod tests {
 
         fn redo_log(&self) -> RedoLog {
             RedoLog::open(self.redo_dev.clone(), 0, 1024 * 1024).unwrap()
-        }
-
-        /// Overwrite a record's primary-index `generation` (keeping its
-        /// offset and other fields), so a test can stage a live record whose
-        /// generation is higher than a tombstone's (the §8.4 keep case).
-        fn set_index_generation(&self, key: &TxKey, generation: u32) {
-            let mut ie = self.index.lookup(key).unwrap();
-            ie.generation = generation;
-            self.index.register(*key, ie).unwrap();
-        }
-
-        /// Free a record's region in the ALLOCATOR only, leaving the
-        /// primary-index entry and the on-device bytes in place. This stages
-        /// the exact index/allocator inconsistency recovery can produce: the
-        /// index still resurrects the key at `record_offset`, but the
-        /// allocator's free-list already considers that region dead. Returns
-        /// `(record_offset, record_size)` of the now-already-free region.
-        fn free_region_in_allocator_only(&mut self, key: &TxKey, utxo_count: u32) -> (u64, u64) {
-            let ie = self.index.lookup(key).unwrap();
-            let record_size = TxMetadata::record_size_for(utxo_count);
-            self.alloc.free(ie.record_offset, record_size).unwrap();
-            (ie.record_offset, record_size)
         }
 
         /// Write `delete_at_height` / `unmined_since` into a record's
@@ -4884,6 +4893,371 @@ mod tests {
         assert_eq!(stats.entries_skipped, 1); // Already in index
     }
 
+    /// Phase 1 log-structured: `RedoOp::CreateV2` carries NO record bytes —
+    /// replay must READ the record back from the data device and register a
+    /// correctly-populated index entry. The `generation` assertion proves the
+    /// cached fields came from the device metadata (the redo entry has no
+    /// generation), i.e. the device was actually read, not fabricated.
+    #[test]
+    fn create_v2_replay_reads_record_from_device() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 5u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x77;
+        let key = TxKey { txid };
+
+        // Write the record to the device WITHOUT registering it in the index —
+        // simulates the data write having landed while the index was lost, so
+        // recovery must rebuild the entry from the device read.
+        let offset = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.generation = 9;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+        assert!(h.index.lookup(&key).is_none());
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset,
+            utxo_count,
+            is_conflicting: false,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+        let ie = h
+            .index
+            .lookup(&key)
+            .expect("CreateV2 must register the entry read back from the device");
+        assert_eq!(ie.record_offset, offset);
+        assert_eq!(ie.utxo_count, utxo_count);
+        assert_eq!(
+            ie.generation, 9,
+            "cached fields must come from the device read"
+        );
+    }
+
+    /// Increment 4: `RedoOp::Relocate` re-points an EXISTING index entry to the
+    /// record's new append-cursor offset, rebuilding the cached fields from the
+    /// relocated (mutated) record.
+    #[test]
+    fn relocate_replay_repoints_index_to_new_offset() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x60;
+        let key = TxKey { txid };
+        let write_rec = |h: &mut RecoveryTestHarness, generation: u32, spent: u32| -> u64 {
+            let offset = h
+                .alloc
+                .allocate(TxMetadata::record_size_for(utxo_count))
+                .unwrap();
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.generation = generation;
+            meta.spent_utxos = spent;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut hh = [0u8; 32];
+                    hh[0] = i as u8;
+                    UtxoSlot::new_unspent(hh)
+                })
+                .collect();
+            io::write_full_record(&*h.data_dev, offset, &meta, &slots).unwrap();
+            offset
+        };
+
+        // Pre-relocation record at off1 (registered in the index, generation 1).
+        let off1 = write_rec(&mut h, 1, 0);
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off1,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        // Relocated record at off2 (generation 2, one output spent baked in).
+        let off2 = write_rec(&mut h, 2, 1);
+        assert_ne!(off1, off2);
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Relocate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off2,
+            utxo_count,
+        })
+        .unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1);
+        let ie = h.index.lookup(&key).unwrap();
+        assert_eq!(
+            ie.record_offset, off2,
+            "index must re-point to the relocated offset"
+        );
+        assert_eq!(
+            ie.generation, 2,
+            "cached fields come from the relocated record"
+        );
+        assert_eq!(ie.spent_utxos, 1);
+    }
+
+    /// A relocation of a tx that is NOT (durably) indexed is moot — recovery
+    /// must skip it, never register the tx from a relocate alone.
+    #[test]
+    fn relocate_replay_skips_when_key_absent() {
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x61;
+        let key = TxKey { txid };
+        let off = h.alloc.allocate(TxMetadata::record_size_for(3)).unwrap();
+        let mut meta = TxMetadata::new(3);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..3)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, off, &meta, &slots).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Relocate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off,
+            utxo_count: 3,
+        })
+        .unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert!(
+            h.index.lookup(&key).is_none(),
+            "relocate of an unindexed tx must not register it"
+        );
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(stats.entries_failed, 0);
+    }
+
+    /// A relocation whose new bytes did NOT land (buffered-tail loss) must keep
+    /// the intact pre-relocation record — append-only never overwrote the old
+    /// extent, so the index stays on the old offset (relocation dropped).
+    #[test]
+    fn relocate_replay_keeps_old_offset_on_buffered_loss() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x62;
+        let key = TxKey { txid };
+        let off1 = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.generation = 1;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, off1, &meta, &slots).unwrap();
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off1,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        // Allocate off2 but write NOTHING there (the relocated bytes were lost).
+        let off2 = h
+            .alloc
+            .allocate(TxMetadata::record_size_for(utxo_count))
+            .unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Relocate {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off2,
+            utxo_count,
+        })
+        .unwrap();
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        let ie = h.index.lookup(&key).unwrap();
+        assert_eq!(
+            ie.record_offset, off1,
+            "buffered-lost relocation must keep the intact pre-relocation record"
+        );
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(stats.entries_failed, 0);
+    }
+
+    /// Phase 1 log-structured: a `CreateV2` whose data write did NOT land (the
+    /// device region is absent/zeroed) is a CONSISTENT buffered-tail loss — it
+    /// must be SKIPPED (the create is dropped, caller re-submits), NOT failed,
+    /// and must NOT register an index entry pointing at garbage.
+    #[test]
+    fn create_v2_replay_skips_when_device_record_absent() {
+        let mut h = RecoveryTestHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x78;
+        let key = TxKey { txid };
+        // Allocate an offset but write NOTHING there (zeroed device region).
+        let offset = h.alloc.allocate(TxMetadata::record_size_for(3)).unwrap();
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::CreateV2 {
+            tx_key: key,
+            device_id: 0,
+            record_offset: offset,
+            utxo_count: 3,
+            is_conflicting: false,
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert!(
+            h.index.lookup(&key).is_none(),
+            "absent device record must not register an index entry"
+        );
+        assert_eq!(stats.entries_skipped, 1);
+        assert_eq!(
+            stats.entries_failed, 0,
+            "buffered-tail loss is Skipped, not Failed"
+        );
+    }
+
+    /// Increment 3b — the segment-engine recovery cursor-recompute. The segment
+    /// allocator journals no `AllocateRegion` ops, so after a crash its header
+    /// cursor is the last-CHECKPOINT value, BEHIND records created after the
+    /// checkpoint. `recover_allocator_frontiers` must advance the frontier past
+    /// the highest live record so a fresh allocation cannot overwrite it.
+    #[test]
+    fn segment_recovery_advances_frontier_past_post_checkpoint_records() {
+        use crate::segment_allocator::SegmentAllocator;
+
+        let device: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let primary = PrimaryBackend::new_in_memory(1000).unwrap();
+        let index = ShardedIndex::from_single(primary);
+
+        // Create a record: allocate from the segment cursor, write it, register it.
+        let make = |seg: &mut SegmentAllocator, n: u8| -> u64 {
+            let utxo_count = 2u32;
+            let mut txid = [0u8; 32];
+            txid[0] = n;
+            let key = TxKey { txid };
+            let offset = seg
+                .allocate(TxMetadata::record_size_for(utxo_count))
+                .unwrap();
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut hh = [0u8; 32];
+                    hh[0] = i as u8;
+                    UtxoSlot::new_unspent(hh)
+                })
+                .collect();
+            io::write_full_record(&*device, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        utxo_count,
+                        block_entry_count: 0,
+                        tx_flags: 0,
+                        spent_utxos: 0,
+                        dah_or_preserve: 0,
+                        unmined_since: 0,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+            offset
+        };
+
+        let mut seg = SegmentAllocator::new(device.clone(), 8 * 1024 * 1024).unwrap();
+        // Three records, then a "checkpoint" (persist the header).
+        make(&mut seg, 1);
+        make(&mut seg, 2);
+        make(&mut seg, 3);
+        seg.persist().unwrap();
+        let checkpoint_cursor = seg.cursor();
+        // Two MORE records created AFTER the checkpoint.
+        make(&mut seg, 4);
+        let o5 = make(&mut seg, 5);
+        let live_frontier = seg.cursor(); // past record 5
+        assert!(o5 >= checkpoint_cursor);
+
+        // Crash + recover the allocator from its header: the cursor is the stale
+        // checkpoint value, BEHIND records 4 and 5.
+        let recovered: BoxedAllocator =
+            Box::new(SegmentAllocator::recover(device.clone()).unwrap());
+        assert_eq!(
+            recovered.next_offset(),
+            checkpoint_cursor,
+            "recovered cursor is the stale checkpoint value"
+        );
+        assert!(recovered.next_offset() < live_frontier);
+
+        // Drive the frontier recompute from the rebuilt index.
+        let devices = vec![device.clone()];
+        let mut allocs = vec![recovered];
+        recover_allocator_frontiers(&index, &devices, &mut allocs).unwrap();
+
+        // The frontier now covers every live record; the next allocation cannot
+        // overwrite record 5.
+        let recovered = &mut allocs[0];
+        assert!(
+            recovered.next_offset() >= live_frontier,
+            "frontier must advance past all live records"
+        );
+        let next = recovered.allocate(TxMetadata::record_size_for(2)).unwrap();
+        assert!(
+            next >= live_frontier,
+            "next allocation must not overwrite a post-checkpoint record"
+        );
+    }
+
     /// Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md) part 4:
     /// `RedoOp::Create` carries the full record bytes; replay must
     /// reconstruct the on-device record byte-for-byte and register a
@@ -4906,12 +5280,16 @@ mod tests {
         // one global sequence counter (as boot wires it).
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         // Build a record's bytes + allocate its region on the given store.
-        let build = |txid_byte: u8, alloc: &mut SlotAllocator| -> (TxKey, u64, Vec<u8>) {
+        let build = |txid_byte: u8,
+                     alloc: &mut crate::allocator::BoxedAllocator|
+         -> (TxKey, u64, Vec<u8>) {
             let utxo_count: u32 = 3;
             let mut txid = [0u8; 32];
             txid[0] = txid_byte;
@@ -4959,7 +5337,7 @@ mod tests {
                 record_offset: off_a,
                 utxo_count: 3,
                 is_conflicting: false,
-                record_bytes: rb_a.clone(),
+                record_bytes: rb_a.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -4970,7 +5348,7 @@ mod tests {
                 record_offset: off_b,
                 utxo_count: 3,
                 is_conflicting: false,
-                record_bytes: rb_b.clone(),
+                record_bytes: rb_b.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5038,8 +5416,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         // Write a real on-device record on STORE 1 (as the replica's
@@ -5127,8 +5507,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         // Boot wiring: each store's allocator is tagged with its store index.
         alloc0.set_redo_device_id(0);
         alloc1.set_redo_device_id(1);
@@ -5186,7 +5568,7 @@ mod tests {
                 record_offset,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes: rb.clone(),
+                record_bytes: rb.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5275,8 +5657,10 @@ mod tests {
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
             let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
             let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-            let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-            let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+            let mut alloc0: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+            let mut alloc1: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(dev1.clone()).unwrap());
             alloc0.set_redo_device_id(0);
             alloc1.set_redo_device_id(1);
             // The original incarnation's region on store 0, the re-create's on store 1.
@@ -5302,7 +5686,7 @@ mod tests {
                     record_offset: off_a,
                     utxo_count,
                     is_conflicting: false,
-                    record_bytes: rb.clone(),
+                    record_bytes: rb.clone().into(),
                     parent_txids: Vec::new(),
                 })
                 .unwrap();
@@ -5328,7 +5712,7 @@ mod tests {
                     record_offset: off_b,
                     utxo_count,
                     is_conflicting: false,
-                    record_bytes: rb.clone(),
+                    record_bytes: rb.clone().into(),
                     parent_txids: Vec::new(),
                 })
                 .unwrap();
@@ -5398,8 +5782,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         alloc0.set_redo_device_id(0);
         alloc1.set_redo_device_id(1);
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
@@ -5478,7 +5864,7 @@ mod tests {
                 record_offset: bogus_offset,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes: vec![0u8; base as usize],
+                record_bytes: vec![0u8; base as usize].into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5494,7 +5880,7 @@ mod tests {
                 record_offset: off_b,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes: rb_b.clone(),
+                record_bytes: rb_b.clone().into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -5549,11 +5935,11 @@ mod tests {
         const PER_STORE: u32 = 40;
 
         let mut devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
-        let mut allocators: Vec<SlotAllocator> = Vec::new();
+        let mut allocators: Vec<crate::allocator::BoxedAllocator> = Vec::new();
         for _ in 0..STORES {
             let dev: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            allocators.push(SlotAllocator::new(dev.clone()).unwrap());
+            allocators.push(Box::new(SlotAllocator::new(dev.clone()).unwrap()));
             devices.push(dev);
         }
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(8192).unwrap());
@@ -5616,7 +6002,7 @@ mod tests {
                         record_offset: offset,
                         utxo_count,
                         is_conflicting: false,
-                        record_bytes: rb,
+                        record_bytes: rb.into(),
                         parent_txids: Vec::new(),
                     })
                     .unwrap();
@@ -5684,8 +6070,10 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let dev1: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         // Write a record on `dev`/`alloc`, register it on store `device_id`, set
@@ -5693,7 +6081,7 @@ mod tests {
         let make = |txid_byte: u8,
                     device_id: u8,
                     dev: &Arc<dyn BlockDevice>,
-                    alloc: &mut SlotAllocator,
+                    alloc: &mut crate::allocator::BoxedAllocator,
                     dah_h: u32,
                     unmined_h: u32|
          -> TxKey {
@@ -5779,9 +6167,9 @@ mod tests {
         let mut unmined_full = UnminedBackend::new_in_memory();
         {
             let devices = [dev0.clone(), dev1.clone()];
-            let mut allocators = [
-                SlotAllocator::new(dev0.clone()).unwrap(),
-                SlotAllocator::new(dev1.clone()).unwrap(),
+            let mut allocators: [crate::allocator::BoxedAllocator; 2] = [
+                Box::new(SlotAllocator::new(dev0.clone()).unwrap()),
+                Box::new(SlotAllocator::new(dev1.clone()).unwrap()),
             ];
             let mut logs = build_logs();
             recover_all_multi_store(
@@ -5814,9 +6202,9 @@ mod tests {
         unmined_touch.insert(850, d, None).unwrap();
         {
             let devices = [dev0.clone(), dev1.clone()];
-            let mut allocators = [
-                SlotAllocator::new(dev0.clone()).unwrap(),
-                SlotAllocator::new(dev1.clone()).unwrap(),
+            let mut allocators: [crate::allocator::BoxedAllocator; 2] = [
+                Box::new(SlotAllocator::new(dev0.clone()).unwrap()),
+                Box::new(SlotAllocator::new(dev1.clone()).unwrap()),
             ];
             let mut logs = build_logs();
             recover_all_multi_store(
@@ -5879,14 +6267,16 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let dev1: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-        let mut alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-        let mut alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut alloc0: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev0.clone()).unwrap());
+        let mut alloc1: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(dev1.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let make = |txid_byte: u8,
                     device_id: u8,
                     dev: &Arc<dyn BlockDevice>,
-                    alloc: &mut SlotAllocator,
+                    alloc: &mut crate::allocator::BoxedAllocator,
                     dah_h: u32,
                     unmined_h: u32|
          -> TxKey {
@@ -5969,7 +6359,8 @@ mod tests {
         // append a Create redo entry and recover.
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -6024,7 +6415,7 @@ mod tests {
             record_offset,
             utxo_count,
             is_conflicting: false,
-            record_bytes: record_bytes.clone(),
+            record_bytes: record_bytes.clone().into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -6085,7 +6476,8 @@ mod tests {
     fn recover_all_rejects_create_offset_not_owned_by_allocator() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6115,7 +6507,7 @@ mod tests {
             record_offset: crate::allocator::DATA_REGION_OFFSET,
             utxo_count,
             is_conflicting: false,
-            record_bytes,
+            record_bytes: record_bytes.into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -6145,7 +6537,7 @@ mod tests {
     /// names this offset, which now holds B's record.
     fn write_record_b_then_free_in_allocator(
         data_dev: &MemoryDevice,
-        alloc: &mut SlotAllocator,
+        alloc: &mut crate::allocator::BoxedAllocator,
         b_txid: [u8; 32],
         utxo_count: u32,
     ) -> u64 {
@@ -6177,7 +6569,8 @@ mod tests {
     fn recover_all_rejects_legacy_create_offset_not_owned_by_allocator() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6234,7 +6627,8 @@ mod tests {
     fn recover_all_legacy_create_tx_id_guard_rejects_alias() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6303,7 +6697,8 @@ mod tests {
     fn recover_offset_uniqueness_evicts_preexisting_snapshot_alias_via_reverse_map() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
         let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
@@ -6406,65 +6801,6 @@ mod tests {
         );
     }
 
-    /// BUG-1 fix #4 (R2): a resurrected primary entry that ALIASES another
-    /// key's record (index A → offset, but on-device tx_id = B) must be
-    /// purged UNCONDITIONALLY by R2 self-purge when a tombstone exists for
-    /// A — the generation keep-guard must NOT apply, because the entry's
-    /// cached `generation` was seeded from the FOREIGN record B.
-    #[test]
-    fn recover_tombstones_r2_purges_aliased_entry_unconditionally() {
-        // Create record B (on-device tx_id = B) under key B, then RE-POINT
-        // the index so key A maps to B's offset and unregister B. The index
-        // now holds the alias A → B's record, with A's cached `generation`
-        // seeded from B (a HIGH value). A LOW-generation tombstone for A
-        // would, under the pre-fix generation keep-guard, be KEPT (tombstone
-        // gen 1 < live gen 9). The BUG-1 fix #4 tx_id guard must override
-        // that and purge A unconditionally.
-        let mut h = RecoveryTestHarness::new();
-        let key_b = h.create_record(0xBB, 2);
-        // Give B a high generation in the index so the keep-guard WOULD fire.
-        h.set_index_generation(&key_b, 9);
-        let b_entry = h.index.lookup(&key_b).unwrap();
-
-        let mut a_txid = [0u8; 32];
-        a_txid[0] = 0xAA;
-        let key_a = TxKey { txid: a_txid };
-        // Alias: A → B's offset/entry (carrying B's generation 9).
-        h.index.register(key_a, b_entry).unwrap();
-        // Remove B so only the aliased A entry remains pointing at the offset.
-        h.index.unregister(&key_b);
-
-        let engine = engine_from_harness(h);
-        // Sanity: A resolves in the index but the on-device record is B's.
-        assert!(engine.lookup_cached(&key_a).is_some());
-        assert!(
-            matches!(
-                engine.read_metadata(&key_a),
-                Err(crate::ops::error::SpendError::TxNotFound)
-            ),
-            "on-device tx_id must NOT match key A (it is B's record)"
-        );
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        // Tombstone for A at LOW generation 1 — below A's live (aliased) gen 9.
-        seed_tombstone(&mut log, &key_a, 1, 150);
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-
-        assert_eq!(
-            stats.kept_newer_generation, 0,
-            "aliased entry must NOT be kept by the generation guard (tx_id mismatch)"
-        );
-        assert_eq!(
-            stats.records_self_purged, 1,
-            "aliased entry must be purged unconditionally on tx_id mismatch"
-        );
-        assert!(
-            engine.lookup_cached(&key_a).is_none(),
-            "aliased entry A must be removed from the index after R2"
-        );
-    }
-
     /// Gap #2: replay must be idempotent — running recovery twice over
     /// the same redo log produces the same final state. Verifies the
     /// "primary already registered → skip" path.
@@ -6472,7 +6808,8 @@ mod tests {
     fn replay_create_idempotent_on_double_recovery() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -6512,7 +6849,7 @@ mod tests {
             record_offset,
             utxo_count,
             is_conflicting: false,
-            record_bytes: record_bytes.clone(),
+            record_bytes: record_bytes.clone().into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -6540,7 +6877,8 @@ mod tests {
     fn legacy_replay_create_populates_cached_fields_from_metadata() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -6622,7 +6960,8 @@ mod tests {
     fn legacy_replay_create_fails_closed_on_missing_record_bytes() {
         let data_dev = std::sync::Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = std::sync::Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
 
         let txid = {
@@ -7800,7 +8139,8 @@ mod tests {
         .unwrap();
 
         // Rebuild the allocator from snapshot.
-        let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut recovered: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         assert_eq!(recovered.free_region_count(), 0, "snapshot lacks the free");
 
         let mut dah = DahBackend::new_in_memory();
@@ -7841,7 +8181,8 @@ mod tests {
         })
         .unwrap();
 
-        let mut recovered = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut recovered: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         let before_next = recovered.next_offset();
 
         let mut dah = DahBackend::new_in_memory();
@@ -7894,7 +8235,8 @@ mod tests {
         let mut dah = DahBackend::new_in_memory();
         let mut unmined = UnminedBackend::new_in_memory();
 
-        let mut once = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut once: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         recover_all_with_allocator(
             &*h.data_dev,
             &redo,
@@ -7905,7 +8247,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut twice = SlotAllocator::recover(h.data_dev.clone()).unwrap();
+        let mut twice: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         for _ in 0..2 {
             recover_all_with_allocator(
                 &*h.data_dev,
@@ -8157,376 +8500,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deletion-tombstone recovery (Phase 7: R1 reconstruct + R2 self-purge)
-    // -----------------------------------------------------------------------
-
-    use crate::index::redb_tombstone::RedbTombstoneIndex;
-    use crate::tombstone::{Tombstone, TombstoneCause, TombstoneLog};
-
-    /// Build a fresh in-memory-device tombstone log + tempdir redb index.
-    fn fresh_tombstone_storage() -> (TombstoneLog, RedbTombstoneIndex, tempfile::TempDir) {
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
-        let log = TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let idx =
-            RedbTombstoneIndex::open(&dir.path().join("tombstone.redb"), 16 * 1024 * 1024).unwrap();
-        (log, idx, dir)
-    }
-
-    /// Consume the harness into an engine (so R2 can route record removal
-    /// through `delete_for_purge`).
-    fn engine_from_harness(h: RecoveryTestHarness) -> Arc<Engine> {
-        Arc::new(Engine::new_with_sharded_index(
-            h.data_dev.clone(),
-            h.index,
-            h.alloc,
-            StripedLocks::new(1024),
-            DahBackend::new_in_memory(),
-            UnminedBackend::new_in_memory(),
-        ))
-    }
-
-    fn seed_tombstone(log: &mut TombstoneLog, key: &TxKey, generation: u32, height: u32) {
-        let shard = crate::cluster::shards::ShardTable::shard_for_key(key);
-        let t = Tombstone::new(
-            key.txid,
-            shard,
-            height,
-            generation,
-            TombstoneCause::SpentDah,
-            0,
-        );
-        log.append_synced(&t).unwrap();
-    }
-
-    #[test]
-    fn r1_rebuild_reconstructs_all_entries() {
-        // N tombstone log entries → recover rebuilds the redb index with all N.
-        let h = RecoveryTestHarness::new();
-        let engine = engine_from_harness(h);
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-
-        let mut keys = Vec::new();
-        for n in 0..7u8 {
-            let mut txid = [0u8; 32];
-            txid[0] = n;
-            txid[1] = n.wrapping_mul(3);
-            let key = TxKey { txid };
-            seed_tombstone(&mut log, &key, n as u32, 100 + n as u32);
-            keys.push(key);
-        }
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(stats.tombstones_reconstructed, 7);
-        // No records exist in the primary index, so nothing is purged.
-        assert_eq!(stats.records_self_purged, 0);
-        assert_eq!(idx.len(), 7);
-        for (n, key) in keys.iter().enumerate() {
-            let v = idx.get(key).unwrap();
-            assert_eq!(v.deletion_height, 100 + n as u32);
-            assert_eq!(v.generation, n as u32);
-        }
-    }
-
-    #[test]
-    fn r2_self_purges_resurrected_record_gen_equal() {
-        // Live record at gen 0 + tombstone at gen 0 (tombstone gen >= live
-        // gen) → recover purges the record.
-        let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(0xA1, 2);
-        let engine = engine_from_harness(h);
-        assert!(engine.lookup(&key).is_some());
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        seed_tombstone(&mut log, &key, 0, 150);
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(stats.records_self_purged, 1);
-        assert_eq!(stats.kept_newer_generation, 0);
-        assert!(
-            engine.lookup(&key).is_none(),
-            "R2 must purge a resurrected record whose tombstone gen >= live gen",
-        );
-        // The tombstone itself survives in the index (still needed later).
-        assert!(idx.is_tombstoned(&key));
-    }
-
-    #[test]
-    fn r2_keeps_record_with_strictly_higher_generation() {
-        // Live record re-created post-deletion at gen 6; tombstone is for the
-        // older gen 3 → recover KEEPS the live record (design §8.4).
-        let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(0xB2, 1);
-        h.set_index_generation(&key, 6);
-        let engine = engine_from_harness(h);
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        seed_tombstone(&mut log, &key, 3, 150);
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(stats.records_self_purged, 0);
-        assert_eq!(stats.kept_newer_generation, 1);
-        assert!(
-            engine.lookup(&key).is_some(),
-            "R2 must NOT purge a record newer than its tombstone",
-        );
-    }
-
-    #[test]
-    fn r2_keeps_record_with_no_tombstone() {
-        // A live record with no tombstone at all is untouched.
-        let mut h = RecoveryTestHarness::new();
-        let kept = h.create_record(0xC3, 1);
-        let purged = h.create_record(0xC4, 1);
-        let engine = engine_from_harness(h);
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        // Only `purged` gets a tombstone.
-        seed_tombstone(&mut log, &purged, 0, 150);
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(stats.records_self_purged, 1);
-        assert!(engine.lookup(&purged).is_none());
-        assert!(
-            engine.lookup(&kept).is_some(),
-            "a record with no tombstone is never purged",
-        );
-    }
-
-    #[test]
-    fn r2_is_idempotent_across_two_recoveries() {
-        // Running recovery twice yields the same state.
-        let mut h = RecoveryTestHarness::new();
-        let purged = h.create_record(0xD5, 2);
-        let newer = h.create_record(0xD6, 1);
-        h.set_index_generation(&newer, 9);
-        let kept_no_ts = h.create_record(0xD7, 1);
-        let engine = engine_from_harness(h);
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        seed_tombstone(&mut log, &purged, 0, 150);
-        seed_tombstone(&mut log, &newer, 4, 150); // older than live gen 9
-
-        let s1 = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(s1.records_self_purged, 1);
-        assert_eq!(s1.kept_newer_generation, 1);
-        assert!(engine.lookup(&purged).is_none());
-        assert!(engine.lookup(&newer).is_some());
-        assert!(engine.lookup(&kept_no_ts).is_some());
-
-        // Second run: identical reconstruct count, nothing left to purge.
-        let s2 = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(s2.tombstones_reconstructed, s1.tombstones_reconstructed);
-        assert_eq!(s2.records_self_purged, 0, "nothing left to purge on rerun");
-        assert_eq!(s2.kept_newer_generation, 1);
-        assert!(engine.lookup(&purged).is_none());
-        assert!(engine.lookup(&newer).is_some());
-        assert!(engine.lookup(&kept_no_ts).is_some());
-        assert_eq!(idx.len(), 2);
-    }
-
-    #[test]
-    fn r2_purges_resurrected_key_whose_region_allocator_already_freed() {
-        // The bug: recovery resurrects a primary-index entry at an offset the
-        // allocator's recovered free-list ALREADY freed. R2's delete must NOT
-        // double-free that region; it must drop the stale index entry and count
-        // the purge as a SUCCESS (no spurious "self-purge failed" warning).
-        let mut h = RecoveryTestHarness::new();
-        let utxo_count = 2;
-        let key = h.create_record(0xE1, utxo_count);
-
-        // Stage the index/allocator inconsistency: free the region in the
-        // allocator only, leaving the index entry + device bytes in place.
-        let (offset, _size) = h.free_region_in_allocator_only(&key, utxo_count);
-        // Sanity: the allocator now considers the region free (the precondition
-        // that makes delete_inner's step-5 free a double-free).
-        assert!(
-            !h.alloc
-                .is_allocated_range(offset, TxMetadata::record_size_for(utxo_count)),
-            "precondition: allocator must already consider the region free",
-        );
-
-        let engine = engine_from_harness(h);
-        // The index still resurrects the key.
-        assert!(
-            engine.lookup(&key).is_some(),
-            "precondition: key resurrected"
-        );
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        seed_tombstone(&mut log, &key, 0, 150);
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(
-            stats.records_self_purged, 1,
-            "an already-free region must count as a SUCCESSFUL purge, not a failure",
-        );
-        assert_eq!(stats.kept_newer_generation, 0);
-        assert!(
-            engine.lookup(&key).is_none(),
-            "the resurrected stale index entry must be removed (R2's goal)",
-        );
-        // The tombstone survives for later use.
-        assert!(idx.is_tombstoned(&key));
-    }
-
-    #[test]
-    fn r2_already_free_purge_is_idempotent_no_loop() {
-        // Running R2 twice on an already-free resurrected key yields the same
-        // state: the key stays gone (the redb-backed primary-index removal is
-        // durable, so there is no per-restart re-purge loop) and the second run
-        // finds nothing to purge.
-        let mut h = RecoveryTestHarness::new();
-        let utxo_count = 1;
-        let key = h.create_record(0xE2, utxo_count);
-        let _ = h.free_region_in_allocator_only(&key, utxo_count);
-        let engine = engine_from_harness(h);
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        seed_tombstone(&mut log, &key, 0, 150);
-
-        let s1 = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(s1.records_self_purged, 1);
-        assert!(engine.lookup(&key).is_none());
-
-        // Second run: the key is already absent, so nothing is purged again
-        // and no double-free is attempted.
-        let s2 = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(
-            s2.records_self_purged, 0,
-            "key already purged + durably removed → no re-purge, no loop",
-        );
-        assert!(engine.lookup(&key).is_none());
-        assert_eq!(idx.len(), 1, "tombstone count is stable across reruns");
-    }
-
-    #[test]
-    fn r2_partial_overlap_free_is_not_tolerated() {
-        // SAFETY boundary: the already-free tolerance is restricted to a record
-        // region FULLY CONTAINED in an existing free region. A PARTIAL overlap
-        // (the record range extends past the free region into still-allocated
-        // space) is real corruption and must NOT be silently tolerated — the
-        // allocator's DoubleFree error must surface so the purge is NOT counted.
-        let mut h = RecoveryTestHarness::new();
-        // A record spanning two 4096 blocks (256 + 100*64 = 6656 → 8192 aligned).
-        let utxo_count = 100;
-        let key = h.create_record(0xE4, utxo_count);
-        let ie = h.index.lookup(&key).unwrap();
-        let offset = ie.record_offset;
-        let full_size = TxMetadata::record_size_for(utxo_count); // > 4096
-        assert!(
-            full_size > 4096,
-            "record must span >1 block for a partial overlap"
-        );
-        // Free ONLY the first 4096 of the record's region, leaving the rest
-        // still allocated. The record's [offset, offset+full_size) now only
-        // PARTIALLY overlaps the free region [offset, offset+4096).
-        h.alloc.free(offset, 4096).unwrap();
-        // Precondition: not fully allocated (overlaps the free block), and the
-        // containing free region does NOT cover the whole record.
-        assert!(!h.alloc.is_allocated_range(offset, full_size));
-        let (free_off, free_size) = h.alloc.free_region_containing(offset).unwrap();
-        assert_eq!(free_off, offset);
-        assert!(
-            offset + full_size > free_off + free_size,
-            "must be a partial overlap"
-        );
-
-        let engine = engine_from_harness(h);
-        assert!(engine.lookup(&key).is_some());
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        seed_tombstone(&mut log, &key, 0, 150);
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(
-            stats.records_self_purged, 0,
-            "a partial-overlap free is corruption and must NOT count as a purge",
-        );
-    }
-
-    #[test]
-    fn r2_genuine_delete_error_is_not_counted_as_purged() {
-        // A GENUINE failure (not the benign already-free case) must keep the
-        // existing warn+retry behavior: the purge is NOT counted, and the
-        // record is left for the next restart. We force a real failure by
-        // making the on-device metadata header unreadable for the resurrected
-        // key, so `delete_inner`'s `read_metadata_for_key` (step pre-1) errors
-        // out BEFORE any index removal — i.e. a transient backend error, not an
-        // already-free region.
-        let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(0xE3, 2);
-        // Corrupt the metadata header so reading it back fails (CRC mismatch),
-        // turning the delete into a genuine StorageError. The region is still
-        // ALLOCATED (we do NOT free it), so this is unambiguously NOT the
-        // already-free path.
-        let ie = h.index.lookup(&key).unwrap();
-        let offset = ie.record_offset;
-        let align = h.data_dev.alignment();
-        let aligned = offset / align as u64 * align as u64;
-        let mut buf = crate::device::AlignedBuf::new(align, align);
-        h.data_dev.pread_exact_at(&mut buf, aligned).unwrap();
-        // Flip the magic bytes so metadata read rejects it.
-        buf[(offset - aligned) as usize] ^= 0xFF;
-        h.data_dev.pwrite_all_at(&buf, aligned).unwrap();
-        h.data_dev.sync().unwrap();
-
-        let engine = engine_from_harness(h);
-        assert!(engine.lookup(&key).is_some());
-
-        let (mut log, mut idx, _dir) = fresh_tombstone_storage();
-        seed_tombstone(&mut log, &key, 0, 150);
-
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(
-            stats.records_self_purged, 0,
-            "a genuine delete error must NOT be counted as a successful purge",
-        );
-        // The record is still present (the delete failed before index removal),
-        // so the next restart will retry — idempotent recovery.
-        assert!(
-            engine.lookup(&key).is_some(),
-            "a genuinely-failed purge must leave the record for retry",
-        );
-    }
-
-    #[test]
-    fn r1_drops_torn_tail_entry() {
-        // R1 relies on the log's torn-tail-drop scan: a corrupt final entry
-        // is not reconstructed, and is not an error.
-        let h = RecoveryTestHarness::new();
-        let engine = engine_from_harness(h);
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
-        let mut log = TombstoneLog::create(dev.clone(), 0, 8 * 1024 * 1024).unwrap();
-        for n in 0..3u8 {
-            let mut txid = [0u8; 32];
-            txid[0] = n;
-            seed_tombstone(&mut log, &TxKey { txid }, n as u32, 100 + n as u32);
-        }
-        // Corrupt the 3rd (final) entry on device: header block is 4096, then
-        // 56-byte entries; entry 2 starts at 4096 + 2*56.
-        let header = 4096u64;
-        let entry2_off = header + 2 * 56;
-        let aligned = entry2_off / 4096 * 4096;
-        let intra = (entry2_off - aligned) as usize;
-        let mut block = crate::device::AlignedBuf::new(4096, 4096);
-        dev.pread_exact_at(&mut block, aligned).unwrap();
-        block[intra + 4] ^= 0xFF;
-        dev.pwrite_all_at(&block, aligned).unwrap();
-        dev.sync().unwrap();
-        let log = TombstoneLog::open(dev, 0, 8 * 1024 * 1024).unwrap();
-
-        let (_unused, mut idx, _dir) = fresh_tombstone_storage();
-        let _ = _unused;
-        let stats = recover_tombstones(&engine, &log, &mut idx).unwrap();
-        assert_eq!(
-            stats.tombstones_reconstructed, 2,
-            "torn final tombstone entry must be dropped, not reconstructed",
-        );
-        assert_eq!(idx.len(), 2);
-    }
-
-    // -----------------------------------------------------------------------
     // BUG3 — record-height floor from replayed live-record (height-bearing)
     // redo entries, independent of tombstones (design §4 height subsystem).
     // -----------------------------------------------------------------------
@@ -8605,7 +8578,8 @@ mod tests {
 
         let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
 
         // 16-shard in-memory index. Enough capacity to avoid resizes.
         let index = ShardedIndex::new_in_memory(1024, 16).unwrap();
@@ -8705,7 +8679,8 @@ mod tests {
 
         let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
         let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
-        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let mut alloc: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
 
         // Two-shard index: every shard selection is a single bit flip under the
         // runtime seed, so there are exactly two shards.
@@ -8802,7 +8777,7 @@ mod tests {
             record_offset: offset_a,
             utxo_count,
             is_conflicting: false,
-            record_bytes,
+            record_bytes: record_bytes.into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -8831,33 +8806,5 @@ mod tests {
             entry_b.record_offset, offset_a,
             "key_b must point to offset_a after evicting the alias"
         );
-    }
-
-    #[test]
-    fn restore_last_durable_height_floors_at_record_height_without_tombstones() {
-        // BUG3 core: a node with a LOST `.height` file (persisted = None) and
-        // tombstones DISABLED (so the tombstone floor is 0) must still restore
-        // its height to the live-record floor H — NOT 0.
-        let h = RecoveryTestHarness::new();
-        let engine = engine_from_harness(h);
-
-        let big_h = 850_000u32;
-        // persisted=None (file lost), record_floor=H (from replayed records).
-        // No tombstones involved — the floor comes purely from the record
-        // height path, proving independence from `tombstones_enabled`.
-        let restored = engine.restore_last_durable_height(None, big_h);
-        assert_eq!(
-            restored, big_h,
-            "must floor at the live-record height, not 0"
-        );
-        assert_eq!(engine.last_durable_height(), big_h);
-
-        // Monotone: a later restore with a lower floor never regresses.
-        let restored2 = engine.restore_last_durable_height(None, 100);
-        assert_eq!(restored2, big_h);
-
-        // The persisted file, when present and higher, still wins.
-        let restored3 = engine.restore_last_durable_height(Some(900_000), 0);
-        assert_eq!(restored3, 900_000);
     }
 }

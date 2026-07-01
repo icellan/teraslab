@@ -1053,6 +1053,37 @@ pub(crate) fn render_metrics_text(
     prom_histogram_ns(&mut out, "teraslab_spend_latency_ns", &h.spend_latency);
     prom_histogram_ns(&mut out, "teraslab_unspend_latency_ns", &h.unspend_latency);
     prom_histogram_ns(&mut out, "teraslab_create_latency_ns", &h.create_latency);
+    // Per-stage create-path attribution (sums to ~create_latency).
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_reserve_latency_ns",
+        &h.create_reserve_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_redo_latency_ns",
+        &h.create_redo_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_devwrite_latency_ns",
+        &h.create_devwrite_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_index_latency_ns",
+        &h.create_index_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_vis_latency_ns",
+        &h.create_vis_latency,
+    );
+    prom_histogram_ns(
+        &mut out,
+        "teraslab_create_build_latency_ns",
+        &h.create_build_latency,
+    );
     prom_histogram_ns(
         &mut out,
         "teraslab_set_mined_latency_ns",
@@ -1197,6 +1228,11 @@ pub(crate) fn render_metrics_text(
             &mut out,
             "teraslab_redo_checkpoint_duration_ns",
             &r.redo_checkpoint_duration_ns,
+        );
+        prom_histogram_ns(
+            &mut out,
+            "teraslab_redo_commit_lock_wait_ns",
+            &r.redo_commit_lock_wait_ns,
         );
     }
     if let Some(mm) = migration_metrics() {
@@ -3223,6 +3259,12 @@ mod tests {
         for name in [
             "teraslab_unspend_latency_ns",
             "teraslab_create_latency_ns",
+            "teraslab_create_reserve_latency_ns",
+            "teraslab_create_redo_latency_ns",
+            "teraslab_create_devwrite_latency_ns",
+            "teraslab_create_index_latency_ns",
+            "teraslab_create_vis_latency_ns",
+            "teraslab_create_build_latency_ns",
             "teraslab_set_mined_latency_ns",
             "teraslab_freeze_latency_ns",
             "teraslab_unfreeze_latency_ns",

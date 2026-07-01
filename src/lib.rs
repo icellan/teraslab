@@ -15,6 +15,7 @@
 // the trait + backends only when a real caller is ready to land
 // alongside.
 pub mod allocator;
+pub mod cache;
 pub mod checkpoint;
 pub mod cluster;
 pub mod config;
@@ -31,9 +32,11 @@ pub mod protocol;
 pub mod record;
 pub mod recovery;
 pub mod redo;
+pub mod redo_group;
 pub mod replication;
+pub mod segment_allocator;
 pub mod server;
 pub mod storage;
+pub mod streaming;
 pub mod subdevice;
-pub mod tombstone;
-pub mod tombstone_gc;
+pub mod visibility;

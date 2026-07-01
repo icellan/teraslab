@@ -51,6 +51,14 @@ pub use errors::*;
 pub use pool::PoolConfig;
 pub use types::*;
 
+/// Named CREATE-wire flag constants, re-exported from the server protocol so
+/// clients share a single source of truth. See the constants' docs for the
+/// wire-vs-persisted numbering footgun these prevent.
+pub use teraslab::protocol::opcodes::{
+    CREATE_FLAG_CONFLICTING, CREATE_FLAG_EXTERNAL_BLOB, CREATE_FLAG_FROZEN, CREATE_FLAG_LOCKED,
+    FLAG_EXTERNAL_BLOB,
+};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2630,8 +2638,6 @@ mod tests {
             migration_batch_size: 100,
             persisted_incarnation: 0,
             cluster_id: TEST_CLUSTER_ID,
-            tombstone_gc_enabled: false,
-            rejoin_grace_blocks: 100_000,
         };
 
         let coordinator = ClusterCoordinator::new(cluster_config, 1);

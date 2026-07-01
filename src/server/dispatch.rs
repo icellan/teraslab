@@ -25,9 +25,7 @@ use crate::record::{ExternalRef, METADATA_SIZE, TxFlags};
 use crate::redo::{RedoLog, RedoOp};
 use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
-use crate::replication::receiver::{
-    DEFAULT_STREAM_KEY, handle_replica_batch, handle_replica_batch_with_tracker,
-};
+use crate::replication::receiver::{DEFAULT_STREAM_KEY, handle_replica_batch_with_tracker};
 use crate::replication::tcp_transport::TcpReplicaTransport;
 use crate::storage::blobstore::BlobStore;
 use parking_lot::Mutex;
@@ -81,186 +79,6 @@ fn le_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_le_bytes([
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
     ]))
-}
-
-/// Decode the optional `OP_MIGRATION_COMPLETE` tombstone section (deletion-
-/// tombstone Phase 8, design §7), beginning at byte `off` in `payload`.
-///
-/// Wire: `[version:1][count(M):4 LE][M × (txid:[u8;32] || generation:u32 LE)]`.
-///
-/// Returns `Some(entries)` only on a fully-valid section whose declared `M`
-/// matches the available bytes. Any of: section absent (offset past end),
-/// unrecognized `version`, truncated header, overflowing count, or a length
-/// that does not match `M` → `None`. A `None` is SAFE: the §7 reconciliation
-/// then treats every extra local key as never-received and TRANSFERS it
-/// (no-loss), never a spurious drop. An empty-but-well-formed section (M == 0)
-/// decodes to `Some(vec![])` — an authoritative "this source has no tombstones
-/// for the shard," distinct from `None` (no section at all).
-fn decode_tombstone_section(payload: &[u8], off: usize) -> Option<Vec<(TxKey, u32)>> {
-    let version = *payload.get(off)?;
-    if version != TOMBSTONE_SECTION_VERSION {
-        return None;
-    }
-    let count = le_u32_at(payload, off.checked_add(1)?)? as usize;
-    let entries_start = off.checked_add(5)?;
-    let needed = 36usize
-        .checked_mul(count)
-        .and_then(|n| n.checked_add(entries_start))?;
-    if payload.len() < needed {
-        return None;
-    }
-    let mut out = Vec::with_capacity(count);
-    let mut pos = entries_start;
-    for _ in 0..count {
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(payload.get(pos..pos + 32)?);
-        let generation = le_u32_at(payload, pos + 32)?;
-        out.push((TxKey { txid }, generation));
-        pos += 36;
-    }
-    Some(out)
-}
-
-/// Apply the tombstone-driven migration reconciliation at the commit gate
-/// (deletion-tombstone Phase 8, design §7 + §9.1 #1 — the multi-source union).
-///
-/// Drains the per-shard reconcile accumulator (every pending current-epoch
-/// source's `(live, tombstones)` manifest), forms the UNION, and for each LOCAL
-/// key the rejoinee holds for `shard` decides via
-/// [`crate::tombstone::classify_reconcile_union`]:
-///
-/// * **Drop** — no source has the key live AND some source tombstones it at a
-///   generation at-or-ahead of the local copy. The rejoinee RECORDS the learned
-///   tombstone (`apply_replicated_tombstone`, pre-arming its own future
-///   self-purge per §6) THEN removes the record (`delete_for_purge`, which
-///   writes NO second tombstone). Idempotent: re-running re-derives the same
-///   state.
-/// * **Transfer** — never-received (no source live, no source tombstone): the
-///   record is LEFT in place for the existing transfer-up path (no-loss).
-/// * **Keep** — live on some source, or a newer local re-creation than the
-///   source's tombstone (§8.4): left untouched (existing exact-entry behavior).
-///
-/// No-loss invariant (Claim B): a key is dropped ONLY when a tombstone is in the
-/// union; a key omitted by every source (no live, no tombstone) is NEVER
-/// dropped — it is transferred. No-resurrection invariant (Claim A): a key
-/// tombstoned by some source and not live anywhere is dropped, so it is never
-/// pushed up to the master.
-///
-/// Always drains the accumulator (even when empty), so a no-op on the off-path.
-///
-/// # Errors
-/// Returns the underlying [`crate::ops::error::SpendError`]'s display string if
-/// recording the learned tombstone or removing a record fails — the caller must
-/// then NOT commit the shard (the over-count is unreconciled).
-fn apply_tombstone_reconciliation(
-    engine: &Engine,
-    cluster: &RunningCluster,
-    shard: u16,
-) -> std::result::Result<(), String> {
-    use crate::tombstone::{ReconcileAction, classify_reconcile_union};
-
-    let manifests = cluster.take_reconcile_accumulator(shard);
-    if manifests.is_empty() {
-        // Nothing accumulated (off-path, or no current-epoch source presented a
-        // tombstone section) → nothing to reconcile.
-        return Ok(());
-    }
-
-    // The committed/migration epoch this commit is happening at. Accumulated
-    // entries are stamped with the `migration_epoch` of the completion that
-    // produced them (BUG4 fix (a)); only entries stamped with THIS epoch may
-    // drive DROPS via their tombstones.
-    let current_epoch = cluster.shard_table().read().version;
-
-    // Build the UNION across all pending sources (§9.1 #1):
-    //   * union_live: a key live on ANY accumulated source. Contributed
-    //     UNCONDITIONALLY by every accumulated entry, regardless of its stamped
-    //     epoch — the no-loss invariant (Claim B) requires the union to see
-    //     EVERY pending source's live set so a key live anywhere is Kept
-    //     (BUG2). A within-slack (epoch == current-1) source's live keys must
-    //     never be Dropped just because that source is not epoch-current.
-    //   * union_tomb: per key, the MAX (newest) tombstone generation across
-    //     sources that tombstone it (the most permissive for a drop — if even
-    //     the newest is older than local, none authorize the drop). A
-    //     tombstone is admitted into the union ONLY from an entry whose stamped
-    //     epoch equals `current_epoch` (BUG4 fix (a)): a STALE entry — one that
-    //     was epoch-current when accumulated but whose epoch the cluster has
-    //     since advanced past (a leaked entry, the case BUG4 (b) also guards) —
-    //     must NOT drive a Drop of a now-live key in this later epoch. Its live
-    //     set is still counted above (no-loss), only its drop-driving power is
-    //     dropped.
-    let mut union_live: std::collections::HashSet<TxKey> = std::collections::HashSet::new();
-    let mut union_tomb: std::collections::HashMap<TxKey, u32> = std::collections::HashMap::new();
-    for m in &manifests {
-        for k in &m.live {
-            union_live.insert(*k);
-        }
-        if m.epoch != current_epoch {
-            // Stale (or within-slack) entry: its tombstones are untrusted for
-            // driving a drop at this epoch. Live set already folded in above.
-            continue;
-        }
-        for (k, tgen) in &m.tombstones {
-            union_tomb
-                .entry(*k)
-                .and_modify(|g| {
-                    // Keep the newer (wrapping-aware) tombstone generation.
-                    if crate::record::generation_target_ahead(*g, *tgen) {
-                        *g = *tgen;
-                    }
-                })
-                .or_insert(*tgen);
-        }
-    }
-
-    // Classify every LOCAL key the rejoinee holds for this shard against the
-    // union. Only keys the source UNION does NOT hold live are drop/transfer
-    // candidates; a live key is Keep (and reconciled by the exact-entry path).
-    for key in engine.keys_for_shard(shard) {
-        let local_gen = match engine.read_metadata(&key) {
-            Ok(meta) => meta.generation,
-            // The key vanished between the scan and the read (a concurrent
-            // delete). Nothing to reconcile for it.
-            Err(_) => continue,
-        };
-        let live = union_live.contains(&key);
-        let tomb_gen = union_tomb.get(&key).copied();
-        match classify_reconcile_union(local_gen, live, tomb_gen) {
-            ReconcileAction::Keep | ReconcileAction::Transfer => {
-                // Keep: live on some source / newer local re-creation — leave it.
-                // Transfer: never-received — leave it for the transfer-up path
-                // (no-loss). Neither mutates local state here.
-            }
-            ReconcileAction::Drop => {
-                // Authoritative deletion. RECORD the learned tombstone first
-                // (pre-arm self-purge, §6), then remove the record WITHOUT
-                // writing a second tombstone (`delete_for_purge`). Use the
-                // union's tombstone generation (the gen that authorized the
-                // drop) and SpentDah cause (the dominant deletion path; the
-                // exact cause is not load-bearing for reconciliation).
-                let drop_gen = tomb_gen.unwrap_or(local_gen);
-                if let Err(e) = engine.apply_replicated_tombstone(
-                    &key,
-                    0, // deletion_height unknown at the rejoinee; 0 keeps the
-                    // tombstone for the full GC horizon (conservative-safe).
-                    drop_gen,
-                    crate::tombstone::TombstoneCause::SpentDah.as_u8(),
-                ) {
-                    return Err(format!("record learned tombstone for {key:?}: {e:?}"));
-                }
-                match engine.delete_for_purge(&crate::ops::remaining::DeleteRequest {
-                    tx_key: key,
-                    due_guard: None,
-                }) {
-                    Ok(()) | Err(crate::ops::error::SpendError::TxNotFound) => {}
-                    Err(e) => {
-                        return Err(format!("drop tombstoned key {key:?}: {e:?}"));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Configurable worker thread count for the replication runtime.
@@ -1185,48 +1003,11 @@ pub(crate) fn handle_request(
                 (None, None)
             };
 
-            // Phase 8 (deletion-tombstone §7): decode the optional TOMBSTONE
-            // section. ONLY when reconciliation is enabled on THIS node AND the
-            // source set FLAG_MIGRATION_TOMBSTONES. The section is appended after
-            // the `from_node:u64` at `needed + 8`; a flagless / disabled receiver
-            // never reads past `from_node`, so the off-path decode is
-            // byte-identical to today (the trailing bytes are simply ignored).
-            //
-            // Wire: [version:1][count(M):4][M × (txid:32 || generation:4)].
-            // An unrecognized version, a short/truncated section, or a malformed
-            // count degrades to `None` (no tombstone section) — which makes the
-            // §7 classify treat every extra local key as never-received and
-            // TRANSFER it (no-loss), never a spurious drop.
-            let source_tombstones: Option<Vec<(TxKey, u32)>> =
-                if request.flags & FLAG_MIGRATION_TOMBSTONES != 0
-                    && engine.tombstone_reconciliation_enabled()
-                    && source_entries.is_some()
-                {
-                    // `needed` is in scope only inside the entries branch above, so
-                    // recompute the tombstone-section offset from the parsed shape:
-                    // 60 + entry_count*36 (entries) + 8 (from_node).
-                    let entries_len = source_entries.as_ref().map(|e| e.len()).unwrap_or(0);
-                    let section_off = 60usize
-                        .checked_add(entries_len.saturating_mul(36))
-                        .and_then(|n| n.checked_add(8));
-                    match section_off {
-                        Some(off) => decode_tombstone_section(&request.payload, off),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
-
-            // The §7 reconciliation path engages ONLY when this node has the
-            // flag on AND the source actually presented a tombstone section.
-            // When false, EVERY decision below — the #29 prune, the superset
-            // accept, the commit gate — is byte-identical to the pre-Phase-8
-            // path. A flag-on receiver that gets a flagless/old source frame
-            // (no section → `source_tombstones == None`) is NOT reconcile-active
-            // and keeps the #29 behavior verbatim.
-            let reconcile_active = engine.tombstone_reconciliation_enabled()
-                && source_tombstones.is_some()
-                && cluster.is_some();
+            // Deletion-tombstone migration reconciliation has been removed: each
+            // node prunes its own fully-spent records independently, so the
+            // OP_MIGRATION_COMPLETE handler always takes the pre-Phase-8 (#29)
+            // path — the byte-identical behavior the (never-enabled) feature
+            // defaulted to.
 
             // Reject migrations from very stale topology epochs.
             // Allow 2 epochs of slack to accommodate re-activation cycles
@@ -1369,14 +1150,8 @@ pub(crate) fn handle_request(
             // let a stale source clear inbound state for a non-empty shard
             // without proving the target's contents.
             //
-            // Phase 8: when reconciliation is active the TOMBSTONE section is
-            // itself authoritative manifest evidence (the source proved which
-            // keys it deleted), so a tombstone-only completion (empty live set)
-            // is admissible. This OR is gated on `reconcile_active`, so the
-            // off-path R-219 requirement is unchanged.
-            let has_manifest_evidence = source_manifest.is_some()
-                || source_entries.as_ref().is_some_and(|e| !e.is_empty())
-                || (reconcile_active && source_tombstones.is_some());
+            let has_manifest_evidence =
+                source_manifest.is_some() || source_entries.as_ref().is_some_and(|e| !e.is_empty());
             if !has_manifest_evidence {
                 return error_response(
                     request.request_id,
@@ -1480,11 +1255,11 @@ pub(crate) fn handle_request(
             // construction (Claim B). So gate the #29 prune on
             // `!tombstone_reconciliation_enabled()`.
             //
-            // OFF path (reconciliation disabled): the condition is exactly
-            // `!false == true`, identical to the pre-Phase-8 `#29` guard, so the
-            // prune runs verbatim.
-            if !engine.tombstone_reconciliation_enabled()
-                && source_is_authoritative_complete
+            // Reconciliation has been removed; this is now always the pre-Phase-8
+            // `#29` prune path (the byte-identical behavior the feature defaulted
+            // to). The migration target prunes any local key the authoritative
+            // source did not list.
+            if source_is_authoritative_complete
                 && let Some(entries) = source_entries.as_ref()
                 && !entries.is_empty()
                 && entries.len() as u64 == expected_records
@@ -1647,7 +1422,7 @@ pub(crate) fn handle_request(
             let actual = engine.shard_record_count(shard);
             let count_ok = if expected_records == 0 && completion_epoch_current {
                 true
-            } else if exact_entries_verified && (completion_epoch_current || reconcile_active) {
+            } else if exact_entries_verified && completion_epoch_current {
                 actual >= expected_records
             } else {
                 actual == expected_records
@@ -1667,16 +1442,7 @@ pub(crate) fn handle_request(
             // verification already confirmed every key's generation — the
             // manifest hash would recompute the same result.
             //
-            // Phase 8: also skip when reconciliation is active. The rejoinee
-            // LEGITIMATELY holds extra keys (the over-count being reconciled),
-            // so the whole-shard hash fold would never match the source's
-            // (smaller) live-set hash. The §7 classify is the authoritative
-            // reconciliation instead. Gated on `reconcile_active`, so the
-            // off-path hash check is unchanged.
-            if !reconcile_active
-                && !exact_entries_verified
-                && let Some(expected_hash) = source_manifest
-            {
+            if !exact_entries_verified && let Some(expected_hash) = source_manifest {
                 let mut local_manifest = crate::cluster::coordinator::ManifestHasher::new();
                 for key in engine.keys_for_shard(shard) {
                     let meta = match engine.read_metadata(&key) {
@@ -1748,32 +1514,6 @@ pub(crate) fn handle_request(
                 // for the shard (BUG4 fix (c)): a non-master/replica target never
                 // applies the union (the commit gate below requires master), so
                 // accumulating there would only leak entries.
-                let prospective_target_master = {
-                    let shard_table = cluster.shard_table();
-                    let table = shard_table.read();
-                    table.target_assignment(shard).master == cluster.self_id()
-                };
-                if reconcile_active && prospective_target_master {
-                    let live = source_entries
-                        .as_ref()
-                        .map(|e| e.iter().map(|(k, _)| *k).collect::<Vec<_>>())
-                        .unwrap_or_default();
-                    // Only an epoch-current source's tombstones may drive drops.
-                    let tombstones = if completion_epoch_current {
-                        source_tombstones.clone().unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    cluster.accumulate_reconcile_manifest(
-                        shard,
-                        crate::cluster::coordinator::SourceReconcileManifest {
-                            live,
-                            tombstones,
-                            epoch: migration_epoch,
-                        },
-                    );
-                }
-
                 if let Some(from_node) = completion_from_node {
                     cluster.mark_inbound_complete_from_source(shard, from_node);
                 } else {
@@ -1785,23 +1525,6 @@ pub(crate) fn handle_request(
                     table.target_assignment(shard).master == cluster.self_id()
                 } && !cluster.has_pending_inbound_shard(shard);
                 if should_commit {
-                    // Phase 8 (§7 + §9.1 #1): apply the tombstone-driven drops
-                    // against the UNION of all pending sources BEFORE committing
-                    // the shard. Gated on the flag so the OFF path never touches
-                    // the accumulator — byte-identical commit to today.
-                    if engine.tombstone_reconciliation_enabled()
-                        && let Err(e) = apply_tombstone_reconciliation(engine, cluster, shard)
-                    {
-                        // A drop failure must NOT silently commit a shard whose
-                        // over-count we failed to reconcile. Report retryable so
-                        // the source re-drives; NOT committing here preserves the
-                        // inbound-pending semantics.
-                        return error_response(
-                            request.request_id,
-                            ERR_MIGRATION_IN_PROGRESS,
-                            &format!("shard {shard} tombstone reconciliation failed: {e}"),
-                        );
-                    }
                     cluster.shard_table().write().commit_shard(shard);
                 }
             }
@@ -2428,6 +2151,27 @@ fn intent_keys_from_redo_ops(ops: &[RedoOp]) -> Vec<TxKey> {
     keys
 }
 
+/// Whether the master-side replication intent is needed for this node right now.
+///
+/// The intent is a per-mutation durable fsync that bridges "redo durable" →
+/// "replica ACK policy satisfied" so a crash in that window has a startup
+/// barrier. It is only meaningful when there are real replica targets: when
+/// `replication_factor > 1`, OR when a migration is active (the dual-write
+/// window fans writes out to a handoff destination even at RF = 1 — see
+/// `build_replication_targets`'s `dual_write_targets_for_shard`).
+///
+/// At RF <= 1 with no migration there are NO replicas to ACK, so the intent is
+/// pure overhead. The profile showed that fsync dominating write latency: it
+/// runs while the spend/set_mined handler holds its per-key visibility + engine
+/// stripe locks, serializing every stripe-overlapping mutation on it. Skipping
+/// it is safe — the Phase-4 replica fan-out is already a no-op with no targets,
+/// and the paired intent commit/clear are no-ops when no `begin` was recorded.
+fn replication_active(cluster: Option<&RunningCluster>) -> bool {
+    cluster.is_some_and(|c| {
+        c.shard_table().read().replication_factor() > 1 || c.migration_pressure_active()
+    })
+}
+
 fn write_replicated_redo_ops(
     engine: &Engine,
     cluster: Option<&RunningCluster>,
@@ -2436,7 +2180,7 @@ fn write_replicated_redo_ops(
 ) -> std::result::Result<(u64, u64), String> {
     write_replicated_redo_ops_with_tracker(
         engine,
-        cluster.is_some(),
+        replication_active(cluster),
         redo_log,
         ops,
         REPLICATION_INTENT_TRACKER.get(),
@@ -3477,17 +3221,6 @@ fn before_images_match_repl_ops(
             })
 }
 
-fn push_repl_with_before_image(
-    repl_ops: &mut Vec<(TxKey, Vec<ReplicaOp>)>,
-    before_images: &mut Vec<(TxKey, Vec<BeforeImage>)>,
-    key: TxKey,
-    op: ReplicaOp,
-    before: BeforeImage,
-) {
-    repl_ops.push((key, vec![op]));
-    before_images.push((key, vec![before]));
-}
-
 /// Compensate for a replication failure by reversing locally-applied mutations.
 ///
 /// When `replicate_all_ops` fails, the local engine has already applied the
@@ -3941,14 +3674,10 @@ fn compensate_replication_failure(
                         record_size: 0,
                     });
                 }
-                ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. } => {
-                    // Delete compensation is handled directly in
-                    // handle_delete_batch using pre-captured record snapshots.
-                    // If this path is reached from another handler, the record
-                    // is already destroyed and cannot be restored here.
-                    // `DeleteV2` behaves identically to `Delete` for rollback —
-                    // the extra tombstone fields don't change that the record
-                    // cannot be reconstructed at this point.
+                ReplicaOp::Delete { .. } => {
+                    // If this path is reached the record is already destroyed and
+                    // cannot be restored here (no per-delete compensation; deletes
+                    // are local prune GC).
                 }
                 ReplicaOp::MarkLongestChain {
                     on_longest_chain,
@@ -4536,6 +4265,33 @@ fn needs_exclusive_visibility_barrier(op: u16) -> bool {
     is_mutation_opcode(op) || matches!(op, OP_REPLICA_BATCH)
 }
 
+/// Hot opcodes that take FINE-GRAINED, PER-KEY visibility instead of the coarse
+/// global barrier. `handle_request` acquires no guard for these; the handler
+/// itself acquires `engine.visibility().mutation(&keys)` (write) or `.read(&keys)`
+/// (read) once it has decoded its keys — so disjoint-key mutations/reads run
+/// concurrently while a read of key K is still excluded from a mutation of K
+/// (batch-atomic per key). All OTHER mutation opcodes keep the coarse global
+/// exclusive guard for now (correct, just not yet parallelized).
+///
+/// `OP_DELETE_BATCH` is fine-grained too: `handle_delete_batch` acquires
+/// `engine.visibility().mutation(&keys)` over the deleted txids AND the
+/// parent-prune keys it touches, after Phase-1 validation has discovered the
+/// parents. Pre-fix delete took the coarse global EXCLUSIVE guard, so every
+/// delete serialized against every other mutation and read and blocked on
+/// in-flight readers draining — the dominant component of the delete-latency
+/// tail once the per-delete fsyncs were removed.
+fn manages_own_visibility(op: u16) -> bool {
+    matches!(
+        op,
+        OP_SPEND_BATCH
+            | OP_SET_MINED_BATCH
+            | OP_CREATE_BATCH
+            | OP_GET_BATCH
+            | OP_GET_SPEND_BATCH
+            | OP_DELETE_BATCH
+    )
+}
+
 /// Free-space headroom (PHYSICAL forward room — see
 /// [`crate::redo::RedoAtomics::available_space`]) a mutation requires before it
 /// may proceed, as a fraction (1/N) of the per-store redo entries-region
@@ -4656,6 +4412,11 @@ fn acquire_dispatch_visibility_guard(
     flags: u16,
 ) -> Option<DispatchVisibilityGuard<'_>> {
     if !needs_dispatch_visibility_barrier(op) {
+        return None;
+    }
+    // Hot per-key ops self-manage their visibility inside the handler (after key
+    // decode), so `handle_request` takes no coarse guard for them.
+    if manages_own_visibility(op) {
         return None;
     }
     // W2/P3: a migration-flagged OP_REPLICA_BATCH takes the SHARED side of
@@ -5057,6 +4818,19 @@ fn handle_spend_batch(
     // path's `ValidatedSpend` would re-acquire the stripe lock and self-deadlock
     // on a stripe collision.
     let txid_keys: Vec<TxKey> = by_txid.keys().map(|t| TxKey { txid: *t }).collect();
+    // Per-key visibility: write-lock the stripes of this batch's keys (plus the
+    // global SHARED side = checkpoint coordination). Excludes any client read of
+    // THESE keys for the apply window (batch-atomic per key) while letting spends
+    // on disjoint keys run fully concurrently — the global exclusive barrier this
+    // replaces serialized every mutation. Dropped before replication, alongside
+    // `stripe_guards`.
+    //
+    // LOCK ORDER (deadlock-critical): visibility is acquired BEFORE the engine
+    // stripe Mutexes — the SAME order create/set_mined use (they take visibility
+    // in the handler, then the stripe lock inside the engine method). Taking the
+    // stripe lock first here would invert the order against those handlers and
+    // deadlock under same-stripe contention.
+    let visibility_guard = engine.visibility().mutation(&txid_keys);
     let stripe_guards = engine.lock_unique_stripes(&txid_keys);
 
     // Per-group staged mutation carried from validate (Phase 1+2) to apply
@@ -5069,18 +4843,37 @@ fn handle_spend_batch(
     let mut staged: Vec<StagedSpend> = Vec::new();
     let mut all_redo_ops: Vec<RedoOp> = Vec::new();
 
-    // Phase 1+2: validate each owned group (guard-free; this fn holds the
-    // stripe locks) and build its redo + replica ops into the shared batch.
-    for (txid, group) in &by_txid {
+    // Per-group validate result, merged back in a deterministic order below.
+    struct GroupOut {
+        errors: Vec<BatchItemError>,
+        redo_ops: Vec<RedoOp>,
+        staged: Option<StagedSpend>,
+    }
+
+    // Phase 1+2: validate one owned group (guard-free; the caller holds every
+    // stripe lock) and build its redo + replica ops. This is READ-ONLY on the
+    // engine — index lookups plus device record reads inside
+    // `prepare_spend_multi` (`read_metadata_fast` + per-offset `read_slot_fast`)
+    // — so it is safe to run concurrently across groups, exactly like
+    // `decorate_get_item` in the GET path. No writes happen here; the single
+    // redo flush (Phase 3) and the serial apply (Phase 4) still run afterwards
+    // with all stripe locks held, so WAL-first ordering and per-txid atomicity
+    // are unchanged.
+    let validate_group = |txid: &[u8; 32], group: &[(usize, &WireSpendItem)]| -> GroupOut {
+        let mut out = GroupOut {
+            errors: Vec::new(),
+            redo_ops: Vec::new(),
+            staged: None,
+        };
         if let Some(redirect_err) = check_shard_ownership(txid, group[0].0 as u32, cluster, false) {
             for &(i, _) in group {
-                errors.push(BatchItemError {
+                out.errors.push(BatchItemError {
                     item_index: i as u32,
                     error_code: redirect_err.error_code,
                     error_data: redirect_err.error_data.clone(),
                 });
             }
-            continue;
+            return out;
         }
 
         let spend_items: Vec<SpendItem> = group
@@ -5108,15 +4901,14 @@ fn handle_spend_batch(
             Ok(v) => v,
             Err(err) => {
                 for &(i, _) in group {
-                    errors.push(spend_error_to_batch_error(i as u32, &err));
+                    out.errors.push(spend_error_to_batch_error(i as u32, &err));
                 }
-                continue;
+                return out;
             }
         };
 
         // Build redo ops for the real UNSPENT→SPENT transitions. Semantics are
-        // identical to the original per-group logic — only accumulated across
-        // groups into one batch.
+        // identical to the original per-group logic.
         //
         // Gap #2 (TERANODE_PRODUCTION_READINESS_GAPS.md): each Spend redo entry
         // carries the cumulative `new_spent_count` AFTER its own application,
@@ -5130,6 +4922,17 @@ fn handle_spend_batch(
         let transition_offsets: std::collections::HashSet<u32> =
             prepared.transitions().iter().map(|(off, _)| *off).collect();
 
+        // Segment (log-structured) store: the spend RELOCATES the record, and
+        // `PreparedSpend::apply_locked` journals a single `RedoOp::Relocate` for
+        // the whole group at apply time (buffered, carrying the new append-cursor
+        // offset that is only known once allocated). So this store must NOT also
+        // emit the in-place per-slot `SpendV2` WAL-first redo — replaying a
+        // `SpendV2` against a relocated record would RMW the stale (now-dead)
+        // offset. Replication is likewise skipped: the segment engine is
+        // non-clustered in v1 (`validate_cluster_safety`), so there are no
+        // replicas to feed. The in-place store keeps the exact prior behaviour.
+        let log_structured = engine.store_is_log_structured(prepared.device_id);
+
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
         for &(i, item) in group {
@@ -5138,35 +4941,75 @@ fn handle_spend_batch(
                 // re-spends do not emit redo/replication or bump generation;
                 // they match the single-spend no-op contract.
                 running_count = running_count.wrapping_add(1);
-                all_redo_ops.push(RedoOp::SpendV2 {
-                    tx_key: key,
-                    offset: item.vout,
-                    spending_data: item.spending_data,
-                    new_spent_count: running_count,
-                    current_block_height: params.current_block_height,
-                    block_height_retention: params.block_height_retention,
-                    target_generation: post_generation,
-                    updated_at: engine.now_millis(),
-                    // B-5: carry the validated slot hash so recovery can
-                    // rebuild a CRC-failing spent slot from this intent.
-                    utxo_hash: Some(item.utxo_hash),
-                });
-                key_repl_ops.push(ReplicaOp::Spend {
-                    tx_key: key,
-                    offset: item.vout,
-                    spending_data: item.spending_data,
-                    current_block_height: params.current_block_height,
-                    block_height_retention: params.block_height_retention,
-                    master_generation: post_generation,
-                });
+                if !log_structured {
+                    out.redo_ops.push(RedoOp::SpendV2 {
+                        tx_key: key,
+                        offset: item.vout,
+                        spending_data: item.spending_data,
+                        new_spent_count: running_count,
+                        current_block_height: params.current_block_height,
+                        block_height_retention: params.block_height_retention,
+                        target_generation: post_generation,
+                        updated_at: engine.now_millis(),
+                        // B-5: carry the validated slot hash so recovery can
+                        // rebuild a CRC-failing spent slot from this intent.
+                        utxo_hash: Some(item.utxo_hash),
+                    });
+                    key_repl_ops.push(ReplicaOp::Spend {
+                        tx_key: key,
+                        offset: item.vout,
+                        spending_data: item.spending_data,
+                        current_block_height: params.current_block_height,
+                        block_height_retention: params.block_height_retention,
+                        master_generation: post_generation,
+                    });
+                }
             }
         }
 
-        staged.push(StagedSpend {
+        out.staged = Some(StagedSpend {
             key,
             prepared,
             key_repl_ops,
         });
+        out
+    };
+
+    // Deterministic group order (by each group's first item index) so the merged
+    // redo/replica op order never depends on HashMap iteration or, under the
+    // fan-out, on thread scheduling.
+    let mut groups: Vec<_> = by_txid.iter().collect();
+    groups.sort_unstable_by_key(|(_, g)| g[0].0);
+
+    // Fan the read-only validate across the read pool for batches at or above
+    // READ_FANOUT_THRESHOLD (distinct txids); smaller batches stay serial. The
+    // collect is order-preserving, so the merge below is deterministic.
+    let group_outs: Vec<GroupOut> = match (groups.len() >= READ_FANOUT_THRESHOLD)
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                groups
+                    .par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
+                    .map(|&(txid, group)| validate_group(txid, group))
+                    .collect()
+            })
+        }
+        None => groups
+            .iter()
+            .map(|&(txid, group)| validate_group(txid, group))
+            .collect(),
+    };
+
+    for go in group_outs {
+        errors.extend(go.errors);
+        all_redo_ops.extend(go.redo_ops);
+        if let Some(s) = go.staged {
+            staged.push(s);
+        }
     }
 
     // Phase 3: ONE redo write for the whole RPC (single fsync), WAL-first. All
@@ -5312,6 +5155,10 @@ fn handle_spend_batch(
     // Release every stripe lock BEFORE replication (network I/O must not run
     // under the locks). On the error returns above the guards drop at scope end.
     drop(stripe_guards);
+    // Release per-key visibility before the replication round-trip (reads of
+    // these keys resume immediately, observing the fully-applied local batch),
+    // mirroring the old MutationBarrier early-release.
+    drop(visibility_guard);
 
     // Final per-item outcome classification for this batch. `errors` holds
     // validation failures *and* redirect errors (when the txid is not owned
@@ -5651,6 +5498,12 @@ fn handle_set_mined_batch(
         valid_items.push(ValidSetMined { idx: i, key });
     }
 
+    // Per-key visibility for the apply window (released before replication).
+    // Excludes a client read of THESE keys while set_mined applies, while
+    // set_mined batches on disjoint keys run concurrently.
+    let visibility_keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
+    let visibility_guard = engine.visibility().mutation(&visibility_keys);
+
     // Phase 2: WAL-first — write redo before engine mutation.
     let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => range,
@@ -5722,7 +5575,35 @@ fn handle_set_mined_batch(
         unset_mined: params.unset_mined,
     };
     let keys: Vec<TxKey> = valid_items.iter().map(|v| v.key).collect();
-    let results = engine.set_mined_batch(&engine_params, &keys);
+    // The apply is the read-modify-write hot path: each `set_mined_inner` reads
+    // the record metadata from the device, mutates, and writes it back. It
+    // self-locks on the per-key stripe lock and only touches Mutex-guarded
+    // secondary indexes, so independent keys apply concurrently safely — and
+    // the slow device I/O then overlaps instead of pinning one core. WAL-first
+    // is intact: the batch's `SetMined` redo was already flushed (Phase 2), and
+    // `set_mined_inner` writes no redo. Fan out at/above READ_FANOUT_THRESHOLD
+    // (order-preserving collect keeps results aligned with `keys`); smaller
+    // batches stay serial.
+    let results: Vec<
+        std::result::Result<crate::ops::set_mined::SetMinedResponse, crate::ops::error::SpendError>,
+    > = match (keys.len() >= READ_FANOUT_THRESHOLD)
+        .then(read_pool)
+        .flatten()
+    {
+        Some(pool) => {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+            pool.install(|| {
+                keys.par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
+                    .map(|k| engine.set_mined_inner(k, &engine_params))
+                    .collect()
+            })
+        }
+        None => keys
+            .iter()
+            .map(|k| engine.set_mined_inner(k, &engine_params))
+            .collect(),
+    };
 
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
     let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
@@ -5730,7 +5611,7 @@ fn handle_set_mined_batch(
     // list per item so the Go client (`txmetacache.SetMinedMulti`) can satisfy
     // its coverage postcondition without an extra GET round-trip. LP-5: the DAH
     // `signal` is surfaced in the same per-item record. `childCount`/#1037 is
-    // intentionally NOT emitted: it existed only to let the Aerospike client
+    // intentionally NOT emitted: it existed only to let the reference UDF client
     // clear `locked` on pagination child records, which TeraSlab does not have
     // (spec §2.2 — pagination eliminated). The master record's LOCKED flag is
     // cleared server-side inside `set_mined_inner` (engine.rs), so there is
@@ -5804,6 +5685,9 @@ fn handle_set_mined_batch(
                 .inc(OpCode::SetMined, classify_wire_error_code(e.error_code));
         }
     }
+
+    // Release per-key visibility before replication (reads of these keys resume).
+    drop(visibility_guard);
 
     // Phase 4: Replicate.
     let repl_outcome = match replicate_all_ops_with_barrier(
@@ -6042,6 +5926,29 @@ fn handle_create_batch(
         m.creates_attempted.inc_by(items.len() as u64);
     }
 
+    // Hold ONLY the global (checkpoint-quiescence) side of the visibility
+    // barrier for the whole handler. This is the issue-#14 guarantee: a
+    // checkpoint cannot persist the allocator header while a reservation is in
+    // memory but its `AllocateRegion` redo is not yet durable (Phases 1b–2). The
+    // global side is SHARED, so concurrent creates never contend on it.
+    //
+    // The contended part — the per-key stripe WRITES that give a reader its
+    // batch-atomic view — is taken separately and held only around Phase 3 (the
+    // index registration, which is the moment a created key becomes reader-
+    // visible). Previously the combined `mutation()` guard held those stripes for
+    // the ENTIRE handler, so two creates sharing any one of their up-to-256
+    // stripes serialized on each other's multi-ms redo fsync + device writes
+    // (measured: ~50% of create latency was just acquiring this guard). Narrowing
+    // the stripe hold to Phase 3 lets stripe-overlapping creates pipeline through
+    // the I/O stages. Reads landing before Phase 3 correctly see "not found"
+    // (the key is not yet in the index), preserving batch-atomic visibility.
+    let vis_start = std::time::Instant::now();
+    let _global_vis = engine.visibility().global_read();
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_vis_latency.record_since(vis_start);
+    }
+    let build_start = std::time::Instant::now();
+
     let mut errors = Vec::new();
     let mut redo_ops: Vec<RedoOp> = Vec::new();
 
@@ -6088,7 +5995,11 @@ fn handle_create_batch(
         create_req: CreateRequest<'a>,
         utxo_count: u32,
         reservation_size: u64,
-        record_bytes: Vec<u8>,
+        // `Arc<[u8]>` so the record image is allocated once here and shared
+        // (refcount bump) between the `RedoOp::Create` redo entry and the
+        // retained `ValidCreate` used for the coalesced device write —
+        // `RedoOp::Create.record_bytes` is `Arc<[u8]>`.
+        record_bytes: std::sync::Arc<[u8]>,
         /// F-IJ-002: keeps the external blob pinned against the periodic
         /// blob-GC sweep from the digest check until index registration.
         /// Released on drop — every failure path (item `continue`, batch
@@ -6107,8 +6018,10 @@ fn handle_create_batch(
         /// PERF #9: the exact on-device record image (== the CreateV2 redo
         /// bytes). Written to device in one coalesced bulk pwrite per
         /// contiguous run (Phase 2b) after the redo flush; Phase 3 then only
-        /// registers the index entry.
-        record_bytes: Vec<u8>,
+        /// registers the index entry. `Arc<[u8]>`: same allocation as the
+        /// `RedoOp::Create.record_bytes` entry (shared by refcount bump, not
+        /// re-copied).
+        record_bytes: std::sync::Arc<[u8]>,
         /// See [`PendingCreate::blob_pin`]; held until after
         /// `create_at_offset` registers the index entry. Never read —
         /// exists purely for its `Drop` (un-pin).
@@ -6124,7 +6037,17 @@ fn handle_create_batch(
     // DuplicateTxId — whose region is freed only IN MEMORY, leaving a durable
     // orphan region in the WAL/on device. Drop every occurrence after the first
     // here, before any reservation, so only one copy is ever materialized.
-    let mut seen_txids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    //
+    // Txids are uniformly random (double-SHA256), so std's SipHash buys no
+    // distribution here and is pure CPU (~5% of create CPU on a flamegraph).
+    // `FastTxHasher` (first 8 txid bytes) is correctness-neutral: `[u8; 32]`
+    // `Eq` is unchanged so any hash collision just probes, and the authoritative
+    // duplicate rejector is the index's `register_create_at_offset`, not this
+    // batch-local set. See `crate::server::fast_hash`.
+    let mut seen_txids: std::collections::HashSet<
+        [u8; 32],
+        std::hash::BuildHasherDefault<crate::server::fast_hash::FastTxHasher>,
+    > = std::collections::HashSet::default();
 
     for (i, item) in items.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(&item.txid, i as u32, cluster, false) {
@@ -6218,9 +6141,9 @@ fn handle_create_batch(
             created_at: item.created_at,
             block_height: item.block_height,
             mined_block_infos: &mined_infos[i],
-            frozen: item.flags & 0x04 != 0,
-            conflicting: item.flags & 0x02 != 0,
-            locked: item.flags & 0x01 != 0,
+            frozen: item.flags & CREATE_FLAG_FROZEN != 0,
+            conflicting: item.flags & CREATE_FLAG_CONFLICTING != 0,
+            locked: item.flags & CREATE_FLAG_LOCKED != 0,
             external_ref,
             parent_txids: &item.parent_txids,
         };
@@ -6266,6 +6189,10 @@ fn handle_create_batch(
             }
         };
         let reservation_size = record_bytes.len() as u64;
+        // Move the freshly-built record image into an `Arc<[u8]>` once (the one
+        // unavoidable copy). Downstream the redo entry and the retained
+        // `ValidCreate` share this allocation via refcount bumps.
+        let record_bytes: std::sync::Arc<[u8]> = record_bytes.into();
         pending_items.push(PendingCreate {
             idx: i,
             create_req,
@@ -6285,15 +6212,16 @@ fn handle_create_batch(
     // window is safe against a concurrent checkpoint persisting the un-journaled
     // reservation because the create holds the exclusive mutation barrier (the
     // same lock the checkpoint task takes) across Phases 1b–3.
-    // Round-robin each new record across the configured stores (placement is a
-    // free local choice recorded in the index `device_id`; reads route by it).
+    // Place each new record across the configured stores (round-robin by
+    // default, or deterministic txid→store when configured). Placement is a
+    // free local choice recorded in the index `device_id`; reads route by it.
     // Records destined for the same store must be reserved together on THAT
     // store's allocator — offsets are store-local — so group positions by store
     // and run one `reserve_batch` per store. Each store's allocator tags its
     // own `AllocateRegion` redo ops with its `device_id` (set at boot).
     let device_ids: Vec<u8> = pending_items
         .iter()
-        .map(|_| engine.place_new_record())
+        .map(|item| engine.place_new_record(&item.create_req.tx_id))
         .collect();
     let store_count = engine.store_count();
     let mut positions_by_store: Vec<Vec<usize>> = vec![Vec::new(); store_count];
@@ -6304,8 +6232,12 @@ fn handle_create_batch(
     // `region_by_pos[pos]` is the reserved region for `pending_items[pos]`
     // (`None` if that store was full for this size). `pending_allocs` holds one
     // in-memory reservation handle per store so Phase 2 can commit/rollback all.
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_build_latency.record_since(build_start);
+    }
     let mut region_by_pos = vec![None; pending_items.len()];
     let mut pending_allocs = Vec::new();
+    let reserve_start = std::time::Instant::now();
     for (device_id, positions) in positions_by_store.into_iter().enumerate() {
         if positions.is_empty() {
             continue;
@@ -6349,7 +6281,13 @@ fn handle_create_batch(
         }
         pending_allocs.push((device_id, pending_alloc));
     }
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_reserve_latency.record_since(reserve_start);
+    }
 
+    // Snapshot the durability mode once for the batch: buffered → index-only
+    // CreateV2 redo (read device on replay); strict → embedding Create.
+    let create_redo_buffered = engine.redo_buffered();
     for (pos, pending) in pending_items.into_iter().enumerate() {
         let Some(region) = region_by_pos[pos].take() else {
             errors.push(BatchItemError {
@@ -6368,19 +6306,40 @@ fn handle_create_batch(
         } else {
             Vec::new()
         };
-        redo_ops.push(RedoOp::Create {
-            tx_key: key,
-            device_id,
-            record_offset: region.offset,
-            utxo_count: pending.utxo_count,
-            is_conflicting: pending.create_req.conflicting,
-            // PERF #9: clone the record image — the original is retained on
-            // ValidCreate for the coalesced bulk device write (Phase 2b). The
-            // redo append serializes its own copy regardless, so this is one
-            // memcpy, not an extra serialize.
-            record_bytes: pending.record_bytes.clone(),
-            parent_txids,
-        });
+        // Phase 1 log-structured lever: under BUFFERED redo durability the data
+        // device write and the redo entry are flushed on the same cadence, so the
+        // redo need not embed the record bytes — recovery reads them back from the
+        // device (replay_create_v2). This drops the create double-write (bytes
+        // written to both device and WAL). Under STRICT durability the data write
+        // is not fsynced before ack, so the WAL embed is the only durable copy —
+        // keep emitting RedoOp::Create. The device write happens either way
+        // (record_bytes is moved into ValidCreate below for the coalesced write).
+        if create_redo_buffered {
+            redo_ops.push(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id,
+                record_offset: region.offset,
+                utxo_count: pending.utxo_count,
+                is_conflicting: pending.create_req.conflicting,
+                parent_txids,
+            });
+        } else {
+            redo_ops.push(RedoOp::Create {
+                tx_key: key,
+                device_id,
+                record_offset: region.offset,
+                utxo_count: pending.utxo_count,
+                is_conflicting: pending.create_req.conflicting,
+                // PERF: `record_bytes` is `Arc<[u8]>`, so this clone is a refcount
+                // bump — NOT a record copy. The same allocation is retained on
+                // ValidCreate (moved below) for the coalesced bulk device write
+                // (Phase 2b). The redo append still serializes its own bytes into
+                // the log buffer; the per-op CLONE the journaling path does
+                // (engine `append_redo_ops_routed`, `pending_entries`) is now O(1).
+                record_bytes: std::sync::Arc::clone(&pending.record_bytes),
+                parent_txids,
+            });
+        }
         valid_items.push(ValidCreate {
             idx: pending.idx,
             create_req: pending.create_req,
@@ -6394,6 +6353,7 @@ fn handle_create_batch(
 
     // Phase 2: WAL-first — write [AllocateRegion… + Create…] as ONE atomic
     // batch (a single fsync, all-or-nothing).
+    let redo_start = std::time::Instant::now();
     let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
         Ok(range) => {
             // The AllocateRegion entries are now durable alongside their
@@ -6422,6 +6382,9 @@ fn handle_create_batch(
             return error_response(req.request_id, ERR_STORAGE_IO, &e);
         }
     };
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_redo_latency.record_since(redo_start);
+    }
 
     // Phase 2b (PERF #9 + multi-store): write every record's bytes to device in
     // ONE coalesced pwrite per contiguous reservation run, PER STORE. Records are
@@ -6433,13 +6396,19 @@ fn handle_create_batch(
     // index entries (register_create_at_offset).
     // (record_offset, slot_size, record_bytes) for one record's coalesced write.
     type BulkRecord<'a> = (u64, u64, &'a [u8]);
-    let mut bulk_by_store: std::collections::HashMap<u8, Vec<BulkRecord>> =
-        std::collections::HashMap::new();
+    // Keyed by store id (small dense u8) — std's SipHash is wasted on these
+    // keys. `FastU8Hasher` is an identity hash; grouping is byte-identical (only
+    // the bucket hash changes). See `crate::server::fast_hash`.
+    let mut bulk_by_store: std::collections::HashMap<
+        u8,
+        Vec<BulkRecord>,
+        std::hash::BuildHasherDefault<crate::server::fast_hash::FastU8Hasher>,
+    > = std::collections::HashMap::default();
     for v in &valid_items {
         bulk_by_store.entry(v.device_id).or_default().push((
             v.record_offset,
             v.reservation_size,
-            v.record_bytes.as_slice(),
+            &v.record_bytes[..],
         ));
     }
     // Fan the per-store coalesced device writes across scoped threads so the N
@@ -6450,6 +6419,7 @@ fn handle_create_batch(
     // cannot form a lock cycle even though that table is keyed by offset only
     // (cross-store offsets can false-share a stripe).
     let stores: Vec<(u8, &Vec<BulkRecord>)> = bulk_by_store.iter().map(|(&d, r)| (d, r)).collect();
+    let devwrite_start = std::time::Instant::now();
     let bulk_err: Option<CreateError> = match stores.split_first() {
         None => None,
         Some((&(head_id, head_recs), tail)) => std::thread::scope(|scope| {
@@ -6486,6 +6456,9 @@ fn handle_create_batch(
             m.creates_failed.inc_by(failed);
         }
         return error_response(req.request_id, ERR_STORAGE_IO, &format!("{e}"));
+    }
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_devwrite_latency.record_since(devwrite_start);
     }
     drop(bulk_by_store);
 
@@ -6683,6 +6656,20 @@ fn handle_create_batch(
     // runs inline (no thread spawn) to keep small batches cheap. Merge the
     // per-chunk fragments IN CHUNK ORDER so `repl_ops_by_key` matches serial.
     let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+    let index_start = std::time::Instant::now();
+    // No per-key visibility stripes on the create path. A create is a single
+    // atomic index insert of an already-device-written record: a concurrent
+    // reader of the key sees it either present (post-register, record already on
+    // device from Phase 2b) or absent (pre-register) — never torn — because
+    // `register_create_at_offset` and the reader's lookup take the same per-key
+    // index lock. Unlike spend/set_mined (read-modify-write, which DO need the
+    // stripe write-lock to hide a half-updated record), a create has no
+    // intermediate visible state to protect. The old whole-handler / Phase-3
+    // stripe guard was therefore pure contention: at high pipelined concurrency
+    // every create grabbed ~256 of 65536 stripes and held them across its own
+    // (contended) register, serializing stripe-overlapping creates on each
+    // other's register time. Checkpoint quiescence + the issue-#14 un-journaled-
+    // reservation window are still covered by the `_global_vis` guard above.
     if !valid_items.is_empty() {
         let max_threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -6727,6 +6714,9 @@ fn handle_create_batch(
                 repl_ops_by_key.extend(frag_repl);
             }
         }
+    }
+    if let Some(h) = DISPATCH_HISTOGRAMS.get() {
+        h.create_index_latency.record_since(index_start);
     }
     // Deterministic response encoding independent of thread interleaving. The
     // serial version already produced errors in ascending item-index order
@@ -7692,123 +7682,17 @@ fn handle_preserve_until_batch(
     batch_response_with_outcome(req.request_id, &errors, repl_outcome)
 }
 
-/// One snapshotted UTXO slot. Used by the delete-batch compensation
-/// path (R-007 — Codex F1) to restore the exact pre-delete slot
-/// state (status + spending_data + hash) when a replication failure
-/// forces the master to undo a delete.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct SnapshotSlot {
-    pub hash: [u8; 32],
-    pub status: u8,
-    pub spending_data: [u8; 36],
-}
-
-/// Full pre-delete snapshot of one transaction record. See
-/// [`build_delete_compensation_ops`] for how this is replayed into
-/// `ReplicaOp` form when replication fails.
-#[derive(Debug, Clone)]
-pub(crate) struct DeleteSnapshot {
-    pub metadata_bytes: Vec<u8>,
-    /// Generation captured from the metadata at snapshot time. Used
-    /// as the `master_generation` on the per-slot Spend/Freeze
-    /// compensation ops so the receiver applies them as a coherent
-    /// view of the pre-delete state (matches the
-    /// `stream_shard_baseline` migration replay pattern).
-    pub master_generation: u32,
-    pub slots: Vec<SnapshotSlot>,
-    pub cold_data: Option<Vec<u8>>,
-    pub is_external: bool,
-}
-
-/// Build the sequence of `ReplicaOp` ops that, when applied in order,
-/// re-establish the exact pre-delete state of `key`. The Create op
-/// restores the metadata + utxo_hashes; subsequent Spend / Freeze /
-/// PruneSlot ops re-stamp slots that were not in the default UNSPENT
-/// state.
-///
-/// R-007 / Codex F1: pre-fix the compensation only emitted Create,
-/// which left every slot UNSPENT regardless of pre-delete state. A
-/// previously-spent slot could then be spent again by a different
-/// transaction. The fix uses the same Create + per-slot replay
-/// pattern that `stream_shard_baseline` uses for migration baselines.
-pub(crate) fn build_delete_compensation_ops(key: &TxKey, snap: &DeleteSnapshot) -> Vec<ReplicaOp> {
-    let mut ops: Vec<ReplicaOp> = Vec::with_capacity(1 + snap.slots.len());
-    ops.push(ReplicaOp::Create {
-        tx_key: *key,
-        metadata_bytes: snap.metadata_bytes.clone(),
-        utxo_hashes: snap.slots.iter().map(|s| s.hash).collect(),
-        cold_data: snap.cold_data.clone(),
-        is_external: snap.is_external,
-    });
-    for (v, slot) in snap.slots.iter().enumerate() {
-        let offset = v as u32;
-        match slot.status {
-            crate::record::UTXO_SPENT => {
-                ops.push(ReplicaOp::Spend {
-                    tx_key: *key,
-                    offset,
-                    spending_data: slot.spending_data,
-                    // Delete compensation first restores lifecycle metadata
-                    // through Create; these slot restamps must not re-evaluate
-                    // DAH and move the snapshotted pruning target.
-                    current_block_height: 0,
-                    block_height_retention: 0,
-                    master_generation: snap.master_generation,
-                });
-            }
-            crate::record::UTXO_FROZEN => {
-                ops.push(ReplicaOp::Freeze {
-                    tx_key: *key,
-                    offset,
-                    master_generation: snap.master_generation,
-                });
-            }
-            crate::record::UTXO_PRUNED => {
-                ops.push(ReplicaOp::PruneSlot {
-                    tx_key: *key,
-                    offset,
-                });
-            }
-            _ => {
-                // UTXO_UNSPENT and any other byte: nothing to replay
-                // — Create already produces an unspent slot.
-            }
-        }
-    }
-    ops
-}
-
-/// Choose the master→replica delete op (deletion-tombstone §6).
-///
-/// When the master's own delete wrote a tombstone (`info` is `Some`), emit
-/// `DeleteV2` carrying those exact `deletion_height` / `generation` / `cause`
-/// values so the replica records a matching tombstone and self-purges on its
-/// own restart. When no tombstone was written (`info` is `None` — tombstones
-/// disabled or no log attached), fall back to the V1 `Delete`, keeping the
-/// `tombstones_enabled = false` behavior byte-identical to the pre-tombstone
-/// path.
-fn delete_replica_op_for(
-    key: TxKey,
-    info: Option<crate::ops::engine::DeleteTombstoneInfo>,
-) -> ReplicaOp {
-    match info {
-        Some(info) => ReplicaOp::DeleteV2 {
-            tx_key: key,
-            deletion_height: info.deletion_height,
-            generation: info.generation,
-            cause: info.cause.as_u8(),
-        },
-        None => ReplicaOp::Delete { tx_key: key },
-    }
-}
-
 fn handle_delete_batch(
     req: &RequestFrame,
     engine: &Engine,
     max_batch: u32,
     cluster: Option<&RunningCluster>,
-    redo_log: Option<&Mutex<RedoLog>>,
-    // C-1: exclusive visibility barrier, released before replication.
+    // Deletes are local prune GC — not durable, not replicated — so the redo
+    // handle is unused here (kept in the signature for call-site symmetry with
+    // the other batch handlers; removed in a later cleanup).
+    _redo_log: Option<&Mutex<RedoLog>>,
+    // Forwarded coarse exclusive guard from the DAH-sweep caller; when `Some`
+    // this handler does NOT take its own per-key visibility (would self-deadlock).
     barrier: Option<MutationBarrier<'_>>,
     // KO-3: when `Some(current_height)` this batch originated from the DAH
     // sweep (`handle_process_expired`), and every `engine.delete` is gated by
@@ -7823,41 +7707,49 @@ fn handle_delete_batch(
     };
     let total_items = txids.len() as u64;
     let mut errors = Vec::new();
-    let mut redo_ops: Vec<RedoOp> = Vec::new();
+    // Deletes of already-absent keys (idempotent GC no-ops) — not failures.
+    let mut idempotent_total: u64 = 0;
 
-    // Phase 1: Validate ownership, lookup record_offset (read-only), build redo ops.
-    // Also snapshot each record BEFORE deletion so we can restore on replication failure.
-    struct ValidDelete {
-        idx: usize,
-        key: TxKey,
-        parent_prunes: Vec<ParentPrune>,
-        /// Full record snapshot for compensation. Contains the metadata
-        /// bytes AND per-slot state (hash + status + spending_data) so
-        /// the compensation path can rebuild not just an empty record
-        /// but the exact pre-delete slot states. R-007 (Codex F1) — the
-        /// previous version captured only `utxo_hashes`, so a compensation
-        /// after replication failure recreated previously-spent slots as
-        /// UNSPENT, opening a double-spend window.
-        snapshot: Option<DeleteSnapshot>,
-    }
-    #[derive(Clone, Copy)]
-    struct ParentPrune {
-        key: TxKey,
-        offset: u32,
-    }
-    let mut valid_items: Vec<ValidDelete> = Vec::new();
+    // Fine-grained visibility for the batch: per-key WRITE over the deleted
+    // txids + global SHARED (so a checkpoint still excludes us). GATED on
+    // `barrier.is_none()`: the DAH-sweep caller forwards its EXCLUSIVE global
+    // guard via `barrier`; re-taking `global.read()` here on the same thread
+    // would self-deadlock.
+    let visibility_guard = barrier.is_none().then(|| {
+        let keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
+        engine.visibility().mutation(&keys)
+    });
+
+    // LOCAL PRUNE. Deletes are independent-node GC of fully-spent records that
+    // are no longer needed — NOT part of normal client operation. They are NOT
+    // durable, NOT replicated, and write NO tombstone: a crash before the
+    // physical cleanup just leaves the record present (and consistent — record +
+    // parent-spent slots + allocated region all still agree), and the pruner
+    // re-deletes it next pass (self-healing). Each item:
+    //   1. validate shard ownership + (external records) the cold-blob guard,
+    //   2. mark every parent slot this child spent as PRUNED (UTXO correctness),
+    //   3. remove the record locally (`engine.prune_delete`: RAM-index
+    //      unregister + header zero via the write-back cache + region free).
     'items: for (i, txid) in txids.iter().enumerate() {
         if let Some(redirect_err) = check_shard_ownership(txid, i as u32, cluster, false) {
             errors.push(redirect_err);
             continue;
         }
         let key = TxKey { txid: *txid };
-        let record_offset = engine.lookup(&key).map(|e| e.record_offset).unwrap_or(0);
-        let record_size = if record_offset == 0 {
-            0
-        } else {
-            match engine.read_metadata(&key) {
-                Ok(meta) => ({ meta.record_size }) as u64,
+
+        // External-blob guard: never remove an external record whose cold blob
+        // is missing (it would be unrecoverable). Reads metadata once; an absent
+        // record (already gone) skips to the idempotent prune below.
+        let is_external = match engine.lookup(&key) {
+            Some(_) => match engine.read_metadata(&key) {
+                Ok(m) => m.flags.contains(crate::record::TxFlags::EXTERNAL),
+                // The record was concurrently deleted/relocated between the lookup
+                // and the read (a benign lock-free-reader race — `read_metadata`
+                // re-resolved the key and found it moved or gone). Nothing to
+                // external-guard; fall through to the idempotent prune below, which
+                // no-ops on an absent record. Do NOT fail: this used to surface as
+                // a spurious STORAGE_ERROR (the delete failure this fixes).
+                Err(crate::ops::error::SpendError::TxNotFound) => false,
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
@@ -7866,101 +7758,32 @@ fn handle_delete_batch(
                     });
                     continue;
                 }
-            }
+            },
+            None => false,
         };
-        // Snapshot the record for compensation. Read metadata + every
-        // slot's full state (hash + status + spending_data). R-007: a
-        // partial snapshot — utxo_hashes only — meant a compensation
-        // recreated previously-spent slots as UNSPENT, allowing a
-        // double-spend immediately after a failed delete.
-        let snapshot = if let Ok(meta) = engine.read_metadata(&key) {
-            let slots = match engine.read_slots(&key) {
-                Ok(slots) => slots
-                    .into_iter()
-                    .map(|slot| SnapshotSlot {
-                        hash: slot.hash,
-                        status: slot.status,
-                        spending_data: slot.spending_data,
-                    })
-                    .collect::<Vec<_>>(),
-                Err(e) => {
-                    // R-007 / IJK-19: do NOT silently substitute a
-                    // zero hash here. A read failure means we cannot
-                    // produce a faithful pre-delete snapshot; if
-                    // replication later fails we would compensate with
-                    // a corrupted view.
-                    tracing::error!(
-                        txid = ?key.txid,
-                        err = ?e,
-                        "delete snapshot: slot-region read failed; skipping snapshot",
-                    );
-                    Vec::new()
-                }
-            };
-            // Build the metadata bytes in the same format as migrate_shard.
-            let mut meta_buf = Vec::with_capacity(70);
-            meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.locktime.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.fee.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.size_in_bytes.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.extended_size.to_le_bytes());
-            let (is_coinbase, wire_flags) =
-                crate::replication::protocol::create_metadata_flag_bytes(meta.flags);
-            meta_buf.push(is_coinbase);
-            meta_buf.extend_from_slice(&meta.spending_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.created_at.to_le_bytes());
-            meta_buf.push(wire_flags);
-            meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
-
-            let cold_data = if meta.flags.contains(crate::record::TxFlags::EXTERNAL) {
-                engine
-                    .blob_store()
-                    .and_then(|bs| bs.get(&key.txid).ok().flatten())
-            } else {
-                None
-            };
-
-            if slots.len() != meta.utxo_count as usize {
-                None
-            } else {
-                Some(DeleteSnapshot {
-                    metadata_bytes: meta_buf,
-                    master_generation: { meta.generation },
-                    slots,
-                    cold_data,
-                    is_external: meta.flags.contains(crate::record::TxFlags::EXTERNAL),
-                })
-            }
-        } else {
-            None
-        };
-
-        if snapshot
-            .as_ref()
-            .is_some_and(|snap| snap.is_external && snap.cold_data.is_none())
+        if is_external
+            && engine
+                .blob_store()
+                .and_then(|bs| bs.get(&key.txid).ok().flatten())
+                .is_none()
         {
             errors.push(BatchItemError {
                 item_index: i as u32,
                 error_code: ERR_STORAGE_IO,
-                error_data: b"delete external blob snapshot missing".to_vec(),
+                error_data: b"delete external blob missing".to_vec(),
             });
             continue;
         }
 
-        // R-119: deleting a child transaction must first make every
-        // parent slot spent by that child terminal (`PRUNED`), replacing
-        // Lua's `deletedChildren` map with the Rust slot status. This
-        // local path is intentionally fail-closed in cluster mode when a
-        // parent belongs to another shard master; a distributed
-        // master-to-master prune transaction is still required for that
-        // topology.
-        let mut parent_prunes = Vec::new();
+        // Parent prune: mark each parent slot spent by THIS child terminal
+        // (`UTXO_PRUNED`). Local + idempotent; on a clustered node a parent on
+        // another shard master is fail-closed (a distributed prune is required
+        // for that topology).
         let parent_txids = match engine.parent_txids_for_child(&key) {
-            Ok(parent_txids) => parent_txids,
+            Ok(p) => p,
+            // The child was concurrently deleted/relocated (race): no parents to
+            // prune. Skip to the idempotent prune below rather than failing.
+            Err(crate::ops::error::SpendError::TxNotFound) => Vec::new(),
             Err(e) => {
                 errors.push(BatchItemError {
                     item_index: i as u32,
@@ -7984,13 +7807,12 @@ fn handle_delete_batch(
                 continue 'items;
             }
             let parent_key = TxKey { txid: parent_txid };
-            match engine.slots_spent_by_child(&parent_key, key.txid) {
-                Ok(offsets) => {
-                    parent_prunes.extend(offsets.into_iter().map(|offset| ParentPrune {
-                        key: parent_key,
-                        offset,
-                    }));
-                }
+            let offsets = match engine.slots_spent_by_child(&parent_key, key.txid) {
+                Ok(o) => o,
+                // The parent was concurrently deleted/relocated (race): its slots
+                // are moot to prune. Skip THIS parent rather than failing the child
+                // delete — the prune is idempotent and best-effort.
+                Err(crate::ops::error::SpendError::TxNotFound) => continue,
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
@@ -7999,309 +7821,72 @@ fn handle_delete_batch(
                     });
                     continue 'items;
                 }
+            };
+            for offset in offsets {
+                if let Err(err) = engine.prune_slot_if_spent_by_child(&parent_key, offset, key.txid)
+                {
+                    errors.push(spend_error_to_batch_error(i as u32, &err));
+                    continue 'items;
+                }
             }
         }
 
-        for prune in &parent_prunes {
-            redo_ops.push(RedoOp::PruneSlotIfSpentBy {
-                tx_key: prune.key,
-                offset: prune.offset,
-                child_txid: key.txid,
-            });
-        }
-        redo_ops.push(RedoOp::Delete {
+        // Remove the record locally (no tombstone, no redo, no replication).
+        match engine.prune_delete(&DeleteRequest {
             tx_key: key,
-            record_offset,
-            record_size,
-        });
-
-        valid_items.push(ValidDelete {
-            idx: i,
-            key,
-            parent_prunes,
-            snapshot,
-        });
-    }
-
-    // Phase 2: WAL-first — write redo before engine mutation.
-    let redo_range = match write_replicated_redo_ops(engine, cluster, redo_log, &redo_ops) {
-        Ok(range) => range,
-        Err(e) => {
-            // M-01: nothing has applied yet — classify every non-redirected
-            // item as ErrStorage-failed before the early return.
-            if let Some(m) = DISPATCH_METRICS.get() {
-                use crate::metrics::OpCode;
-                let failed = tally_storage_abort(m, OpCode::Delete, total_items, 0, 0, &errors);
-                m.deletes_failed.inc_by(failed);
-            }
-            return error_response(req.request_id, ERR_STORAGE_IO, &e);
-        }
-    };
-
-    // Phase 3: Apply engine mutations and build repl ops.
-    let mut repl_ops_by_key: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
-    let mut before_images_by_key: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
-    let mut deleted_snapshots: Vec<(TxKey, DeleteSnapshot)> = Vec::new();
-    for v in valid_items.iter() {
-        let mut item_prune_ops: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
-        let mut item_prune_before: Vec<(TxKey, Vec<BeforeImage>)> = Vec::new();
-        let mut item_failed = false;
-        for prune in &v.parent_prunes {
-            match engine.prune_slot_if_spent_by_child(&prune.key, prune.offset, v.key.txid) {
-                Ok(applied) => {
-                    if applied {
-                        push_repl_with_before_image(
-                            &mut item_prune_ops,
-                            &mut item_prune_before,
-                            prune.key,
-                            ReplicaOp::PruneSlotIfSpentBy {
-                                tx_key: prune.key,
-                                offset: prune.offset,
-                                child_txid: v.key.txid,
-                            },
-                            BeforeImage::Prune {
-                                prior_status: crate::record::UTXO_SPENT,
-                            },
-                        );
-                    }
-                }
-                Err(err) => {
-                    if !item_prune_ops.is_empty() {
-                        match compensate_replication_failure(
-                            engine,
-                            &item_prune_ops,
-                            &item_prune_before,
-                            redo_log,
-                        ) {
-                            // Engine-op (prune) failure before any replication
-                            // was attempted: local rollback only, no replica
-                            // could have seen these ops, so the comp range is
-                            // discarded.
-                            Ok(_) => {}
-                            Err(e) => {
-                                return error_response(req.request_id, ERR_INTERNAL, &e);
-                            }
-                        }
-                    }
-                    errors.push(spend_error_to_batch_error(v.idx as u32, &err));
-                    item_failed = true;
-                    break;
-                }
-            }
-        }
-        if item_failed {
-            continue;
-        }
-        match engine.delete_returning_tombstone(&DeleteRequest {
-            tx_key: v.key,
             due_guard: sweep_due_height,
         }) {
-            Ok(tombstone_info) => {
-                repl_ops_by_key.extend(item_prune_ops);
-                before_images_by_key.extend(item_prune_before);
-                // Deletion-tombstone §6: emit `DeleteV2` carrying the SAME
-                // tombstone fields the master's own delete recorded, so the
-                // replica writes a matching tombstone and self-purges on its
-                // own restart. `tombstone_info` is `Some` exactly when a
-                // tombstone was written (feature on AND log attached); when
-                // it is `None` (tombstones disabled / no log) we emit the V1
-                // `Delete`, keeping that fallback byte-identical to the
-                // pre-tombstone behavior.
-                let delete_op = delete_replica_op_for(v.key, tombstone_info);
-                push_repl_with_before_image(
-                    &mut repl_ops_by_key,
-                    &mut before_images_by_key,
-                    v.key,
-                    delete_op,
-                    BeforeImage::None,
-                );
-            }
-            Err(err) => {
-                if !item_prune_ops.is_empty() {
-                    match compensate_replication_failure(
-                        engine,
-                        &item_prune_ops,
-                        &item_prune_before,
-                        redo_log,
-                    ) {
-                        // Engine-op (delete) failure before replication:
-                        // local rollback only, comp range discarded.
-                        Ok(_) => {}
-                        Err(e) => {
-                            return error_response(req.request_id, ERR_INTERNAL, &e);
-                        }
-                    }
-                }
-                errors.push(spend_error_to_batch_error(v.idx as u32, &err));
-            }
-        }
-    }
-    // Collect snapshots for successfully deleted records.
-    for v in valid_items {
-        if let Some(snap) = v.snapshot
-            && repl_ops_by_key.iter().any(|(k, _)| *k == v.key)
-        {
-            deleted_snapshots.push((v.key, snap));
+            Ok(()) => {}
+            // Idempotent GC: the record is already gone — a concurrent or
+            // duplicate delete won the race, or it was never present. The
+            // delete's post-condition (record absent) already holds, so this is
+            // success, not a failure. The three steps above (external-blob
+            // guard, parent lookup, parent-slot scan) already tolerate this
+            // exact race; the final prune must agree, matching the reference's
+            // idempotent delete. Tracked as `Outcome::Idempotent` so the
+            // no-op stays distinguishable from a real removal in metrics.
+            Err(SpendError::TxNotFound) => idempotent_total += 1,
+            Err(err) => errors.push(spend_error_to_batch_error(i as u32, &err)),
         }
     }
 
-    // Phase 4: Replicate.
-    let repl_outcome = match replicate_all_ops_with_barrier(
-        cluster,
-        &repl_ops_by_key,
-        redo_range,
-        &[redo_range],
-        barrier,
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            // Compensate: re-create deleted records from snapshots, then
-            // replay per-slot state so a previously-spent / frozen /
-            // pruned slot is restored to that exact state. R-007: this
-            // is the fix for Codex F1 — without the per-slot replay,
-            // the recreated record would have all slots in the default
-            // UNSPENT state, opening a double-spend window for any
-            // outputs that were already spent before the delete.
-            //
-            // R-007 / R-035 also drops the `let _ = handle_replica_batch`
-            // and `let _ = write_redo_ops` swallows: a compensation
-            // failure must surface as ERR_INTERNAL so the operator can
-            // intervene; silently clearing the replication intent on
-            // top of a half-restored state is exactly the divergence
-            // BC-62 / F9 warned about.
-            // F-G5-023 (maintainability hazard): this in-process
-            // compensation path hand-constructs an OP_REPLICA_BATCH frame
-            // and feeds it back through `handle_replica_batch`. That
-            // bypasses every check the network path applies (HMAC, the
-            // cluster_key gate, sequence-number dedupe) — intentional
-            // because the inputs are trusted-by-construction, but the
-            // network path and the compensation path will drift apart if
-            // a future security gate is added to one and not the other.
-            // The structural fix is to extract a pure `apply_replica_ops`
-            // function in `src/replication/receiver.rs` (G7 territory)
-            // and call it from both sites; for now the synthesised-frame
-            // approach is wired so the rollback semantics stay correct.
-            let mut compensation_failed: Option<String> = None;
-            for (key, snap) in &deleted_snapshots {
-                let ops = build_delete_compensation_ops(key, snap);
-
-                let create_req = crate::protocol::frame::RequestFrame {
-                    request_id: 0,
-                    op_code: OP_REPLICA_BATCH,
-                    flags: 0,
-                    payload: ReplicaBatch {
-                        first_sequence: 0,
-                        ops,
-                        trace_ctx: None,
-                        source_node_id: None,
-                        // Self-compensation path: applies through the
-                        // ungated `handle_replica_batch` so cluster_key
-                        // gating does not apply. The wire field is
-                        // therefore left as the V1-compat sentinel `0`.
-                        cluster_key: 0,
-                    }
-                    .serialize()
-                    .into(),
-                };
-                let resp = handle_replica_batch(
-                    &create_req,
-                    engine,
-                    &std::sync::atomic::AtomicU64::new(0),
-                );
-                if resp.status != STATUS_OK {
-                    compensation_failed = Some(format!(
-                        "delete compensation failed for txid {:?}: status={}",
-                        key.txid, resp.status,
-                    ));
-                    break;
-                }
-                // Append a Create redo entry for crash recovery.
-                let entry = match engine.lookup(key) {
-                    Some(e) => e,
-                    None => {
-                        compensation_failed = Some(format!(
-                            "delete compensation: re-created record disappeared for txid {:?}",
-                            key.txid
-                        ));
-                        break;
-                    }
-                };
-                if let Err(e) = write_redo_ops(
-                    engine,
-                    redo_log,
-                    &[RedoOp::ReplicaCreate {
-                        tx_key: *key,
-                        device_id: entry.device_id,
-                        record_offset: entry.record_offset,
-                        utxo_count: snap.slots.len() as u32,
-                    }],
-                ) {
-                    compensation_failed = Some(format!(
-                        "delete compensation redo append failed for txid {:?}: {e}",
-                        key.txid
-                    ));
-                    break;
-                }
-            }
-            if let Some(cause) = compensation_failed {
-                tracing::error!(cause = %cause, "delete compensation aborted; node is in degraded state");
-                return error_response(req.request_id, ERR_INTERNAL, &cause);
-            }
-            // Also compensate any non-delete ops in the same batch. `DeleteV2`
-            // counts as a delete here (it is the tombstone-carrying form this
-            // handler now emits) so it is NOT re-compensated as a "non-delete".
-            let non_delete: Vec<_> = repl_ops_by_key
-                .iter()
-                .filter(|(_, ops)| {
-                    !ops.iter()
-                        .any(|o| matches!(o, ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. }))
-                })
-                .cloned()
-                .collect();
-            let non_delete_before: Vec<_> = repl_ops_by_key
-                .iter()
-                .zip(before_images_by_key.iter())
-                .filter(|((_, ops), _)| {
-                    !ops.iter()
-                        .any(|o| matches!(o, ReplicaOp::Delete { .. } | ReplicaOp::DeleteV2 { .. }))
-                })
-                .map(|(_, before)| before.clone())
-                .collect();
-            if !non_delete.is_empty() {
-                if let Some(resp) = compensate_replication_failure_or_error(
-                    req.request_id,
-                    cluster,
-                    engine,
-                    &non_delete,
-                    &non_delete_before,
-                    redo_log,
-                    &[redo_range],
-                ) {
-                    return resp;
-                }
-            } else {
-                clear_replication_intents_after_compensation(&[redo_range]);
-            }
-            return error_response(req.request_id, ERR_REPLICATION_FAILED, &e);
-        }
-    };
+    drop(visibility_guard);
 
     let failed_total = errors.len() as u64;
-    let succeeded_total = total_items.saturating_sub(failed_total);
+    let succeeded_total = total_items
+        .saturating_sub(failed_total)
+        .saturating_sub(idempotent_total);
     if let Some(m) = DISPATCH_METRICS.get() {
-        m.deletes_succeeded.inc_by(succeeded_total);
+        // Idempotent no-ops did not fail, so they count toward the coarse
+        // succeeded counter; the operations matrix keeps them in their own
+        // `Idempotent` bucket.
+        m.deletes_succeeded
+            .inc_by(succeeded_total + idempotent_total);
         m.deletes_failed.inc_by(failed_total);
-        // Dual-write: labeled operations table.
         use crate::metrics::{OpCode, Outcome};
         m.operations
             .inc_by(OpCode::Delete, Outcome::Ok, succeeded_total);
+        m.operations
+            .inc_by(OpCode::Delete, Outcome::Idempotent, idempotent_total);
         for e in &errors {
             m.operations
                 .inc(OpCode::Delete, classify_wire_error_code(e.error_code));
         }
     }
 
-    batch_response_with_outcome(req.request_id, &errors, repl_outcome)
+    if errors.is_empty() {
+        ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_OK,
+            payload: vec![],
+        }
+    } else {
+        ResponseFrame {
+            request_id: req.request_id,
+            status: STATUS_PARTIAL_ERROR,
+            payload: encode_sparse_errors(&errors),
+        }
+    }
 }
 
 fn handle_mark_longest_chain_batch(
@@ -8466,8 +8051,34 @@ fn handle_mark_longest_chain_batch(
 // ---------------------------------------------------------------------------
 
 /// Batch sizes at or above this fan out across the read pool; smaller batches
-/// stay serial to avoid pool-dispatch overhead dominating a trivial lookup.
-const READ_FANOUT_THRESHOLD: usize = 8;
+/// stay serial.
+///
+/// PERF (2026-07-01, RAM-disk profile): this was `8`, which fanned nearly every
+/// batch into the rayon read pool. But the dispatch pool already runs
+/// `cores * 8` (~96) workers processing RPCs CONCURRENTLY, so under realistic
+/// high-connection load each RPC's rayon fan-out nests a second layer of
+/// parallelism on top — `cores`-sized read pool, contended by ~96 dispatch
+/// workers — and the rayon join/steal/sleep machinery (`bridge_producer_consumer`,
+/// `join_context`, `Sleep::sleep`) DOMINATED the on-CPU profile (the
+/// "CPU/dispatch-coordination cap"). Cross-RPC parallelism from the dispatch pool
+/// already keeps the cores busy, so the within-RPC fan-out was pure
+/// oversubscription overhead for typical (tens-to-hundreds-item) batches.
+/// Raising the threshold to 512 keeps fan-out only for the genuinely huge batches
+/// (a big block's GET) where intra-batch parallelism pays even with the overhead,
+/// and lets everything else run serially on its already-parallel dispatch worker.
+/// Measured on a RAM disk (I/O removed, coordination-bound): saturating recipe
+/// went 72.8k -> 89.7k ops/s (+23%) and create p99 125 -> 68 ms (-46%).
+const READ_FANOUT_THRESHOLD: usize = 512;
+
+/// Minimum items per rayon job when a batch DOES fan out. `par_iter()` otherwise
+/// splits recursively down to single elements, and the RAM-disk profile showed
+/// `rayon_core::join::join_context` (the recursive split-join) dominating even
+/// the batches above [`READ_FANOUT_THRESHOLD`] — the splitting overhead, not the
+/// per-item work. `with_min_len` caps the split depth so a fanned batch becomes a
+/// handful of coarse jobs (~`batch / 64`, i.e. roughly one per core for a
+/// threshold-sized batch) instead of hundreds of tiny ones, keeping the
+/// parallelism while cutting the join churn.
+const FANOUT_MIN_LEN: usize = 64;
 
 /// Dedicated work-stealing pool for intra-batch read fan-out. `None` if the
 /// pool failed to build (then reads serve serially — correct, just single-core
@@ -8945,6 +8556,14 @@ fn handle_get_batch(
         Err(e) => return codec_error_response(req.request_id, "get batch", e),
     };
 
+    // Per-key read visibility: read-lock the stripes of the keys we read (plus
+    // the global SHARED side). A read of key K is excluded from a concurrent
+    // mutation of K (so it never observes K mid-batch), while reads share
+    // stripes with each other and run concurrently with disjoint mutations.
+    // Held across the (possibly fanned-out) reads below.
+    let vis_keys: Vec<TxKey> = txids.iter().map(|t| TxKey { txid: *t }).collect();
+    let _visibility_guard = engine.visibility().read(&vis_keys);
+
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
     let results: Vec<WireGetResult> = match (txids.len() >= READ_FANOUT_THRESHOLD)
@@ -8952,10 +8571,11 @@ fn handle_get_batch(
         .flatten()
     {
         Some(pool) => {
-            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
             pool.install(|| {
                 txids
                     .par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
                     .map(|txid| decorate_get_item(txid, engine, field_mask, local_read, cluster))
                     .collect()
             })
@@ -9291,8 +8911,8 @@ fn handle_preserve_transactions(
 /// Before the DAH sweep, process preservations whose window has elapsed:
 /// for each record with `preserve_until` in `[1, current_height]`, set
 /// `delete_at_height = current_height + block_height_retention` and clear
-/// `preserve_until` (mirroring the Aerospike pruner's
-/// `ProcessExpiredPreservations`, `aerospike.go:999-1100`). Without this the
+/// `preserve_until` (mirroring the reference pruner's
+/// `ProcessExpiredPreservations` in the upstream Go reference, ~lines 999-1100). Without this the
 /// preserved set grows monotonically and is never reclaimed. The expired
 /// records do NOT get deleted in this same call — their fresh DAH is
 /// `current_height + retention`, in the future — exactly as the reference
@@ -9302,7 +8922,7 @@ fn handle_preserve_transactions(
 ///
 /// `[current_height:4]` or `[current_height:4][block_height_retention:4]`.
 /// The 8-byte form supplies the retention used for expiry-phase DAH
-/// scheduling (the Aerospike store reads it from server config; TeraSlab's
+/// scheduling (the reference UDF store reads it from server config; TeraSlab's
 /// hot-path mutations already carry `block_height_retention` per request, so
 /// the sweep client supplies it the same way). The legacy 4-byte form omits
 /// retention: the expiry phase is then skipped (retention treated as 0) and
@@ -9625,6 +9245,12 @@ fn handle_get_spend_batch(
         Err(e) => return codec_error_response(req.request_id, "get_spend batch", e),
     };
 
+    // Per-key read visibility (see handle_get_batch): exclude each read key from
+    // a concurrent mutation of that key while staying concurrent with disjoint
+    // mutations and other reads.
+    let vis_keys: Vec<TxKey> = items.iter().map(|i| TxKey { txid: i.txid }).collect();
+    let _visibility_guard = engine.visibility().read(&vis_keys);
+
     let local_read = req.flags & FLAG_LOCAL_READ != 0;
 
     let results: Vec<WireGetSpendResult> = match (items.len() >= READ_FANOUT_THRESHOLD)
@@ -9632,10 +9258,11 @@ fn handle_get_spend_batch(
         .flatten()
     {
         Some(pool) => {
-            use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
             pool.install(|| {
                 items
                     .par_iter()
+                    .with_min_len(FANOUT_MIN_LEN)
                     .map(|item| decorate_get_spend_item(item, engine, local_read, cluster))
                     .collect()
             })
@@ -10030,7 +9657,7 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         // distinguish via the empty payload (real `InvalidSpend` carries
         // the 36-byte `spending_data`).
         SpendError::ReservedSpendingData { .. } => (ERR_INVALID_SPEND, vec![]),
-        // F-X-022: Aerospike `addDeletedChildren` parity. Distinct wire
+        // F-X-022: the reference UDF `addDeletedChildren` parity. Distinct wire
         // code (`ERR_DELETED_CHILDREN = 35`) so clients can distinguish
         // the resurrected-then-pruned rejection from the regular
         // `UTXO_PRUNED` slot-status rejection (`ERR_INVALID_SPEND`).
@@ -10743,66 +10370,7 @@ mod tests {
     }
 
     impl DispatchTestHarness {
-        /// Create a new harness with a 64 MB in-memory device.
-        fn new() -> Self {
-            let dev: Arc<dyn BlockDevice> =
-                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            Self::with_device(dev)
-        }
-
-        fn with_device(dev: Arc<dyn BlockDevice>) -> Self {
-            let alloc = SlotAllocator::new(dev.clone()).unwrap();
-            let index = Index::new(10000).unwrap();
-            let locks = StripedLocks::new(1024);
-            let dah = DahIndex::new();
-            let unmined = UnminedIndex::new();
-            let engine = Engine::new(dev, index, alloc, locks, dah, unmined);
-            Self {
-                engine,
-                _metrics_guard: metrics_test_lock(),
-                _index_dir: None,
-            }
-        }
-
-        /// Create a harness whose engine spans `1 + aux` stores, each on its
-        /// own in-memory device. Records are placed round-robin across stores
-        /// (store 0, store 1, ... store N, store 0, ...), so consecutive
-        /// `create_tx` calls land on different physical devices — exercising
-        /// the GetBatch per-store parallel fan-out.
-        fn with_stores(aux: usize) -> Self {
-            let dev0: Arc<dyn BlockDevice> =
-                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-            let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
-            let aux_stores: Vec<(Arc<dyn BlockDevice>, SlotAllocator)> = (0..aux)
-                .map(|_| {
-                    let dev: Arc<dyn BlockDevice> =
-                        Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
-                    let alloc = SlotAllocator::new(dev.clone()).unwrap();
-                    (dev, alloc)
-                })
-                .collect();
-            let index = crate::index::ShardedIndex::from_single(Index::new(10000).unwrap().into());
-            let engine = Engine::new_multi_store(
-                dev0,
-                alloc0,
-                aux_stores,
-                index,
-                StripedLocks::new(1024),
-                DahIndex::new(),
-                UnminedIndex::new(),
-            );
-            Self {
-                engine,
-                _metrics_guard: metrics_test_lock(),
-                _index_dir: None,
-            }
-        }
-
-        /// Create a harness whose engine runs over the given index backend.
-        ///
-        /// For [`IndexBackendMode::Redb`] / [`IndexBackendMode::FileBacked`]
-        /// the on-disk index files live in a temp directory held by the
-        /// returned harness; the in-memory backend needs none.
+        // (restored) General harness constructor parameterized by index backend.
         fn with_backend(mode: &IndexBackendMode) -> Self {
             let dev: Arc<dyn BlockDevice> =
                 Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -10814,7 +10382,6 @@ mod tests {
                 redb_path: dir.path().join("primary.redb"),
                 redb_dah_path: dir.path().join("dah.redb"),
                 redb_unmined_path: dir.path().join("unmined.redb"),
-                redb_tombstone_path: dir.path().join("tombstone.redb"),
                 redb_cache_size: 16 * 1024 * 1024,
                 file_backed_path: dir.path().join("primary.index"),
                 index_shards: 16,
@@ -10846,6 +10413,62 @@ mod tests {
                 engine,
                 _metrics_guard: metrics_test_lock(),
                 _index_dir: Some(dir),
+            }
+        }
+
+        /// Create a new harness with a 64 MB in-memory device.
+        fn new() -> Self {
+            let dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            Self::with_device(dev)
+        }
+
+        fn with_device(dev: Arc<dyn BlockDevice>) -> Self {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(10000).unwrap();
+            let locks = StripedLocks::new(1024);
+            let dah = DahIndex::new();
+            let unmined = UnminedIndex::new();
+            let engine = Engine::new(dev, index, alloc, locks, dah, unmined);
+            Self {
+                engine,
+                _metrics_guard: metrics_test_lock(),
+                _index_dir: None,
+            }
+        }
+
+        /// Create a harness whose engine spans `1 + aux` stores, each on its
+        /// own in-memory device. Records are placed round-robin across stores
+        /// (store 0, store 1, ... store N, store 0, ...), so consecutive
+        /// `create_tx` calls land on different physical devices — exercising
+        /// the GetBatch per-store parallel fan-out.
+        fn with_stores(aux: usize) -> Self {
+            let dev0: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+            let aux_stores: Vec<(Arc<dyn BlockDevice>, crate::allocator::BoxedAllocator)> = (0
+                ..aux)
+                .map(|_| {
+                    let dev: Arc<dyn BlockDevice> =
+                        Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+                    let alloc = SlotAllocator::new(dev.clone()).unwrap();
+                    (dev, Box::new(alloc) as crate::allocator::BoxedAllocator)
+                })
+                .collect();
+            let index = crate::index::ShardedIndex::from_single(Index::new(10000).unwrap().into());
+            let engine = Engine::new_multi_store(
+                dev0,
+                Box::new(alloc0),
+                aux_stores,
+                index,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            Self {
+                engine,
+                _metrics_guard: metrics_test_lock(),
+                _index_dir: None,
             }
         }
 
@@ -11343,7 +10966,7 @@ mod tests {
 
         // Manually insert into unmined index at different heights
         {
-            let mut ui = h.engine.unmined_index();
+            let ui = h.engine.unmined_index();
             ui.insert(100, TxKey { txid: txid_a }, None).unwrap();
             ui.insert(200, TxKey { txid: txid_b }, None).unwrap();
             ui.insert(300, TxKey { txid: txid_c }, None).unwrap();
@@ -11475,7 +11098,7 @@ mod tests {
         assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
 
         {
-            let mut ui = h.engine.unmined_index();
+            let ui = h.engine.unmined_index();
             ui.insert(100, TxKey { txid }, None).unwrap();
         }
 
@@ -11648,7 +11271,7 @@ mod tests {
         // spent_utxos == 0 — process-expired must skip it after
         // the re-validation step (R-102 / IJK-09).
         {
-            let mut dah = h.engine.dah_index();
+            let dah = h.engine.dah_index();
             dah.insert(500, TxKey { txid: txid_c }, None).unwrap();
         }
 
@@ -12061,7 +11684,7 @@ mod tests {
         assert_ne!(dah_before, 0);
         assert_eq!(preserve_until(&h, txid, 100_000).status, STATUS_OK);
         {
-            let mut dah = h.engine.dah_index();
+            let dah = h.engine.dah_index();
             dah.insert(dah_before, key, None).unwrap();
         }
 
@@ -13184,10 +12807,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].item_index, 0);
         assert_eq!(errors[0].error_code, ERR_STORAGE_IO);
-        assert!(
-            String::from_utf8_lossy(&errors[0].error_data)
-                .contains("external blob snapshot missing")
-        );
+        assert!(String::from_utf8_lossy(&errors[0].error_data).contains("external blob missing"));
 
         let resp = h.request(
             OP_GET_BATCH,
@@ -13994,6 +13614,478 @@ mod tests {
         );
     }
 
+    /// Parallel read fan-out for the spend validate phase must preserve exact
+    /// per-item outcomes. Drives a batch above `READ_FANOUT_THRESHOLD` with a
+    /// mix of valid spends, a UTXO-hash mismatch, and a not-found txid, then
+    /// asserts the resulting on-device state and the single-flush contract —
+    /// so the fanned `prepare_spend_multi` reads can't reorder, drop, or
+    /// misclassify any item versus the old serial loop.
+    #[test]
+    fn spend_batch_parallel_validate_preserves_per_item_outcomes() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+
+        let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &engine, 8192, None, Some(&redo_log), &mut cs, None)
+        };
+
+        // N valid txids, each with 2 utxos. N is comfortably above
+        // READ_FANOUT_THRESHOLD (8) so the parallel validate path is taken.
+        const N: usize = 10;
+        let mk_txid = |k: usize| {
+            let mut t = [0u8; 32];
+            t[0] = 0xA7;
+            t[1] = k as u8;
+            t
+        };
+        let mk_hash = |k: usize, vout: u8| {
+            let mut h = [0u8; 32];
+            h[0] = 0xA7;
+            h[1] = k as u8;
+            h[2] = vout;
+            h
+        };
+
+        let create_items: Vec<WireCreateItem> = (0..N)
+            .map(|k| WireCreateItem {
+                txid: mk_txid(k),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![mk_hash(k, 0), mk_hash(k, 1)],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
+        assert_eq!(
+            request(OP_CREATE_BATCH, encode_create_batch(&create_items)).status,
+            STATUS_OK,
+            "seed creates must succeed"
+        );
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 0,
+        };
+        // Build a spend batch: vout 0 valid on all N txids, plus two doomed
+        // items — a wrong-hash spend on txid 0's vout 1, and a spend of a txid
+        // that was never created. Distinct txids = N + 1 (>= threshold).
+        let mut spend_items: Vec<WireSpendItem> = (0..N)
+            .map(|k| WireSpendItem {
+                txid: mk_txid(k),
+                vout: 0,
+                utxo_hash: mk_hash(k, 0),
+                spending_data: [0xD3; 36],
+            })
+            .collect();
+        spend_items.push(WireSpendItem {
+            txid: mk_txid(0),
+            vout: 1,
+            utxo_hash: [0xEE; 32], // wrong hash -> must be rejected, slot stays unspent
+            spending_data: [0xD3; 36],
+        });
+        let missing_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xBB;
+            t
+        };
+        spend_items.push(WireSpendItem {
+            txid: missing_txid,
+            vout: 0,
+            utxo_hash: [0x00; 32],
+            spending_data: [0xD3; 36],
+        });
+
+        let syncs_before = redo_dev.sync_count();
+        let resp = request(OP_SPEND_BATCH, encode_spend_batch(&params, &spend_items));
+        let flush_syncs = redo_dev.sync_count() - syncs_before;
+
+        // Two of the items fail (wrong hash + not-found), so the batch reports
+        // a partial error; the valid items still applied.
+        assert_eq!(
+            resp.status, STATUS_PARTIAL_ERROR,
+            "batch with 2 doomed items should report partial error"
+        );
+
+        // Every valid txid's vout 0 must be SPENT; vout 1 must be UNSPENT.
+        for k in 0..N {
+            let slots = engine
+                .read_slots(&TxKey { txid: mk_txid(k) })
+                .expect("created txid must exist");
+            assert_eq!(
+                slots[0].status,
+                crate::record::UTXO_SPENT,
+                "txid {k} vout 0 must be spent by the fanned batch"
+            );
+            assert_eq!(
+                slots[1].status,
+                crate::record::UTXO_UNSPENT,
+                "txid {k} vout 1 must remain unspent"
+            );
+        }
+        // The wrong-hash item targeted txid 0 vout 1 — already asserted UNSPENT
+        // above, confirming the mismatch was rejected, not silently applied.
+        // The not-found txid must not have been created as a side effect.
+        assert!(
+            engine.read_slots(&TxKey { txid: missing_txid }).is_err(),
+            "spend of a missing txid must not materialize a record"
+        );
+
+        // WAL-first single-flush contract is unchanged by the fan-out: the N
+        // valid spends commit in exactly one redo fsync.
+        assert_eq!(
+            flush_syncs, 1,
+            "fanned spend validate must still collapse to one redo flush; got {flush_syncs}"
+        );
+    }
+
+    /// Parallel apply fan-out for set_mined must preserve exact per-item
+    /// outcomes. Drives a batch above `READ_FANOUT_THRESHOLD` (valid txids plus
+    /// a not-found txid), then asserts each valid record gained the block entry
+    /// with the right fields and the missing one was not materialized — so the
+    /// fanned `set_mined_inner` apply can't drop, misroute, or corrupt any item
+    /// versus the old serial loop.
+    #[test]
+    fn set_mined_batch_parallel_apply_preserves_per_item_outcomes() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(CountingSyncDevice::new(16 * 1024 * 1024, 4096));
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+
+        let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &engine, 8192, None, Some(&redo_log), &mut cs, None)
+        };
+
+        const N: usize = 10; // > READ_FANOUT_THRESHOLD (8) -> parallel apply path
+        let mk_txid = |k: usize| {
+            let mut t = [0u8; 32];
+            t[0] = 0x5E;
+            t[1] = k as u8;
+            t
+        };
+        let create_items: Vec<WireCreateItem> = (0..N)
+            .map(|k| WireCreateItem {
+                txid: mk_txid(k),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![[k as u8; 32]],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect();
+        assert_eq!(
+            request(OP_CREATE_BATCH, encode_create_batch(&create_items)).status,
+            STATUS_OK,
+            "seed creates must succeed"
+        );
+
+        const BLOCK_ID: u32 = 7;
+        const BLOCK_HEIGHT: u32 = 900_000;
+        const SUBTREE: u32 = 3;
+        let params = SetMinedBatchParams {
+            block_id: BLOCK_ID,
+            block_height: BLOCK_HEIGHT,
+            subtree_idx: SUBTREE,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: BLOCK_HEIGHT,
+            block_height_retention: 288,
+        };
+        // All N valid txids plus one that was never created.
+        let missing_txid = {
+            let mut t = [0u8; 32];
+            t[0] = 0xCC;
+            t
+        };
+        let mut txids: Vec<[u8; 32]> = (0..N).map(mk_txid).collect();
+        txids.push(missing_txid);
+
+        let resp = request(OP_SET_MINED_BATCH, encode_set_mined_batch(&params, &txids));
+        assert_eq!(
+            resp.status, STATUS_PARTIAL_ERROR,
+            "batch with one not-found txid should report partial error"
+        );
+
+        // Every valid txid must carry the new block entry with the exact fields.
+        for k in 0..N {
+            let entry = engine
+                .read_block_entry(&TxKey { txid: mk_txid(k) }, BLOCK_ID)
+                .expect("created txid must exist")
+                .unwrap_or_else(|| panic!("txid {k} must have block entry after fanned set_mined"));
+            // Copy out of the packed struct before comparing (no unaligned refs).
+            let (bh, st) = (entry.block_height, entry.subtree_idx);
+            assert_eq!(bh, BLOCK_HEIGHT, "txid {k} block_height");
+            assert_eq!(st, SUBTREE, "txid {k} subtree_idx");
+        }
+        // The not-found txid must not have been materialized.
+        assert!(
+            engine
+                .read_block_entry(&TxKey { txid: missing_txid }, BLOCK_ID)
+                .is_err(),
+            "set_mined of a missing txid must not materialize a record"
+        );
+    }
+
+    /// Deadlock regression for the per-key visibility barrier. Every mutation
+    /// handler must take visibility BEFORE the engine stripe locks; a prior
+    /// version took the stripe lock first in spend but visibility first in
+    /// create/set_mined — an inversion that deadlocked under same-stripe
+    /// contention (caught only by the load test, not the suite). A tiny stripe
+    /// count forces frequent spend×create stripe collisions; a liveness watchdog
+    /// fails fast (rather than hanging forever) if the inversion regresses.
+    #[test]
+    fn concurrent_spend_and_create_do_not_deadlock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _g = metrics_test_lock();
+
+        // FEW stripes -> spend and create keys collide often, exercising the
+        // cross-table (visibility × stripe-lock) acquisition order.
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let redo = Arc::new(Mutex::new(
+            RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                16 * 1024 * 1024,
+            )
+            .unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        // Free fns (no captures) so the worker threads can use them freely.
+        fn mk_txid(w: usize, n: usize) -> [u8; 32] {
+            let mut t = [0u8; 32];
+            t[0] = w as u8;
+            t[16] = n as u8; // bytes 16..24 drive the stripe hash
+            t[17] = (n >> 8) as u8;
+            t
+        }
+        fn mk_hash(w: usize, n: usize) -> [u8; 32] {
+            let mut h = [0u8; 32];
+            h[0] = 0xC0;
+            h[1] = w as u8;
+            h[2] = n as u8;
+            h
+        }
+        fn create_item(w: usize, n: usize) -> WireCreateItem {
+            WireCreateItem {
+                txid: mk_txid(w, n),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![mk_hash(w, n)],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            }
+        }
+        let do_req = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(
+                &req,
+                &engine,
+                8192,
+                None,
+                Some(redo.as_ref()),
+                &mut cs,
+                None,
+            )
+        };
+
+        const W: usize = 8;
+        const ITERS: usize = 40;
+        // Pre-create the keys each worker will later spend (so spends are valid).
+        for w in 0..W {
+            for n in 0..ITERS {
+                assert_eq!(
+                    do_req(OP_CREATE_BATCH, encode_create_batch(&[create_item(w, n)])).status,
+                    STATUS_OK,
+                );
+            }
+        }
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(W));
+        let handles: Vec<_> = (0..W)
+            .map(|w| {
+                let engine = engine.clone();
+                let redo = redo.clone();
+                let done = done.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let do_req = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+                        let req = RequestFrame {
+                            request_id: 1,
+                            op_code: op,
+                            flags: 0,
+                            payload: payload.into(),
+                        };
+                        let mut cs = crate::server::ConnectionState::new();
+                        handle_request(
+                            &req,
+                            &engine,
+                            8192,
+                            None,
+                            Some(redo.as_ref()),
+                            &mut cs,
+                            None,
+                        )
+                    };
+                    barrier.wait();
+                    for n in 0..ITERS {
+                        // Spend a pre-created key (visibility→stripe order)...
+                        let params = SpendBatchParams {
+                            ignore_conflicting: false,
+                            ignore_locked: false,
+                            current_block_height: 1000,
+                            block_height_retention: 0,
+                        };
+                        let _ = do_req(
+                            OP_SPEND_BATCH,
+                            encode_spend_batch(
+                                &params,
+                                &[WireSpendItem {
+                                    txid: mk_txid(w, n),
+                                    vout: 0,
+                                    utxo_hash: mk_hash(w, n),
+                                    spending_data: [0xD0; 36],
+                                }],
+                            ),
+                        );
+                        // ...while another worker creates a colliding-stripe key
+                        // (also visibility→stripe). Inverted orders would deadlock.
+                        let other = (w + 1) % W;
+                        let _ = do_req(
+                            OP_CREATE_BATCH,
+                            encode_create_batch(&[create_item(other, ITERS + n)]),
+                        );
+                        let _ = do_req(
+                            OP_GET_BATCH,
+                            encode_get_batch(FieldMask::ALL_METADATA, &[mk_txid(w, n)]),
+                        );
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        // Liveness watchdog: under correct (uniform) lock order this finishes in
+        // well under a second; a deadlock would leave `done < W`.
+        let start = std::time::Instant::now();
+        while done.load(Ordering::SeqCst) < W
+            && start.elapsed() < std::time::Duration::from_secs(30)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            done.load(Ordering::SeqCst),
+            W,
+            "workers did not all finish within 30s — lock-order inversion (visibility \
+             vs stripe locks) has regressed into a deadlock"
+        );
+        for h in handles {
+            h.join().expect("worker joins");
+        }
+    }
+
     /// PR#21 review (P2): the per-txid DAH secondary updates must be folded into
     /// ONE batched redo flush for the whole RPC, not one `append_and_flush` per
     /// last-spend txid. `commit_dah_batch` is the fold primitive: N transitions
@@ -14068,6 +14160,49 @@ mod tests {
                 redo_dev.clone() as Arc<dyn BlockDevice>,
                 0,
                 redo_size.max(4096),
+            )
+            .unwrap();
+            Self {
+                engine,
+                redo_log: Arc::new(Mutex::new(redo_log)),
+                data_dev,
+                redo_dev,
+                _metrics_guard: metrics_test_lock(),
+            }
+        }
+
+        /// Engine + allocator over a [`crate::cache::CachingDevice`] wrapping the
+        /// data device, in write-through (`writeback = false`) or write-back
+        /// (`true`) mode. With write-back this proves the WAL recovers records
+        /// whose data write only ever landed in the (crash-lost) cache;
+        /// `crash_and_recover` rebuilds over the inner `data_dev`, simulating the
+        /// lost cache.
+        fn new_with_cache(writeback: bool) -> Self {
+            let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+            let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+            let cache: Arc<dyn BlockDevice> = Arc::new(crate::cache::CachingDevice::new(
+                data_dev.clone() as Arc<dyn BlockDevice>,
+                8 * 1024 * 1024,
+                writeback,
+                // Long interval: keep the background writeback thread from
+                // preemptively flushing so this crash-recovery test deterministically
+                // exercises the WAL replaying cache-lost (un-synced) data writes.
+                3_600_000,
+            ));
+            let alloc = SlotAllocator::new(cache.clone()).unwrap();
+            let index = Index::new(10000).unwrap();
+            let engine = Engine::new(
+                cache.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let redo_log = crate::redo::RedoLog::open(
+                redo_dev.clone() as Arc<dyn BlockDevice>,
+                0,
+                4 * 1024 * 1024,
             )
             .unwrap();
             Self {
@@ -14249,6 +14384,127 @@ mod tests {
             missing.len(),
             acked_keys.len()
         );
+    }
+
+    #[test]
+    fn writethrough_cache_is_transparent_to_engine_lifecycle() {
+        // A full create -> spend -> set_mined -> read lifecycle through a
+        // write-through cache must behave exactly as the raw device: the cache is
+        // a transparent BlockDevice wrapper.
+        let h = RedoDispatchHarness::new_with_cache(false);
+        let mut txid = [0u8; 32];
+        txid[0] = 0x42;
+        let key = TxKey { txid };
+
+        assert_eq!(h.create_tx(txid, 3).status, STATUS_OK, "create");
+        // Read back through the cache.
+        let hash = h.engine.read_slot(&key, 0).unwrap().hash;
+
+        let params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash: hash,
+            spending_data: [0xCD; 36],
+        };
+        assert_eq!(
+            h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]))
+                .status,
+            STATUS_OK,
+            "spend"
+        );
+        let sm = SetMinedBatchParams {
+            block_id: 9,
+            block_height: 500_000,
+            subtree_idx: 2,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 500_000,
+            block_height_retention: 288,
+        };
+        assert_eq!(
+            h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&sm, &[txid]))
+                .status,
+            STATUS_OK,
+            "set_mined"
+        );
+
+        // Final state is correct and coherent through the cache.
+        assert!(
+            h.engine.read_slot(&key, 0).unwrap().is_spent(),
+            "slot spent"
+        );
+        let entry = h
+            .engine
+            .read_block_entry(&key, 9)
+            .unwrap()
+            .expect("block entry present");
+        let bh = entry.block_height;
+        assert_eq!(bh, 500_000, "block height recorded");
+    }
+
+    #[test]
+    fn writeback_cache_lost_on_crash_is_recovered_from_wal() {
+        // The engine writes records through a WRITE-BACK cache, so the data-device
+        // write is deferred in RAM and never synced here. On crash that RAM is
+        // lost — exactly the volatile-write case the durability contract already
+        // tolerates (recovery.rs step 3: the data write "is NOT necessarily
+        // durable on return"). The fsynced WAL must still recover everything.
+        let h = RedoDispatchHarness::new_with_cache(true);
+
+        let mut acked = Vec::new();
+        for i in 0..20u8 {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            txid[31] = i.wrapping_mul(11);
+            let resp = h.create_tx(txid, 3);
+            assert_eq!(resp.status, STATUS_OK, "create {i} failed");
+            acked.push(TxKey { txid });
+        }
+        // Spend slot 0 of the first 10 (the read is served coherently from the
+        // dirty cache).
+        let mut spent = Vec::new();
+        for key in acked.iter().take(10) {
+            let hash = h.engine.read_slot(key, 0).unwrap().hash;
+            let item = WireSpendItem {
+                txid: key.txid,
+                vout: 0,
+                utxo_hash: hash,
+                spending_data: [0xAB; 36],
+            };
+            let params = SpendBatchParams {
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            };
+            let resp = h.request(OP_SPEND_BATCH, encode_spend_batch(&params, &[item]));
+            assert_eq!(resp.status, STATUS_OK, "spend failed");
+            spent.push(*key);
+        }
+
+        // CRASH: drop the engine + write-back cache WITHOUT sync; recover over the
+        // inner data device, whose blocks never received the deferred writes.
+        let h2 = h.crash_and_recover();
+
+        for key in &acked {
+            assert!(
+                h2.engine.lookup(key).is_some(),
+                "created record lost after crash despite the WAL covering the write-back cache"
+            );
+        }
+        for key in &spent {
+            let slot = h2
+                .engine
+                .read_slot(key, 0)
+                .expect("spent record must be readable after recovery");
+            assert!(slot.is_spent(), "spend lost after crash despite the WAL");
+        }
     }
 
     #[test]
@@ -15850,48 +16106,6 @@ mod tests {
         manifest.finalize()
     }
 
-    /// Append a Phase 8 tombstone section to a completion payload (test mirror
-    /// of `coordinator::append_tombstone_section`). The caller must also set
-    /// `FLAG_MIGRATION_TOMBSTONES` on the request frame.
-    fn append_test_tombstone_section(payload: &mut Vec<u8>, tombstones: &[(TxKey, u32)]) {
-        payload.push(TOMBSTONE_SECTION_VERSION);
-        payload.extend_from_slice(&(tombstones.len() as u32).to_le_bytes());
-        for (key, generation) in tombstones {
-            payload.extend_from_slice(&key.txid);
-            payload.extend_from_slice(&generation.to_le_bytes());
-        }
-    }
-
-    /// Attach a tombstone log + redb index to the harness engine and turn ON
-    /// both `tombstones_enabled` (already default) and
-    /// `tombstone_reconciliation_enabled` (Phase 8). Returns the log + index
-    /// handles + the TempDir backing the redb so they outlive the test.
-    #[allow(clippy::type_complexity)]
-    fn enable_tombstone_reconciliation(
-        engine: &Engine,
-    ) -> (
-        Arc<Mutex<crate::tombstone::TombstoneLog>>,
-        Arc<Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
-        TempDir,
-    ) {
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
-        let log = Arc::new(Mutex::new(
-            crate::tombstone::TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap(),
-        ));
-        let dir = TempDir::new().unwrap();
-        let idx = Arc::new(Mutex::new(
-            crate::index::redb_tombstone::RedbTombstoneIndex::open(
-                &dir.path().join("tombstone.redb"),
-                16 * 1024 * 1024,
-            )
-            .unwrap(),
-        ));
-        engine.set_tombstone_log(log.clone());
-        engine.set_tombstone_index(idx.clone());
-        engine.set_tombstone_reconciliation_enabled(true);
-        (log, idx, dir)
-    }
-
     /// Construct a txid whose shard (low 12 bits of txid[0..2]) equals `shard`.
     fn txid_for_shard(shard: u16, salt: u8) -> [u8; 32] {
         let mut txid = [0u8; 32];
@@ -16010,28 +16224,23 @@ mod tests {
         assert_eq!(entries[0].sequence, range.0);
     }
 
-    /// C-1: the exclusive visibility barrier serializes client reads
-    /// against the *local apply window* — a reader blocks while the
-    /// mutation handler holds the exclusive guard (during apply + redo
-    /// durability) and proceeds the instant it is released. After C-1 the
-    /// barrier is released *before* the replication round-trip, so this
-    /// test pins the local-apply portion of the contract (the no-torn-read
-    /// invariant) AND that `MutationBarrier::release` actually drops the
-    /// lock. The separate
-    /// `c1_barrier_released_before_replication_network_io` test pins that
-    /// the barrier is NOT held across the replication network RTT.
+    /// Per-key visibility: a client read of key K blocks while a mutation of K
+    /// holds the per-key write guard (the local apply window — no torn batch
+    /// observed) and proceeds the instant it is released. This is the
+    /// finer-grained replacement for the old global-barrier reader-blocking
+    /// test; cross-key concurrency (the throughput win) is pinned by the
+    /// `crate::visibility` primitive tests.
     #[test]
     fn reader_blocks_during_local_apply_window() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let engine = Arc::new(DispatchTestHarness::new().engine);
         let reader_engine = Arc::clone(&engine);
-        let mut mutation_guard =
-            acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH, 0);
-        assert!(
-            mutation_guard.is_some(),
-            "mutation op should acquire the visibility barrier",
-        );
+        let key = TxKey { txid: [0xAB; 32] };
+
+        // Hold the per-key mutation visibility for `key` (apply window).
+        let mutation_guard = engine.visibility().mutation(std::slice::from_ref(&key));
+
         let reader_entered = Arc::new(AtomicBool::new(false));
         let reader_finished = Arc::new(AtomicBool::new(false));
         let reader_entered_thread = Arc::clone(&reader_entered);
@@ -16039,9 +16248,10 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             reader_entered_thread.store(true, Ordering::SeqCst);
-            let _read_guard =
-                acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH, 0)
-                    .expect("read op should acquire the visibility barrier");
+            // A read of the SAME key must block on the mutation's per-key write.
+            let _read_guard = reader_engine
+                .visibility()
+                .read(std::slice::from_ref(&TxKey { txid: [0xAB; 32] }));
             reader_finished_thread.store(true, Ordering::SeqCst);
         });
 
@@ -16051,20 +16261,15 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         assert!(
             !reader_finished.load(Ordering::SeqCst),
-            "client reads must block while the mutation holds the exclusive \
-             barrier (local apply window) so no torn batch is observed"
+            "a read of the mutated key must block during its apply window so no \
+             torn batch is observed"
         );
 
-        // Releasing via the MutationBarrier handle (the C-1 early-release
-        // path) must unblock the reader exactly as dropping the whole guard
-        // does — proving `MutationBarrier::release`/drop releases the lock.
-        let barrier = mutation_barrier_from(&mut mutation_guard)
-            .expect("exclusive op yields a releasable MutationBarrier");
-        drop(barrier);
+        drop(mutation_guard);
         handle.join().expect("reader thread joins");
         assert!(
             reader_finished.load(Ordering::SeqCst),
-            "reader proceeds the instant the exclusive barrier is released"
+            "reader proceeds the instant the per-key mutation guard is released"
         );
     }
 
@@ -16589,6 +16794,69 @@ mod tests {
         assert_eq!(plan.addr_nodes.get(&n2_addr), Some(&n2));
         assert_eq!(plan.addr_nodes.get(&n3_addr), Some(&n3));
         assert!(!plan.addr_nodes.contains_key(&n1_addr));
+    }
+
+    /// The per-mutation replication intent (a durable fsync on the hot write
+    /// path) is gated by `replication_active`: skipped at RF<=1 with no
+    /// migration (no replicas to ACK), kept when RF>1 or a migration dual-write
+    /// window is open. This is the order-of-magnitude single-node write fix.
+    #[test]
+    fn replication_active_gates_intent_on_real_replica_targets() {
+        use crate::cluster::coordinator::new_test_running_cluster;
+        use crate::cluster::shards::{NodeId, ShardTable};
+
+        // No cluster at all -> never active.
+        assert!(!replication_active(None));
+
+        let n1 = NodeId(1);
+        let n2 = NodeId(2);
+        let n3 = NodeId(3);
+        let a1: SocketAddr = "127.0.0.1:18901".parse().unwrap();
+        let a2: SocketAddr = "127.0.0.1:18902".parse().unwrap();
+        let a3: SocketAddr = "127.0.0.1:18903".parse().unwrap();
+        let members = vec![n1, n2, n3];
+
+        // RF = 1, idle: no replicas, no migration -> intent skipped.
+        let table_rf1 = ShardTable::compute_with_epoch(&members, 1, 220, 1);
+        let rf1 = new_test_running_cluster(
+            n1,
+            table_rf1,
+            &[(n1, a1), (n2, a2), (n3, a3)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        assert!(
+            !replication_active(Some(&rf1)),
+            "RF=1 idle: no replica targets, intent must be skipped"
+        );
+
+        // RF = 2: real replica targets -> intent needed.
+        let table_rf2 = ShardTable::compute_with_epoch(&members, 2, 221, 1);
+        let rf2 = new_test_running_cluster(
+            n1,
+            table_rf2,
+            &[(n1, a1), (n2, a2), (n3, a3)],
+            &members,
+            &[],
+            &[],
+            &[],
+            3,
+        );
+        assert!(
+            replication_active(Some(&rf2)),
+            "RF>1: real replicas, intent required"
+        );
+
+        // RF = 1 but a migration dual-write window is open -> intent needed
+        // (the dual-write destination must observe the write durably).
+        rf1.test_open_dual_write_window(0, n3);
+        assert!(
+            replication_active(Some(&rf1)),
+            "RF=1 + migration dual-write window: intent required"
+        );
     }
 
     /// Phase E: outside an active migration, the dual-write window is empty
@@ -17265,6 +17533,31 @@ mod tests {
     }
 
     #[test]
+    fn delete_batch_manages_own_fine_grained_visibility() {
+        // Async-delete fix: OP_DELETE_BATCH was moved into
+        // `manages_own_visibility`, so `handle_request` must take NO coarse
+        // guard for it (the handler acquires per-key `visibility().mutation`
+        // itself). Pre-fix delete took the coarse global EXCLUSIVE barrier,
+        // serializing every delete against all reads/mutations. A COLD mutation
+        // (OP_FREEZE_BATCH) still takes the exclusive guard — the contrast that
+        // proves delete is genuinely on the fine-grained path now.
+        assert!(
+            manages_own_visibility(OP_DELETE_BATCH),
+            "delete must manage its own per-key visibility"
+        );
+        let engine = Arc::new(DispatchTestHarness::new().engine);
+        assert!(
+            acquire_dispatch_visibility_guard(engine.as_ref(), OP_DELETE_BATCH, 0).is_none(),
+            "delete must take no coarse dispatch visibility guard"
+        );
+        let cold = acquire_dispatch_visibility_guard(engine.as_ref(), OP_FREEZE_BATCH, 0);
+        assert!(
+            matches!(cold, Some(DispatchVisibilityGuard::Exclusive(_))),
+            "a cold mutation still takes the coarse exclusive guard"
+        );
+    }
+
+    #[test]
     fn c1_barrier_released_before_replication_network_io() {
         // C-1: a mutation whose replication RTT is slow must NOT hold the
         // engine-wide exclusive visibility barrier across the network round-
@@ -17287,7 +17580,11 @@ mod tests {
         let engine = Arc::new(DispatchTestHarness::new().engine);
         let reader_engine = Arc::clone(&engine);
 
-        let mut guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_SPEND_BATCH, 0);
+        // A COLD mutation op (OP_FREEZE_BATCH) still takes the coarse global
+        // exclusive barrier + the releasable MutationBarrier — the C-1
+        // early-release mechanism under test. (Hot ops like spend now
+        // self-manage per-key visibility and don't use this path.)
+        let mut guard = acquire_dispatch_visibility_guard(engine.as_ref(), OP_FREEZE_BATCH, 0);
         let barrier = mutation_barrier_from(&mut guard)
             .expect("exclusive op yields a releasable MutationBarrier");
 
@@ -17303,8 +17600,9 @@ mod tests {
             // the fix).
             loop {
                 if let Some(t0) = *started_thread.lock() {
-                    let _read_guard =
-                        acquire_dispatch_visibility_guard(reader_engine.as_ref(), OP_GET_BATCH, 0);
+                    // The global SHARED side a client read takes — blocked by the
+                    // cold mutation's global exclusive until it is released.
+                    let _read_guard = reader_engine.acquire_dispatch_visibility_guard();
                     reader_wait_thread.store(t0.elapsed().as_millis() as u64, Ordering::SeqCst);
                     return;
                 }
@@ -17566,12 +17864,14 @@ mod tests {
             matches!(second_migration, DispatchVisibilityGuard::Shared(_)),
             "a second concurrent migration apply also takes the SHARED guard",
         );
-        let concurrent_read = acquire_dispatch_visibility_guard(engine.as_ref(), OP_GET_BATCH, 0)
-            .expect("read takes a visibility barrier");
-        assert!(
-            matches!(concurrent_read, DispatchVisibilityGuard::Shared(_)),
-            "a client read runs concurrently with migration applies (no starvation)",
-        );
+        // A client read self-manages per-key visibility, which takes the global
+        // SHARED side — so it acquires immediately alongside the migration
+        // applies (also shared), proving no starvation. (Acquiring here without
+        // blocking IS the assertion; the global shared side cannot block on
+        // another shared holder.)
+        let concurrent_read = engine
+            .visibility()
+            .read(std::slice::from_ref(&TxKey { txid: [0x5A; 32] }));
         drop(concurrent_read);
         drop(second_migration);
         drop(migration_guard);
@@ -17592,8 +17892,11 @@ mod tests {
         let finished_t = Arc::clone(&finished);
         let blocked = std::thread::spawn(move || {
             entered_t.store(true, Ordering::SeqCst);
-            let _g = acquire_dispatch_visibility_guard(blocked_engine.as_ref(), OP_SPEND_BATCH, 0)
-                .expect("mutation takes a visibility barrier");
+            // A COLD mutation (OP_FREEZE_BATCH) takes the global exclusive side,
+            // which the normal replica batch's exclusive guard blocks. (Hot ops
+            // self-manage per-key and would not contend on the global here.)
+            let _g = acquire_dispatch_visibility_guard(blocked_engine.as_ref(), OP_FREEZE_BATCH, 0)
+                .expect("cold mutation takes the global visibility barrier");
             finished_t.store(true, Ordering::SeqCst);
         });
         while !entered.load(Ordering::SeqCst) {
@@ -18374,1045 +18677,6 @@ mod tests {
         assert_eq!(h.engine.shard_record_count(shard), 1);
         assert!(h.engine.read_metadata(&key_a).is_ok());
         assert!(h.engine.read_metadata(&TxKey { txid: txid_b }).is_err());
-    }
-
-    /// Build a single-node committed-master cluster at `epoch` with `shard`
-    /// registered inbound — the standard fixture for the reconciliation tests.
-    fn reconcile_test_cluster(
-        shard: u16,
-        epoch: u64,
-    ) -> crate::cluster::coordinator::RunningCluster {
-        let members = vec![crate::cluster::shards::NodeId(1)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
-        crate::cluster::coordinator::new_test_running_cluster(
-            crate::cluster::shards::NodeId(1),
-            table,
-            &[(
-                crate::cluster::shards::NodeId(1),
-                "127.0.0.1:4709".parse().unwrap(),
-            )],
-            &members,
-            &[shard],
-            &[],
-            &[],
-            1,
-        )
-    }
-
-    /// Phase 8 (§7), flag ON. The rejoinee holds three extra-vs-live-manifest
-    /// keys: LIVE (in the source manifest), TOMBSTONED (in the source tombstone
-    /// section), and NEVER-RECEIVED (in neither). After a current-epoch
-    /// authoritative completion: the live key is kept, the tombstoned key is
-    /// DROPPED (and the rejoinee records the learned tombstone — pre-arm), and
-    /// the never-received key is RETAINED (transferred up, no-loss).
-    #[test]
-    fn migration_complete_reconcile_drops_tombstoned_keeps_live_retains_never_received() {
-        let h = DispatchTestHarness::new();
-        let (_log, idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 41u16;
-        let txid_live = txid_for_shard(shard, 1);
-        let txid_tomb = txid_for_shard(shard, 2);
-        let txid_never = txid_for_shard(shard, 3);
-        assert_eq!(h.create_tx(txid_live, 1).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_tomb, 1).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_never, 1).status, STATUS_OK);
-
-        let key_live = TxKey { txid: txid_live };
-        let key_tomb = TxKey { txid: txid_tomb };
-        let key_never = TxKey { txid: txid_never };
-        let gen_live = h.engine.read_metadata(&key_live).unwrap().generation;
-        let gen_tomb = h.engine.read_metadata(&key_tomb).unwrap().generation;
-
-        let epoch = 50u64;
-        let cluster = reconcile_test_cluster(shard, epoch);
-
-        // Source live manifest = {live}. Source tombstones = {(tomb, gen >= local)}.
-        let live_entries = vec![(key_live, gen_live)];
-        let mut payload = build_migration_complete_payload(
-            live_entries.len() as u64,
-            0,
-            epoch,
-            None,
-            Some(&live_entries),
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut payload, &[(key_tomb, gen_tomb)]);
-        let req = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: FLAG_MIGRATION_TOMBSTONES,
-            payload: payload.into(),
-        };
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &req,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-
-        assert_eq!(resp.status, STATUS_OK);
-        assert_eq!(cluster.inbound_pending_count(), 0, "commit clears inbound");
-        // Live: kept. Tombstoned: dropped. Never-received: retained (transfer).
-        assert!(h.engine.read_metadata(&key_live).is_ok(), "live key kept");
-        assert!(
-            h.engine.read_metadata(&key_tomb).is_err(),
-            "tombstoned key dropped (no resurrection)"
-        );
-        assert!(
-            h.engine.read_metadata(&key_never).is_ok(),
-            "never-received key retained for transfer (no-loss)"
-        );
-        // The rejoinee recorded the learned tombstone for the dropped key.
-        assert!(
-            idx.lock().is_tombstoned(&key_tomb),
-            "rejoinee records the learned tombstone (pre-arm self-purge)"
-        );
-        assert!(
-            !idx.lock().is_tombstoned(&key_never),
-            "never-received key is NOT tombstoned"
-        );
-    }
-
-    /// Phase 8 no-resurrection: a key tombstoned by the source is DROPPED on the
-    /// rejoinee, so it can never be in the set the rejoinee would push up to the
-    /// master. The drop is the mechanism that keeps the deleted UTXO from coming
-    /// back. (The transfer-up set is exactly the post-reconcile live keys; the
-    /// dropped key is absent from it.)
-    #[test]
-    fn migration_complete_reconcile_no_resurrection_tombstoned_not_in_transfer_set() {
-        let h = DispatchTestHarness::new();
-        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 42u16;
-        let txid_tomb = txid_for_shard(shard, 5);
-        assert_eq!(h.create_tx(txid_tomb, 1).status, STATUS_OK);
-        let key_tomb = TxKey { txid: txid_tomb };
-        let gen_tomb = h.engine.read_metadata(&key_tomb).unwrap().generation;
-
-        let epoch = 51u64;
-        let cluster = reconcile_test_cluster(shard, epoch);
-
-        // Source live = {} (no exact entries), tombstone for the only local key.
-        let mut payload = build_migration_complete_payload(
-            0,
-            0,
-            epoch,
-            None,
-            None,
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut payload, &[(key_tomb, gen_tomb)]);
-
-        let req = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: FLAG_MIGRATION_TOMBSTONES,
-            payload: payload.into(),
-        };
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &req,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-
-        assert_eq!(resp.status, STATUS_OK);
-        // The tombstoned key is gone — never available to push up.
-        assert!(
-            h.engine.read_metadata(&key_tomb).is_err(),
-            "tombstoned key dropped → never resurrected/pushed up"
-        );
-        let transfer_set = h.engine.keys_for_shard(shard);
-        assert!(
-            !transfer_set.contains(&key_tomb),
-            "tombstoned key absent from the transfer-up set"
-        );
-    }
-
-    /// Phase 8 no-loss: an extra local key with NO tombstone from the source
-    /// (and not in the live manifest) is NOT dropped — it is retained for the
-    /// transfer-up path. This is the case that would be DATA LOSS if the §7
-    /// path ever dropped a never-received key.
-    #[test]
-    fn migration_complete_reconcile_no_loss_never_received_retained() {
-        let h = DispatchTestHarness::new();
-        let (_log, idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 43u16;
-        let txid_live = txid_for_shard(shard, 7);
-        let txid_never = txid_for_shard(shard, 8);
-        assert_eq!(h.create_tx(txid_live, 1).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_never, 1).status, STATUS_OK);
-        let key_live = TxKey { txid: txid_live };
-        let key_never = TxKey { txid: txid_never };
-        let gen_live = h.engine.read_metadata(&key_live).unwrap().generation;
-
-        let epoch = 52u64;
-        let cluster = reconcile_test_cluster(shard, epoch);
-
-        // Source: live = {live}, tombstones = {} (empty section). The never key
-        // is in neither → must be retained (transfer).
-        let live_entries = vec![(key_live, gen_live)];
-        let mut payload = build_migration_complete_payload(
-            live_entries.len() as u64,
-            0,
-            epoch,
-            None,
-            Some(&live_entries),
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut payload, &[]);
-        let req = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: FLAG_MIGRATION_TOMBSTONES,
-            payload: payload.into(),
-        };
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &req,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-
-        assert_eq!(resp.status, STATUS_OK);
-        assert!(h.engine.read_metadata(&key_live).is_ok(), "live kept");
-        assert!(
-            h.engine.read_metadata(&key_never).is_ok(),
-            "never-received key with no tombstone retained (no-loss)"
-        );
-        assert!(
-            !idx.lock().is_tombstoned(&key_never),
-            "no tombstone manufactured for the never-received key"
-        );
-    }
-
-    /// Phase 8 §8.4: a tombstone for an OLDER generation does NOT drop a newer
-    /// local re-creation. The local key is at gen N; the source tombstones it at
-    /// gen N-1 → KEEP (the local copy is newer).
-    #[test]
-    fn migration_complete_reconcile_older_tombstone_keeps_newer_recreation() {
-        let h = DispatchTestHarness::new();
-        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 44u16;
-        let txid = txid_for_shard(shard, 9);
-        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
-        let key = TxKey { txid };
-        // Bump the record's generation past 0 via a set-mined mutation so we can
-        // present a STRICTLY-OLDER tombstone generation below.
-        h.engine
-            .set_mined(&crate::ops::set_mined::SetMinedRequest {
-                tx_key: key,
-                block_id: 1,
-                block_height: 10,
-                subtree_idx: 0,
-                current_block_height: 10,
-                block_height_retention: 100,
-                on_longest_chain: true,
-                unset_mined: false,
-            })
-            .unwrap();
-        let local_gen = h.engine.read_metadata(&key).unwrap().generation;
-        assert!(local_gen >= 1, "set-mined bumps generation >= 1");
-
-        let epoch = 53u64;
-        let cluster = reconcile_test_cluster(shard, epoch);
-
-        // Source live = {} (empty manifest, no entries), tombstone at older gen.
-        let mut payload = build_migration_complete_payload(
-            0,
-            0,
-            epoch,
-            None,
-            None,
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut payload, &[(key, local_gen - 1)]);
-        let req = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: FLAG_MIGRATION_TOMBSTONES,
-            payload: payload.into(),
-        };
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &req,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-
-        assert_eq!(resp.status, STATUS_OK);
-        assert!(
-            h.engine.read_metadata(&key).is_ok(),
-            "newer local re-creation kept despite older tombstone (§8.4)"
-        );
-    }
-
-    /// Phase 8 OFF-PATH byte-identical proof: with `tombstone_reconciliation_enabled`
-    /// FALSE (default), an authoritative current-epoch completion still prunes the
-    /// extra local key exactly as the #29 path does — IDENTICAL to
-    /// `migration_complete_exact_entries_prune_extra_local_records`. Even a frame
-    /// that carries a tombstone section + flag is IGNORED off-path (the section is
-    /// never decoded), so the tombstoned key is pruned by #29 like any other extra.
-    #[test]
-    fn migration_complete_reconcile_off_path_is_hash29_behavior() {
-        let h = DispatchTestHarness::new();
-        // Attach tombstone storage but leave reconciliation DISABLED (default).
-        // (We do NOT call enable_tombstone_reconciliation; reconciliation stays
-        // off, so the #29 path runs verbatim.)
-        assert!(
-            !h.engine.tombstone_reconciliation_enabled(),
-            "reconciliation is OFF by default"
-        );
-        let shard = 45u16;
-        let txid_a = txid_for_shard(shard, 7);
-        let txid_b = txid_for_shard(shard, 8);
-        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_b, 1).status, STATUS_OK);
-        let key_a = TxKey { txid: txid_a };
-        let key_b = TxKey { txid: txid_b };
-        let gen_a = h.engine.read_metadata(&key_a).unwrap().generation;
-        let gen_b = h.engine.read_metadata(&key_b).unwrap().generation;
-
-        let epoch = 49u64;
-        let cluster = reconcile_test_cluster(shard, epoch);
-
-        // Even with a tombstone section + flag on the frame, the off-path
-        // ignores it: B (the extra) is pruned by #29, NOT spared, and no
-        // tombstone-driven decision runs.
-        let entries = vec![(key_a, gen_a)];
-        let mut payload = build_migration_complete_payload(
-            1,
-            0,
-            epoch,
-            None,
-            Some(&entries),
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut payload, &[(key_b, gen_b)]);
-        let req = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: FLAG_MIGRATION_TOMBSTONES,
-            payload: payload.into(),
-        };
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &req,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-
-        assert_eq!(resp.status, STATUS_OK);
-        assert_eq!(cluster.inbound_pending_count(), 0);
-        assert_eq!(h.engine.shard_record_count(shard), 1);
-        assert!(h.engine.read_metadata(&key_a).is_ok());
-        // Off-path: B pruned by #29 (identical to the prune test), NOT spared by
-        // any tombstone logic.
-        assert!(h.engine.read_metadata(&key_b).is_err());
-    }
-
-    /// Phase 8 §9.1 #1 (multi-source UNION) at the handler level. Two sources
-    /// stream the same shard. Source X (NodeId(1)) TOMBSTONES key K; source Y
-    /// (NodeId(2)) holds K LIVE. The drop is deferred to the commit gate and
-    /// evaluated against the UNION: K is live on Y → KEPT, even though X
-    /// tombstoned it. The commit only fires after BOTH completions.
-    #[test]
-    fn migration_complete_reconcile_multi_source_union_keeps_key_live_on_other_source() {
-        let h = DispatchTestHarness::new();
-        let (_log, idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 46u16;
-        let txid_k = txid_for_shard(shard, 1);
-        let txid_y_only = txid_for_shard(shard, 2);
-        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_y_only, 1).status, STATUS_OK);
-        let key_k = TxKey { txid: txid_k };
-        let key_y = TxKey { txid: txid_y_only };
-        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
-        let gen_y = h.engine.read_metadata(&key_y).unwrap().generation;
-
-        // Single-node committed master, NO inbound preregistered; register TWO
-        // sources for the shard so the commit gate requires both completions.
-        let epoch = 54u64;
-        let members = vec![crate::cluster::shards::NodeId(1)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
-        let cluster = crate::cluster::coordinator::new_test_running_cluster(
-            crate::cluster::shards::NodeId(1),
-            table,
-            &[(
-                crate::cluster::shards::NodeId(1),
-                "127.0.0.1:4710".parse().unwrap(),
-            )],
-            &members,
-            &[],
-            &[],
-            &[],
-            1,
-        );
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(1));
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
-
-        let mut conn_state = crate::server::ConnectionState::new();
-
-        // Completion #1 from X (NodeId(1)): live = {} , tombstone = {(K, gen_k)}.
-        let mut payload_x = build_migration_complete_payload(
-            0,
-            0,
-            epoch,
-            None,
-            None,
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut payload_x, &[(key_k, gen_k)]);
-        let req_x = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: FLAG_MIGRATION_TOMBSTONES,
-            payload: payload_x.into(),
-        };
-        let resp_x = handle_request(
-            &req_x,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(resp_x.status, STATUS_OK);
-        // Not committed yet — Y is still pending; K must NOT have been dropped.
-        assert!(
-            cluster.has_pending_inbound_shard(shard),
-            "still pending Y after X's completion"
-        );
-        assert!(
-            h.engine.read_metadata(&key_k).is_ok(),
-            "K not dropped before commit gate (union deferred)"
-        );
-
-        // Completion #2 from Y (NodeId(2)): live = {K, Y}, no tombstones.
-        let live_y = vec![(key_k, gen_k), (key_y, gen_y)];
-        let mut payload_y = build_migration_complete_payload(
-            live_y.len() as u64,
-            0,
-            epoch,
-            None,
-            Some(&live_y),
-            Some(crate::cluster::shards::NodeId(2)),
-        );
-        append_test_tombstone_section(&mut payload_y, &[]);
-        let req_y = RequestFrame {
-            request_id: shard as u64,
-            op_code: OP_MIGRATION_COMPLETE,
-            flags: FLAG_MIGRATION_TOMBSTONES,
-            payload: payload_y.into(),
-        };
-        let resp_y = handle_request(
-            &req_y,
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(resp_y.status, STATUS_OK);
-        assert_eq!(
-            cluster.inbound_pending_count(),
-            0,
-            "both sources done → committed"
-        );
-
-        // UNION result: K is live on Y → KEPT despite X's tombstone. Y kept too.
-        assert!(
-            h.engine.read_metadata(&key_k).is_ok(),
-            "K kept — live on a concurrent source wins over another's tombstone"
-        );
-        assert!(h.engine.read_metadata(&key_y).is_ok(), "Y kept (live)");
-        assert!(
-            !idx.lock().is_tombstoned(&key_k),
-            "K not tombstoned on the rejoinee (it was kept)"
-        );
-    }
-
-    /// Phase 8 §9.1 #1 (multi-source UNION) — the DROP case. Source X
-    /// tombstones K; source Y OMITS K entirely (never-received-by-Y). No source
-    /// has K live, X tombstones it at gen >= local → K is DROPPED at the commit
-    /// gate.
-    #[test]
-    fn migration_complete_reconcile_multi_source_union_drops_when_no_source_live() {
-        let h = DispatchTestHarness::new();
-        let (_log, idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 47u16;
-        let txid_k = txid_for_shard(shard, 3);
-        let txid_y = txid_for_shard(shard, 4);
-        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_y, 1).status, STATUS_OK);
-        let key_k = TxKey { txid: txid_k };
-        let key_y = TxKey { txid: txid_y };
-        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
-        let gen_y = h.engine.read_metadata(&key_y).unwrap().generation;
-
-        let epoch = 55u64;
-        let members = vec![crate::cluster::shards::NodeId(1)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
-        let cluster = crate::cluster::coordinator::new_test_running_cluster(
-            crate::cluster::shards::NodeId(1),
-            table,
-            &[(
-                crate::cluster::shards::NodeId(1),
-                "127.0.0.1:4711".parse().unwrap(),
-            )],
-            &members,
-            &[],
-            &[],
-            &[],
-            1,
-        );
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(1));
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
-
-        let mut conn_state = crate::server::ConnectionState::new();
-
-        // X: tombstone K, no live.
-        let mut px = build_migration_complete_payload(0, 0, epoch, None, None, Some(NodeId(1)));
-        append_test_tombstone_section(&mut px, &[(key_k, gen_k)]);
-        let rx = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: FLAG_MIGRATION_TOMBSTONES,
-                payload: px.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(rx.status, STATUS_OK);
-
-        // Y: live = {Y} only (omits K), no tombstones.
-        let live_y = vec![(key_y, gen_y)];
-        let mut py = build_migration_complete_payload(
-            live_y.len() as u64,
-            0,
-            epoch,
-            None,
-            Some(&live_y),
-            Some(NodeId(2)),
-        );
-        append_test_tombstone_section(&mut py, &[]);
-        let ry = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: FLAG_MIGRATION_TOMBSTONES,
-                payload: py.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(ry.status, STATUS_OK);
-        assert_eq!(cluster.inbound_pending_count(), 0);
-
-        // No source has K live; X tombstones it → K DROPPED. Y kept (live).
-        assert!(
-            h.engine.read_metadata(&key_k).is_err(),
-            "K dropped — tombstoned by X, live on no source"
-        );
-        assert!(h.engine.read_metadata(&key_y).is_ok(), "Y kept (live on Y)");
-        assert!(
-            idx.lock().is_tombstoned(&key_k),
-            "learned tombstone recorded for dropped K"
-        );
-    }
-
-    /// BUG2: a WITHIN-SLACK (migration_epoch == table.version - 1, admitted by
-    /// the 2-epoch slack but NOT epoch-current) source holding key K LIVE must
-    /// contribute K to the union so a concurrent CURRENT-epoch source that
-    /// tombstones K does NOT wrongly Drop it. Before the fix, the within-slack
-    /// source cleared its inbound bit WITHOUT being accumulated, so the union
-    /// saw only `{tomb K}` and Dropped a live K (loss + resurrection).
-    #[test]
-    fn migration_complete_reconcile_within_slack_live_source_keeps_key() {
-        let h = DispatchTestHarness::new();
-        let (_log, idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 60u16;
-        let txid_k = txid_for_shard(shard, 1);
-        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
-        let key_k = TxKey { txid: txid_k };
-        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
-
-        // This node is the committed target master at table version = epoch.
-        let epoch = 70u64;
-        let members = vec![crate::cluster::shards::NodeId(1)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
-        let cluster = crate::cluster::coordinator::new_test_running_cluster(
-            crate::cluster::shards::NodeId(1),
-            table,
-            &[(
-                crate::cluster::shards::NodeId(1),
-                "127.0.0.1:4720".parse().unwrap(),
-            )],
-            &members,
-            &[],
-            &[],
-            &[],
-            1,
-        );
-        // Two pending sources: X (current-epoch, tombstones K) and Y
-        // (within-slack epoch-1, holds K live).
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(1));
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
-        let mut conn_state = crate::server::ConnectionState::new();
-
-        // Completion X (NodeId(1)) at the CURRENT epoch: tombstones K, no live.
-        let mut px = build_migration_complete_payload(
-            0,
-            0,
-            epoch,
-            None,
-            None,
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut px, &[(key_k, gen_k)]);
-        let rx = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: FLAG_MIGRATION_TOMBSTONES,
-                payload: px.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(rx.status, STATUS_OK);
-        assert!(cluster.has_pending_inbound_shard(shard), "Y still pending");
-
-        // Completion Y (NodeId(2)) at the WITHIN-SLACK epoch (epoch - 1): holds
-        // K live, no tombstones. Not epoch-current, but must still contribute
-        // its live set to the union.
-        let live_y = vec![(key_k, gen_k)];
-        let mut py = build_migration_complete_payload(
-            live_y.len() as u64,
-            0,
-            epoch - 1,
-            None,
-            Some(&live_y),
-            Some(crate::cluster::shards::NodeId(2)),
-        );
-        append_test_tombstone_section(&mut py, &[]);
-        let ry = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: FLAG_MIGRATION_TOMBSTONES,
-                payload: py.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(ry.status, STATUS_OK);
-        assert_eq!(cluster.inbound_pending_count(), 0, "both done → committed");
-
-        // The union saw K live on the within-slack source → K KEPT, not Dropped.
-        assert!(
-            h.engine.read_metadata(&key_k).is_ok(),
-            "K kept — live on the within-slack source (no loss, no resurrection)"
-        );
-        assert!(
-            !idx.lock().is_tombstoned(&key_k),
-            "K not tombstoned on the rejoinee (it was kept)"
-        );
-    }
-
-    /// BUG3: with reconciliation ENABLED, an authoritative-complete source that
-    /// ships NO tombstone section (reconcile_active=false for ITS frame) must
-    /// NOT trigger the #29 whole-shard prune — a legit-extra LIVE key survives.
-    /// Before the fix, the prune was gated per-frame on `reconcile_active`, so
-    /// this frame ran #29 and deleted the extra (writing a tombstone →
-    /// cluster-wide loss). The whole-shard prune is now gated on
-    /// `!tombstone_reconciliation_enabled()`.
-    #[test]
-    fn migration_complete_reconcile_enabled_no_tombstone_section_does_not_prune_extra() {
-        let h = DispatchTestHarness::new();
-        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 61u16;
-        let txid_a = txid_for_shard(shard, 1); // in the manifest
-        let txid_extra = txid_for_shard(shard, 2); // legit-extra, omitted
-        assert_eq!(h.create_tx(txid_a, 1).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_extra, 1).status, STATUS_OK);
-        let key_a = TxKey { txid: txid_a };
-        let key_extra = TxKey { txid: txid_extra };
-        let gen_a = h.engine.read_metadata(&key_a).unwrap().generation;
-
-        let epoch = 71u64;
-        let cluster = reconcile_test_cluster(shard, epoch);
-
-        // Authoritative-complete source: exact entries = {A}, NO tombstone
-        // section on the frame (so its frame is NOT reconcile_active).
-        let entries = vec![(key_a, gen_a)];
-        let payload = build_migration_complete_payload(
-            1,
-            0,
-            epoch,
-            None,
-            Some(&entries),
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        // NO append_test_tombstone_section, NO FLAG_MIGRATION_TOMBSTONES.
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: 0,
-                payload: payload.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(resp.status, STATUS_OK);
-        // The extra LIVE key SURVIVES — the #29 whole-shard prune was suppressed
-        // because reconciliation is enabled.
-        assert!(
-            h.engine.read_metadata(&key_a).is_ok(),
-            "manifest key A kept"
-        );
-        assert!(
-            h.engine.read_metadata(&key_extra).is_ok(),
-            "legit-extra LIVE key survives (no #29 prune under reconciliation)"
-        );
-    }
-
-    /// BUG4 (c): a NON-MASTER (replica) target must NOT accumulate reconcile
-    /// manifests — it never applies the union (the commit gate requires this
-    /// node be the target master), so accumulating there would only leak.
-    #[test]
-    fn migration_complete_reconcile_non_master_target_does_not_accumulate() {
-        let h = DispatchTestHarness::new();
-        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        // 2-node table; pick a shard whose TARGET MASTER is NodeId(2) so this
-        // node (NodeId(1)) is a non-master target for it.
-        let epoch = 72u64;
-        let members = vec![
-            crate::cluster::shards::NodeId(1),
-            crate::cluster::shards::NodeId(2),
-        ];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
-        let shard = (0u16..crate::cluster::shards::NUM_SHARDS as u16)
-            .find(|s| table.target_assignment(*s).master == crate::cluster::shards::NodeId(2))
-            .expect("some shard mastered by NodeId(2)");
-        let txid_k = txid_for_shard(shard, 1);
-        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
-        let key_k = TxKey { txid: txid_k };
-        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
-
-        let cluster = crate::cluster::coordinator::new_test_running_cluster(
-            crate::cluster::shards::NodeId(1),
-            table,
-            &[
-                (
-                    crate::cluster::shards::NodeId(1),
-                    "127.0.0.1:4721".parse().unwrap(),
-                ),
-                (
-                    crate::cluster::shards::NodeId(2),
-                    "127.0.0.1:4722".parse().unwrap(),
-                ),
-            ],
-            &members,
-            &[],
-            &[],
-            &[],
-            2,
-        );
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
-
-        // A current-epoch completion with a tombstone section arrives at this
-        // non-master target.
-        let mut payload = build_migration_complete_payload(
-            0,
-            0,
-            epoch,
-            None,
-            None,
-            Some(crate::cluster::shards::NodeId(2)),
-        );
-        append_test_tombstone_section(&mut payload, &[(key_k, gen_k)]);
-        let mut conn_state = crate::server::ConnectionState::new();
-        let resp = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: FLAG_MIGRATION_TOMBSTONES,
-                payload: payload.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(resp.status, STATUS_OK);
-        // Non-master target: nothing accumulated (no leak), and no commit/drop.
-        assert_eq!(
-            cluster.reconcile_accumulator_len(shard),
-            0,
-            "non-master target does not accumulate (BUG4c)"
-        );
-        assert!(
-            h.engine.read_metadata(&key_k).is_ok(),
-            "non-master target never drops via the union"
-        );
-    }
-
-    /// BUG4 (a)+(b): a STALE-epoch accumulator entry's TOMBSTONES are discarded
-    /// at the commit gate (do not drive a drop), and the bulk inbound-clear
-    /// path drops accumulator entries (no leak). Here a current-epoch source
-    /// accumulates a tombstone for K; the cluster epoch then advances; at the
-    /// later-epoch commit the stale tombstone must NOT drop the now-live K.
-    #[test]
-    fn migration_complete_reconcile_stale_epoch_accumulator_entry_does_not_drop() {
-        use crate::tombstone::{ReconcileAction, classify_reconcile_union};
-        // Sanity: the union classifier keeps a key live on a source even with a
-        // tombstone present (defends the no-loss arm this test exercises).
-        assert_eq!(
-            classify_reconcile_union(5, true, Some(5)),
-            ReconcileAction::Keep
-        );
-
-        let h = DispatchTestHarness::new();
-        let (_log, _idx, _dir) = enable_tombstone_reconciliation(&h.engine);
-        let shard = 62u16;
-        let txid_k = txid_for_shard(shard, 1);
-        assert_eq!(h.create_tx(txid_k, 1).status, STATUS_OK);
-        let key_k = TxKey { txid: txid_k };
-        let gen_k = h.engine.read_metadata(&key_k).unwrap().generation;
-
-        // Committed master at epoch E; two pending sources so the first
-        // completion accumulates but does NOT commit.
-        let epoch = 80u64;
-        let members = vec![crate::cluster::shards::NodeId(1)];
-        let table = crate::cluster::shards::ShardTable::compute_with_epoch(&members, 1, epoch, 1);
-        let cluster = crate::cluster::coordinator::new_test_running_cluster(
-            crate::cluster::shards::NodeId(1),
-            table,
-            &[(
-                crate::cluster::shards::NodeId(1),
-                "127.0.0.1:4723".parse().unwrap(),
-            )],
-            &members,
-            &[],
-            &[],
-            &[],
-            1,
-        );
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(1));
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
-        let mut conn_state = crate::server::ConnectionState::new();
-
-        // Source X at epoch E tombstones K (accumulated, epoch-stamped E).
-        let mut px = build_migration_complete_payload(
-            0,
-            0,
-            epoch,
-            None,
-            None,
-            Some(crate::cluster::shards::NodeId(1)),
-        );
-        append_test_tombstone_section(&mut px, &[(key_k, gen_k)]);
-        let rx = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: FLAG_MIGRATION_TOMBSTONES,
-                payload: px.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(rx.status, STATUS_OK);
-        assert_eq!(
-            cluster.reconcile_accumulator_len(shard),
-            1,
-            "X's manifest accumulated (epoch-stamped E)"
-        );
-
-        // The cluster epoch ADVANCES (a new committed table version). The
-        // accumulated X entry is now STALE relative to the committed epoch.
-        // (Bump only `version`; assignments are unchanged so this node remains
-        // the shard's target master.)
-        cluster.shard_table().write().version = epoch + 1;
-
-        // Source Y completes at the NEW epoch holding K live → both sources done
-        // → commit fires. The stale E entry's tombstone must NOT drop K.
-        let live_y = vec![(key_k, gen_k)];
-        let mut py = build_migration_complete_payload(
-            live_y.len() as u64,
-            0,
-            epoch + 1,
-            None,
-            Some(&live_y),
-            Some(crate::cluster::shards::NodeId(2)),
-        );
-        append_test_tombstone_section(&mut py, &[]);
-        let ry = handle_request(
-            &RequestFrame {
-                request_id: shard as u64,
-                op_code: OP_MIGRATION_COMPLETE,
-                flags: FLAG_MIGRATION_TOMBSTONES,
-                payload: py.into(),
-            },
-            &h.engine,
-            8192,
-            Some(&cluster),
-            None,
-            &mut conn_state,
-            None,
-        );
-        assert_eq!(ry.status, STATUS_OK);
-        assert_eq!(cluster.inbound_pending_count(), 0, "both done → committed");
-        assert!(
-            h.engine.read_metadata(&key_k).is_ok(),
-            "K kept — stale-epoch tombstone discarded at commit (BUG4a), and K live on Y"
-        );
-    }
-
-    /// BUG4 (b): a NON-ABORT bulk inbound-clear path drops accumulator entries
-    /// (no leak). `mark_inbound_complete_all` clears the inbound bit without
-    /// routing through the commit union, so its accumulator entry must go too.
-    #[test]
-    fn reconcile_accumulator_cleared_on_mark_inbound_complete_all() {
-        let epoch = 90u64;
-        let shard = 63u16;
-        let cluster = reconcile_test_cluster(shard, epoch);
-        cluster.register_test_inbound_from_source(shard, crate::cluster::shards::NodeId(2));
-        let k = TxKey {
-            txid: txid_for_shard(shard, 1),
-        };
-        cluster.accumulate_reconcile_manifest(
-            shard,
-            crate::cluster::coordinator::SourceReconcileManifest {
-                live: vec![k],
-                tombstones: vec![],
-                epoch,
-            },
-        );
-        assert_eq!(cluster.reconcile_accumulator_len(shard), 1, "accumulated");
-        // A non-abort inbound-clear path.
-        cluster.mark_inbound_complete_all(shard);
-        assert_eq!(
-            cluster.reconcile_accumulator_len(shard),
-            0,
-            "accumulator cleared on mark_inbound_complete_all (no leak, BUG4b)"
-        );
-    }
-
-    /// Frame round-trip: `decode_tombstone_section` decodes what
-    /// `append_test_tombstone_section` produces; a flagless frame (no section
-    /// appended) decodes the rest exactly as today and returns `None` for the
-    /// section.
-    #[test]
-    fn tombstone_section_frame_round_trip_and_backcompat() {
-        let shard = 60u16;
-        let key1 = TxKey {
-            txid: txid_for_shard(shard, 1),
-        };
-        let key2 = TxKey {
-            txid: txid_for_shard(shard, 2),
-        };
-        let live = vec![(key1, 7u32)];
-        let tombs = vec![(key1, 11u32), (key2, 12u32)];
-
-        // With a section: offset = 60 + live*36 + 8.
-        let mut payload = build_migration_complete_payload(
-            live.len() as u64,
-            0,
-            5,
-            None,
-            Some(&live),
-            Some(NodeId(1)),
-        );
-        append_test_tombstone_section(&mut payload, &tombs);
-        let section_off = 60 + live.len() * 36 + 8;
-        let decoded = decode_tombstone_section(&payload, section_off).expect("section decodes");
-        assert_eq!(decoded, tombs, "round-trip preserves entries");
-
-        // Empty section round-trips to Some(vec![]) (authoritative "no tombstones").
-        let mut empty_payload = build_migration_complete_payload(
-            live.len() as u64,
-            0,
-            5,
-            None,
-            Some(&live),
-            Some(NodeId(1)),
-        );
-        append_test_tombstone_section(&mut empty_payload, &[]);
-        let decoded_empty =
-            decode_tombstone_section(&empty_payload, section_off).expect("empty section decodes");
-        assert!(decoded_empty.is_empty(), "empty section → Some(empty)");
-
-        // Back-compat: a flagless frame (no section appended) parses the rest
-        // exactly as today; decoding at the would-be section offset returns None
-        // (offset past end of payload).
-        let flagless = build_migration_complete_payload(
-            live.len() as u64,
-            0,
-            5,
-            None,
-            Some(&live),
-            Some(NodeId(1)),
-        );
-        assert_eq!(flagless.len(), section_off, "no trailing section bytes");
-        assert!(
-            decode_tombstone_section(&flagless, section_off).is_none(),
-            "flagless frame: no section to decode"
-        );
-        // The existing fields still decode from their fixed offsets.
-        assert_eq!(le_u64_at(&flagless, 0), Some(live.len() as u64));
-        assert_eq!(le_u32_at(&flagless, 56), Some(live.len() as u32));
     }
 
     /// Task #29 (no-loss): a SHORT manifest stamped with a SUPERSEDED epoch
@@ -21741,77 +21005,9 @@ mod tests {
         assert_eq!(after_fail - before_fail, 1, "freezes_failed += 1");
     }
 
-    /// Delete items should tick deletes_succeeded / deletes_failed per item.
-    #[test]
-    fn master_emit_delete_v2_when_tombstone_written() {
-        // Deletion-tombstone §6 master emit gating: a written tombstone →
-        // DeleteV2 carrying the exact fields; no tombstone → V1 Delete.
-        let k = TxKey { txid: [0x44; 32] };
-
-        let v2 = delete_replica_op_for(
-            k,
-            Some(crate::ops::engine::DeleteTombstoneInfo {
-                deletion_height: 700_222,
-                generation: 13,
-                cause: crate::tombstone::TombstoneCause::SpentDah,
-            }),
-        );
-        match v2 {
-            ReplicaOp::DeleteV2 {
-                tx_key,
-                deletion_height,
-                generation,
-                cause,
-            } => {
-                assert_eq!(tx_key, k);
-                assert_eq!(deletion_height, 700_222);
-                assert_eq!(generation, 13);
-                assert_eq!(cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
-            }
-            other => panic!("expected DeleteV2, got {other:?}"),
-        }
-
-        // tombstones disabled / no log → V1 Delete fallback.
-        let v1 = delete_replica_op_for(k, None);
-        assert_eq!(v1, ReplicaOp::Delete { tx_key: k });
-    }
-
-    #[test]
-    fn master_delete_writes_tombstone_end_to_end() {
-        // The full master delete-batch dispatch writes a tombstone when the
-        // feature is active — the precondition that makes the emit a DeleteV2.
-        let h = DispatchTestHarness::new();
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
-        let log = crate::tombstone::TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
-        let log = Arc::new(Mutex::new(log));
-        let dir = TempDir::new().unwrap();
-        let idx = crate::index::redb_tombstone::RedbTombstoneIndex::open(
-            &dir.path().join("tombstone.redb"),
-            16 * 1024 * 1024,
-        )
-        .unwrap();
-        let idx = Arc::new(Mutex::new(idx));
-        h.engine.set_tombstone_log(log.clone());
-        h.engine.set_tombstone_index(idx.clone());
-
-        let txid = DispatchTestHarness::make_txid(95);
-        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
-
-        let payload = encode_txid_batch(&[txid], &[]);
-        let resp = h.request(OP_DELETE_BATCH, payload);
-        assert_eq!(resp.status, STATUS_OK);
-
-        let k = TxKey { txid };
-        assert!(h.engine.lookup(&k).is_none(), "record removed");
-        assert!(
-            idx.lock().is_tombstoned(&k),
-            "master delete wrote a tombstone (DeleteV2 precondition)",
-        );
-        assert_eq!(log.lock().scan().unwrap().len(), 1);
-    }
-
     #[test]
     fn handle_delete_batch_ticks_outcome_counters() {
+        use crate::metrics::{OpCode, Outcome};
         let m = test_metrics();
         let _ = test_histograms();
 
@@ -21823,16 +21019,39 @@ mod tests {
         let payload = encode_txid_batch(&[txid_a, txid_missing], &[]);
         let before_succ = m.deletes_succeeded.get();
         let before_fail = m.deletes_failed.get();
+        let before_ok = m.operations.get(OpCode::Delete, Outcome::Ok);
+        let before_idem = m.operations.get(OpCode::Delete, Outcome::Idempotent);
         let resp = h.request(OP_DELETE_BATCH, payload);
         let after_succ = m.deletes_succeeded.get();
         let after_fail = m.deletes_failed.get();
-        assert_eq!(resp.status, STATUS_PARTIAL_ERROR);
+        let after_ok = m.operations.get(OpCode::Delete, Outcome::Ok);
+        let after_idem = m.operations.get(OpCode::Delete, Outcome::Idempotent);
+
+        // Delete is idempotent GC: deleting an already-absent txid is not a
+        // failure — its post-condition (record absent) already holds — so the
+        // whole batch succeeds and no per-item error is emitted.
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "no partial error: missing is idempotent"
+        );
+        assert_eq!(
+            after_fail - before_fail,
+            0,
+            "deletes_failed unchanged (absent key is not a failure)"
+        );
         assert_eq!(
             after_succ - before_succ,
-            1,
-            "deletes_succeeded += 1 (A deleted)"
+            2,
+            "deletes_succeeded += 2 (A removed + missing idempotent)"
         );
-        assert_eq!(after_fail - before_fail, 1, "deletes_failed += 1 (missing)");
+        // The operations matrix still distinguishes a real removal (Ok) from an
+        // idempotent no-op (Idempotent) so observability is preserved.
+        assert_eq!(after_ok - before_ok, 1, "Delete/Ok += 1 (A removed)");
+        assert_eq!(
+            after_idem - before_idem,
+            1,
+            "Delete/Idempotent += 1 (missing no-op)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -22220,8 +21439,8 @@ mod tests {
         let index = crate::index::ShardedIndex::from_single(Index::new(10_000).unwrap().into());
         let engine = Arc::new(Engine::new_multi_store(
             dev0,
-            alloc0,
-            vec![(dev1, alloc1)],
+            Box::new(alloc0),
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             index,
             StripedLocks::new(64),
             DahIndex::new(),
@@ -23633,7 +22852,8 @@ mod tests {
             let redo_log =
                 crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, redo_size)
                     .unwrap();
-            let mut alloc = SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+            let mut alloc: crate::allocator::BoxedAllocator =
+                Box::new(SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap());
             let primary: PrimaryBackend = Index::new(10000).unwrap().into();
             let index = crate::index::ShardedIndex::from_single(primary);
             let mut dah = DahBackend::new_in_memory();
@@ -23825,140 +23045,6 @@ mod tests {
         assert!(
             slot.is_unspent(),
             "durable comp Unspend ⇒ recovery lands the slot UNSPENT (compensated, single-valued)"
-        );
-    }
-
-    /// R-007 (Codex F1): the `build_delete_compensation_ops` helper
-    /// must reproduce per-slot state after Create — a previously-spent
-    /// slot must be re-stamped with its original `spending_data`, a
-    /// frozen slot must be re-frozen, a pruned slot must be re-pruned,
-    /// and unspent slots stay default. Pre-fix the compensation only
-    /// emitted Create with `utxo_hashes`, leaving every slot UNSPENT
-    /// regardless of pre-delete state and opening a double-spend
-    /// window after a failed delete-batch replication.
-    #[test]
-    fn delete_compensation_ops_restore_per_slot_state() {
-        let mut txid = [0u8; 32];
-        txid[0] = 0xC0;
-        let key = TxKey { txid };
-
-        // Synthesize a snapshot with one slot of each interesting status.
-        let mut spend_a = [0u8; 36];
-        spend_a[0..4].copy_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]);
-        let mut spend_b = [0u8; 36];
-        spend_b[0..4].copy_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB]);
-        let snap = DeleteSnapshot {
-            metadata_bytes: vec![0u8; 70],
-            master_generation: 7,
-            slots: vec![
-                // 0: unspent (no replay op expected)
-                SnapshotSlot {
-                    hash: [0x10; 32],
-                    status: crate::record::UTXO_UNSPENT,
-                    spending_data: [0u8; 36],
-                },
-                // 1: spent with spend_a
-                SnapshotSlot {
-                    hash: [0x11; 32],
-                    status: crate::record::UTXO_SPENT,
-                    spending_data: spend_a,
-                },
-                // 2: frozen
-                SnapshotSlot {
-                    hash: [0x12; 32],
-                    status: crate::record::UTXO_FROZEN,
-                    spending_data: [0u8; 36],
-                },
-                // 3: pruned
-                SnapshotSlot {
-                    hash: [0x13; 32],
-                    status: crate::record::UTXO_PRUNED,
-                    spending_data: [0u8; 36],
-                },
-                // 4: spent with spend_b
-                SnapshotSlot {
-                    hash: [0x14; 32],
-                    status: crate::record::UTXO_SPENT,
-                    spending_data: spend_b,
-                },
-            ],
-            cold_data: None,
-            is_external: false,
-        };
-
-        let ops = build_delete_compensation_ops(&key, &snap);
-
-        // First op MUST be Create with the snapshotted hashes.
-        match &ops[0] {
-            ReplicaOp::Create {
-                tx_key,
-                utxo_hashes,
-                is_external,
-                ..
-            } => {
-                assert_eq!(*tx_key, key);
-                assert_eq!(utxo_hashes.len(), 5);
-                assert_eq!(utxo_hashes[1], [0x11; 32]);
-                assert!(!*is_external);
-            }
-            other => panic!("expected Create as first op, got {other:?}"),
-        }
-
-        // Subsequent ops must restore non-default slot states. Order
-        // doesn't matter for correctness as long as Create is first.
-        let tail = &ops[1..];
-        let spent_a = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::Spend { tx_key, offset: 1, spending_data, master_generation, .. }
-                if *tx_key == key && *spending_data == spend_a && *master_generation == 7
-            )
-        });
-        assert!(
-            spent_a.is_some(),
-            "compensation must re-stamp slot 1 with the original spending_data; got {ops:?}"
-        );
-
-        let spent_b = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::Spend { tx_key, offset: 4, spending_data, master_generation, .. }
-                if *tx_key == key && *spending_data == spend_b && *master_generation == 7
-            )
-        });
-        assert!(
-            spent_b.is_some(),
-            "compensation must re-stamp slot 4 with the original spending_data"
-        );
-
-        let frozen = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::Freeze { tx_key, offset: 2, master_generation }
-                if *tx_key == key && *master_generation == 7
-            )
-        });
-        assert!(frozen.is_some(), "compensation must re-freeze slot 2");
-
-        let pruned = tail.iter().find(|op| {
-            matches!(op,
-                ReplicaOp::PruneSlot { tx_key, offset: 3 }
-                if *tx_key == key
-            )
-        });
-        assert!(pruned.is_some(), "compensation must re-prune slot 3");
-
-        // Slot 0 was UNSPENT — it should NOT have a replay op, since
-        // Create defaults to UNSPENT and an extra op would over-bump
-        // generation on the receiver.
-        let no_extras = tail.iter().any(|op| {
-            matches!(
-                op,
-                ReplicaOp::Spend { offset: 0, .. }
-                    | ReplicaOp::Freeze { offset: 0, .. }
-                    | ReplicaOp::PruneSlot { offset: 0, .. }
-            )
-        });
-        assert!(
-            !no_extras,
-            "compensation must NOT emit a replay op for slot 0 (UNSPENT)"
         );
     }
 

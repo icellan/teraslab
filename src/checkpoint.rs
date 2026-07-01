@@ -61,6 +61,17 @@ use crate::redo::RedoLog;
 
 type ResetGuard = Arc<dyn Fn(u64) -> bool + Send + Sync + 'static>;
 
+/// Max partially-dead segments the defrag compaction relocates out of PER
+/// checkpoint. Bounds the live-record copy amplification and the checkpoint's
+/// added duration; the fully-dead fast path (unbounded, cheap) does the bulk of
+/// the reclaim, so compaction only needs to chip at the long-lived-record tail.
+const DEFRAG_COMPACT_MAX_SEGMENTS: usize = 4;
+/// Only compact segments this dead or more (0.0..=1.0). A high threshold means few
+/// live records to copy per segment reclaimed (≤25% live at 0.75), keeping the
+/// amplification favorable, and makes compaction self-gating (no work until a
+/// segment is mostly dead).
+const DEFRAG_COMPACT_MIN_DEAD_FRAC: f64 = 0.75;
+
 /// Configuration for the background checkpoint task.
 ///
 /// BC-01: the task uses hysteresis to avoid back-to-back checkpoints
@@ -265,6 +276,17 @@ fn run_checkpoint_loop(
     // checkpoint to BLOCKING instead of spinning fuzzy snapshots that cannot
     // keep up. Reset once a checkpoint actually drains.
     let mut escalate_blocking = false;
+    // Fill-rate vs checkpoint-cost tracking (lever 6d): when the redo refills to
+    // high-water FASTER than a fuzzy (non-blocking) checkpoint takes to run, a
+    // fuzzy will be overtaken — the log fills to 100% mid-snapshot, writes stall
+    // for the rest of its duration, and it ends in `LogFull` and falls back to
+    // blocking anyway. Skip straight to a blocking (drain-reset) checkpoint in
+    // that case: a brief, bounded serving stall instead of a long one at a full
+    // log. `last_fuzzy_duration` is updated only after a fuzzy attempt, so a
+    // fast blocking reset does not reset the estimate; it relaxes back to fuzzy
+    // once the workload slows and the refill again outlasts a fuzzy.
+    let mut last_ckpt_completed: Option<std::time::Instant> = None;
+    let mut last_fuzzy_duration = Duration::ZERO;
     // S-P2c: when the previous checkpoint reclaimed NOTHING (e.g. the reset
     // guard is holding the redo prefix for a lagging replica), a blocking
     // checkpoint would hold the exclusive visibility barrier across an O(index)
@@ -325,13 +347,26 @@ fn run_checkpoint_loop(
 
         // FUZZY by default (non-blocking serving). BLOCKING when the log has
         // crossed the emergency mark, when the previous fuzzy attempt could not
-        // drain it, or when an appender is already starved on a full log — a
-        // brief serving stall to fully reclaim, far better than letting appends
-        // fail with `LogFull` (which rejects a valid block and drops the sync
-        // peer). EXCEPT when reclaim is stalled (S-P2c): a blocking checkpoint
-        // that can reclaim nothing only freezes reads, so fall back to fuzzy.
-        let blocking =
-            !reclaim_stalled && (starved || usage >= emergency_water || escalate_blocking);
+        // drain it, when an appender is already starved on a full log, or when
+        // the log refills faster than a fuzzy checkpoint runs (it would be
+        // overtaken — see `last_fuzzy_duration`). A brief serving stall to fully
+        // reclaim is far better than letting appends fail with `LogFull` (which
+        // rejects a valid block and drops the sync peer) for the duration of a
+        // doomed fuzzy snapshot. TWO exceptions force the non-blocking path:
+        //   * Lever 7 — a segment-ring reclaim frees whole covered segments by a
+        //     pointer advance, never racing the writer for entry space and never
+        //     returning LogFull, so the blocking/escalation machinery is moot.
+        //   * S-P2c — while reclaim is stalled (the reset guard holds the prefix
+        //     for a lagging replica) a blocking O(index) snapshot reclaims
+        //     nothing and only freezes reads; stay fuzzy until the replica
+        //     catches up.
+        let fuzzy_overtaken = fuzzy_would_be_overtaken(
+            last_ckpt_completed.map(|t| t.elapsed()),
+            last_fuzzy_duration,
+        );
+        let blocking = !engine.redo_is_ring()
+            && !reclaim_stalled
+            && (starved || usage >= emergency_water || escalate_blocking || fuzzy_overtaken);
 
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_triggered_total.inc();
@@ -362,6 +397,13 @@ fn run_checkpoint_loop(
         if let Some(m) = crate::metrics::redo_metrics() {
             m.redo_checkpoint_duration_ns
                 .record_ns(elapsed.as_nanos() as u64);
+        }
+        // Record how long a FUZZY checkpoint costs (only fuzzy attempts, so a
+        // fast blocking reset does not shrink the estimate) and when this
+        // checkpoint finished, for the next iteration's fill-rate comparison.
+        last_ckpt_completed = Some(std::time::Instant::now());
+        if !blocking {
+            last_fuzzy_duration = elapsed;
         }
 
         match outcome {
@@ -403,15 +445,26 @@ fn run_checkpoint_loop(
                 if let Some(m) = crate::metrics::redo_metrics() {
                     m.redo_checkpoint_failed_total.inc();
                 }
-                backoff = next_backoff(backoff, &config);
-                // Retry as blocking if the log is dangerously full; a failed
-                // fuzzy attempt has not reclaimed anything.
-                escalate_blocking = last_usage >= emergency_water;
-                tracing::error!(
-                    err = %e,
-                    next_backoff_ms = backoff.as_millis() as u64,
-                    "checkpoint failed",
-                );
+                let log_full = e.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX);
+                (backoff, escalate_blocking) =
+                    react_to_checkpoint_error(&e, backoff, last_usage, emergency_water, &config);
+                if log_full {
+                    // Expected under sustained overload: the fuzzy checkpoint
+                    // could not keep up. Escalating to a blocking reset (with no
+                    // back-off) is the designed response, so this is a WARN, not
+                    // an operator-actionable ERROR.
+                    tracing::warn!(
+                        err = %e,
+                        "fuzzy checkpoint could not keep up with write load — \
+                         escalating to a blocking checkpoint with no back-off",
+                    );
+                } else {
+                    tracing::error!(
+                        err = %e,
+                        next_backoff_ms = backoff.as_millis() as u64,
+                        "checkpoint failed",
+                    );
+                }
                 // S-P2b: honor the exponential back-off NOW, in shutdown-aware
                 // slices. `park_drainer` short-circuits on `blocked > 0`, so a
                 // starved appender against a persistently failing snapshot
@@ -436,6 +489,58 @@ fn run_checkpoint_loop(
         }
     }
     tracing::info!("checkpoint task exiting");
+}
+
+/// Whether a fuzzy (non-blocking) checkpoint would be overtaken by the write
+/// load before it can reclaim — true when the redo refilled to the trigger
+/// threshold (`refill_since_last`) in less time than the last fuzzy checkpoint
+/// took to run (`last_fuzzy_duration`). In that regime the loop should run a
+/// blocking (drain-reset) checkpoint directly rather than start a doomed fuzzy
+/// that fills the log mid-snapshot and stalls writes for its whole duration.
+///
+/// Returns false with no history (`None`) or a zero estimate, so the first
+/// checkpoints are fuzzy until a real fuzzy duration is observed; it relaxes
+/// back to fuzzy once the workload slows and the refill again outlasts a fuzzy.
+fn fuzzy_would_be_overtaken(
+    refill_since_last: Option<Duration>,
+    last_fuzzy_duration: Duration,
+) -> bool {
+    match refill_since_last {
+        Some(refill) => last_fuzzy_duration > Duration::ZERO && refill < last_fuzzy_duration,
+        None => false,
+    }
+}
+
+/// Decide how the checkpoint task should react to a failed checkpoint.
+///
+/// A `LogFull` failure is categorically different from a device fault: it means
+/// the redo is full and a (typically fuzzy / non-blocking) checkpoint could not
+/// reclaim it — at sustained write rates the entries appended during the
+/// snapshot pile up past the fence faster than the relocate-compaction can move
+/// them, so the compaction surfaces `LogFull`. Writes are already backpressured
+/// at this point, so the right response is to escalate to a BLOCKING checkpoint
+/// on the very next iteration with **no** back-off — every backed-off
+/// millisecond is pure write-stall time, and re-attempting a fuzzy checkpoint
+/// would just fail the same way. A genuine I/O fault, by contrast, keeps the
+/// exponential back-off (hammering a broken device is harmful) and only escalates
+/// to blocking when the log is already dangerously full.
+///
+/// Returns `(next_backoff, escalate_blocking)`.
+fn react_to_checkpoint_error(
+    err: &str,
+    current_backoff: Duration,
+    last_usage: f64,
+    emergency_water: f64,
+    config: &CheckpointConfig,
+) -> (Duration, bool) {
+    if err.contains(crate::redo::LOG_FULL_MESSAGE_PREFIX) {
+        (Duration::ZERO, true)
+    } else {
+        (
+            next_backoff(current_backoff, config),
+            last_usage >= emergency_water,
+        )
+    }
 }
 
 /// Compute the next exponential back-off, doubling up to `max_backoff`.
@@ -566,6 +671,24 @@ where
     };
     let started_at = std::time::Instant::now();
 
+    // 0. Defrag COMPACTION (log-structured engine): relocate the few live records
+    //    out of the most-dead partially-dead segments so they drain and can be
+    //    reclaimed below. Runs BEFORE the snapshot so it captures the relocated
+    //    (new) offsets; the relocate writes are fsynced by `persist_allocator`'s
+    //    device barrier before the redo is fenced. Rate-limited (few victims,
+    //    high dead threshold) so the copy amplification and checkpoint duration
+    //    stay bounded; self-gating (no work when nothing is that dead) so it is a
+    //    no-op for the short-lived-record workload the fast path already covers.
+    //    No-op for the in-place engine.
+    let compacted =
+        engine.defrag_compact(DEFRAG_COMPACT_MAX_SEGMENTS, DEFRAG_COMPACT_MIN_DEAD_FRAC);
+    if compacted > 0 {
+        tracing::debug!(
+            compacted,
+            "checkpoint: defrag relocated live records out of victim segments"
+        );
+    }
+
     // 1. Snapshot index + DAH + unmined to disk (tempfile + rename).
     //    `snapshot_index` serializes each shard under its own short-lived read
     //    lock in write-path order (shard before secondaries), so it cannot
@@ -574,6 +697,19 @@ where
     engine
         .snapshot_index(&config.snapshot_path)
         .map_err(|e| format!("snapshot_index: {e}"))?;
+
+    // 1b. Defrag fast path: reclaim fully-dead segments (log-structured engine)
+    //     so the header persisted next reflects the reclaimed, reused layout —
+    //     this is what bounds device growth under relocate-on-spend. No-op for the
+    //     in-place engine; re-derivable from the index on crash, so it is not
+    //     journaled.
+    let reclaimed = engine.defrag_reclaim_fully_dead();
+    if reclaimed > 0 {
+        tracing::debug!(
+            reclaimed,
+            "checkpoint: defrag reclaimed fully-dead segments"
+        );
+    }
 
     // 2. Persist allocator state to its on-disk header (fsynced before
     //    returning).
@@ -605,6 +741,14 @@ where
     //      compaction cannot silently revert acked mutations whose only
     //      durable copy was the just-reclaimed redo prefix.
     crate::fault_injection::check(crate::fault_injection::SyncPoint::BeforeCheckpointDataSync);
+    // Under buffered durability the redo entries covering this checkpoint's
+    // fence may have been acked but not yet fsynced. They MUST be durable before
+    // the fence is written and the prefix reclaimed, otherwise a crash after
+    // compaction would lose acked+checkpointed mutations. Forcing the redo flush
+    // here is a no-op under strict durability (already fsynced per commit).
+    engine
+        .flush_all_redo()
+        .map_err(|e| format!("redo durable flush: {e}"))?;
     engine
         .flush_index_durable()
         .map_err(|e| format!("index durable flush: {e}"))?;
@@ -627,6 +771,9 @@ where
     //    representative `redo_log` lock here, since store 0's log is the same
     //    Mutex and that would deadlock. When no per-store logs are attached
     //    (tests / single handle), fall back to the passed `redo_log` directly.
+    // The fence/reclaim helpers are layout-dispatched (lever 7): a ring records
+    // the fence in its header and reclaims by freeing covered segments; a linear
+    // log appends a RecoveryProgress marker and compacts the prefix.
     let per_store = engine.has_per_store_redo();
     if per_store {
         engine
@@ -635,7 +782,7 @@ where
     } else {
         redo_log
             .lock()
-            .mark_recovery_progress(snapshot_fence_sequence)
+            .checkpoint_fence(snapshot_fence_sequence)
             .map_err(|e| format!("redo checkpoint fence: {e}"))?;
     }
 
@@ -659,7 +806,7 @@ where
         } else {
             redo_log
                 .lock()
-                .compact_prefix_through(snapshot_fence_sequence)
+                .checkpoint_reclaim(snapshot_fence_sequence)
                 .map_err(|e| format!("redo compact: {e}"))?;
         }
         true
@@ -696,6 +843,100 @@ mod tests {
     use crate::redo::{RedoLog, RedoOp};
     use std::sync::Arc;
 
+    /// Lever 6d: a `LogFull` checkpoint failure must escalate to a blocking
+    /// checkpoint with NO back-off (the redo is full, writes are backpressured,
+    /// every backed-off ms is stall time), whereas a genuine I/O fault must keep
+    /// the exponential back-off and only escalate when already dangerously full.
+    #[test]
+    fn react_to_checkpoint_error_escalates_on_log_full_without_backoff() {
+        let cfg = CheckpointConfig::new(PathBuf::from("/tmp/unused.snap"));
+
+        // LogFull during the (fuzzy) compact, triggered while usage was read as a
+        // STALE low value: still escalate + no back-off (do not trust last_usage).
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "redo compact: redo log full: 667873280/536866816 bytes used",
+            Duration::from_secs(4), // a backoff already in flight
+            0.75,                   // stale low usage from before the slow fuzzy ran
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(backoff, Duration::ZERO, "LogFull must clear the back-off");
+        assert!(
+            escalate,
+            "LogFull must escalate the next checkpoint to blocking"
+        );
+
+        // The fence variant is the same class of failure.
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "redo checkpoint fence: redo log full: 1/1 bytes used",
+            Duration::ZERO,
+            0.10,
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(backoff, Duration::ZERO);
+        assert!(escalate);
+
+        // A genuine I/O fault: keep the exponential back-off, and escalate ONLY
+        // when the log is already past the emergency mark.
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "data device sync: I/O error: disk on fire",
+            Duration::ZERO,
+            0.50, // below emergency
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(
+            backoff, cfg.initial_backoff,
+            "an I/O fault keeps the exponential back-off"
+        );
+        assert!(
+            !escalate,
+            "below emergency, an I/O fault does not force blocking"
+        );
+
+        let (backoff, escalate) = react_to_checkpoint_error(
+            "data device sync: I/O error: disk on fire",
+            cfg.initial_backoff,
+            0.95, // past emergency
+            cfg.emergency_high_water,
+            &cfg,
+        );
+        assert_eq!(
+            backoff,
+            cfg.initial_backoff * 2,
+            "an I/O fault doubles the back-off"
+        );
+        assert!(
+            escalate,
+            "past emergency, even an I/O fault escalates to blocking"
+        );
+    }
+
+    /// Lever 6d: pick a blocking checkpoint when the log refills faster than a
+    /// fuzzy checkpoint runs (a fuzzy would be overtaken), but stay fuzzy under
+    /// light load and before any fuzzy duration is known.
+    #[test]
+    fn fuzzy_would_be_overtaken_only_under_fast_refill() {
+        // No history yet → fuzzy.
+        assert!(!fuzzy_would_be_overtaken(None, Duration::from_secs(2)));
+        // No measured fuzzy duration yet → fuzzy.
+        assert!(!fuzzy_would_be_overtaken(
+            Some(Duration::from_millis(100)),
+            Duration::ZERO
+        ));
+        // Refill (5s) slower than a fuzzy (2s) → light load → stay fuzzy.
+        assert!(!fuzzy_would_be_overtaken(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(2)
+        ));
+        // Refill (1s) faster than a fuzzy (2s) → write-heavy → go blocking.
+        assert!(fuzzy_would_be_overtaken(
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(2)
+        ));
+    }
+
     fn make_engine_and_redo() -> (Arc<Engine>, Arc<Mutex<RedoLog>>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
@@ -718,6 +959,37 @@ mod tests {
         let log = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
         let redo = Arc::new(Mutex::new(log));
         (engine, redo, dir)
+    }
+
+    /// Like [`make_engine_and_redo`] but the redo log is a fresh **segment ring**
+    /// of `count` segments of `segment_size` bytes (lever 7).
+    fn make_engine_and_ring_redo(
+        segment_size: u64,
+        count: u64,
+    ) -> (Arc<Engine>, Arc<Mutex<RedoLog>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let total = 4096 + segment_size * count;
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let log = RedoLog::format_ring(redo_dev, 0, total, segment_size).unwrap();
+        (engine, Arc::new(Mutex::new(log)), dir)
+    }
+
+    fn ring_freeze(n: u8) -> RedoOp {
+        RedoOp::Freeze {
+            tx_key: crate::index::TxKey { txid: [n; 32] },
+            offset: 0,
+        }
     }
 
     /// End-to-end: the gate (which admits a mutation only when the reserve is
@@ -799,7 +1071,7 @@ mod tests {
                 record_offset: 4096,
                 utxo_count: 1,
                 is_conflicting: false,
-                record_bytes: vec![0xAB; payload],
+                record_bytes: vec![0xAB; payload].into(),
                 parent_txids: Vec::new(),
             }) {
                 Ok(_) => {}
@@ -1073,6 +1345,94 @@ mod tests {
         );
     }
 
+    /// Phase 6: a checkpoint over a ring redo log fences (header) and reclaims
+    /// (frees covered segments) — usage drops, recovery is bounded by the fence,
+    /// and the log stays a usable ring afterwards.
+    #[test]
+    fn ring_checkpoint_fences_and_reclaims() {
+        let segment_size = 4096u64;
+        let (engine, redo, dir) = make_engine_and_ring_redo(segment_size, 4);
+        let snap_path = dir.path().join("ring.snap");
+
+        let usage_before = {
+            let mut log = redo.lock();
+            for i in 0..200u32 {
+                log.append(ring_freeze((i % 251) as u8)).unwrap();
+            }
+            log.flush().unwrap();
+            assert!(log.is_segment_ring());
+            log.usage_fraction()
+        };
+        assert!(usage_before > 0.4, "ring should be substantially filled");
+
+        let cfg = CheckpointConfig::new(snap_path);
+        let stats = perform_checkpoint(&cfg, &engine, &redo).unwrap();
+        assert!(stats.reset_performed, "ring reclaim ran");
+        assert!(
+            stats.usage_after < usage_before,
+            "reclaim freed covered segments: {} -> {}",
+            usage_before,
+            stats.usage_after
+        );
+
+        let log = redo.lock();
+        assert!(log.is_segment_ring(), "still a ring after checkpoint");
+        assert!(
+            log.recover().unwrap().is_empty(),
+            "all flushed entries are below the fence → recovery replays nothing"
+        );
+        drop(log);
+        // Still serving: more appends succeed after the checkpoint.
+        redo.lock().append(ring_freeze(7)).unwrap();
+    }
+
+    /// Phase 6: sustained fill→checkpoint cycles on a ring never brick — the ring
+    /// keeps accepting writes across many reclaim rounds (no LogFull wedge).
+    #[test]
+    fn ring_sustained_checkpoints_never_brick() {
+        let segment_size = 4096u64;
+        let (engine, redo, dir) = make_engine_and_ring_redo(segment_size, 4);
+        let cfg = CheckpointConfig::new(dir.path().join("sustained_ring.snap"));
+
+        // Many more entries than the ring can hold at once, interleaved with
+        // checkpoints — every append must succeed (reclaim keeps up).
+        for round in 0..20u32 {
+            {
+                let mut log = redo.lock();
+                for i in 0..60u32 {
+                    log.append(ring_freeze(
+                        (round.wrapping_mul(60).wrapping_add(i) % 251) as u8,
+                    ))
+                    .expect("ring append must never wedge under checkpoint reclaim");
+                }
+                log.flush().unwrap();
+            }
+            perform_checkpoint(&cfg, &engine, &redo).unwrap();
+        }
+        let log = redo.lock();
+        assert!(log.is_segment_ring());
+        assert!(log.usage_fraction() < 1.0, "ring is not stuck full");
+    }
+
+    /// Phase 6: `Engine::redo_is_ring` reflects the attached logs so the
+    /// checkpoint loop can pick the non-blocking ring path.
+    #[test]
+    fn engine_redo_is_ring_reflects_attached_logs() {
+        let (engine, _redo, _dir) = make_engine_and_redo();
+        assert!(
+            !engine.redo_is_ring(),
+            "no per-store logs attached → not ring"
+        );
+
+        let total = 4096 + 4096 * 4;
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(total, 4096).unwrap());
+        let ring = Arc::new(Mutex::new(
+            RedoLog::format_ring(dev, 0, total, 4096).unwrap(),
+        ));
+        engine.set_redo_logs(vec![ring]);
+        assert!(engine.redo_is_ring(), "attached ring log → redo_is_ring");
+    }
+
     // -- B-1 / G-1 durability-barrier tests --
 
     /// Seed a volatile data device + redo log with two acked, WAL-first
@@ -1126,7 +1486,7 @@ mod tests {
             record_offset,
             utxo_count,
             is_conflicting: false,
-            record_bytes,
+            record_bytes: record_bytes.into(),
             parent_txids: Vec::new(),
         })
         .unwrap();
@@ -1222,8 +1582,10 @@ mod tests {
 
         // Restart: allocator from its header, index from the snapshot,
         // then redo replay (empty — the fence covers everything).
-        let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
-            .expect("allocator header must be durable after checkpoint");
+        let mut alloc2: crate::allocator::BoxedAllocator = Box::new(
+            SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
+                .expect("allocator header must be durable after checkpoint"),
+        );
         let (primary2, dah2, unmined2, _flags) =
             PrimaryBackend::restore_all(&snap_path).expect("snapshot must restore");
         let index2 = crate::index::ShardedIndex::from_single(primary2);
@@ -1419,8 +1781,10 @@ mod tests {
             2,
             "no fence may exist — both entries must still be replayable"
         );
-        let mut alloc2 = SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
-            .expect("allocator persist (fsynced) preceded the crash point");
+        let mut alloc2: crate::allocator::BoxedAllocator = Box::new(
+            SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
+                .expect("allocator persist (fsynced) preceded the crash point"),
+        );
         let index2 =
             crate::index::ShardedIndex::from_single(PrimaryBackend::new_in_memory(128).unwrap());
         let mut dah_b = DahBackend::new_in_memory();
@@ -1464,19 +1828,20 @@ mod tests {
         redo_capacity: u64,
     ) -> (
         crate::index::ShardedIndex,
-        crate::allocator::SlotAllocator,
+        crate::allocator::BoxedAllocator,
         usize,
     ) {
         use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, UnminedBackend};
         use crate::recovery::recover_all_with_allocator;
 
-        let mut alloc = match SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>) {
+        let alloc = match SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>) {
             Ok(a) => a,
             Err(crate::allocator::AllocatorError::NoPersistedState) => {
                 SlotAllocator::new(data_dev.clone() as Arc<dyn BlockDevice>).unwrap()
             }
             Err(e) => panic!("allocator recover failed unexpectedly: {e:?}"),
         };
+        let mut alloc: crate::allocator::BoxedAllocator = Box::new(alloc);
 
         let (primary, dah, unmined) = if snap_path.exists() {
             let (idx, dah, unmined, _flags) =
@@ -1784,7 +2149,7 @@ mod tests {
                 record_offset: region_r,
                 utxo_count,
                 is_conflicting: false,
-                record_bytes,
+                record_bytes: record_bytes.into(),
                 parent_txids: Vec::new(),
             })
             .unwrap();
@@ -2439,6 +2804,293 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "task must shut down within 1 s, took {elapsed:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // redo_buffered_io: no-per-flush-fsync background flush + barrier durability
+    // -----------------------------------------------------------------------
+
+    /// A redo-log block device that (a) counts `sync`/`sync_data` calls and
+    /// (b) models a volatile write cache with a durable shadow: `sync` copies
+    /// live → shadow; [`Self::simulate_power_loss`] reverts live → shadow,
+    /// dropping every write issued since the last sync. Returns `None` from
+    /// `as_raw_ptr` so the redo log always uses the pread/pwrite path the shadow
+    /// governs. This is the counting-device pattern from `redo_group.rs` /
+    /// `engine.rs` tests, extended with the volatile shadow so a recovery test
+    /// can prove the un-fsynced tail is dropped while the barrier-synced prefix
+    /// survives.
+    struct CountingShadowDevice {
+        live: parking_lot::Mutex<Vec<u8>>,
+        shadow: parking_lot::Mutex<Vec<u8>>,
+        alignment: usize,
+        syncs: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingShadowDevice {
+        fn new(size: usize, alignment: usize) -> Arc<Self> {
+            Arc::new(Self {
+                live: parking_lot::Mutex::new(vec![0u8; size]),
+                shadow: parking_lot::Mutex::new(vec![0u8; size]),
+                alignment,
+                syncs: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        fn sync_count(&self) -> u64 {
+            self.syncs.load(Ordering::SeqCst)
+        }
+
+        /// Drop every write since the last durable sync (revert live → shadow).
+        fn simulate_power_loss(&self) {
+            let shadow = self.shadow.lock();
+            let mut live = self.live.lock();
+            live.copy_from_slice(&shadow);
+        }
+    }
+
+    impl BlockDevice for CountingShadowDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            let live = self.live.lock();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > live.len() {
+                return Err(crate::device::DeviceError::Io(std::io::Error::other(
+                    "oob pread",
+                )));
+            }
+            buf.copy_from_slice(&live[start..end]);
+            Ok(buf.len())
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            let mut live = self.live.lock();
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > live.len() {
+                return Err(crate::device::DeviceError::Io(std::io::Error::other(
+                    "oob pwrite",
+                )));
+            }
+            live[start..end].copy_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn alignment(&self) -> usize {
+            self.alignment
+        }
+
+        fn size(&self) -> u64 {
+            self.live.lock().len() as u64
+        }
+
+        fn sync(&self) -> crate::device::Result<()> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            let live = self.live.lock();
+            let mut shadow = self.shadow.lock();
+            shadow.copy_from_slice(&live);
+            Ok(())
+        }
+
+        // No `sync_data` override: the trait default calls `sync`, so the redo
+        // hot-path `sync_data()` is counted AND makes the shadow durable.
+
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
+    /// Build an engine whose single per-store redo log lives on a
+    /// `CountingShadowDevice`, with buffered durability enabled — the
+    /// `redo_buffered_io` runtime shape (page-cache open is a device concern;
+    /// here the shadow device stands in for the cache so the test is
+    /// deterministic). Returns the engine, the shared redo Arc, the redo device
+    /// handle (for sync-count / power-loss), and the temp dir for the snapshot.
+    fn make_buffered_engine_and_redo() -> (
+        Arc<Engine>,
+        Arc<Mutex<RedoLog>>,
+        Arc<CountingShadowDevice>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        let redo_dev = CountingShadowDevice::new(256 * 1024, 4096);
+        let log = RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 256 * 1024).unwrap();
+        let redo = Arc::new(Mutex::new(log));
+        // Attach to the engine so `flush_all_redo[_no_sync]` and the checkpoint
+        // barrier operate on this exact log, and enable buffered durability.
+        engine.set_redo_logs(vec![redo.clone()]);
+        engine.set_buffered_durability(true);
+        (engine, redo, redo_dev, dir)
+    }
+
+    /// Core `redo_buffered_io` guarantee: a periodic buffered flush
+    /// (`flush_all_redo_no_sync`) pwrites WITHOUT a device fsync, while the
+    /// checkpoint barrier DOES fsync the redo before it fences/reclaims. After
+    /// the barrier the fenced prefix is durable and recovery is bounded by it.
+    #[test]
+    fn async_redo_flush_no_per_flush_fsync_but_barrier_is_durable() {
+        let (engine, redo, redo_dev, dir) = make_buffered_engine_and_redo();
+
+        // Drive several buffered appends through the engine's committer (buffered
+        // durability → the append itself does NOT fsync).
+        {
+            let committer = engine.redo_committer_for_test(0);
+            for i in 0..20u8 {
+                committer
+                    .commit(vec![RedoOp::Freeze {
+                        tx_key: crate::index::TxKey { txid: [i + 1; 32] },
+                        offset: i as u32,
+                    }])
+                    .expect("buffered append must succeed");
+            }
+        }
+
+        // A periodic buffered-io flush: pwrite the entries, but NO device fsync.
+        let before_flush = redo_dev.sync_count();
+        engine
+            .flush_all_redo_no_sync()
+            .expect("no-sync flush must succeed");
+        let after_flush = redo_dev.sync_count();
+        assert_eq!(
+            after_flush, before_flush,
+            "the buffered-io periodic flush must NOT fsync the redo device \
+             (sync count went {before_flush} -> {after_flush})"
+        );
+
+        // The bytes were pwritten (live), so they are READABLE in-process even
+        // though they are not yet durable — this is exactly the page-cache state.
+        let readable = redo.lock().read_from_sequence(1).unwrap();
+        assert_eq!(
+            readable.len(),
+            20,
+            "no-sync flush still pwrites the entries (page-cache visible)"
+        );
+
+        // Now the checkpoint barrier. It MUST fsync the redo before fencing and
+        // reclaiming the covered prefix.
+        let before_ckpt = redo_dev.sync_count();
+        let cfg = CheckpointConfig::new(dir.path().join("buffered.snap"));
+        let stats = perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
+        let after_ckpt = redo_dev.sync_count();
+        assert!(
+            after_ckpt > before_ckpt,
+            "the checkpoint barrier MUST fsync the redo before fence/reclaim \
+             (sync count went {before_ckpt} -> {after_ckpt}); removing the per-flush \
+             fsync is only safe because of this barrier fsync"
+        );
+        assert!(
+            stats.reset_performed,
+            "barrier covers the whole flushed prefix → reclaim runs"
+        );
+
+        // The fenced prefix is durable: a power loss now (drop everything since
+        // the last sync) must NOT lose the checkpointed entries, and recovery is
+        // bounded by the durable fence (all entries are at/below it → empty).
+        redo_dev.simulate_power_loss();
+        let recovered = redo.lock().recover().unwrap();
+        assert!(
+            recovered.is_empty(),
+            "all flushed entries are covered by the durable barrier fence → \
+             recovery replays nothing, found {} entries",
+            recovered.len()
+        );
+    }
+
+    /// Recovery prefix invariant under `redo_buffered_io`: entries made durable
+    /// by the barrier survive a simulated power loss + reopen; entries appended
+    /// AFTER the last barrier and only no-sync-flushed (never fsynced) are
+    /// allowed to be absent — the lost tail is a consistent prefix, never a hole.
+    #[test]
+    fn buffered_io_recovery_keeps_barrier_prefix_drops_unsynced_tail() {
+        let (engine, redo, redo_dev, dir) = make_buffered_engine_and_redo();
+        let committer = engine.redo_committer_for_test(0);
+
+        // Phase A: durable set — appended, then made durable by the checkpoint
+        // barrier (which fsyncs the redo). These must survive a crash. We append
+        // entries that recovery can REPLAY (Freeze ops) and checkpoint so the
+        // fence covers them; post-fence they recover as an empty set, so to prove
+        // survival we read them back from the durable shadow via a fresh reopen
+        // BEFORE the fence is consulted is not possible — instead we assert the
+        // durable WRITE POSITION below. First, drive + barrier:
+        for i in 0..10u8 {
+            committer
+                .commit(vec![RedoOp::Freeze {
+                    tx_key: crate::index::TxKey { txid: [i + 1; 32] },
+                    offset: i as u32,
+                }])
+                .expect("durable-set append");
+        }
+        let cfg = CheckpointConfig::new(dir.path().join("prefix.snap"));
+        perform_checkpoint(&cfg, &engine, &redo).expect("barrier must fsync the durable set");
+        // Capture the durable high-water sequence the fence advanced to.
+        let durable_seq = redo.lock().current_sequence();
+        let durable_sync_count = redo_dev.sync_count();
+
+        // Phase B: at-risk tail — appended and only NO-SYNC flushed (pwritten to
+        // the page cache, never fsynced). On a power loss these are dropped.
+        for i in 10..20u8 {
+            committer
+                .commit(vec![RedoOp::Freeze {
+                    tx_key: crate::index::TxKey { txid: [i + 1; 32] },
+                    offset: i as u32,
+                }])
+                .expect("at-risk append");
+        }
+        engine
+            .flush_all_redo_no_sync()
+            .expect("no-sync flush of the at-risk tail");
+        // The at-risk tail cost ZERO additional fsyncs (the invariant under test).
+        assert_eq!(
+            redo_dev.sync_count(),
+            durable_sync_count,
+            "the at-risk tail must not have been fsynced"
+        );
+        // In-process the tail IS visible (page-cache) — sequence advanced past
+        // the durable high-water.
+        assert!(
+            redo.lock().current_sequence() > durable_seq,
+            "the at-risk tail advanced the in-memory sequence"
+        );
+
+        // Power loss: drop everything since the last durable sync (the at-risk
+        // tail), then reopen from the durable shadow.
+        redo_dev.simulate_power_loss();
+        drop(redo);
+        let reopened =
+            RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, 256 * 1024).unwrap();
+
+        // Prefix invariant: the reopened durable sequence is the barrier's
+        // high-water — the at-risk tail is gone, and what remains is a clean
+        // prefix (never a partial/hole). The durable sequence must not roll back
+        // below the fence, and must not include the dropped tail.
+        let recovered_seq = reopened.current_sequence();
+        assert_eq!(
+            recovered_seq, durable_seq,
+            "after power loss the durable sequence must equal the barrier fence \
+             ({durable_seq}); the un-fsynced tail is dropped as a clean prefix, \
+             found {recovered_seq}"
+        );
+        // And recovery is bounded by the durable fence: the barrier-covered
+        // entries are at/below it, so replay is empty (no hole, no resurrection
+        // of the dropped tail).
+        let replay = reopened.recover().unwrap();
+        assert!(
+            replay.is_empty(),
+            "recovery from the durable prefix replays nothing past the fence, \
+             found {} entries",
+            replay.len()
         );
     }
 }

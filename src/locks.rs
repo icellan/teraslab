@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 /// Unlike the hashtable seed this value is never persisted and has no
 /// on-disk layout implications: lock striping is purely in-memory, so a
 /// fresh random seed every process start is free of compatibility concerns.
-fn stripe_seed() -> u64 {
+pub(crate) fn stripe_seed() -> u64 {
     // Prefer the OS CSPRNG. Unlike the index hashtable — where a non-random
     // seed would silently re-enable a DoS and therefore justifies a panic — a
     // lock stripe collision only costs contention, never correctness. So on the
@@ -398,6 +398,37 @@ mod tests {
         // Floor of 16.
         let locks3 = StripedRwLocks::new(1);
         assert_eq!(locks3.stripe_count(), 16);
+    }
+
+    #[test]
+    fn striped_rwlocks_records_in_same_4k_block_share_a_stripe() {
+        // Packed-record coordination (PACKED_RECORD_STORAGE_DESIGN.md §3.2): the
+        // stripe index shifts off the low 12 bits (4096) before masking, so any
+        // two record offsets within the SAME 4 KiB block map to the SAME stripe
+        // and therefore serialize their read-modify-write. Combined with the
+        // allocator's no-straddle invariant (no record crosses a 4 KiB block),
+        // this is exactly the block-level mutual exclusion packed neighbours
+        // need — no per-call-site rekey required. Holds for device alignments
+        // <= 4096 (the standard); larger alignments must not enable packing.
+        let locks = StripedRwLocks::new(65_536);
+        let block_base = 0x40_000u64; // some 4 KiB-aligned block
+        let s = locks.stripe_index(block_base);
+        // Several packed records within the block (offsets < 4096 apart).
+        for intra in [0u64, 8, 320, 393, 700, 1400, 2048, 4000, 4095] {
+            assert_eq!(
+                locks.stripe_index(block_base + intra),
+                s,
+                "offset {intra} within the block must share the block's stripe",
+            );
+        }
+        // The next 4 KiB block maps to a different stripe (adjacent block ->
+        // adjacent stripe, distinct here), so disjoint blocks don't needlessly
+        // serialize.
+        assert_ne!(
+            locks.stripe_index(block_base + 4096),
+            s,
+            "the next 4 KiB block must map to a different stripe",
+        );
     }
 
     #[test]

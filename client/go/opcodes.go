@@ -107,28 +107,28 @@ const (
 	ErrCodeRedirect         uint16 = 14
 
 	// Cluster / streaming / operational error codes (15-37).
-	ErrCodeNoQuorum               uint16 = 15
-	ErrCodeStreamNotFound         uint16 = 16
-	ErrCodeBlobNotFound           uint16 = 17
-	ErrCodeStreamOffsetMismatch   uint16 = 18
-	ErrCodeMigrationInProgress    uint16 = 19
-	ErrCodeReplicationFailed      uint16 = 20
-	ErrCodeMigrationManifest      uint16 = 21
-	ErrCodeMigrationManifestStale uint16 = 22
-	ErrCodeTopologyPersistFailed  uint16 = 23
-	ErrCodeStaleEpoch             uint16 = 24
-	ErrCodeClusterNotReady        uint16 = 25
-	ErrCodeIndexDegraded          uint16 = 26
-	ErrCodeClusterAuthFailed      uint16 = 27
-	ErrCodePayloadMalformed       uint16 = 28
-	ErrCodeOpcodeUnsupported      uint16 = 29
-	ErrCodeStorageIO              uint16 = 30
-	ErrCodeRateLimited            uint16 = 31
-	ErrCodeNotClustered           uint16 = 32
-	ErrCodeInvariantViolation     uint16 = 33
-	ErrCodeStreamInvariant        uint16 = 34
-	ErrCodeDeletedChildren        uint16 = 35
-	ErrCodeNotDue                 uint16 = 36
+	ErrCodeNoQuorum                uint16 = 15
+	ErrCodeStreamNotFound          uint16 = 16
+	ErrCodeBlobNotFound            uint16 = 17
+	ErrCodeStreamOffsetMismatch    uint16 = 18
+	ErrCodeMigrationInProgress     uint16 = 19
+	ErrCodeReplicationFailed       uint16 = 20
+	ErrCodeMigrationManifest       uint16 = 21
+	ErrCodeMigrationManifestStale  uint16 = 22
+	ErrCodeTopologyPersistFailed   uint16 = 23
+	ErrCodeStaleEpoch              uint16 = 24
+	ErrCodeClusterNotReady         uint16 = 25
+	ErrCodeIndexDegraded           uint16 = 26
+	ErrCodeClusterAuthFailed       uint16 = 27
+	ErrCodePayloadMalformed        uint16 = 28
+	ErrCodeOpcodeUnsupported       uint16 = 29
+	ErrCodeStorageIO               uint16 = 30
+	ErrCodeRateLimited             uint16 = 31
+	ErrCodeNotClustered            uint16 = 32
+	ErrCodeInvariantViolation      uint16 = 33
+	ErrCodeStreamInvariant         uint16 = 34
+	ErrCodeDeletedChildren         uint16 = 35
+	ErrCodeNotDue                  uint16 = 36
 	ErrCodeMigrationTargetNotReady uint16 = 37
 
 	ErrCodeInternal uint16 = 255
@@ -196,11 +196,27 @@ const (
 	SlotFrozen  uint8 = 0xFF
 )
 
-// Record flag bits.
+// CreateItem.Flags bits (the CREATE-wire flags byte).
+//
+// IMPORTANT: the CREATE-wire numbering is a SEPARATE namespace from the
+// server's PERSISTED TxFlags. On the wire a create is decoded as
+// locked=0x01, conflicting=0x02, frozen=0x04, external_blob=0x08; the
+// persisted layout differs (locked=0x04, external=0x08). Build the create
+// flags byte from these named constants only — putting the persisted LOCKED
+// bit (0x04) on the wire silently creates a FROZEN UTXO. Behavior note:
+// Teranode creates UNLOCKED and uses the separate SetLocked op, so only
+// create-time locking trips this; named constants keep callers honest.
 const (
+	// FlagLocked creates the transaction LOCKED (spends rejected until an
+	// explicit SetLocked(false)). Wire 0x01.
+	FlagLocked uint8 = 0x01
+	// FlagConflicting creates the transaction marked CONFLICTING. Wire 0x02.
+	FlagConflicting uint8 = 0x02
+	// FlagFrozen creates the transaction FROZEN. Wire 0x04.
+	FlagFrozen uint8 = 0x04
 	// FlagExternalBlob indicates that cold_data was pre-uploaded to the
 	// blobstore via OP_STREAM_CHUNK / OP_STREAM_END and should not be
-	// inlined in the CreateBatch payload.
+	// inlined in the CreateBatch payload. Wire 0x08.
 	FlagExternalBlob uint8 = 0x08
 )
 

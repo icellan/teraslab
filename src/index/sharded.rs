@@ -27,7 +27,6 @@ use std::sync::OnceLock;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::allocator::SlotAllocator;
 use crate::cluster::shards::ShardTable;
 use crate::device::BlockDevice;
 use crate::index::backend::PrimaryBackend;
@@ -77,9 +76,35 @@ const V2_MAX_SHARD_COUNT: usize = 256;
 ///
 /// Initialised once from `getrandom`; falls back to `RandomState` if the
 /// syscall is unavailable (e.g. restricted sandboxes).
-fn index_shard_seed() -> u64 {
+///
+/// Exposed to the crate so the sharded SECONDARY indexes
+/// ([`crate::index::sharded_secondary::ShardedSecondary`]) install the SAME
+/// seed: a given key then maps to the same shard NUMBER in both the primary and
+/// the secondary index, which keeps the cross-subsystem lock-order reasoning
+/// simple (the per-key secondary shard lock is taken while already holding the
+/// primary key's shard lock — different lock sets, same shard index).
+pub(crate) fn index_shard_seed() -> u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
     *SEED.get_or_init(crate::index::hashmix::init_process_seed)
+}
+
+/// Map `key` to a shard in `[0, shard_count)` using the SplitMix64 finaliser
+/// over txid bytes `[24..32]` XOR-ed with `seed`.
+///
+/// `shard_count` MUST be a power of two ≥ 1 (every constructor in this crate
+/// routes through `clamp_shard_count`), so `shard_count - 1` is the correct
+/// bitmask. Shared by [`ShardedIndex::index_shard_for_key`] and the sharded
+/// secondary indexes so a key routes to the same shard number in both.
+#[inline]
+pub(crate) fn shard_for_key(seed: u64, key: &TxKey, shard_count: usize) -> usize {
+    // The `try_into` on a statically-32-byte array with a fixed slice range
+    // cannot fail; `unwrap_or` maps the impossible error to 0 (panic-free
+    // library code per project rules, mirroring `locks.rs`).
+    let raw = u64::from_le_bytes(key.txid[24..32].try_into().unwrap_or([0u8; 8]));
+    // SplitMix64 finalizer over (raw XOR seed) — shared impl in
+    // `crate::index::hashmix`.
+    let x = crate::index::hashmix::splitmix64_finalize(raw ^ seed);
+    (x as usize) & (shard_count - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,17 +225,12 @@ impl ShardedIndex {
     /// stripe `[16..24]`) XOR-mixed with the per-process seed through a
     /// SplitMix64 finaliser.
     pub fn index_shard_for_key(&self, key: &TxKey) -> usize {
-        // The `try_into` on a statically-32-byte array with a fixed slice range
-        // cannot fail; `unwrap_or` maps the impossible error to 0 (panic-free
-        // library code per project rules, mirroring `locks.rs`).
-        let raw = u64::from_le_bytes(key.txid[24..32].try_into().unwrap_or([0u8; 8]));
-        // SplitMix64 finalizer over (raw XOR seed) — shared impl in
-        // `crate::index::hashmix`.
-        let x = crate::index::hashmix::splitmix64_finalize(raw ^ self.seed);
         // `shards.len()` is always a clamped power-of-two ≥ 1 (every constructor
-        // routes through `clamp_shard_count`), so `len - 1` is always the
-        // correct bitmask — no separate `shard_mask` field needed.
-        (x as usize) & (self.shards.len() - 1)
+        // routes through `clamp_shard_count`), so the shared `shard_for_key`
+        // bitmask (`len - 1`) is always correct — no separate `shard_mask`
+        // field needed. Factored so the sharded secondary indexes route a key
+        // to the same shard number under the same seed.
+        shard_for_key(self.seed, key, self.shards.len())
     }
 
     /// Acquire a read lock on the shard that owns `key`.
@@ -879,24 +899,43 @@ impl ShardedIndex {
     /// lock) are never blocked; a writer to shard `i` waits only while shard `i`
     /// itself is being serialized.
     ///
+    /// # Sharded secondaries
+    ///
+    /// `dah` / `unmined` are the sharded-secondary wrappers. They are spread
+    /// across the SAME shard count as this primary index, so:
+    /// - At one primary shard both wrappers are single-shard; the v1 path locks
+    ///   the primary shard FIRST and then the single secondary shards (write-path
+    ///   order), and delegates to the unchanged single-backend `snapshot_all`,
+    ///   producing a byte-identical v1 file.
+    /// - At N primary shards the v2 path serializes each primary region, releases
+    ///   every primary lock, then gathers the FULL (unsharded) secondary contents
+    ///   by fanning out over each wrapper's shards (`collect_pairs`, one shard
+    ///   locked at a time) — so no cross-subsystem lock is ever held at once and
+    ///   the on-disk secondary section is identical in layout to the single-table
+    ///   path (entry order within a section is irrelevant — restore re-inserts
+    ///   unordered).
+    ///
     /// # Errors
     ///
-    /// [`IndexError::FormatError`] if any shard or secondary backend is not the
-    /// in-memory variant; [`IndexError::Io`] on a filesystem failure; and the
-    /// v1 delegate's error at a single shard.
+    /// [`IndexError::FormatError`] if any primary shard or secondary backend is
+    /// not the in-memory variant; [`IndexError::Io`] on a filesystem failure; and
+    /// the v1 delegate's error at a single shard.
     pub fn snapshot_all_concurrent(
         &self,
-        dah: &parking_lot::Mutex<crate::index::DahBackend>,
-        unmined: &parking_lot::Mutex<crate::index::UnminedBackend>,
+        dah: &crate::index::ShardedDahIndex,
+        unmined: &crate::index::ShardedUnminedIndex,
         path: &std::path::Path,
     ) -> Result<(), IndexError> {
-        // One shard: keep the v1 format. Acquire the shard read lock FIRST,
-        // then the secondaries — the write path's order — so no barrier is
-        // needed to prevent the dah/unmined→shard inversion.
+        // One shard: keep the v1 format. Acquire the primary shard read lock
+        // FIRST, then the (single) secondary shards — the write path's order —
+        // so no barrier is needed to prevent the dah/unmined→shard inversion.
+        // The secondary wrappers are also single-shard here (same count as the
+        // primary), so `lock_shard0` yields the one backend, exactly matching the
+        // pre-sharding `&DahBackend` / `&UnminedBackend` the delegate expects.
         if self.shards.len() == 1 {
             let shard = self.shards[0].read();
-            let dah_g = dah.lock();
-            let unmined_g = unmined.lock();
+            let dah_g = dah.lock_shard0();
+            let unmined_g = unmined.lock_shard0();
             return shard.snapshot_all(&dah_g, &unmined_g, path);
         }
 
@@ -917,26 +956,25 @@ impl ShardedIndex {
             regions.push(idx.serialize_primary());
         }
 
-        // 2) Serialize the secondaries under their own locks, AFTER every shard
-        // lock above has been released (no nested lock → no write-path
-        // inversion).
-        let secondary = {
-            let dah_g = dah.lock();
-            let unmined_g = unmined.lock();
-            let (
-                crate::index::DahBackend::InMemory(dah_idx),
-                crate::index::UnminedBackend::InMemory(unmined_idx),
-            ) = (&*dah_g, &*unmined_g)
-            else {
-                return Err(IndexError::FormatError {
-                    detail:
-                        "ShardedIndex::snapshot_all_concurrent v2 requires in-memory dah/unmined \
+        // 2) Gather the secondaries' FULL contents AFTER every primary shard
+        // lock above has been released (no nested cross-subsystem lock → no
+        // write-path inversion). Mirror the prior "in-memory only" contract: a
+        // redb secondary is self-durable and must not be folded into the file.
+        if !dah.all_in_memory() || !unmined.all_in_memory() {
+            return Err(IndexError::FormatError {
+                detail: "ShardedIndex::snapshot_all_concurrent v2 requires in-memory dah/unmined \
                          backends"
-                            .into(),
-                });
-            };
-            crate::index::serialize_secondary_sections(dah_idx, unmined_idx)
-        };
+                    .into(),
+            });
+        }
+        // Each wrapper fans out over its own shards, locking one shard at a time
+        // (see `ShardedSecondary::collect_pairs`); the resulting pair lists are
+        // the full union, serialized into the same layout as the single-table
+        // path.
+        let dah_pairs = dah.collect_pairs();
+        let unmined_pairs = unmined.collect_pairs();
+        let secondary =
+            crate::index::serialize_secondary_sections_from_pairs(&dah_pairs, &unmined_pairs);
 
         let data = Self::assemble_v2(self.seed, &regions, &secondary);
 
@@ -1192,6 +1230,12 @@ impl ShardedIndex {
     /// - `shard_count`: the target number of index shards. Rounded up to the
     ///   next power of two and clamped to `[1, 256]` by `clamp_shard_count`.
     ///   Use `1` for the N=1 degenerate case (single-lock pass-through).
+    /// - `expected_records`: configured steady-state record count. The hash
+    ///   table is pre-sized to `max(scanned_count, expected_records)`, so a
+    ///   fresh/empty device still allocates steady-state capacity and avoids a
+    ///   resize storm (repeated rehash-under-write-guard as creates arrive).
+    ///   Pass `0` to size purely from the scanned count (the pre-change
+    ///   behavior).
     ///
     /// # Errors
     ///
@@ -1200,16 +1244,22 @@ impl ShardedIndex {
     /// (hash-table allocation failure when routing entries to shards).
     pub fn rebuild_in_memory(
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn crate::allocator::RecordAllocator,
         shard_count: usize,
+        expected_records: usize,
     ) -> Result<Self, IndexError> {
         // Single-backend device scan — reuses all proven scan logic.
         let single = PrimaryBackend::rebuild(device, allocator)?;
         let count = single.len();
 
-        // Capacity hint: at least 64 per shard so small devices don't
-        // allocate tiny tables; scale proportionally for larger scans.
-        let per_shard_hint = (count / clamp_shard_count(shard_count))
+        // Sizing basis is `max(scanned_count, expected_records)`: a fresh/empty
+        // device scans 0 records, so without the `expected_records` floor each
+        // shard would start tiny and rehash-under-write-guard repeatedly as
+        // steady-state creates arrive — a resize storm that serializes the
+        // create path. Capacity hint: at least 64 per shard so small devices
+        // don't allocate tiny tables; scale proportionally for larger inputs.
+        let basis = count.max(expected_records);
+        let per_shard_hint = (basis / clamp_shard_count(shard_count))
             .max(64)
             .saturating_mul(2);
 
@@ -1229,10 +1279,15 @@ impl ShardedIndex {
     /// right store. Used by the multi-store boot path when no index snapshot is
     /// available. With one store this is equivalent to [`Self::rebuild_in_memory`]
     /// (device_id 0). `devices` and `allocators` are 1:1 per store.
+    ///
+    /// The hash table is pre-sized to `max(total_scanned_count, expected_records)`
+    /// — see [`Self::rebuild_in_memory`] — so a fresh/empty cluster of stores
+    /// still allocates steady-state capacity and avoids a resize storm.
     pub fn rebuild_in_memory_multi_store(
         devices: &[std::sync::Arc<dyn BlockDevice>],
-        allocators: &[SlotAllocator],
+        allocators: &[crate::allocator::BoxedAllocator],
         shard_count: usize,
+        expected_records: usize,
     ) -> Result<Self, IndexError> {
         assert_eq!(
             devices.len(),
@@ -1243,11 +1298,15 @@ impl ShardedIndex {
         let mut singles = Vec::with_capacity(devices.len());
         let mut total = 0usize;
         for (dev, alloc) in devices.iter().zip(allocators.iter()) {
-            let single = PrimaryBackend::rebuild(&**dev, alloc)?;
+            let single = PrimaryBackend::rebuild(&**dev, &**alloc)?;
             total += single.len();
             singles.push(single);
         }
-        let per_shard_hint = (total / clamp_shard_count(shard_count))
+        // Sizing basis is `max(total_scanned_count, expected_records)` — see
+        // `rebuild_in_memory`: the `expected_records` floor pre-sizes a fresh
+        // cluster of stores to steady-state capacity, avoiding a resize storm.
+        let basis = total.max(expected_records);
+        let per_shard_hint = (basis / clamp_shard_count(shard_count))
             .max(64)
             .saturating_mul(2);
         let sharded =
@@ -2304,9 +2363,31 @@ mod tests {
             expected.insert(key.txid, entry);
         }
 
-        let dah = parking_lot::Mutex::new(crate::index::DahBackend::InMemory(DahIndex::new()));
-        let unmined =
-            parking_lot::Mutex::new(crate::index::UnminedBackend::InMemory(UnminedIndex::new()));
+        // Sharded secondaries at the SAME 16-shard count as the primary, so the
+        // v2 snapshot exercises the per-shard secondary fan-out. Populate both
+        // with pre-snapshot entries (keyed identically to the primary keys so
+        // they spread across the 16 secondary shards) and require every one to
+        // survive the restore.
+        let dah = crate::index::ShardedDahIndex::shard_in_memory(
+            crate::index::DahBackend::new_in_memory(),
+            16,
+        );
+        let unmined = crate::index::ShardedUnminedIndex::shard_in_memory(
+            crate::index::UnminedBackend::new_in_memory(),
+            16,
+        );
+        assert!(dah.shard_count() > 1, "secondaries must actually shard");
+        let mut expected_dah = std::collections::HashSet::new();
+        let mut expected_unmined = std::collections::HashSet::new();
+        for i in 0..PRE {
+            let key = make_key(i);
+            let dah_h = (i as u32 % 1000) + 1;
+            dah.insert(dah_h, key, None).unwrap();
+            expected_dah.insert(key.txid);
+            let unmined_h = (i as u32 % 700) + 1;
+            unmined.insert(unmined_h, key, None).unwrap();
+            expected_unmined.insert(key.txid);
+        }
 
         // Three writers register NEW entries (disjoint key ranges) concurrently
         // with the snapshot, so each shard is mutated while it is being — or
@@ -2337,7 +2418,7 @@ mod tests {
             w.join().unwrap();
         }
 
-        let (restored, _dah, _unmined, _flags) =
+        let (restored, restored_dah, restored_unmined, _flags) =
             ShardedIndex::restore_all(&path, 16).expect("fuzzy snapshot must restore");
         for (txid, entry) in &expected {
             let key = TxKey { txid: *txid };
@@ -2351,6 +2432,36 @@ mod tests {
             restored.len() >= PRE as usize,
             "restored index must hold at least the {PRE} pre-snapshot entries, got {}",
             restored.len()
+        );
+
+        // The sharded-secondary fan-out must serialize EVERY pre-snapshot
+        // secondary entry (these are stable — no concurrent secondary writes).
+        // `restore_all` returns the secondaries UNSHARDED, exactly as the v1
+        // path does, proving the on-disk secondary section is format-compatible.
+        assert_eq!(
+            restored_dah.len(),
+            expected_dah.len(),
+            "every pre-snapshot DAH entry must survive the sharded fan-out snapshot",
+        );
+        let restored_dah_set: std::collections::HashSet<[u8; 32]> = restored_dah
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        assert_eq!(restored_dah_set, expected_dah, "DAH membership must match");
+        assert_eq!(
+            restored_unmined.len(),
+            expected_unmined.len(),
+            "every pre-snapshot unmined entry must survive the sharded fan-out snapshot",
+        );
+        let restored_unmined_set: std::collections::HashSet<[u8; 32]> = restored_unmined
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        assert_eq!(
+            restored_unmined_set, expected_unmined,
+            "unmined membership must match",
         );
     }
 
@@ -2551,7 +2662,8 @@ mod tests {
     fn rebuild_in_memory_roundtrip() {
         let (dev, alloc, records) = setup_device_for_rebuild(50);
 
-        let sharded = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16).unwrap();
+        // expected_records=0 → sizing basis is the scanned count, unchanged.
+        let sharded = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16, 0).unwrap();
         assert_eq!(sharded.shard_count(), 16);
         assert_eq!(
             sharded.len(),
@@ -2615,7 +2727,7 @@ mod tests {
             std::sync::Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
 
-        let result = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16);
+        let result = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 16, 0);
         let sharded = result.expect("rebuild_in_memory on empty device must succeed");
 
         assert_eq!(sharded.shard_count(), 16, "must produce 16 shards");
@@ -2626,6 +2738,66 @@ mod tests {
             let guard = shard.read();
             assert_eq!(guard.len(), 0, "shard {i} must be empty");
         }
+    }
+
+    /// Regression guard for the fresh-start resize storm: on an EMPTY device the
+    /// scanned count is 0, so the old sizing (basis = `count`) allocated ~183
+    /// buckets/shard and forced a rehash-under-write-guard storm as steady-state
+    /// inserts arrived. Threading `expected_records` into the rebuild must
+    /// pre-size the table to steady-state capacity so no resize is needed.
+    #[test]
+    fn rebuild_in_memory_presizes_to_expected_records_on_empty_device() {
+        let dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+
+        let expected_records = 2_000_000usize;
+        let idx = ShardedIndex::rebuild_in_memory(&*dev, &alloc, 256, expected_records)
+            .expect("rebuild_in_memory on empty device must succeed");
+
+        let capacity = idx.stats().capacity;
+        assert!(
+            capacity >= expected_records,
+            "fresh-device rebuild must pre-size to expected_records to avoid a \
+             resize storm: capacity={capacity} < expected_records={expected_records}"
+        );
+    }
+
+    /// Backward-compat / regression pin: `expected_records = 0` must be a no-op
+    /// change — the sizing basis falls back to the scanned count exactly as
+    /// before. On an empty device that means the SAME capacity the old code
+    /// produced (`count=0` → `per_shard_hint = 128` → `new_in_memory(128*S, S)`),
+    /// proving the new max() only ever raises the floor and never alters the old
+    /// behavior when no expectation is supplied. Also guards that when the
+    /// scanned count exceeds `expected_records`, the larger count still governs.
+    #[test]
+    fn rebuild_in_memory_uses_scanned_count_when_larger_than_expected() {
+        let dev =
+            std::sync::Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let alloc = crate::allocator::SlotAllocator::new(dev.clone()).unwrap();
+
+        // expected_records = 0 reproduces the OLD capacity exactly: with count=0
+        // the basis is count.max(0) = count = 0, identical to pre-change sizing.
+        let shard_count = 256usize;
+        let old_basis = 0usize; // scanned count on an empty device
+        let per_shard_hint = (old_basis / clamp_shard_count(shard_count))
+            .max(64)
+            .saturating_mul(2);
+        let expected_old = ShardedIndex::new_in_memory(
+            per_shard_hint * clamp_shard_count(shard_count),
+            shard_count,
+        )
+        .unwrap()
+        .stats()
+        .capacity;
+
+        let idx = ShardedIndex::rebuild_in_memory(&*dev, &alloc, shard_count, 0)
+            .expect("rebuild_in_memory with expected_records=0 must succeed");
+        assert_eq!(
+            idx.stats().capacity,
+            expected_old,
+            "expected_records=0 must reproduce the old capacity exactly (no-op change)"
+        );
     }
 
     /// Multi-store device-scan rebuild must recover records from EVERY store and
@@ -2672,9 +2844,10 @@ mod tests {
         let (dev1, alloc1, keys1) = seed(20, 1);
 
         let devices: Vec<std::sync::Arc<dyn BlockDevice>> = vec![dev0, dev1];
-        let allocators = vec![alloc0, alloc1];
+        let allocators: Vec<crate::allocator::BoxedAllocator> =
+            vec![Box::new(alloc0), Box::new(alloc1)];
         let sharded =
-            ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16).unwrap();
+            ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16, 0).unwrap();
 
         assert_eq!(
             sharded.len(),

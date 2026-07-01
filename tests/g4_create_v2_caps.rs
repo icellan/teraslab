@@ -37,7 +37,7 @@ fn create_v2_with_too_many_parents_is_rejected_on_reopen() {
         record_offset: 4096,
         utxo_count: 1,
         is_conflicting: false,
-        record_bytes: vec![0u8; 256],
+        record_bytes: vec![0u8; 256].into(),
         parent_txids: bad_parents,
     })
     .unwrap();
@@ -78,7 +78,7 @@ fn create_v2_within_caps_round_trips() {
         record_offset: 4096,
         utxo_count: 1,
         is_conflicting: false,
-        record_bytes: vec![0u8; 512],
+        record_bytes: vec![0u8; 512].into(),
         parent_txids: parents.clone(),
     })
     .unwrap();

@@ -8,7 +8,18 @@
 //! Rebuilt from a device scan on recovery.
 
 use crate::index::TxKey;
-use std::collections::{BTreeMap, HashMap};
+use crate::server::fast_hash::FastTxHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::BuildHasherDefault;
+
+/// Per-height bucket of txids, keyed by the fast non-cryptographic txid hasher.
+///
+/// Insert and remove are O(1). A block's transactions can share a single
+/// delete_at_height, collapsing into one bucket; with a `Vec` removal was
+/// O(bucket) and draining that bucket was O(n^2). A set keeps each removal O(1).
+/// txids are double-SHA256 digests (uniformly random), so the fast first-8-bytes
+/// hasher distributes them well.
+type HeightBucket = HashSet<TxKey, BuildHasherDefault<FastTxHasher>>;
 
 /// Redo log entry for DAH secondary index mutations.
 ///
@@ -28,7 +39,7 @@ pub struct DahRedoEntry {
 /// Secondary index mapping delete_at_height to transactions.
 pub struct DahIndex {
     /// Forward map: height -> txids scheduled for deletion at that height.
-    by_height: BTreeMap<u32, Vec<TxKey>>,
+    by_height: BTreeMap<u32, HeightBucket>,
     /// Reverse map: txid -> current delete_at_height (for O(1) removal).
     by_txid: HashMap<TxKey, u32>,
 }
@@ -67,7 +78,7 @@ impl DahIndex {
             self.remove_from_height_vec(old_height, &key);
         }
         self.by_txid.insert(key, height);
-        self.by_height.entry(height).or_default().push(key);
+        self.by_height.entry(height).or_default().insert(key);
     }
 
     /// Remove a transaction from the DAH index.
@@ -85,7 +96,7 @@ impl DahIndex {
     pub fn range_query(&self, current_height: u32) -> Vec<TxKey> {
         let mut result = Vec::new();
         for (_, keys) in self.by_height.range(..=current_height) {
-            result.extend_from_slice(keys);
+            result.extend(keys.iter().copied());
         }
         result
     }
@@ -160,14 +171,15 @@ impl DahIndex {
             self.by_height
                 .entry(entry.new_height)
                 .or_default()
-                .push(key);
+                .insert(key);
         }
     }
 
-    /// Remove a key from the Vec at the given height, cleaning up empty vecs.
+    /// Remove a key from the bucket at the given height in O(1), dropping the
+    /// bucket when it becomes empty.
     fn remove_from_height_vec(&mut self, height: u32, key: &TxKey) {
         if let Some(keys) = self.by_height.get_mut(&height) {
-            keys.retain(|k| k != key);
+            keys.remove(key);
             if keys.is_empty() {
                 self.by_height.remove(&height);
             }
@@ -289,6 +301,86 @@ mod tests {
         assert_eq!(idx.len(), 0);
         assert!(idx.is_empty());
         assert!(idx.range_query(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn large_single_bucket_remove_all_one_by_one() {
+        // All keys scheduled for deletion at the SAME height collapse into one
+        // bucket. With the old Vec+retain this drain is O(n^2); with a set it is
+        // O(1) per removal.
+        const N: u32 = 5_000;
+        let height = 900_000;
+        let mut idx = DahIndex::new();
+
+        let keys: Vec<TxKey> = (0..N)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..4].copy_from_slice(&i.to_le_bytes());
+                TxKey { txid }
+            })
+            .collect();
+
+        for &k in &keys {
+            idx.insert(height, k);
+        }
+        assert_eq!(idx.len(), N as usize);
+        assert_eq!(idx.range_query(height).len(), N as usize);
+
+        for (removed, &k) in keys.iter().enumerate() {
+            idx.remove(&k);
+            let expected_remaining = N as usize - (removed + 1);
+            assert_eq!(idx.len(), expected_remaining);
+            assert_eq!(idx.range_query(height).len(), expected_remaining);
+        }
+
+        assert!(idx.is_empty());
+        assert!(idx.range_query(height).is_empty());
+    }
+
+    #[test]
+    fn mixed_insert_remove_query_correctness() {
+        let mut idx = DahIndex::new();
+        for i in 0u8..20 {
+            let h = if i % 2 == 0 { 100 } else { 200 };
+            idx.insert(h, key(i));
+        }
+        assert_eq!(idx.len(), 20);
+
+        for i in (0u8..20).filter(|i| i % 3 == 0) {
+            idx.remove(&key(i));
+        }
+
+        use std::collections::HashSet as StdHashSet;
+        let mut expected_at_or_below_100: StdHashSet<[u8; 32]> = StdHashSet::new();
+        let mut expected_all: StdHashSet<[u8; 32]> = StdHashSet::new();
+        for i in 0u8..20 {
+            if i % 3 == 0 {
+                continue;
+            }
+            expected_all.insert(key(i).txid);
+            if i % 2 == 0 {
+                expected_at_or_below_100.insert(key(i).txid);
+            }
+        }
+
+        // delete-at-height query (range_query) is order-independent now.
+        let got_100: StdHashSet<[u8; 32]> = idx.range_query(100).iter().map(|k| k.txid).collect();
+        assert_eq!(got_100, expected_at_or_below_100);
+
+        let got_all: StdHashSet<[u8; 32]> = idx.range_query(200).iter().map(|k| k.txid).collect();
+        assert_eq!(got_all, expected_all);
+
+        let iter_pairs: StdHashSet<(u32, [u8; 32])> =
+            idx.iter().map(|(h, k)| (h, k.txid)).collect();
+        let mut expected_pairs: StdHashSet<(u32, [u8; 32])> = StdHashSet::new();
+        for i in 0u8..20 {
+            if i % 3 == 0 {
+                continue;
+            }
+            let h = if i % 2 == 0 { 100 } else { 200 };
+            expected_pairs.insert((h, key(i).txid));
+        }
+        assert_eq!(iter_pairs, expected_pairs);
     }
 
     #[test]

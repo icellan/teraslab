@@ -35,6 +35,38 @@ type pipeConn struct {
 	closeOnce sync.Once
 	closed    atomic.Bool
 	connErr   atomic.Pointer[error]
+	// probeFailures counts CONSECUTIVE health-probe failures (reset on any
+	// successful probe). The pool only marks a connection dead once this reaches
+	// probeFailThreshold — see recordProbe.
+	probeFailures atomic.Int64
+}
+
+// probeFailThreshold is how many CONSECUTIVE health-probe failures a connection
+// must accumulate before the pool marks it dead and closes it.
+//
+// A single probe can falsely time out: the pool routes new requests to the
+// least-loaded (idle) connection, which is exactly the connection the health
+// checker decides to ping. If a burst of pipelined requests lands on it right
+// after the checker's `hasInflight()` skip-check, the ping queues behind the
+// server's per-connection in-flight cap and exceeds the probe timeout. Killing
+// the connection on that one false timeout closes it out from under those
+// just-dispatched requests, failing them with "connection closed" (the
+// pooled-path GET-failure race). Requiring two consecutive failures rides out a
+// transient timeout while still reaping a genuinely-dead idle connection within
+// one extra health cycle. A genuinely broken connection also surfaces via its
+// own read/write path (closeInternal), independent of this probe.
+const probeFailThreshold = 2
+
+// recordProbe folds one health-probe outcome into the connection's
+// consecutive-failure counter and reports whether the connection should now be
+// considered dead. A successful probe resets the streak. Returns true only once
+// the failure streak reaches probeFailThreshold.
+func (c *pipeConn) recordProbe(ok bool) bool {
+	if ok {
+		c.probeFailures.Store(0)
+		return false
+	}
+	return c.probeFailures.Add(1) >= probeFailThreshold
 }
 
 // hasInflight reports whether the connection currently has in-flight requests.
@@ -46,12 +78,30 @@ func (c *pipeConn) hasInflight() bool {
 	return c.inflight.Load() > 0
 }
 
+// inflightCount returns the number of requests currently in flight on this
+// connection (including health pings). The pool uses this to pick the
+// least-loaded connection and to decide whether a connection still has headroom
+// below the pipeline-depth target before growing the pool.
+func (c *pipeConn) inflightCount() int64 {
+	return c.inflight.Load()
+}
+
 // dial creates a new pipelined connection to the given address.
 func dial(ctx context.Context, addr string, timeout time.Duration) (*pipeConn, error) {
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	// Disable Nagle's algorithm. Requests and responses are small framed
+	// messages; with Nagle on, the client's small request writes are held in
+	// the kernel TCP send buffer waiting for a peer ACK, interacting with the
+	// peer's delayed-ACK to add 40 ms–3 s of latency per RPC. The server sets
+	// TCP_NODELAY on its accept path (src/server/mod.rs); without the matching
+	// client-side setting, every round-trip still pays the Nagle/delayed-ACK
+	// tax. Best-effort: only *net.TCPConn supports it.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
 	}
 	pc := &pipeConn{
 		conn:     conn,

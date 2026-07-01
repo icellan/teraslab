@@ -9,7 +9,18 @@
 //! index are logged in the redo log and replayed on recovery (Phase 7).
 
 use crate::index::TxKey;
-use std::collections::{BTreeMap, HashMap};
+use crate::server::fast_hash::FastTxHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::BuildHasherDefault;
+
+/// Per-height bucket of txids, keyed by the fast non-cryptographic txid hasher.
+///
+/// Insert and remove are O(1). A mined block's transactions all share one
+/// height, so they collapse into a single bucket; with a `Vec` removal was
+/// O(bucket) and a setMined burst over that bucket was O(n^2). A set keeps each
+/// setMined removal O(1). txids are double-SHA256 digests (uniformly random), so
+/// the fast first-8-bytes hasher distributes them well.
+type HeightBucket = HashSet<TxKey, BuildHasherDefault<FastTxHasher>>;
 
 /// Redo log entry for unmined index mutations.
 ///
@@ -28,7 +39,7 @@ pub struct UnminedRedoEntry {
 /// Secondary index mapping unmined_since to transactions.
 pub struct UnminedIndex {
     /// Forward map: unmined_since height -> txids.
-    by_height: BTreeMap<u32, Vec<TxKey>>,
+    by_height: BTreeMap<u32, HeightBucket>,
     /// Reverse map: txid -> current unmined_since value.
     by_txid: HashMap<TxKey, u32>,
 }
@@ -66,7 +77,7 @@ impl UnminedIndex {
         };
 
         self.by_txid.insert(key, height);
-        self.by_height.entry(height).or_default().push(key);
+        self.by_height.entry(height).or_default().insert(key);
 
         UnminedRedoEntry {
             txid: key.txid,
@@ -100,7 +111,7 @@ impl UnminedIndex {
     pub fn range_query(&self, cutoff_height: u32) -> Vec<TxKey> {
         let mut result = Vec::new();
         for (_, keys) in self.by_height.range(..=cutoff_height) {
-            result.extend_from_slice(keys);
+            result.extend(keys.iter().copied());
         }
         result
     }
@@ -152,13 +163,15 @@ impl UnminedIndex {
             self.by_height
                 .entry(entry.new_height)
                 .or_default()
-                .push(key);
+                .insert(key);
         }
     }
 
+    /// Remove a key from the bucket at the given height in O(1), dropping the
+    /// bucket when it becomes empty.
     fn remove_from_height_vec(&mut self, height: u32, key: &TxKey) {
         if let Some(keys) = self.by_height.get_mut(&height) {
-            keys.retain(|k| k != key);
+            keys.remove(key);
             if keys.is_empty() {
                 self.by_height.remove(&height);
             }
@@ -342,6 +355,95 @@ mod tests {
         assert_eq!(idx.range_query(300), vec![key(3)]);
         let r400 = idx.range_query(400);
         assert_eq!(r400.len(), 2); // key(2) at 400 + key(3) at 300
+    }
+
+    #[test]
+    fn large_single_bucket_remove_all_one_by_one() {
+        // All keys created at the SAME height collapse into one bucket — the
+        // setMined burst pattern. With the old Vec+retain this loop is O(n^2)
+        // and stalls; with a set each removal is O(1).
+        const N: u32 = 5_000;
+        let height = 800_000;
+        let mut idx = UnminedIndex::new();
+
+        let keys: Vec<TxKey> = (0..N)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0..4].copy_from_slice(&i.to_le_bytes());
+                TxKey { txid }
+            })
+            .collect();
+
+        for &k in &keys {
+            idx.insert(height, k);
+        }
+        assert_eq!(idx.len(), N as usize);
+        assert_eq!(idx.range_query(height).len(), N as usize);
+
+        // Remove one-by-one; after each removal the remaining keys must still
+        // all be present and the removed one gone.
+        for (removed, &k) in keys.iter().enumerate() {
+            idx.remove(&k);
+            let expected_remaining = N as usize - (removed + 1);
+            assert_eq!(idx.len(), expected_remaining);
+            assert_eq!(idx.range_query(height).len(), expected_remaining);
+        }
+
+        // Bucket fully drained — empty bucket dropped, query empty.
+        assert!(idx.is_empty());
+        assert!(idx.range_query(height).is_empty());
+    }
+
+    #[test]
+    fn mixed_insert_remove_iter_correctness() {
+        let mut idx = UnminedIndex::new();
+        // Two heights, interleaved inserts.
+        for i in 0u8..20 {
+            let h = if i % 2 == 0 { 100 } else { 200 };
+            idx.insert(h, key(i));
+        }
+        assert_eq!(idx.len(), 20);
+
+        // Remove every key whose n is divisible by 3.
+        for i in (0u8..20).filter(|i| i % 3 == 0) {
+            idx.remove(&key(i));
+        }
+
+        // Reconstruct expected sets.
+        use std::collections::HashSet as StdHashSet;
+        let mut expected_100: StdHashSet<[u8; 32]> = StdHashSet::new();
+        let mut expected_200: StdHashSet<[u8; 32]> = StdHashSet::new();
+        for i in 0u8..20 {
+            if i % 3 == 0 {
+                continue;
+            }
+            if i % 2 == 0 {
+                expected_100.insert(key(i).txid);
+            } else {
+                expected_200.insert(key(i).txid);
+            }
+        }
+
+        // range_query and iter are order-independent now; compare as sets.
+        let got_100: StdHashSet<[u8; 32]> = idx.range_query(100).iter().map(|k| k.txid).collect();
+        assert_eq!(got_100, expected_100);
+
+        let all: StdHashSet<[u8; 32]> = idx.range_query(200).iter().map(|k| k.txid).collect();
+        let mut expected_all = expected_100.clone();
+        expected_all.extend(expected_200.iter().copied());
+        assert_eq!(all, expected_all);
+
+        // iter() must yield exactly the live (height, key) pairs.
+        let iter_pairs: StdHashSet<(u32, [u8; 32])> =
+            idx.iter().map(|(h, k)| (h, k.txid)).collect();
+        let mut expected_pairs: StdHashSet<(u32, [u8; 32])> = StdHashSet::new();
+        for &t in &expected_100 {
+            expected_pairs.insert((100, t));
+        }
+        for &t in &expected_200 {
+            expected_pairs.insert((200, t));
+        }
+        assert_eq!(iter_pairs, expected_pairs);
     }
 
     #[test]

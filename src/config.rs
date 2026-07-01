@@ -202,6 +202,30 @@ pub enum ConfigError {
         backend: IndexBackendMode,
     },
 
+    /// `cache.writeback = true` with `cache.bytes = 0`. Write-back needs a
+    /// buffer to defer writes into; a zero budget means "no cache" and can only
+    /// be write-through (i.e. the device is not wrapped at all).
+    #[error(
+        "cache.writeback = true requires cache.bytes > 0 (write-back needs a buffer); \
+         set cache.bytes to a non-zero budget or leave cache.writeback = false"
+    )]
+    WriteBackRequiresCacheBytes,
+
+    /// `storage.packed = true` with `device_alignment > 4096`. Packed mode's
+    /// block-granular `io_locks` hardcode a 4096-byte lock block; a larger
+    /// device block could map two packed records in the same physical block to
+    /// different lock stripes and under-lock a shared block (torn writes). See
+    /// `docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.2.
+    #[error(
+        "storage.packed = true requires device_alignment <= 4096 (the packed io_locks lock \
+         block is 4096 bytes), found device_alignment = {device_alignment}; either set \
+         device_alignment <= 4096 or disable packing (storage.packed = false)"
+    )]
+    PackedAlignmentTooLarge {
+        /// The configured device alignment that exceeds the packed lock block.
+        device_alignment: usize,
+    },
+
     /// `advertise_addr` does not parse as `host:port` (only checked when set).
     /// See F-G10-013.
     #[error(
@@ -432,15 +456,6 @@ pub struct IndexConfig {
     /// Only used when `backend = "redb"`.
     pub redb_unmined_path: PathBuf,
 
-    /// Path for the redb deletion-tombstone lookup index database.
-    ///
-    /// Unlike the other redb paths this is used regardless of the primary
-    /// `backend` (tombstones are a cluster-correctness feature independent of
-    /// the primary-index storage mode). The on-device tombstone log is the
-    /// durable source of truth; this redb file is a derived index rebuilt
-    /// from the log on recovery.
-    pub redb_tombstone_path: PathBuf,
-
     /// redb page cache size in bytes. Default: 256 MiB.
     /// Only applies to the redb backend.
     pub redb_cache_size: usize,
@@ -464,7 +479,6 @@ impl Default for IndexConfig {
             redb_path: PathBuf::from("teraslab-index.redb"),
             redb_dah_path: PathBuf::from("teraslab-dah.redb"),
             redb_unmined_path: PathBuf::from("teraslab-unmined.redb"),
-            redb_tombstone_path: PathBuf::from("teraslab-tombstone.redb"),
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
             file_backed_path: PathBuf::from("teraslab-index.dat"),
             index_shards: 256,
@@ -489,6 +503,230 @@ impl IndexConfig {
     }
 }
 
+/// Optional in-RAM data-device block cache (see `docs/WRITE_CACHE_SPEC.md`).
+///
+/// `O_DIRECT` bypasses the OS page cache, so read-modify-write ops re-read each
+/// record from the device. This optional cache absorbs those reads (and, in
+/// write-back mode, defers the data writes to the next `sync()` barrier).
+///
+/// # Example (TOML)
+///
+/// ```toml
+/// [cache]
+/// bytes = 2147483648         # 2 GiB per-store; 0 (default) = no cache
+/// writeback = false          # false = write-through (no durability change)
+/// writeback_interval_ms = 50 # write-back only: background drain cadence
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    /// Per-store cache budget in bytes. `0` (default) disables the cache
+    /// entirely — the device is not wrapped and behavior is byte-for-byte the
+    /// raw `O_DIRECT` path (maximum safety).
+    pub bytes: usize,
+
+    /// `false` (default) = write-through (every write reaches the device
+    /// immediately; pure read acceleration, durability unchanged). `true` =
+    /// write-back (writes are buffered in RAM and flushed on the `sync()`
+    /// barrier the checkpoint already issues; still WAL-safe). Requires
+    /// `bytes > 0`.
+    pub writeback: bool,
+
+    /// Write-back only: cadence in milliseconds of the background writeback
+    /// thread that continuously drains dirty blocks to the device so the dirty
+    /// footprint stays bounded (keeping writes RAM-fast and the checkpoint's
+    /// `sync()` cheap). Default 50 ms. Purely a performance knob — it changes
+    /// only *when* dirty blocks reach the device ahead of `sync()`, never what
+    /// `sync()`/recovery guarantee. Ignored in write-through mode (no thread is
+    /// spawned). Clamped to a minimum of 1 ms.
+    pub writeback_interval_ms: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            writeback: false,
+            writeback_interval_ms: default_cache_writeback_interval_ms(),
+        }
+    }
+}
+
+/// Default background writeback cadence (ms) for [`CacheConfig`].
+const fn default_cache_writeback_interval_ms() -> u64 {
+    50
+}
+
+impl CacheConfig {
+    /// Whether the cache is enabled (non-zero budget).
+    pub fn is_enabled(&self) -> bool {
+        self.bytes > 0
+    }
+}
+
+/// On-device storage layout configuration (`[storage]` TOML section).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// Pack multiple sub-block records contiguously within a single device
+    /// block instead of giving each record its own 4 KiB block. `false`
+    /// (default) is the unchanged block-per-record layout — byte-for-byte
+    /// identical behavior and no extra I/O.
+    ///
+    /// Packing kills create write amplification (≈7 records per device write)
+    /// but changes the on-disk format: a packed device stamps allocator
+    /// header version 2 and MUST always be reopened packed (reopening it
+    /// non-packed corrupts it via `free()`'s block-rounding). Packing therefore
+    /// requires a FRESH device — there is no in-place migration. See
+    /// `docs/PACKED_RECORD_STORAGE_DESIGN.md`.
+    ///
+    /// When enabled, `device_alignment` must be `<= 4096`: the block-granular
+    /// `io_locks` hardcode a 4096-byte lock block, so a larger device block
+    /// could map two packed records to different lock stripes and under-lock a
+    /// shared block. Validation rejects `packed = true` with
+    /// `device_alignment > 4096`.
+    pub packed: bool,
+
+    /// How a new record is assigned to a store at create time:
+    /// `"round_robin"` (default) or `"txid"`.
+    ///
+    /// `"round_robin"` (default) is the unchanged behavior — even fill across
+    /// stores via a rotating counter, independent of the txid. `"txid"` makes
+    /// placement a deterministic function of the txid's last 8 bytes
+    /// (`store = last8(txid) LE % num_stores`), so a record's store is
+    /// computable from its txid for every op — the foundation for per-store
+    /// dispatch routing.
+    ///
+    /// Reads always route by the index entry's recorded `device_id`, never by
+    /// re-deriving placement, so switching this key on an already-populated
+    /// store is safe: existing records keep their recorded store and stay
+    /// readable; only NEW records follow the new strategy.
+    #[serde(deserialize_with = "deserialize_placement")]
+    pub placement: crate::subdevice::PlacementStrategy,
+
+    /// Append-only allocation: never reuse freed regions; every new record
+    /// extends the high-water mark (`false`, default, is the unchanged best-fit
+    /// freelist behavior).
+    ///
+    /// This is the Phase 1 log-structured write lever (see
+    /// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`): under the UTXO
+    /// recipe the create-then-delete churn fills the freelist, and best-fit
+    /// reuse then scatters new records into the freed holes — defeating the
+    /// write-back cache's sequential-flush coalescing. With `append_only`, frees
+    /// are still journaled and tracked (for recovery + accounting) but never
+    /// handed back out, so creates stay strictly sequential and coalesce into
+    /// large sequential write-backs like a log-structured store.
+    ///
+    /// Trade-off: NO space reclamation — the device grows unbounded (the
+    /// freelist accumulates and `persist` will eventually hit
+    /// `FreelistOverflow`). Intended for bounded benchmark runs and as the
+    /// precursor to the full segment engine (defrag-based reclaim, Phase 3), not
+    /// for unbounded production use. Unlike `packed`, this is a pure runtime
+    /// placement policy: it does not change the on-disk format and is NOT
+    /// persisted, so a device can be reopened in either mode safely.
+    pub append_only: bool,
+
+    /// Storage engine: `"in_place"` (default) uses the best-fit `SlotAllocator`;
+    /// `"segment"` uses the log-structured append-cursor `SegmentAllocator`
+    /// (creates append to a moving cursor; sequential writes; relocate + defrag in
+    /// later phases). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+    ///
+    /// The engine determines the on-disk allocator header format (distinct
+    /// magics), so a device formatted by one engine cannot be opened by the
+    /// other — switching engines requires a fresh device.
+    #[serde(deserialize_with = "deserialize_storage_engine")]
+    pub engine: StorageEngine,
+
+    /// Segment size in bytes for the `"segment"` engine (ignored by `"in_place"`).
+    /// Default 8 MiB. Must be a positive multiple of `device_alignment` and fit
+    /// the per-store data region.
+    #[serde(default = "default_segment_size")]
+    pub segment_size: u64,
+
+    /// Interpose the per-store streaming write buffer
+    /// ([`crate::streaming::StreamingWriteDevice`]) in front of each segment
+    /// store's device. Buffers the sequential append tail and flushes it as large
+    /// sequential pwrites (the reference datastore's streaming model), instead of
+    /// letting the random-access write-back cache re-scatter the appends into ~6 KB
+    /// writes (measured in `bench/results/20260630-ec2-segment`).
+    ///
+    /// Only meaningful with `engine = "segment"` (it has no effect on
+    /// `"in_place"`, whose writes are in-place RMW, not appends). When enabled the
+    /// underlying data cache is forced WRITE-THROUGH so the streaming flush — not
+    /// the cache's eviction path — owns write coalescing. Default `false`
+    /// (opt-in); the segment engine works without it (just with the scattered
+    /// write pattern the EC2 A/B measured).
+    #[serde(default)]
+    pub streaming: bool,
+}
+
+/// Default segment size (8 MiB) for the segment storage engine.
+const fn default_segment_size() -> u64 {
+    8 * 1024 * 1024
+}
+
+/// On-disk storage engine selection (`[storage] engine`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StorageEngine {
+    /// Best-fit freelist allocator (records placed at home offsets, updated in
+    /// place). Required for clustered/replicated nodes and for strict redo
+    /// durability (set `engine = "in_place"` explicitly for those).
+    InPlace,
+    /// Log-structured append-cursor allocator (creates append sequentially,
+    /// spends relocate-on-write). The default: higher throughput and lower tail
+    /// latency on the standalone UTXO workload. Requires buffered redo
+    /// durability (now the default) and a non-clustered node.
+    #[default]
+    Segment,
+}
+
+/// Deserialize the `[storage] engine` key into a [`StorageEngine`].
+/// Accepts `"in_place"` (or empty) and `"segment"`; rejects anything else loudly.
+fn deserialize_storage_engine<'de, D>(
+    deserializer: D,
+) -> std::result::Result<StorageEngine, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    match s.as_str() {
+        "in_place" => Ok(StorageEngine::InPlace),
+        // Empty string falls through to the default engine (segment), matching
+        // an absent `[storage] engine` key.
+        "segment" | "" => Ok(StorageEngine::Segment),
+        other => Err(serde::de::Error::custom(format!(
+            "unknown storage engine: {other:?} (expected \"in_place\" or \"segment\")"
+        ))),
+    }
+}
+
+/// Deserialize the `[storage] placement` key into a [`PlacementStrategy`].
+/// Accepts `"round_robin"` (or empty) and `"txid"`; rejects anything else with
+/// a typed serde error so a typo fails startup loudly instead of silently
+/// defaulting.
+fn deserialize_placement<'de, D>(
+    deserializer: D,
+) -> std::result::Result<crate::subdevice::PlacementStrategy, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use crate::subdevice::PlacementStrategy;
+    let s = String::deserialize(deserializer)?;
+    match s.as_str() {
+        "round_robin" | "" => Ok(PlacementStrategy::RoundRobin),
+        "txid" => Ok(PlacementStrategy::Txid),
+        other => Err(serde::de::Error::custom(format!(
+            "unknown placement strategy: {other:?} (expected \"round_robin\" or \"txid\")"
+        ))),
+    }
+}
+
+/// Maximum `device_alignment` (bytes) compatible with packed mode. The
+/// block-granular `io_locks` / `lock_span_blocks` hardcode a 4096-byte lock
+/// block (`docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.2); a larger device block
+/// could under-lock a shared block, so packing is refused above this.
+const PACKED_MAX_DEVICE_ALIGNMENT: usize = 4096;
+
 /// TeraSlab server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -512,13 +750,15 @@ pub struct ServerConfig {
     pub device_alignment: usize,
 
     /// Number of virtual stores to carve each physical device into
-    /// (Aerospike-style virtual devices). `1` = one store per device. Splitting
+    /// (reference-style virtual devices). `1` = one store per device. Splitting
     /// a device into K stores gives K independent allocators + index lock
     /// domains (lock/contention parallelism) sharing one physical device's I/O
     /// bandwidth and fsync barrier. Total stores = `device_paths.len() *
     /// device_split`, bounded by 256 (the index entry's `device_id` is a `u8`).
-    /// Records are placed round-robin across all stores at create time; reads
-    /// route by the index entry's recorded `device_id`.
+    /// Records are placed across all stores at create time per the
+    /// `[storage] placement` strategy (round-robin by default, or deterministic
+    /// txid→store); reads always route by the index entry's recorded
+    /// `device_id`.
     pub device_split: usize,
 
     /// Size of the redo log region in bytes.
@@ -528,22 +768,6 @@ pub struct ServerConfig {
     /// path by appending `.redo`.
     pub redo_log_path: Option<PathBuf>,
 
-    /// Size of the on-device deletion-tombstone log region in bytes.
-    ///
-    /// The tombstone log ([`crate::tombstone::TombstoneLog`]) is append-only
-    /// and — unlike the redo log — is NOT reset on checkpoint; it is bounded
-    /// only by GC compaction below the safe-rejoin horizon (a later phase).
-    /// The region must hold roughly `deletion_rate × horizon_window × 56 B`
-    /// worth of tombstones; the default matches the redo region until the GC
-    /// horizon tuning (deletion-tombstone design §3.3/§4.5) lands.
-    pub tombstone_region_size: u64,
-
-    /// Path for the on-device deletion-tombstone log file. If not set,
-    /// derived from the first device path by appending `.tombstone`. The
-    /// tombstone log lives in its own file (mirroring the redo log's
-    /// `.redo` sibling file) at region offset 0.
-    pub tombstone_log_path: Option<PathBuf>,
-
     /// Path for the tiny durable node-height file that persists the engine's
     /// `last_durable_height` across restarts (deletion-tombstone design §4,
     /// height subsystem). If not set, derived from the index snapshot path by
@@ -551,94 +775,12 @@ pub struct ServerConfig {
     ///
     /// The file holds a single fsynced, CRC-protected `u32` written
     /// atomically (temp + rename) by the checkpoint task and on graceful
-    /// shutdown, sibling to the allocator persist. It is ALWAYS maintained
-    /// (independent of `tombstones_enabled` / `tombstone_gc_enabled`); on
+    /// shutdown, sibling to the allocator persist. It is ALWAYS maintained; on
     /// recovery the value is restored and then bounded below by a
     /// record-derived floor so the height can never regress (monotonicity).
     /// A missing or corrupt file simply falls back to the record-derived
     /// floor — never a hard failure.
     pub last_durable_height_path: Option<PathBuf>,
-
-    /// Whether the engine writes a durable deletion tombstone on every
-    /// physical record delete, and whether recovery reconstructs the
-    /// tombstone index and runs the R2 self-purge pass.
-    ///
-    /// Default `true`. When `false`, the delete path behaves exactly as it
-    /// did before tombstones existed (no tombstone append, no extra work),
-    /// and recovery skips the tombstone rebuild + self-purge — the
-    /// conservative fallback per deletion-tombstone design §11.5.
-    pub tombstones_enabled: bool,
-
-    /// Whether tombstone-driven migration reconciliation is enabled
-    /// (deletion-tombstone Phase 8, design §7/§11.5).
-    ///
-    /// Default `false` — the conservative, soak-pending state. When `false`,
-    /// `OP_MIGRATION_COMPLETE`, the completion-frame builder, the superset
-    /// proof, and the failed-handoff disposition behave EXACTLY as on the
-    /// pre-Phase-8 path (Fix B superset-accept + #29 prune gate): no tombstone
-    /// frame section is emitted or decoded and no tombstone-driven drop occurs.
-    /// When `true`, a rejoinee classifies its migration over-count against the
-    /// source's tombstone manifest (§7) — dropping authoritatively-deleted keys
-    /// while transferring never-received keys up — and the superset proof
-    /// relaxes to the source's non-tombstoned keys. Enable only after CI soak
-    /// validates convergence + no-loss + no-resurrection (design §11.3).
-    pub tombstone_reconciliation_enabled: bool,
-
-    /// Whether bounded-retention tombstone garbage collection (Phase 5) and
-    /// its load-bearing rejoin-eligibility gate (Phase 4) are active
-    /// (deletion-tombstone design §4).
-    ///
-    /// Default `false` — the conservative, soak-pending state. The Phase 4
-    /// rejoin gate and the Phase 5 GC daemon are the §4.3 coupled pair: the
-    /// gate is what makes GC sound (a node stale enough to need a GC'd
-    /// tombstone is refused incremental rejoin and full-resynced), so they
-    /// share this single switch. When `false`:
-    ///
-    /// - The rejoin-eligibility gate is INERT: a catching-up node is admitted
-    ///   exactly as it is today (no staleness refusal, no forced full resync).
-    /// - The GC daemon performs NO tombstone range-delete and NO log
-    ///   compaction — tombstones are retained unboundedly (bounded only by the
-    ///   operational outage length), byte-identical to the pre-Phase-4/5 path.
-    ///
-    /// The always-on node-height tracking ([`crate::ops::engine::Engine::last_durable_height`])
-    /// and the [`crate::protocol::opcodes::OP_GET_NODE_HEIGHT`] query are
-    /// purely additive and are NOT gated by this flag (they only track and
-    /// answer a number; nothing acts on it unless GC is enabled).
-    ///
-    /// Enable only after CI soak validates the cross-node min-finalized-height
-    /// horizon, GC firing, and a laggard rejoining right at the grace boundary
-    /// being full-resynced rather than incrementally admitted (design §11.3).
-    pub tombstone_gc_enabled: bool,
-
-    /// Maximum staleness (in block heights) a rejoining node may carry before
-    /// it is refused an incremental rejoin and forced into a full-baseline
-    /// resync (deletion-tombstone design §4.2/§4.5).
-    ///
-    /// This is the load-bearing coupling bound shared by the Phase 4 rejoin
-    /// gate and the Phase 5 GC horizon: a tombstone is GC-eligible once
-    /// `min_member_finalized_height − deletion_height ≥ rejoin_grace_blocks`,
-    /// and a node more than `rejoin_grace_blocks` behind the cluster tip is
-    /// refused incremental rejoin. Because both use the SAME bound, any node
-    /// stale enough to still need a GC'd tombstone is — by the §4.3 proof —
-    /// too stale to be admitted incrementally and is instead full-resynced
-    /// (which discards its stale copy).
-    ///
-    /// Default `100_000` — a finality-scale value (design §4.5: tie to
-    /// finality, not to a generous outage window). Only consulted when
-    /// [`Self::tombstone_gc_enabled`] is `true`.
-    pub rejoin_grace_blocks: u32,
-
-    /// Cadence in milliseconds at which the background tombstone-GC daemon
-    /// (Phase 5) evaluates the GC horizon (deletion-tombstone design §4.6).
-    ///
-    /// Each tick — only when [`Self::tombstone_gc_enabled`] is `true` — the
-    /// daemon computes the committed-member min finalized height, derives the
-    /// safe horizon, range-deletes redb tombstone rows below it, and compacts
-    /// the on-device log prefix. A missing member height makes the daemon skip
-    /// the round (conservative; never GC on incomplete info). Sized like the
-    /// checkpoint cadence; a slow cadence only delays reclamation, never
-    /// affects correctness. Default `60_000` (one minute).
-    pub tombstone_gc_poll_interval_ms: u64,
 
     /// Path for the index snapshot file.
     pub index_snapshot_path: PathBuf,
@@ -720,6 +862,84 @@ pub struct ServerConfig {
     /// Maximum aggregate request-frame bytes allowed in flight across all
     /// TCP connection threads. A value of 0 disables the aggregate cap.
     pub max_inflight_request_bytes: usize,
+
+    /// Per-connection request pipelining depth: the number of requests on a
+    /// single connection that may be dispatched concurrently.
+    ///
+    /// `1` (the default) preserves the strictly serial per-connection model —
+    /// each request is fully handled (including its redo fsync) before the next
+    /// on that connection is read. Values `> 1` let the connection dispatch up
+    /// to `pipeline_depth` requests at once on a bounded worker pool, with
+    /// responses written back as each completes (matched by `request_id`, so
+    /// they may return out of order). This raises the number of mutations
+    /// reaching the redo group-commit concurrently — the throughput lever for
+    /// clients that keep several requests in flight on one connection — without
+    /// needing one OS connection/thread per in-flight request.
+    ///
+    /// Ordering caveat: with `> 1`, two requests issued on the same connection
+    /// without waiting for the first's response may be applied in either order.
+    /// Stateful blob-streaming ops (`OP_STREAM_CHUNK` / `OP_STREAM_END`) and
+    /// authenticated inter-node frames always take a drain barrier and run
+    /// serially, so their semantics are unchanged.
+    pub pipeline_depth: usize,
+
+    /// Buffered (relaxed) redo durability. `false` (default) = strict: every
+    /// mutation is fsynced to the redo WAL before it is acked (no acked write is
+    /// ever lost on crash). `true` = buffered: a mutation is acked after its
+    /// in-memory redo append, and a background flusher (every
+    /// [`Self::redo_flush_interval_ms`]) plus the checkpoint barrier make it
+    /// durable. This removes the fsync from the ack path — the main write-
+    /// throughput lever — at the cost of a bounded crash-loss window: on an
+    /// unclean shutdown, mutations acked since the last background flush are
+    /// lost. The store stays internally consistent (the redo is the source of
+    /// truth, so a lost entry's mutation vanishes atomically). Use only where
+    /// the client tolerates re-submitting a small recent tail after a crash.
+    pub redo_buffered: bool,
+
+    /// Background redo-flush interval in milliseconds when
+    /// [`Self::redo_buffered`] is `true`. Smaller = narrower crash-loss window
+    /// but more fsyncs; larger = better coalescing but more at-risk data.
+    /// Ignored under strict durability.
+    pub redo_flush_interval_ms: u64,
+
+    /// Open the redo log through the OS page cache (buffered I/O) instead of
+    /// `O_DIRECT` (Linux) / `F_NOCACHE` (macOS), AND make the background
+    /// flusher pwrite WITHOUT a per-flush fsync. `false` (default) keeps the
+    /// existing behavior byte-for-byte: the redo device is opened `O_DIRECT`
+    /// and every background flush fsyncs.
+    ///
+    /// When `true`, redo writes go through the page cache (smooth, kernel-
+    /// coalesced writeback) and the background flusher skips the per-flush
+    /// fsync — durability for the redo then comes from (a) OS writeback and
+    /// (b) the checkpoint barrier, which still fsyncs the redo BEFORE it
+    /// fences/reclaims the log, so reclamation safety is unchanged. The DATA
+    /// device(s) are UNAFFECTED — they always stay `O_DIRECT`. Only the redo
+    /// WAL is buffered. This is a relaxed-durability lever (matching a
+    /// no-commit-to-device posture): on an unclean shutdown the un-fsynced
+    /// redo tail is lost, but the store stays internally consistent because
+    /// the data writes for that tail are equally relaxed.
+    ///
+    /// This implies buffered redo durability: it is only meaningful together
+    /// with [`Self::redo_buffered`] (the ack path must already be off the
+    /// fsync), and the server enables buffered durability automatically when
+    /// this is set.
+    pub redo_buffered_io: bool,
+
+    /// Lever 7: use the in-device segment-ring redo layout
+    /// (`docs/REDO_SEGMENT_RING_DESIGN.md`) instead of the linear-with-reset log.
+    /// `false` (default) keeps the linear layout. A FRESH redo region adopts this
+    /// setting; an existing on-disk ring is always used as a ring regardless
+    /// (the device format wins), and an existing non-empty LINEAR log stays
+    /// linear until it is drained (clean shutdown) + the region reset — the node
+    /// warns and runs on linear that session rather than discarding live redo.
+    pub redo_segment_ring: bool,
+
+    /// Segment size in bytes for the ring layout when [`Self::redo_segment_ring`]
+    /// is enabled. `0` (default) auto-derives ~8 segments from
+    /// [`Self::redo_log_size`]. When set, must be a non-zero multiple of
+    /// [`Self::device_alignment`] and leave at least 3 whole segments in the
+    /// region. Ignored when the ring is disabled.
+    pub redo_segment_size: u64,
 
     /// HTTP listen address for observability endpoints (metrics, health, debug).
     pub http_listen_addr: String,
@@ -987,6 +1207,14 @@ pub struct ServerConfig {
     /// indexes use in-memory hash tables or on-disk redb B+ trees.
     pub index: IndexConfig,
 
+    /// Optional in-RAM data-device block cache. Disabled by default
+    /// (`bytes = 0`). See [`CacheConfig`].
+    pub cache: CacheConfig,
+
+    /// On-device storage layout (`[storage]`). `packed` is off by default. See
+    /// [`StorageConfig`].
+    pub storage: StorageConfig,
+
     /// Expected device identity (hex string). If set, the server refuses to
     /// start if the on-disk identity does not match. Use this to prevent
     /// accidentally pointing at the wrong device.
@@ -1014,19 +1242,7 @@ impl Default for ServerConfig {
             device_split: 1,
             redo_log_size: 64 * 1024 * 1024, // 64 MiB
             redo_log_path: None,
-            tombstone_region_size: 64 * 1024 * 1024, // 64 MiB
-            tombstone_log_path: None,
             last_durable_height_path: None,
-            tombstones_enabled: true,
-            tombstone_reconciliation_enabled: false,
-            // Phase 4+5 (rejoin gate + GC daemon) ship DISABLED. The enabled
-            // path awaits CI soak (design §11.5); until then there is no
-            // rejoin refusal and no tombstone GC — byte-identical behavior.
-            tombstone_gc_enabled: false,
-            // Finality-scale default (design §4.5). Only consulted when
-            // `tombstone_gc_enabled` is true.
-            rejoin_grace_blocks: 100_000,
-            tombstone_gc_poll_interval_ms: 60_000,
             index_snapshot_path: PathBuf::from("teraslab-index.snap"),
             expected_records: 100_000,
             lock_stripes: 65536,
@@ -1037,6 +1253,17 @@ impl Default for ServerConfig {
             max_active_streams_per_connection: Self::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
             stream_idle_timeout_secs: Self::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             max_inflight_request_bytes: 256 * 1024 * 1024,
+            pipeline_depth: 1,
+            // Buffered redo durability is the default: it matches the reference
+            // datastore's async-durability posture and is REQUIRED by the
+            // default segment engine (whose relocate-on-spend journals after the
+            // data write). Set `redo_buffered = false` for strict durability —
+            // which also requires `engine = "in_place"`.
+            redo_buffered: true,
+            redo_flush_interval_ms: 5,
+            redo_buffered_io: false,
+            redo_segment_ring: false,
+            redo_segment_size: 0,
             http_listen_addr: "127.0.0.1:9100".to_string(),
             enable_remote_bind: false,
             enable_admin_endpoints: false,
@@ -1080,6 +1307,8 @@ impl Default for ServerConfig {
             replica_lag_warn_threshold_ops: 10_000,
             recovery_missing_primary_tolerance: 65_536,
             index: IndexConfig::default(),
+            cache: CacheConfig::default(),
+            storage: StorageConfig::default(),
             device_id: None,
             observability: ObservabilityConfig::default(),
         }
@@ -1176,6 +1405,17 @@ impl ServerConfig {
     /// otherwise derives it from the first device path by appending `.redo`.
     ///
     /// When `redo_log_path` is `None` and `device_paths` is empty (a
+    /// Whether buffered (relaxed) redo durability is in effect.
+    ///
+    /// `true` when [`Self::redo_buffered`] is set OR [`Self::redo_buffered_io`]
+    /// is set: the page-cache redo open + no-per-flush-fsync flusher only make
+    /// sense once the ack path is already off the fsync, so `redo_buffered_io`
+    /// implies buffered durability. This single source of truth gates both the
+    /// engine's `set_buffered_durability` and the background flusher's spawn.
+    pub fn redo_buffered_effective(&self) -> bool {
+        self.redo_buffered || self.redo_buffered_io
+    }
+
     /// misconfiguration that `validate_safe_defaults` rejects with
     /// `ConfigError::NoDevicePaths`), this falls back to the built-in
     /// default `teraslab-data.dat.redo` rather than panicking. The
@@ -1191,29 +1431,6 @@ impl ServerConfig {
                     .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
                 let mut p = base.into_os_string();
                 p.push(".redo");
-                PathBuf::from(p)
-            }
-        }
-    }
-
-    /// Resolve the deletion-tombstone log file path. Uses
-    /// `tombstone_log_path` if explicitly set, otherwise derives it from the
-    /// first device path by appending `.tombstone`.
-    ///
-    /// Same fallback story as [`Self::resolved_redo_log_path`] when
-    /// `tombstone_log_path` is `None` and `device_paths` is empty —
-    /// `validate_safe_defaults` is the gate.
-    pub fn resolved_tombstone_log_path(&self) -> PathBuf {
-        match &self.tombstone_log_path {
-            Some(p) => p.clone(),
-            None => {
-                let base = self
-                    .device_paths
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| PathBuf::from("teraslab-data.dat"));
-                let mut p = base.into_os_string();
-                p.push(".tombstone");
                 PathBuf::from(p)
             }
         }
@@ -1332,6 +1549,42 @@ impl ServerConfig {
     /// — the runtime signal emitted when RF > 1 best-effort is *not* in use
     /// but individual best-effort paths fall back because replicas ACK-failed.
     pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
+        // The log-structured segment engine is NON-CLUSTERED in v1: its spends
+        // relocate the record (a physical move) rather than journaling a logical
+        // op, so the redo entries cannot be converted to replica ops. Refuse to
+        // start a clustered / replicated node on the segment engine rather than
+        // silently dropping replication. (See increment 4 / the design doc.)
+        if self.storage.engine == StorageEngine::Segment
+            && (self.is_clustered() || self.replication_factor > 1)
+        {
+            return Err(format!(
+                "storage.engine = \"segment\" is not supported with clustering \
+                 (node_id = {}, replication_factor = {}): the log-structured engine \
+                 is non-clustered in v1. Use storage.engine = \"in_place\" for clustered \
+                 nodes, or run this node standalone (node_id = 0, replication_factor = 1).",
+                self.node_id, self.replication_factor,
+            ));
+        }
+        // The segment engine's spend journals its `Relocate` intent AFTER writing
+        // the relocated record (not WAL-first): the new append-cursor offset is
+        // only known once allocated during apply. Crash safety therefore relies on
+        // BUFFERED durability — the checkpoint barrier fsyncs every store's data
+        // device before reclaiming any redo prefix, so the relocated image, its
+        // `Relocate` redo, and the old-extent dead-mark become durable together (a
+        // crash before the barrier loses all three and leaves the pre-relocation
+        // record intact). Under STRICT durability that ordering is not guaranteed,
+        // so refuse to start rather than silently weaken the crash contract.
+        if self.storage.engine == StorageEngine::Segment && !self.redo_buffered_effective() {
+            return Err(
+                "storage.engine = \"segment\" requires buffered redo durability: set \
+                 redo_buffered = true (or redo_buffered_io = true). The log-structured \
+                 spend journals its Relocate intent after writing the relocated record, \
+                 so crash safety depends on the checkpoint barrier fsyncing the data \
+                 device before reclaiming the redo — a guarantee strict durability does \
+                 not provide."
+                    .to_string(),
+            );
+        }
         match self.ack_policy.as_str() {
             "auto" | "write_all" | "write_majority" | "best_effort" => {}
             other => {
@@ -1538,6 +1791,21 @@ impl ServerConfig {
             });
         }
 
+        // Write-back caching needs a non-zero buffer to defer writes into.
+        if self.cache.writeback && self.cache.bytes == 0 {
+            return Err(ConfigError::WriteBackRequiresCacheBytes);
+        }
+
+        // Packed mode is only safe when the device block (the RMW unit) is no
+        // larger than the 4096-byte io_locks lock block; otherwise two packed
+        // records in one physical block could map to different lock stripes and
+        // a shared block could be under-locked. Off by default → no-op.
+        if self.storage.packed && self.device_alignment > PACKED_MAX_DEVICE_ALIGNMENT {
+            return Err(ConfigError::PackedAlignmentTooLarge {
+                device_alignment: self.device_alignment,
+            });
+        }
+
         // (0b) Size sanity gates. Pre-fix `device_alignment = 0` or
         // non-power-of-2 `lock_stripes` produced cryptic runtime panics.
         self.validate_sizes()?;
@@ -1722,10 +1990,29 @@ impl ServerConfig {
         }
         nonzero_u64("device_size", self.device_size)?;
         nonzero_u64("redo_log_size", self.redo_log_size)?;
-        nonzero_u64("tombstone_region_size", self.tombstone_region_size)?;
         nonzero_usize("expected_records", self.expected_records)?;
         nonzero_u32("max_batch_size", self.max_batch_size)?;
         nonzero_usize("max_connections", self.max_connections)?;
+
+        // Lever 7: validate an explicit ring segment size (0 = auto-derive). The
+        // redo region (minus its one-block header) must hold at least 3 whole
+        // segments, each independently O_DIRECT-writable (alignment-multiple).
+        if self.redo_segment_ring && self.redo_segment_size != 0 {
+            let align = self.device_alignment as u64;
+            if !self.redo_segment_size.is_multiple_of(align) {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "redo_segment_size = {} must be a multiple of device_alignment {}",
+                    self.redo_segment_size, self.device_alignment
+                )));
+            }
+            let entries = self.redo_log_size.saturating_sub(align);
+            if entries / self.redo_segment_size < 3 {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "redo_segment_size = {} leaves fewer than 3 segments in a {}-byte redo region",
+                    self.redo_segment_size, self.redo_log_size
+                )));
+            }
+        }
 
         // BC-01: checkpoint watermarks must form a valid hysteresis
         // band (0 < low < high < 1) so the background trigger has
@@ -1767,13 +2054,6 @@ impl ServerConfig {
         nonzero_u64(
             "checkpoint_poll_interval_ms",
             self.checkpoint_poll_interval_ms,
-        )?;
-        // The tombstone-GC daemon polls on this cadence (Phase 5). A zero
-        // interval would busy-spin the daemon thread; require it non-zero
-        // even though the daemon only acts when `tombstone_gc_enabled`.
-        nonzero_u64(
-            "tombstone_gc_poll_interval_ms",
-            self.tombstone_gc_poll_interval_ms,
         )?;
 
         // device_size must be large enough to hold at least one record's
@@ -1969,12 +2249,14 @@ backend = ""
 
     #[test]
     fn best_effort_with_rf_3_is_rejected() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 3,
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
+        // Clustered nodes require the in_place engine (segment is standalone-only).
+        cfg.storage.engine = StorageEngine::InPlace;
 
         let err = cfg.validate_cluster_safety().unwrap_err();
         assert!(err.contains("replication_degraded_mode"));
@@ -1984,12 +2266,13 @@ backend = ""
 
     #[test]
     fn best_effort_with_rf_2_is_rejected() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 2,
             replication_factor: 2,
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
+        cfg.storage.engine = StorageEngine::InPlace;
 
         let err = cfg.validate_cluster_safety().unwrap_err();
         assert!(err.contains("replication_factor = 2"));
@@ -1997,13 +2280,14 @@ backend = ""
 
     #[test]
     fn ack_policy_best_effort_requires_degraded_mode_best_effort() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 3,
             ack_policy: "best_effort".to_string(),
             replication_degraded_mode: "reject".to_string(),
             ..ServerConfig::default()
         };
+        cfg.storage.engine = StorageEngine::InPlace;
 
         let err = cfg.validate_cluster_safety().unwrap_err();
         assert!(err.contains("ack_policy"), "error was: {err}");
@@ -2014,12 +2298,14 @@ backend = ""
     #[test]
     fn best_effort_with_rf_1_is_accepted() {
         // RF=1 means no replicas — best_effort is a no-op and permitted.
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 1,
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
+        // node_id>0 is clustered → in_place (segment is standalone-only).
+        cfg.storage.engine = StorageEngine::InPlace;
 
         cfg.validate_cluster_safety()
             .expect("RF=1 with best_effort must validate successfully");
@@ -2052,6 +2338,382 @@ backend = ""
     }
 
     #[test]
+    fn writeback_cache_requires_nonzero_bytes() {
+        let cfg = ServerConfig {
+            cache: CacheConfig {
+                bytes: 0,
+                writeback: true,
+                ..CacheConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        match cfg.validate_safe_defaults() {
+            Err(ConfigError::WriteBackRequiresCacheBytes) => {}
+            other => panic!("expected WriteBackRequiresCacheBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cache_defaults_to_disabled_and_passes_validation() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.cache.bytes, 0, "cache is off by default");
+        assert!(!cfg.cache.writeback);
+        assert_eq!(
+            cfg.cache.writeback_interval_ms, 50,
+            "background writeback cadence defaults to 50 ms"
+        );
+        assert!(!cfg.cache.is_enabled());
+        // Default config (cache off) must validate.
+        cfg.validate_safe_defaults()
+            .expect("default config (cache disabled) must validate");
+    }
+
+    #[test]
+    fn storage_packed_defaults_off_and_validates() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.storage.packed, "packed must default to OFF");
+        cfg.validate_safe_defaults()
+            .expect("default config (packed off) must validate");
+    }
+
+    #[test]
+    fn packed_with_4096_alignment_validates() {
+        let cfg = ServerConfig {
+            storage: StorageConfig {
+                packed: true,
+                ..StorageConfig::default()
+            },
+            device_alignment: 4096,
+            ..ServerConfig::default()
+        };
+        cfg.validate_safe_defaults()
+            .expect("packed with device_alignment = 4096 must validate");
+    }
+
+    #[test]
+    fn placement_defaults_to_round_robin() {
+        let cfg = ServerConfig::default();
+        assert_eq!(
+            cfg.storage.placement,
+            crate::subdevice::PlacementStrategy::RoundRobin,
+            "placement must default to round_robin (unchanged behavior)",
+        );
+        // A config with no [storage] section at all also defaults to round_robin.
+        let cfg2: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            cfg2.storage.placement,
+            crate::subdevice::PlacementStrategy::RoundRobin,
+        );
+    }
+
+    #[test]
+    fn placement_txid_parses_from_toml() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nplacement = \"txid\"\n").unwrap();
+        assert_eq!(
+            cfg.storage.placement,
+            crate::subdevice::PlacementStrategy::Txid,
+        );
+    }
+
+    #[test]
+    fn placement_round_robin_parses_from_toml() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nplacement = \"round_robin\"\n").unwrap();
+        assert_eq!(
+            cfg.storage.placement,
+            crate::subdevice::PlacementStrategy::RoundRobin,
+        );
+    }
+
+    #[test]
+    fn placement_unknown_value_is_rejected() {
+        let result: std::result::Result<ServerConfig, _> =
+            toml::from_str("[storage]\nplacement = \"by_size\"\n");
+        let err = result.expect_err("unknown placement strategy must fail to parse");
+        assert!(
+            err.to_string().contains("unknown placement strategy"),
+            "error must name the bad key: {err}",
+        );
+    }
+
+    #[test]
+    fn storage_engine_defaults_to_segment() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
+        // The default is a bootable standalone config: segment requires buffered
+        // durability (also now the default) and a non-clustered node.
+        assert!(
+            cfg.redo_buffered_effective(),
+            "default durability is buffered"
+        );
+        cfg.validate_cluster_safety()
+            .expect("default (segment + buffered + standalone) must validate");
+    }
+
+    #[test]
+    fn empty_engine_string_resolves_to_default_segment() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nengine = \"\"\n").unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
+    }
+
+    #[test]
+    fn storage_engine_segment_parses_with_segment_size_default() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nengine = \"segment\"\n").unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
+        assert_eq!(cfg.storage.segment_size, 8 * 1024 * 1024, "default 8 MiB");
+    }
+
+    #[test]
+    fn storage_engine_in_place_and_custom_segment_size_parse() {
+        let cfg: ServerConfig =
+            toml::from_str("[storage]\nengine = \"in_place\"\nsegment_size = 16777216\n").unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::InPlace);
+        assert_eq!(cfg.storage.segment_size, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn segment_engine_rejected_with_clustering() {
+        // node_id > 0 → clustered → segment engine must be refused.
+        let mut cfg = ServerConfig {
+            node_id: 1,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::Segment;
+        let err = cfg
+            .validate_cluster_safety()
+            .expect_err("segment engine on a clustered node must be refused");
+        assert!(
+            err.contains("segment") && err.contains("clustering"),
+            "error must explain the conflict: {err}",
+        );
+    }
+
+    #[test]
+    fn segment_engine_allowed_standalone() {
+        // node_id = 0, replication_factor = 1, buffered durability → segment OK.
+        let mut cfg = ServerConfig::default();
+        cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = true;
+        assert_eq!(cfg.node_id, 0);
+        assert_eq!(cfg.replication_factor, 1);
+        cfg.validate_cluster_safety()
+            .expect("segment engine must be allowed on a standalone buffered node");
+    }
+
+    #[test]
+    fn storage_streaming_defaults_off_and_parses() {
+        let def: ServerConfig = toml::from_str("[storage]\nengine = \"segment\"\n").unwrap();
+        assert!(!def.storage.streaming, "streaming defaults off");
+        let on: ServerConfig =
+            toml::from_str("[storage]\nengine = \"segment\"\nstreaming = true\n").unwrap();
+        assert!(on.storage.streaming, "streaming = true must parse");
+        assert_eq!(on.storage.engine, StorageEngine::Segment);
+    }
+
+    #[test]
+    fn segment_engine_rejected_under_strict_durability() {
+        // Standalone but STRICT durability → segment engine must be refused: its
+        // spend journals the Relocate after the data write (not WAL-first), so
+        // crash safety needs the buffered checkpoint barrier.
+        let mut cfg = ServerConfig::default();
+        cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = false;
+        cfg.redo_buffered_io = false;
+        let err = cfg
+            .validate_cluster_safety()
+            .expect_err("segment engine under strict durability must be refused");
+        assert!(
+            err.contains("segment") && err.contains("buffered"),
+            "error must explain the durability requirement: {err}",
+        );
+    }
+
+    #[test]
+    fn storage_engine_unknown_value_is_rejected() {
+        let result: std::result::Result<ServerConfig, _> =
+            toml::from_str("[storage]\nengine = \"lsm\"\n");
+        let err = result.expect_err("unknown storage engine must fail to parse");
+        assert!(
+            err.to_string().contains("unknown storage engine"),
+            "error must name the bad key: {err}",
+        );
+    }
+
+    #[test]
+    fn redo_segment_ring_defaults_off_and_validates() {
+        let cfg = ServerConfig::default();
+        assert!(!cfg.redo_segment_ring, "segment ring must default OFF");
+        assert_eq!(cfg.redo_segment_size, 0, "segment size defaults to auto");
+        cfg.validate_sizes()
+            .expect("default config (ring off) must validate");
+    }
+
+    #[test]
+    fn redo_buffered_io_defaults_off_and_implies_buffered_durability() {
+        // redo_buffered_io still defaults OFF; redo_buffered now defaults ON
+        // (buffered durability is the default — see `redo_buffered`).
+        let cfg = ServerConfig::default();
+        assert!(!cfg.redo_buffered_io, "redo_buffered_io must default OFF");
+        assert!(cfg.redo_buffered, "redo_buffered now defaults ON");
+        assert!(
+            cfg.redo_buffered_effective(),
+            "default durability is buffered"
+        );
+
+        // Explicit strict durability (both off) → not buffered.
+        let strict = ServerConfig {
+            redo_buffered: false,
+            redo_buffered_io: false,
+            ..ServerConfig::default()
+        };
+        assert!(
+            !strict.redo_buffered_effective(),
+            "neither flag set → not buffered"
+        );
+
+        // redo_buffered alone → buffered.
+        let buffered = ServerConfig {
+            redo_buffered: true,
+            ..ServerConfig::default()
+        };
+        assert!(buffered.redo_buffered_effective());
+
+        // redo_buffered_io alone → implies buffered durability.
+        let io = ServerConfig {
+            redo_buffered_io: true,
+            redo_buffered: false,
+            ..ServerConfig::default()
+        };
+        assert!(
+            io.redo_buffered_effective(),
+            "redo_buffered_io must imply buffered durability"
+        );
+    }
+
+    #[test]
+    fn redo_buffered_io_parses_from_toml_top_level_scalar() {
+        // Top-level scalar before any [section], as required by the async config.
+        let toml_str = "redo_buffered = true\nredo_buffered_io = true\n";
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            cfg.redo_buffered_io,
+            "redo_buffered_io must parse from TOML"
+        );
+        assert!(cfg.redo_buffered_effective());
+
+        // Absent key → default false (backward compatibility with old configs).
+        let cfg2: ServerConfig = toml::from_str("redo_buffered = true\n").unwrap();
+        assert!(
+            !cfg2.redo_buffered_io,
+            "absent redo_buffered_io defaults to false"
+        );
+    }
+
+    #[test]
+    fn redo_segment_ring_auto_and_valid_explicit_size_validate() {
+        // Auto (0) is always valid.
+        let auto = ServerConfig {
+            redo_segment_ring: true,
+            redo_segment_size: 0,
+            device_alignment: 4096,
+            redo_log_size: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        auto.validate_sizes()
+            .expect("ring with auto segment size validates");
+
+        // Explicit, alignment-multiple, >= 3 segments.
+        let explicit = ServerConfig {
+            redo_segment_size: 8 * 1024 * 1024,
+            ..auto
+        };
+        explicit
+            .validate_sizes()
+            .expect("ring with a valid explicit segment size validates");
+    }
+
+    #[test]
+    fn redo_segment_ring_rejects_bad_segment_size() {
+        // Not a multiple of device_alignment.
+        let misaligned = ServerConfig {
+            redo_segment_ring: true,
+            redo_segment_size: 5000,
+            device_alignment: 4096,
+            redo_log_size: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        assert!(
+            misaligned.validate_sizes().is_err(),
+            "misaligned segment size rejected"
+        );
+
+        // Too large → fewer than 3 segments.
+        let too_big = ServerConfig {
+            redo_segment_ring: true,
+            redo_segment_size: 32 * 1024 * 1024,
+            device_alignment: 4096,
+            redo_log_size: 64 * 1024 * 1024,
+            ..ServerConfig::default()
+        };
+        assert!(
+            too_big.validate_sizes().is_err(),
+            "segment size leaving < 3 segments rejected"
+        );
+    }
+
+    #[test]
+    fn packed_with_alignment_above_4096_is_rejected() {
+        let cfg = ServerConfig {
+            storage: StorageConfig {
+                packed: true,
+                ..StorageConfig::default()
+            },
+            device_alignment: 8192,
+            ..ServerConfig::default()
+        };
+        match cfg.validate_safe_defaults() {
+            Err(ConfigError::PackedAlignmentTooLarge { device_alignment }) => {
+                assert_eq!(device_alignment, 8192);
+            }
+            other => panic!("expected PackedAlignmentTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonpacked_with_alignment_above_4096_is_allowed() {
+        // The packed-only alignment gate must NOT fire when packing is off:
+        // a non-packed device may legitimately use a larger block.
+        let cfg = ServerConfig {
+            storage: StorageConfig {
+                packed: false,
+                ..StorageConfig::default()
+            },
+            device_alignment: 8192,
+            ..ServerConfig::default()
+        };
+        if let Err(e) = cfg.validate_safe_defaults() {
+            assert!(
+                !matches!(e, ConfigError::PackedAlignmentTooLarge { .. }),
+                "non-packed config must not trip the packed alignment gate, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn writethrough_cache_with_bytes_passes_validation() {
+        let cfg = ServerConfig {
+            cache: CacheConfig {
+                bytes: 64 * 1024 * 1024,
+                writeback: false,
+                ..CacheConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        assert!(cfg.cache.is_enabled());
+        cfg.validate_safe_defaults()
+            .expect("write-through cache with a budget must validate");
+    }
+
+    #[test]
     fn multi_store_with_memory_backend_does_not_trip_backend_guard() {
         // The in-memory backend supports multi-store device-scan rebuild, so the
         // backend guard must NOT fire (later unrelated checks may still fail).
@@ -2077,12 +2739,13 @@ backend = ""
 
     #[test]
     fn reject_mode_with_rf_3_is_accepted() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 3,
             replication_degraded_mode: "reject".to_string(),
             ..ServerConfig::default()
         };
+        cfg.storage.engine = StorageEngine::InPlace;
 
         cfg.validate_cluster_safety()
             .expect("reject mode must always validate");

@@ -4,6 +4,7 @@
 //! Engine, and writes response frames. One thread per connection.
 
 pub mod dispatch;
+pub(crate) mod fast_hash;
 pub mod http;
 pub mod startup;
 
@@ -484,6 +485,44 @@ impl Server {
 
         tracing::info!(listen_addr = %self.config.listen_addr, "TeraSlab server listening");
 
+        // One shared dispatch pool for all pipelined connections (created only
+        // when pipelining is enabled). Sized for blocking dispatch work (each
+        // task may block on the redo fsync), so oversubscribe the cores rather
+        // than match them; bounded so the thread count never tracks connection
+        // count. `None` keeps every connection on the original serial path.
+        let dispatch_pool: Option<Arc<DispatchPool>> = if self.config.pipeline_depth > 1 {
+            let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
+            let num_workers = cores.saturating_mul(8).clamp(16, 256);
+            // One dispatch shard per store (total stores = device_paths.len() *
+            // device_split, matching `ServerConfig` validation). Routing each
+            // request to its store's shard by txid hash breaks the single-queue
+            // funnel (PERF_LEDGER E22); the per-shard worker subset shares the
+            // bounded `num_workers` total threads.
+            let num_shards = self
+                .config
+                .device_paths
+                .len()
+                .saturating_mul(self.config.device_split)
+                .max(1);
+            tracing::info!(
+                num_workers,
+                num_shards,
+                pipeline_depth = self.config.pipeline_depth,
+                "per-connection request pipelining enabled (per-store sharded dispatch pool)"
+            );
+            Some(DispatchPool::new(
+                num_workers,
+                num_shards,
+                self.engine.clone(),
+                self.cluster.clone(),
+                self.redo_log.clone(),
+                self.blob_store.clone(),
+                self.config.max_batch_size,
+            ))
+        } else {
+            None
+        };
+
         'accept_loop: while !self.shutdown.load(Ordering::Relaxed) {
             // Block until either the listener becomes readable or the
             // waker fires. `None` timeout means "wait forever"; the
@@ -681,6 +720,8 @@ impl Server {
                         // is rejected with `ERR_CLUSTER_AUTH_FAILED`. Default
                         // remains `false` (trusted-overlay) per FIX_POLICY §2.
                         let strict_auth = self.config.strict_auth;
+                        let pipeline_depth = self.config.pipeline_depth.max(1);
+                        let dispatch_pool = dispatch_pool.clone();
 
                         // Move the per-IP guard into the spawned
                         // thread so its `Drop` runs exactly once when
@@ -707,6 +748,8 @@ impl Server {
                                     inflight_request_bytes,
                                     cluster_secret,
                                     strict_auth,
+                                    pipeline_depth,
+                                    dispatch_pool,
                                     read_timeout: CONNECTION_READ_TIMEOUT,
                                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                                     write_timeout: CONNECTION_WRITE_TIMEOUT,
@@ -741,6 +784,13 @@ impl Server {
         // Wait for active connections to drain
         while self.active_connections.load(Ordering::Relaxed) > 0 {
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // All connections have drained (each handler's ConnDrainGuard already
+        // waited for its pooled requests), so the pool queue is empty; stop and
+        // join the shared dispatch workers.
+        if let Some(pool) = dispatch_pool {
+            pool.shutdown();
         }
 
         Ok(())
@@ -800,6 +850,15 @@ struct ConnectionOptions<'a> {
     /// Orchestrator-wired: G10 owns `ServerConfig::strict_auth` and the
     /// CLI `--strict-auth` flag; this field is the local read-site.
     strict_auth: bool,
+    /// Per-connection concurrent dispatch depth (see
+    /// [`ServerConfig::pipeline_depth`]). `1` = strictly serial (current
+    /// behavior); `> 1` hands up to this many requests at once to the shared
+    /// [`DispatchPool`], writing responses as each completes.
+    pipeline_depth: usize,
+    /// Shared dispatch pool for pipelined connections (`None` = no pooling, so
+    /// every request runs inline on the connection thread). One pool is shared
+    /// by all connections so the thread count stays bounded.
+    dispatch_pool: Option<Arc<DispatchPool>>,
     read_timeout: Duration,
     /// L-01: whole-frame assembly deadline (see [`FRAME_ASSEMBLY_TIMEOUT`]).
     /// Injectable per-connection so tests can exercise the deadline
@@ -845,7 +904,6 @@ fn handle_connection_inner(
     // produces a payload `Bytes` that shares the underlying allocation
     // — no `to_vec()` copy on the request hot path.
     let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
-    read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
     // H-2: `0` disables the idle reaper; any positive value installs a
     // per-stream idle deadline enforced on each request (see the
     // `reap_idle_streams` call in the loop below).
@@ -859,10 +917,36 @@ fn handle_connection_inner(
         .with_max_active_streams(opts.max_active_streams)
         .with_stream_idle_timeout(stream_idle_timeout);
 
+    let depth = opts.pipeline_depth.max(1);
+    // All responses — worker-dispatched, inline-barrier, and read-path error
+    // frames — serialize through this cloned write handle so bytes from
+    // concurrent writers never interleave on the socket. `stream` is used only
+    // for reads from here on. At `depth == 1` there are no workers, so the
+    // mutex is uncontended and behaviour matches the original serial path.
+    let writer: Arc<Mutex<TcpStream>> =
+        Arc::new(Mutex::new(stream.try_clone().map_err(|e| {
+            format!("clone stream for pipelined writer: {e}")
+        })?));
+
+    // Per-connection in-flight tracker: bounds this connection to `depth`
+    // concurrent requests in the SHARED dispatch pool, and lets a barrier op
+    // (blob stream / authenticated frame) wait for the connection to quiesce
+    // before running inline against `conn_state`. The drain guard flushes all
+    // pooled responses on every return path before the writer/socket drops.
+    let inflight = Arc::new(ConnInFlight::new(depth));
+    let _drain_on_exit = ConnDrainGuard(Arc::clone(&inflight));
+    let pipelining = depth > 1 && opts.dispatch_pool.is_some();
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
+
+        // PERF: reclaim the read buffer cheaply (in place when uniquely
+        // owned, fresh allocation when a pipelined worker still holds the
+        // previous frame) so the body-assembly write below never triggers
+        // a per-frame realloc + memcpy. See `prepare_read_buf`.
+        prepare_read_buf(&mut read_buf);
 
         // Read the 4-byte length prefix
         let mut len_buf = [0u8; 4];
@@ -900,7 +984,7 @@ fn handle_connection_inner(
                     &format!("frame too large: {total_length} > {max_wire_frame_size}"),
                 ),
             };
-            let _ = stream.write_all(&resp.encode());
+            let _ = writer.lock().write_all(&resp.encode());
             return Err(format!(
                 "frame too large: {total_length} > MAX_FRAME_SIZE {max_wire_frame_size}"
             ));
@@ -929,7 +1013,7 @@ fn handle_connection_inner(
                     ),
                 ),
             };
-            let _ = stream.write_all(&resp.encode());
+            let _ = writer.lock().write_all(&resp.encode());
             return Err(format!(
                 "frame below minimum size: total_length {total_length} < MIN_REQUEST_BODY {}",
                 crate::protocol::frame::MIN_REQUEST_BODY
@@ -951,7 +1035,7 @@ fn handle_connection_inner(
                         "aggregate in-flight request memory limit exceeded",
                     ),
                 };
-                let _ = stream.write_all(&resp.encode());
+                let _ = writer.lock().write_all(&resp.encode());
                 return Err(format!(
                     "aggregate in-flight request memory limit exceeded: requested {frame_len} bytes"
                 ));
@@ -1013,7 +1097,7 @@ fn handle_connection_inner(
                         "strict_auth: cluster_secret required for inter-node opcode",
                     ),
                 };
-                let _ = stream.write_all(&resp.encode());
+                let _ = writer.lock().write_all(&resp.encode());
                 return Err(format!(
                     "strict_auth: rejecting unsigned inter-node op_code={op_code}"
                 ));
@@ -1107,7 +1191,7 @@ fn handle_connection_inner(
                             &format!("cluster frame authentication failed: {e}"),
                         ),
                     };
-                    let _ = stream.write_all(&resp.encode());
+                    let _ = writer.lock().write_all(&resp.encode());
                     return Err(format!("cluster frame authentication failed: {e}"));
                 }
             };
@@ -1116,12 +1200,14 @@ fn handle_connection_inner(
             Bytes::from(sink)
         } else {
             // Assemble the full frame (length prefix + body) into the
-            // persistent `read_buf`. The 4-byte length prefix and the
+            // persistent `read_buf`, which `prepare_read_buf` reset to
+            // len 0 with at least `READ_BUF_RETAINED_SIZE` capacity at the
+            // top of the loop. The 4-byte length prefix and the
             // `head_to_read` peeked bytes are spliced in first; the
-            // remainder is read from the stream.
-            if read_buf.len() < 4 + frame_len {
-                read_buf.resize(4 + frame_len, 0);
-            }
+            // remainder is read from the stream. `resize` grows `len` from
+            // 0 — in place against the reclaimed/fresh capacity (no
+            // realloc for frames up to `READ_BUF_RETAINED_SIZE`).
+            read_buf.resize(4 + frame_len, 0);
             read_buf[..4].copy_from_slice(&len_buf);
             read_buf[4..4 + head_to_read].copy_from_slice(&head_buf[..head_to_read]);
             if frame_len > head_to_read {
@@ -1129,22 +1215,14 @@ fn handle_connection_inner(
                     .read_exact(&mut read_buf[4 + head_to_read..4 + frame_len])
                     .map_err(|e| format!("read frame body: {e}"))?;
             }
-            let frame_bytes_mut = read_buf.split_to(4 + frame_len);
-            // Shrink read_buf IMMEDIATELY after split_to so a giant
-            // frame does not pin peak-frame capacity on the connection
-            // during dispatch + response write. Under the per-IP
-            // connection cap (`max_connections_per_ip = 64` by default)
-            // a 16 MiB peak frame would otherwise hold 64 × 16 MiB
-            // = 1 GiB pinned across concurrent slow-loris-ish clients
-            // until each connection's iteration completed.
-            reset_read_buf_if_oversized(&mut read_buf);
-            if read_buf.capacity() < READ_BUF_RETAINED_SIZE {
-                read_buf.reserve(READ_BUF_RETAINED_SIZE - read_buf.capacity());
-            }
-            if read_buf.len() < READ_BUF_RETAINED_SIZE {
-                read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
-            }
-            frame_bytes_mut.freeze()
+            // `split_to` hands the frame off as a zero-copy `Bytes`. The
+            // buffer is reclaimed (or replaced, if a worker still holds
+            // this frame) on the NEXT iteration's `prepare_read_buf` —
+            // never via a per-frame `reserve` memcpy. An oversized frame
+            // that grew the allocation past `READ_BUF_RETAINED_SIZE` is
+            // shed there too, so peak-frame capacity is not pinned on the
+            // connection across iterations.
+            read_buf.split_to(4 + frame_len).freeze()
         };
 
         // L-01: a deadline-capped read may have shrunk the socket read
@@ -1176,47 +1254,460 @@ fn handle_connection_inner(
             );
         }
 
-        // Dispatch to handler
-        let response = dispatch::handle_request(
-            &request,
-            engine,
-            opts.max_batch_size,
-            opts.cluster,
-            opts.redo_log,
-            &mut conn_state,
-            opts.blob_store,
-        );
-
-        // Write response
-        let encoded_response = response.encode();
-        let response_bytes = if auth_required {
-            crate::cluster::auth::sign_frame(
-                opts.cluster_secret
-                    .as_ref()
-                    .expect("checked above")
-                    .as_slice(),
-                &encoded_response,
-            )
-            .map_err(|e| format!("sign response frame: {e}"))?
+        // Dispatch tail. Pipeline-eligible requests are handed to the
+        // concurrent worker pool: the worker dispatches and writes the
+        // response (matched by `request_id` on the client, possibly out of
+        // order), so the reader can immediately read the next frame and more
+        // mutations reach the redo group-commit at once. Stateful blob-stream
+        // ops and authenticated inter-node frames take a drain barrier and run
+        // inline against `conn_state`, so their semantics are unchanged.
+        if pipelining && is_pipelineable(&request, auth_required) {
+            // Reserve a per-connection slot (backpressure to `depth`) then hand
+            // the request to the shared pool; the worker writes the response.
+            inflight.acquire();
+            opts.dispatch_pool
+                .as_ref()
+                .expect("pipelining implies a dispatch pool")
+                .submit(WorkItem {
+                    request,
+                    writer: Arc::clone(&writer),
+                    inflight: Arc::clone(&inflight),
+                    _permit: _inflight_permit,
+                });
         } else {
-            encoded_response
-        };
-        stream
-            .write_all(&response_bytes)
-            .map_err(|e| format!("write response: {e}"))?;
-        // (The per-iteration read_buf reset has moved up to right
-        // after `split_to` so a giant frame does not pin per-IP
-        // capacity through the dispatch + response window. Reset
-        // again here is redundant.)
+            // Barrier / serial path: drain the connection's pooled requests so
+            // `conn_state` and response ordering are quiescent, then run inline.
+            if pipelining {
+                inflight.drain();
+            }
+            let response = dispatch::handle_request(
+                &request,
+                engine,
+                opts.max_batch_size,
+                opts.cluster,
+                opts.redo_log,
+                &mut conn_state,
+                opts.blob_store,
+            );
+            write_response(
+                &writer,
+                response,
+                auth_required,
+                opts.cluster_secret.as_ref(),
+            )?;
+        }
+        // The per-iteration read_buf reclaim happens at the TOP of the
+        // loop (`prepare_read_buf`), not here: doing it there lets the
+        // pipelined path observe whether the just-handed-off frame is
+        // still held by a worker (shared → fresh buffer) vs. already
+        // dispatched (unique → in-place reclaim, no copy).
     }
 }
 
-fn reset_read_buf_if_oversized(read_buf: &mut BytesMut) {
+/// One pipelined request handed to the shared [`DispatchPool`]. Carries its
+/// own connection's `writer` (so the worker can reply to the right socket) and
+/// `inflight` tracker (released when the response is written).
+///
+/// `_permit` is the in-flight-bytes accounting permit; held (not read) for the
+/// work item's lifetime so the aggregate memory cap stays charged until the
+/// response is written, mirroring the serial path.
+struct WorkItem {
+    request: RequestFrame,
+    writer: Arc<Mutex<TcpStream>>,
+    inflight: Arc<ConnInFlight>,
+    _permit: InflightBytesPermit,
+}
+
+/// Per-connection in-flight accounting for pooled dispatch. Bounds a single
+/// connection to `depth` concurrently-dispatched requests (backpressure) and
+/// lets a barrier op wait for that connection to quiesce.
+struct ConnInFlight {
+    count: Mutex<usize>,
+    cv: parking_lot::Condvar,
+    depth: usize,
+}
+
+impl ConnInFlight {
+    fn new(depth: usize) -> Self {
+        Self {
+            count: Mutex::new(0),
+            cv: parking_lot::Condvar::new(),
+            depth,
+        }
+    }
+
+    /// Reader: reserve a slot, blocking while `depth` are already in flight.
+    fn acquire(&self) {
+        let mut n = self.count.lock();
+        while *n >= self.depth {
+            self.cv.wait(&mut n);
+        }
+        *n += 1;
+    }
+
+    /// Worker: release a slot once its response has been written.
+    fn release(&self) {
+        let mut n = self.count.lock();
+        *n -= 1;
+        self.cv.notify_all();
+    }
+
+    /// Reader: block until this connection has no pooled requests in flight.
+    fn drain(&self) {
+        let mut n = self.count.lock();
+        while *n > 0 {
+            self.cv.wait(&mut n);
+        }
+    }
+}
+
+/// RAII drain: on every connection-handler return path, wait for the
+/// connection's pooled requests to finish so all responses are written before
+/// the writer (and the underlying socket) is dropped.
+struct ConnDrainGuard(Arc<ConnInFlight>);
+
+impl Drop for ConnDrainGuard {
+    fn drop(&mut self) {
+        self.0.drain();
+    }
+}
+
+/// A request is pipeline-eligible if it neither mutates per-connection
+/// [`ConnectionState`] (the blob-stream ops) nor requires per-frame HMAC
+/// verification/signing (authenticated inter-node frames). Everything else is
+/// dispatched concurrently; these take a drain barrier and run inline.
+fn is_pipelineable(request: &RequestFrame, auth_required: bool) -> bool {
+    !auth_required && !matches!(request.op_code, OP_STREAM_CHUNK | OP_STREAM_END)
+}
+
+/// Encode, optionally sign, and write one response under the shared writer
+/// mutex so concurrent workers (and the inline barrier path) never interleave
+/// bytes on the socket.
+fn write_response(
+    writer: &Mutex<TcpStream>,
+    response: ResponseFrame,
+    auth_required: bool,
+    cluster_secret: Option<&Arc<Vec<u8>>>,
+) -> Result<(), String> {
+    let encoded = response.encode();
+    let bytes = if auth_required {
+        crate::cluster::auth::sign_frame(
+            cluster_secret
+                .expect("auth_required implies a configured cluster_secret")
+                .as_slice(),
+            &encoded,
+        )
+        .map_err(|e| format!("sign response frame: {e}"))?
+    } else {
+        encoded
+    };
+    writer
+        .lock()
+        .write_all(&bytes)
+        .map_err(|e| format!("write response: {e}"))
+}
+
+/// One independent dispatch shard: its own queue + condvar, polled only by its
+/// own subset of workers. Sharding the queue this way removes the single
+/// process-wide `Mutex<VecDeque>` that every pipelined connection used to
+/// funnel through (PERF, PERF_LEDGER E22: ~40-48k ops/s software cap, ~192
+/// workers contending one mutex while CPU sat ~30% idle).
+struct DispatchShard {
+    queue: Mutex<std::collections::VecDeque<WorkItem>>,
+    not_empty: parking_lot::Condvar,
+}
+
+/// Compute the dispatch shard index for a routing txid, matching Phase 1's
+/// txid placement (`src/subdevice.rs` `StorePlacer::place` in
+/// [`crate::subdevice::PlacementStrategy::Txid`]): the store/shard is the
+/// little-endian `u64` of the LAST 8 bytes of the txid, modulo the shard count.
+///
+/// Routing a request to "its" store's shard is purely an affinity hint -- the
+/// engine always reaches the correct store via the index entry's `device_id`
+/// (reads/mutations) or the placer (creates), never via the dispatch shard. A
+/// mis-routed request still executes correctly; routing only affects
+/// contention/affinity. See [`routing_shard`].
+#[inline]
+fn shard_index_for_txid(txid: &[u8; 32], k: usize) -> usize {
+    if k <= 1 {
+        return 0;
+    }
+    let last8: [u8; 8] = txid[24..32]
+        .try_into()
+        .expect("a 32-byte txid always has 8 trailing bytes");
+    (u64::from_le_bytes(last8) % k as u64) as usize
+}
+
+/// Byte offset of the FIRST item's txid in a batch request payload, by opcode,
+/// or `None` for ops that carry no per-record txid (admin/cluster/ping/etc).
+///
+/// These offsets are the fixed header sizes the matching `decode_*_batch`
+/// codecs skip before the first item (see `src/protocol/codec.rs`). For
+/// `decode_txid_batch`-based ops the offset is `4 + shared_len`. The offset is
+/// only used to derive a routing hint, so an unknown/short payload safely falls
+/// back to shard 0 -- correctness never depends on it.
+#[inline]
+fn first_txid_offset(op_code: u16) -> Option<usize> {
+    Some(match op_code {
+        // count(4) + ignore_c(1) + ignore_l(1) + cbh(4) + bhr(4)
+        OP_SPEND_BATCH => 14,
+        // count(4) + cbh(4) + bhr(4)
+        OP_UNSPEND_BATCH => 12,
+        // count(4) + block_id(4) + height(4) + subtree(4) + 2xu8 + cbh(4) + bhr(4)
+        OP_SET_MINED_BATCH => 26,
+        // count(4)
+        OP_CREATE_BATCH => 4,
+        // count(4) + height(4) + spendable_after(4)
+        OP_REASSIGN_BATCH => 12,
+        // slot-item batches: count(4)
+        OP_FREEZE_BATCH | OP_UNFREEZE_BATCH => 4,
+        // get-spend items: count(4)
+        OP_GET_SPEND_BATCH => 4,
+        // get batch: count(4) + field_mask(4)
+        OP_GET_BATCH => 8,
+        // remove-conflicting-child pairs: count(4)
+        OP_REMOVE_CONFLICTING_CHILD_BATCH => 4,
+        // txid_batch ops: 4 + shared_len (shared_len per dispatch handler)
+        OP_SET_CONFLICTING_BATCH => 4 + 9,
+        OP_SET_LOCKED_BATCH => 4 + 1,
+        OP_PRESERVE_UNTIL_BATCH => 4 + 4,
+        OP_DELETE_BATCH => 4,
+        OP_MARK_LONGEST_CHAIN_BATCH => 4 + 9,
+        OP_QUERY_CONFLICTING | OP_PRESERVE_TRANSACTIONS => 4 + 4,
+        _ => return None,
+    })
+}
+
+/// Choose the dispatch shard for a request: extract the FIRST item's txid (a
+/// routing hint -- a batch may span stores, which the engine handles
+/// per-record) and hash it like Phase 1 placement. Ops with no txid
+/// (admin/cluster/ping) route to shard 0. Always returns a valid index in
+/// `0..k`.
+fn routing_shard(request: &RequestFrame, k: usize) -> usize {
+    if k <= 1 {
+        return 0;
+    }
+    let payload = &request.payload;
+    match first_txid_offset(request.op_code) {
+        Some(off) if payload.len() >= off + 32 => {
+            let txid: [u8; 32] = payload[off..off + 32]
+                .try_into()
+                .expect("checked len >= off + 32");
+            shard_index_for_txid(&txid, k)
+        }
+        // No txid, or payload too short to contain one: a harmless hint miss.
+        _ => 0,
+    }
+}
+
+/// Process-wide bounded dispatch pool shared by ALL pipelined connections,
+/// sharded into `K` independent queues (one per store) to break the single
+/// queue funnel.
+///
+/// A fixed set of worker threads pull [`WorkItem`]s and dispatch them
+/// concurrently, writing each response to its own connection's writer. Sharing
+/// one pool -- instead of spawning `pipeline_depth` threads per connection --
+/// keeps the total thread count bounded regardless of connection count (the
+/// per-connection model exploded to `conns x depth` threads and thrashed the
+/// scheduler). Per-connection concurrency is still bounded to `depth` by each
+/// connection's [`ConnInFlight`]; the pool size bounds total concurrent
+/// dispatch (and thus the degree of redo group-commit coalescing).
+///
+/// PERF (PERF_LEDGER E22): with a single shared queue, ALL pipelined
+/// connections contended one `Mutex<VecDeque>` + `Condvar`. Splitting into one
+/// shard per store -- and routing each [`WorkItem`] to its store's shard by
+/// txid hash (an affinity hint; correctness still flows through the
+/// index/placer) -- removes that funnel while keeping total threads bounded.
+struct DispatchPool {
+    shards: Vec<DispatchShard>,
+    closed: AtomicBool,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl DispatchPool {
+    /// Spawn the worker threads, sharded into `num_shards` independent queues
+    /// (`num_shards = num_stores`, min 1). The `num_workers` total threads are
+    /// split evenly across shards (`max(1, num_workers / num_shards)` each), so
+    /// the total stays bounded as before. Each worker holds clones of the
+    /// engine-global handles (cloned `Arc`s, so the workers are `'static`) and
+    /// dispatches with its own throwaway [`ConnectionState`] -- valid because
+    /// only non-pipelineable (blob-stream) ops touch connection state and those
+    /// never reach the pool, so ANY worker can process ANY [`WorkItem`].
+    fn new(
+        num_workers: usize,
+        num_shards: usize,
+        engine: Arc<Engine>,
+        cluster: Option<Arc<RunningCluster>>,
+        redo_log: Option<Arc<Mutex<RedoLog>>>,
+        blob_store: Option<Arc<dyn BlobStore>>,
+        max_batch_size: u32,
+    ) -> Arc<Self> {
+        let num_shards = num_shards.max(1);
+        let workers_per_shard = (num_workers / num_shards).max(1);
+        let mut shards = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            shards.push(DispatchShard {
+                queue: Mutex::new(std::collections::VecDeque::new()),
+                not_empty: parking_lot::Condvar::new(),
+            });
+        }
+        let pool = Arc::new(Self {
+            shards,
+            closed: AtomicBool::new(false),
+            workers: Mutex::new(Vec::new()),
+        });
+        let mut handles = Vec::with_capacity(num_shards * workers_per_shard);
+        for shard_idx in 0..num_shards {
+            for _ in 0..workers_per_shard {
+                let pool = Arc::clone(&pool);
+                let engine = Arc::clone(&engine);
+                let cluster = cluster.clone();
+                let redo_log = redo_log.clone();
+                let blob_store = blob_store.clone();
+                handles.push(std::thread::spawn(move || {
+                    dispatch_worker(
+                        &pool,
+                        shard_idx,
+                        &engine,
+                        cluster.as_deref(),
+                        redo_log.as_deref(),
+                        blob_store.as_deref(),
+                        max_batch_size,
+                    );
+                }));
+            }
+        }
+        *pool.workers.lock() = handles;
+        pool
+    }
+
+    /// Reader: enqueue a request onto the shard chosen by [`routing_shard`].
+    /// Backpressure is applied by the caller via the connection's
+    /// [`ConnInFlight::acquire`] BEFORE submitting, so the queue is bounded
+    /// transitively by (active connections x depth).
+    fn submit(&self, item: WorkItem) {
+        let idx = routing_shard(&item.request, self.shards.len());
+        let shard = &self.shards[idx];
+        shard.queue.lock().push_back(item);
+        shard.not_empty.notify_one();
+    }
+
+    /// Worker: block for the next item on shard `shard_idx` without holding a
+    /// lock across the wait, so all workers can park concurrently. `None` once
+    /// closed and the shard is drained.
+    fn recv(&self, shard_idx: usize) -> Option<WorkItem> {
+        let shard = &self.shards[shard_idx];
+        let mut q = shard.queue.lock();
+        loop {
+            if let Some(item) = q.pop_front() {
+                return Some(item);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            shard.not_empty.wait(&mut q);
+        }
+    }
+
+    /// Stop the pool: wake every shard's workers so they observe the drained
+    /// queue and exit, then join them all. Called on server shutdown.
+    fn shutdown(&self) {
+        self.closed.store(true, Ordering::Release);
+        for shard in &self.shards {
+            shard.not_empty.notify_all();
+        }
+        let handles = std::mem::take(&mut *self.workers.lock());
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+/// One shard-bound dispatch worker. Pulls items from its assigned shard
+/// (`shard_idx`), dispatches each (pipeline-eligible ops never touch
+/// `conn_state`, so a private throwaway state is sufficient, and any worker can
+/// process any item -- the shard is only an affinity hint), writes the response
+/// to that item's connection writer, and releases the connection's in-flight
+/// slot.
+fn dispatch_worker(
+    pool: &DispatchPool,
+    shard_idx: usize,
+    engine: &Engine,
+    cluster: Option<&RunningCluster>,
+    redo_log: Option<&Mutex<RedoLog>>,
+    blob_store: Option<&dyn BlobStore>,
+    max_batch_size: u32,
+) {
+    let mut conn_state = ConnectionState::new();
+    while let Some(item) = pool.recv(shard_idx) {
+        let response = dispatch::handle_request(
+            &item.request,
+            engine,
+            max_batch_size,
+            cluster,
+            redo_log,
+            &mut conn_state,
+            blob_store,
+        );
+        // Pipeline-eligible requests are never auth_required, so responses are
+        // written unsigned. A write failure means the peer is gone; log and
+        // continue — the broken socket surfaces as a read error on its reader.
+        if let Err(e) = write_response(&item.writer, response, false, None) {
+            tracing::debug!(err = %e, "pipelined response write failed; connection closing");
+        }
+        // Release the in-flight-bytes permit (drop item) before the connection
+        // slot so a drain/backpressure waiter sees memory reclaimed first.
+        let inflight = Arc::clone(&item.inflight);
+        drop(item);
+        inflight.release();
+    }
+}
+
+/// Prepare the per-connection read buffer for the next frame WITHOUT a
+/// per-frame realloc + memcpy.
+///
+/// PERF (Linux/NVMe profile, bench/LINUX_NVME_REPORT.md): ~31% of the
+/// server's ON-CPU time was `__memcpy` inside `BytesMut::reserve_inner`,
+/// driven from here. The previous design, after `split_to`-freezing each
+/// frame, eagerly called `read_buf.reserve(RET - cap)` + `resize(RET, 0)`
+/// at the *bottom* of the loop. In the pipelined path the frozen frame
+/// `Bytes` is handed to a worker and stays alive across the iteration, so
+/// the underlying allocation is still shared (`KIND_ARC`, not unique).
+/// `reserve` on a shared `BytesMut` whose remaining capacity is short
+/// abandons the buffer and **memcpys the entire retained `len` (~256 KiB
+/// of zeros) into a fresh allocation every single frame** — confirmed
+/// against `bytes-1.11.1` `reserve_inner` (KIND_ARC, non-unique branch).
+///
+/// The fix: at the TOP of each loop, `clear()` the buffer (len → 0) and
+/// `try_reclaim(RET)`. `try_reclaim` reclaims the advanced head offset
+/// in place when the buffer is uniquely owned (serial path: the previous
+/// frame was already dispatched and dropped) and NEVER reallocates — it
+/// returns `false` instead. When it returns `false` (pipelined path: a
+/// worker still holds the previous frame) we install a fresh
+/// `RET`-capacity buffer. Either way nothing is copied: the only assembly
+/// write is the `resize(4 + frame_len, 0)` for the actual frame, which is
+/// in-place against the reclaimed/fresh capacity.
+///
+/// Oversized-frame handling is preserved: a buffer grown past `RET` by a
+/// large frame is replaced with a fresh `RET`-capacity allocation so a
+/// single 16 MiB frame does not pin peak capacity on the connection.
+fn prepare_read_buf(read_buf: &mut BytesMut) {
+    // Drop any retained bytes from the previous frame (there are none in
+    // steady state — each frame is fully read then split off — but a
+    // partial assembly that errored out could leave a tail; clearing is
+    // the correctness-preserving reset point).
+    read_buf.clear();
+    // Shed an oversized allocation outright so peak-frame capacity is not
+    // pinned across iterations.
     if read_buf.capacity() > READ_BUF_RETAINED_SIZE {
         *read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
-        read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
-    } else if read_buf.len() != READ_BUF_RETAINED_SIZE {
-        read_buf.resize(READ_BUF_RETAINED_SIZE, 0);
+        return;
+    }
+    // Cheaply reclaim the advanced head offset in place when we are the
+    // sole owner; if a worker still holds the prior frame's `Bytes`,
+    // `try_reclaim` returns false WITHOUT copying and we allocate fresh.
+    if !read_buf.try_reclaim(READ_BUF_RETAINED_SIZE) {
+        *read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
     }
 }
 
@@ -1294,15 +1785,74 @@ mod tests {
     }
 
     #[test]
-    fn read_buf_shrinks_after_small_frame() {
+    fn prepare_read_buf_sheds_oversized_allocation() {
+        // A frame larger than the retained size grew the buffer; the next
+        // `prepare_read_buf` must shed it back to the retained capacity so
+        // peak-frame memory is not pinned on the connection.
         let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE * 4);
         read_buf.resize(READ_BUF_RETAINED_SIZE * 4, 0);
         assert!(read_buf.capacity() > READ_BUF_RETAINED_SIZE);
 
-        reset_read_buf_if_oversized(&mut read_buf);
+        prepare_read_buf(&mut read_buf);
 
-        assert_eq!(read_buf.len(), READ_BUF_RETAINED_SIZE);
-        assert_eq!(read_buf.capacity(), READ_BUF_RETAINED_SIZE);
+        assert_eq!(read_buf.len(), 0, "buffer must be cleared for assembly");
+        assert_eq!(
+            read_buf.capacity(),
+            READ_BUF_RETAINED_SIZE,
+            "oversized allocation must be shed to the retained size",
+        );
+    }
+
+    /// PERF regression guard (Linux/NVMe profile: ~31% ON-CPU in
+    /// `BytesMut::reserve_inner`→memcpy). When the previous frame has been
+    /// dropped (serial path: the buffer is uniquely owned), the steady-state
+    /// assemble→split→reclaim cycle must reclaim the head offset IN PLACE —
+    /// the backing allocation pointer must not change and nothing is copied.
+    #[test]
+    fn prepare_read_buf_reclaims_in_place_when_unique() {
+        let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
+        prepare_read_buf(&mut read_buf);
+        let base_ptr = read_buf.as_ptr() as usize;
+
+        for frame_len in [4usize, 100, 4096, 65536] {
+            // Assemble a frame, hand it off, then drop it (serial dispatch).
+            read_buf.resize(frame_len, 0);
+            let frame = read_buf.split_to(frame_len).freeze();
+            drop(frame);
+
+            prepare_read_buf(&mut read_buf);
+            assert_eq!(
+                read_buf.as_ptr() as usize,
+                base_ptr,
+                "unique buffer must be reclaimed in place (no realloc/memcpy) \
+                 for frame_len={frame_len}",
+            );
+            assert_eq!(read_buf.len(), 0);
+            assert!(read_buf.capacity() >= READ_BUF_RETAINED_SIZE);
+        }
+    }
+
+    /// When a pipelined worker still holds the previous frame's `Bytes`,
+    /// the backing allocation is shared and cannot be reclaimed; the buffer
+    /// is replaced with a fresh retained-capacity allocation rather than
+    /// (the old behaviour) memcpying the retained tail into a new buffer via
+    /// `reserve`. The just-handed-off frame's bytes must stay intact.
+    #[test]
+    fn prepare_read_buf_replaces_when_frame_still_held() {
+        let mut read_buf = BytesMut::with_capacity(READ_BUF_RETAINED_SIZE);
+        prepare_read_buf(&mut read_buf);
+
+        read_buf.resize(8, 0);
+        read_buf[..8].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let held = read_buf.split_to(8).freeze(); // worker keeps this alive
+
+        prepare_read_buf(&mut read_buf);
+
+        // Buffer is usable for the next frame...
+        assert_eq!(read_buf.len(), 0);
+        assert!(read_buf.capacity() >= READ_BUF_RETAINED_SIZE);
+        // ...and the handed-off frame was not disturbed.
+        assert_eq!(&held[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -1332,6 +1882,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_millis(50),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1384,6 +1936,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_secs(2),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1463,6 +2017,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     // Per-read timeout deliberately much longer than the
                     // drip interval below: every individual read makes
                     // "progress", so only the frame-assembly deadline can
@@ -1533,6 +2089,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_secs(5),
                     frame_deadline: Duration::from_secs(1),
                     write_timeout: Duration::from_secs(1),
@@ -1582,6 +2140,126 @@ mod tests {
         assert!(result.is_ok(), "connection result was {result:?}");
     }
 
+    /// PERF + correctness regression for the per-frame buffer reclaim
+    /// (`prepare_read_buf`). Drives `handle_connection_inner` over a real
+    /// socket with MANY back-to-back frames of VARYING sizes — exercising
+    /// the assemble → split → reclaim cycle repeatedly — and interleaves a
+    /// frame deliberately fragmented across multiple `write`s with the
+    /// split landing mid-body. Every response must carry the matching
+    /// `request_id` in order: a reclaim bug that dropped, duplicated, or
+    /// corrupted retained bytes would mis-parse the `request_id` (read out
+    /// of the frame body after the buffer was reclaimed) or desynchronise
+    /// the stream, and this would catch it.
+    #[test]
+    fn many_frames_and_partial_split_decode_correctly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(2),
+                    write_timeout: Duration::from_secs(2),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+
+        // Send 64 PING frames whose payload length varies frame-to-frame so
+        // the per-frame `resize`/reclaim runs at many sizes. PING ignores
+        // payload bytes but still echoes `request_id`, so the request_id is
+        // the integrity witness for the post-reclaim frame body.
+        let count = 64u64;
+        for id in 1..=count {
+            let payload_len = (id as usize * 7) % 257; // 0..256, varies
+            let req = RequestFrame {
+                request_id: 1000 + id,
+                op_code: OP_PING,
+                flags: 0,
+                payload: Bytes::from(vec![(id & 0xFF) as u8; payload_len]),
+            };
+            client.write_all(&req.encode()).unwrap();
+        }
+        // Read all 64 responses; they must arrive in order with matching
+        // request_ids (serial path → in-order), proving no frame was
+        // dropped or duplicated across the reclaim cycle.
+        for id in 1..=count {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(
+                resp.request_id,
+                1000 + id,
+                "response {id} out of order or corrupted",
+            );
+            assert_eq!(resp.status, STATUS_OK);
+        }
+
+        // Now a frame deliberately fragmented across writes, with the split
+        // landing MID-BODY (after the length prefix + head peek but before
+        // the body is complete). This exercises the `read_exact` body
+        // completion against the reclaimed buffer.
+        let frag = RequestFrame {
+            request_id: 9999,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Bytes::from(vec![0xCD; 200]),
+        }
+        .encode();
+        // First chunk: length prefix + part of the head/body.
+        client.write_all(&frag[..10]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Second chunk: more body, still incomplete.
+        client.write_all(&frag[10..120]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        // Final chunk: completes the frame.
+        client.write_all(&frag[120..]).unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(resp.request_id, 9999, "fragmented frame mis-decoded");
+        assert_eq!(resp.status, STATUS_OK);
+
+        // One more whole frame after the fragmented one: the stream must
+        // remain in sync (a reclaim/offset bug would desynchronise here).
+        let after = RequestFrame {
+            request_id: 12345,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Bytes::new(),
+        };
+        client.write_all(&after.encode()).unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(resp.request_id, 12345);
+        assert_eq!(resp.status, STATUS_OK);
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+    }
+
     #[test]
     fn unsigned_inter_node_frame_rejected_when_cluster_secret_configured() {
         assert_unsigned_protected_opcode_rejected(OP_REPLICA_BATCH);
@@ -1623,6 +2301,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: Some(Arc::new(b"cluster-secret".to_vec())),
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1680,6 +2360,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: Some(Arc::new(b"cluster-secret".to_vec())),
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1754,6 +2436,552 @@ mod tests {
         response
     }
 
+    // ---- Per-connection request pipelining ----------------------------------
+
+    #[test]
+    fn conn_inflight_backpressures_at_depth() {
+        // depth=1: the second acquire must block until the first is released.
+        let f = Arc::new(ConnInFlight::new(1));
+        f.acquire(); // count = 1 (== depth)
+        let f2 = Arc::clone(&f);
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired2 = Arc::clone(&acquired);
+        let h = std::thread::spawn(move || {
+            f2.acquire(); // must block: count == depth
+            acquired2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "second acquire must block while the connection is at depth"
+        );
+        f.release(); // frees a slot
+        h.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn conn_inflight_drain_waits_for_completion() {
+        let f = Arc::new(ConnInFlight::new(4));
+        f.acquire();
+        f.acquire();
+        let f2 = Arc::clone(&f);
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained2 = Arc::clone(&drained);
+        let h = std::thread::spawn(move || {
+            f2.drain(); // blocks until count hits 0
+            drained2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drained.load(Ordering::SeqCst),
+            "drain must wait for in-flight"
+        );
+        f.release();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !drained.load(Ordering::SeqCst),
+            "drain must still wait while one request is in flight"
+        );
+        f.release();
+        h.join().unwrap();
+        assert!(drained.load(Ordering::SeqCst), "drain returns once empty");
+    }
+
+    /// End-to-end: a connection with `pipeline_depth > 1` must answer EVERY
+    /// concurrently-pipelined request (the client sends many frames before
+    /// reading any reply), each response matched to its `request_id`. This is
+    /// the invariant the multiplexing client relies on; responses may arrive in
+    /// any order, so the test collects by id rather than asserting sequence.
+    #[test]
+    fn pipelined_connection_answers_all_concurrent_requests() {
+        const N: u64 = 64;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let engine = Arc::new(test_engine());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        // Real shared pool, exercising the production dispatch path.
+        let pool = DispatchPool::new(8, 1, engine.clone(), None, None, None, 1024);
+        let server_pool = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 8,
+                    dispatch_pool: Some(server_pool),
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(5),
+                    write_timeout: Duration::from_secs(5),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        // Fire all N requests without reading any reply in between — the server
+        // must dispatch them concurrently and stream the replies back.
+        let mut buf = Vec::new();
+        for id in 1..=N {
+            let req = RequestFrame {
+                request_id: id,
+                op_code: OP_PING,
+                flags: 0,
+                payload: Bytes::new(),
+            };
+            buf.extend_from_slice(&req.encode());
+        }
+        client.write_all(&buf).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..N {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(resp.status, STATUS_OK, "ping {} not OK", resp.request_id);
+            assert!(
+                seen.insert(resp.request_id),
+                "duplicate response for request_id {}",
+                resp.request_id
+            );
+        }
+        let expected: std::collections::HashSet<u64> = (1..=N).collect();
+        assert_eq!(
+            seen, expected,
+            "every request_id must get exactly one reply"
+        );
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+        pool.shutdown();
+    }
+
+    /// Build a 32-byte txid whose LAST 8 bytes are the little-endian `tail`.
+    /// Placement (`StorePlacer::place` in Txid mode) and dispatch routing both
+    /// key on these last 8 bytes, so `tail` directly selects the store/shard.
+    fn txid_with_tail(tail: u64) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[24..32].copy_from_slice(&tail.to_le_bytes());
+        t
+    }
+
+    /// A two-store engine in deterministic txid-placement mode (store =
+    /// last8(txid) % 2), exercised through the wire dispatch path.
+    fn two_store_txid_engine() -> Engine {
+        use crate::index::ShardedIndex;
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut engine = Engine::new_multi_store(
+            dev0,
+            Box::new(alloc0),
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
+            ShardedIndex::from_single(Index::new(1024).unwrap().into()),
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        engine.set_placement_strategy(crate::subdevice::PlacementStrategy::Txid);
+        engine
+    }
+
+    fn create_payload_for(tail: u64) -> (([u8; 32], [u8; 32]), Vec<u8>) {
+        use crate::protocol::codec::{WireCreateItem, encode_create_batch};
+        let txid = txid_with_tail(tail);
+        let mut uh = [0u8; 32];
+        uh[0] = 0xAB;
+        uh[31] = (tail & 0xff) as u8;
+        let item = WireCreateItem {
+            txid,
+            tx_version: 2,
+            locktime: 0,
+            fee: 1000,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1_700_000_000_000,
+            flags: 0,
+            utxo_hashes: vec![uh],
+            cold_data: vec![],
+            block_height: 0,
+            mined_block_id: None,
+            mined_block_height: None,
+            mined_subtree_idx: None,
+            parent_txids: vec![],
+        };
+        ((txid, uh), encode_create_batch(&[item]))
+    }
+
+    /// UNIT: the dispatch shard index for a txid equals Phase 1 placement
+    /// (`last8(txid) LE % k`) — exactly what `StorePlacer::place` computes in
+    /// Txid mode, so a store's ops land on that store's shard.
+    #[test]
+    fn shard_index_matches_txid_placement() {
+        for k in [1usize, 2, 3, 4, 7, 16] {
+            let placer =
+                crate::subdevice::StorePlacer::new(crate::subdevice::PlacementStrategy::Txid, k);
+            for tail in [0u64, 1, 2, 3, 10, 11, 255, 4096, u64::MAX, 12_345_678_901] {
+                let txid = txid_with_tail(tail);
+                assert_eq!(
+                    shard_index_for_txid(&txid, k),
+                    placer.place(&txid),
+                    "shard for tail={tail} k={k} must match StorePlacer::place",
+                );
+            }
+        }
+    }
+
+    /// UNIT: `routing_shard` extracts the FIRST item's txid at the correct
+    /// per-op offset and hashes it like placement; ops with no txid (and short
+    /// payloads) fall back to shard 0.
+    #[test]
+    fn routing_shard_uses_first_item_txid_and_falls_back() {
+        const K: usize = 4;
+        // A GET batch (header 8) whose first txid has tail=11 -> shard 11%4=3.
+        let get = RequestFrame {
+            request_id: 1,
+            op_code: OP_GET_BATCH,
+            flags: 0,
+            payload: crate::protocol::codec::encode_get_batch(0, &[txid_with_tail(11)]).into(),
+        };
+        assert_eq!(
+            routing_shard(&get, K),
+            shard_index_for_txid(&txid_with_tail(11), K)
+        );
+        assert_eq!(routing_shard(&get, K), 3);
+
+        // A CREATE batch (header 4) with tail=10 -> shard 10%4=2.
+        let (_k, create_payload) = create_payload_for(10);
+        let create = RequestFrame {
+            request_id: 2,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: create_payload.into(),
+        };
+        assert_eq!(routing_shard(&create, K), 2);
+
+        // A txid-less op (PING) and a too-short batch both route to shard 0.
+        let ping = RequestFrame {
+            request_id: 3,
+            op_code: OP_PING,
+            flags: 0,
+            payload: Bytes::new(),
+        };
+        assert_eq!(routing_shard(&ping, K), 0);
+        let truncated = RequestFrame {
+            request_id: 4,
+            op_code: OP_GET_BATCH,
+            flags: 0,
+            payload: Bytes::from_static(&[0u8; 8]), // header only, no item
+        };
+        assert_eq!(routing_shard(&truncated, K), 0);
+
+        // k == 1: everything routes to the single shard.
+        assert_eq!(routing_shard(&get, 1), 0);
+    }
+
+    /// INTEGRATION: many pipelined requests across BOTH stores, mixed ops
+    /// (create then get), routed through the K-shard pool over the real
+    /// connection handler. Every response must come back correct and exactly
+    /// once. Catches routing / response-assembly regressions.
+    #[test]
+    fn sharded_pool_serves_mixed_ops_across_stores() {
+        use crate::protocol::codec::{FieldMask, decode_get_response_checked, encode_get_batch};
+        use std::io::Read as _;
+
+        let engine = Arc::new(two_store_txid_engine());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // 2 stores -> 2 shards. Workers split across shards.
+        let pool = DispatchPool::new(8, 2, engine.clone(), None, None, None, 1024);
+        assert_eq!(pool.shards.len(), 2);
+        let server_pool = Arc::clone(&pool);
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 8,
+                    dispatch_pool: Some(server_pool),
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(5),
+                    write_timeout: Duration::from_secs(5),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+
+        // Tails 0..16 land on store tail%2: a uniform spread across both shards.
+        let tails: Vec<u64> = (0..16).collect();
+        let mut keys = Vec::new();
+
+        // Phase A: pipeline 16 creates without reading between them.
+        let mut buf = Vec::new();
+        for (i, &tail) in tails.iter().enumerate() {
+            let ((txid, uh), payload) = create_payload_for(tail);
+            keys.push((txid, uh));
+            buf.extend_from_slice(
+                &RequestFrame {
+                    request_id: (i + 1) as u64,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: payload.into(),
+                }
+                .encode(),
+            );
+        }
+        client.write_all(&buf).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..tails.len() {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "create {} not OK: {:?}",
+                resp.request_id, resp.payload
+            );
+            assert!(
+                seen.insert(resp.request_id),
+                "dup create resp {}",
+                resp.request_id
+            );
+        }
+        assert_eq!(seen, (1..=tails.len() as u64).collect());
+
+        // Phase B: pipeline 16 gets; each must return the seeded utxo_hash,
+        // proving the record was created on (and read from) the right store
+        // regardless of which shard dispatched it.
+        let mut buf = Vec::new();
+        for (i, (txid, _uh)) in keys.iter().enumerate() {
+            buf.extend_from_slice(
+                &RequestFrame {
+                    request_id: 1000 + i as u64,
+                    op_code: OP_GET_BATCH,
+                    flags: 0,
+                    payload: encode_get_batch(FieldMask::ALL, &[*txid]).into(),
+                }
+                .encode(),
+            );
+        }
+        client.write_all(&buf).unwrap();
+        let mut got = std::collections::HashSet::new();
+        for _ in 0..keys.len() {
+            let resp = read_response_frame_for_test(&mut client);
+            assert_eq!(resp.status, STATUS_OK, "get {} not OK", resp.request_id);
+            assert!(
+                got.insert(resp.request_id),
+                "dup get resp {}",
+                resp.request_id
+            );
+            let items = decode_get_response_checked(&resp.payload, 4).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].status, STATUS_OK, "record must exist after create");
+        }
+        assert_eq!(got, (1000..1000 + keys.len() as u64).collect());
+
+        // PER-CONNECTION ORDER: a fresh, serial round-trip must preserve
+        // request_id (the pipelined client matches by id, but the serial
+        // single-in-flight case must be strictly ordered).
+        for (i, (txid, _uh)) in keys.iter().take(4).enumerate() {
+            let req = RequestFrame {
+                request_id: 9000 + i as u64,
+                op_code: OP_GET_BATCH,
+                flags: 0,
+                payload: encode_get_batch(FieldMask::ALL, &[*txid]).into(),
+            };
+            client.write_all(&req.encode()).unwrap();
+            let mut len_buf = [0u8; 4];
+            client.read_exact(&mut len_buf).unwrap();
+            let n = u32::from_le_bytes(len_buf) as usize;
+            let mut body = vec![0u8; n];
+            client.read_exact(&mut body).unwrap();
+            let (resp, _) =
+                ResponseFrame::decode(&[len_buf.as_slice(), body.as_slice()].concat()).unwrap();
+            assert_eq!(
+                resp.request_id,
+                9000 + i as u64,
+                "serial round-trip must answer in request order",
+            );
+        }
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+        pool.shutdown();
+    }
+
+    /// INTEGRATION (hint-not-correctness): force a record onto store X (its txid
+    /// hashes there) but run the pool with K=3 shards so the SAME txid hashes to
+    /// a DIFFERENT shard index than its store id. The create+get must still
+    /// succeed — proving the dispatch shard is only an affinity hint and the
+    /// engine resolves the real store via the index/placer.
+    #[test]
+    fn mismatched_shard_still_executes_against_correct_store() {
+        use crate::protocol::codec::{FieldMask, decode_get_response_checked, encode_get_batch};
+
+        // tail=1: store = 1 % 2 = 1; with K=3 shards, shard = 1 % 3 = 1 too —
+        // pick tail=2 instead: store = 2%2 = 0, shard = 2%3 = 2. Different.
+        let tail = 2u64;
+        let txid = txid_with_tail(tail);
+        assert_ne!(
+            shard_index_for_txid(&txid, 3),
+            (tail % 2) as usize,
+            "test precondition: chosen tail must map shard != store",
+        );
+
+        let engine = Arc::new(two_store_txid_engine());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Deliberately K=3 shards over a 2-store engine — a mismatch.
+        let pool = DispatchPool::new(6, 3, engine.clone(), None, None, None, 1024);
+        assert_eq!(pool.shards.len(), 3);
+        let server_pool = Arc::clone(&pool);
+        let server_engine = engine.clone();
+        let server_shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let result = handle_connection_inner(
+                stream,
+                &server_engine,
+                &server_shutdown,
+                ConnectionOptions {
+                    max_batch_size: 1024,
+                    max_stream_total_bytes: ServerConfig::DEFAULT_MAX_STREAM_TOTAL_BYTES,
+                    max_active_streams: ServerConfig::DEFAULT_MAX_ACTIVE_STREAMS_PER_CONNECTION,
+                    stream_idle_timeout_secs: ServerConfig::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                    cluster: None,
+                    redo_log: None,
+                    blob_store: None,
+                    inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
+                    cluster_secret: None,
+                    strict_auth: false,
+                    pipeline_depth: 8,
+                    dispatch_pool: Some(server_pool),
+                    read_timeout: Duration::from_secs(5),
+                    frame_deadline: Duration::from_secs(5),
+                    write_timeout: Duration::from_secs(5),
+                },
+            );
+            tx.send(result).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+
+        let ((_txid, _uh), create_payload) = create_payload_for(tail);
+        client
+            .write_all(
+                &RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: create_payload.into(),
+                }
+                .encode(),
+            )
+            .unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "create must succeed despite shard!=store"
+        );
+
+        client
+            .write_all(
+                &RequestFrame {
+                    request_id: 2,
+                    op_code: OP_GET_BATCH,
+                    flags: 0,
+                    payload: encode_get_batch(FieldMask::ALL, &[txid]).into(),
+                }
+                .encode(),
+            )
+            .unwrap();
+        let resp = read_response_frame_for_test(&mut client);
+        assert_eq!(resp.status, STATUS_OK);
+        let items = decode_get_response_checked(&resp.payload, 4).unwrap();
+        assert_eq!(
+            items[0].status, STATUS_OK,
+            "record readable via index, not shard"
+        );
+
+        // The record actually lives on store `tail % 2`, not the dispatch shard.
+        let entry = engine
+            .lookup(&crate::index::TxKey { txid })
+            .expect("entry exists");
+        assert_eq!(
+            entry.device_id as usize,
+            (tail % 2) as usize,
+            "record stored by placer/index on the right store, independent of dispatch shard",
+        );
+
+        drop(client);
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should exit after client disconnect");
+        assert!(result.is_ok(), "connection result was {result:?}");
+        pool.shutdown();
+    }
+
+    /// A K-shard pool with no traffic must shut down cleanly: every shard's
+    /// workers wake on close and join without hanging.
+    #[test]
+    fn sharded_pool_shutdown_drains_and_joins_all_shards() {
+        let engine = Arc::new(test_engine());
+        let pool = DispatchPool::new(12, 4, engine, None, None, None, 1024);
+        assert_eq!(pool.shards.len(), 4);
+        // shutdown must return (join all workers) — a stuck shard would hang the
+        // test under the harness timeout.
+        pool.shutdown();
+        // Idempotent: a second shutdown after workers are gone is a no-op.
+        pool.shutdown();
+    }
+
     /// F-G5-001 (CRITICAL): with `strict_auth = true` AND `cluster_secret =
     /// None`, an inter-node opcode must be rejected with
     /// `ERR_CLUSTER_AUTH_FAILED` rather than silently accepted.
@@ -1784,6 +3012,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: true,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1847,6 +3077,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),
@@ -1928,6 +3160,8 @@ mod tests {
                     inflight_request_bytes: Arc::new(InflightBytesLimiter::new(0)),
                     cluster_secret: None,
                     strict_auth: false,
+                    pipeline_depth: 1,
+                    dispatch_pool: None,
                     read_timeout: Duration::from_secs(1),
                     frame_deadline: FRAME_ASSEMBLY_TIMEOUT,
                     write_timeout: Duration::from_secs(1),

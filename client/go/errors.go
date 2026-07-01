@@ -75,9 +75,9 @@ func (e *TooManyRedirectsError) Error() string {
 // route; the caller (or the transient-retry layer) should refresh the
 // partition map and retry. Addr is the redirect target that was refused.
 type StaleRedirectError struct {
-	Addr           string
-	ServerVersion  uint64
-	ClientVersion  uint64
+	Addr          string
+	ServerVersion uint64
+	ClientVersion uint64
 }
 
 func (e *StaleRedirectError) Error() string {

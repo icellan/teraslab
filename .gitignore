@@ -49,3 +49,8 @@ teraslab-tombstone*
 
 # Local agent/dev worktrees (not tracked)
 .worktrees/
+
+# Local-only performance-campaign analysis artifacts (kept out of the repo).
+# Working-tree copies remain on the dev machine; not part of the codebase.
+bench/*.md
+bench/results/

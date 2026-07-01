@@ -355,7 +355,7 @@ pub struct MigrationThrottle {
 }
 
 impl MigrationThrottle {
-    /// Default cap (32 MiB) — matches Aerospike's `MAX_BYTES_EMIGRATING`.
+    /// Default cap (32 MiB) — matches the reference UDF's `MAX_BYTES_EMIGRATING`.
     pub const DEFAULT_CAP_BYTES: u64 = 32 * 1024 * 1024;
 
     /// Env var that overrides the cap at process startup. Empty / unset /
@@ -493,46 +493,6 @@ pub struct MigrationManager {
     /// retains its last copy rather than stranding it. Cleared when this
     /// node re-acquires the shard as an inbound migration target.
     committed_handoffs: std::collections::HashMap<u16, u64>,
-    /// Per-shard accumulation of each pending source's reconciliation manifest
-    /// (deletion-tombstone Phase 8, design §9.1 #1 — the multi-source union).
-    ///
-    /// Keyed by shard; each value is the list of per-source manifests collected
-    /// since the shard's inbound migration began. Drained when the shard
-    /// commits and the union drop is applied. Co-located with the inbound
-    /// state it shadows so EVERY inbound-clear path
-    /// ([`Self::clear_inbound`], [`Self::clear_stale_inbound`],
-    /// [`Self::clear_pending_inbound_for_shards`],
-    /// [`Self::mark_inbound_complete_all`]) also drops the matching accumulator
-    /// entries — preventing the leak where a non-committing handoff stranded an
-    /// entry forever (BUG4 fix (b)). Empty and untouched unless
-    /// `tombstone_reconciliation_enabled`, so the off-path is byte-identical
-    /// (a remove from an empty map is a no-op).
-    reconcile_accumulator: std::collections::HashMap<u16, Vec<SourceReconcileManifest>>,
-}
-
-/// One source's per-shard reconciliation manifest, accumulated across
-/// `OP_MIGRATION_COMPLETE` arrivals for the multi-source UNION drop rule
-/// (deletion-tombstone Phase 8, design §9.1 #1).
-///
-/// A rejoinee may receive completions from several concurrent sources for the
-/// same shard. The Drop decision (§7 row 2) must be evaluated against the UNION
-/// of ALL pending sources' live∪tombstone sets, NOT a single source — a key
-/// tombstoned by source X but live on source Y must be KEPT. So each completion
-/// stashes its `(live_keys, tombstones)` here and the actual drops are deferred
-/// to the commit gate (`!has_pending_inbound_shard`), where the union is
-/// computed. Touched ONLY on the `tombstone_reconciliation_enabled` path.
-#[derive(Debug, Clone, Default)]
-pub struct SourceReconcileManifest {
-    /// The source's LIVE keys for the shard (its exact-entry manifest).
-    pub live: Vec<crate::index::TxKey>,
-    /// The source's TOMBSTONES for the shard: `(key, deletion-generation)`.
-    pub tombstones: Vec<(crate::index::TxKey, u32)>,
-    /// The `migration_epoch` of the completion that produced this manifest
-    /// (BUG4 fix (a)). The commit gate DISCARDS any accumulated entry whose
-    /// epoch is not the current committed/migration epoch BEFORE computing the
-    /// union, so a STALE `{tomb k}` from a superseded plan can never drive a
-    /// Drop of a now-live `k` in a later epoch's commit.
-    pub epoch: u64,
 }
 
 impl MigrationManager {
@@ -545,75 +505,7 @@ impl MigrationManager {
             fenced_shards: ShardBitmap::new(),
             dual_write_targets: std::collections::HashMap::new(),
             committed_handoffs: std::collections::HashMap::new(),
-            reconcile_accumulator: std::collections::HashMap::new(),
         }
-    }
-
-    /// Accumulate one source's per-shard reconciliation manifest for the
-    /// multi-source union (deletion-tombstone Phase 8, design §9.1 #1).
-    ///
-    /// Called once per `OP_MIGRATION_COMPLETE` arrival on the
-    /// `tombstone_reconciliation_enabled` path. The manifests are unioned and
-    /// the deferred drops applied at the commit gate via
-    /// [`Self::take_reconcile_accumulator`]. No-op semantics off-path: nothing
-    /// else reads this map unless reconciliation is enabled.
-    pub fn accumulate_reconcile_manifest(&mut self, shard: u16, manifest: SourceReconcileManifest) {
-        self.reconcile_accumulator
-            .entry(shard)
-            .or_default()
-            .push(manifest);
-    }
-
-    /// Remove and return all accumulated source manifests for `shard`.
-    ///
-    /// Called at the commit gate to compute the union (`live` / `tombstone`
-    /// sets across every pending source) before applying the deferred drops.
-    /// Returns an empty vec if nothing was accumulated (e.g. reconciliation
-    /// disabled, or a source sent no tombstone section).
-    pub fn take_reconcile_accumulator(&mut self, shard: u16) -> Vec<SourceReconcileManifest> {
-        self.reconcile_accumulator
-            .remove(&shard)
-            .unwrap_or_default()
-    }
-
-    /// Discard any accumulated source manifests for `shard` without applying
-    /// them — used on abort / inbound-clear so a non-committing handoff does
-    /// not leak accumulator entries (BUG4 fix (b)). No-op off-path.
-    pub fn clear_reconcile_accumulator(&mut self, shard: u16) {
-        self.reconcile_accumulator.remove(&shard);
-    }
-
-    /// Number of accumulated source manifests for `shard` (test-only peek that
-    /// does NOT drain — used to assert the BUG4 accumulate-lifecycle).
-    #[cfg(test)]
-    pub(crate) fn reconcile_accumulator_len_for_test(&self, shard: u16) -> usize {
-        self.reconcile_accumulator
-            .get(&shard)
-            .map(|v| v.len())
-            .unwrap_or(0)
-    }
-
-    /// Drop accumulator entries for every shard that is no longer
-    /// pending-inbound (BUG4 fix (b)).
-    ///
-    /// Called after a bulk inbound-clear ([`Self::clear_inbound`],
-    /// [`Self::clear_stale_inbound`], [`Self::clear_pending_inbound_for_shards`]):
-    /// a reconcile manifest is meaningful ONLY while its shard is still awaiting
-    /// inbound data and may yet commit through the union. Once the shard's
-    /// pending entry is gone (settled, superseded, or reaped) the handoff will
-    /// not commit through the union, so its accumulated manifests must be
-    /// dropped rather than stranded forever. Retains entries for shards still
-    /// pending so a concurrent in-flight source is not lost. No-op off-path
-    /// (map empty).
-    fn prune_reconcile_accumulator_to_pending(&mut self) {
-        if self.reconcile_accumulator.is_empty() {
-            return;
-        }
-        // Split the borrows: `retain` mutably borrows the accumulator while the
-        // closure only reads the (separate) inbound bitmap field.
-        let bitmap = &self.inbound_bitmap;
-        self.reconcile_accumulator
-            .retain(|shard, _| bitmap.test(*shard));
     }
 
     /// Record that this node has COMMITTED-ly handed off `shard` as the
@@ -844,7 +736,6 @@ impl MigrationManager {
         // BUG4 (b): this clears the shard's inbound state without routing
         // through the commit-gate union, so drop any accumulated reconcile
         // manifests for it to prevent a leak. No-op off-path (map empty).
-        self.clear_reconcile_accumulator(shard);
     }
 
     pub fn mark_inbound_complete_from_source(&mut self, shard: u16, from_node: NodeId) {
@@ -1396,7 +1287,6 @@ impl MigrationManager {
         self.inbound_bitmap.clear_all();
         // BUG4 (b): no shard is pending after a full clear → drop the whole
         // accumulator (no-op off-path).
-        self.prune_reconcile_accumulator_to_pending();
     }
 
     /// Remove pending inbound entries for the selected shards.
@@ -1423,7 +1313,6 @@ impl MigrationManager {
             }
             // BUG4 (b): drop accumulator entries for shards no longer pending
             // (no-op off-path).
-            self.prune_reconcile_accumulator_to_pending();
         }
         removed
     }
@@ -1449,7 +1338,6 @@ impl MigrationManager {
             }
             // BUG4 (b): a COMPLETED-but-uncommitted shard removed here will not
             // commit through the union → drop its accumulator (no-op off-path).
-            self.prune_reconcile_accumulator_to_pending();
         }
         removed
     }

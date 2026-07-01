@@ -1,0 +1,61 @@
+# TeraSlab config for the Linux / raw-NVMe perf profile (EC2 i3en.6xlarge:
+# 24 vCPU, 2x 6.8TiB NVMe instance-store SSD, kernel 6.18).
+#
+# Data devices are the RAW NVMe block devices (O_DIRECT, kernel-reported size via
+# BLKGETSIZE64 — device_size below is ignored for block devices). device_split=1
+# so each physical NVMe is one independent store (allocator + index lock domain +
+# per-store redo) = true physical I/O parallelism across the 2 spindles.
+#
+# CRITICAL: redo/tombstone/index paths MUST be real filesystem paths — the default
+# derives "<device_paths[0]>.redo" which is nonsensical for /dev/nvme1n1. They live
+# on the EBS root fs under /home/ec2-user/tsmeta (buffered/async redo hides EBS
+# latency; create them before launch).
+node_id = 0
+listen_addr = "0.0.0.0:3300"
+http_listen_addr = "0.0.0.0:9100"
+seed_nodes = []
+replication_factor = 1
+
+device_paths = ["/dev/nvme1n1", "/dev/nvme2n1"]
+device_split = 1                  # 2 paths x 1 = 2 stores (one per raw NVMe)
+device_size = 4294967296          # IGNORED for raw block devices (kernel size wins); kept >= MIN_DEVICE_SIZE
+device_alignment = 4096           # NVMe logical block; O_DIRECT offset/len/buffer must be multiples
+
+redo_log_path = "/home/ec2-user/tsmeta/redo"
+tombstone_log_path = "/home/ec2-user/tsmeta/tombstone"
+index_snapshot_path = "/home/ec2-user/tsmeta/index.snap"
+redo_log_size = 268435456         # 256 MiB/store x 2 = 512 MiB total
+
+expected_records = 20000000
+lock_stripes = 65536
+max_batch_size = 8192
+max_connections = 2048
+max_connections_per_ip = 2048
+pipeline_depth = 16
+block_height_retention = 288
+
+# Async durability: buffered (page-cache) redo + background flush, no per-flush
+# fsync (durability via the checkpoint barrier). DATA devices stay raw O_DIRECT.
+redo_buffered = true
+redo_flush_interval_ms = 50
+redo_buffered_io = true
+redo_segment_ring = true
+
+checkpoint_high_water = 0.50
+checkpoint_low_water = 0.15
+checkpoint_emergency_water = 0.90
+checkpoint_poll_interval_ms = 250
+
+strict_auth = false
+enable_remote_bind = true
+enable_admin_endpoints = true     # /metrics + /debug/pprof for profiling
+admin_token = "bench-local-admin-token-0001"
+
+# Write-back cache OFF for the raw-device profile: every data read/write goes
+# O_DIRECT to the NVMe so we measure the real device path. (A cache-on variant is
+# used separately for the throughput-ceiling run.)
+[index]
+backend = "memory"
+
+[storage]
+placement = "txid"

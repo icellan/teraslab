@@ -20,12 +20,39 @@ use thiserror::Error;
 /// the device header (freelist checkpoint, device metadata).
 pub const DATA_REGION_OFFSET: u64 = 1024 * 1024; // 1 MiB reserved for header
 
+/// Small reservation alignment used in packed mode (for struct field access),
+/// applied instead of rounding every reservation up to the device block.
+///
+/// In packed mode a small record (`size <= device block`) is rounded up to this
+/// boundary and packed contiguously within a single device block, instead of
+/// being rounded up to the full `device_alignment` (typically 4096) as the
+/// default non-packed mode does. See `docs/PACKED_RECORD_STORAGE_DESIGN.md`
+/// §3.1.
+pub const RECORD_ALIGN: u64 = 8;
+
 /// Magic number for the allocator header on device.
 const ALLOCATOR_MAGIC: u64 = 0x5445_5241_414C_4C43; // "TERAALLC"
 
 /// Current header version. Stored at bytes 40..44 so `recover()` can reject
 /// incompatible on-disk formats written by future builds.
+///
+/// This is the NON-PACKED (default) layout version. A packed device stamps
+/// [`HEADER_VERSION_PACKED`] instead; see [`SlotAllocator::persist`] and
+/// [`SlotAllocator::recover`].
 const HEADER_VERSION: u32 = 1;
+
+/// On-disk header version stamped by a PACKED allocator (sub-4 KiB record
+/// offsets, packed within a device block — see
+/// `docs/PACKED_RECORD_STORAGE_DESIGN.md`).
+///
+/// Packing must be persisted so a device's format wins over config across
+/// restarts: reopening a packed device in non-packed mode would make `free()`
+/// `align_up` to the full device block and over-free packed block-neighbours
+/// (silent corruption). `recover` restores packed-ness from this marker; an
+/// older binary that only knows [`HEADER_VERSION`] sees `version > max_known`
+/// and fails CLOSED with [`AllocatorError::UnsupportedVersion`] rather than
+/// misreading a packed device non-packed.
+const HEADER_VERSION_PACKED: u32 = 2;
 
 /// Byte offset of the header CRC32 field (little-endian u32). Computed over
 /// the header bytes from offset 0 up through the freelist entries, with the
@@ -221,10 +248,35 @@ pub struct PendingBatchAllocation {
     /// Per-input result in `sizes` order: `Some(region)` when reserved, `None`
     /// when the device was full for that size.
     pub regions: Vec<Option<AllocatedRegion>>,
-    /// In-memory reservation handles kept so `rollback_pending` can undo them.
-    reservations: Vec<(u64, Reservation)>,
+    /// In-memory rollback handle so `rollback_pending` can undo the reservation.
+    /// Variant determined by the producing allocator (each allocator only ever
+    /// receives back a `PendingBatchAllocation` it produced). `pub(crate)` so the
+    /// segment allocator (a sibling module) can build/destructure it.
+    pub(crate) rollback: BatchRollback,
     /// `AllocateRegion` redo entries the caller must journal before committing.
-    alloc_redo_ops: Vec<RedoOp>,
+    /// Empty for the segment allocator (which recovers its cursor from the index,
+    /// so it journals no region ops — see `segment_allocator`).
+    pub(crate) alloc_redo_ops: Vec<RedoOp>,
+}
+
+/// The allocator-specific in-memory rollback handle carried by a
+/// [`PendingBatchAllocation`]. The in-place [`SlotAllocator`] undoes each
+/// reservation individually (freelist re-insert or high-water reset); the
+/// append-cursor [`crate::segment_allocator::SegmentAllocator`] restores a single
+/// pre-batch cursor snapshot (the open segment is derivable from the cursor).
+pub(crate) enum BatchRollback {
+    /// In-place: per-reservation undo tokens, undone in reverse order.
+    Slot(Vec<(u64, Reservation)>),
+    /// Append-cursor: restore the cursor + the open segment's `used` to their
+    /// pre-batch values (the open segment index is derivable from the cursor).
+    Segment {
+        /// Cursor before the batch.
+        pre_cursor: u64,
+        /// Open segment before the batch.
+        pre_open_segment: u32,
+        /// `used` of `pre_open_segment` before the batch.
+        pre_open_used: u64,
+    },
 }
 
 impl PendingBatchAllocation {
@@ -282,6 +334,30 @@ pub struct SlotAllocator {
     /// recovery routes each region to the owning store's allocator and the
     /// entry to that store's redo log.
     redo_device_id: u8,
+    /// Opt-in packed allocation mode (default `false`).
+    ///
+    /// When `false` (the default), every reservation is rounded up to the
+    /// device block (`alignment`) exactly as before — byte-for-byte unchanged.
+    /// When `true`, small reservations (`size <= alignment`) are rounded up only
+    /// to [`RECORD_ALIGN`] and packed contiguously within a single device block
+    /// (never straddling a block boundary), while large reservations (`size >
+    /// alignment`) stay device-block-granular and block-aligned. See
+    /// [`Self::set_packed`] and `docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.1.
+    packed: bool,
+    /// Append-only allocation mode (default `false`).
+    ///
+    /// When `true`, [`Self::reserve_aligned`] never consults the freelist —
+    /// every allocation extends the high-water mark, so records are placed
+    /// strictly sequentially even as deletes free regions. Freed regions are
+    /// still journaled and inserted into the freelist (so recovery replay and
+    /// accounting are unchanged) but are NEVER handed back out. This is the
+    /// Phase 1 log-structured write lever; see [`Self::set_append_only`] and
+    /// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+    ///
+    /// Unlike [`Self::packed`], this is a pure placement policy: it does not
+    /// affect the on-disk format and is NOT persisted in the header — a device
+    /// can be reopened in either mode.
+    append_only: bool,
     /// Test/fault-injection only: fail the next [`SlotAllocator::persist`]
     /// call with [`AllocatorError::PersistFaultInjected`], then auto-clear.
     ///
@@ -310,8 +386,9 @@ enum FreelistBackend {
 
 // Source of an in-memory reservation. Kept so redo failures can roll the
 // allocator state back before the caller observes an unjournaled offset.
+// `pub(crate)` because it appears in the `pub(crate)` [`BatchRollback::Slot`].
 #[derive(Debug, Clone, Copy)]
-enum Reservation {
+pub(crate) enum Reservation {
     FromFreelist {
         /// The allocation's returned offset (= region start).
         alloc_offset: u64,
@@ -354,13 +431,37 @@ impl FreelistBackend {
     }
 
     /// Best-fit allocation. Returns `Some((offset, region_size))` or `None`.
-    fn best_fit(&mut self, aligned_size: u64) -> Option<(u64, u64)> {
+    ///
+    /// `block` carries the packed-mode placement constraint:
+    /// - `None` → non-packed: any region of sufficient size qualifies
+    ///   (behavior unchanged).
+    /// - `Some(block)` → packed: a region qualifies only if the head
+    ///   allocation `[region.offset, region.offset + aligned_size)` stays
+    ///   within a single `block` (small, `aligned_size <= block`) or starts
+    ///   block-aligned (large, `aligned_size > block`). Regions that would
+    ///   straddle a block boundary or misalign a large record are skipped so
+    ///   the caller falls through to the high-water path.
+    fn best_fit(&mut self, aligned_size: u64, block: Option<u64>) -> Option<(u64, u64)> {
+        // Does placing `aligned_size` at `offset` satisfy the packed
+        // within-one-block (small) / block-aligned (large) constraint?
+        let qualifies = |offset: u64| -> bool {
+            match block {
+                None => true,
+                Some(block) => {
+                    if aligned_size <= block {
+                        offset % block + aligned_size <= block
+                    } else {
+                        offset.is_multiple_of(block)
+                    }
+                }
+            }
+        };
         let result = match self {
             Self::Small(v) => {
                 let mut best_idx: Option<usize> = None;
                 let mut best_waste: u64 = u64::MAX;
                 for (i, region) in v.iter().enumerate() {
-                    if region.size >= aligned_size {
+                    if region.size >= aligned_size && qualifies(region.offset) {
                         let waste = region.size - aligned_size;
                         if waste < best_waste {
                             best_waste = waste;
@@ -384,7 +485,14 @@ impl FreelistBackend {
                 Some((region.offset, region.size))
             }
             Self::Large { by_offset, by_size } => {
-                let &(region_size, region_offset) = by_size.range((aligned_size, 0)..).next()?;
+                // Scan candidates in size order (smallest sufficient first) and
+                // take the first that also satisfies the block constraint. In
+                // non-packed mode `qualifies` is always true, so this stops at
+                // the first candidate — identical to the prior behavior.
+                let (region_size, region_offset) = by_size
+                    .range((aligned_size, 0)..)
+                    .map(|&(sz, off)| (sz, off))
+                    .find(|&(_, off)| qualifies(off))?;
                 by_size.remove(&(region_size, region_offset));
                 by_offset.remove(&region_offset);
                 if region_size > aligned_size {
@@ -537,6 +645,8 @@ impl SlotAllocator {
             device_id,
             redo_log: None,
             redo_device_id: 0,
+            packed: false,
+            append_only: false,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_persist: std::cell::Cell::new(false),
         })
@@ -584,6 +694,42 @@ impl SlotAllocator {
         self.redo_log.is_some()
     }
 
+    /// Enable or disable packed allocation mode.
+    ///
+    /// Default is `false` (device-block reservations, unchanged behavior). When
+    /// set to `true`, small reservations are packed within a single device block
+    /// at [`RECORD_ALIGN`] granularity and large reservations stay block-aligned
+    /// — see [`Self::align_reservation`] for the exact rule. Set once at startup
+    /// before any allocation; toggling it on a device that already holds
+    /// records placed under the other mode is unsupported (offsets differ).
+    pub fn set_packed(&mut self, packed: bool) {
+        self.packed = packed;
+    }
+
+    /// Whether packed allocation mode is currently enabled. See
+    /// [`Self::set_packed`].
+    pub fn is_packed(&self) -> bool {
+        self.packed
+    }
+
+    /// Enable or disable append-only allocation mode.
+    ///
+    /// Default is `false` (best-fit freelist reuse, unchanged behavior). When
+    /// `true`, [`Self::reserve_aligned`] never consults the freelist; every
+    /// allocation extends the high-water mark, keeping records sequential even
+    /// as deletes free space. Frees are still journaled and tracked but never
+    /// reused, so the device grows unbounded (no reclamation). Set once at
+    /// startup. See the field docs and the Phase 1 log-structured design.
+    pub fn set_append_only(&mut self, append_only: bool) {
+        self.append_only = append_only;
+    }
+
+    /// Whether append-only allocation mode is currently enabled. See
+    /// [`Self::set_append_only`].
+    pub fn is_append_only(&self) -> bool {
+        self.append_only
+    }
+
     /// Allocate a contiguous region of at least `size` bytes.
     ///
     /// The returned offset is aligned to the device's minimum I/O size.
@@ -597,7 +743,7 @@ impl SlotAllocator {
     /// no externally-visible effect and must treat the allocation as not
     /// having happened.
     pub fn allocate(&mut self, size: u64) -> Result<u64> {
-        let aligned_size = self.align_up(size);
+        let aligned_size = self.align_reservation(size);
         let (offset, reservation) = self.reserve_aligned(aligned_size)?;
 
         // Journal the reservation BEFORE returning — ensures the allocation
@@ -648,7 +794,7 @@ impl SlotAllocator {
         let mut redo_ops: Vec<RedoOp> = Vec::new();
 
         for size in sizes {
-            let aligned_size = self.align_up(*size);
+            let aligned_size = self.align_reservation(*size);
             match self.reserve_aligned(aligned_size) {
                 Ok((offset, reservation)) => {
                     results.push(Some(AllocatedRegion {
@@ -731,7 +877,7 @@ impl SlotAllocator {
         let mut alloc_redo_ops: Vec<RedoOp> = Vec::new();
 
         for size in sizes {
-            let aligned_size = self.align_up(*size);
+            let aligned_size = self.align_reservation(*size);
             match self.reserve_aligned(aligned_size) {
                 Ok((offset, reservation)) => {
                     regions.push(Some(AllocatedRegion {
@@ -760,7 +906,7 @@ impl SlotAllocator {
 
         Ok(PendingBatchAllocation {
             regions,
-            reservations,
+            rollback: BatchRollback::Slot(reservations),
             alloc_redo_ops,
         })
     }
@@ -770,8 +916,13 @@ impl SlotAllocator {
     /// in the freelist, so this only records allocation metrics and drops the
     /// rollback handles.
     pub fn commit_pending(&mut self, pending: PendingBatchAllocation) {
-        let count = pending.reservations.len() as u64;
-        let bytes: u64 = pending.reservations.iter().map(|(sz, _)| *sz).sum();
+        let BatchRollback::Slot(reservations) = &pending.rollback else {
+            // A SlotAllocator only ever receives back a PendingBatchAllocation it
+            // produced (the engine routes commit to the same store's allocator).
+            unreachable!("SlotAllocator::commit_pending given a non-Slot rollback handle");
+        };
+        let count = reservations.len() as u64;
+        let bytes: u64 = reservations.iter().map(|(sz, _)| *sz).sum();
         self.record_allocation_metrics(count, bytes);
     }
 
@@ -781,7 +932,10 @@ impl SlotAllocator {
     /// durable to compensate, so this needs no redo write (and works even when
     /// the redo log is full — the condition that motivated it).
     pub fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
-        for (aligned_size, reservation) in pending.reservations.into_iter().rev() {
+        let BatchRollback::Slot(reservations) = pending.rollback else {
+            unreachable!("SlotAllocator::rollback_pending given a non-Slot rollback handle");
+        };
+        for (aligned_size, reservation) in reservations.into_iter().rev() {
             self.rollback_reservation(aligned_size, reservation);
         }
     }
@@ -795,7 +949,12 @@ impl SlotAllocator {
     /// failure the freelist is left untouched and
     /// [`AllocatorError::RedoLogFailure`] is returned.
     pub fn free(&mut self, offset: u64, size: u64) -> Result<()> {
-        let aligned_size = self.align_up(size);
+        // Align the SAME way the region was reserved (`align_reservation`): in
+        // packed mode that is the record granularity, NOT the device block, so
+        // freeing one packed record returns exactly its byte range and never
+        // over-frees the block-neighbours it shares a 4 KiB block with. In
+        // non-packed mode this is `align_up` (device block), unchanged.
+        let aligned_size = self.align_reservation(size);
 
         if aligned_size == 0 {
             return Err(AllocatorError::InvalidFree {
@@ -901,7 +1060,25 @@ impl SlotAllocator {
     }
 
     fn reserve_aligned(&mut self, aligned_size: u64) -> Result<(u64, Reservation)> {
-        if let Some((region_offset, region_size)) = self.freelist.best_fit(aligned_size) {
+        // In packed mode, pass the device block to `best_fit` so a reused hole
+        // satisfies the within-one-block (small) / block-aligned (large)
+        // constraint for the allocation it hands out. In non-packed mode the
+        // constraint is absent and `best_fit` behaves exactly as before.
+        let block_constraint = if self.packed {
+            Some(self.alignment as u64)
+        } else {
+            None
+        };
+        // Append-only mode skips freelist reuse entirely so every allocation
+        // extends the high-water mark — records stay strictly sequential even
+        // after deletes (whose freed regions remain in the freelist for
+        // accounting/recovery but are never handed back out).
+        let from_freelist = if self.append_only {
+            None
+        } else {
+            self.freelist.best_fit(aligned_size, block_constraint)
+        };
+        if let Some((region_offset, region_size)) = from_freelist {
             // best_fit already removed/split the region in the freelist.
             self.freelist.maybe_demote();
             Ok((
@@ -913,7 +1090,30 @@ impl SlotAllocator {
             ))
         } else {
             // No suitable free region — extend at the append point.
-            let offset = self.next_offset;
+            let previous_next_offset = self.next_offset;
+            let mut offset = self.next_offset;
+
+            // Packed placement invariant: a record never straddles a device
+            // block, and a large record starts block-aligned. If placing at
+            // the current high-water mark would violate that, advance to the
+            // next block boundary. The skipped tail
+            // `[previous_next_offset, offset)` is acceptable waste for this
+            // phase (~1%); `previous_next_offset` (the ORIGINAL high-water)
+            // is recorded below so rollback reclaims the record AND the tail.
+            if self.packed {
+                let block = self.alignment as u64;
+                let need_bump = if aligned_size <= block {
+                    offset % block + aligned_size > block
+                } else {
+                    !offset.is_multiple_of(block)
+                };
+                if need_bump {
+                    offset = offset.div_ceil(block) * block;
+                }
+            }
+
+            // Overflow + device-size bounds are checked against the possibly
+            // bumped offset.
             let Some(end) = offset.checked_add(aligned_size) else {
                 return Err(AllocatorError::DeviceFull {
                     requested: aligned_size,
@@ -926,7 +1126,6 @@ impl SlotAllocator {
                     largest_free: self.freelist.largest(),
                 });
             }
-            let previous_next_offset = self.next_offset;
             self.next_offset = end;
             Ok((
                 offset,
@@ -1082,7 +1281,11 @@ impl SlotAllocator {
     }
 
     fn replay_allocate(&mut self, offset: u64, size: u64) -> bool {
-        let aligned_size = self.align_up(size);
+        // Use the same size-alignment the live path used so packed offsets
+        // reconstruct identically from the redo `AllocateRegion` entries. The
+        // redo entry's `offset` is the exact placed offset, so no bump logic is
+        // needed here — only the SIZE alignment must match `align_reservation`.
+        let aligned_size = self.align_reservation(size);
         let Some(end) = offset.checked_add(aligned_size) else {
             tracing::error!(
                 target = "teraslab::allocator",
@@ -1174,7 +1377,13 @@ impl SlotAllocator {
     }
 
     fn replay_free(&mut self, offset: u64, size: u64) -> bool {
-        let aligned_size = self.align_up(size);
+        // Align the same way the live path sized the reservation so replay
+        // reconstructs identical packed ranges. `FreeRegion` redo entries store
+        // an already-aligned size, on which `align_reservation` is idempotent
+        // (it equals `align_up` for any block-multiple input), so this is a
+        // no-op for the current free path and stays exact if a later phase
+        // packs frees too.
+        let aligned_size = self.align_reservation(size);
         if aligned_size == 0 {
             tracing::error!(
                 target = "teraslab::allocator",
@@ -1333,6 +1542,27 @@ impl SlotAllocator {
     }
 
     pub fn persist(&self) -> Result<()> {
+        self.persist_header_no_sync()?;
+        // B-1 audit fix: barrier the header write so it is durable (not merely
+        // in the device/drive write cache) before returning — recovery and the
+        // checkpoint rely on this. See `persist_header_no_sync` for the path
+        // that intentionally defers this sync to the caller.
+        self.device.sync()?;
+        Ok(())
+    }
+
+    /// Write the allocator header to the device WITHOUT the durability fsync.
+    ///
+    /// The caller MUST sync the device afterwards to make the header durable.
+    /// This exists for the checkpoint, which writes every store's header and
+    /// then syncs all store devices ONCE — crucially, *outside* the per-store
+    /// allocator mutex. Folding the `device.sync()` into the lock (as `persist`
+    /// does) means a slow sync — e.g. flushing a large write-back data cache —
+    /// holds the allocator mutex for its whole duration, which blocks every
+    /// create's `reserve_*` and stalls all writes (profiled: a single 90s
+    /// checkpoint sync froze the server). Header writing is cheap and stays
+    /// under the lock; the expensive sync is hoisted out by the caller.
+    pub(crate) fn persist_header_no_sync(&self) -> Result<()> {
         // Test/fault-injection only: fail-once hook to drive a checkpoint
         // into the "snapshot renamed, allocator persist failed, no fence
         // written" crash window. Auto-clears so a retry succeeds. Compiled
@@ -1365,7 +1595,16 @@ impl SlotAllocator {
         buf[8..16].copy_from_slice(&self.next_offset.to_le_bytes());
         buf[16..24].copy_from_slice(&(count as u64).to_le_bytes());
         buf[24..40].copy_from_slice(&self.device_id);
-        buf[40..44].copy_from_slice(&HEADER_VERSION.to_le_bytes());
+        // Stamp the layout version: packed devices write
+        // `HEADER_VERSION_PACKED` (2) so `recover` restores packed-ness and an
+        // old v1-only binary fails closed; non-packed devices write
+        // `HEADER_VERSION` (1), byte-identical to before.
+        let version = if self.packed {
+            HEADER_VERSION_PACKED
+        } else {
+            HEADER_VERSION
+        };
+        buf[40..44].copy_from_slice(&version.to_le_bytes());
         // CRC slot stays zero until we hash — this is part of the contract.
         buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&0u32.to_le_bytes());
 
@@ -1389,14 +1628,9 @@ impl SlotAllocator {
         buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
         self.device.pwrite_all_at(&buf, 0)?;
-        // B-1 audit fix: barrier the header write. Without this the pwrite
-        // can sit in the drive's volatile write cache; the checkpoint then
-        // compacts the AllocateRegion/FreeRegion redo entries covering the
-        // delta, and a power loss reverts the header with no replayable
-        // copy left — the next boot double-allocates live regions. The
-        // checkpoint doc has always claimed "allocator persist is fsynced
-        // before returning"; this makes that claim true.
-        self.device.sync()?;
+        // NOTE: the durability fsync is intentionally NOT here — `persist` adds
+        // it, and the checkpoint syncs all store devices once outside the
+        // allocator lock. See this method's doc comment.
         Ok(())
     }
 
@@ -1460,9 +1694,17 @@ impl SlotAllocator {
                 .try_into()
                 .map_err(|_| AllocatorError::CorruptedHeader)?,
         );
-        if version > HEADER_VERSION {
-            return Err(AllocatorError::UnsupportedVersion(version));
-        }
+        // Classify the on-disk layout from the version field. The DEVICE's
+        // format wins: packed-ness comes from here, never from config. Any
+        // version this build does not know (including a v2 packed header read
+        // by an old v1-only binary, where `HEADER_VERSION_PACKED` would not be
+        // a known value) fails CLOSED — opening a packed device non-packed
+        // would corrupt it via `free()`'s block-rounding.
+        let packed = match version {
+            HEADER_VERSION => false,
+            HEADER_VERSION_PACKED => true,
+            other => return Err(AllocatorError::UnsupportedVersion(other)),
+        };
 
         // Read the full freelist and verify CRC32.
         //
@@ -1542,6 +1784,11 @@ impl SlotAllocator {
             device_id,
             redo_log: None,
             redo_device_id: 0,
+            packed,
+            // Append-only is a runtime placement policy, not an on-disk format;
+            // it is never persisted, so a recovered allocator starts in the
+            // default (best-fit) mode until the caller re-applies config.
+            append_only: false,
             #[cfg(any(test, feature = "fault-injection"))]
             fail_next_persist: std::cell::Cell::new(false),
         })
@@ -1551,6 +1798,30 @@ impl SlotAllocator {
     fn align_up(&self, size: u64) -> u64 {
         let a = self.alignment as u64;
         size.div_ceil(a) * a
+    }
+
+    /// Compute the reservation size for `size` bytes, honoring packed mode.
+    ///
+    /// - Not packed → `align_up(size)` (device block — unchanged behavior).
+    /// - Packed, small (`size <= device block`) → rounded up to [`RECORD_ALIGN`]
+    ///   so several records pack within one block.
+    /// - Packed, large (`size > device block`) → `align_up(size)` (device-block
+    ///   multiple) so a large record owns whole blocks and stays block-granular.
+    ///
+    /// This sizes the reservation only; the within-one-block / block-aligned
+    /// *placement* invariant is enforced in [`Self::reserve_aligned`].
+    fn align_reservation(&self, size: u64) -> u64 {
+        if !self.packed {
+            return self.align_up(size);
+        }
+        let block = self.alignment as u64;
+        if size <= block {
+            // Small/packable: round up to the small struct-access alignment.
+            size.div_ceil(RECORD_ALIGN) * RECORD_ALIGN
+        } else {
+            // Large: keep device-block granularity so it owns its blocks.
+            self.align_up(size)
+        }
     }
 
     /// The number of free regions in the freelist.
@@ -1581,7 +1852,10 @@ impl SlotAllocator {
     /// redo entry that points outside allocator-owned space must not
     /// register a primary index entry.
     pub fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
-        let aligned_size = self.align_up(size);
+        // Match the reservation granularity (record-aligned in packed mode, the
+        // device block otherwise) so the checked range is exactly the record's,
+        // not a 4 KiB-rounded span that would bleed into packed neighbours.
+        let aligned_size = self.align_reservation(size);
         let Some(end) = offset.checked_add(aligned_size) else {
             return false;
         };
@@ -1689,6 +1963,342 @@ impl SlotAllocator {
 }
 
 // ---------------------------------------------------------------------------
+// RecordAllocator trait — the storage-engine seam
+// ---------------------------------------------------------------------------
+
+/// The device-space allocator interface the engine, recovery, index-rebuild, and
+/// checkpoint paths depend on, so a store can be backed by either the in-place
+/// [`SlotAllocator`] (best-fit freelist) or the log-structured
+/// [`crate::segment_allocator::SegmentAllocator`] (append cursor + defrag).
+///
+/// This is the increment-2 abstraction of the log-structured engine build (see
+/// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`). The engine holds
+/// `Box<dyn RecordAllocator>` per store; callers route by `device_id`.
+///
+/// The common error is [`AllocatorError`]; a segment allocator maps its own
+/// errors into it. Test/fault-injection hooks (`arm_fail_next_persist`,
+/// `__test_force_push_free_region`) are intentionally NOT on the trait — tests
+/// that need them construct the concrete [`SlotAllocator`].
+///
+/// `Send` is required because the allocator lives in `Mutex<Box<dyn RecordAllocator>>`
+/// inside an `Arc<Engine>` shared across worker threads.
+pub trait RecordAllocator: Send {
+    /// Allocate a contiguous region of at least `size` bytes; see
+    /// [`SlotAllocator::allocate`].
+    fn allocate(&mut self, size: u64) -> Result<u64>;
+    /// Allocate multiple regions with a single redo flush; see
+    /// [`SlotAllocator::allocate_batch`].
+    fn allocate_batch(&mut self, sizes: &[u64]) -> Result<Vec<Option<AllocatedRegion>>>;
+    /// Reserve a batch in memory, deferring the durable journaling to the caller
+    /// (orphan prevention); see [`SlotAllocator::reserve_batch`].
+    fn reserve_batch(&mut self, sizes: &[u64]) -> Result<PendingBatchAllocation>;
+    /// Finalize a reservation whose redo ops the caller has journaled.
+    fn commit_pending(&mut self, pending: PendingBatchAllocation);
+    /// Roll back a reservation whose redo batch could not be journaled.
+    fn rollback_pending(&mut self, pending: PendingBatchAllocation);
+    /// Return a region; see [`SlotAllocator::free`].
+    fn free(&mut self, offset: u64, size: u64) -> Result<()>;
+    /// Persist allocator state to the device header and fsync.
+    fn persist(&self) -> Result<()>;
+    /// Write the header without the durability fsync (checkpoint hoists the sync).
+    fn persist_header_no_sync(&self) -> Result<()>;
+    /// Apply an allocator-relevant redo entry during recovery; returns whether
+    /// state changed. See [`SlotAllocator::replay_redo`].
+    fn replay_redo(&mut self, op: &RedoOp) -> bool;
+    /// Whether `[offset, offset+size)` is allocated (inside high-water, not free).
+    fn is_allocated_range(&self, offset: u64, size: u64) -> bool;
+    /// The free region containing `offset`, if any.
+    fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)>;
+    /// Number of free regions (diagnostics).
+    fn free_region_count(&self) -> usize;
+    /// Observability snapshot.
+    fn stats(&self) -> AllocatorStats;
+    /// Current high-water mark.
+    fn next_offset(&self) -> u64;
+    /// Start of the data region.
+    fn data_region_start(&self) -> u64;
+    /// Device I/O alignment.
+    fn device_alignment(&self) -> usize;
+    /// 128-bit device identity.
+    fn device_id(&self) -> [u8; 16];
+    /// Device identity as lowercase hex.
+    fn device_id_hex(&self) -> String;
+    /// Attach a redo log for journaling allocate/free.
+    fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>);
+    /// Tag this allocator's store for redo routing.
+    fn set_redo_device_id(&mut self, device_id: u8);
+    /// The store tag stamped on this allocator's redo entries.
+    fn redo_device_id(&self) -> u8;
+    /// Whether a redo log is attached.
+    fn has_redo_log(&self) -> bool;
+    /// Enable/disable packed allocation mode.
+    fn set_packed(&mut self, packed: bool);
+    /// Whether packed mode is enabled.
+    fn is_packed(&self) -> bool;
+    /// Enable/disable append-only allocation mode.
+    fn set_append_only(&mut self, append_only: bool);
+    /// Whether append-only mode is enabled.
+    fn is_append_only(&self) -> bool;
+
+    /// Whether this is the LOG-STRUCTURED (segment) allocator, whose records are
+    /// relocated to a new append-cursor offset on mutation (relocate-on-spend)
+    /// rather than updated in place. Default `false` (the in-place
+    /// [`SlotAllocator`]); the segment allocator overrides it. The engine caches
+    /// this per store (like packed-ness) to branch the spend write path without
+    /// locking the allocator on the hot path.
+    fn is_log_structured(&self) -> bool {
+        false
+    }
+
+    /// Recovery: ensure the allocation frontier is at least `end` (the end offset
+    /// of the highest live record), so post-checkpoint records are not overwritten
+    /// by a fresh allocation. Default no-op: the in-place [`SlotAllocator`]
+    /// re-derives its high-water mark from replayed `AllocateRegion` ops. The
+    /// append-cursor segment allocator overrides this (it journals no region ops,
+    /// so its cursor is recomputed from the index after replay — design §3.2).
+    fn recover_frontier_at_least(&mut self, end: u64) {
+        let _ = end;
+    }
+
+    /// Recovery reconciliation for the log-structured (segment) engine: rebuild
+    /// the reclaimed-segment free list from the LIVE index so a defragged
+    /// (bounded-growth, non-monotonic) layout survives a crash. `live_offsets` are
+    /// the record offsets of every live index entry on this store. Called AFTER
+    /// [`Self::recover_frontier_at_least`] has set the cursor/open segment.
+    /// Default no-op: the in-place [`SlotAllocator`] has no segments to reclaim.
+    /// The segment allocator overrides it — every already-used segment holding no
+    /// live record is a defrag hole it returns to the reuse free list.
+    fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
+        let _ = live_offsets;
+    }
+
+    /// Defrag fast path (log-structured engine): reclaim every fully-dead segment
+    /// (all its records relocated out or deleted) for reuse, bounding device
+    /// growth. Returns the number of segments reclaimed. Default 0: the in-place
+    /// [`SlotAllocator`] reclaims freed space through its freelist, not segments.
+    /// The segment allocator overrides it. Safe to call under the allocator lock;
+    /// the reclaimed state is re-derivable on recovery
+    /// ([`Self::reconcile_recovered_free_list`]), so it needs no journaling — the
+    /// checkpoint persists it in the header on its next pass.
+    fn reclaim_fully_dead_segments(&mut self) -> usize {
+        0
+    }
+
+    /// Defrag compaction candidates (log-structured engine): the device
+    /// `[start, end)` byte ranges of up to `max` PARTIALLY-dead segments whose
+    /// dead fraction is at least `min_dead_frac`, most-dead-first. The caller (the
+    /// engine) relocates the few live records inside each range out to the cursor,
+    /// after which the segment drains fully and the fast path
+    /// ([`Self::reclaim_fully_dead_segments`]) reclaims it. Default empty: the
+    /// in-place [`SlotAllocator`] has no segments. The segment allocator overrides.
+    fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
+        let _ = (min_dead_frac, max);
+        Vec::new()
+    }
+
+    /// Test/fault-injection only: arm the next persist to fail once. On the trait
+    /// so checkpoint crash tests can trigger it through the engine's boxed
+    /// allocator. Compiled out of production builds.
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn arm_fail_next_persist(&self);
+}
+
+/// A heap-allocated, dynamically-dispatched [`RecordAllocator`] — the concrete
+/// type a [`crate::ops::Engine`] store holds so it can be backed by either the
+/// in-place or the log-structured allocator.
+pub type BoxedAllocator = Box<dyn RecordAllocator>;
+
+/// Blanket impl so a `Box<dyn RecordAllocator>` is itself a [`RecordAllocator`].
+/// Lets a [`BoxedAllocator`] be passed anywhere an `impl RecordAllocator` is
+/// expected (e.g. the `Engine` constructors) and a `&[BoxedAllocator]` satisfy
+/// generic allocator-slice bounds — forwarding every call to the inner trait
+/// object.
+impl RecordAllocator for BoxedAllocator {
+    fn allocate(&mut self, size: u64) -> Result<u64> {
+        (**self).allocate(size)
+    }
+    fn allocate_batch(&mut self, sizes: &[u64]) -> Result<Vec<Option<AllocatedRegion>>> {
+        (**self).allocate_batch(sizes)
+    }
+    fn reserve_batch(&mut self, sizes: &[u64]) -> Result<PendingBatchAllocation> {
+        (**self).reserve_batch(sizes)
+    }
+    fn commit_pending(&mut self, pending: PendingBatchAllocation) {
+        (**self).commit_pending(pending)
+    }
+    fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
+        (**self).rollback_pending(pending)
+    }
+    fn free(&mut self, offset: u64, size: u64) -> Result<()> {
+        (**self).free(offset, size)
+    }
+    fn persist(&self) -> Result<()> {
+        (**self).persist()
+    }
+    fn persist_header_no_sync(&self) -> Result<()> {
+        (**self).persist_header_no_sync()
+    }
+    fn replay_redo(&mut self, op: &RedoOp) -> bool {
+        (**self).replay_redo(op)
+    }
+    fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
+        (**self).is_allocated_range(offset, size)
+    }
+    fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)> {
+        (**self).free_region_containing(offset)
+    }
+    fn free_region_count(&self) -> usize {
+        (**self).free_region_count()
+    }
+    fn stats(&self) -> AllocatorStats {
+        (**self).stats()
+    }
+    fn next_offset(&self) -> u64 {
+        (**self).next_offset()
+    }
+    fn data_region_start(&self) -> u64 {
+        (**self).data_region_start()
+    }
+    fn device_alignment(&self) -> usize {
+        (**self).device_alignment()
+    }
+    fn device_id(&self) -> [u8; 16] {
+        (**self).device_id()
+    }
+    fn device_id_hex(&self) -> String {
+        (**self).device_id_hex()
+    }
+    fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>) {
+        (**self).set_redo_log(redo_log)
+    }
+    fn set_redo_device_id(&mut self, device_id: u8) {
+        (**self).set_redo_device_id(device_id)
+    }
+    fn redo_device_id(&self) -> u8 {
+        (**self).redo_device_id()
+    }
+    fn has_redo_log(&self) -> bool {
+        (**self).has_redo_log()
+    }
+    fn set_packed(&mut self, packed: bool) {
+        (**self).set_packed(packed)
+    }
+    fn is_packed(&self) -> bool {
+        (**self).is_packed()
+    }
+    fn set_append_only(&mut self, append_only: bool) {
+        (**self).set_append_only(append_only)
+    }
+    fn is_append_only(&self) -> bool {
+        (**self).is_append_only()
+    }
+    fn is_log_structured(&self) -> bool {
+        (**self).is_log_structured()
+    }
+    fn recover_frontier_at_least(&mut self, end: u64) {
+        (**self).recover_frontier_at_least(end)
+    }
+    fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
+        (**self).reconcile_recovered_free_list(live_offsets)
+    }
+    fn reclaim_fully_dead_segments(&mut self) -> usize {
+        (**self).reclaim_fully_dead_segments()
+    }
+    fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
+        (**self).defrag_victim_ranges(min_dead_frac, max)
+    }
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn arm_fail_next_persist(&self) {
+        (**self).arm_fail_next_persist()
+    }
+}
+
+impl RecordAllocator for SlotAllocator {
+    fn allocate(&mut self, size: u64) -> Result<u64> {
+        SlotAllocator::allocate(self, size)
+    }
+    fn allocate_batch(&mut self, sizes: &[u64]) -> Result<Vec<Option<AllocatedRegion>>> {
+        SlotAllocator::allocate_batch(self, sizes)
+    }
+    fn reserve_batch(&mut self, sizes: &[u64]) -> Result<PendingBatchAllocation> {
+        SlotAllocator::reserve_batch(self, sizes)
+    }
+    fn commit_pending(&mut self, pending: PendingBatchAllocation) {
+        SlotAllocator::commit_pending(self, pending)
+    }
+    fn rollback_pending(&mut self, pending: PendingBatchAllocation) {
+        SlotAllocator::rollback_pending(self, pending)
+    }
+    fn free(&mut self, offset: u64, size: u64) -> Result<()> {
+        SlotAllocator::free(self, offset, size)
+    }
+    fn persist(&self) -> Result<()> {
+        SlotAllocator::persist(self)
+    }
+    fn persist_header_no_sync(&self) -> Result<()> {
+        SlotAllocator::persist_header_no_sync(self)
+    }
+    fn replay_redo(&mut self, op: &RedoOp) -> bool {
+        SlotAllocator::replay_redo(self, op)
+    }
+    fn is_allocated_range(&self, offset: u64, size: u64) -> bool {
+        SlotAllocator::is_allocated_range(self, offset, size)
+    }
+    fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)> {
+        SlotAllocator::free_region_containing(self, offset)
+    }
+    fn free_region_count(&self) -> usize {
+        SlotAllocator::free_region_count(self)
+    }
+    fn stats(&self) -> AllocatorStats {
+        SlotAllocator::stats(self)
+    }
+    fn next_offset(&self) -> u64 {
+        SlotAllocator::next_offset(self)
+    }
+    fn data_region_start(&self) -> u64 {
+        SlotAllocator::data_region_start(self)
+    }
+    fn device_alignment(&self) -> usize {
+        SlotAllocator::device_alignment(self)
+    }
+    fn device_id(&self) -> [u8; 16] {
+        SlotAllocator::device_id(self)
+    }
+    fn device_id_hex(&self) -> String {
+        SlotAllocator::device_id_hex(self)
+    }
+    fn set_redo_log(&mut self, redo_log: Arc<Mutex<RedoLog>>) {
+        SlotAllocator::set_redo_log(self, redo_log)
+    }
+    fn set_redo_device_id(&mut self, device_id: u8) {
+        SlotAllocator::set_redo_device_id(self, device_id)
+    }
+    fn redo_device_id(&self) -> u8 {
+        SlotAllocator::redo_device_id(self)
+    }
+    fn has_redo_log(&self) -> bool {
+        SlotAllocator::has_redo_log(self)
+    }
+    fn set_packed(&mut self, packed: bool) {
+        SlotAllocator::set_packed(self, packed)
+    }
+    fn is_packed(&self) -> bool {
+        SlotAllocator::is_packed(self)
+    }
+    fn set_append_only(&mut self, append_only: bool) {
+        SlotAllocator::set_append_only(self, append_only)
+    }
+    fn is_append_only(&self) -> bool {
+        SlotAllocator::is_append_only(self)
+    }
+    #[cfg(any(test, feature = "fault-injection"))]
+    fn arm_fail_next_persist(&self) {
+        SlotAllocator::arm_fail_next_persist(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1763,6 +2373,70 @@ mod tests {
         alloc.free(o1, 4096).unwrap();
         let o2 = alloc.allocate(4096).unwrap();
         assert_eq!(o1, o2); // Reused the freed region
+    }
+
+    #[test]
+    fn append_only_defaults_off() {
+        let dev = test_device(16);
+        let alloc = SlotAllocator::new(dev).unwrap();
+        assert!(!alloc.is_append_only());
+    }
+
+    #[test]
+    fn append_only_does_not_reuse_freed_region() {
+        // Contrast with `free_and_reuse`: in append-only mode a freed region is
+        // NOT handed back out — the next allocation extends the high-water mark.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_append_only(true);
+        assert!(alloc.is_append_only());
+
+        let o1 = alloc.allocate(4096).unwrap();
+        let o2 = alloc.allocate(4096).unwrap();
+        assert_eq!(o2, o1 + 4096);
+        alloc.free(o1, 4096).unwrap();
+
+        let o3 = alloc.allocate(4096).unwrap();
+        // Best-fit mode would return o1 here; append-only extends past o2.
+        assert_ne!(o3, o1);
+        assert_eq!(o3, o2 + 4096);
+    }
+
+    #[test]
+    fn append_only_still_tracks_frees_for_accounting() {
+        // Frees must still be journaled/tracked (recovery + accounting) even
+        // though allocation never reuses them.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_append_only(true);
+        let o1 = alloc.allocate(4096).unwrap();
+        let _o2 = alloc.allocate(4096).unwrap();
+        assert_eq!(alloc.free_region_count(), 0);
+        alloc.free(o1, 4096).unwrap();
+        assert_eq!(alloc.free_region_count(), 1);
+        // The freed region sits in the freelist but is not reused.
+        let o3 = alloc.allocate(4096).unwrap();
+        assert_ne!(o3, o1);
+        assert_eq!(alloc.free_region_count(), 1);
+    }
+
+    #[test]
+    fn append_only_composes_with_packed() {
+        // Packed + append-only: small records pack sequentially at RECORD_ALIGN
+        // within a block, and freed records are never reused.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        alloc.set_append_only(true);
+        let o0 = alloc.allocate(600).unwrap();
+        let o1 = alloc.allocate(600).unwrap();
+        // Packed: 600 is already 8-aligned, so o1 packs immediately after o0.
+        assert_eq!(o1, o0 + 600);
+        alloc.free(o0, 600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        // Append-only: o0's hole is not reused; o2 extends past o1.
+        assert_ne!(o2, o0);
+        assert_eq!(o2, o1 + 600);
     }
 
     #[test]
@@ -3458,6 +4132,621 @@ mod tests {
             after_above - before_above >= 2,
             "generation_wrap_warn_total must advance by ≥ 2 when delta > 2^30, got {}",
             after_above - before_above,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1: packed, block-aware allocation (docs/PACKED_RECORD_STORAGE_DESIGN
+    // §3.1). All tests use the 4096-alignment `test_device`.
+    // -----------------------------------------------------------------------
+
+    /// Default-off regression: with packing disabled, reservations are still
+    /// rounded up to the full 4 KB device block exactly as before. Pins the
+    /// pre-packed behavior so the opt-in cannot silently change the default.
+    #[test]
+    fn packed_default_off_reservations_stay_block_aligned() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        assert!(!alloc.is_packed(), "packing must default to OFF");
+
+        let o1 = alloc.allocate(600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        let o3 = alloc.allocate(600).unwrap();
+
+        assert_eq!(o1, DATA_REGION_OFFSET);
+        // Each ~600 B record consumes a full 4096 B block — 4096 B apart.
+        assert_eq!(o2 - o1, 4096, "non-packed records must be one block apart");
+        assert_eq!(o3 - o2, 4096, "non-packed records must be one block apart");
+    }
+
+    /// Packed mode places multiple small records within ONE 4 KB block: offsets
+    /// are RECORD_ALIGN-aligned, share a block, and are < a block apart —
+    /// contrasting with the 4096-apart non-packed layout above.
+    #[test]
+    fn packed_small_records_share_one_block() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        assert!(alloc.is_packed());
+
+        let block = 4096u64;
+        let o1 = alloc.allocate(600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        let o3 = alloc.allocate(600).unwrap();
+
+        assert_eq!(o1, DATA_REGION_OFFSET, "first packed record at data start");
+
+        // 600 rounds up to 600.div_ceil(8)*8 = 600 (already 8-aligned) -> 608?
+        // 600 % 8 == 0, so aligned size is 600. Spacing is the aligned size.
+        for (i, &o) in [o1, o2, o3].iter().enumerate() {
+            assert_eq!(
+                o % RECORD_ALIGN,
+                0,
+                "record {i} must be RECORD_ALIGN-aligned"
+            );
+            assert_eq!(
+                o / block,
+                o1 / block,
+                "record {i} must share the first block with o1"
+            );
+        }
+        assert_eq!(o2 - o1, 600, "packed spacing == RECORD_ALIGN-aligned size");
+        assert_eq!(o3 - o2, 600, "packed spacing == RECORD_ALIGN-aligned size");
+        assert!(o3 - o1 < block, "all three must fit within one block");
+    }
+
+    #[test]
+    fn packed_free_does_not_overfree_block_neighbours() {
+        // The corruption GATE (PACKED_RECORD_STORAGE_DESIGN.md §3): freeing one
+        // packed record must return EXACTLY its byte range, not a 4 KiB-rounded
+        // span that would also free the records sharing its block.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+
+        let o1 = alloc.allocate(600).unwrap();
+        let o2 = alloc.allocate(600).unwrap();
+        let o3 = alloc.allocate(600).unwrap();
+        let block = 4096u64;
+        assert_eq!(o1 / block, o3 / block, "all three packed into one block");
+        assert!(alloc.is_allocated_range(o1, 600));
+        assert!(alloc.is_allocated_range(o3, 600));
+
+        // Free the MIDDLE record with its exact size.
+        alloc.free(o2, 600).unwrap();
+
+        // Neighbours must remain allocated — a 4 KiB-rounded free would have
+        // swept o3 (forward, within o2+4096) into the freelist.
+        assert!(
+            alloc.is_allocated_range(o1, 600),
+            "o1 must not be over-freed by free(o2)"
+        );
+        assert!(
+            alloc.is_allocated_range(o3, 600),
+            "o3 must not be over-freed by free(o2)"
+        );
+
+        // The freed hole is exactly o2's range and is reused as-is.
+        let reused = alloc.allocate(600).unwrap();
+        assert_eq!(
+            reused, o2,
+            "freed packed hole reused exactly; neighbours intact"
+        );
+    }
+
+    /// Packed reservation size rounds non-8-multiple sizes up to RECORD_ALIGN.
+    #[test]
+    fn packed_reservation_rounds_up_to_record_align() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+
+        // 393 -> rounds up to 400 (393.div_ceil(8)*8 = 400).
+        let o1 = alloc.allocate(393).unwrap();
+        let o2 = alloc.allocate(393).unwrap();
+        assert_eq!(
+            o2 - o1,
+            400,
+            "393 B must reserve 400 B (RECORD_ALIGN multiple)"
+        );
+        assert_eq!(o1 % RECORD_ALIGN, 0);
+        assert_eq!(o2 % RECORD_ALIGN, 0);
+    }
+
+    /// No small record straddles a block boundary: reserve until the next
+    /// record would cross, and assert it bumps to the next block start (leaving
+    /// the block tail as waste).
+    #[test]
+    fn packed_no_small_record_straddles_block() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+
+        // 1024 B records: 4 fit in a block exactly (4*1024 == 4096). The 5th
+        // would start at block+0 already since 4*1024 fills the block.
+        // Use 1000 B (rounds to 1000, 8-aligned) so 4 fit (4000) and the 5th
+        // would straddle (4000 + 1000 = 5000 > 4096) -> bump to next block.
+        let mut offsets = Vec::new();
+        for _ in 0..5 {
+            offsets.push(alloc.allocate(1000).unwrap());
+        }
+        // First four within block 0.
+        let first_block = DATA_REGION_OFFSET / block;
+        for (i, &o) in offsets.iter().take(4).enumerate() {
+            assert_eq!(o / block, first_block, "record {i} in block 0");
+            assert!(
+                o % block + 1000 <= block,
+                "record {i} at {o} must not straddle a block boundary"
+            );
+        }
+        // Fifth bumped to the start of the next block (no straddle).
+        let fifth = offsets[4];
+        assert_eq!(
+            fifth % block,
+            0,
+            "the straddling record must be bumped to a block boundary"
+        );
+        assert_eq!(
+            fifth,
+            DATA_REGION_OFFSET + block,
+            "fifth record must start at the next block"
+        );
+    }
+
+    /// A large record (> one block) gets a block-aligned offset and a
+    /// block-multiple reservation size, and stays block-granular even in packed
+    /// mode.
+    #[test]
+    fn packed_large_record_is_block_aligned() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+
+        // Place a small record first so the high-water is mid-block.
+        let small = alloc.allocate(600).unwrap();
+        assert_eq!(small, DATA_REGION_OFFSET);
+
+        // A large record (5000 B > block) must be bumped to a block boundary
+        // and reserve a block multiple (8192).
+        let large = alloc.allocate(5000).unwrap();
+        assert_eq!(large % block, 0, "large record must start block-aligned");
+        assert_eq!(
+            large,
+            DATA_REGION_OFFSET + block,
+            "large record bumped to next block after the small one"
+        );
+
+        // The next allocation must start a block-multiple past the large one
+        // (5000 -> align_up -> 8192).
+        let after = alloc.allocate(600).unwrap();
+        assert_eq!(
+            after,
+            large + 8192,
+            "large reservation must be a block multiple (8192)"
+        );
+    }
+
+    /// Freelist reuse in packed mode returns a within-block hole and hands out a
+    /// within-block, RECORD_ALIGN-aligned allocation from it.
+    ///
+    /// Holes are seeded as precise byte ranges via the test helper because
+    /// `free()` still block-rounds in this phase (the free path is not yet
+    /// packing-aware — out of scope for §3.1); best_fit's block-awareness is
+    /// what we exercise here.
+    #[test]
+    fn packed_freelist_reuse_respects_block_boundary() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+        let d = DATA_REGION_OFFSET;
+
+        // Advance the high-water past block 0 so reuse (not bump) is exercised.
+        let _hw = alloc.allocate(8000).unwrap(); // large -> blocks 0..1 owned
+
+        // Seed a 1000 B hole wholly within block 2: [D+2*block, D+2*block+1000).
+        let hole = d + 2 * block;
+        alloc.__test_force_push_free_region(hole, 1000);
+        assert_eq!(alloc.free_region_count(), 1);
+
+        // A 1000 B packed alloc must reuse that within-block hole exactly.
+        let reused = alloc.allocate(1000).unwrap();
+        assert_eq!(reused, hole, "packed reuse must take the within-block hole");
+        assert!(
+            reused % block + 1000 <= block,
+            "reuse must stay within one block"
+        );
+        assert_eq!(alloc.free_region_count(), 0, "exact-fit hole consumed");
+    }
+
+    /// A freelist hole that would force a straddling allocation is skipped:
+    /// best_fit must reject a hole whose head allocation crosses a block
+    /// boundary and fall through to the high-water mark instead, leaving the
+    /// hole untouched.
+    #[test]
+    fn packed_skips_straddling_freelist_hole() {
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+        let d = DATA_REGION_OFFSET;
+
+        // Seed a 2000 B hole that begins late in block 0:
+        // [D+3000, D+5000) — it spans the block-0/block-1 boundary at D+4096.
+        let hole = d + 3000;
+        alloc.__test_force_push_free_region(hole, 2000);
+        assert_eq!(alloc.free_region_count(), 1);
+
+        // A 1500 B request (aligned 1504). At the hole start D+3000:
+        // 3000 % 4096 + 1504 = 4504 > 4096 -> would straddle. best_fit must SKIP
+        // the hole and fall through to the high-water mark.
+        let placed = alloc.allocate(1500).unwrap();
+        assert!(
+            placed % block + 1504 <= block,
+            "1500 B packed alloc at {placed} must not straddle a block"
+        );
+        assert_ne!(
+            placed, hole,
+            "the straddling hole must be skipped, not reused"
+        );
+        // The 2000 B hole must still be in the freelist (untouched).
+        assert_eq!(
+            alloc.free_region_containing(hole),
+            Some((hole, 2000)),
+            "skipped hole must remain in the freelist"
+        );
+    }
+
+    /// Rolling back a bumped high-water reservation restores `next_offset`
+    /// fully, reclaiming BOTH the record bytes AND the skipped block tail.
+    #[test]
+    fn packed_rollback_of_bumped_reservation_reclaims_tail() {
+        // Drive the rollback via reserve_batch/rollback_pending (no redo log
+        // needed) so we exercise the exact rollback_reservation path.
+        let dev = test_device(16);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let d = DATA_REGION_OFFSET;
+        let block = 4096u64;
+
+        // Fill block 0 to 4000 B (4 x 1000 B); high-water = D+4000, mid-block.
+        for _ in 0..4 {
+            alloc.allocate(1000).unwrap();
+        }
+        let hw_before = alloc.stats().next_offset;
+        assert_eq!(hw_before, d + 4000);
+
+        // A 1000 B packed alloc here straddles -> bumps to D+4096, advancing
+        // next_offset to D+4096+1000. Use reserve_batch so we can roll back.
+        let pending = alloc.reserve_batch(&[1000]).unwrap();
+        let region = pending.regions[0].expect("reservation must succeed");
+        assert_eq!(region.offset, d + block, "must bump to next block start");
+        assert_eq!(alloc.stats().next_offset, d + block + 1000);
+
+        // Roll back: next_offset must return to the ORIGINAL pre-bump value,
+        // reclaiming the 96 B tail [D+4000, D+4096) plus the 1000 B record.
+        alloc.rollback_pending(pending);
+        assert_eq!(
+            alloc.stats().next_offset,
+            hw_before,
+            "rollback must restore next_offset to before the bump (reclaim record + tail)"
+        );
+        assert_eq!(
+            alloc.free_region_count(),
+            0,
+            "high-water rollback must not leave a freelist hole"
+        );
+    }
+
+    /// Replay parity: drive packed allocations through a redo-logged allocator,
+    /// capture the `AllocateRegion` redo ops, replay them into a FRESH packed
+    /// allocator, and assert next_offset + freelist match the live allocator
+    /// exactly (no double-allocation, identical packed layout).
+    #[test]
+    fn packed_replay_parity_matches_live_layout() {
+        let dev = test_device(16);
+        let (_redo_dev, redo) = make_redo_log(1024 * 1024);
+
+        // Live packed allocator with a redo log attached.
+        let mut live = SlotAllocator::new(dev.clone()).unwrap();
+        live.set_packed(true);
+        live.set_redo_log(redo.clone());
+
+        // A mix of small (packed, sharing blocks + a bump) and one large
+        // (block-aligned) reservation.
+        let sizes = [600u64, 600, 1000, 1000, 1000, 1000, 5000, 393];
+        for &s in &sizes {
+            live.allocate(s).unwrap();
+        }
+
+        // Capture the AllocateRegion redo ops the live path journaled.
+        let entries = redo.lock().read_from_sequence(1).unwrap();
+        let alloc_ops: Vec<RedoOp> = entries
+            .into_iter()
+            .map(|e| e.op)
+            .filter(|op| matches!(op, RedoOp::AllocateRegion { .. }))
+            .collect();
+        assert_eq!(
+            alloc_ops.len(),
+            sizes.len(),
+            "one AllocateRegion op per allocate"
+        );
+
+        // Replay into a FRESH packed allocator over a fresh device of the same
+        // geometry (no redo log on the replay target).
+        let replay_dev = test_device(16);
+        let mut replayed = SlotAllocator::new(replay_dev).unwrap();
+        replayed.set_packed(true);
+        for op in &alloc_ops {
+            replayed.replay_redo(op);
+        }
+
+        // next_offset must match exactly.
+        assert_eq!(
+            replayed.stats().next_offset,
+            live.stats().next_offset,
+            "replayed high-water must match the live packed layout"
+        );
+
+        // Freelist must match exactly (offset-ordered).
+        let live_free: Vec<(u64, u64)> = live.freelist.iter_offset_order().collect();
+        let replayed_free: Vec<(u64, u64)> = replayed.freelist.iter_offset_order().collect();
+        assert_eq!(
+            replayed_free, live_free,
+            "replayed freelist must match the live packed freelist"
+        );
+
+        // Sanity: the large record (5000 B) is block-aligned in the live layout.
+        // Its offset is the 7th AllocateRegion op.
+        if let RedoOp::AllocateRegion { offset, size, .. } = alloc_ops[6] {
+            assert_eq!(offset % 4096, 0, "large record must be block-aligned");
+            assert_eq!(size, 8192, "5000 B large record reserves 8192 B");
+        } else {
+            panic!("expected AllocateRegion op for the large record");
+        }
+    }
+
+    /// Block-aware best_fit on the Large/BTree freelist variant: seed enough
+    /// holes to promote past PROMOTE_THRESHOLD, then verify a straddling hole is
+    /// skipped and a within-block hole is reused — covering the BTree code path
+    /// (the small-freelist tests cover the Vec variant).
+    #[test]
+    fn packed_btree_best_fit_is_block_aware() {
+        let dev = test_device(64);
+        let mut alloc = SlotAllocator::new(dev).unwrap();
+        alloc.set_packed(true);
+        let block = 4096u64;
+        let d = DATA_REGION_OFFSET;
+
+        // Seed PROMOTE_THRESHOLD + 2 non-adjacent 64 B holes, one per block,
+        // forcing the freelist to promote to the BTree backend.
+        let n = PROMOTE_THRESHOLD + 2;
+        for i in 0..n as u64 {
+            // 64 B hole at the START of block (i+10): wholly within that block.
+            alloc.__test_force_push_free_region(d + (i + 10) * block, 64);
+        }
+        assert!(
+            alloc.free_region_count() > PROMOTE_THRESHOLD,
+            "freelist must be on the BTree backend"
+        );
+
+        // Add ONE straddling hole big enough to be the best-fit by size for a
+        // 100 B request, positioned to cross a block boundary: [block20+4050, +200).
+        let straddle = d + 20 * block + 4050;
+        alloc.__test_force_push_free_region(straddle, 200);
+
+        // A 100 B request (aligned 104). The 200 B straddling hole is the
+        // largest candidate but crosses the boundary (4050 % 4096 + 104 = 4154
+        // > 4096) -> must be skipped. A 64 B hole is too small. So it falls to
+        // the high-water mark (block-aligned, within one block).
+        let placed = alloc.allocate(100).unwrap();
+        assert!(
+            placed % block + 104 <= block,
+            "BTree packed alloc at {placed} must not straddle a block"
+        );
+        assert_ne!(placed, straddle, "straddling BTree hole must be skipped");
+        assert_eq!(
+            alloc.free_region_containing(straddle),
+            Some((straddle, 200)),
+            "skipped straddling hole must remain in the BTree freelist"
+        );
+
+        // A 64 B request (aligned 64) MUST reuse one of the within-block holes
+        // (exact fit), not the high-water mark. best_fit picks the smallest
+        // sufficient qualifying region.
+        let small = alloc.allocate(64).unwrap();
+        assert!(
+            small % block + 64 <= block,
+            "reused within-block hole must not straddle"
+        );
+        assert_eq!(
+            alloc.free_region_containing(small),
+            None,
+            "the reused hole must have been removed from the freelist"
+        );
+        assert_eq!(
+            small % RECORD_ALIGN,
+            0,
+            "reused offset must be RECORD_ALIGN-aligned"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4: on-disk packed format marker (HEADER_VERSION_PACKED).
+    // The device's persisted packed-ness must win over config across restarts;
+    // opening a packed device non-packed would corrupt via `free()`'s 4 KiB
+    // align_up (PACKED_RECORD_STORAGE_DESIGN.md §1/§5).
+    // -----------------------------------------------------------------------
+
+    /// A packed allocator persists header version 2 and recovers as packed.
+    #[test]
+    fn packed_allocator_persists_version_2_and_recovers_packed() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            alloc.allocate(600).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        // Raw header: version field at 40..44 must be HEADER_VERSION_PACKED.
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        let version = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        assert_eq!(
+            version, HEADER_VERSION_PACKED,
+            "a packed allocator must stamp header version {HEADER_VERSION_PACKED}"
+        );
+
+        let recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(
+            recovered.is_packed(),
+            "recover of a v2 header must restore packed mode from the device"
+        );
+    }
+
+    /// A non-packed allocator persists header version 1 and recovers non-packed.
+    #[test]
+    fn nonpacked_allocator_persists_version_1_and_recovers_nonpacked() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            assert!(!alloc.is_packed());
+            alloc.allocate(600).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        let version = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        assert_eq!(
+            version, HEADER_VERSION,
+            "a non-packed allocator must stamp header version {HEADER_VERSION} (unchanged)"
+        );
+
+        let recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(
+            !recovered.is_packed(),
+            "recover of a v1 header must restore non-packed mode"
+        );
+    }
+
+    /// The DEVICE wins: a v2 (packed) device recovers as packed regardless of
+    /// how the allocator was constructed — there is no config override on the
+    /// recover path. (`recover` cannot be told to be non-packed.)
+    #[test]
+    fn recovered_v2_device_is_always_packed() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            alloc.allocate(600).unwrap();
+            alloc.allocate(600).unwrap();
+            alloc.persist().unwrap();
+        }
+        let recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(
+            recovered.is_packed(),
+            "a v2 device must always recover packed (device-format-wins)"
+        );
+    }
+
+    /// Old-binary fail-closed: a v1-only build (one that does not understand
+    /// version 2) must reject a v2/packed header rather than misread it
+    /// non-packed and corrupt it via `free()`. Simulated by checking the
+    /// version gate: bumping HEADER_VERSION to anything below the persisted
+    /// packed marker would make `recover` return `UnsupportedVersion`.
+    #[test]
+    fn v1_build_rejects_v2_packed_header() {
+        let dev = test_device(16);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            alloc.persist().unwrap();
+        }
+
+        // Confirm the persisted version really is the packed marker (2).
+        let mut buf = crate::device::AlignedBuf::new(4096, 4096);
+        dev.pread(&mut buf, 0).unwrap();
+        let on_disk = u32::from_le_bytes(buf[40..44].try_into().unwrap());
+        assert_eq!(on_disk, HEADER_VERSION_PACKED);
+
+        // A v1-only build's max-known version is HEADER_VERSION (1). The recover
+        // gate rejects any on-disk version it does not know. Assert that the
+        // packed marker is strictly greater than the v1 max, so such a build
+        // hits the `version > max_known` branch and fails CLOSED.
+        assert!(
+            HEADER_VERSION_PACKED > HEADER_VERSION,
+            "packed marker must exceed the v1 max-known version so an old binary fails closed"
+        );
+
+        // Drive the actual rejection: rewrite the version to a value ABOVE the
+        // CURRENT build's max-known (HEADER_VERSION_PACKED) so `recover` takes
+        // the same `UnsupportedVersion` branch a v1 build takes on a v2 header.
+        // (CRC must be recomputed so we exercise the version gate, not the CRC
+        // gate.) This proves the gate is the fail-closed path.
+        let future = HEADER_VERSION_PACKED + 1;
+        buf[40..44].copy_from_slice(&future.to_le_bytes());
+        // Recompute CRC over the covered range with the CRC field zeroed.
+        let count = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+        let covered_end = FREELIST_OFFSET + count * 16;
+        for b in &mut buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4] {
+            *b = 0;
+        }
+        let crc = {
+            let mut h = crc32fast::Hasher::new();
+            h.update(&buf[..covered_end]);
+            h.finalize()
+        };
+        buf[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
+        dev.pwrite(&buf, 0).unwrap();
+
+        match SlotAllocator::recover(dev) {
+            Err(AllocatorError::UnsupportedVersion(v)) => assert_eq!(v, future),
+            Err(other) => panic!("expected UnsupportedVersion({future}), got: {other}"),
+            Ok(_) => panic!("expected UnsupportedVersion, but recover succeeded"),
+        }
+    }
+
+    /// End-to-end packing corruption gate across a persist/recover cycle:
+    /// several packed records share one block; free the middle; recover; the
+    /// surviving neighbours must read back intact and must not have been
+    /// over-freed (the freed hole is reused exactly, not a 4 KiB span).
+    #[test]
+    fn packed_persist_recover_preserves_block_neighbours() {
+        let dev = test_device(16);
+        let (o1, o2, o3);
+        {
+            let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+            alloc.set_packed(true);
+            o1 = alloc.allocate(600).unwrap();
+            o2 = alloc.allocate(600).unwrap();
+            o3 = alloc.allocate(600).unwrap();
+            let block = 4096u64;
+            assert_eq!(o1 / block, o3 / block, "all three packed in one block");
+            // Free the middle with its exact size, then snapshot.
+            alloc.free(o2, 600).unwrap();
+            alloc.persist().unwrap();
+        }
+
+        // Recover: packed mode restored from the header, neighbours still live,
+        // the middle hole still free and reused exactly.
+        let mut recovered = SlotAllocator::recover(dev).unwrap();
+        assert!(recovered.is_packed(), "must recover packed");
+        assert!(
+            recovered.is_allocated_range(o1, 600),
+            "o1 must survive persist/recover (not over-freed)"
+        );
+        assert!(
+            recovered.is_allocated_range(o3, 600),
+            "o3 must survive persist/recover (not over-freed)"
+        );
+        let reused = recovered.allocate(600).unwrap();
+        assert_eq!(
+            reused, o2,
+            "the freed packed hole is reused exactly after recovery"
         );
     }
 }

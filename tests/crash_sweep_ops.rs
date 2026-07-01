@@ -703,7 +703,7 @@ fn sweep_create() {
                         record_offset,
                         utxo_count,
                         is_conflicting: false,
-                        record_bytes: record_bytes.clone(),
+                        record_bytes: record_bytes.clone().into(),
                         parent_txids: Vec::new(),
                     })
                     .ok();

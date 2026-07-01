@@ -15,10 +15,10 @@ pub mod preserve_backend;
 pub mod preserve_index;
 pub mod redb_dah;
 pub mod redb_primary;
-pub mod redb_tombstone;
 pub mod redb_unmined;
 pub mod secondary_backend;
 pub mod sharded;
+pub mod sharded_secondary;
 pub mod unmined_index;
 mod util;
 
@@ -31,8 +31,10 @@ pub use preserve_index::PreserveIndex;
 pub use redb_primary::CachedFieldsUpdate;
 pub use secondary_backend::{DahBackend, UnminedBackend};
 pub use sharded::ShardedIndex;
+pub use sharded_secondary::{ShardedDahIndex, ShardedSecondary, ShardedUnminedIndex};
 pub use unmined_index::{UnminedIndex, UnminedRedoEntry};
 
+#[cfg(test)]
 use crate::allocator::SlotAllocator;
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::record::{DeletedRecordMarker, METADATA_MAGIC, METADATA_SIZE, TxMetadata};
@@ -413,6 +415,23 @@ impl Index {
         Ok(())
     }
 
+    /// Register an entry only if `key` is absent, without an automatic resize.
+    ///
+    /// Single-probe fused check-then-insert: returns `Ok(true)` if the key was
+    /// absent and the entry was inserted, `Ok(false)` if the key was already
+    /// present (the index is left unchanged — the existing entry is NEVER
+    /// overwritten). Used by the create path so a duplicate-txid check and the
+    /// insert share ONE Robin Hood probe instead of a separate `lookup` probe
+    /// followed by an `insert` that re-probes. See
+    /// [`hashtable::HashTable::insert_if_absent`] for the correctness argument.
+    pub(crate) fn register_without_resize_if_absent(
+        &mut self,
+        key: TxKey,
+        entry: TxIndexEntry,
+    ) -> Result<bool> {
+        Ok(self.table.insert_if_absent(key, entry)?)
+    }
+
     pub(crate) fn resize_target_capacity(&self) -> Option<usize> {
         if self.table.load_factor() > self.resize_threshold {
             Some(self.table.capacity() * 2)
@@ -580,7 +599,10 @@ impl Index {
     /// This is the cold-start path when no snapshot exists. Reads every
     /// record header between `allocator.data_region_start()` and
     /// `allocator.next_offset()`, checking for valid magic numbers.
-    pub fn rebuild(device: &dyn BlockDevice, allocator: &SlotAllocator) -> Result<Self> {
+    pub fn rebuild(
+        device: &dyn BlockDevice,
+        allocator: &dyn crate::allocator::RecordAllocator,
+    ) -> Result<Self> {
         let mut index = Self::new(1024)?;
         let align = allocator.device_alignment();
         let start = allocator.data_region_start();
@@ -678,7 +700,7 @@ impl Index {
     /// Returns `(DahIndex, UnminedIndex)` populated from record metadata.
     pub fn rebuild_secondary(
         device: &dyn BlockDevice,
-        allocator: &SlotAllocator,
+        allocator: &dyn crate::allocator::RecordAllocator,
     ) -> Result<(DahIndex, UnminedIndex)> {
         let mut dah = DahIndex::new();
         let mut unmined = UnminedIndex::new();
@@ -992,6 +1014,30 @@ fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKe
 pub(crate) fn serialize_secondary_sections(dah: &DahIndex, unmined: &UnminedIndex) -> Vec<u8> {
     let mut buf = serialize_secondary(&DAH_SECTION_MAGIC, dah.iter());
     buf.extend_from_slice(&serialize_secondary(&UNMINED_SECTION_MAGIC, unmined.iter()));
+    buf
+}
+
+/// Serialize the DAH + unmined secondary sections from already-collected
+/// `(height, key)` pair lists, producing the SAME byte layout as
+/// [`serialize_secondary_sections`].
+///
+/// Used by the sharded-secondary checkpoint path
+/// ([`crate::index::sharded::ShardedIndex::snapshot_all_concurrent`]): the
+/// sharded wrappers spread entries across `N` shards, so their full contents are
+/// gathered into two pair vectors (each shard locked and released in turn) and
+/// serialized here. Entry ORDER within a section is irrelevant — the format is a
+/// flat `(height, key)` list that [`parse_secondary_sections`] re-inserts
+/// unordered — so a shard-then-bucket order round-trips identically to the
+/// single-backend bucket order.
+pub(crate) fn serialize_secondary_sections_from_pairs(
+    dah_pairs: &[(u32, TxKey)],
+    unmined_pairs: &[(u32, TxKey)],
+) -> Vec<u8> {
+    let mut buf = serialize_secondary(&DAH_SECTION_MAGIC, dah_pairs.iter().copied());
+    buf.extend_from_slice(&serialize_secondary(
+        &UNMINED_SECTION_MAGIC,
+        unmined_pairs.iter().copied(),
+    ));
     buf
 }
 

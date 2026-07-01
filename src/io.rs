@@ -1029,6 +1029,17 @@ pub unsafe fn write_utxo_slot_direct(
 /// Reads the first `METADATA_SIZE` bytes from the device at the given
 /// record offset. The read is rounded up to the device alignment.
 pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxMetadata> {
+    // F-G2 (torn-read fix): hold the per-offset read guard for the whole read.
+    // The metadata header can straddle a device-block boundary (packed records
+    // start mid-block), so without this guard a concurrent `write_metadata`
+    // (setMined / spend footer update on the write-through-cache path) writing
+    // block N then N+1 could be observed as block-N-new + block-(N+1)-old — a torn
+    // header that fails CRC and surfaces as a spurious STORAGE_ERROR. The
+    // direct-ptr fast path (`read_metadata_direct`) already takes this guard;
+    // the trait/cache path did not. Excludes `write_metadata`/`write_utxo_slot`/
+    // `write_record_bytes` (all take the write side) for the same offset.
+    let _r = io_locks().read(record_offset);
+
     let align = device.alignment();
 
     // Record offset must be aligned (allocator guarantees this).
@@ -1060,6 +1071,12 @@ pub fn write_metadata(
     record_offset: u64,
     metadata: &TxMetadata,
 ) -> Result<()> {
+    // Hold the per-offset write guard across the (possibly multi-block, RMW)
+    // header write so a concurrent lock-free `read_metadata` for the same offset
+    // never observes a torn header — the write counterpart of the guard added to
+    // `read_metadata`.
+    let _w = io_locks().write(record_offset);
+
     let align = device.alignment();
     let aligned_base = record_offset / align as u64 * align as u64;
     let intra_offset = (record_offset - aligned_base) as usize;
@@ -1229,6 +1246,124 @@ pub fn read_record_identity_and_slot(
     Ok((identity, slot))
 }
 
+/// Write a record image (`image` = the exact bytes to land on device starting
+/// at `offset`) in a way that is read-modify-write-correct for sub-block,
+/// unaligned, and block-sharing writes — the packed-record write path
+/// (`docs/PACKED_RECORD_STORAGE_DESIGN.md` §3.3).
+///
+/// Two paths, selected purely by the geometry of `(offset, image.len())`:
+///
+/// - **Fast path (behavior unchanged from the legacy single `pwrite`):** when
+///   `offset % align == 0 && image.len() % align == 0` — the non-packed case,
+///   always true for 4 KiB-aligned, block-multiple record buffers — a single
+///   direct [`BlockDevice::pwrite_all_at`] is issued at `offset`. No `pread` is
+///   performed: byte-for-byte identical to the pre-packing code path.
+/// - **RMW path (packed / unaligned):** the covering aligned span
+///   `[align_down(offset), align_up(offset + image.len()))` is read into an
+///   [`AlignedBuf`] (preserving the partial first/last blocks' neighbour bytes
+///   — with the write-back cache these reads are RAM hits), `image` is copied
+///   into the buffer at `offset - aligned_base`, and the whole span is written
+///   back with one `pwrite_all_at`. The middle full blocks belong to this
+///   record and are overwritten by the copy regardless; only the head/tail
+///   partial blocks need their neighbour bytes preserved by the read.
+///
+/// This is the same read-modify-write discipline [`write_utxo_slot`] already
+/// uses for a single slot, generalized to a whole record/run image.
+///
+/// # Locking
+///
+/// This helper performs NO locking. The caller MUST hold the
+/// [`io_locks`]`().write` guard for EVERY 4 KiB block the covering span touches
+/// (acquired in globally-sorted stripe order), so a record write into a shared
+/// block and a concurrent spend of its neighbour in the same block are mutually
+/// exclusive and cannot tear the block. See [`write_record_bytes`] and
+/// [`write_records_coalesced`] for the call-site locking.
+///
+/// # Errors
+///
+/// Propagates any [`DeviceError`] from the underlying `pread`/`pwrite`.
+fn write_image_rmw(device: &dyn BlockDevice, offset: u64, image: &[u8]) -> Result<()> {
+    let align = device.alignment();
+    let align_u64 = align as u64;
+
+    // Fast path: block-aligned offset AND block-multiple length. This is the
+    // only path the non-packed (4 KiB-aligned) layout ever takes, and it issues
+    // exactly the single `pwrite_all_at(image, offset)` the legacy code did —
+    // no read-modify-write, no extra `pread`.
+    if offset.is_multiple_of(align_u64) && image.len().is_multiple_of(align) {
+        device.pwrite_all_at(image, offset)?;
+        return Ok(());
+    }
+
+    // RMW path: align the covering span down to the block at the head and up to
+    // the block at the tail, read it (to keep the head/tail partial blocks'
+    // neighbour bytes), patch in `image`, write the whole span back.
+    let aligned_base = offset - (offset % align_u64);
+    let end = offset
+        .checked_add(image.len() as u64)
+        .ok_or(DeviceError::OutOfBounds {
+            offset,
+            len: image.len() as u64,
+            device_size: device.size(),
+        })?;
+    let aligned_end = align_up(end as usize, align) as u64;
+    let span_len = (aligned_end - aligned_base) as usize;
+    let intra = (offset - aligned_base) as usize;
+
+    let mut buf = AlignedBuf::new(span_len, align);
+    device.pread_exact_at(&mut buf, aligned_base)?;
+    buf[intra..intra + image.len()].copy_from_slice(image);
+    device.pwrite_all_at(&buf, aligned_base)?;
+    Ok(())
+}
+
+/// Acquire the [`io_locks`]`().write` guard for EVERY 4 KiB block the covering
+/// span `[offset, offset + span_bytes)` touches, returned as a `Vec` of held
+/// guards.
+///
+/// The block-granular `io_locks` stripe is `(byte_offset >> 12) & mask` — one
+/// stripe per 4 KiB block. A record/run RMW reads-then-writes every block its
+/// covering span spans, so it must exclude every other writer/spender of those
+/// blocks (a concurrent neighbour spend RMWs the shared head/tail block). The
+/// stripe of each covered block is computed, **deduplicated and sorted** so two
+/// concurrent multi-block acquirers always take shared stripes in the same
+/// global order and cannot deadlock — the same discipline
+/// [`write_records_coalesced`] uses for a run. One block stride is added per
+/// step so a span covering 1, 2, or 3 blocks locks exactly those blocks.
+///
+/// Locks the same stripe(s) `write_utxo_slot` / `read_record_identity_and_slots`
+/// take for any record in those blocks, so a create into a shared block and a
+/// spend of its neighbour are mutually exclusive.
+pub(crate) fn lock_span_blocks(
+    offset: u64,
+    span_bytes: u64,
+) -> Vec<parking_lot::RwLockWriteGuard<'static, ()>> {
+    let locks = io_locks();
+    // One 4 KiB block per stripe (the stripe shift is 12 = log2(4096)).
+    const BLOCK: u64 = 4096;
+    let first_block = offset - (offset % BLOCK);
+    // Last byte the write touches (span_bytes >= 1 for every real record image;
+    // a zero-length image touches no block and locks nothing).
+    if span_bytes == 0 {
+        return Vec::new();
+    }
+    let last_byte = offset + span_bytes - 1;
+    let last_block = last_byte - (last_byte % BLOCK);
+
+    let mut stripes: Vec<usize> = Vec::new();
+    let mut block = first_block;
+    loop {
+        stripes.push(locks.stripe_index(block));
+        if block == last_block {
+            break;
+        }
+        block += BLOCK;
+    }
+    stripes.sort_unstable();
+    stripes.dedup();
+    stripes.iter().map(|&s| locks.write_index(s)).collect()
+}
+
 /// Write a single [`UtxoSlot`] at `slot_index` within the record at `record_offset`.
 ///
 /// Uses read-modify-write: reads the aligned block containing the slot,
@@ -1269,8 +1404,29 @@ pub fn write_utxo_slot(
 
 /// Write a complete new record (metadata + all UTXO slots) in one operation.
 ///
-/// Used at creation time. The entire record is written as a single aligned
-/// buffer to minimize I/O operations.
+/// Used at creation time. The record image is written read-modify-write-correct
+/// for sub-block / unaligned / block-sharing offsets via [`write_image_rmw`]:
+///
+/// - **Block-aligned `record_offset` (non-packed, the default):** the image is
+///   padded to a full device block and written with a single `pwrite_all_at` —
+///   byte-for-byte identical to the legacy single aligned write, no extra
+///   `pread`.
+/// - **Unaligned `record_offset` (packed):** the image is padded only to
+///   [`crate::allocator::RECORD_ALIGN`] (the packed reservation granularity, so
+///   no over-write into a neighbour packed record) and landed via the
+///   read-modify-write covering-span path, preserving any neighbour bytes that
+///   share the head/tail block.
+///
+/// # Locking
+///
+/// This function takes NO `io_locks` guard (unchanged from the pre-packing
+/// behavior). Its callers are single-threaded with respect to the records they
+/// touch (checkpoint flush, recovery replay, tests), all at block-aligned
+/// offsets. The concurrent packed create path runs through
+/// [`write_record_bytes`] / [`write_records_coalesced`], which hold the block
+/// stripe(s) of the covering span. If a future caller invokes this on a packed
+/// (unaligned) offset under concurrency, it MUST first hold the
+/// [`io_locks`]`().write` guard for every block the covering span touches.
 pub fn write_full_record(
     device: &dyn BlockDevice,
     record_offset: u64,
@@ -1279,9 +1435,17 @@ pub fn write_full_record(
 ) -> Result<()> {
     let align = device.alignment();
     let data_len = METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE;
-    let aligned_len = align_up(data_len, align);
+    // Block-aligned offset → pad to a full device block so the fast path in
+    // `write_image_rmw` fires (legacy behavior, byte-identical). Unaligned
+    // (packed) offset → pad only to the record granularity so the image never
+    // covers a neighbour packed record's bytes.
+    let image_len = if record_offset.is_multiple_of(align as u64) {
+        align_up(data_len, align)
+    } else {
+        align_up(data_len, crate::allocator::RECORD_ALIGN as usize)
+    };
 
-    let mut buf = AlignedBuf::new(aligned_len, align);
+    let mut buf = AlignedBuf::new(image_len, align);
 
     // Write metadata
     let mut meta_bytes = [0u8; METADATA_SIZE];
@@ -1296,8 +1460,7 @@ pub fn write_full_record(
         buf[offset..offset + UTXO_SLOT_SIZE].copy_from_slice(&slot_bytes);
     }
 
-    device.pwrite_all_at(&buf, record_offset)?;
-    Ok(())
+    write_image_rmw(device, record_offset, &buf[..image_len])
 }
 
 /// Write a fully serialized record image (metadata + UTXO slots + optional
@@ -1311,27 +1474,43 @@ pub fn write_full_record(
 ///
 /// Propagates any [`DeviceError`] from the underlying `pwrite`.
 ///
-/// # Concurrency contract (F-X-007 / BC-02)
+/// `buf` is the exact record image to land on device at `record_offset`
+/// (caller-padded). The write is read-modify-write-correct for sub-block /
+/// unaligned / block-sharing offsets via [`write_image_rmw`]: a non-packed
+/// (block-aligned offset, block-multiple `buf`) write is the legacy single
+/// `pwrite_all_at` with no extra `pread`; a packed (unaligned / sub-block) write
+/// reads the covering aligned span, patches `buf` in, and writes the span back —
+/// preserving neighbour bytes packed in the shared head/tail block.
 ///
-/// Acquires the process-wide `StripedRwLocks` *write* guard keyed by
-/// `record_offset` for the duration of the write. Creation was previously
-/// exempt from the record-level guard on the assumption that a record being
-/// created has no concurrent readers — that assumption is false when the
-/// allocator reuses a freed region: a lock-free reader still holding the old
-/// offset (obtained from the primary index before the previous occupant's
-/// delete unregistered it) reads the region while the new record's bytes are
-/// being copied in. If the region is re-created for the SAME txid the stale
-/// reader is verifying, the `meta.tx_id` defense (F-G2-001) passes while the
-/// slot region still carries the previous occupant's bytes — returning
+/// # Concurrency contract (F-X-007 / BC-02, extended for packing)
+///
+/// Acquires the process-wide `StripedRwLocks` *write* guard for EVERY 4 KiB
+/// block the covering span `[align_down(record_offset), align_up(record_offset +
+/// buf.len()))` touches (via [`lock_span_blocks`]: deduped, sorted stripe order
+/// so concurrent multi-block writers cannot deadlock). For a non-packed record
+/// the span is one block → one guard, identical to the prior single-offset
+/// guard. For a packed record sharing a block with neighbours this excludes a
+/// concurrent spend that RMWs the same block (`write_utxo_slot` locks the same
+/// block stripe), preventing a torn block.
+///
+/// Creation was previously exempt from the record-level guard on the assumption
+/// that a record being created has no concurrent readers — that assumption is
+/// false when the allocator reuses a freed region: a lock-free reader still
+/// holding the old offset (obtained from the primary index before the previous
+/// occupant's delete unregistered it) reads the region while the new record's
+/// bytes are being copied in. If the region is re-created for the SAME txid the
+/// stale reader is verifying, the `meta.tx_id` defense (F-G2-001) passes while
+/// the slot region still carries the previous occupant's bytes — returning
 /// another transaction's slots under this key. Live repro:
 /// `tests/g2_delete_race.rs::delete_does_not_alias_concurrent_create`.
 /// Pairs with the read guards in `read_metadata_direct`,
 /// `read_utxo_slot_direct`, and `read_all_utxo_slots`.
 pub fn write_record_bytes(device: &dyn BlockDevice, record_offset: u64, buf: &[u8]) -> Result<()> {
-    // F-X-007 (BC-02): record-level write guard — see the doc comment.
-    let _w = io_locks().write(record_offset);
-    device.pwrite_all_at(buf, record_offset)?;
-    Ok(())
+    // F-X-007 (BC-02) + packing: hold the write guard for every block the
+    // covering span touches (one block for the non-packed case), in sorted
+    // stripe order. See the doc comment and `lock_span_blocks`.
+    let _guards = lock_span_blocks(record_offset, buf.len() as u64);
+    write_image_rmw(device, record_offset, buf)
 }
 
 /// Bulk-write many newly-created records, coalescing physically contiguous
@@ -1349,14 +1528,25 @@ pub fn write_record_bytes(device: &dyn BlockDevice, record_offset: u64, buf: &[u
 /// each record into its zero-padded aligned slot, so crash recovery and the
 /// CreateV2 redo replay observe exactly the same on-device records.
 ///
-/// # Concurrency (F-X-007 / g2)
+/// For a packed run (8-aligned base, reservation-sized slots) the covering span
+/// `[align_down(run_base), align_up(run_base + run_total))` may share its first
+/// and/or last 4 KiB block with a pre-existing neighbour record; the run is then
+/// written read-modify-write over that covering span via [`write_image_rmw`],
+/// preserving the neighbour's bytes. A non-packed run (block-aligned base,
+/// block-multiple total) takes the fast single `pwrite` with no extra `pread`.
 ///
-/// Holds the per-record `io_locks().write` guard for EVERY offset covered by a
-/// run across that run's pwrite — identical torn-read protection to N separate
-/// [`write_record_bytes`] calls (a stale lock-free reader of a REUSED offset
-/// cannot observe a half-written record). Guards are acquired deduplicated and
-/// sorted by stripe so concurrent multi-offset writers cannot deadlock; each
-/// run's guards are released before the next run.
+/// # Concurrency (F-X-007 / g2, extended for packing)
+///
+/// Holds the `io_locks().write` guard for EVERY 4 KiB block the run's covering
+/// span touches, across that run's write (via [`lock_span_blocks`]). For a
+/// non-packed run those blocks are exactly the run's record offsets — identical
+/// torn-read protection to N separate [`write_record_bytes`] calls (a stale
+/// lock-free reader of a REUSED offset cannot observe a half-written record).
+/// For a packed run it additionally covers the shared head/tail block so a
+/// concurrent neighbour spend (which RMWs the same block under the same stripe)
+/// is mutually exclusive — no torn block. Guards are acquired deduplicated and
+/// sorted by stripe so concurrent multi-block writers/spenders cannot deadlock;
+/// each run's guards are released before the next run.
 pub fn write_records_coalesced(
     device: &dyn BlockDevice,
     records: &[(u64, u64, &[u8])],
@@ -1365,7 +1555,6 @@ pub fn write_records_coalesced(
         return Ok(());
     }
     let align = device.alignment();
-    let locks = io_locks();
 
     // Process records in offset order so physically adjacent slots coalesce.
     let mut order: Vec<usize> = (0..records.len()).collect();
@@ -1401,14 +1590,16 @@ pub fn write_records_coalesced(
         let run_base = records[run[0]].0;
         let run_total: usize = run.iter().map(|&i| records[i].1 as usize).sum();
 
-        // Hold the write guard for every covered offset (dedup + sorted).
-        let mut stripes: Vec<usize> = run
-            .iter()
-            .map(|&i| locks.stripe_index(records[i].0))
-            .collect();
-        stripes.sort_unstable();
-        stripes.dedup();
-        let _guards: Vec<_> = stripes.iter().map(|&s| locks.write_index(s)).collect();
+        // Hold the write guard for EVERY 4 KiB block the run's covering span
+        // `[align_down(run_base), align_up(run_base + run_total))` touches, in
+        // deduped, sorted stripe order. For a non-packed run (block-aligned
+        // base, block-multiple total) the covered blocks ARE the run's record
+        // offsets — same stripes as before. For a packed run the head/tail block
+        // may be SHARED with a pre-existing neighbour record; locking the whole
+        // covering span's blocks makes the run's RMW mutually exclusive with a
+        // concurrent spend of that neighbour (which RMWs the same block under
+        // the same stripe). Sorted order across runs/spenders prevents deadlock.
+        let _guards = lock_span_blocks(run_base, run_total as u64);
 
         // One aligned buffer for the whole run: each record's bytes at its
         // slot offset, padding left zero (matching the per-record write).
@@ -1418,7 +1609,11 @@ pub fn write_records_coalesced(
             let rel = (off - run_base) as usize;
             buf[rel..rel + bytes.len()].copy_from_slice(bytes);
         }
-        device.pwrite_all_at(&buf, run_base)?;
+        // RMW-correct write of the covering span: fast single `pwrite` for the
+        // non-packed (aligned base + block-multiple total) run; covering-span
+        // read-modify-write for a packed run that shares its head/tail block
+        // with a pre-existing neighbour (preserving the neighbour's bytes).
+        write_image_rmw(device, run_base, &buf)?;
 
         run_start = run_end;
     }
@@ -1616,6 +1811,326 @@ mod tests {
 
         let results = read_utxo_slots(&*dev, 0, &[]).unwrap();
         assert!(results.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3b: cache-coordinated sub-block / packed record-image writes
+    // (read-modify-write neighbour preservation + fast-path equivalence +
+    // multi-block locking under concurrency). See `write_image_rmw`.
+    // -----------------------------------------------------------------------
+
+    /// Test-only [`BlockDevice`] wrapper that counts `pread` calls and reports
+    /// NO raw pointer, forcing callers down the block-I/O (`pread`/`pwrite`)
+    /// path — the production O_DIRECT path the RMW writer targets. Used to prove
+    /// the fast path issues zero `pread`s (no read-modify-write) and the RMW
+    /// path issues exactly one.
+    struct CountingDevice {
+        inner: Arc<MemoryDevice>,
+        preads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingDevice {
+        fn new(inner: Arc<MemoryDevice>) -> Self {
+            Self {
+                inner,
+                preads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn pread_count(&self) -> usize {
+            self.preads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl BlockDevice for CountingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.preads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn sync(&self) -> Result<()> {
+            self.inner.sync()
+        }
+        // Deliberately NOT forwarding `as_raw_ptr` — returns the trait default
+        // `None` so the writers take the block-I/O RMW path under test.
+    }
+
+    /// Read `len` raw bytes from a device at `offset` (block-aligned span),
+    /// returning the exact `[offset, offset+len)` slice. Used to assert
+    /// neighbour bytes are preserved by an RMW write.
+    fn read_raw(dev: &dyn BlockDevice, offset: u64, len: usize) -> Vec<u8> {
+        let align = dev.alignment();
+        let base = offset - (offset % align as u64);
+        let intra = (offset - base) as usize;
+        let total = align_up(intra + len, align);
+        let mut buf = AlignedBuf::new(total, align);
+        dev.pread_exact_at(&mut buf, base).unwrap();
+        buf[intra..intra + len].to_vec()
+    }
+
+    #[test]
+    fn rmw_write_into_shared_block_preserves_neighbour() {
+        // Two records share one 4 KiB block at sub-block offsets. Write
+        // neighbour B first, then write record A at an adjacent sub-block
+        // offset in the SAME block. B's bytes must survive (RMW preserves the
+        // tail block) and A must read back exactly.
+        let dev = test_device();
+        // Block 0: A at offset 0 (len 512), B at offset 512 (len 512).
+        let a_off = 0u64;
+        let b_off = 512u64;
+        let a_bytes: Vec<u8> = (0..512u32).map(|i| (i & 0xFF) as u8).collect();
+        let b_bytes: Vec<u8> = (0..512u32)
+            .map(|i| (0xC0u8).wrapping_add(i as u8))
+            .collect();
+
+        // Write neighbour B first.
+        write_record_bytes(&*dev, b_off, &b_bytes).unwrap();
+        // Now write A into the same block — must not clobber B.
+        write_record_bytes(&*dev, a_off, &a_bytes).unwrap();
+
+        assert_eq!(
+            read_raw(&*dev, a_off, 512),
+            a_bytes,
+            "A must read back exactly"
+        );
+        assert_eq!(
+            read_raw(&*dev, b_off, 512),
+            b_bytes,
+            "neighbour B in the same block must be preserved by A's RMW"
+        );
+    }
+
+    #[test]
+    fn rmw_run_spanning_blocks_preserves_both_neighbours() {
+        // A run whose covering span spans 3 blocks and shares its first and
+        // last block with pre-existing neighbours. Both neighbours intact after
+        // the write; the run reads back correctly.
+        let dev = test_device();
+        let align = 4096u64;
+        // Pre-existing neighbour HEAD at [0, 1024) in block 0.
+        let head: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
+        // Pre-existing neighbour TAIL at [2*4096 + 3072, 3*4096) in block 2.
+        let tail_off = 2 * align + 3072;
+        let tail: Vec<u8> = (0..1024u32)
+            .map(|i| (0x90u8).wrapping_add(i as u8))
+            .collect();
+        write_record_bytes(&*dev, 0, &head).unwrap();
+        write_record_bytes(&*dev, tail_off, &tail).unwrap();
+
+        // Run occupies [1024, 2*4096 + 3072): starts in block 0 after HEAD,
+        // fully covers block 1, ends in block 2 before TAIL. ~9 KiB image.
+        let run_off = 1024u64;
+        let run_len = (tail_off - run_off) as usize;
+        let run_bytes: Vec<u8> = (0..run_len as u32)
+            .map(|i| (0x40u8).wrapping_add((i % 251) as u8))
+            .collect();
+        write_record_bytes(&*dev, run_off, &run_bytes).unwrap();
+
+        assert_eq!(read_raw(&*dev, 0, 1024), head, "HEAD neighbour preserved");
+        assert_eq!(
+            read_raw(&*dev, tail_off, 1024),
+            tail,
+            "TAIL neighbour preserved"
+        );
+        assert_eq!(
+            read_raw(&*dev, run_off, run_len),
+            run_bytes,
+            "run reads back"
+        );
+    }
+
+    #[test]
+    fn fast_path_aligned_write_issues_no_pread() {
+        // A 4 KiB-aligned, block-multiple write must take the fast path: a
+        // single `pwrite`, ZERO `pread` (no read-modify-write). Proven via the
+        // counting device.
+        let dev = Arc::new(CountingDevice::new(Arc::new(
+            MemoryDevice::new(64 * 1024, 4096).unwrap(),
+        )));
+        // O_DIRECT requires a block-aligned buffer ADDRESS on the fast path, so
+        // the production caller always passes an `AlignedBuf`. Use one here.
+        let mut image = AlignedBuf::new(4096, 4096); // aligned offset, block-multiple len
+        image.iter_mut().for_each(|b| *b = 0xAB);
+        write_record_bytes(&*dev, 4096, &image).unwrap();
+        // A two-block aligned image is still fast-path (no pread).
+        let mut image2 = AlignedBuf::new(8192, 4096);
+        image2.iter_mut().for_each(|b| *b = 0xCD);
+        write_record_bytes(&*dev, 8192, &image2).unwrap();
+        // Both writes were fast-path: zero preads issued (no read-modify-write).
+        // Asserted BEFORE any read-back, since `read_raw` itself issues a pread
+        // through the counting device.
+        assert_eq!(
+            dev.pread_count(),
+            0,
+            "fast path (aligned + block-multiple) must not read-modify-write"
+        );
+        // Now read back (these reads DO count, but the assertion above is done).
+        assert_eq!(read_raw(&*dev, 4096, 4096), &image[..]);
+        assert_eq!(read_raw(&*dev, 8192, 8192), &image2[..]);
+    }
+
+    #[test]
+    fn rmw_path_unaligned_write_issues_exactly_one_pread() {
+        // A sub-block / unaligned write takes the RMW path: exactly one `pread`
+        // of the covering span, then one `pwrite`.
+        let dev = Arc::new(CountingDevice::new(Arc::new(
+            MemoryDevice::new(64 * 1024, 4096).unwrap(),
+        )));
+        let image = vec![0x11u8; 512];
+        write_record_bytes(&*dev, 512, &image).unwrap(); // offset 512, sub-block
+        assert_eq!(
+            dev.pread_count(),
+            1,
+            "RMW path reads the covering span exactly once"
+        );
+        assert_eq!(read_raw(&*dev, 512, 512), image);
+    }
+
+    #[test]
+    fn fast_path_byte_identical_to_legacy_single_pwrite() {
+        // Fast-path equivalence: the bytes a 4 KiB-aligned block-multiple write
+        // lands are byte-for-byte identical to a raw `pwrite_all_at` of the same
+        // buffer at the same offset (the legacy code path).
+        let legacy = test_device();
+        let viargmw = test_device();
+        let mut image = AlignedBuf::new(4096, 4096);
+        for (i, b) in image.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        legacy.pwrite_all_at(&image, 4096).unwrap();
+        write_record_bytes(&*viargmw, 4096, &image).unwrap();
+
+        assert_eq!(
+            read_raw(&*legacy, 4096, 4096),
+            read_raw(&*viargmw, 4096, 4096),
+            "fast-path write must equal legacy single pwrite byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn coalesced_packed_run_rmw_preserves_neighbour_block() {
+        // The coalesced bulk writer over a packed run that shares its head block
+        // with a pre-existing neighbour: the neighbour survives, all run records
+        // read back. Records are RECORD_ALIGN-strided within one block.
+        let dev = test_device();
+        // Pre-existing neighbour at [0, 256) in block 0.
+        let neighbour: Vec<u8> = (0..256u32)
+            .map(|i| (0xE0u8).wrapping_add(i as u8))
+            .collect();
+        write_record_bytes(&*dev, 0, &neighbour).unwrap();
+
+        // Packed run of 3 records starting at offset 256, each reservation 400 B
+        // (8-aligned), back-to-back: 256, 656, 1056 — all within block 0.
+        let r0: Vec<u8> = vec![0x01u8; 380];
+        let r1: Vec<u8> = vec![0x02u8; 380];
+        let r2: Vec<u8> = vec![0x03u8; 380];
+        let records: Vec<(u64, u64, &[u8])> = vec![
+            (256, 400, r0.as_slice()),
+            (656, 400, r1.as_slice()),
+            (1056, 400, r2.as_slice()),
+        ];
+        write_records_coalesced(&*dev, &records).unwrap();
+
+        assert_eq!(
+            read_raw(&*dev, 0, 256),
+            neighbour,
+            "neighbour preserved by run RMW"
+        );
+        assert_eq!(read_raw(&*dev, 256, 380), r0);
+        assert_eq!(read_raw(&*dev, 656, 380), r1);
+        assert_eq!(read_raw(&*dev, 1056, 380), r2);
+    }
+
+    /// Read `[offset, offset+len)` while holding the block read guard for that
+    /// offset — the same `io_locks` stripe the record-image writers hold. This
+    /// is what a production reader (`read_all_utxo_slots`) does; it makes the
+    /// read mutually exclusive with a concurrent block RMW so a non-torn block
+    /// is observable. Used by the concurrency test below.
+    fn read_raw_guarded(dev: &dyn BlockDevice, offset: u64, len: usize) -> Vec<u8> {
+        let _r = record_read_guard(offset);
+        read_raw(dev, offset, len)
+    }
+
+    #[test]
+    fn concurrent_packed_write_and_spend_in_shared_block_never_tear() {
+        // Two packed records A and B share one 4 KiB block. Two threads keep
+        // rewriting A and B respectively (each a record-image RMW of the shared
+        // block — exactly the create-into-shared-block vs spend-of-neighbour
+        // scenario). Because every write and every guarded read locks the SAME
+        // block stripe, a reader can never observe a torn block: each record
+        // always reads back as a uniform marker (one of its own written
+        // values), never a byte-mix of the two records.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dev = test_device();
+        let a_off = 0u64;
+        let b_off = 2048u64; // same 4 KiB block as A
+        let len = 256usize;
+
+        // Seed both with a known marker (value byte repeated).
+        write_record_bytes(&*dev, a_off, &vec![0xA0u8; len]).unwrap();
+        write_record_bytes(&*dev, b_off, &vec![0xB0u8; len]).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let dev_a = Arc::clone(&dev);
+        let dev_b = Arc::clone(&dev);
+        let stop_a = Arc::clone(&stop);
+        let stop_b = Arc::clone(&stop);
+
+        // Writer A: cycles A's image through marker values 0xA0..0xAF and
+        // verifies A always reads back as a uniform A-marker (guarded read).
+        let h_a = std::thread::spawn(move || {
+            let mut v: u8 = 0xA0;
+            while !stop_a.load(Ordering::Relaxed) {
+                write_record_bytes(&*dev_a, a_off, &vec![v; len]).unwrap();
+                let got = read_raw_guarded(&*dev_a, a_off, len);
+                assert!(
+                    got.iter().all(|&x| (0xA0..=0xAF).contains(&x))
+                        && got.iter().all(|&x| x == got[0]),
+                    "record A torn: {got:?}"
+                );
+                v = if v == 0xAF { 0xA0 } else { v + 1 };
+            }
+        });
+        // Writer B: cycles B's image through marker values 0xB0..0xBF.
+        let h_b = std::thread::spawn(move || {
+            let mut v: u8 = 0xB0;
+            while !stop_b.load(Ordering::Relaxed) {
+                write_record_bytes(&*dev_b, b_off, &vec![v; len]).unwrap();
+                let got = read_raw_guarded(&*dev_b, b_off, len);
+                assert!(
+                    got.iter().all(|&x| (0xB0..=0xBF).contains(&x))
+                        && got.iter().all(|&x| x == got[0]),
+                    "record B torn: {got:?}"
+                );
+                v = if v == 0xBF { 0xB0 } else { v + 1 };
+            }
+        });
+
+        // Main thread: many guarded cross-checks that BOTH records are always
+        // consistent (uniform, in their own marker range) — never a torn block.
+        for _ in 0..5000 {
+            let a = read_raw_guarded(&*dev, a_off, len);
+            assert!(
+                a.iter().all(|&x| (0xA0..=0xAF).contains(&x)) && a.iter().all(|&x| x == a[0]),
+                "record A torn (main): {a:?}"
+            );
+            let b = read_raw_guarded(&*dev, b_off, len);
+            assert!(
+                b.iter().all(|&x| (0xB0..=0xBF).contains(&x)) && b.iter().all(|&x| x == b[0]),
+                "record B torn (main): {b:?}"
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        h_a.join().unwrap();
+        h_b.join().unwrap();
     }
 
     #[test]

@@ -32,8 +32,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::allocator::{AllocatorError, SlotAllocator};
-use crate::config::IndexConfig;
+use crate::allocator::{AllocatorError, BoxedAllocator, RecordAllocator, SlotAllocator};
+use crate::config::{IndexConfig, StorageEngine};
 use crate::device::BlockDevice;
 use crate::index::{
     DahBackend, DahIndex, IndexError, PrimaryBackend, ShardedIndex, UnminedBackend, UnminedIndex,
@@ -334,6 +334,105 @@ pub fn recover_or_create_allocator(
     }
 }
 
+/// Recover-or-create the per-store allocator for the configured storage engine,
+/// returning it boxed as a [`BoxedAllocator`] so the engine can hold either the
+/// in-place [`SlotAllocator`] or the log-structured
+/// [`crate::segment_allocator::SegmentAllocator`].
+///
+/// Each engine stamps a distinct on-disk header magic, so opening a device with
+/// the wrong engine fails closed ([`AllocatorError::CorruptedHeader`]) rather
+/// than misreading it. `NoPersistedState` (all-zero header) is the only "fresh"
+/// signal; every other recover error propagates so a corrupt/foreign header
+/// refuses to start.
+pub fn recover_or_create_boxed_allocator(
+    device: Arc<dyn BlockDevice>,
+    engine: StorageEngine,
+    segment_size: u64,
+) -> Result<(BoxedAllocator, AllocatorOrigin), AllocatorError> {
+    match engine {
+        StorageEngine::InPlace => {
+            let (alloc, origin) = recover_or_create_allocator(device)?;
+            Ok((Box::new(alloc), origin))
+        }
+        StorageEngine::Segment => {
+            use crate::segment_allocator::SegmentAllocator;
+            match SegmentAllocator::recover(device.clone()) {
+                Ok(alloc) => Ok((Box::new(alloc), AllocatorOrigin::Recovered)),
+                Err(crate::segment_allocator::SegmentAllocatorError::NoPersistedState) => {
+                    tracing::info!(
+                        "segment allocator header region is all zeros — fresh device, \
+                         creating a new segment allocator"
+                    );
+                    let alloc = SegmentAllocator::new(device, segment_size)
+                        .map_err(crate::allocator::AllocatorError::from)?;
+                    Ok((Box::new(alloc), AllocatorOrigin::Fresh))
+                }
+                Err(e) => {
+                    tracing::error!(detail = %e, "segment allocator recover failed");
+                    Err(e.into())
+                }
+            }
+        }
+    }
+}
+
+/// Reconcile a store's allocator packed-ness with the configured `packed`
+/// flag, honoring the rule that the DEVICE's on-disk format always wins.
+///
+/// - **Fresh device** ([`AllocatorOrigin::Fresh`]): the device has no format
+///   yet, so config decides — `set_packed(config_packed)` BEFORE any
+///   allocation, so the first reservations pack and the first `persist`
+///   stamps the packed header version.
+/// - **Recovered device** ([`AllocatorOrigin::Recovered`]):
+///   [`SlotAllocator::recover`] already set packed-ness from the header. The
+///   config is NOT allowed to override it: reopening a packed device
+///   non-packed (or vice versa) would corrupt it via `free()`'s block-rounding.
+///   If config disagrees with the device, the device wins and a clear warning
+///   is logged (packing a non-packed device, or un-packing a packed one,
+///   requires a fresh device / migration — out of scope).
+///
+/// `store` is the store index, used only for log context.
+pub fn apply_packed_mode(
+    alloc: &mut dyn RecordAllocator,
+    origin: AllocatorOrigin,
+    config_packed: bool,
+    store: usize,
+) {
+    match origin {
+        AllocatorOrigin::Fresh => {
+            // Fresh device: config decides the on-disk format.
+            alloc.set_packed(config_packed);
+            if config_packed {
+                tracing::info!(
+                    store,
+                    "storage.packed = true: fresh device will use the packed record layout"
+                );
+            }
+        }
+        AllocatorOrigin::Recovered => {
+            // Device format wins. Warn on any config/device mismatch but never
+            // override the recovered packed-ness.
+            let device_packed = alloc.is_packed();
+            if config_packed && !device_packed {
+                tracing::warn!(
+                    store,
+                    "storage.packed = true but this device recovered as NON-packed \
+                     (existing data uses the block-per-record layout); honoring the \
+                     device and staying NON-packed. Packing requires a fresh device / \
+                     migration (no in-place migration exists)."
+                );
+            } else if !config_packed && device_packed {
+                tracing::warn!(
+                    store,
+                    "storage.packed = false but this device recovered as PACKED; \
+                     honoring the device and staying PACKED. Opening a packed device \
+                     non-packed would corrupt it via free()'s block-rounding."
+                );
+            }
+        }
+    }
+}
+
 /// Load the redb primary index. Restore first, fall back to a
 /// device-rebuild on a clean restore-error, fail closed otherwise.
 ///
@@ -351,7 +450,7 @@ pub fn recover_or_create_allocator(
 pub fn load_primary_index_redb(
     config: &IndexConfig,
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
     if crate::index::migration::import_in_progress(config) {
         let sentinel_path = crate::index::migration::import_sentinel_path(&config.redb_path);
@@ -402,7 +501,7 @@ pub fn load_primary_index_file_backed(
     path: &Path,
     expected_records: usize,
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
     let restore_suffix = if path.exists() {
         match PrimaryBackend::restore_file_backed(path, expected_records) {
@@ -438,7 +537,7 @@ pub fn load_primary_index_file_backed(
 /// error rather than starting with an empty index.
 pub fn load_primary_index_in_memory(
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> Result<PrimaryBackend, RebuildError> {
     PrimaryBackend::rebuild(device, allocator).map_err(|e| RebuildError::InMemoryPrimary {
         rebuild_err: format!("{e}"),
@@ -458,6 +557,10 @@ pub fn load_primary_index_in_memory(
 /// - `allocator`: slot allocator whose freelist is used to skip free holes.
 /// - `shard_count`: number of index shards to create (rounded up to the next
 ///   power of two, clamped to `[1, 256]`).
+/// - `expected_records`: configured steady-state record count. Each shard's
+///   hash table is pre-sized to `max(scanned_count, expected_records)` so a
+///   fresh/empty device still allocates steady-state capacity and avoids a
+///   rehash-under-write-guard resize storm on the create path.
 ///
 /// # Errors
 ///
@@ -466,10 +569,11 @@ pub fn load_primary_index_in_memory(
 /// underlying [`IndexError`].
 pub fn load_sharded_index_in_memory(
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
     shard_count: usize,
+    expected_records: usize,
 ) -> Result<ShardedIndex, RebuildError> {
-    ShardedIndex::rebuild_in_memory(device, allocator, shard_count).map_err(|e| {
+    ShardedIndex::rebuild_in_memory(device, allocator, shard_count, expected_records).map_err(|e| {
         RebuildError::InMemoryPrimary {
             rebuild_err: format!("{e}"),
         }
@@ -485,20 +589,24 @@ pub fn load_sharded_index_in_memory(
 /// index entry's `device_id`; a single-device scan would index only the records
 /// that happened to land on store 0 and silently lose the rest.
 ///
+/// `expected_records` pre-sizes each shard's hash table to
+/// `max(total_scanned_count, expected_records)`, so a fresh/empty cluster of
+/// stores still allocates steady-state capacity and avoids a resize storm.
+///
 /// # Errors
 ///
 /// Returns [`RebuildError::InMemoryPrimary`] if any store's device scan or shard
 /// routing fails.
 pub fn load_sharded_index_in_memory_multi(
     devices: &[std::sync::Arc<dyn BlockDevice>],
-    allocators: &[SlotAllocator],
+    allocators: &[BoxedAllocator],
     shard_count: usize,
+    expected_records: usize,
 ) -> Result<ShardedIndex, RebuildError> {
-    ShardedIndex::rebuild_in_memory_multi_store(devices, allocators, shard_count).map_err(|e| {
-        RebuildError::InMemoryPrimary {
+    ShardedIndex::rebuild_in_memory_multi_store(devices, allocators, shard_count, expected_records)
+        .map_err(|e| RebuildError::InMemoryPrimary {
             rebuild_err: format!("{e}"),
-        }
-    })
+        })
 }
 
 /// Rebuild secondary indexes from the device, returning a
@@ -509,7 +617,7 @@ pub fn load_sharded_index_in_memory_multi(
 /// then rejects endpoints that depend on the missing data.
 pub fn rebuild_in_memory_secondaries(
     device: &dyn BlockDevice,
-    allocator: &SlotAllocator,
+    allocator: &dyn RecordAllocator,
 ) -> SecondaryLoadOutcome {
     match PrimaryBackend::rebuild_secondary(device, allocator) {
         Ok((dah, unmined)) => SecondaryLoadOutcome {
@@ -650,10 +758,19 @@ pub enum RedoOpenError {
 ///   mismatch, etc.).
 /// * [`RedoOpenError::Log`] — the device opened but `RedoLog::open`
 ///   could not establish a valid log (bounds, corrupt history, etc.).
+///
+/// `buffered_io` selects the device open mode: `false` (default / strict)
+/// opens the redo with `O_DIRECT` (Linux) / `F_NOCACHE` (macOS) exactly as
+/// before; `true` opens it through the OS page cache
+/// ([`crate::device::DirectDevice::open_buffered`]) for the relaxed
+/// `redo_buffered_io` mode. It affects ONLY the redo device — the data
+/// device(s) are opened elsewhere and always stay `O_DIRECT`.
 pub fn open_mandatory_redo_log(
     path: &Path,
     size: u64,
     alignment: usize,
+    segment_ring: Option<u64>,
+    buffered_io: bool,
 ) -> Result<
     (
         std::sync::Arc<dyn crate::device::BlockDevice>,
@@ -661,11 +778,14 @@ pub fn open_mandatory_redo_log(
     ),
     RedoOpenError,
 > {
-    let device = crate::device::DirectDevice::open(path, size, alignment).map_err(|e| {
-        RedoOpenError::Device {
-            path: path.display().to_string(),
-            reason: format!("{e}"),
-        }
+    let open_res = if buffered_io {
+        crate::device::DirectDevice::open_buffered(path, size, alignment)
+    } else {
+        crate::device::DirectDevice::open(path, size, alignment)
+    };
+    let device = open_res.map_err(|e| RedoOpenError::Device {
+        path: path.display().to_string(),
+        reason: format!("{e}"),
     })?;
     let device: std::sync::Arc<dyn crate::device::BlockDevice> = std::sync::Arc::new(device);
     let log =
@@ -673,65 +793,50 @@ pub fn open_mandatory_redo_log(
             path: path.display().to_string(),
             reason: format!("{e}"),
         })?;
+
+    // Lever 7: adopt the segment-ring layout per config, with the same
+    // "device-format-wins" discipline as `storage.packed`:
+    //   * an existing on-disk ring is always used as a ring (handled above by
+    //     `RedoLog::open`);
+    //   * a FRESH region (never written: current_sequence == 1) adopts the ring;
+    //   * an existing NON-EMPTY linear region stays linear this session (the
+    //     ring is not read-compatible and we will not discard live redo) — the
+    //     operator drains (clean shutdown) + resets the region to adopt it.
+    if let Some(seg_cfg) = segment_ring {
+        if log.is_segment_ring() {
+            return Ok((device, log));
+        }
+        if log.current_sequence() == 1 {
+            let seg_size = if seg_cfg == 0 {
+                derive_ring_segment_size(size, alignment)
+            } else {
+                seg_cfg
+            };
+            let ring = crate::redo::RedoLog::format_ring(device.clone(), 0, size, seg_size)
+                .map_err(|e| RedoOpenError::Log {
+                    path: path.display().to_string(),
+                    reason: format!("{e}"),
+                })?;
+            return Ok((device, ring));
+        }
+        tracing::warn!(
+            path = %path.display(),
+            "redo_segment_ring enabled but the redo region holds existing linear data — \
+             staying on the linear layout this session; drain (clean shutdown) and reset \
+             the redo region to adopt the segment ring",
+        );
+    }
     Ok((device, log))
 }
 
-/// Errors raised by [`open_tombstone_log`] when the deletion-tombstone log
-/// cannot be opened (deletion-tombstone Phase 3).
-#[derive(Debug, thiserror::Error)]
-pub enum TombstoneOpenError {
-    /// `DirectDevice::open` failed for the tombstone-log file.
-    #[error("tombstone log device open failed at {path}: {reason}")]
-    Device { path: String, reason: String },
-
-    /// The device opened but [`crate::tombstone::TombstoneLog::open`] returned
-    /// an error (region bounds, corrupt / incompatible header, etc.).
-    #[error("tombstone log open failed at {path}: {reason}")]
-    Log { path: String, reason: String },
-}
-
-/// Open or create the on-device deletion-tombstone log at `path`
-/// (deletion-tombstone Phase 3), mirroring [`open_mandatory_redo_log`].
-///
-/// The tombstone log lives in its own device file (a `.tombstone` sibling of
-/// the data device, exactly as the redo log is a `.redo` sibling) at region
-/// offset 0. Unlike the redo log it is append-only and NOT reset on
-/// checkpoint; it is the durable source of truth for deletion tombstones.
-///
-/// On success the caller receives the device handle (which must be kept alive
-/// for the lifetime of the process so the shared fd survives) and the open
-/// [`crate::tombstone::TombstoneLog`]. The caller wraps the log in
-/// `Arc<Mutex<_>>` for shared engine access.
-///
-/// # Errors
-/// * [`TombstoneOpenError::Device`] — `DirectDevice::open` failed.
-/// * [`TombstoneOpenError::Log`] — the device opened but the log could not be
-///   established (bounds / corrupt header / incompatible version).
-pub fn open_tombstone_log(
-    path: &Path,
-    size: u64,
-    alignment: usize,
-) -> Result<
-    (
-        std::sync::Arc<dyn crate::device::BlockDevice>,
-        crate::tombstone::TombstoneLog,
-    ),
-    TombstoneOpenError,
-> {
-    let device = crate::device::DirectDevice::open(path, size, alignment).map_err(|e| {
-        TombstoneOpenError::Device {
-            path: path.display().to_string(),
-            reason: format!("{e}"),
-        }
-    })?;
-    let device: std::sync::Arc<dyn crate::device::BlockDevice> = std::sync::Arc::new(device);
-    let log = crate::tombstone::TombstoneLog::open(device.clone(), 0, size).map_err(|e| {
-        TombstoneOpenError::Log {
-            path: path.display().to_string(),
-            reason: format!("{e}"),
-        }
-    })?;
-    Ok((device, log))
+/// Auto-derive a ring segment size (~8 segments) from the redo region size,
+/// rounded down to the device alignment and floored at one alignment block so a
+/// tiny region still yields whole segments.
+fn derive_ring_segment_size(size: u64, alignment: usize) -> u64 {
+    let align = alignment as u64;
+    let entries = size.saturating_sub(align);
+    let eighth = (entries / 8) / align * align;
+    eighth.max(align)
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1455,72 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Packed-mode startup wiring (apply_packed_mode): fresh adopts config,
+    // recovered honors the device (device format wins).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_packed_mode_fresh_device_adopts_config_on() {
+        // Fresh device + config packed -> allocator becomes packed before use.
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("fresh");
+        assert_eq!(origin, AllocatorOrigin::Fresh);
+        assert!(!alloc.is_packed(), "fresh allocator starts non-packed");
+        apply_packed_mode(&mut alloc, origin, true, 0);
+        assert!(alloc.is_packed(), "fresh + config packed -> packed");
+    }
+
+    #[test]
+    fn apply_packed_mode_fresh_device_adopts_config_off() {
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("fresh");
+        apply_packed_mode(&mut alloc, origin, false, 0);
+        assert!(!alloc.is_packed(), "fresh + config off -> non-packed");
+    }
+
+    #[test]
+    fn apply_packed_mode_recovered_packed_device_wins_over_config_off() {
+        // A v2 (packed) device must STAY packed even when config says off —
+        // opening it non-packed would corrupt it via free()'s block-rounding.
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        {
+            let mut a = SlotAllocator::new(dev.clone()).unwrap();
+            a.set_packed(true);
+            a.allocate(600).unwrap();
+            a.persist().unwrap();
+        }
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("recover packed");
+        assert_eq!(origin, AllocatorOrigin::Recovered);
+        assert!(alloc.is_packed(), "recovered device is packed");
+        // Config says OFF, but the device wins.
+        apply_packed_mode(&mut alloc, origin, false, 0);
+        assert!(
+            alloc.is_packed(),
+            "recovered packed device must stay packed regardless of config"
+        );
+    }
+
+    #[test]
+    fn apply_packed_mode_recovered_nonpacked_device_wins_over_config_on() {
+        // A v1 (non-packed) device must STAY non-packed even when config says
+        // packed — packing existing data needs a fresh device / migration.
+        let dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        {
+            let mut a = SlotAllocator::new(dev.clone()).unwrap();
+            a.allocate(600).unwrap();
+            a.persist().unwrap();
+        }
+        let (mut alloc, origin) = recover_or_create_allocator(dev).expect("recover non-packed");
+        assert_eq!(origin, AllocatorOrigin::Recovered);
+        assert!(!alloc.is_packed());
+        apply_packed_mode(&mut alloc, origin, true, 0);
+        assert!(
+            !alloc.is_packed(),
+            "recovered non-packed device must stay non-packed regardless of config"
+        );
+    }
+
     #[test]
     fn in_memory_primary_rebuild_error_includes_underlying_cause() {
         let err = RebuildError::InMemoryPrimary {
@@ -1428,7 +1599,7 @@ mod tests {
     fn mandatory_redo_open_succeeds_in_clean_dir() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("redo.log");
-        let result = super::open_mandatory_redo_log(&path, 1 << 20, 4096);
+        let result = super::open_mandatory_redo_log(&path, 1 << 20, 4096, None, false);
         let (_dev, log) = match result {
             Ok(parts) => parts,
             Err(e) => panic!("clean tmp path must open: {e}"),
@@ -1441,13 +1612,66 @@ mod tests {
         );
     }
 
+    /// Phase 7: with the ring enabled, a FRESH redo region adopts the segment
+    /// ring; reopening the same region keeps it a ring (device format wins).
+    #[test]
+    fn mandatory_redo_open_fresh_adopts_ring() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ring.redo");
+        // segment_ring = Some(0) → auto-derive segment size.
+        let (_dev, log) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0), false).unwrap();
+        assert!(log.is_segment_ring(), "fresh region adopts the ring");
+        drop(log);
+
+        // Reopen WITHOUT requesting the ring: the on-disk ring is still used.
+        let (_dev2, log2) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, None, false).unwrap();
+        assert!(log2.is_segment_ring(), "on-disk ring format wins on reopen");
+    }
+
+    /// Phase 7: an explicit segment size is honored when adopting the ring.
+    #[test]
+    fn mandatory_redo_open_honors_explicit_segment_size() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("ring_explicit.redo");
+        let (_dev, log) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(64 * 1024), false).unwrap();
+        assert!(log.is_segment_ring());
+        // 1 MiB region − 4 KiB header = 1044480 B; / 64 KiB = 15 segments.
+        assert_eq!(log.capacity(), 15 * 64 * 1024);
+    }
+
+    /// Phase 7: requesting the ring on a region that already holds linear data
+    /// stays linear (does not discard live redo).
+    #[test]
+    fn mandatory_redo_open_keeps_existing_linear() {
+        use crate::redo::RedoOp;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("linear.redo");
+        {
+            let (_dev, mut log) =
+                super::open_mandatory_redo_log(&path, 1 << 20, 4096, None, false).unwrap();
+            log.append(RedoOp::Checkpoint).unwrap();
+            log.flush().unwrap();
+            assert!(!log.is_segment_ring());
+        }
+        // Now request the ring: existing linear data → stays linear this session.
+        let (_dev, log) =
+            super::open_mandatory_redo_log(&path, 1 << 20, 4096, Some(0), false).unwrap();
+        assert!(
+            !log.is_segment_ring(),
+            "non-empty linear region must not be reformatted to a ring"
+        );
+    }
+
     #[test]
     fn mandatory_redo_open_fails_on_unwritable_path() {
         // Pointing at a parent directory that does not exist returns a
         // `DeviceError` from `DirectDevice::open` — the gap #2 contract
         // is that this propagates instead of falling back to memory.
         let path = std::path::Path::new("/this/path/does/not/exist/redo.log");
-        let result = super::open_mandatory_redo_log(path, 1 << 20, 4096);
+        let result = super::open_mandatory_redo_log(path, 1 << 20, 4096, None, false);
         let err = match result {
             Ok(_) => panic!("missing parent dir must fail closed (no in-memory fallback)"),
             Err(e) => e,
@@ -1474,7 +1698,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // tmp.path() itself exists as a directory.
         let dir_path = tmp.path().to_path_buf();
-        let result = super::open_mandatory_redo_log(&dir_path, 1 << 20, 4096);
+        let result = super::open_mandatory_redo_log(&dir_path, 1 << 20, 4096, None, false);
         let err = match result {
             Ok(_) => panic!("a directory path must fail closed (no in-memory fallback)"),
             Err(e) => e,
@@ -1532,7 +1756,7 @@ mod tests {
             expected.push((TxKey { txid }, offset));
         }
 
-        let sharded = super::load_sharded_index_in_memory(&*dev, &alloc, 16)
+        let sharded = super::load_sharded_index_in_memory(&*dev, &alloc, 16, 0)
             .expect("load_sharded_index_in_memory must succeed with populated device");
 
         assert_eq!(sharded.shard_count(), 16, "must produce 16 shards");

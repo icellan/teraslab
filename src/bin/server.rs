@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use parking_lot::Mutex;
-use teraslab::allocator::SlotAllocator;
+
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
@@ -31,10 +31,10 @@ use teraslab::server::Server;
 use teraslab::server::dispatch::{SecondaryStatus, set_secondary_status};
 use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
-    AllocatorOrigin, SecondaryLoadOutcome, check_replay_tolerance_with_cap, fallback_dah_index,
-    fallback_unmined_index, load_primary_index_file_backed, load_primary_index_redb,
-    load_sharded_index_in_memory, load_sharded_index_in_memory_multi, open_mandatory_redo_log,
-    open_tombstone_log, rebuild_in_memory_secondaries, recover_or_create_allocator,
+    AllocatorOrigin, SecondaryLoadOutcome, apply_packed_mode, check_replay_tolerance_with_cap,
+    fallback_dah_index, fallback_unmined_index, load_primary_index_file_backed,
+    load_primary_index_redb, load_sharded_index_in_memory, load_sharded_index_in_memory_multi,
+    open_mandatory_redo_log, rebuild_in_memory_secondaries, recover_or_create_boxed_allocator,
     secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
@@ -517,6 +517,72 @@ fn main() {
         }
         devs
     };
+
+    // 1c. Optionally interpose the in-RAM data-device block cache
+    // (docs/WRITE_CACHE_SPEC.md). `cache.bytes == 0` (default) leaves the raw
+    // O_DIRECT devices untouched — byte-for-byte today's behavior, maximum
+    // safety. When enabled, every store gets its own cache; the engine uses it
+    // transparently as a `BlockDevice`, and write-back stays WAL-safe because
+    // the checkpoint's data-device barrier flushes dirty blocks via `sync()`.
+    // The streaming write buffer owns write coalescing for the segment engine, so
+    // the underlying data cache must be WRITE-THROUGH under it — a write-back cache
+    // would re-scatter the streaming flushes through its own eviction path,
+    // defeating the point. Streaming is segment-only (in_place writes are in-place
+    // RMW, not appends).
+    let use_streaming = config.storage.engine == teraslab::config::StorageEngine::Segment
+        && config.storage.streaming;
+    let cache_writeback = config.cache.writeback && !use_streaming;
+    let store_devices: Vec<Arc<dyn BlockDevice>> = if config.cache.is_enabled() {
+        tracing::info!(
+            bytes = config.cache.bytes,
+            mode = if cache_writeback {
+                "write-back"
+            } else {
+                "write-through"
+            },
+            forced_write_through = use_streaming && config.cache.writeback,
+            stores = store_devices.len(),
+            "interposing in-RAM data-device cache"
+        );
+        store_devices
+            .into_iter()
+            .map(|d| {
+                Arc::new(teraslab::cache::CachingDevice::new(
+                    d,
+                    config.cache.bytes,
+                    cache_writeback,
+                    config.cache.writeback_interval_ms,
+                )) as Arc<dyn BlockDevice>
+            })
+            .collect()
+    } else {
+        store_devices
+    };
+
+    // Interpose the per-store streaming write buffer for the segment engine. It
+    // buffers the append tail and flushes it as large sequential writes; the
+    // checkpoint barrier's `sync()` flushes it before any redo prefix is reclaimed,
+    // so buffered durability is unchanged. The allocator header (offset 0) and any
+    // in-place mutation of an already-flushed record pass straight through to the
+    // cache/device — see `StreamingWriteDevice`.
+    let store_devices: Vec<Arc<dyn BlockDevice>> = if use_streaming {
+        tracing::info!(
+            stores = store_devices.len(),
+            flush_threshold = teraslab::streaming::DEFAULT_FLUSH_THRESHOLD,
+            flush_chunk = teraslab::streaming::DEFAULT_FLUSH_CHUNK,
+            "interposing per-store streaming write buffer (segment engine)"
+        );
+        store_devices
+            .into_iter()
+            .map(|d| {
+                Arc::new(teraslab::streaming::StreamingWriteDevice::with_defaults(d))
+                    as Arc<dyn BlockDevice>
+            })
+            .collect()
+    } else {
+        store_devices
+    };
+
     // Store 0 backs the existing single-store boot code (snapshot load, header
     // verify); stores 1..N are wired in below for allocators/recovery/engine.
     let device = store_devices[0].clone();
@@ -571,7 +637,11 @@ fn main() {
     // allocator — a fresh allocator over a device with persisted state
     // restarts allocation at the data-region start and its next creates
     // overwrite live records.
-    let (allocator, allocator_origin) = match recover_or_create_allocator(device.clone()) {
+    let (allocator, allocator_origin) = match recover_or_create_boxed_allocator(
+        device.clone(),
+        config.storage.engine,
+        config.storage.segment_size,
+    ) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::error!(
@@ -626,12 +696,31 @@ fn main() {
     // stores 1..N recover their own header. Each is tagged with its store
     // index so its AllocateRegion/FreeRegion redo entries carry that store's
     // device_id (recovery routes region ops to the right store's allocator).
-    let mut store_allocators: Vec<SlotAllocator> = Vec::with_capacity(num_stores);
+    let mut store_allocators: Vec<teraslab::allocator::BoxedAllocator> =
+        Vec::with_capacity(num_stores);
     let mut allocator = allocator;
     allocator.set_redo_device_id(0);
+    // Packed mode: a FRESH device adopts config.storage.packed (before any
+    // allocation); a RECOVERED device keeps its on-disk format (device wins,
+    // mismatch logged). Done per store so every store is consistent.
+    apply_packed_mode(&mut *allocator, allocator_origin, config.storage.packed, 0);
+    // Append-only placement (Phase 1 log-structured write lever): pure runtime
+    // policy, not an on-disk format, so config always wins regardless of origin.
+    allocator.set_append_only(config.storage.append_only);
+    if config.storage.append_only {
+        tracing::warn!(
+            "storage.append_only = true: freed regions are never reused (records stay \
+             sequential for log-structured write-back coalescing). Space is NOT reclaimed — \
+             the device grows unbounded. Intended for benchmarks, not unbounded production."
+        );
+    }
     store_allocators.push(allocator);
     for (i, sdev) in store_devices.iter().enumerate().skip(1) {
-        let (mut alloc, _origin) = match recover_or_create_allocator(sdev.clone()) {
+        let (mut alloc, origin) = match recover_or_create_boxed_allocator(
+            sdev.clone(),
+            config.storage.engine,
+            config.storage.segment_size,
+        ) {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::error!(
@@ -644,6 +733,8 @@ fn main() {
             }
         };
         alloc.set_redo_device_id(i as u8);
+        apply_packed_mode(&mut *alloc, origin, config.storage.packed, i);
+        alloc.set_append_only(config.storage.append_only);
         store_allocators.push(alloc);
     }
 
@@ -673,11 +764,27 @@ fn main() {
     // every record on stores 1..N. `load_sharded_index_in_memory_multi` scans all
     // stores and stamps each entry's `device_id`. N=1 keeps the byte-identical
     // single-device path.
+    // Pre-size the rebuilt in-memory index to the configured steady-state
+    // record count: on a fresh/empty device the scan finds 0 records, so without
+    // this each shard would start tiny and rehash-under-write-guard repeatedly as
+    // creates arrive — a resize storm that serializes the create path. Captured
+    // into a local so the closure borrows only the scalar, not all of `config`.
+    let expected_records = config.expected_records;
     let rebuild_primary_from_scan = |shard_count: usize| -> Result<ShardedIndex, _> {
         if num_stores > 1 {
-            load_sharded_index_in_memory_multi(&store_devices, &store_allocators, shard_count)
+            load_sharded_index_in_memory_multi(
+                &store_devices,
+                &store_allocators,
+                shard_count,
+                expected_records,
+            )
         } else {
-            load_sharded_index_in_memory(&*device, &store_allocators[0], shard_count)
+            load_sharded_index_in_memory(
+                &*device,
+                &*store_allocators[0],
+                shard_count,
+                expected_records,
+            )
         }
     };
     let load_outcome: (ShardedIndex, SecondaryLoadOutcome) = if config.index.backend
@@ -691,7 +798,8 @@ fn main() {
                  using 1 shard (sharding is implemented for the in-memory backend)",
             );
         }
-        let primary = match load_primary_index_redb(&config.index, &*device, &store_allocators[0]) {
+        let primary = match load_primary_index_redb(&config.index, &*device, &*store_allocators[0])
+        {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "redb primary index opened");
                 idx
@@ -740,7 +848,7 @@ fn main() {
             fb_path,
             config.expected_records,
             &*device,
-            &store_allocators[0],
+            &*store_allocators[0],
         ) {
             Ok(idx) => {
                 tracing::info!(entries = idx.len(), "file-backed index opened");
@@ -752,7 +860,7 @@ fn main() {
             }
         };
         // File-backed mode: secondary indexes stay in-memory.
-        let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
+        let secondaries = rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
         (ShardedIndex::from_single(primary), secondaries)
     } else {
         // In-memory backend (default). Builds a `ShardedIndex` at
@@ -771,7 +879,7 @@ fn main() {
                     );
                     let secondaries = if flags.dah_needs_rebuild && flags.unmined_needs_rebuild {
                         tracing::warn!("both secondary indexes need rebuild (snapshot corrupt)");
-                        rebuild_in_memory_secondaries(&*device, &store_allocators[0])
+                        rebuild_in_memory_secondaries(&*device, &*store_allocators[0])
                     } else if flags.dah_needs_rebuild {
                         tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
                         // Preserve the intact unmined from the snapshot;
@@ -779,7 +887,7 @@ fn main() {
                         // marks DAH as degraded but keeps unmined healthy.
                         match teraslab::index::PrimaryBackend::rebuild_secondary(
                             &*device,
-                            &store_allocators[0],
+                            &*store_allocators[0],
                         ) {
                             Ok((rebuilt_dah, _)) => SecondaryLoadOutcome {
                                 dah: DahBackend::from(rebuilt_dah),
@@ -808,7 +916,7 @@ fn main() {
                         tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
                         match teraslab::index::PrimaryBackend::rebuild_secondary(
                             &*device,
-                            &store_allocators[0],
+                            &*store_allocators[0],
                         ) {
                             Ok((_, rebuilt_unmined)) => SecondaryLoadOutcome {
                                 dah: DahBackend::from(dah),
@@ -849,7 +957,8 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
+                    let secondaries =
+                        rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
                     (index, secondaries)
                 }
             }
@@ -862,7 +971,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let secondaries = rebuild_in_memory_secondaries(&*device, &store_allocators[0]);
+            let secondaries = rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
             (index, secondaries)
         }
     };
@@ -929,12 +1038,20 @@ fn main() {
             os.push(format!(".{store_idx}"));
             std::path::PathBuf::from(os)
         };
-        match open_mandatory_redo_log(&path, config.redo_log_size, config.device_alignment) {
+        let segment_ring = config.redo_segment_ring.then_some(config.redo_segment_size);
+        match open_mandatory_redo_log(
+            &path,
+            config.redo_log_size,
+            config.device_alignment,
+            segment_ring,
+            config.redo_buffered_io,
+        ) {
             Ok((dev, log)) => {
                 tracing::info!(
                     path = %path.display(),
                     store = store_idx,
                     size_mib = config.redo_log_size / (1024 * 1024),
+                    segment_ring = log.is_segment_ring(),
                     "redo log opened (mandatory, per-store)",
                 );
                 redo_log_devices.push(dev);
@@ -1116,11 +1233,34 @@ fn main() {
     // pairing each aux allocator with its device, and construct the multi-store
     // engine. With one store, aux is empty and this is exactly the prior
     // single-store engine.
+    // Segment engine: recompute each store's append frontier from the rebuilt
+    // index BEFORE the allocators are moved into the engine, so a post-checkpoint
+    // record (beyond the stale header cursor) is never overwritten by the first
+    // fresh allocation. No-op for the in-place engine (skipped here to avoid the
+    // per-store metadata read).
+    if config.storage.engine == teraslab::config::StorageEngine::Segment
+        && let Err(e) = teraslab::recovery::recover_allocator_frontiers(
+            &index,
+            &store_devices,
+            &mut store_allocators,
+        )
+    {
+        tracing::error!(
+            err = %e,
+            "FATAL: could not recompute the segment allocator frontier on recovery \
+             (a corrupt highest-offset record); refusing to start rather than risk \
+             overwriting live data",
+        );
+        std::process::exit(1);
+    }
     let mut alloc_iter = store_allocators.into_iter();
     let primary_allocator = alloc_iter
         .next()
         .expect("at least one store allocator (validated >= 1 store)");
-    let aux_stores: Vec<(Arc<dyn BlockDevice>, SlotAllocator)> =
+    // store_allocators already holds boxed `dyn RecordAllocator` (in-place or
+    // log-structured per storage.engine), so pair each aux allocator with its
+    // device directly.
+    let aux_stores: Vec<(Arc<dyn BlockDevice>, teraslab::allocator::BoxedAllocator)> =
         store_devices[1..].iter().cloned().zip(alloc_iter).collect();
     let mut engine = Engine::new_multi_store(
         store_devices[0].clone(),
@@ -1130,6 +1270,17 @@ fn main() {
         locks,
         dah_index,
         unmined_index,
+    );
+
+    // Honor the configured create-time store placement strategy (round-robin by
+    // default, or deterministic txid→store). Reads always route by the recorded
+    // device_id, so this only changes where NEW records land — safe to set on an
+    // already-populated store.
+    engine.set_placement_strategy(config.storage.placement);
+    tracing::info!(
+        placement = ?config.storage.placement,
+        stores = engine.store_count(),
+        "store placement strategy set",
     );
 
     // Fail closed if the recovered/loaded index references a store that does not
@@ -1239,6 +1390,20 @@ fn main() {
     // migration suppression read via `engine.redo_log()`).
     if let Some(ref logs) = redo_logs_arc {
         engine.set_redo_logs(logs.clone());
+        // Apply buffered (relaxed) redo durability if configured. Must follow
+        // set_redo_logs so the per-store group-commit coordinators exist.
+        // `redo_buffered_io` implies buffered durability (see
+        // `redo_buffered_effective`).
+        if config.redo_buffered_effective() {
+            engine.set_buffered_durability(true);
+            tracing::warn!(
+                flush_interval_ms = config.redo_flush_interval_ms,
+                buffered_io = config.redo_buffered_io,
+                "BUFFERED redo durability enabled — mutations are acked before \
+                 fsync; up to one flush interval of acked writes may be lost on \
+                 an unclean shutdown (relaxed-durability mode)"
+            );
+        }
     }
 
     // 4b. Attach the (already-constructed) blobstore to the engine. The
@@ -1248,111 +1413,8 @@ fn main() {
 
     let engine = Arc::new(engine);
 
-    // 4c. Deletion tombstones (deletion-tombstone Phase 3 + 7).
-    //
-    // Open the on-device tombstone log (its own `.tombstone` device file,
-    // mirroring the redo log's `.redo` sibling) and the redb tombstone
-    // lookup index, attach both to the engine, then run the tombstone
-    // recovery pass: R1 rebuilds the redb index from the durable log, R2
-    // self-purges any record this node resurrected for a key the cluster
-    // authoritatively deleted (design §5). All gated on `tombstones_enabled`
-    // (default true); when off, the delete path and recovery behave exactly
-    // as before tombstones existed (design §11.5).
-    //
-    // Kept alive for the process lifetime (like `_redo_log_device`) so the
-    // shared fd survives. A failure to open the log/index is fatal — a
-    // partially-wired tombstone subsystem would silently drop the
-    // deletion-evidence the cluster relies on.
-    engine.set_tombstones_enabled(config.tombstones_enabled);
-    // Phase 8 (design §7/§11.5): tombstone-driven migration reconciliation.
-    // Default OFF; awaits CI soak. When OFF, OP_MIGRATION_COMPLETE / the
-    // completion-frame builder / the superset proof / the failed-handoff
-    // disposition are byte-identical to the pre-Phase-8 Fix-B/#29 path. The
-    // enabled path additionally needs the tombstone index attached (below) to
-    // observe a non-empty source tombstone set; with reconciliation on but
-    // tombstones off, the source presents an empty tombstone section and the
-    // path degrades to the never-received TRANSFER decision (no-loss).
-    engine.set_tombstone_reconciliation_enabled(config.tombstone_reconciliation_enabled);
-    if config.tombstone_reconciliation_enabled {
-        tracing::info!(
-            "tombstone-driven migration reconciliation ENABLED (Phase 8) — \
-             enabled path is NOT docker-validated; awaiting CI soak",
-        );
-    }
-    // Height floor for the height subsystem (design §4), populated from the
-    // tombstone index when tombstones are enabled; `None` otherwise.
-    let mut tombstone_height_floor: Option<u32> = None;
-    if config.tombstones_enabled {
-        let tombstone_path = config.resolved_tombstone_log_path();
-        let (tombstone_device, tombstone_log) = match open_tombstone_log(
-            &tombstone_path,
-            config.tombstone_region_size,
-            config.device_alignment,
-        ) {
-            Ok(parts) => parts,
-            Err(e) => {
-                tracing::error!(
-                    path = %tombstone_path.display(),
-                    err = %e,
-                    "FATAL: deletion-tombstone log unavailable — cannot start with \
-                     tombstones enabled (set tombstones_enabled = false to fall back)",
-                );
-                std::process::exit(1);
-            }
-        };
-        let _tombstone_device: Arc<dyn BlockDevice> = tombstone_device;
-
-        let mut tombstone_index = match teraslab::index::redb_tombstone::RedbTombstoneIndex::open(
-            &config.index.redb_tombstone_path,
-            config.index.redb_cache_size,
-        ) {
-            Ok(idx) => idx,
-            Err(e) => {
-                tracing::error!(
-                    path = %config.index.redb_tombstone_path.display(),
-                    err = %e,
-                    "FATAL: deletion-tombstone redb index unavailable",
-                );
-                std::process::exit(1);
-            }
-        };
-
-        // R1 + R2: reconstruct the index from the log and self-purge.
-        match teraslab::recovery::recover_tombstones(&engine, &tombstone_log, &mut tombstone_index)
-        {
-            Ok(stats) => {
-                tracing::info!(
-                    reconstructed = stats.tombstones_reconstructed,
-                    self_purged = stats.records_self_purged,
-                    kept_newer_generation = stats.kept_newer_generation,
-                    "deletion-tombstone recovery complete (R1 reconstruct + R2 self-purge)",
-                );
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "FATAL: deletion-tombstone recovery failed");
-                std::process::exit(1);
-            }
-        }
-
-        // Height-subsystem floor (design §4): the max tombstone deletion
-        // height is a sound, free lower bound for the node's last-durable
-        // height (a tombstone's deletion_height ≤ the chain tip the node saw
-        // when it applied that delete). Read it before the index is moved.
-        tombstone_height_floor = tombstone_index.max_deletion_height().unwrap_or_else(|e| {
-            tracing::warn!(err = %e, "could not read tombstone max deletion height for height floor");
-            None
-        });
-
-        engine.set_tombstone_log(Arc::new(Mutex::new(tombstone_log)));
-        engine.set_tombstone_index(Arc::new(Mutex::new(tombstone_index)));
-        tracing::info!(
-            path = %tombstone_path.display(),
-            size_mib = config.tombstone_region_size / (1024 * 1024),
-            "deletion-tombstone log + index attached (enabled)",
-        );
-    } else {
-        tracing::info!("deletion tombstones disabled (tombstones_enabled = false)");
-    }
+    // Deletion tombstones removed: deletes are independent-node prune GC (no
+    // tombstone log/index, no replication, no migration reconciliation).
 
     // Height subsystem (deletion-tombstone design §4): attach the durable
     // height file and restore the node's last-durable height. ALWAYS-ON and
@@ -1375,9 +1437,7 @@ fn main() {
     // Persistence keeps the value monotone across restarts.
     let height_path = config.resolved_last_durable_height_path();
     let persisted_height = teraslab::ops::engine::read_durable_height_file(&height_path);
-    let record_floor = tombstone_height_floor
-        .unwrap_or(0)
-        .max(recovery_height_floor);
+    let record_floor = recovery_height_floor;
     engine.set_last_durable_height_path(height_path.clone());
     let restored_height = engine.restore_last_durable_height(persisted_height, record_floor);
     tracing::info!(
@@ -1500,10 +1560,6 @@ fn main() {
             migration_batch_size: config.migration_batch_size,
             persisted_incarnation: topo_state.incarnation,
             cluster_id: resolved_cluster_id,
-            // Phase 4 rejoin gate (deletion-tombstone design §4.3). Shares the
-            // GC master switch; default OFF → gate inert.
-            tombstone_gc_enabled: config.tombstone_gc_enabled,
-            rejoin_grace_blocks: config.rejoin_grace_blocks,
         };
         if initial_peak > 1 {
             tracing::info!(
@@ -1833,6 +1889,50 @@ fn main() {
         }
     });
 
+    // Background redo flusher for buffered durability: periodically push every
+    // store's redo log to the device so acked-but-unflushed mutations become
+    // durable, bounding the crash-loss window to ~one interval. Strict
+    // durability skips this (each commit already fsyncs). Observes the shutdown
+    // flag and exits promptly.
+    //
+    // Under `redo_buffered_io` the periodic flush pwrites WITHOUT a per-flush
+    // fsync (`flush_all_redo_no_sync`): the redo device is opened buffered, so
+    // the bytes go to the OS page cache and durability is provided by kernel
+    // writeback plus the checkpoint barrier's redo fsync before it reclaims.
+    // This removes the periodic device fsync that, on some virtualized hosts,
+    // stalls the VM for tens of milliseconds. Without `redo_buffered_io` the
+    // periodic flush keeps its per-flush fsync (`flush_all_redo`), unchanged.
+    //
+    // The FINAL flush on a clean shutdown ALWAYS fsyncs (`flush_all_redo`),
+    // regardless of `redo_buffered_io`, so a graceful stop loses nothing.
+    let redo_flush_handle: Option<std::thread::JoinHandle<()>> = if config.redo_buffered_effective()
+    {
+        let engine = engine.clone();
+        let shutdown_flag = shutdown_flag.clone();
+        let interval = std::time::Duration::from_millis(config.redo_flush_interval_ms.max(1));
+        let buffered_io = config.redo_buffered_io;
+        Some(std::thread::spawn(move || {
+            while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                let res = if buffered_io {
+                    engine.flush_all_redo_no_sync()
+                } else {
+                    engine.flush_all_redo()
+                };
+                if let Err(e) = res {
+                    tracing::error!(err = %e, "background redo flush failed");
+                }
+            }
+            // Final flush on shutdown so a clean stop loses nothing — always a
+            // real fsync, even under `redo_buffered_io`.
+            if let Err(e) = engine.flush_all_redo() {
+                tracing::error!(err = %e, "final redo flush on shutdown failed");
+            }
+        }))
+    } else {
+        None
+    };
+
     // R-049: spawn the periodic orphan-blob GC sweep. Recovery already
     // reconciled the blob store against the freshly-replayed primary index
     // on startup; this task takes care of orphans that accumulate during
@@ -1851,40 +1951,6 @@ fn main() {
     } else {
         tracing::info!("blob-gc periodic sweep disabled (blob_gc_interval_secs = 0)",);
         None
-    };
-
-    // Phase 5 — spawn the tombstone-GC daemon (deletion-tombstone design §4.6),
-    // sibling to the checkpoint / blob-gc tasks. It is spawned only in
-    // clustered mode (it needs the committed-membership view to compute the
-    // min finalized height) and ticks on `tombstone_gc_poll_interval_ms`. The
-    // daemon is GATED INTERNALLY on `tombstone_gc_enabled` (default OFF): when
-    // disabled it wakes, sees the flag is off, and does nothing — no horizon
-    // query, no range-delete, no log compaction. With GC off, this is a
-    // dormant thread and behavior is byte-identical to before Phase 5.
-    let tombstone_gc_handle: Option<std::thread::JoinHandle<()>> = match &cluster {
-        Some(c) => {
-            let gc_cfg = teraslab::tombstone_gc::TombstoneGcConfig {
-                enabled: config.tombstone_gc_enabled,
-                rejoin_grace_blocks: config.rejoin_grace_blocks,
-                poll_interval: std::time::Duration::from_millis(
-                    config.tombstone_gc_poll_interval_ms,
-                ),
-            };
-            if config.tombstone_gc_enabled {
-                tracing::warn!(
-                    rejoin_grace_blocks = config.rejoin_grace_blocks,
-                    "tombstone GC ENABLED (Phase 4+5) — the enabled path is NOT \
-                     docker-validated; awaiting CI soak (design §11.5)",
-                );
-            }
-            Some(teraslab::tombstone_gc::spawn_tombstone_gc_task(
-                gc_cfg,
-                engine.clone(),
-                c.clone(),
-                shutdown_flag.clone(),
-            ))
-        }
-        None => None,
     };
 
     // R-038 (D-01): spawn the replica-lag monitor when:
@@ -1984,8 +2050,8 @@ fn main() {
         // while the foreground unwind raced ahead.
         checkpoint_handle: Mutex::new(checkpoint_handle),
         blob_gc_handle: Mutex::new(blob_gc_handle),
+        redo_flush_handle: Mutex::new(redo_flush_handle),
         lag_monitor_handle: Mutex::new(lag_monitor_handle),
-        tombstone_gc_handle: Mutex::new(tombstone_gc_handle),
     };
 
     // F-G10-001 + F-G10-002: install the SIGINT/SIGTERM handler now. The
@@ -2031,11 +2097,10 @@ struct ServerWithShutdown {
     checkpoint_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the periodic blob-GC sweep thread. See F-G10-022.
     blob_gc_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Join handle for the background redo flusher (buffered durability only).
+    redo_flush_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Join handle for the replica-lag monitor thread. See F-G10-022.
     lag_monitor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// Join handle for the Phase 5 tombstone-GC daemon thread (gated off by
-    /// default). See deletion-tombstone design §4.6.
-    tombstone_gc_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerWithShutdown {
@@ -2065,13 +2130,13 @@ impl ServerWithShutdown {
             std::time::Duration::from_secs(5),
         );
         Self::join_with_timeout(
-            "lag_monitor",
-            self.lag_monitor_handle.lock().take(),
+            "redo_flush",
+            self.redo_flush_handle.lock().take(),
             std::time::Duration::from_secs(5),
         );
         Self::join_with_timeout(
-            "tombstone_gc",
-            self.tombstone_gc_handle.lock().take(),
+            "lag_monitor",
+            self.lag_monitor_handle.lock().take(),
             std::time::Duration::from_secs(5),
         );
 

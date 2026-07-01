@@ -3,10 +3,11 @@
 //! Owns the index, device, locks, and secondary indexes. Provides the
 //! spend/unspend methods that are the public API for this phase.
 
-use crate::allocator::SlotAllocator;
+use crate::allocator::{BoxedAllocator, RecordAllocator};
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::{
-    DahBackend, PreserveBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
+    DahBackend, PreserveBackend, PrimaryBackend, ShardedDahIndex, ShardedIndex,
+    ShardedUnminedIndex, TxIndexEntry, TxKey, UnminedBackend,
 };
 use crate::io;
 use crate::locks::StripedLocks;
@@ -82,80 +83,6 @@ impl Drop for MigrationJournalGuard {
     }
 }
 
-/// Thread-safe store engine for UTXO operations.
-///
-/// All mutation operations acquire a per-transaction stripe lock, ensuring
-/// that concurrent operations on different transactions run in parallel
-/// while operations on the same transaction are serialized.
-///
-/// # Atomic-apply invariant (F-G5-022 / A-4)
-///
-/// Each mutation entry point (`Self::spend`, `Self::unspend`,
-/// `Self::set_mined` / `Self::set_mined_inner`, `Self::set_locked`,
-/// `Self::create`, `Self::delete`, `Self::freeze`, `Self::unfreeze`,
-/// `Self::reassign`, `Self::mark_on_longest_chain`, etc.) acquires the
-/// per-tx stripe mutex *as its first action* and holds it for the entire
-/// read → validate → write → index-sync sequence. The mutex is released
-/// only after every observable side effect (slot write, metadata write,
-/// primary-index cache update, secondary-index two-phase update) has
-/// landed.
-///
-/// Consequence: there is no validate-then-apply window where two
-/// concurrent same-key spends could both observe `UTXO_UNSPENT` and both
-/// commit. The reproduction test
-/// `tests/g2_atomic_apply.rs::concurrent_spend_same_utxo_yields_exactly_one_winner`
-/// runs 16 threads × 200 iterations against the same UTXO and asserts
-/// exactly one `Ok` and `N-1` `AlreadySpent`. Any future refactor that
-/// splits the validate-and-apply sequence across the lock boundary, or
-/// downgrades the stripe mutex to an RwLock with shared validation, will
-/// surface as ≥2 winners and a panicking test.
-///
-/// Read-only paths (`Self::read_metadata`, `Self::read_slot`,
-/// `Self::read_slots`, `Self::read_block_entry`, `Self::get_spend`)
-/// intentionally skip the per-tx stripe mutex for throughput. Torn-read
-/// safety on these paths comes from the record-keyed [`crate::locks::StripedRwLocks`]
-/// table inside [`crate::io`] (F-X-007 / BC-02): every `*_direct` helper
-/// acquires a record-level read guard while copying bytes off the device,
-/// and every writer holds the corresponding write guard for the bulk
-/// memcpy + CRC restamp. The CRC32 over `TxMetadata` does NOT provide
-/// torn-read protection — its role is detecting on-disk corruption. The
-/// regression test `direct_read_write_concurrent_stress_never_returns_torn_data`
-/// (in `io.rs`) proves CRC alone is empirically insufficient on AArch64:
-/// NEON memcpy can publish the new CRC bytes before the new field bytes,
-/// so a concurrent reader can observe a CRC that validates against
-/// partially-old state. See the F-X-007 / BC-02 commentary at the top of
-/// [`crate::io`] for the full mechanism.
-///
-/// WARNING: the read-side `io_locks()` acquisitions in the `io.rs`
-/// `*_direct` helpers MUST NOT be removed as a "redundant given CRC"
-/// optimization — that exact reasoning was the original BC-02 contract
-/// and it is disproven by the stress test above.
-///
-/// In addition, the `meta.tx_id == key.txid` re-check in
-/// `read_metadata_for_key` (F-G2-001) defends against
-/// `delete + create_at_offset` aliasing. Callers that need a
-/// mutation-stable view (e.g. dispatch-side before-image capture for
-/// replication compensation) MUST either already hold the appropriate
-/// stripe lock or accept that the snapshot may be staler than the
-/// committed engine state by the time their follow-up mutation runs.
-///
-/// The exact tombstone fields written by a public delete (deletion-tombstone
-/// §6). Returned by [`Engine::delete_returning_tombstone`] so the master
-/// replication path can emit a `DeleteV2` carrying the *same* values the
-/// master's own tombstone recorded (matching generation / deletion_height /
-/// cause), instead of re-deriving them on the replica. `None` is returned by
-/// that method when no tombstone was written (feature off or no log attached).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeleteTombstoneInfo {
-    /// Block height recorded in the tombstone (sweep height for a DAH delete,
-    /// observed tip for an admin delete).
-    pub deletion_height: u32,
-    /// The record's generation counter at deletion time.
-    pub generation: u32,
-    /// Why the record was deleted.
-    pub cause: crate::tombstone::TombstoneCause,
-}
-
 /// One storage domain: a device (whole physical device or a
 /// [`SubDevice`](crate::subdevice::SubDevice) carved from one) plus its own raw
 /// device pointer and allocator. A node runs N stores, all held in
@@ -169,7 +96,20 @@ pub(crate) struct Store {
     /// path. `null_mut()` when the device does not support direct access (file /
     /// raw O_DIRECT), in which case I/O falls back to `pread`/`pwrite`.
     device_ptr: *mut u8,
-    allocator: parking_lot::Mutex<SlotAllocator>,
+    allocator: parking_lot::Mutex<BoxedAllocator>,
+    /// Cached copy of this store's allocator packed-ness, snapshotted at
+    /// construction. Packed-ness is set once at startup (fresh device from
+    /// config, recovered device from the header) and never toggled afterwards,
+    /// so caching it here lets the create write path branch its buffer padding
+    /// (gate #2: pad to `RECORD_ALIGN` in packed mode, full block otherwise)
+    /// without locking the allocator mutex on every write.
+    packed: bool,
+    /// Cached log-structured-ness (the segment engine), snapshotted at
+    /// construction. When `true`, the spend write path RELOCATES the record to a
+    /// new append-cursor offset instead of an in-place RMW. Like `packed`, fixed
+    /// for the store's lifetime, so the hot path branches on it without locking
+    /// the allocator. See [`crate::allocator::RecordAllocator::is_log_structured`].
+    log_structured: bool,
 }
 
 pub struct Engine {
@@ -178,8 +118,10 @@ pub struct Engine {
     /// `device_id` via [`Self::device_for`] / [`Self::device_ptr_for`] /
     /// [`Self::allocator_for`].
     stores: Vec<Store>,
-    /// Round-robin placement of new records across all stores.
-    placer: crate::subdevice::RoundRobinPlacer,
+    /// Store placement for new records (round-robin by default, or deterministic
+    /// txid→store when configured). Reads always route by the recorded
+    /// `device_id`, so the strategy only affects where NEW records land.
+    placer: crate::subdevice::StorePlacer,
     /// Sharded primary index. Each shard is a complete [`PrimaryBackend`]
     /// behind its own `RwLock`, so a write to one shard does not block
     /// reads/writes on other shards. Constructed at the configured
@@ -188,8 +130,19 @@ pub struct Engine {
     /// single recovered/rebuilt backend via [`ShardedIndex::from_single`]).
     index: ShardedIndex,
     locks: StripedLocks,
-    dah_index: parking_lot::Mutex<DahBackend>,
-    unmined_index: parking_lot::Mutex<UnminedBackend>,
+    /// DAH (delete-at-height) secondary index, sharded by txkey to remove the
+    /// single-global-mutex contention that previously serialised every Spend /
+    /// SetMined. Routes a key to the same shard NUMBER as the primary `index`
+    /// (same seed + hashing), so the per-key secondary shard lock taken while
+    /// holding the primary key's shard lock is a disjoint lock set — no deadlock
+    /// cycle. Sharded only for the in-memory backend; the redb variant stays
+    /// single-shard (`from_single`).
+    dah_index: ShardedDahIndex,
+    /// `unmined_since` secondary index, sharded by txkey. See [`Self::dah_index`]
+    /// for the routing + lock-ordering contract. An A/B test showed this index's
+    /// former single global mutex alone cost ~21 % of throughput under the
+    /// create-heavy workload.
+    unmined_index: ShardedUnminedIndex,
     /// Secondary index mapping `preserve_until` → txids, serving the
     /// expired-preservation sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`) in
     /// O(expired) instead of an O(index-size) primary walk (issue #25).
@@ -221,7 +174,12 @@ pub struct Engine {
     /// thus ran sequentially, and replicas added a 3 s per-RPC stall
     /// because OP_REPLICA_BATCH also acquires this guard. RwLock keeps
     /// the checkpoint guarantee while restoring per-op parallelism.
-    dispatch_visibility_barrier: parking_lot::RwLock<()>,
+    /// Per-key visibility barrier (see [`crate::visibility::VisibilityBarrier`]).
+    /// Its global side is the checkpoint gate (mutations/reads share, checkpoint
+    /// excludes); its per-key stripes give batch-atomic read-vs-mutation
+    /// exclusion without serializing disjoint mutations. The legacy
+    /// `acquire_*_visibility_guard` accessors map onto its global side.
+    visibility: std::sync::Arc<crate::visibility::VisibilityBarrier>,
     /// Per-store redo logs, one per store (index = `device_id`). Populated by
     /// [`Self::set_redo_logs`] at boot. Each store's log has its own backing
     /// region so writes get N parallel fsync streams instead of serializing on
@@ -234,51 +192,29 @@ pub struct Engine {
     /// attach a single representative handle; the per-store routing helpers
     /// fall back to [`Self::redo_log_handle`] in that case.
     redo_logs: std::sync::OnceLock<Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>>,
+    /// Per-store group-commit coordinators, one per entry in [`Self::redo_logs`]
+    /// and wrapping the same `Arc<Mutex<RedoLog>>`. The dispatch write path
+    /// ([`Self::append_redo_ops_routed`]) routes each store's append+flush
+    /// through its coordinator so concurrent batch RPCs to the same store
+    /// coalesce their fsync (leader/follower group commit) instead of
+    /// serializing one-fsync-per-RPC on the log mutex. Built alongside
+    /// `redo_logs` in [`Self::set_redo_logs`].
+    redo_committers: std::sync::OnceLock<Vec<Arc<crate::redo_group::GroupCommit>>>,
+    /// Buffered (relaxed) redo durability, mirroring the per-store committers'
+    /// flag so the engine-internal redo paths that bypass the committers — the
+    /// two-phase secondary-index journalling ([`Self::update_both_secondary_indexes`]
+    /// and [`Self::sync_primary_and_both_secondary_atomic`]) — honour the same
+    /// contract: in buffered mode they APPEND the secondary intent without an
+    /// fsync (the background flusher / checkpoint make it durable, coalesced),
+    /// instead of fsyncing per key on the ack path. Set in
+    /// [`Self::set_buffered_durability`]; defaults to strict (`false`).
+    redo_buffered: std::sync::atomic::AtomicBool,
     /// One shared redo backpressure coordinator across all per-store logs,
     /// built and injected in [`Self::set_redo_logs`]. The dispatch gate
     /// ([`crate::redo::RedoBackpressure::wait_for_capacity`]) and the
     /// checkpoint drainer read it; each store's log signals it on reclaim.
     /// `None` until redo logs are attached (test / no-WAL paths).
     redo_backpressure: std::sync::OnceLock<Arc<crate::redo::RedoBackpressure>>,
-    /// Append-only on-device deletion-tombstone log (deletion-tombstone
-    /// Phase 3). When attached AND [`Self::tombstones_enabled`] is true, the
-    /// physical-delete path appends a [`crate::tombstone::Tombstone`] here
-    /// and rides the delete's existing `device.sync()` so the tombstone is
-    /// durable BEFORE the primary-index removal (design §9.1 #4). Attached
-    /// post-construction via [`Self::set_tombstone_log`], mirroring
-    /// [`Self::set_redo_log`], so existing `Engine::new` call sites are
-    /// untouched. `None` in test / unconfigured paths.
-    tombstone_log: std::sync::OnceLock<Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>>,
-    /// redb-backed derived lookup index over the tombstone log. The log is
-    /// the durable source of truth; this index is rebuilt from it on
-    /// recovery (design §5.1), so its insert is NOT separately fsynced on
-    /// the hot path. Attached via [`Self::set_tombstone_index`].
-    tombstone_index: std::sync::OnceLock<
-        Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
-    >,
-    /// Master switch for the deletion-tombstone feature (design §11.5).
-    ///
-    /// Defaults to `true`. When `false`, the delete path writes NO tombstone
-    /// and behaves exactly as it did before tombstones existed; recovery
-    /// skips the R2 self-purge. Set from config via
-    /// [`Self::set_tombstones_enabled`].
-    tombstones_enabled: std::sync::atomic::AtomicBool,
-    /// Master switch for tombstone-driven migration RECONCILIATION
-    /// (deletion-tombstone Phase 8, design §7/§11.5).
-    ///
-    /// Defaults to `false` — the conservative, soak-pending state. When
-    /// `false`, the `OP_MIGRATION_COMPLETE` reconciliation, the completion-frame
-    /// builder, the superset proof, and `failed_handoff_disposition` behave
-    /// EXACTLY as on the pre-Phase-8 path (Fix B superset-accept + #29 prune
-    /// gate): no tombstone frame section is emitted or decoded, and no
-    /// tombstone-driven drop occurs. When `true`, the rejoinee classifies its
-    /// over-count against the source's tombstone manifest (§7) and the superset
-    /// proof relaxes to non-tombstoned keys (§7). Set from config via
-    /// [`Self::set_tombstone_reconciliation_enabled`]; independent of
-    /// [`Self::tombstones_enabled`] (reconciliation additionally requires the
-    /// tombstone WRITE path, but the gate is checked separately so the
-    /// off-default is byte-identical regardless of write-path state).
-    tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool,
     /// Highest `current_block_height` this node has durably observed across
     /// every height-bearing op it applied (spend / set_mined /
     /// mark_longest_chain / unspend), monotonically maxed
@@ -391,7 +327,7 @@ impl Engine {
     pub fn new(
         device: Arc<dyn BlockDevice>,
         index: impl Into<PrimaryBackend>,
-        allocator: SlotAllocator,
+        allocator: impl RecordAllocator + 'static,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
         unmined_index: impl Into<UnminedBackend>,
@@ -422,7 +358,7 @@ impl Engine {
     pub fn new_with_sharded_index(
         device: Arc<dyn BlockDevice>,
         index: ShardedIndex,
-        allocator: SlotAllocator,
+        allocator: impl RecordAllocator + 'static,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
         unmined_index: impl Into<UnminedBackend>,
@@ -430,7 +366,7 @@ impl Engine {
         Self::new_inner(
             device,
             index,
-            allocator,
+            Box::new(allocator),
             locks,
             dah_index.into(),
             unmined_index.into(),
@@ -444,8 +380,8 @@ impl Engine {
     /// index entry's `device_id`. Single-device callers use [`Engine::new`].
     pub fn new_multi_store(
         primary_device: Arc<dyn BlockDevice>,
-        primary_allocator: SlotAllocator,
-        aux: Vec<(Arc<dyn BlockDevice>, SlotAllocator)>,
+        primary_allocator: BoxedAllocator,
+        aux: Vec<(Arc<dyn BlockDevice>, BoxedAllocator)>,
         index: ShardedIndex,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
@@ -463,16 +399,20 @@ impl Engine {
             .into_iter()
             .map(|(device, allocator)| {
                 let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
+                let packed = allocator.is_packed();
+                let log_structured = allocator.is_log_structured();
                 Store {
                     device,
                     device_ptr,
                     allocator: parking_lot::Mutex::new(allocator),
+                    packed,
+                    log_structured,
                 }
             })
             .collect();
         let total = 1 + aux_stores.len();
         engine.stores.extend(aux_stores);
-        engine.placer = crate::subdevice::RoundRobinPlacer::new(total);
+        engine.placer = crate::subdevice::StorePlacer::round_robin(total);
         engine
     }
 
@@ -486,7 +426,7 @@ impl Engine {
     fn new_inner(
         device: Arc<dyn BlockDevice>,
         index: ShardedIndex,
-        allocator: SlotAllocator,
+        allocator: BoxedAllocator,
         locks: StripedLocks,
         dah_index: DahBackend,
         unmined_index: UnminedBackend,
@@ -494,41 +434,50 @@ impl Engine {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
         // Single-device construction: store 0 only, no aux stores. The
         // multi-store boot path uses `new_multi_store`.
-        let placer = crate::subdevice::RoundRobinPlacer::new(1);
+        let placer = crate::subdevice::StorePlacer::round_robin(1);
         let shard_count_capacity = crate::cluster::shards::NUM_SHARDS;
         let shard_counts: Vec<std::sync::atomic::AtomicU64> = (0..shard_count_capacity)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
+        // Match the visibility barrier's per-key stripe count to the mutation
+        // lock table so the two granularities line up.
+        let visibility = crate::visibility::VisibilityBarrier::new(locks.stripe_count());
+        let store0_packed = allocator.is_packed();
+        let store0_log_structured = allocator.is_log_structured();
+        // Shard both secondary indexes at the SAME count as the primary index so
+        // a key routes to the same shard number everywhere. `shard_in_memory`
+        // re-shards the (already recovered/reconciled) single in-memory backend
+        // by draining its entries; the redb / on-disk variant stays single-shard
+        // (self-durable, manages its own concurrency). Infallible — the in-memory
+        // shards built here have an infallible insert and the redb backend takes
+        // the non-inserting single-shard pass-through.
+        let secondary_shards = index.shard_count();
+        let dah_index = ShardedDahIndex::shard_in_memory(dah_index, secondary_shards);
+        let unmined_index = ShardedUnminedIndex::shard_in_memory(unmined_index, secondary_shards);
         let engine = Self {
             stores: vec![Store {
                 device,
                 device_ptr,
                 allocator: parking_lot::Mutex::new(allocator),
+                packed: store0_packed,
+                log_structured: store0_log_structured,
             }],
             placer,
             index,
             locks,
-            dah_index: parking_lot::Mutex::new(dah_index),
-            unmined_index: parking_lot::Mutex::new(unmined_index),
+            dah_index,
+            unmined_index,
             // Preserve index is unconditionally in-memory (no constructor
             // param): recovery re-derives it from authoritative device metadata
             // via `rebuild_preserve_index_from_device`. Boots empty; populated
             // before serving traffic.
             preserve_index: parking_lot::Mutex::new(PreserveBackend::new_in_memory()),
             conflicting_index: parking_lot::Mutex::new(crate::index::ConflictingIndex::new()),
-            dispatch_visibility_barrier: parking_lot::RwLock::new(()),
+            visibility,
             redo_logs: std::sync::OnceLock::new(),
+            redo_committers: std::sync::OnceLock::new(),
+            redo_buffered: std::sync::atomic::AtomicBool::new(false),
             redo_backpressure: std::sync::OnceLock::new(),
-            tombstone_log: std::sync::OnceLock::new(),
-            tombstone_index: std::sync::OnceLock::new(),
-            // Default ON (design §11.5). A delete still writes no tombstone
-            // until a log + index are attached, so this is inert until the
-            // server wires the storage in.
-            tombstones_enabled: std::sync::atomic::AtomicBool::new(true),
-            // Default OFF (design §11.5, Phase 8). The enabled path awaits CI
-            // soak; until set true by config the migration reconciliation is
-            // byte-identical to the pre-Phase-8 Fix-B/#29 behavior.
-            tombstone_reconciliation_enabled: std::sync::atomic::AtomicBool::new(false),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
             blob_store: None,
@@ -590,6 +539,14 @@ impl Engine {
     /// route each redo entry to the owning store's log via the private
     /// `redo_log_for_device` helper.
     pub fn set_redo_logs(&self, logs: Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>>) {
+        // Build a group-commit coordinator per log (wrapping the SAME Arc) before
+        // publishing, so `redo_committers` and `redo_logs` are always in lockstep:
+        // the write path coalesces via the coordinators, while checkpoint /
+        // secondary-index / recovery paths keep locking the shared logs directly.
+        let committers: Vec<Arc<crate::redo_group::GroupCommit>> = logs
+            .iter()
+            .map(|log| crate::redo_group::GroupCommit::new(log.clone()))
+            .collect();
         // Build ONE backpressure coordinator over every store's space mirror,
         // and inject it into each log so any store's reclaim wakes every gated
         // appender. The coordinator's free signal is the MIN across stores, so
@@ -608,7 +565,74 @@ impl Engine {
         }
         if self.redo_logs.set(logs).is_err() {
             tracing::warn!("engine per-store redo logs already attached; ignoring replacement");
+            return;
         }
+        let _ = self.redo_committers.set(committers);
+    }
+
+    /// Enable buffered (relaxed) redo durability on every per-store group-commit
+    /// coordinator AND on the engine itself: mutations are acked after the
+    /// in-memory redo append, and a background flusher (plus the checkpoint
+    /// barrier) makes them durable. Trades a bounded crash-loss window for
+    /// removing the fsync from the ack path. Call once at startup after
+    /// [`Self::set_redo_logs`].
+    ///
+    /// The engine-level flag ([`Self::redo_buffered`]) governs the
+    /// engine-internal redo paths that do NOT route through the committers — the
+    /// two-phase secondary-index journalling. Without it those paths fsync the
+    /// redo per key even in buffered mode (the per-key `setMined` fsync that
+    /// dominated the write workload). It is set unconditionally so single-store
+    /// / committer-less configurations honour the contract too; the committer
+    /// loop below additionally flips the primary write path's coordinators.
+    pub fn set_buffered_durability(&self, buffered: bool) {
+        self.redo_buffered
+            .store(buffered, std::sync::atomic::Ordering::Release);
+        if let Some(committers) = self.redo_committers.get() {
+            for c in committers {
+                c.set_buffered(buffered);
+            }
+        }
+    }
+
+    /// Whether buffered (relaxed) redo durability is active for the
+    /// engine-internal redo paths (two-phase secondary-index journalling).
+    /// `true` => append the secondary intent without an ack-path fsync and let
+    /// the background flusher / checkpoint coalesce it durable; `false` (strict)
+    /// => fsync the intent before the redb commit, per round.
+    pub(crate) fn redo_buffered(&self) -> bool {
+        self.redo_buffered
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Force every per-store redo log durable (fsync). Used by the background
+    /// flusher under buffered durability and by the checkpoint barrier before it
+    /// reclaims the redo prefix. Idempotent and cheap when nothing is dirty.
+    pub fn flush_all_redo(&self) -> std::result::Result<(), String> {
+        if let Some(committers) = self.redo_committers.get() {
+            for c in committers {
+                c.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Pwrite every per-store redo log's buffered entries to the device WITHOUT
+    /// issuing the durability fsync.
+    ///
+    /// Used by the background flusher ONLY under the relaxed `redo_buffered_io`
+    /// mode (redo device opened buffered). Durability comes from the kernel's
+    /// page-cache writeback plus the checkpoint barrier, which still calls
+    /// [`Self::flush_all_redo`] (a real fsync) BEFORE it fences and reclaims the
+    /// redo prefix — so reclamation safety is unchanged. Under strict durability
+    /// the background flusher uses [`Self::flush_all_redo`] instead, and this is
+    /// never called.
+    pub fn flush_all_redo_no_sync(&self) -> std::result::Result<(), String> {
+        if let Some(committers) = self.redo_committers.get() {
+            for c in committers {
+                c.flush_no_sync()?;
+            }
+        }
+        Ok(())
     }
 
     /// The shared redo backpressure coordinator across all per-store logs.
@@ -657,6 +681,38 @@ impl Engine {
         }
     }
 
+    /// The group-commit coordinator owning store `device_id`, used by the
+    /// dispatch write path so concurrent batches to the same store coalesce
+    /// their fsync. Mirrors [`Self::redo_log_for_device`] exactly (migration
+    /// suppression, out-of-range clamp to store 0) so routing is identical.
+    fn redo_committer_for_device(
+        &self,
+        device_id: u8,
+    ) -> Option<Arc<crate::redo_group::GroupCommit>> {
+        if migration_journal_suppressed() {
+            return None;
+        }
+        match self.redo_committers.get() {
+            Some(committers) if !committers.is_empty() => {
+                let idx = (device_id as usize).min(committers.len() - 1);
+                Some(committers[idx].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Test-only accessor for the per-store group-commit coordinator, so unit
+    /// tests can drive buffered redo appends through the same path the dispatch
+    /// write path uses. Panics if no committers are attached (a test bug).
+    #[cfg(test)]
+    pub(crate) fn redo_committer_for_test(
+        &self,
+        device_id: u8,
+    ) -> Arc<crate::redo_group::GroupCommit> {
+        self.redo_committer_for_device(device_id)
+            .expect("test: redo committers must be attached via set_redo_logs")
+    }
+
     /// The redo log owning the store that holds `key`, by primary-index
     /// lookup. Falls back to store 0's log when the key is not (yet) in the
     /// index — e.g. a secondary-intent for a key whose primary entry is being
@@ -695,6 +751,8 @@ impl Engine {
         use crate::redo::RedoOp;
         match op {
             RedoOp::Create { device_id, .. }
+            | RedoOp::CreateV2 { device_id, .. }
+            | RedoOp::Relocate { device_id, .. }
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
@@ -720,6 +778,8 @@ impl Engine {
         use crate::redo::RedoOp;
         match op {
             RedoOp::Create { device_id, .. }
+            | RedoOp::CreateV2 { device_id, .. }
+            | RedoOp::Relocate { device_id, .. }
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
@@ -801,6 +861,12 @@ impl Engine {
                     crate::redo::RedoOp::Create {
                         tx_key, device_id, ..
                     }
+                    | crate::redo::RedoOp::CreateV2 {
+                        tx_key, device_id, ..
+                    }
+                    | crate::redo::RedoOp::Relocate {
+                        tx_key, device_id, ..
+                    }
                     | crate::redo::RedoOp::ReplicaCreate {
                         tx_key, device_id, ..
                     } => {
@@ -827,60 +893,21 @@ impl Engine {
         // and an `AllocateRegion` always precedes its sibling `Create`). Returns
         // the (min, max) sequence this store contributed, or `None` if the store
         // has no log attached.
+        // Route this store's ops through its group-commit coordinator: concurrent
+        // batch RPCs to the same store stage their ops and one leader does a
+        // single append+flush covering them all, so the fsync is shared instead
+        // of serialized one-per-RPC on the log mutex. The coordinator preserves
+        // the exact semantics this closure had before: per-submission (first,last)
+        // range, fail-closed poison on a mid-batch append failure, and a flush
+        // error surfaced as Err. `None` means no log attached / migration
+        // suppression (identical to `redo_log_for_device` returning None).
         let append_flush = |store: usize,
                             store_ops: &[&crate::redo::RedoOp]|
          -> Result<Option<(u64, u64)>, String> {
-            let Some(log) = self.redo_log_for_device(store as u8) else {
+            let Some(committer) = self.redo_committer_for_device(store as u8) else {
                 return Ok(None);
             };
-            let mut guard = log.lock();
-            // Pre-flight the WHOLE batch's footprint against this store's
-            // forward headroom BEFORE appending any op. An oversized batch (one
-            // whose redo footprint exceeds the store's free space — e.g. a fat
-            // cold-data create burst, or the residual where the pre-barrier gate
-            // admitted on stale free space) must fail CLEANLY here: append
-            // nothing, draw no sequence, return LogFull. Otherwise the per-op
-            // append below would buffer the leading ops (with consumed global
-            // sequences) and then fail mid-batch, forcing poison() — which
-            // bricks the store's log until restart. The dispatch caller treats
-            // this Err as a redo-full and rolls its in-memory reservations back.
-            if !guard.would_fit(store_ops) {
-                tracing::error!(
-                    store,
-                    ops = store_ops.len(),
-                    "redo batch exceeds store forward headroom; rejecting without append"
-                );
-                return Err("redo log append failed".to_string());
-            }
-            let mut first = u64::MAX;
-            let mut last = 0u64;
-            let mut wrote = false;
-            for op in store_ops {
-                match guard.append((*op).clone()) {
-                    Ok(seq) => {
-                        first = first.min(seq);
-                        last = last.max(seq);
-                        wrote = true;
-                    }
-                    Err(e) => {
-                        // Defense in depth: with the would_fit pre-flight above,
-                        // a LogFull here is unreachable (capacity was verified
-                        // under this same lock). A real I/O/poison error still
-                        // lands here. A mid-batch failure leaves earlier ops
-                        // buffered with consumed global sequences that must
-                        // never flush, so poison the log (a poisoned flush() is
-                        // a no-op error) and fail closed.
-                        guard.poison();
-                        tracing::error!(err = %e, "redo log append failed; log poisoned");
-                        return Err("redo log append failed".to_string());
-                    }
-                }
-            }
-            guard.flush().map_err(|e| {
-                tracing::error!(err = %e, "redo log flush failed");
-                "redo log flush failed".to_string()
-            })?;
-            Ok(wrote.then_some((first, last)))
+            committer.commit(store_ops.iter().map(|o| (*o).clone()).collect())
         };
 
         let touched: Vec<usize> = (0..store_count)
@@ -1000,15 +1027,28 @@ impl Engine {
         &self,
         fence: u64,
     ) -> std::result::Result<(), crate::redo::RedoError> {
+        // Layout-dispatched per log (`checkpoint_reclaim`): a ring frees covered
+        // segments (pointer advance); a linear log compacts the prefix.
         match self.redo_logs.get() {
             Some(logs) if !logs.is_empty() => {
                 for log in logs {
-                    log.lock().compact_prefix_through(fence)?;
+                    log.lock().checkpoint_reclaim(fence)?;
                 }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Whether this node's redo logs use the segment-ring layout (lever 7). The
+    /// representative handle's layout is authoritative; all stores' logs share
+    /// the same format. Used by the checkpoint task to pick the non-blocking ring
+    /// path. Returns `false` when no per-store logs are attached.
+    pub fn redo_is_ring(&self) -> bool {
+        match self.redo_logs.get() {
+            Some(logs) => logs.first().is_some_and(|l| l.lock().is_segment_ring()),
+            None => false,
+        }
     }
 
     /// Write a recovery-progress fence marker to EVERY attached redo log so a
@@ -1022,10 +1062,13 @@ impl Engine {
         &self,
         through_sequence: u64,
     ) -> std::result::Result<(), crate::redo::RedoError> {
+        // Layout-dispatched per log (`checkpoint_fence`): a ring writes the
+        // header fence (no log append); a linear log appends a RecoveryProgress
+        // marker.
         match self.redo_logs.get() {
             Some(logs) if !logs.is_empty() => {
                 for log in logs {
-                    log.lock().mark_recovery_progress(through_sequence)?;
+                    log.lock().checkpoint_fence(through_sequence)?;
                 }
             }
             _ => {}
@@ -1250,80 +1293,6 @@ impl Engine {
         Ok(earliest)
     }
 
-    /// Attach the on-device deletion-tombstone log (deletion-tombstone
-    /// Phase 3).
-    ///
-    /// Once attached AND with [`Self::tombstones_enabled`] true, the
-    /// physical-delete path appends a tombstone to this log and rides the
-    /// delete's existing `device.sync()` for durability. Call this after
-    /// constructing the engine and before accepting traffic; ignored (with a
-    /// warning) if a log is already attached.
-    pub fn set_tombstone_log(
-        &self,
-        tombstone_log: Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>,
-    ) {
-        if self.tombstone_log.set(tombstone_log).is_err() {
-            tracing::warn!("engine tombstone log already attached; ignoring replacement");
-        }
-    }
-
-    /// Attach the redb-backed tombstone lookup index (deletion-tombstone
-    /// Phase 3). Derived from the log; rebuilt from it on recovery.
-    pub fn set_tombstone_index(
-        &self,
-        tombstone_index: Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
-    ) {
-        if self.tombstone_index.set(tombstone_index).is_err() {
-            tracing::warn!("engine tombstone index already attached; ignoring replacement");
-        }
-    }
-
-    /// The attached tombstone log handle, if any.
-    pub fn tombstone_log(&self) -> Option<Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>> {
-        self.tombstone_log.get().cloned()
-    }
-
-    /// The attached tombstone index handle, if any.
-    pub fn tombstone_index(
-        &self,
-    ) -> Option<Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>> {
-        self.tombstone_index.get().cloned()
-    }
-
-    /// Set the deletion-tombstone feature flag (design §11.5).
-    ///
-    /// `true` (the default) makes the delete path write a durable tombstone;
-    /// `false` reverts the delete path to its pre-tombstone behavior and
-    /// disables the R2 recovery self-purge. Set once from config at startup.
-    pub fn set_tombstones_enabled(&self, enabled: bool) {
-        self.tombstones_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether the deletion-tombstone feature is enabled.
-    pub fn tombstones_enabled(&self) -> bool {
-        self.tombstones_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Set the tombstone-driven migration-reconciliation flag (Phase 8,
-    /// design §7/§11.5). Default `false`. Set once from config at startup.
-    ///
-    /// `true` activates the §7 reconciliation in `OP_MIGRATION_COMPLETE`, the
-    /// tombstone completion-frame section, and the relaxed superset proof;
-    /// `false` keeps every one of those paths byte-identical to the
-    /// pre-Phase-8 Fix-B/#29 behavior.
-    pub fn set_tombstone_reconciliation_enabled(&self, enabled: bool) {
-        self.tombstone_reconciliation_enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether tombstone-driven migration reconciliation is enabled (Phase 8).
-    pub fn tombstone_reconciliation_enabled(&self) -> bool {
-        self.tombstone_reconciliation_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     // -----------------------------------------------------------------------
     // Node last-durable-height tracking (deletion-tombstone design §4,
     // height subsystem). ALWAYS-ON and purely additive.
@@ -1437,13 +1406,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether the delete path should write a tombstone on this call: the
-    /// feature is enabled AND both the log and index are attached. When any
-    /// is missing the delete behaves exactly as the pre-tombstone path.
-    fn tombstone_write_active(&self) -> bool {
-        self.tombstones_enabled() && self.tombstone_log.get().is_some()
-    }
-
     /// Acquire the SHARED (read-side) dispatch visibility barrier — used
     /// by client READ ops so they run concurrently with each other while
     /// remaining mutually exclusive with mutations, replica-batch applies,
@@ -1456,7 +1418,14 @@ impl Engine {
     /// compensation, and reads are blocked for the full window. Among
     /// themselves, reads are concurrent.
     pub(crate) fn acquire_dispatch_visibility_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
-        self.dispatch_visibility_barrier.read()
+        self.visibility.global_read()
+    }
+
+    /// The per-key visibility barrier, for handlers that take fine-grained
+    /// per-key read/mutation guards (hot paths) instead of the coarse global
+    /// side returned by the `acquire_*_visibility_guard` accessors.
+    pub(crate) fn visibility(&self) -> &std::sync::Arc<crate::visibility::VisibilityBarrier> {
+        &self.visibility
     }
 
     /// Acquire the EXCLUSIVE (write-side) dispatch visibility barrier —
@@ -1467,7 +1436,7 @@ impl Engine {
     pub(crate) fn acquire_mutation_visibility_guard(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, ()> {
-        self.dispatch_visibility_barrier.write()
+        self.visibility.global_write()
     }
 
     /// Backwards-compatible alias of [`Self::acquire_mutation_visibility_guard`]
@@ -1478,7 +1447,7 @@ impl Engine {
     pub(crate) fn acquire_checkpoint_visibility_guard(
         &self,
     ) -> parking_lot::RwLockWriteGuard<'_, ()> {
-        self.dispatch_visibility_barrier.write()
+        self.visibility.global_write()
     }
 
     /// Update the DAH secondary index with two-phase durability.
@@ -1500,16 +1469,20 @@ impl Engine {
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
         let log_ref = log_arc.as_deref();
-        let mut dah = self.dah_index.lock();
+        // The sharded wrapper locks ONLY the shard owning `key` for each call;
+        // remove + insert route to the same shard (same key), so this is the
+        // same single-shard critical section the global mutex used to be.
         let _writer_gauge = crate::metrics::writer_enter();
         if old_height != 0 {
-            dah.remove(key, log_ref)
+            self.dah_index
+                .remove(key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("dah secondary remove: {e}"),
                 })?;
         }
         if new_height != 0 {
-            dah.insert(new_height, *key, log_ref)
+            self.dah_index
+                .insert(new_height, *key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("dah secondary insert: {e}"),
                 })?;
@@ -1531,23 +1504,81 @@ impl Engine {
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
         let log_ref = log_arc.as_deref();
-        let mut unmined = self.unmined_index.lock();
+        // The sharded wrapper locks ONLY the shard owning `key`; remove + insert
+        // route to the same shard, so this is the same single-shard critical
+        // section the global mutex used to be.
         let _writer_gauge = crate::metrics::writer_enter();
         if old_height != 0 {
-            unmined
+            self.unmined_index
                 .remove(key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("unmined secondary remove: {e}"),
                 })?;
         }
         if new_height != 0 {
-            unmined
+            self.unmined_index
                 .insert(new_height, *key, log_ref)
                 .map_err(|e| SpendError::StorageError {
                     detail: format!("unmined secondary insert: {e}"),
                 })?;
         }
         Ok(())
+    }
+
+    /// Journal a batch of secondary-index intents (`SecondaryDahUpdate` /
+    /// `SecondaryUnminedUpdate`) to the store's redo log, honouring the active
+    /// durability mode. The intents are appended atomically (all-or-nothing).
+    ///
+    /// - **Strict** (`redo_buffered == false`): append + fsync in one call
+    ///   ([`RedoLog::append_batch_and_flush`]) so the intent is durable BEFORE
+    ///   the redb secondary mutation that follows.
+    /// - **Buffered** (`redo_buffered == true`): append WITHOUT fsync
+    ///   ([`RedoLog::append_atomic`]); the background flusher / checkpoint make
+    ///   it durable, coalescing many keys into one fsync. This is what stops the
+    ///   per-key `setMined` fsync from dominating the write workload.
+    ///
+    /// Correctness under buffered mode: these intents are NOT the durable source
+    /// of truth — recovery rebuilds the secondary indexes from the authoritative
+    /// primary on-device metadata (`reconcile_secondary_indexes_*`), using the
+    /// intents only to mark which keys to reconcile. The primary metadata write
+    /// is itself buffered (write-back cache) and becomes durable on the same
+    /// flush boundary, so a crash loses the primary write, the secondary intent,
+    /// and the redb mutation together — a consistent prefix. A `LogFull` is
+    /// transient backpressure and must NOT poison (lever-6 semantics); a genuine
+    /// fault poisons the log (fail-closed). Empty `ops` is a no-op.
+    fn journal_secondary_ops(
+        &self,
+        log: &Arc<parking_lot::Mutex<crate::redo::RedoLog>>,
+        ops: &[crate::redo::RedoOp],
+    ) -> Result<(), SpendError> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut guard = log.lock();
+        let result = if self.redo_buffered() {
+            // Append-only; durability deferred to the background flusher.
+            guard.append_atomic(ops).map(|_| ())
+        } else {
+            // Strict: fsync the intent before returning.
+            guard.append_batch_and_flush(ops).map(|_| ())
+        };
+        result.map_err(|e| match e {
+            // Transient full log: do NOT poison — the checkpoint reclaims space
+            // and the caller's op fails cleanly (its primary write is rolled
+            // back in memory). Poisoning would wedge the node on a momentary
+            // full log.
+            crate::redo::RedoError::LogFull { .. } => SpendError::StorageError {
+                detail: format!("secondary intent journal: {e}"),
+            },
+            // A genuine fault (already-poisoned log, or a strict-mode flush I/O
+            // error which already poisoned inside `flush`): fail closed.
+            other => {
+                guard.poison();
+                SpendError::StorageError {
+                    detail: format!("secondary intent journal: {other}"),
+                }
+            }
+        })
     }
 
     /// Update the preserve secondary index for a `preserve_until` transition.
@@ -1588,12 +1619,13 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply a combined DAH + unmined update with a single redo fsync.
+    /// Apply a combined DAH + unmined update with a single redo fsync (strict)
+    /// or a single coalesced append (buffered).
     ///
     /// When both secondary indexes change in the same operation (e.g.
     /// `mark_on_longest_chain`), this batches both intent records into one
-    /// `RedoLog::append_batch_and_flush` so there is exactly one fsync for
-    /// the pair. Both redb commits then follow.
+    /// [`Self::journal_secondary_ops`] call so there is exactly one redo
+    /// append/fsync for the pair. Both redb commits then follow.
     fn update_both_secondary_indexes(
         &self,
         key: &TxKey,
@@ -1612,7 +1644,8 @@ impl Engine {
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
 
-        // Phase 1: one fsync covering both secondary intents (if both change).
+        // Phase 1: journal both secondary intents (one fsync in strict mode, a
+        // coalesced append in buffered mode) before the redb mutations.
         if let Some(ref log) = log_arc {
             let mut ops = Vec::with_capacity(2);
             if dah_changed {
@@ -1629,42 +1662,40 @@ impl Engine {
                     new_height: new_unmined,
                 });
             }
-            let mut guard = log.lock();
-            guard
-                .append_batch_and_flush(&ops)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("secondary batch append_and_flush: {e}"),
-                })?;
+            self.journal_secondary_ops(log, &ops)?;
         }
 
         // Phase 2: commit both redb transactions. The redo log already has the
-        // durable record; recovery replay handles any redb commit failure.
+        // durable record; recovery replay handles any redb commit failure. Each
+        // sharded call locks only `key`'s shard (dah and unmined are separate
+        // wrappers); the two were never held at once here, so routing each by
+        // key preserves the prior critical-section structure.
         if dah_changed {
-            let mut dah = self.dah_index.lock();
             if old_dah != 0 {
-                dah.remove(key, None)
+                self.dah_index
+                    .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("dah secondary remove (post-fsync): {e}"),
                     })?;
             }
             if new_dah != 0 {
-                dah.insert(new_dah, *key, None)
-                    .map_err(|e| SpendError::StorageError {
+                self.dah_index.insert(new_dah, *key, None).map_err(|e| {
+                    SpendError::StorageError {
                         detail: format!("dah secondary insert (post-fsync): {e}"),
-                    })?;
+                    }
+                })?;
             }
         }
         if unmined_changed {
-            let mut unmined = self.unmined_index.lock();
             if old_unmined != 0 {
-                unmined
+                self.unmined_index
                     .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("unmined secondary remove (post-fsync): {e}"),
                     })?;
             }
             if new_unmined != 0 {
-                unmined
+                self.unmined_index
                     .insert(new_unmined, *key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("unmined secondary insert (post-fsync): {e}"),
@@ -1719,11 +1750,12 @@ impl Engine {
         let dah_changed = old_dah != new_dah;
         let unmined_changed = old_unmined != new_unmined;
 
-        // Phase 1: one fsync covering both secondary intents (if any change).
+        // Phase 1: journal both secondary intents (one fsync in strict mode, a
+        // coalesced append in buffered mode) before the primary+redb mutations.
         // Per-store redo: route the secondary-index intent to the log owning
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
-        if (dah_changed || unmined_changed) && log_arc.is_some() {
+        if let Some(ref log) = log_arc {
             let mut ops = Vec::with_capacity(2);
             if dah_changed {
                 ops.push(crate::redo::RedoOp::SecondaryDahUpdate {
@@ -1739,14 +1771,7 @@ impl Engine {
                     new_height: new_unmined,
                 });
             }
-            if let Some(ref log) = log_arc {
-                let mut guard = log.lock();
-                guard
-                    .append_batch_and_flush(&ops)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("atomic primary+secondary batch append_and_flush: {e}"),
-                    })?;
-            }
+            self.journal_secondary_ops(log, &ops)?;
         }
 
         // Phase 2: lock order = primary.write → dah → unmined (matches
@@ -1772,6 +1797,17 @@ impl Engine {
         // where a secondary reader cross-checking the primary must wait for
         // this write to drop. At one shard this is the whole index, exactly as
         // before; at N shards it is the shard owning `key`.
+        //
+        // H1 under sharded secondaries: each `dah_index`/`unmined_index` call
+        // below locks only the secondary shard owning `key` (dah and unmined
+        // route the same key to the same shard number, but they are independent
+        // wrappers → independent lock sets). Those shard locks are taken WHILE
+        // `primary_guard` is held, so the lock order stays primary.write → dah →
+        // unmined — never unmined-before-dah, never two secondary shards of one
+        // index at once. The H1 cross-check window is preserved because a
+        // secondary reader cross-checks the PRIMARY (gated by
+        // `read_shard(key)`), which still blocks on `primary_guard` until every
+        // secondary mutation here has landed.
         let mut primary_guard = self.index.write_shard(key);
         primary_guard
             .update_cached_fields(
@@ -1787,34 +1823,33 @@ impl Engine {
                 detail: format!("index update_cached_fields failed: {e}"),
             })?;
 
-        let mut dah = self.dah_index.lock();
-        let mut unmined = self.unmined_index.lock();
-
         if dah_changed {
             if old_dah != 0 {
-                dah.remove(key, None)
+                self.dah_index
+                    .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic dah remove: {e}"),
                     })?;
             }
             if new_dah != 0 {
-                dah.insert(new_dah, *key, None)
-                    .map_err(|e| SpendError::StorageError {
+                self.dah_index.insert(new_dah, *key, None).map_err(|e| {
+                    SpendError::StorageError {
                         detail: format!("atomic dah insert: {e}"),
-                    })?;
+                    }
+                })?;
             }
         }
 
         if unmined_changed {
             if old_unmined != 0 {
-                unmined
+                self.unmined_index
                     .remove(key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic unmined remove: {e}"),
                     })?;
             }
             if new_unmined != 0 {
-                unmined
+                self.unmined_index
                     .insert(new_unmined, *key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("atomic unmined insert: {e}"),
@@ -1822,8 +1857,6 @@ impl Engine {
             }
         }
 
-        drop(unmined);
-        drop(dah);
         drop(primary_guard);
 
         Ok(())
@@ -1957,7 +1990,7 @@ impl Engine {
     ///
     /// Used by the dispatch layer to free pre-allocated space when a redo
     /// flush fails after [`Self::pre_allocate_create`] succeeded.
-    pub fn allocator(&self) -> &parking_lot::Mutex<SlotAllocator> {
+    pub fn allocator(&self) -> &parking_lot::Mutex<BoxedAllocator> {
         &self.stores[0].allocator
     }
 
@@ -1974,6 +2007,26 @@ impl Engine {
     #[inline]
     pub fn device_for(&self, device_id: u8) -> &Arc<dyn BlockDevice> {
         &self.stores[device_id as usize].device
+    }
+
+    /// Whether store `device_id` uses the packed record layout (sub-block,
+    /// `RECORD_ALIGN`-granular). Read from a value cached at construction (no
+    /// allocator lock); packed-ness is fixed for a store's lifetime.
+    #[inline]
+    pub(crate) fn store_is_packed(&self, device_id: u8) -> bool {
+        self.stores[device_id as usize].packed
+    }
+
+    /// Whether store `device_id` uses the LOG-STRUCTURED (segment) engine, in
+    /// which a spend RELOCATES the record to a new append-cursor offset instead
+    /// of an in-place RMW. Cached at construction (no allocator lock). See
+    /// [`crate::allocator::RecordAllocator::is_log_structured`].
+    ///
+    /// The spend hot path branches on this (relocate vs in-place RMW) in
+    /// [`PreparedSpend::apply_locked`] and the dispatch redo-emission gate.
+    #[inline]
+    pub(crate) fn store_is_log_structured(&self, device_id: u8) -> bool {
+        self.stores[device_id as usize].log_structured
     }
 
     /// Fsync the data device of EVERY store.
@@ -2063,17 +2116,30 @@ impl Engine {
 
     /// The allocator for store `device_id`.
     #[inline]
-    pub fn allocator_for(&self, device_id: u8) -> &parking_lot::Mutex<SlotAllocator> {
+    pub fn allocator_for(&self, device_id: u8) -> &parking_lot::Mutex<BoxedAllocator> {
         &self.stores[device_id as usize].allocator
     }
 
-    /// Choose the store for a NEW record (round-robin across all stores) and
-    /// return the `device_id` to stamp into its index entry. Placement is a
-    /// free local choice recorded in the index; reads route by the stored
-    /// `device_id`, never by a function of the key.
+    /// Choose the store for a NEW record and return the `device_id` to stamp
+    /// into its index entry. With the default round-robin strategy the `txid`
+    /// is ignored; with the txid strategy the store is a deterministic function
+    /// of the txid's last 8 bytes (see [`crate::subdevice::StorePlacer::place`]).
+    ///
+    /// Placement is a free local choice recorded in the index; reads route by
+    /// the stored `device_id`, never by re-deriving placement — so switching
+    /// strategies on an existing store is safe for already-written records.
     #[inline]
-    pub fn place_new_record(&self) -> u8 {
-        self.placer.pick() as u8
+    pub fn place_new_record(&self, txid: &[u8; 32]) -> u8 {
+        self.placer.place(txid) as u8
+    }
+
+    /// Replace the placement strategy, preserving the store count. Called once
+    /// at boot to honor the configured `[storage] placement` key. The strategy
+    /// only affects where NEW records land; existing records keep their recorded
+    /// `device_id`, so this is safe to flip on an already-populated store.
+    pub fn set_placement_strategy(&mut self, strategy: crate::subdevice::PlacementStrategy) {
+        let num_stores = self.placer.num_stores();
+        self.placer = crate::subdevice::StorePlacer::new(strategy, num_stores);
     }
 
     /// Get a reference to the blobstore, if configured.
@@ -2246,21 +2312,28 @@ impl Engine {
         // different shards overlap, so the high-water mark reflects real
         // sharded-create parallelism. Guard drops with the function scope.
         let _writer_gauge = crate::metrics::writer_enter();
-        // Reject-not-overwrite: the only safe insert-if-absent is a
-        // check under the same write lock that performs the insert.
-        if guard.lookup_checked(&key)?.is_some() {
+        // Reject-not-overwrite, in a SINGLE Robin Hood probe: the fused
+        // `register_without_resize_if_absent` walks the probe chain once,
+        // detecting an existing key inline and bailing without overwriting,
+        // or placing the new entry. This replaces the previous separate
+        // `lookup_checked` probe followed by a re-probing `insert` — the
+        // create hot path now does one index probe instead of two. The check
+        // and the insert still run under the same shard write guard, so
+        // check-then-insert cannot interleave with another writer on this
+        // shard (the atomicity the old separate-probe version relied on).
+        let len_before = guard.len();
+        let inserted = guard.register_without_resize_if_absent(key, entry)?;
+        if !inserted {
             return Ok(false);
         }
-        let len_before = guard.len();
-        guard.register_without_resize(key, entry)?;
         debug_assert!(
-            guard.len() > len_before,
-            "register_new_with_shard_count: insert did not grow the index \
-             despite the key being absent under the same write lock"
+            guard.len() == len_before + 1,
+            "register_new_with_shard_count: insert-if-absent reported inserted \
+             but the index did not grow by exactly one under the write lock"
         );
         // Counts are seeded eagerly at construction so this `fetch_add` runs
-        // unconditionally under the still-held write guard for the newly
-        // inserted key, preserving insert-then-count atomicity (fix #1).
+        // (only on an actual insert) under the still-held write guard for the
+        // newly inserted key, preserving insert-then-count atomicity (fix #1).
         self.shard_counts[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
         // Resize UNDER the held guard (no drop-then-reacquire).
         guard.resize_if_needed()?;
@@ -2391,7 +2464,40 @@ impl Engine {
         key: &TxKey,
         record_offset: u64,
     ) -> std::result::Result<TxMetadata, SpendError> {
-        let meta = self.read_metadata_fast(device_id, record_offset)?;
+        let meta = match self.read_metadata_fast(device_id, record_offset) {
+            Ok(m) => m,
+            Err(e) => {
+                // A CRC/torn/zeroed read at a lock-free-captured offset usually
+                // means the record was concurrently DELETED underneath us: the
+                // delete zeroes the header (tombstone) AFTER unregistering the
+                // index (see `delete_inner`), so a reader that grabbed the offset
+                // before the unregister can read the just-zeroed header. That is a
+                // benign race, not corruption — and the answer the caller should
+                // get is exactly what it would get post-delete: TxNotFound.
+                //
+                // Distinguish race from GENUINE corruption by re-resolving the
+                // key: if it no longer maps to THIS (device, offset) — moved by a
+                // relocate, or gone by a delete — report TxNotFound; only a
+                // still-current mapping is real corruption worth surfacing. The
+                // unregister-before-tombstone ordering guarantees the re-lookup
+                // observes the removal whenever the tombstone was observable.
+                match self.index.lookup_checked(key) {
+                    Ok(Some(cur))
+                        if cur.record_offset == record_offset && cur.device_id == device_id =>
+                    {
+                        return Err(e); // still mapped here → genuine corruption
+                    }
+                    Ok(_) => return Err(SpendError::TxNotFound), // moved or gone → race
+                    Err(ie) => {
+                        return Err(SpendError::StorageError {
+                            detail: format!(
+                                "metadata read failed then index re-lookup failed: {ie}"
+                            ),
+                        });
+                    }
+                }
+            }
+        };
         if meta.tx_id != key.txid {
             return Err(SpendError::TxNotFound);
         }
@@ -2478,26 +2584,20 @@ impl Engine {
             }
             Ok(())
         } else {
-            let device = self.device_for(device_id);
-            let align = device.alignment();
-            let aligned_base = record_offset / align as u64 * align as u64;
-            let intra_offset = (record_offset - aligned_base) as usize;
-            let total_size = io::align_up(intra_offset + METADATA_SIZE, align);
-
-            let mut buf = AlignedBuf::new(total_size, align);
-            if intra_offset != 0 || !METADATA_SIZE.is_multiple_of(align) {
-                device.pread_exact_at(&mut buf, aligned_base).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("{e}"),
-                    }
-                })?;
-            }
-            buf[intra_offset..intra_offset + METADATA_SIZE].copy_from_slice(&header);
-            device
-                .pwrite_all_at(&buf, aligned_base)
-                .map_err(|e| SpendError::StorageError {
+            // F-X-007 (BC-02): route through `write_record_bytes`, which holds
+            // the per-block write guard (`lock_span_blocks`) across its RMW. The
+            // previous bare pread+patch+pwrite here held NO lock, so for a PACKED
+            // record it read the covering block, overlaid this record's tombstone
+            // header, and wrote the WHOLE block back — clobbering a block-neighbour
+            // packed record that a concurrent (differently-keyed) writer had just
+            // written, leaving the neighbour all-zero. That surfaced as
+            // `CRC mismatch: expected 0x00000000` on a later setMined/delete read
+            // of the clobbered neighbour (segment engine, packed, under load).
+            io::write_record_bytes(&**self.device_for(device_id), record_offset, &header).map_err(
+                |e| SpendError::StorageError {
                     detail: format!("{e}"),
-                })
+                },
+            )
         }
     }
 
@@ -2665,24 +2765,6 @@ impl Engine {
     /// and filters inline, avoiding a full clone + filter pass.
     pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
         self.index.keys_for_shard(shard)
-    }
-
-    /// All tombstoned keys for `shard`, as `(TxKey, deletion-generation)` pairs.
-    ///
-    /// The source (master) side of tombstone-driven migration reconciliation
-    /// (deletion-tombstone Phase 8, design §7): the master builds the completion
-    /// frame's tombstone section from this — mirroring [`Self::keys_for_shard`]
-    /// for live keys. Returns an empty vec when no tombstone index is attached
-    /// (feature inert), so a caller observes the pre-tombstone empty set.
-    ///
-    /// The generation in each pair is the record's generation at deletion time,
-    /// which the §7 row-2/row-4 split compares against the rejoinee's local
-    /// generation (the create-after-delete defense, §8.4).
-    pub fn tombstones_for_shard(&self, shard: u16) -> Vec<(TxKey, u32)> {
-        match self.tombstone_index.get() {
-            Some(idx) => idx.lock().tombstones_for_shard(shard),
-            None => Vec::new(),
-        }
     }
 
     /// Group all keys by shard in a single index scan.
@@ -2919,7 +3001,7 @@ impl Engine {
                     let spendable_height = u32::from_le_bytes(buf);
                     // Spendable AT stop: half-open interval `[0, spendable_height)`.
                     // At `current_block_height == spendable_height` the UTXO is
-                    // unfrozen — matches Teranode PR #949 / svnode / Aerospike
+                    // unfrozen — matches Teranode PR #949 / svnode / the reference UDF
                     // post-fix. Pre-fix this used `>=` which false-rejected at
                     // the exact unlock height — i.e. accepting txs the network
                     // would reject.
@@ -3131,7 +3213,7 @@ impl Engine {
                     // no write means nothing to recover.
                     //
                     // F-X-022 — `addDeletedChildren` parity with
-                    // Aerospike. Before returning the no-op, consult
+                    // the reference UDF. Before returning the no-op, consult
                     // the parent record's `deleted_children` list. If
                     // the requesting child txid is present, the
                     // chain history has been altered ("resurrected-
@@ -3434,7 +3516,15 @@ impl Engine {
     ///
     /// Used by both [`set_mined`] (single request) and [`set_mined_batch`]
     /// (batch with shared params). Acquires the per-transaction stripe lock.
-    fn set_mined_inner(
+    /// Apply a single `set_mined` under this record's own stripe lock.
+    ///
+    /// Shared by [`Self::set_mined_batch`] and the dispatch handler's parallel
+    /// apply fan-out. Self-locking (takes the per-key stripe lock on entry) and
+    /// touching only Mutex-guarded secondary indexes and the per-offset
+    /// device locks, so independent keys are safe to apply concurrently. Writes
+    /// no redo — the caller has already made the batch's `SetMined` intents
+    /// durable (WAL-first), so a parallel apply does not affect crash recovery.
+    pub(crate) fn set_mined_inner(
         &self,
         tx_key: &TxKey,
         req: &SetMinedSharedParams,
@@ -3991,10 +4081,11 @@ impl Engine {
         let base_size = TxMetadata::record_size_for(utxo_count);
         let total_size = base_size + cold_size as u64;
 
-        // Place this new record on a store (round-robin) and allocate there.
-        // The chosen store is recorded in the index entry's device_id below, so
+        // Place this new record on a store (round-robin by default, or
+        // deterministic txid→store when configured) and allocate there. The
+        // chosen store is recorded in the index entry's device_id below, so
         // every later access routes to it via device_for(entry.device_id).
-        let device_id = self.place_new_record();
+        let device_id = self.place_new_record(&key.txid);
         let record_offset = self
             .allocator_for(device_id)
             .lock()
@@ -4627,9 +4718,22 @@ impl Engine {
     ) -> Result<(), CreateError> {
         let align = self.device_for(device_id).alignment();
         let data_len = METADATA_SIZE + slots.len() * UTXO_SLOT_SIZE + cold_data.len();
-        let aligned_len = data_len.div_ceil(align) * align;
+        // Gate #2 (packed): a packed single-create must land the EXACT record
+        // image (padded only to `RECORD_ALIGN`, the allocator's reservation
+        // granularity) so the RMW in `write_record_bytes` patches only its own
+        // bytes and never over-writes a block-neighbour packed record. The
+        // non-packed path is byte-identical to before: pad to the full device
+        // block so `write_record_bytes` takes the single aligned write with no
+        // extra `pread`. (The bulk coalesced create path already sizes its
+        // buffer by the reservation, so it was already correct.)
+        let image_len = if self.store_is_packed(device_id) {
+            data_len.div_ceil(crate::allocator::RECORD_ALIGN as usize)
+                * crate::allocator::RECORD_ALIGN as usize
+        } else {
+            data_len.div_ceil(align) * align
+        };
 
-        let mut buf = crate::device::AlignedBuf::new(aligned_len, align);
+        let mut buf = crate::device::AlignedBuf::new(image_len, align);
 
         // Write metadata
         let mut meta_bytes = [0u8; METADATA_SIZE];
@@ -4662,6 +4766,203 @@ impl Engine {
         )?;
 
         Ok(())
+    }
+
+    /// Relocate `tx_key`'s record to a freshly-appended segment offset, baking in
+    /// `metadata` + `slot_mutations`, re-pointing the index, journaling a
+    /// [`RedoOp::Relocate`], and dead-marking the old extent. Returns the new
+    /// device offset. The LOG-STRUCTURED (segment) engine's spend primitive — it
+    /// converts an in-place RMW (scattered write at the record's home offset) into
+    /// a sequential append at the allocator cursor.
+    ///
+    /// # Preconditions
+    /// - The caller MUST hold `tx_key`'s stripe lock (this performs read-old →
+    ///   write-new → repoint → free as one logical mutation; the lock excludes any
+    ///   other writer of this record).
+    /// - The store MUST be log-structured ([`Self::store_is_log_structured`]) so
+    ///   `free` dead-marks rather than returning the extent to a reuse freelist,
+    ///   and append-only never overwrites the old extent before defrag.
+    /// - Crash safety relies on BUFFERED durability: the new image, the `Relocate`
+    ///   redo, and the dead-mark all become durable together at the checkpoint
+    ///   barrier (which fsyncs the data device before reclaiming any redo prefix).
+    ///   A crash before that barrier loses all three together and leaves the
+    ///   pre-relocation record intact at the old offset — the buffered-tail-loss
+    ///   contract `replay_relocate` enforces. Do NOT use under strict durability:
+    ///   journaling happens AFTER the data write, not WAL-first.
+    ///
+    /// # Ordering (consensus-critical)
+    /// allocate → write new image → journal `Relocate` → repoint index → free old.
+    /// A lock-free reader that grabbed the old offset before the repoint still
+    /// reads valid bytes: the old extent stays intact (append-only never reuses a
+    /// freed offset until defrag), and the index swap is atomic. The repoint
+    /// precedes the free so no reader can reach the old offset via the index once
+    /// it is dead-marked.
+    ///
+    /// The new index entry is rebuilt from `metadata` IDENTICALLY to
+    /// [`crate::recovery::replay_relocate`] (offset + all cached fields), so the
+    /// live index after this call is byte-equal to the index recovery would
+    /// reconstruct from the relocated record — there is no live-vs-recovered
+    /// divergence to reconcile, and the caller does NOT additionally
+    /// `sync_index_cache` for the relocated key.
+    ///
+    /// # Errors
+    /// [`SpendError::TxNotFound`] if the key is absent; [`SpendError::StorageError`]
+    /// on a slot-mutation offset out of range, device-full, or any device/index
+    /// I/O failure.
+    fn relocate_record(
+        &self,
+        device_id: u8,
+        tx_key: &TxKey,
+        metadata: &TxMetadata,
+        slot_mutations: &[(u32, UtxoSlot)],
+    ) -> Result<u64, SpendError> {
+        let old_entry = self
+            .index
+            .lookup_checked(tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        let old_offset = old_entry.record_offset;
+        let record_size = { metadata.record_size } as u64;
+        let utxo_count = { metadata.utxo_count };
+
+        // Reservation size for the relocated image — IDENTICAL rule to
+        // `write_full_record_with_cold` / the allocator's `align_reservation`, so
+        // the bytes we read, the bytes we write, and the extent we free all agree.
+        let align = self.device_for(device_id).alignment();
+        let reservation = if self.store_is_packed(device_id) {
+            (record_size as usize).div_ceil(crate::allocator::RECORD_ALIGN as usize)
+                * crate::allocator::RECORD_ALIGN as usize
+        } else {
+            (record_size as usize).div_ceil(align) * align
+        };
+
+        // Slot-mutation offsets must land within the record's own reservation —
+        // surface an out-of-range vout as a typed error instead of a slice panic.
+        let slot_region_end = METADATA_SIZE + utxo_count as usize * UTXO_SLOT_SIZE;
+        if slot_region_end > reservation {
+            return Err(SpendError::StorageError {
+                detail: format!(
+                    "relocate: slot region {slot_region_end} exceeds reservation {reservation}",
+                ),
+            });
+        }
+        for &(vout, _) in slot_mutations {
+            if vout >= utxo_count {
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "relocate: slot mutation vout {vout} >= utxo_count {utxo_count}",
+                    ),
+                });
+            }
+        }
+
+        // 1. Read the FULL current record image (metadata + every slot + inline
+        // cold data) so cold bytes are carried VERBATIM through the move — the
+        // segment spend changes only the metadata footer + the spent slots, never
+        // the cold tail. Honor the (possibly packed, mid-block) base offset.
+        let aligned_base = old_offset / align as u64 * align as u64;
+        let intra = (old_offset - aligned_base) as usize;
+        let read_len = io::align_up(intra + reservation, align);
+        let mut read_buf = AlignedBuf::new(read_len, align);
+        self.device_for(device_id)
+            .pread_exact_at(&mut read_buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("relocate: read old image: {e}"),
+            })?;
+        // The write buffer must be device-aligned (O_DIRECT), so copy the record
+        // span into a fresh `AlignedBuf` rather than re-slicing the (arbitrarily
+        // aligned) heap read into a `Vec`.
+        let mut image = AlignedBuf::new(reservation, align);
+        image[..reservation].copy_from_slice(&read_buf[intra..intra + reservation]);
+
+        // 2. Overlay the baked-in mutation: the new metadata header...
+        let mut meta_bytes = [0u8; METADATA_SIZE];
+        metadata.to_bytes(&mut meta_bytes);
+        image[..METADATA_SIZE].copy_from_slice(&meta_bytes);
+        // ...and each mutated slot (CRC re-stamped by `to_bytes`).
+        for &(vout, ref slot) in slot_mutations {
+            let off = METADATA_SIZE + vout as usize * UTXO_SLOT_SIZE;
+            let mut slot_bytes = [0u8; UTXO_SLOT_SIZE];
+            slot.to_bytes(&mut slot_bytes);
+            image[off..off + UTXO_SLOT_SIZE].copy_from_slice(&slot_bytes);
+        }
+
+        // 3. Allocate the new (sequential, append-cursor) offset.
+        let new_offset = {
+            let mut alloc = self.allocator_for(device_id).lock();
+            alloc
+                .allocate(record_size)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("relocate: allocate new offset: {e}"),
+                })?
+        };
+
+        // 4. Write the relocated image at the new offset (RMW-safe for packed
+        // sub-block records, holding every covered block's write guard).
+        io::write_record_bytes(&**self.device_for(device_id), new_offset, &image).map_err(|e| {
+            // Roll the speculative allocation back so a write failure does not leak
+            // the cursor advance.
+            let mut alloc = self.allocator_for(device_id).lock();
+            let _ = alloc.free(new_offset, record_size);
+            SpendError::StorageError {
+                detail: format!("relocate: write new image: {e}"),
+            }
+        })?;
+
+        // 5. Journal the relocation intent (BUFFERED — see preconditions). No
+        // embedded bytes: recovery reads the record back from `new_offset`.
+        if let Some(log) = self.redo_log_for_device(device_id) {
+            log.lock()
+                .append(crate::redo::RedoOp::Relocate {
+                    tx_key: *tx_key,
+                    device_id,
+                    record_offset: new_offset,
+                    utxo_count,
+                })
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("relocate: journal Relocate: {e}"),
+                })?;
+        }
+
+        // 6. Re-point the index to the new offset, rebuilding ALL cached fields
+        // from `metadata` so the live entry equals what `replay_relocate` would
+        // reconstruct. `ShardedIndex::register` OVERWRITES the existing key on its
+        // owning shard WITHOUT touching `shard_record_count` (txid is unchanged →
+        // same shard, same count), so this is a pure offset+fields re-point, not a
+        // new insertion.
+        let new_entry = TxIndexEntry {
+            device_id,
+            record_offset: new_offset,
+            utxo_count,
+            block_entry_count: { metadata.block_entry_count },
+            tx_flags: { metadata.flags }.bits(),
+            spent_utxos: { metadata.spent_utxos },
+            dah_or_preserve: { metadata.delete_at_height },
+            unmined_since: { metadata.unmined_since },
+            generation: { metadata.generation },
+        };
+        self.index
+            .register(*tx_key, new_entry)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("relocate: index re-point: {e}"),
+            })?;
+
+        // 7. Dead-mark the old extent. Under the segment allocator this only
+        // updates live/dead accounting (recomputed from the index on recovery);
+        // the bytes stay readable until defrag, so no concurrent reader holding
+        // the old offset can observe a torn or reused record.
+        {
+            let mut alloc = self.allocator_for(device_id).lock();
+            alloc
+                .free(old_offset, record_size)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("relocate: free old extent: {e}"),
+                })?;
+        }
+
+        Ok(new_offset)
     }
 
     /// Read cold data from a record.
@@ -4917,7 +5218,7 @@ impl Engine {
         // on-record DAH so the now-prunable-by-other-means record stops
         // being re-scanned on every sweep.
         self.update_dah_index(parent_key, old_dah, new_dah)?;
-        // F-X-022: Aerospike `addDeletedChildren` parity. The prune above
+        // F-X-022: the reference UDF `addDeletedChildren` parity. The prune above
         // is the PRIMARY defense (UTXO_PRUNED is the on-disk slot status
         // every spend path checks first). The append below is the
         // SECONDARY audit/diagnostic trail + defense-in-depth at the
@@ -5641,22 +5942,11 @@ impl Engine {
                 detail: "device full for conflicting children".into(),
             })?;
 
-        let align = self.device_for(device_id).alignment();
-        let aligned_base = new_offset / align as u64 * align as u64;
-        let intra = (new_offset - aligned_base) as usize;
-        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
-        let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
-        for (i, child) in children.iter().enumerate() {
-            wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
-        }
-        if let Err(err) = self
-            .device_for(device_id)
-            .pwrite_all_at(&wbuf, aligned_base)
-        {
-            // pwrite failed — roll back the freshly-allocated extent so
+        if let Err(err) = self.write_children_block(device_id, new_offset, children) {
+            // write failed — roll back the freshly-allocated extent so
             // we don't leak it. If the rollback itself fails, surface
             // the leak via tracing (we still need to return the
-            // original pwrite error to the caller) so operators can
+            // original error to the caller) so operators can
             // correlate against the R-049 orphan-blob sweep.
             if let Err(free_err) =
                 self.free_conflicting_children_block(device_id, new_offset, children.len())
@@ -5667,14 +5957,12 @@ impl Engine {
                     kind = "conflicting_children_alloc_rollback",
                     offset = new_offset,
                     bytes = (children.len() * 32) as u64,
-                    pwrite_error = %err,
+                    write_error = %err,
                     free_error = %free_err,
-                    "rollback free after failed conflicting-children pwrite also failed; bytes leaked until R-049 sweep"
+                    "rollback free after failed conflicting-children write also failed; bytes leaked until R-049 sweep"
                 );
             }
-            return Err(SpendError::StorageError {
-                detail: format!("{err}"),
-            });
+            return Err(err);
         }
 
         Ok(new_offset)
@@ -5774,7 +6062,7 @@ impl Engine {
     }
 
     // -----------------------------------------------------------------------
-    // F-X-022 — Deleted children list (Aerospike `addDeletedChildren` parity)
+    // F-X-022 — Deleted children list (the reference UDF `addDeletedChildren` parity)
     //
     // The deleted-children list is a per-parent-record audit/diagnostic of
     // every child txid that has been pruned against the parent. It mirrors
@@ -5799,7 +6087,7 @@ impl Engine {
     /// Deduplicates: if the child already exists, this is a no-op.
     /// Returns Ok(()) if the parent is not found (may be on another node).
     ///
-    /// F-X-022: Aerospike `addDeletedChildren` parity. Mirrors
+    /// F-X-022: the reference UDF `addDeletedChildren` parity. Mirrors
     /// [`Self::append_conflicting_child`] — see that method for the full
     /// rationale on the CAS retry loop, the allocate-out-of-lock pattern,
     /// and the orphan-blob tracing fall-back on rollback.
@@ -5853,16 +6141,31 @@ impl Engine {
             // primary — UTXO_PRUNED remains the primary defense).
             if !intent_logged {
                 // Per-store redo: route the intent to the parent record's
-                // store (its `device_id`, resolved above).
+                // store (its `device_id`, resolved above). Under BUFFERED
+                // durability append WITHOUT flushing — the per-child fsync this
+                // `append_and_flush` used to force was part of the delete
+                // latency floor; the background flusher + checkpoint barrier make
+                // the AppendDeletedChild entry durable, and the data device
+                // (children block + parent metadata) is fsynced by the same
+                // barrier before this redo prefix is reclaimed, so a crash
+                // before the barrier loses the prune the same way buffered
+                // create/spend can lose an un-checkpointed mutation (the relaxed
+                // durability contract). Strict durability keeps the per-call
+                // flush so the intent is durable before the block write.
+                let op = crate::redo::RedoOp::AppendDeletedChild {
+                    parent_key: *parent_key,
+                    child_txid,
+                };
                 if let Some(log) = self.redo_log_for_device(device_id) {
-                    log.lock()
-                        .append_and_flush(crate::redo::RedoOp::AppendDeletedChild {
-                            parent_key: *parent_key,
-                            child_txid,
-                        })
-                        .map_err(|e| SpendError::StorageError {
-                            detail: format!("append deleted child redo: {e}"),
-                        })?;
+                    let mut guard = log.lock();
+                    let r = if self.redo_buffered() {
+                        guard.append(op).map(|_| ())
+                    } else {
+                        guard.append_and_flush(op).map(|_| ())
+                    };
+                    r.map_err(|e| SpendError::StorageError {
+                        detail: format!("append deleted child redo: {e}"),
+                    })?;
                 }
                 intent_logged = true;
             }
@@ -5945,6 +6248,58 @@ impl Engine {
         }
     }
 
+    /// Write a children-list block (deleted- or conflicting-children) of `[u8;32]`
+    /// txids at `offset` on `device_id`, preserving any packed-neighbour bytes in
+    /// the same device block(s).
+    ///
+    /// In PACKED mode the allocator hands out sub-block (`RECORD_ALIGN`-granular)
+    /// offsets, so a children block can share a device block with another record.
+    /// A bare aligned write of `[aligned_base, aligned_base+write_len)` would zero
+    /// the neighbour's bytes → CRC mismatch when that neighbour is later read (the
+    /// packed-delete corruption observed via `prune_slot_if_spent_by_child`). So in
+    /// packed mode we read-modify-write: `pread` the aligned region first, overlay
+    /// only the children bytes, then write back — mirroring `write_metadata_fast`.
+    ///
+    /// In NON-PACKED mode every allocation is block-aligned and exclusive
+    /// (`intra == 0`, the block is the children block's own), so the RMW read is
+    /// unnecessary and skipped — byte-identical to the previous behaviour.
+    fn write_children_block(
+        &self,
+        device_id: u8,
+        offset: u64,
+        children: &[[u8; 32]],
+    ) -> Result<(), SpendError> {
+        let align = self.device_for(device_id).alignment();
+        let aligned_base = offset / align as u64 * align as u64;
+        let intra = (offset - aligned_base) as usize;
+        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
+        // F-X-007 (BC-02): hold the per-block write guard across the RMW. Without
+        // it, a PACKED children-block RMW reads the covering block, overlays only
+        // the children bytes, and writes the WHOLE block back — clobbering a
+        // block-neighbour packed record a concurrent writer just wrote (all-zero
+        // neighbour → spurious `CRC mismatch: expected 0x00000000` on a later
+        // read). Mirrors `io::write_record_bytes`; the guard KEY is the block, so
+        // it excludes every other writer/reader of the shared block.
+        let _guards = io::lock_span_blocks(offset, write_len as u64);
+        let mut buf = crate::device::AlignedBuf::new(write_len, align);
+        if self.store_is_packed(device_id) {
+            // Preserve packed neighbours: read the live block(s) before overlaying.
+            self.device_for(device_id)
+                .pread_exact_at(&mut buf, aligned_base)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                })?;
+        }
+        for (i, child) in children.iter().enumerate() {
+            buf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
+        }
+        self.device_for(device_id)
+            .pwrite_all_at(&buf, aligned_base)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("{e}"),
+            })
+    }
+
     fn read_deleted_children_at(
         &self,
         device_id: u8,
@@ -5992,18 +6347,7 @@ impl Engine {
                 detail: "device full for deleted children".into(),
             })?;
 
-        let align = self.device_for(device_id).alignment();
-        let aligned_base = new_offset / align as u64 * align as u64;
-        let intra = (new_offset - aligned_base) as usize;
-        let write_len = (intra + children.len() * 32).div_ceil(align) * align;
-        let mut wbuf = crate::device::AlignedBuf::new(write_len, align);
-        for (i, child) in children.iter().enumerate() {
-            wbuf[intra + i * 32..intra + (i + 1) * 32].copy_from_slice(child);
-        }
-        if let Err(err) = self
-            .device_for(device_id)
-            .pwrite_all_at(&wbuf, aligned_base)
-        {
+        if let Err(err) = self.write_children_block(device_id, new_offset, children) {
             if let Err(free_err) =
                 self.free_deleted_children_block(device_id, new_offset, children.len())
             {
@@ -6013,14 +6357,12 @@ impl Engine {
                     kind = "deleted_children_alloc_rollback",
                     offset = new_offset,
                     bytes = (children.len() * 32) as u64,
-                    pwrite_error = %err,
+                    write_error = %err,
                     free_error = %free_err,
-                    "rollback free after failed deleted-children pwrite also failed; bytes leaked until R-049 sweep"
+                    "rollback free after failed deleted-children write also failed; bytes leaked until R-049 sweep"
                 );
             }
-            return Err(SpendError::StorageError {
-                detail: format!("{err}"),
-            });
+            return Err(err);
         }
 
         Ok(new_offset)
@@ -6042,7 +6384,7 @@ impl Engine {
 
     /// Read all deleted children txids for a transaction.
     ///
-    /// F-X-022: Aerospike `addDeletedChildren` parity. Returns an empty
+    /// F-X-022: the reference UDF `addDeletedChildren` parity. Returns an empty
     /// vec when the parent has never had a child pruned against it.
     ///
     /// # Concurrency (g2 — barrier-dependent)
@@ -6728,81 +7070,38 @@ impl Engine {
     /// sweep the blob remains on the blob store (orphaned but harmless — no
     /// index entry references it). This keeps the delete hot path off the
     /// blob-store I/O path and lets the sweep batch unlinks.
-    ///
-    /// # Deletion tombstone (deletion-tombstone Phase 3)
-    ///
-    /// When the feature is active (`Self::tombstone_write_active`) this
-    /// path also writes a durable [`crate::tombstone::Tombstone`] so the
-    /// cluster's physical removal is self-describing across a restart /
-    /// rejoin. The tombstone is made durable BEFORE the primary-index
-    /// removal (design §9.1 #4), so a crash can never leave "deletion
-    /// durably committed but tombstone lost." The redb tombstone-index
-    /// insert is a derived index (rebuilt from the log on recovery) and is
-    /// NOT separately fsynced on this hot path.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        // Public deletes write a tombstone when the feature is active. The
-        // recovery R2 self-purge uses `delete_inner(.., false, true)` instead
-        // so it never re-tombstones a key whose tombstone already exists and
-        // tolerates an already-free region. The hot path passes
-        // `tolerate_already_free = false`: a double-free here is a real bug.
-        self.delete_inner(req, self.tombstone_write_active(), false)
-            .map(|_| ())
+        self.delete_inner(req)
     }
 
-    /// Like [`Self::delete`] but returns the exact tombstone fields written
-    /// (deletion-tombstone §6).
+    /// Local prune-delete: remove a fully-spent record locally with NO redo and
+    /// NO replication.
     ///
-    /// Returns `Ok(Some(info))` when a tombstone was written (the feature is
-    /// active and a log is attached), carrying the `deletion_height`,
-    /// `generation`, and `cause` recorded — so the master replication path can
-    /// emit a `DeleteV2` carrying those same values to replicas. Returns
-    /// `Ok(None)` when no tombstone was written (feature off or no log
-    /// attached); the caller then falls back to emitting a V1 `Delete`, keeping
-    /// the `tombstones_enabled = false` behavior byte-identical.
-    ///
-    /// # Errors
-    /// Same as [`Self::delete`]: [`SpendError::TxNotFound`] if the key is
-    /// absent, or [`SpendError::StorageError`] on a device/index failure.
-    pub fn delete_returning_tombstone(
-        &self,
-        req: &DeleteRequest,
-    ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
-        self.delete_inner(req, self.tombstone_write_active(), false)
+    /// Deletes are independent-node GC of records that are fully spent and no
+    /// longer needed, NOT part of normal client operation. Durability is
+    /// unnecessary: a crash before the physical cleanup just leaves the record
+    /// present (and consistent — record + parent-spent slots + allocated region
+    /// all still agree), and the pruner re-deletes it on its next pass
+    /// (self-healing). Physically identical to [`Self::delete`] (RAM-index
+    /// unregister + header zero via the write-back cache + region free); the
+    /// distinct name documents the pruner's intent at the call site. Returns
+    /// `Ok(())` on success or when the record is already gone (idempotent).
+    pub fn prune_delete(&self, req: &DeleteRequest) -> Result<(), SpendError> {
+        self.delete_inner(req)
     }
 
-    /// Internal delete with explicit tombstone control.
+    /// Internal delete.
     ///
-    /// `write_tombstone` is the public delete path's
-    /// [`Self::tombstone_write_active`] result for normal deletes, and
-    /// `false` for the recovery R2 self-purge (the tombstone already exists;
-    /// re-writing one would be redundant — see [`Self::delete_for_purge`]).
+    /// # Ordering (F-G2-001)
     ///
-    /// # Ordering (F-G2-001 + deletion-tombstone §9.1 #4)
-    ///
-    /// 1. (tombstone path only) build the [`crate::tombstone::Tombstone`]
-    ///    from the record's generation-at-deletion + deletion_height + cause,
-    ///    append it to the [`crate::tombstone::TombstoneLog`], and make it
-    ///    durable — so the tombstone is on stable storage BEFORE the
-    ///    deletion is durably committed.
-    /// 2. Zero the on-device metadata header (rebuild skip-guard).
-    /// 3. `sync()` the data device so the zeroed header is durable before any
+    /// 1. Zero the on-device metadata header (rebuild skip-guard).
+    /// 2. `sync()` the data device so the zeroed header is durable before any
     ///    future overwrite of the freed region.
-    /// 4. Unregister the key from the primary index. This MUST follow the
-    ///    tombstone durability (step 1) so a crash between them yields at
-    ///    worst "tombstone present, record present" (R2 purges on recovery),
-    ///    never "record gone, tombstone lost."
-    /// 5. Return the region to the allocator (after the primary-index removal,
+    /// 3. Unregister the key from the primary index.
+    /// 4. Return the region to the allocator (after the primary-index removal,
     ///    so no `lookup(key)` can reach the post-free offset — F-G2-001).
-    /// 6. (tombstone path only) insert the derived redb tombstone row. Not
-    ///    fsynced here; a crash after the log append but before this insert
-    ///    is re-derived by recovery's `rebuild_from`.
-    fn delete_inner(
-        &self,
-        req: &DeleteRequest,
-        write_tombstone: bool,
-        tolerate_already_free: bool,
-    ) -> Result<Option<DeleteTombstoneInfo>, SpendError> {
+    fn delete_inner(&self, req: &DeleteRequest) -> Result<(), SpendError> {
         let _guard = self.locks.lock(&req.tx_key);
 
         // G-4: a backend read error must not collapse to "absent".
@@ -6852,168 +7151,71 @@ impl Engine {
             )
         };
 
-        // Step 1 (deletion-tombstone §9.1 #4): build and durably record the
-        // tombstone BEFORE the primary-index removal. `entry.generation` is
-        // the record's generation at deletion time, read above under this
-        // stripe lock. `due_guard == Some(height)` is the DAH sweep
-        // (`SpentDah`, deletion_height = the sweep height); `None` is an
-        // admin / explicit delete (`Admin`, deletion_height = the observed
-        // tip we can derive from cached state). The redb-index insert is a
-        // derived step deferred to step 6 (rebuilt from the log on recovery,
-        // so it need not be fsynced on the hot path).
+        // Step 2: Remove from the primary index (+ shard count) FIRST — BEFORE
+        // zeroing the header. This closes a lock-free-reader race: the header
+        // tombstone below (CRC-zeroing the record) used to run while the index
+        // still pointed at this offset, so a concurrent LOCK-FREE metadata read
+        // (a sibling delete's external-blob pre-check, a GET, a setMined) could
+        // `lookup(tx_key)` → offset → read the just-zeroed header → fail with a
+        // spurious `record corruption: CRC mismatch` (STORAGE_ERROR). Unregister
+        // first: once removed, no `lookup(tx_key)` reaches this offset, so a
+        // reader either observed it BEFORE (and reads the still-intact header) or
+        // AFTER (gets `None` → clean `TxNotFound`) — never the zeroed window.
         //
-        // NOTE on the "single fsync" goal (design §3.3): the production
-        // tombstone log lives in its own device file (like the redo log), so
-        // it is fsynced on its own device here — this is a separate-device
-        // fsync, not a second fsync of the SAME region. The load-bearing
-        // invariant the design requires is preserved exactly: the tombstone
-        // is durable before the deletion is durably committed.
-        let tombstone_to_index = if write_tombstone {
-            self.append_delete_tombstone(req, &entry)?
-        } else {
-            None
-        };
-
-        // Capture the exact fields written so the master replication path can
-        // emit a `DeleteV2` carrying them (deletion-tombstone §6). `cause` came
-        // from a known [`crate::tombstone::TombstoneCause`] inside
-        // `append_delete_tombstone`, so `from_u8` here never fails; on the
-        // impossible corruption case we treat it as "no info" and the caller
-        // falls back to a V1 `Delete`.
-        let tombstone_info = tombstone_to_index.as_ref().and_then(|(_, v)| {
-            crate::tombstone::TombstoneCause::from_u8(v.cause)
-                .ok()
-                .map(|cause| DeleteTombstoneInfo {
-                    deletion_height: v.deletion_height,
-                    generation: v.generation,
-                    cause,
-                })
-        });
-
-        // Step 2: Tombstone the metadata before freeing the region so crash-time
-        // index rebuilds cannot resurrect this record from stale bytes in freed
-        // space. The marker overwrites the full header (zeroing all but its own
-        // prefix), so freed regions can be reallocated later without old tx
-        // metadata remaining readable. It also carries `record_size` so a
-        // post-crash device-scan rebuild skips the WHOLE deleted record, not
-        // just its first alignment block (multi-block boot-loop fix).
-        self.write_zeroed_metadata_header(entry.device_id, entry.record_offset, record_size)?;
-        // Step 3: Sync so the zeroed header is durable before any reuse.
-        self.device_for(entry.device_id)
-            .sync()
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("delete tombstone sync failed: {e}"),
-            })?;
-
-        // Step 4: Remove from primary index AND decrement shard_counts in
-        // the same critical section so the two can never drift (H2
-        // correctness fix). `unregister_with_shard_count` only decrements
-        // when an entry was actually removed, preventing underflow if the
-        // key was concurrently removed between the earlier `lookup` and
-        // this point. This MUST precede the allocator free (F-G2-001):
-        // otherwise a concurrent `create_at_offset` could re-allocate the
-        // same offset and write a fresh, CRC-valid `TxMetadata` for a
-        // different transaction; a lock-free reader holding the offset
-        // returned by the still-live primary-index entry would then read
-        // that unrelated metadata back as if it belonged to `tx_key`.
+        // Ordering invariants preserved: this still precedes the allocator free
+        // (F-G2-001 — a freed+reused offset must never be reachable via a live
+        // index entry), and it now also precedes the tombstone. Recovery is
+        // unaffected: the delete is journaled (redo `Delete`), so redo-replay
+        // removes the record regardless of tombstone timing; the tombstone remains
+        // only the device-scan-rebuild fallback's guard.
         //
-        // G-4: if the backend remove fails, propagate it and DO NOT free
-        // the region or touch secondaries — otherwise the row would remain
-        // in redb pointing at a region we just returned to the allocator.
+        // `unregister_with_shard_count` only decrements when an entry was actually
+        // removed (H2: no underflow if the key was concurrently removed). G-4: if
+        // the backend remove fails, propagate it and DO NOT tombstone/free/touch
+        // secondaries — the row would otherwise stay in redb pointing at a region
+        // we are about to zero and return to the allocator.
         self.unregister_with_shard_count(&req.tx_key)
             .map_err(|e| SpendError::StorageError {
                 detail: format!("index unregister failed: {e}"),
             })?;
 
-        // Step 5: Return the region to the allocator. From this point on
-        // the offset can be handed out to a future `create`/`create_at_offset`.
-        // Because step 4 already removed the primary-index entry, no
-        // reader can reach this offset via `lookup(req.tx_key)` any longer.
+        // Step 3: Tombstone the metadata header (now unreachable via the index) so
+        // a crash-time DEVICE-SCAN rebuild cannot resurrect this record from stale
+        // bytes in freed space. The marker overwrites the full header, carrying
+        // `record_size` so a device scan skips the WHOLE deleted record, not just
+        // its first alignment block (multi-block boot-loop fix).
+        self.write_zeroed_metadata_header(entry.device_id, entry.record_offset, record_size)?;
+        // Step 4: Sync so the zeroed header is durable before any reuse.
         //
-        // `tolerate_already_free` is set ONLY by the recovery R2 self-purge
-        // path ([`Self::delete_for_purge`]). Recovery can encounter an
-        // index/allocator inconsistency where the primary index resurrected a
-        // record at an offset the allocator's recovered free-list already
-        // freed (see `recover_tombstones`). For that path a region that the
-        // allocator already considers fully free is BENIGN — the free-list is
-        // authoritative that the region is dead, and R2's job is only to drop
-        // the stale index entry (step 4, already done above). Freeing it again
-        // would (correctly) raise `DoubleFree`, so we skip the free instead.
-        //
-        // CRITICAL SAFETY: this tolerance is restricted to the case where the
-        // record's `[offset, offset + record_size)` is FULLY CONTAINED in a
-        // single already-free region. A PARTIAL overlap (the record range
-        // extends past the free region into space that may be allocated/live)
-        // is real corruption and is NOT tolerated even on the purge path — the
-        // `free` error is propagated so it keeps surfacing. The normal
-        // spend/delete hot path (`tolerate_already_free == false`) ALWAYS
-        // propagates any allocator error: a double-free there is a genuine bug
-        // that must never be hidden.
-        {
-            let mut alloc = self.allocator_for(entry.device_id).lock();
-            if tolerate_already_free && !alloc.is_allocated_range(entry.record_offset, record_size)
-            {
-                // Region is not fully allocated. Only tolerate the fully
-                // contained case; anything else is a partial overlap (or an
-                // out-of-bounds range) and must error.
-                let contained = alloc
-                    .free_region_containing(entry.record_offset)
-                    .is_some_and(|(free_offset, free_size)| {
-                        let region_end = entry.record_offset.saturating_add(record_size);
-                        let free_end = free_offset.saturating_add(free_size);
-                        entry.record_offset >= free_offset && region_end <= free_end
-                    });
-                if contained {
-                    // Benign: the region is already, correctly, free. The stale
-                    // index entry has been removed (step 4). Nothing more to do.
-                    tracing::debug!(
-                        offset = entry.record_offset,
-                        size = record_size,
-                        "delete_for_purge: region already free (resurrected \
-                         index/allocator inconsistency); index entry removed, \
-                         skipping redundant free",
-                    );
-                } else {
-                    // Partial overlap or out-of-bounds — real corruption.
-                    // Attempt the free so the allocator produces its precise
-                    // `DoubleFree`/`InvalidFree` error, then propagate it.
-                    alloc.free(entry.record_offset, record_size).map_err(|e| {
-                        SpendError::StorageError {
-                            detail: format!("{e}"),
-                        }
-                    })?;
-                }
-            } else {
-                alloc.free(entry.record_offset, record_size).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("{e}"),
-                    }
+        // Under BUFFERED (relaxed) durability we skip this synchronous fsync on
+        // the hot path: the zeroed-header write has already landed in the
+        // write-back cache, the delete is journalled to the (buffered) redo log
+        // below, and the checkpoint barrier fsyncs every store's data device
+        // before it reclaims any redo prefix (src/checkpoint.rs
+        // `sync_all_store_devices` precedes the fence/reclaim). So durability is
+        // DEFERRED to the same barrier buffered create/spend rely on, not
+        // dropped. Pre-fix this per-delete fsync was the dominant component of
+        // the delete-latency floor (the p99.9 blocker). Strict durability keeps
+        // the synchronous sync exactly as before.
+        if !self.redo_buffered() {
+            self.device_for(entry.device_id)
+                .sync()
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("delete tombstone sync failed: {e}"),
                 })?;
-            }
         }
 
-        // Step 6: Insert the derived redb tombstone row (not fsynced — the
-        // log is the durable source of truth; recovery `rebuild_from`
-        // re-derives this index). A failure here is logged but NOT fatal:
-        // the durable log already carries the tombstone, so recovery will
-        // reconstruct the missing row. Failing the whole delete after the
-        // primary-index removal already committed would leave the caller a
-        // spurious error for an operation that did, in fact, complete.
-        if let Some((key, value)) = tombstone_to_index
-            && let Some(idx) = self.tombstone_index.get()
-            && let Err(e) = idx.lock().insert(
-                key,
-                value.deletion_height,
-                value.generation,
-                value.shard,
-                value.cause,
-            )
+        // Step 5: Return the region to the allocator. From this point on
+        // the offset can be handed out to a future `create`/`create_at_offset`.
+        // Because step 2 already removed the primary-index entry, no
+        // reader can reach this offset via `lookup(req.tx_key)` any longer.
         {
-            tracing::warn!(
-                err = %e,
-                "delete: tombstone redb-index insert failed; log carries the \
-                 tombstone and recovery will re-derive the index row",
-            );
+            let mut alloc = self.allocator_for(entry.device_id).lock();
+            alloc
+                .free(entry.record_offset, record_size)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("{e}"),
+                })?;
         }
 
         // Clean up secondary indexes with two-phase durability, gated off the
@@ -7043,342 +7245,13 @@ impl Engine {
             self.conflicting_index.lock().remove(&req.tx_key);
         }
 
-        Ok(tombstone_info)
-    }
-
-    /// Delete a record WITHOUT writing a new deletion tombstone.
-    ///
-    /// Used exclusively by the recovery R2 self-purge (design §5.2): the key
-    /// already has a durable tombstone (that is *why* it is being purged), so
-    /// re-tombstoning would be redundant and could mask a generation race.
-    /// All other delete semantics (header zero, fsync, primary-index removal,
-    /// region free, secondary cleanup) are identical to [`Self::delete`], so
-    /// re-running recovery is idempotent.
-    ///
-    /// # Already-free tolerance (resurrected index/allocator inconsistency)
-    ///
-    /// This path passes `tolerate_already_free = true` to [`Self::delete_inner`].
-    /// Recovery can resurrect a primary-index entry pointing at a `record_offset`
-    /// the allocator's recovered free-list ALREADY freed (an index/allocator
-    /// inconsistency — see [`crate::recovery::recover_tombstones`]). For such a
-    /// key the index-entry removal is the only work R2 needs: the allocator
-    /// free-list is already authoritative that the region is dead, so the
-    /// otherwise-correct `free` of step 5 would raise [`DoubleFree`] and wrongly
-    /// fail an operation that, in fact, completed. When the region is fully
-    /// contained in an existing free region the free is skipped (benign) and
-    /// this returns `Ok(())`; a PARTIAL overlap is still surfaced as a
-    /// [`SpendError::StorageError`] (real corruption — never silently tolerated).
-    ///
-    /// The normal client/sweep delete path keeps the strict behavior
-    /// (`tolerate_already_free = false`): a double-free there is a genuine bug.
-    ///
-    /// [`DoubleFree`]: crate::allocator::AllocatorError::DoubleFree
-    pub(crate) fn delete_for_purge(&self, req: &DeleteRequest) -> Result<(), SpendError> {
-        self.delete_inner(req, false, true).map(|_| ())
-    }
-
-    /// BUG-1 fix #4: drop a CORRUPT, aliased primary-index entry whose
-    /// on-device record belongs to a DIFFERENT transaction.
-    ///
-    /// Used by recovery R2 self-purge when the resurrected entry for `key`
-    /// points at a `record_offset` whose on-device metadata `tx_id != key`
-    /// (verified by the caller via [`Self::read_metadata`] returning
-    /// [`SpendError::TxNotFound`]). The normal [`Self::delete_for_purge`]
-    /// CANNOT remove such an entry: its `delete_inner` reads
-    /// `read_metadata_for_key`, which itself rejects on the tx_id mismatch
-    /// and returns `TxNotFound` BEFORE removing anything, so the alias would
-    /// survive.
-    ///
-    /// This path is surgical: it removes ONLY the stale index row (and its
-    /// shard count + secondary-index entries derived from the entry's cached
-    /// heights). It deliberately does NOT zero the on-device header and does
-    /// NOT free the region — those bytes belong to the rightful owner record
-    /// B and must be left intact.
-    ///
-    /// Returns `true` if an entry was removed, `false` if the key was already
-    /// absent (idempotent). Propagates [`crate::index::IndexError`] as a
-    /// [`SpendError::StorageError`] on a backend removal failure.
-    pub(crate) fn purge_aliased_index_entry(&self, key: &TxKey) -> Result<bool, SpendError> {
-        let _guard = self.locks.lock(key);
-        let removed =
-            self.unregister_with_shard_count(key)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("aliased-entry index unregister failed: {e}"),
-                })?;
-        if removed.is_none() {
-            return Ok(false);
-        }
-
-        // Remove `key` from ALL THREE secondary indexes UNCONDITIONALLY by key.
-        // This purge path holds NO authoritative device metadata (it is dropping
-        // a stale/aliased primary-index entry whose device footer belongs to a
-        // DIFFERENT record), and the cached heights can be stale after a redo
-        // replay, so neither can decide membership. `remove` is a no-op when the
-        // key is absent, so unconditional removal is safe and closes the
-        // stale-cache leak for DAH / unmined / preserve alike (the cache-gated
-        // version leaked whenever the cache lagged the backend — the same class
-        // as the `delete_inner` fix).
-        let log_arc = self.redo_log_for_key(key);
-        let log_ref = log_arc.as_deref();
-        self.dah_index()
-            .remove(key, log_ref)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("dah secondary remove (purge): {e}"),
-            })?;
-        self.unmined_index()
-            .remove(key, log_ref)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("unmined secondary remove (purge): {e}"),
-            })?;
-        self.preserve_index()
-            .remove(key, None)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("preserve secondary remove (purge): {e}"),
-            })?;
-        Ok(true)
-    }
-
-    /// Discard ALL local records for `shard` WITHOUT writing tombstones, for
-    /// the Phase 4 full-resync path (deletion-tombstone design §4.3).
-    ///
-    /// When the rejoin gate refuses an incremental rejoin (the node is too
-    /// stale and may hold a stale live copy of a key whose tombstone is
-    /// already GC'd), the node must DISCARD its local copy of the shards it is
-    /// about to re-receive and pull fresh baselines. This is a LOCAL discard,
-    /// NOT a cluster delete: it must NOT write tombstones (a tombstone would
-    /// wrongly mark the key deleted cluster-wide), so it routes through
-    /// `Self::delete_for_purge` (`write_tombstone = false`), which otherwise
-    /// performs the identical, audited header-zero → fsync → primary-index
-    /// removal → region-free → secondary-cleanup sequence.
-    ///
-    /// The freshly-cleared shard is then repopulated by the normal inbound
-    /// migration baseline push from the shard's master after the catch-up
-    /// installs the active routing snapshot — so no stale extra survives the
-    /// resync, which is precisely what the §4.3 proof requires.
-    ///
-    /// Returns the number of records discarded. Per-key failures are logged
-    /// and skipped (best-effort): a record that fails to discard is simply
-    /// re-evaluated on the next baseline apply (idempotent), and the count
-    /// reflects only successful discards.
-    ///
-    /// # Warning
-    /// This is a destructive bulk-local operation reachable ONLY from the
-    /// Phase 4 full-resync path, which is gated behind `tombstone_gc_enabled`
-    /// (default OFF). It is not on any client path.
-    pub fn discard_shard_records(&self, shard: u16) -> usize {
-        let keys = self.keys_for_shard(shard);
-        let mut discarded = 0usize;
-        for key in keys {
-            let req = DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            };
-            match self.delete_for_purge(&req) {
-                Ok(()) => discarded += 1,
-                // TX_NOT_FOUND can occur if a concurrent op already removed the
-                // key — benign for a discard. Anything else is logged and the
-                // key is left for the next baseline apply to reconcile.
-                Err(SpendError::TxNotFound) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        shard,
-                        err = %e,
-                        "full-resync discard: failed to drop a local record; \
-                         baseline re-apply will reconcile it",
-                    );
-                }
-            }
-        }
-        discarded
-    }
-
-    /// Build the [`crate::tombstone::Tombstone`] for this delete, append it
-    /// to the durable log, and return the values to insert into the redb
-    /// index (so the caller can defer that derived-index write).
-    ///
-    /// Returns `Ok(None)` when no tombstone log is attached (the feature is
-    /// inert). The append is made durable here so the tombstone is on stable
-    /// storage before the primary-index removal (design §9.1 #4).
-    ///
-    /// # Errors
-    /// [`SpendError::StorageError`] if the log append / sync fails. The
-    /// delete is aborted in that case — we must not proceed to remove the
-    /// primary-index row when we could not durably record the deletion.
-    fn append_delete_tombstone(
-        &self,
-        req: &DeleteRequest,
-        entry: &TxIndexEntry,
-    ) -> Result<Option<(TxKey, crate::index::redb_tombstone::TombstoneIndexValue)>, SpendError>
-    {
-        let Some(log) = self.tombstone_log.get() else {
-            return Ok(None);
-        };
-
-        // cause + deletion_height per design §11.1 step 3:
-        //   - DAH sweep (`due_guard == Some(h)`): SpentDah at height `h`.
-        //   - admin / explicit (`due_guard == None`): Admin at the observed
-        //     tip. We do not have a distinct call-site signal for the #29
-        //     migration prune at this layer (that wiring is a later phase),
-        //     so non-DAH deletes default to Admin, as the task permits.
-        let (cause, deletion_height) = match req.due_guard {
-            Some(height) => (crate::tombstone::TombstoneCause::SpentDah, height),
-            None => (
-                crate::tombstone::TombstoneCause::Admin,
-                self.observed_tip_height(),
-            ),
-        };
-        let generation = entry.generation;
-        let shard = crate::cluster::shards::ShardTable::shard_for_key(&req.tx_key);
-
-        let tombstone = crate::tombstone::Tombstone::new(
-            req.tx_key.txid,
-            shard,
-            deletion_height,
-            generation,
-            cause,
-            0,
-        );
-
-        // Append + make durable on the tombstone device BEFORE returning, so
-        // the tombstone is durable before the caller proceeds to the
-        // primary-index removal.
-        {
-            let mut guard = log.lock();
-            guard
-                .append_synced(&tombstone)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("tombstone log append failed: {e}"),
-                })?;
-        }
-
-        let value = crate::index::redb_tombstone::TombstoneIndexValue {
-            deletion_height,
-            generation,
-            shard,
-            cause: cause.as_u8(),
-        };
-        Ok(Some((req.tx_key, value)))
-    }
-
-    /// Record a tombstone replicated from the master with *exact* carried
-    /// fields (deletion-tombstone §6, replica `DeleteV2` apply).
-    ///
-    /// Unlike `Self::append_delete_tombstone` — which derives the fields from
-    /// the local record at delete time — this writes the master's
-    /// `deletion_height` / `generation` / `cause` verbatim, so the replica's
-    /// tombstone matches the master's. The receiver calls it AFTER removing the
-    /// record (record-removal-then-tombstone ordering, §6); a crash in between
-    /// leaves "record gone, tombstone pending," which recovery R2 re-derives
-    /// harmlessly.
-    ///
-    /// The key need NOT exist locally: a replica that never held the key still
-    /// records the tombstone (the §6 "pre-arm" benefit, cheap at 56 B) so a
-    /// later resurrecting source self-purges.
-    ///
-    /// Idempotent: if the redb index already carries a row for `tx_key`, this
-    /// is a no-op — it does NOT append a duplicate to the durable log
-    /// (re-applying a `DeleteV2` in a re-sent batch costs no extra SSD wear).
-    /// The `shard` is derived from `tx_key`, matching the master.
-    ///
-    /// Inert (returns `Ok(())` doing nothing) when no tombstone log is
-    /// attached, so the `tombstones_enabled = false` / no-log fallback path
-    /// behaves exactly as before.
-    ///
-    /// # Errors
-    /// [`SpendError::StorageError`] if the durable log append / sync fails. A
-    /// redb-index insert failure is logged but NOT fatal: the durable log
-    /// carries the tombstone and recovery `rebuild_from` re-derives the row.
-    pub fn apply_replicated_tombstone(
-        &self,
-        tx_key: &TxKey,
-        deletion_height: u32,
-        generation: u32,
-        cause: u8,
-    ) -> Result<(), SpendError> {
-        let Some(log) = self.tombstone_log.get() else {
-            return Ok(());
-        };
-
-        // Validate the cause byte up front so a corrupt op can never decode to
-        // a wrong variant on disk (mirrors `TombstoneCause::from_u8`).
-        let cause_enum = crate::tombstone::TombstoneCause::from_u8(cause).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("replicated tombstone has unknown cause byte: {e}"),
-            }
-        })?;
-
-        let shard = crate::cluster::shards::ShardTable::shard_for_key(tx_key);
-
-        // Idempotency: if the redb index already carries this key, the
-        // tombstone is already durable (the log carries it, the index derives
-        // from it). Skip re-appending to avoid duplicate log entries on a
-        // re-sent batch. The index is the derived view, but it is the cheapest
-        // membership probe; on a crash that lost the index row the log is
-        // re-scanned at recovery, and a re-sent `DeleteV2` then re-appends —
-        // harmless (last-writer-wins on key in `rebuild_from`).
-        if let Some(idx) = self.tombstone_index.get()
-            && idx.lock().is_tombstoned(tx_key)
-        {
-            return Ok(());
-        }
-
-        let tombstone = crate::tombstone::Tombstone::new(
-            tx_key.txid,
-            shard,
-            deletion_height,
-            generation,
-            cause_enum,
-            0,
-        );
-
-        {
-            let mut guard = log.lock();
-            guard
-                .append_synced(&tombstone)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("replicated tombstone log append failed: {e}"),
-                })?;
-        }
-
-        // Insert the derived redb row. Non-fatal on failure: the durable log
-        // already carries the tombstone and recovery `rebuild_from` re-derives
-        // the row.
-        if let Some(idx) = self.tombstone_index.get()
-            && let Err(e) = idx
-                .lock()
-                .insert(*tx_key, deletion_height, generation, shard, cause)
-        {
-            tracing::warn!(
-                err = %e,
-                "apply_replicated_tombstone: redb-index insert failed; log carries the \
-                 tombstone and recovery will re-derive the index row",
-            );
-        }
-
         Ok(())
-    }
-
-    /// Best-effort observed tip height for admin-delete tombstones.
-    ///
-    /// Admin deletes carry no `due_guard` height, so the tombstone's
-    /// `deletion_height` is taken from the highest block height the engine
-    /// has observed. We derive it from the redo log's recorded tip if
-    /// available, falling back to 0. This is only used as the GC-horizon
-    /// anchor for admin tombstones (a later phase); 0 is safe (it merely
-    /// keeps the tombstone longer), so a missing tip never causes
-    /// under-retention.
-    fn observed_tip_height(&self) -> u32 {
-        // The engine does not maintain a separate tip cache; admin deletes
-        // are rare and out-of-band. Using 0 keeps the tombstone for the full
-        // (eventual) GC horizon, which is conservative-safe. A future phase
-        // that threads the cluster tip into the engine can refine this.
-        0
     }
 
     /// Expire a preservation whose `preserve_until` height has been reached.
     ///
-    /// Mirror of the Aerospike pruner's `ProcessExpiredPreservations`
-    /// (`teranode/stores/utxo/aerospike/aerospike.go:999-1100`) and spec
+    /// Mirror of the reference pruner's `ProcessExpiredPreservations`
+    /// (the upstream Teranode UTXO-store Go reference, ~lines 999-1100) and spec
     /// §3.18 Phase 3 ("Expired preservation processing"): for a record whose
     /// `preserve_until` is in `[1, current_height]`, clear `preserve_until` and
     /// — only if the record is sweep-eligible — schedule deletion by setting
@@ -7571,9 +7444,16 @@ impl Engine {
         })
     }
 
-    /// Get the unmined index (for testing).
-    pub fn unmined_index(&self) -> parking_lot::MutexGuard<'_, UnminedBackend> {
-        self.unmined_index.lock()
+    /// Borrow the sharded unmined secondary index.
+    ///
+    /// Returns the [`ShardedUnminedIndex`] wrapper, which exposes the same
+    /// `range_query` / `len` / `is_empty` / `insert` / `remove` surface the
+    /// callers used on the former `MutexGuard` — each call locks only the shard
+    /// owning the key (or fans out for the whole-index reads). Used by the
+    /// pruner read path (`dispatch::handle_query_old_unmined`), the metrics /
+    /// status endpoints, and tests.
+    pub fn unmined_index(&self) -> &ShardedUnminedIndex {
+        &self.unmined_index
     }
 
     /// Get the preserve index (backs the expired-preservation sweep; also used
@@ -7936,9 +7816,14 @@ impl Engine {
             .find(|entry| entry.block_id == block_id))
     }
 
-    /// Get the DAH index (for testing).
-    pub fn dah_index(&self) -> parking_lot::MutexGuard<'_, DahBackend> {
-        self.dah_index.lock()
+    /// Borrow the sharded DAH secondary index.
+    ///
+    /// Returns the [`ShardedDahIndex`] wrapper. See [`Self::unmined_index`] for
+    /// the surface and locking contract. Used by the pruner read path
+    /// (`dispatch::handle_process_expired_preservations`), the metrics / status
+    /// endpoints, and tests.
+    pub fn dah_index(&self) -> &ShardedDahIndex {
+        &self.dah_index
     }
 
     /// Number of entries in the primary index.
@@ -8039,11 +7924,121 @@ impl Engine {
     ///
     /// Returns [`crate::allocator::AllocatorError`] on device I/O failure.
     pub fn persist_allocator(&self) -> crate::allocator::Result<()> {
-        // Persist every store's allocator (one per device).
+        // Write every store's allocator header under its lock — a cheap header
+        // pwrite, lock released immediately — WITHOUT folding in the fsync. Then
+        // fsync all store devices via `sync_all_store_devices`, which runs the
+        // per-store syncs in PARALLEL and holds NO allocator lock.
+        //
+        // Two problems with the old `for store { allocator.lock().persist() }`:
+        //   1. it held the allocator mutex across `device.sync()`, and when the
+        //      data device is a large write-back cache that sync flushes for
+        //      tens of seconds — stalling every create's `reserve_*` for the
+        //      whole flush (profiled: a 90s checkpoint that froze all writes);
+        //   2. it synced stores serially, so N stores cost the SUM of their
+        //      flushes instead of the slowest single one.
+        //
+        // The header is still durable when this returns (crash-safety
+        // unchanged): the sync below completes before the recovery fence is
+        // written and the redo prefix is reclaimed.
         for store in &self.stores {
-            store.allocator.lock().persist()?;
+            store.allocator.lock().persist_header_no_sync()?;
         }
+        self.sync_all_store_devices()?;
         Ok(())
+    }
+
+    /// Defrag fast path: reclaim every fully-dead segment across all stores for
+    /// reuse, bounding device growth under the log-structured (segment) engine.
+    /// Returns the total number of segments reclaimed.
+    ///
+    /// Called by the checkpoint immediately BEFORE [`Self::persist_allocator`], so
+    /// the reclaimed state (reset segments + grown free list) lands in the on-disk
+    /// header atomically with the rest of the checkpoint. In-place stores are a
+    /// no-op (their allocator's trait method returns 0). Runs under each store's
+    /// allocator lock — brief, and mutually exclusive with allocate/free, which
+    /// only ever touch the OPEN segment (never a sealed fully-dead one).
+    ///
+    /// No journaling: a crash before the persisting checkpoint simply loses the
+    /// reclaim, and recovery re-derives the free list from the live index
+    /// ([`crate::allocator::RecordAllocator::reconcile_recovered_free_list`]).
+    pub fn defrag_reclaim_fully_dead(&self) -> usize {
+        let mut total = 0;
+        for store in &self.stores {
+            total += store.allocator.lock().reclaim_fully_dead_segments();
+        }
+        total
+    }
+
+    /// Defrag COMPACTION (log-structured engine): relocate the few live records
+    /// out of up to `max_segments` partially-dead victim segments (dead fraction ≥
+    /// `min_dead_frac`, most-dead-first) so they DRAIN and the fast path can then
+    /// reclaim them. This is the long-lived-record tail case the fully-dead fast
+    /// path ([`Self::defrag_reclaim_fully_dead`]) cannot reach on its own. Returns
+    /// the number of records relocated.
+    ///
+    /// Each live record is moved VERBATIM to the append cursor via
+    /// [`Self::relocate_record`] under its stripe lock — the same primitive and
+    /// atomicity a spend uses, with empty slot mutations and its current metadata,
+    /// so it re-points the index, journals a buffered `Relocate`, and frees the old
+    /// extent. Best-effort + rate-limited: caller bounds `max_segments` (and thus
+    /// the copy amplification); a per-record error is logged and skipped, never
+    /// aborting the sweep.
+    ///
+    /// Concurrency: the key set is snapshotted lock-free, then each record is
+    /// RE-CHECKED under its stripe lock — a concurrent spend/delete that already
+    /// moved or removed it (so it is no longer in a victim range) is skipped. A new
+    /// offset always lands in the open/free region, never a victim (victims exclude
+    /// the open segment), so a relocated record never re-enters a victim.
+    pub fn defrag_compact(&self, max_segments: usize, min_dead_frac: f64) -> usize {
+        let mut relocated = 0usize;
+        for (store_idx, store) in self.stores.iter().enumerate() {
+            if !store.log_structured {
+                continue;
+            }
+            let device_id = store_idx as u8;
+            let ranges = store
+                .allocator
+                .lock()
+                .defrag_victim_ranges(min_dead_frac, max_segments);
+            if ranges.is_empty() {
+                continue;
+            }
+            let in_victim = |off: u64| ranges.iter().any(|&(s, e)| off >= s && off < e);
+
+            // Snapshot the keys whose live record currently sits in a victim.
+            let mut keys: Vec<TxKey> = Vec::new();
+            self.index.for_each(|key, e| {
+                if e.device_id == device_id && in_victim(e.record_offset) {
+                    keys.push(key);
+                }
+            });
+
+            for key in keys {
+                let _guard = self.locks.lock(&key);
+                // Re-check under the lock: a concurrent spend/delete may have moved
+                // or removed the record since the snapshot.
+                let Some(e) = self.index.lookup(&key) else {
+                    continue;
+                };
+                if e.device_id != device_id || !in_victim(e.record_offset) {
+                    continue;
+                }
+                let meta = match self.read_metadata_fast(device_id, e.record_offset) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        tracing::warn!(target: "teraslab::defrag", err = %err, "compaction: read metadata failed; skipping record");
+                        continue;
+                    }
+                };
+                match self.relocate_record(device_id, &key, &meta, &[]) {
+                    Ok(_) => relocated += 1,
+                    Err(err) => {
+                        tracing::warn!(target: "teraslab::defrag", err = %err, "compaction: relocate failed; skipping record");
+                    }
+                }
+            }
+        }
+        relocated
     }
 
     /// Force the primary, DAH, and unmined index backends durable on
@@ -8063,9 +8058,9 @@ impl Engine {
     /// flush fails; the caller must treat all index state as NOT durable.
     pub fn flush_index_durable(&self) -> crate::index::Result<()> {
         self.index.flush_durable()?;
-        self.dah_index.lock().flush_durable()?;
+        self.dah_index.flush_durable()?;
         self.preserve_index.lock().flush_durable()?;
-        self.unmined_index.lock().flush_durable()
+        self.unmined_index.flush_durable()
     }
 }
 
@@ -8207,6 +8202,14 @@ impl PreparedSpend {
             ));
         }
 
+        // Segment (log-structured) engine: the spend RELOCATES the record to a
+        // fresh append-cursor offset rather than RMW-ing slots + metadata in
+        // place. The spent slots and the updated metadata are folded into ONE
+        // sequential image written below (step 9, `relocate_record`), so the
+        // in-place slot writes here are skipped — writing them at the old offset
+        // would scatter exactly the I/O the segment engine exists to eliminate.
+        let log_structured = engine.store_is_log_structured(device_id);
+
         // 6. Batch write all valid slot mutations (zero-alloc when direct).
         // R-004: stop on first write failure and propagate it. Continuing
         // through the batch and pretending success on partial-write would
@@ -8215,8 +8218,10 @@ impl PreparedSpend {
         // covering "spent_utxos == count(slots in SPENT state)" would
         // break, premature pruning would follow, and a follow-up spend on
         // the same UTXO with different spending_data would succeed.
-        for &(offset, ref new_slot) in &valid_spends {
-            engine.write_slot_fast(device_id, record_offset, offset, new_slot)?;
+        if !log_structured {
+            for &(offset, ref new_slot) in &valid_spends {
+                engine.write_slot_fast(device_id, record_offset, offset, new_slot)?;
+            }
         }
 
         crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterDataPwrite);
@@ -8262,22 +8267,38 @@ impl PreparedSpend {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 9. Write metadata (targeted spend footer when direct, full otherwise).
-        // R-004: propagate the write error.
-        let device_ptr = engine.device_ptr_for(device_id);
-        if !device_ptr.is_null() {
-            // SAFETY: `device_ptr` is non-null (checked above) and is store
-            // `device_id`'s live device base; `record_offset` is
-            // allocator-valid for that store. This spend `apply` still holds
-            // the record's stripe lock (`_guard`, captured at prepare time);
-            // `write_metadata_direct` takes the per-offset `io_locks()` write
-            // side for torn-read-safe publication.
-            unsafe { io::write_metadata_direct(device_ptr, record_offset, &metadata) };
+        // 9. Persist the mutation.
+        if log_structured {
+            // Segment engine: append the full record (spent slots + updated
+            // metadata baked in) at a fresh cursor offset, re-point the index,
+            // journal a buffered `Relocate`, and dead-mark the old extent — all
+            // under the stripe lock the caller holds. `relocate_record` sets the
+            // index entry in full (identically to recovery), so NO subsequent
+            // `sync_index_cache` is needed (or wanted — it would update the old
+            // key's cached fields without moving the offset). The Relocate redo
+            // is journaled here, AFTER the WAL-first flush of this RPC, which is
+            // why the segment engine requires BUFFERED durability (enforced at
+            // boot): image + redo + dead-mark become durable together at the
+            // checkpoint barrier; a crash before it keeps the old record intact.
+            engine.relocate_record(device_id, &tx_key, &metadata, &valid_spends)?;
         } else {
-            engine.write_metadata_fast(device_id, record_offset, &metadata)?;
-        }
+            // In-place RMW: targeted spend footer when direct, full otherwise.
+            // R-004: propagate the write error.
+            let device_ptr = engine.device_ptr_for(device_id);
+            if !device_ptr.is_null() {
+                // SAFETY: `device_ptr` is non-null (checked above) and is store
+                // `device_id`'s live device base; `record_offset` is
+                // allocator-valid for that store. This spend `apply` still holds
+                // the record's stripe lock (`_guard`, captured at prepare time);
+                // `write_metadata_direct` takes the per-offset `io_locks()` write
+                // side for torn-read-safe publication.
+                unsafe { io::write_metadata_direct(device_ptr, record_offset, &metadata) };
+            } else {
+                engine.write_metadata_fast(device_id, record_offset, &metadata)?;
+            }
 
-        engine.sync_index_cache(&tx_key, &metadata)?;
+            engine.sync_index_cache(&tx_key, &metadata)?;
+        }
 
         // 10. Update the DAH secondary index (two-phase durable). When the
         // caller asked to defer (batched spend path), return the transition so
@@ -8353,17 +8374,23 @@ impl PreparedSpend {
 
         // Phase 2: commit each redb DAH transaction (intent already durable, so
         // pass no log — recovery reconciles from primary metadata regardless).
-        let mut dah = engine.dah_index.lock();
+        // The sharded wrapper locks each key's own shard per call, so distinct
+        // keys in the batch commit against independent shard locks instead of
+        // serialising on the former single global DAH mutex.
         let _writer_gauge = crate::metrics::writer_enter();
         for &(tx_key, old_height, new_height) in transitions {
             if old_height != 0 {
-                dah.remove(&tx_key, None)
+                engine
+                    .dah_index
+                    .remove(&tx_key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("dah secondary remove (batched): {e}"),
                     })?;
             }
             if new_height != 0 {
-                dah.insert(new_height, tx_key, None)
+                engine
+                    .dah_index
+                    .insert(new_height, tx_key, None)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("dah secondary insert (batched): {e}"),
                     })?;
@@ -8592,7 +8619,7 @@ fn overflow_block_size(metadata: &TxMetadata, alignment: usize) -> usize {
 fn write_overflow_entries(
     device: &dyn BlockDevice,
     record_offset: u64,
-    allocator: &parking_lot::Mutex<SlotAllocator>,
+    allocator: &parking_lot::Mutex<BoxedAllocator>,
     metadata: &mut TxMetadata,
     entries: &[BlockEntry],
 ) -> Result<(), crate::device::DeviceError> {
@@ -9047,8 +9074,11 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         let engine = Engine::new_multi_store(
             dev0.clone(),
-            alloc0,
-            vec![(dev1.clone(), alloc1)],
+            Box::new(alloc0),
+            vec![(
+                dev1.clone(),
+                Box::new(alloc1) as crate::allocator::BoxedAllocator,
+            )],
             ShardedIndex::from_single(Index::new(100).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -9064,7 +9094,9 @@ mod tests {
         let a1 = engine.allocator_for(1) as *const _;
         assert_ne!(a0, a1);
         // Round-robin placement cycles across both stores and stays in range.
-        let picks: Vec<u8> = (0..4).map(|_| engine.place_new_record()).collect();
+        // (Round-robin ignores the txid, so any value works here.)
+        let zero = [0u8; 32];
+        let picks: Vec<u8> = (0..4).map(|_| engine.place_new_record(&zero)).collect();
         assert_eq!(picks, vec![0, 1, 0, 1]);
     }
 
@@ -10576,6 +10608,607 @@ mod tests {
         );
     }
 
+    /// Increment 4b-1: the engine caches per-store log-structured-ness from the
+    /// allocator so the spend path can branch (relocate vs in-place) without
+    /// locking the allocator on the hot path.
+    #[test]
+    fn store_log_structured_reflects_the_allocator_engine() {
+        // Segment allocator → log-structured store.
+        let seg_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg = crate::segment_allocator::SegmentAllocator::new(seg_dev.clone(), 8 * 1024 * 1024)
+            .unwrap();
+        let seg_engine = Engine::new(
+            seg_dev,
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert!(seg_engine.store_is_log_structured(0));
+
+        // In-place (SlotAllocator) → NOT log-structured.
+        let slot_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let slot = SlotAllocator::new(slot_dev.clone()).unwrap();
+        let slot_engine = Engine::new(
+            slot_dev,
+            Index::new(64).unwrap(),
+            slot,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert!(!slot_engine.store_is_log_structured(0));
+    }
+
+    // ---- Increment 4b-2: the `relocate_record` primitive (segment engine) ----
+
+    /// Build a segment-engine `Engine` with one seeded 4-UTXO record (all
+    /// unspent), returning `(engine, device, key, metadata, slots, old_offset)`.
+    fn seg_engine_with_record() -> (
+        Arc<Engine>,
+        Arc<dyn BlockDevice>,
+        TxKey,
+        TxMetadata,
+        Vec<UtxoSlot>,
+        u64,
+    ) {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg =
+            crate::segment_allocator::SegmentAllocator::new(dev.clone(), 8 * 1024 * 1024).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        assert!(engine.store_is_log_structured(0));
+
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0xAB;
+        let key = TxKey { txid };
+
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i as u8) + 1;
+                UtxoSlot::new_unspent(h)
+            })
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: offset,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+
+        (engine, dev, key, meta, slots, offset)
+    }
+
+    /// F-G2-001: `read_metadata_for_key` must tell a benign delete/relocate
+    /// race (record gone under a lock-free-captured offset) apart from genuine
+    /// on-device corruption. When the CRC-checked fast read fails, it
+    /// re-resolves the key through the primary index:
+    ///   - still mapped to THIS (device, offset) → surface the StorageError
+    ///     (real corruption worth reporting);
+    ///   - moved or unmapped                      → return TxNotFound (the
+    ///     post-delete answer; the unregister→tombstone ordering guarantees the
+    ///     re-lookup observes the removal whenever the zeroed header is visible).
+    #[test]
+    fn read_metadata_for_key_distinguishes_race_from_corruption() {
+        let (engine, dev, key, _meta, _slots, offset) = seg_engine_with_record();
+
+        // Corrupt the on-device metadata header: overwrite it with raw zeros so
+        // the stored CRC (0x0000_0000) no longer matches the computed CRC and
+        // the lock-free read fails — the exact shape a just-tombstoned/torn
+        // header presents to a reader that captured the offset pre-unregister.
+        let align = dev.alignment();
+        let zbuf = AlignedBuf::new(io::align_up(METADATA_SIZE, align), align);
+        dev.pwrite_all_at(&zbuf, offset).unwrap();
+
+        // Sanity: the raw fast read now errors on the zeroed header.
+        let raw = engine.read_metadata_fast(0, offset);
+        assert!(
+            matches!(raw, Err(SpendError::StorageError { .. })),
+            "zeroed header must fail the CRC-checked fast read, got {raw:?}"
+        );
+
+        // Case A — key STILL maps to this (device, offset): genuine corruption,
+        // surface the storage error rather than masking it as a missing tx.
+        let still_here = engine.read_metadata_for_key(0, &key, offset);
+        assert!(
+            matches!(still_here, Err(SpendError::StorageError { .. })),
+            "current mapping → corruption must surface as StorageError, got {still_here:?}"
+        );
+
+        // Case B — the delete unregistered the key first (unregister→tombstone
+        // ordering): the re-lookup observes the removal and the same failed read
+        // now resolves to TxNotFound, the post-delete answer the caller expects.
+        engine.index.unregister(&key);
+        let gone = engine.read_metadata_for_key(0, &key, offset);
+        assert!(
+            matches!(gone, Err(SpendError::TxNotFound)),
+            "unmapped key → benign race must resolve to TxNotFound, got {gone:?}"
+        );
+    }
+
+    /// F-X-007 (BC-02) regression: the cache-path `write_zeroed_metadata_header`
+    /// (delete's tombstone) must hold the per-block write guard across its RMW.
+    /// Before the fix it did a bare pread+patch+pwrite with NO lock, so for a
+    /// packed record it wrote the WHOLE covering block back and clobbered a
+    /// block-neighbour packed record a concurrent writer had just written
+    /// (all-zero neighbour → `CRC mismatch: expected 0x00000000` on a later
+    /// setMined/delete read; observed on the segment engine under load).
+    ///
+    /// A cache-backed device (`as_raw_ptr == None`) forces the cache branch. The
+    /// test holds the block's write guard and asserts the tombstone BLOCKS on it
+    /// (it completes only once the guard is released) — proving the RMW is now
+    /// serialized against every other writer of the shared block.
+    #[test]
+    fn tombstone_cache_path_holds_block_write_guard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mem: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev: Arc<dyn BlockDevice> = Arc::new(crate::cache::CachingDevice::new(
+            mem,
+            64 * 1024 * 1024,
+            true,
+            3_600_000,
+        ));
+        let seg =
+            crate::segment_allocator::SegmentAllocator::new(dev.clone(), 8 * 1024 * 1024).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        // The whole point: the cache device exposes no raw pointer, so the
+        // tombstone takes the (previously unlocked) cache branch.
+        assert!(engine.device_ptr_for(0).is_null());
+
+        let utxo_count = 4u32;
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = [0x5A; 32];
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|_| UtxoSlot::new_unspent([0u8; 32]))
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        // Hold the per-block write guard the fixed tombstone must acquire.
+        let guards = io::lock_span_blocks(offset, METADATA_SIZE as u64);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let e2 = engine.clone();
+        let d2 = done.clone();
+        let h = std::thread::spawn(move || {
+            e2.write_zeroed_metadata_header(0, offset, record_size)
+                .unwrap();
+            d2.store(true, Ordering::SeqCst);
+        });
+        // While the guard is held the tombstone cannot make progress.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "tombstone must block on the per-block write guard (unlocked = clobbers neighbours)"
+        );
+        drop(guards);
+        h.join().unwrap();
+        assert!(
+            done.load(Ordering::SeqCst),
+            "tombstone completes once the block write guard is released"
+        );
+    }
+
+    #[test]
+    fn relocate_record_moves_record_verbatim() {
+        let (engine, dev, key, meta, slots, old_offset) = seg_engine_with_record();
+
+        // Pure move: no baked-in mutation.
+        let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
+        assert_ne!(
+            new_offset, old_offset,
+            "append-cursor must hand out a fresh offset"
+        );
+
+        // Index now points at the new offset.
+        let entry = engine
+            .lookup(&key)
+            .expect("key still indexed after relocate");
+        assert_eq!(entry.record_offset, new_offset);
+        assert_eq!(entry.utxo_count, 4);
+
+        // The relocated image is byte-faithful: metadata identity + every slot.
+        let m2 = io::read_metadata(&*dev, new_offset).unwrap();
+        assert_eq!({ m2.tx_id }, key.txid);
+        assert_eq!({ m2.utxo_count }, 4);
+        let s2 = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        for (i, orig) in slots.iter().enumerate() {
+            assert_eq!(s2[i].hash, orig.hash, "slot {i} hash preserved");
+            assert_eq!(s2[i].status, UTXO_UNSPENT, "slot {i} status preserved");
+        }
+
+        // The old extent is dead-marked but its bytes stay intact (append-only
+        // never overwrites until defrag), so a lock-free reader that still holds
+        // the old offset reads a valid record rather than garbage.
+        let m_old = io::read_metadata(&*dev, old_offset).unwrap();
+        assert_eq!({ m_old.tx_id }, key.txid);
+    }
+
+    #[test]
+    fn relocate_record_bakes_in_slot_and_metadata_mutation() {
+        let (engine, dev, key, meta, slots, _old) = seg_engine_with_record();
+
+        // Mutate metadata (spend bookkeeping) + flip slot 1 to SPENT — the exact
+        // shape the segment spend path will hand the primitive in 4c.
+        let mut new_meta = meta;
+        new_meta.spent_utxos = 1;
+        new_meta.generation = 7;
+        let spending_data = [0x42u8; 36];
+        let spent_slot = UtxoSlot::new_spent(slots[1].hash, spending_data);
+
+        let new_offset = engine
+            .relocate_record(0, &key, &new_meta, &[(1, spent_slot.clone())])
+            .unwrap();
+
+        // Baked-in metadata landed.
+        let m = io::read_metadata(&*dev, new_offset).unwrap();
+        assert_eq!({ m.spent_utxos }, 1);
+        assert_eq!({ m.generation }, 7);
+
+        // Slot 1 is SPENT with the new spending data; the others are untouched.
+        let s = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        assert_eq!(s[1].status, UTXO_SPENT);
+        assert_eq!(s[1].spending_data, spending_data);
+        assert_eq!(s[1].hash, slots[1].hash);
+        assert_eq!(s[0].status, UTXO_UNSPENT);
+        assert_eq!(s[2].status, UTXO_UNSPENT);
+        assert_eq!(s[3].status, UTXO_UNSPENT);
+
+        // The index cached fields are rebuilt from the new metadata — identical to
+        // what `replay_relocate` reconstructs from the device (live == recovered).
+        let entry = engine.lookup(&key).unwrap();
+        assert_eq!(entry.record_offset, new_offset);
+        assert_eq!(entry.spent_utxos, 1);
+        assert_eq!(entry.generation, 7);
+    }
+
+    #[test]
+    fn relocate_record_journals_relocate_intent() {
+        use crate::redo::{RedoLog, RedoOp};
+
+        let (engine, _dev, key, meta, _slots, _old) = seg_engine_with_record();
+
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
+        engine.set_redo_log(Arc::new(parking_lot::Mutex::new(log)));
+
+        let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
+
+        // Buffered append: flush so a fresh reopen can recover it.
+        engine.redo_log().unwrap().lock().flush().unwrap();
+
+        let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::Relocate { tx_key, device_id, record_offset, utxo_count }
+                    if *tx_key == key
+                        && *device_id == 0
+                        && *record_offset == new_offset
+                        && *utxo_count == 4
+            )),
+            "a Relocate intent for the new offset must be journaled"
+        );
+    }
+
+    #[test]
+    fn relocate_record_rejects_out_of_range_vout() {
+        let (engine, _dev, key, meta, slots, _old) = seg_engine_with_record();
+
+        // vout 4 is out of range for a 4-UTXO record (valid: 0..=3).
+        let err = engine
+            .relocate_record(0, &key, &meta, &[(4, slots[0].clone())])
+            .unwrap_err();
+        match err {
+            SpendError::StorageError { detail } => {
+                assert!(detail.contains("vout 4"), "got: {detail}");
+            }
+            other => panic!("expected StorageError, got {other:?}"),
+        }
+    }
+
+    /// Increment 5c: the checkpoint's defrag fast path reclaims a drained segment
+    /// through the engine, bounding growth. Drains a segment via the allocator,
+    /// then `defrag_reclaim_fully_dead` (what the checkpoint calls) reclaims it.
+    #[test]
+    fn defrag_reclaim_fully_dead_reclaims_a_drained_segment() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        // 2-block segments so a single segment drains quickly.
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 2 * 4096).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        // Fill seg0, advance into seg1, then dead-mark all of seg0.
+        {
+            let alloc = engine.allocator_for(0);
+            let mut a = alloc.lock();
+            let o0 = a.allocate(4096).unwrap();
+            let o1 = a.allocate(4096).unwrap(); // seg0 full
+            let _ = a.allocate(4096).unwrap(); // seg1 open
+            a.free(o0, 4096).unwrap();
+            a.free(o1, 4096).unwrap(); // seg0 fully dead
+        }
+        assert_eq!(
+            engine.defrag_reclaim_fully_dead(),
+            1,
+            "the drained seg0 must be reclaimed"
+        );
+        // Idempotent: nothing left to reclaim.
+        assert_eq!(engine.defrag_reclaim_fully_dead(), 0);
+    }
+
+    /// An in-place (SlotAllocator) engine reclaims nothing — the fast path is a
+    /// no-op there (freelist reuse, not segments).
+    #[test]
+    fn defrag_reclaim_is_noop_for_in_place_engine() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let slot = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            slot,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert_eq!(engine.defrag_reclaim_fully_dead(), 0);
+    }
+
+    /// Increment 5c-2: compaction relocates the few LIVE records out of a
+    /// partially-dead victim segment so it drains and can be reclaimed.
+    #[test]
+    fn defrag_compact_relocates_live_records_out_of_a_victim_segment() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg_size = 4 * 4096; // 4-block segments
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), seg_size).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            Index::new(256).unwrap(),
+            seg,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let record_size = TxMetadata::record_size_for(1);
+
+        // Fill seg0 with 4 one-block reservations; only the LAST holds a live,
+        // indexed record. The first three are dead-marked below (simulating
+        // records that were deleted / relocated away), leaving seg0 75% dead.
+        let o0 = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let o1 = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let o2 = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let o_live = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let seg0_start = o0; // first allocation is the segment-0 base
+        let seg0_end = seg0_start + seg_size;
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0x5C;
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        let slots = vec![UtxoSlot::new_unspent([0x5C; 32])];
+        io::write_full_record(&*dev, o_live, &meta, &slots).unwrap();
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: o_live,
+                    utxo_count: 1,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+        // Advance past seg0 (seal it) and dead-mark the three unindexed blocks.
+        let _ = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        for off in [o0, o1, o2] {
+            engine
+                .allocator_for(0)
+                .lock()
+                .free(off, record_size)
+                .unwrap();
+        }
+        // seg0 is now 3/4 dead with one live record — a compaction victim.
+        assert!((seg0_start..seg0_end).contains(&engine.lookup(&key).unwrap().record_offset));
+
+        let relocated = engine.defrag_compact(4, 0.7);
+        assert_eq!(relocated, 1, "the one live record must be relocated out");
+
+        // The record now lives OUTSIDE seg0, and reads through the index still see
+        // it (relocate re-pointed the index).
+        let new_off = engine.lookup(&key).unwrap().record_offset;
+        assert!(
+            !(seg0_start..seg0_end).contains(&new_off),
+            "relocated record must leave the victim segment"
+        );
+        assert_eq!(engine.read_slot(&key, 0).unwrap().hash, [0x5C; 32]);
+        // seg0 is now fully dead and reclaims.
+        assert_eq!(engine.defrag_reclaim_fully_dead(), 1);
+    }
+
+    /// Compaction is a no-op when nothing is dead enough (self-gating).
+    #[test]
+    fn defrag_compact_is_noop_below_the_dead_threshold() {
+        let (engine, _dev, _key, _meta, _slots, _off) = seg_engine_with_record();
+        // A single all-live record: no segment is partially dead.
+        assert_eq!(engine.defrag_compact(4, 0.75), 0);
+    }
+
+    /// Increment 4c: a spend on the segment engine, driven through the PRODUCTION
+    /// apply path (`spend_multi` → `ValidatedSpend::apply` → `apply_locked`),
+    /// relocates the record instead of mutating it in place.
+    #[test]
+    fn segment_spend_relocates_record_through_apply_path() {
+        use crate::redo::RedoLog;
+
+        let (engine, dev, key, _meta, slots, old_offset) = seg_engine_with_record();
+
+        // Attach a buffered redo log — the segment spend journals a Relocate at
+        // apply time and requires buffered durability.
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
+        engine.set_redo_log(Arc::new(parking_lot::Mutex::new(log)));
+        engine.set_buffered_durability(true);
+
+        let spending_data = [0x9Au8; 36];
+        let req = SpendMultiRequest {
+            tx_key: key,
+            spends: vec![SpendItem {
+                offset: 0,
+                utxo_hash: slots[0].hash,
+                spending_data,
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+
+        let resp = engine.spend_multi(&req).unwrap();
+        assert_eq!(resp.spent_count, 1);
+
+        // The record RELOCATED: the index now points at a fresh offset.
+        let entry = engine.lookup(&key).unwrap();
+        assert_ne!(
+            entry.record_offset, old_offset,
+            "segment spend must relocate the record to a new offset"
+        );
+        let new_offset = entry.record_offset;
+        assert_eq!(entry.spent_utxos, 1);
+
+        // The spend landed at the NEW offset: slot 0 SPENT, others untouched.
+        let s = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        assert_eq!(s[0].status, UTXO_SPENT);
+        assert_eq!(s[0].spending_data, spending_data);
+        assert_eq!(s[1].status, UTXO_UNSPENT);
+        let m = io::read_metadata(&*dev, new_offset).unwrap();
+        assert_eq!({ m.spent_utxos }, 1);
+
+        // Reading back THROUGH the engine (index → new offset) observes the spend.
+        let via_engine = engine.read_slot(&key, 0).unwrap();
+        assert_eq!(via_engine.status, UTXO_SPENT);
+
+        // A second spend of a different vout relocates again and accumulates.
+        let req2 = SpendMultiRequest {
+            tx_key: key,
+            spends: vec![SpendItem {
+                offset: 1,
+                utxo_hash: slots[1].hash,
+                spending_data: [0x9Bu8; 36],
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 100,
+            block_height_retention: 288,
+        };
+        let resp2 = engine.spend_multi(&req2).unwrap();
+        assert_eq!(resp2.spent_count, 1);
+        let entry2 = engine.lookup(&key).unwrap();
+        assert_ne!(
+            entry2.record_offset, new_offset,
+            "second spend relocates again"
+        );
+        assert_eq!(entry2.spent_utxos, 2);
+        // Both spends are visible at the latest offset.
+        assert_eq!(engine.read_slot(&key, 0).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&key, 1).unwrap().status, UTXO_SPENT);
+        assert_eq!(engine.read_slot(&key, 2).unwrap().status, UTXO_UNSPENT);
+    }
+
+    #[test]
+    fn relocate_record_absent_key_is_tx_not_found() {
+        let (engine, _dev, _key, meta, _slots, _old) = seg_engine_with_record();
+        let mut other = [0u8; 32];
+        other[0] = 0xFF;
+        let missing = TxKey { txid: other };
+        match engine.relocate_record(0, &missing, &meta, &[]) {
+            Err(SpendError::TxNotFound) => {}
+            other => panic!("expected TxNotFound, got {other:?}"),
+        }
+    }
+
     #[test]
     fn concurrent_different_transactions() {
         let dev: Arc<dyn BlockDevice> =
@@ -11898,7 +12531,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // F-X-022 — Aerospike `addDeletedChildren` parity tests
+    // F-X-022 — the reference UDF `addDeletedChildren` parity tests
     // -----------------------------------------------------------------------
 
     /// F-X-022: a fresh record has no deleted children — `read_deleted_children`
@@ -11948,6 +12581,55 @@ mod tests {
     /// transition still fires (verified separately by
     /// `prune_slot_if_spent_by_child_updates_counters_once`); this test
     /// pins the SECONDARY audit-trail invariant.
+    #[test]
+    fn packed_children_block_write_preserves_neighbour_record() {
+        // Regression for the pooled packed-delete corruption: in packed mode a
+        // children block shares a device block with a neighbour record, so the
+        // children-block write MUST read-modify-write to preserve the neighbour.
+        // A bare aligned write zeroes the neighbour → CRC mismatch on read (seen
+        // via prune_slot_if_spent_by_child: "record corruption: CRC mismatch").
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        alloc.set_packed(true);
+        let engine = Engine::new(
+            dev,
+            Index::new(100).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert!(engine.store_is_packed(0), "test requires a packed store");
+
+        // Fill block 0 with a sentinel standing in for a neighbour record.
+        let sentinel = 0xABu8;
+        let mut block = crate::device::AlignedBuf::new(4096, 4096);
+        block[..].fill(sentinel);
+        engine.device_for(0).pwrite_all_at(&block, 0).unwrap();
+
+        // Write a children block packed into the SAME block 0 at a sub-block
+        // offset past the neighbour. Pre-fix this zeroed [0,800) and [832,4096).
+        let child = [0x11u8; 32];
+        engine.write_children_block(0, 800, &[child]).unwrap();
+
+        let mut back = crate::device::AlignedBuf::new(4096, 4096);
+        engine.device_for(0).pread_exact_at(&mut back, 0).unwrap();
+        assert!(
+            back[..800].iter().all(|&b| b == sentinel),
+            "neighbour prefix must be preserved by RMW, not zeroed"
+        );
+        assert_eq!(
+            &back[800..832],
+            &child,
+            "children written at the packed offset"
+        );
+        assert!(
+            back[832..4096].iter().all(|&b| b == sentinel),
+            "neighbour suffix must be preserved by RMW, not zeroed"
+        );
+    }
+
     #[test]
     fn prune_slot_if_spent_by_child_appends_to_deleted_children_list() {
         let h = TestHarness::new(3, TxFlags::empty());
@@ -13856,8 +14538,8 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         Arc::new(Engine::new_multi_store(
             dev0,
-            alloc0,
-            vec![(dev1, alloc1)],
+            Box::new(alloc0),
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -13923,6 +14605,169 @@ mod tests {
         engine.spend_multi(&multi).expect("spend on store 1");
         let slot = engine.read_slot(&store1_key, 0).expect("read spent slot");
         assert!(slot.is_spent(), "slot on store 1 must read back as spent");
+    }
+
+    /// Build a 4-byte CreateRequest whose txid's LAST 8 bytes encode `tail`
+    /// (little-endian); leading bytes are derived from `n` so different records
+    /// have distinct keys. Used to drive deterministic txid placement.
+    fn make_create_req_with_tail(
+        n: u8,
+        tail: u64,
+        utxo_count: usize,
+    ) -> (Vec<[u8; 32]>, CreateRequest<'static>) {
+        let (hashes, mut req) = make_create_req(n, utxo_count);
+        // Overwrite the trailing 8 bytes so txid placement is fully controlled.
+        req.tx_id[24..32].copy_from_slice(&tail.to_le_bytes());
+        (hashes, req)
+    }
+
+    /// A two-store engine in deterministic txid-placement mode, returning the
+    /// engine plus the underlying store devices and a snapshot of their
+    /// allocators (for a recovery-by-device-scan test). Devices are shared
+    /// `Arc`s, so writes through the engine are visible on the returned handles.
+    fn create_two_store_engine_txid() -> (
+        Engine,
+        Vec<Arc<dyn BlockDevice>>,
+        Arc<dyn BlockDevice>,
+        Arc<dyn BlockDevice>,
+    ) {
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let mut engine = Engine::new_multi_store(
+            dev0.clone(),
+            Box::new(alloc0),
+            vec![(
+                dev1.clone(),
+                Box::new(alloc1) as crate::allocator::BoxedAllocator,
+            )],
+            ShardedIndex::from_single(Index::new(1000).unwrap().into()),
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        engine.set_placement_strategy(crate::subdevice::PlacementStrategy::Txid);
+        (engine, vec![dev0.clone(), dev1.clone()], dev0, dev1)
+    }
+
+    #[test]
+    fn txid_placement_create_lands_in_hashed_store_and_reads_back() {
+        let (engine, _devs, _d0, _d1) = create_two_store_engine_txid();
+        assert_eq!(engine.store_count(), 2);
+
+        // Pick tails that land on each store: store = tail % 2.
+        // tail=10 -> store 0, tail=11 -> store 1, tail=20 -> store 0, tail=21 -> store 1.
+        let cases: [(u8, u64); 4] = [(1, 10), (2, 11), (3, 20), (4, 21)];
+        let mut keys = Vec::new();
+        let mut hashes_by_key = Vec::new();
+        for (n, tail) in cases {
+            let (hashes, req) = make_create_req_with_tail(n, tail, 3);
+            engine.create(&req).expect("create");
+            keys.push((req.tx_key(), tail));
+            hashes_by_key.push(hashes);
+        }
+
+        for (i, (key, tail)) in keys.iter().enumerate() {
+            let expected_store = (tail % 2) as u8;
+            let entry = engine.lookup(key).expect("entry");
+            assert_eq!(
+                entry.device_id, expected_store,
+                "record {i} (tail {tail}) must land on store {expected_store} = tail % num_stores",
+            );
+            // Reads route by the recorded device_id (the normal path) — correct
+            // contents prove the record is on, and read from, the right store.
+            let meta = engine.read_metadata(key).expect("read_metadata");
+            assert_eq!(meta.tx_id, key.txid, "record {i} read from the wrong store");
+            let slots = engine.read_slots(key).expect("read_slots");
+            assert_eq!(slots.len(), hashes_by_key[i].len(), "record {i} slot count");
+        }
+
+        // Both stores were actually used (txids covered store 0 and store 1).
+        let used: std::collections::BTreeSet<u8> = keys
+            .iter()
+            .map(|(k, _)| engine.lookup(k).unwrap().device_id)
+            .collect();
+        assert_eq!(
+            used,
+            std::collections::BTreeSet::from([0, 1]),
+            "txid placement must have used both stores for this txid set",
+        );
+    }
+
+    #[test]
+    fn txid_placement_records_recover_with_correct_device_id_across_restart() {
+        // Create several records in txid mode, then simulate a restart: drop the
+        // engine's in-memory index and rebuild it by scanning EVERY store's
+        // device (the multi-store recovery path). Each record must be recovered
+        // with the device_id of the store it physically lives on (== txid
+        // placement) and read back correctly.
+        let (dev0, dev1, keys) = {
+            let (engine, _devs, dev0, dev1) = create_two_store_engine_txid();
+            // Tails covering both stores. tail % 2 decides the store.
+            let cases: [(u8, u64); 6] =
+                [(1, 100), (2, 101), (3, 102), (4, 103), (5, 200), (6, 201)];
+            let mut keys = Vec::new();
+            for (n, tail) in cases {
+                let (_h, req) = make_create_req_with_tail(n, tail, 3);
+                engine.create(&req).expect("create");
+                keys.push((req.tx_key(), (tail % 2) as u8));
+            }
+            // Persist each store's allocator header (what a checkpoint does)
+            // so the post-restart recover() sees the correct high-water mark
+            // and the device scan covers every written record.
+            for id in 0..engine.store_count() as u8 {
+                engine.allocator_for(id).lock().persist().unwrap();
+            }
+            (dev0, dev1, keys)
+        }; // engine (and its index) dropped here — the "restart".
+
+        // Reconstruct allocators from the persisted device headers (the real
+        // boot path), then rebuild the index by scanning every store's device.
+        let a0 = SlotAllocator::recover(dev0.clone()).unwrap();
+        let a1 = SlotAllocator::recover(dev1.clone()).unwrap();
+        let devices: Vec<Arc<dyn BlockDevice>> = vec![dev0.clone(), dev1.clone()];
+        let allocators: Vec<crate::allocator::BoxedAllocator> = vec![Box::new(a0), Box::new(a1)];
+        let rebuilt =
+            ShardedIndex::rebuild_in_memory_multi_store(&devices, &allocators, 16, 0).unwrap();
+
+        assert_eq!(
+            rebuilt.len(),
+            keys.len(),
+            "every txid-placed record must be recovered from its store after restart",
+        );
+
+        // Rebuild an engine over the recovered index + same devices and read
+        // each record back through the normal (index-routed) read path.
+        let alloc0 = SlotAllocator::recover(devices[0].clone()).unwrap();
+        let alloc1 = SlotAllocator::recover(devices[1].clone()).unwrap();
+        let engine2 = Engine::new_multi_store(
+            devices[0].clone(),
+            Box::new(alloc0),
+            vec![(
+                devices[1].clone(),
+                Box::new(alloc1) as crate::allocator::BoxedAllocator,
+            )],
+            rebuilt,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        for (key, expected_store) in &keys {
+            let entry = engine2.lookup(key).expect("recovered entry");
+            assert_eq!(
+                entry.device_id, *expected_store,
+                "recovered record must carry the device_id of the store it lives on",
+            );
+            let meta = engine2.read_metadata(key).expect("read recovered record");
+            assert_eq!(
+                meta.tx_id, key.txid,
+                "recovered record read from wrong store"
+            );
+        }
     }
 
     #[test]
@@ -14073,7 +14918,7 @@ mod tests {
                 record_offset: 4096,
                 utxo_count: 0,
                 is_conflicting: false,
-                record_bytes: vec![0u8; 64],
+                record_bytes: vec![0u8; 64].into(),
                 parent_txids: Vec::new(),
             },
             RedoOp::Freeze {
@@ -14194,8 +15039,8 @@ mod tests {
         let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
         let engine = Engine::new_multi_store(
             dev0,
-            alloc0,
-            vec![(dev1, alloc1)],
+            Box::new(alloc0),
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
@@ -14433,21 +15278,20 @@ mod tests {
         );
     }
 
-    /// P1 (review): an OVERSIZED routed batch — one whose redo footprint
-    /// exceeds the store's forward headroom — must fail CLEANLY: return the
-    /// redo-full error, append nothing, and leave the log USABLE. It must NOT
-    /// poison/brick the store. The `would_fit` pre-flight in
-    /// `append_redo_ops_routed` rejects before any partial append, so no
-    /// consumed-sequence residue can diverge durable from acknowledged state —
-    /// which is what the old "append until LogFull mid-batch, then poison" path
-    /// did (bricking the store's log until restart on a merely-too-big batch).
+    /// Lever 6: an over-capacity batch (`LogFull`) in `append_redo_ops_routed`
+    /// must fail closed but stay TRANSIENT — the log is rejected atomically with
+    /// no buffered residue and is NOT poisoned, because `LogFull` is reclaimed by
+    /// the checkpoint. Poisoning would turn a momentarily full log into a
+    /// permanent "restart required" wedge (the bug this replaces: the old path
+    /// poisoned on every mid-batch `LogFull`). After space is reclaimed a fitting
+    /// batch succeeds and is durable.
     #[test]
-    fn append_redo_ops_routed_rejects_oversized_batch_without_poison() {
+    fn append_redo_ops_routed_logfull_is_transient_not_poison() {
         use crate::redo::{RedoLog, RedoOp};
 
         let engine = create_engine(); // single store
-        // Tiny log: a 4 KiB header block + ~4 KiB entries region; a 2000-op
-        // batch vastly exceeds it.
+        // Tiny log: a 4 KiB header block + ~4 KiB entries region holds ~100
+        // small ops, so a 2000-op batch overflows the whole region.
         let rdev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8192, 4096).unwrap());
         let log = RedoLog::open(rdev.clone(), 0, 8192).unwrap();
         let log_arc = Arc::new(parking_lot::Mutex::new(log));
@@ -14462,37 +15306,193 @@ mod tests {
             .collect();
         let err = engine
             .append_redo_ops_routed(&ops)
-            .expect_err("an oversized batch must fail (redo full)");
+            .expect_err("an over-capacity batch must fail closed");
         assert!(
-            err.contains("redo log append failed"),
-            "expected the redo-full error, got: {err}"
+            err.contains("redo log full"),
+            "expected the transient full-log error, got: {err}"
         );
 
-        // The log is NOT poisoned: a normal small append still succeeds, so the
-        // store is not bricked by a single oversized request.
-        assert!(
-            log_arc
-                .lock()
-                .append(RedoOp::AllocateRegion {
-                    device_id: 0,
-                    offset: 0,
-                    size: 4096,
-                })
-                .is_ok(),
-            "log must remain usable after rejecting an oversized batch (no poison/brick)"
-        );
-        log_arc
-            .lock()
-            .flush()
-            .expect("flush of the small append must succeed");
+        // The log is NOT poisoned and carries no residue: the over-capacity
+        // batch buffered nothing, so a small batch appends and flushes cleanly.
+        let small: Vec<RedoOp> = (0..2u64)
+            .map(|i| RedoOp::AllocateRegion {
+                device_id: 0,
+                offset: i * 4096,
+                size: 4096,
+            })
+            .collect();
+        let (first, last) = engine
+            .append_redo_ops_routed(&small)
+            .expect("log must accept writes — a transient LogFull must not poison");
+        assert_eq!(last - first, 1, "two ops -> span of 2 sequences");
 
-        // The rejected batch left NO residue: only the one post-reject append is
-        // durable (the oversized batch appended nothing, drew no sequence).
+        // Only the small batch is durable; the failed big batch left no residue.
         let fresh = RedoLog::open(rdev, 0, 8192).unwrap();
         assert_eq!(
             fresh.recover().unwrap().len(),
-            1,
-            "only the post-reject append is durable; the oversized batch left no residue"
+            2,
+            "only the fitting batch is durable; no residue from the rejected batch"
+        );
+    }
+
+    #[test]
+    fn append_redo_ops_routed_coalesces_concurrent_writers() {
+        use crate::redo::{RedoLog, RedoOp};
+
+        // Single store, per-store redo over a sync-counting device so we can see
+        // how many fsyncs N concurrent routed writers actually cost.
+        let engine = create_engine();
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let (cdev, syncs) = SyncCountingDevice::new(inner);
+        let log = RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        let baseline = syncs.load(Ordering::SeqCst);
+
+        const N: usize = 16;
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let engine = engine.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    engine
+                        .append_redo_ops_routed(&[RedoOp::Delete {
+                            tx_key: TxKey {
+                                txid: [i as u8; 32],
+                            },
+                            record_offset: i as u64 * 4096,
+                            record_size: 4096,
+                        }])
+                        .expect("routed write ok")
+                })
+            })
+            .collect();
+        let mut ranges: Vec<(u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let fsyncs = syncs.load(Ordering::SeqCst) - baseline;
+        assert!(fsyncs >= 1, "must flush at least once");
+        assert!(
+            fsyncs < N as u64,
+            "routed group commit must coalesce concurrent writers: {N} writers used \
+             {fsyncs} fsyncs (expected < {N})"
+        );
+
+        // Every writer got a distinct, contiguous single-sequence range — no
+        // lost, duplicated, or overlapping sequence under the coalescing.
+        ranges.sort();
+        assert_eq!(ranges.len(), N);
+        for i in 1..ranges.len() {
+            assert_eq!(ranges[i].0, ranges[i].1, "one op -> one sequence");
+            assert_eq!(
+                ranges[i].0,
+                ranges[i - 1].0 + 1,
+                "routed ranges must be contiguous with no gap/dup"
+            );
+        }
+    }
+
+    /// Drive `n` two-phase secondary-index updates (the `setMined` reorg path
+    /// that journals `SecondaryDahUpdate`/`SecondaryUnminedUpdate`) over a redo
+    /// log on a sync-counting device, and return how many redo fsyncs it cost.
+    /// `buffered` selects the durability mode under test. Each key is setMined
+    /// twice (off-chain then on-chain) so `unmined_since` is guaranteed to move
+    /// on at least one call regardless of the create-time default — i.e. the
+    /// secondary path provably fires for every key.
+    fn secondary_update_fsyncs(n: u8, buffered: bool) -> u64 {
+        let data_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Arc::new(Engine::new(
+            data_dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Redo log on its OWN sync-counting device so the count is exactly the
+        // secondary-path fsyncs, not data-device flushes.
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let (cdev, syncs) = SyncCountingDevice::new(inner);
+        let log =
+            crate::redo::RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        engine.set_buffered_durability(buffered);
+
+        // Create n records.
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let (_, req) = make_create_req(i + 1, 2);
+            engine.create(&req).unwrap();
+            keys.push(req.tx_key());
+        }
+
+        // Count only the secondary-path fsyncs (skip create's own journalling).
+        let baseline = syncs.load(Ordering::SeqCst);
+
+        let off_chain = SetMinedSharedParams {
+            block_id: 7,
+            block_height: 900_000,
+            subtree_idx: 0,
+            current_block_height: 900_000,
+            block_height_retention: 288,
+            on_longest_chain: false,
+            unset_mined: false,
+        };
+        let on_chain = SetMinedSharedParams {
+            on_longest_chain: true,
+            ..off_chain
+        };
+        for r in engine.set_mined_batch(&off_chain, &keys) {
+            r.expect("off-chain setMined ok");
+        }
+        for r in engine.set_mined_batch(&on_chain, &keys) {
+            r.expect("on-chain setMined ok");
+        }
+
+        // Make the buffered tail durable, exactly as the background flusher /
+        // checkpoint would, and assert the writes ARE recoverable (durability is
+        // preserved, just deferred).
+        engine.flush_all_redo().expect("flush ok");
+
+        syncs.load(Ordering::SeqCst) - baseline
+    }
+
+    #[test]
+    fn buffered_secondary_index_updates_coalesce_fsyncs() {
+        // PIN/FIX: in buffered durability the two-phase secondary-index path
+        // (`update_both_secondary_indexes` inside setMined) must NOT fsync the
+        // redo per key — it appends and lets the background flusher coalesce the
+        // tail into one fsync. Pre-fix every secondary update called
+        // `RedoLog::flush` directly (one fsync per key, the ~600 fsync/s
+        // bottleneck); post-fix N keys × 2 updates cost a single trailing flush.
+        const N: u8 = 32;
+
+        // Strict mode is the control: it fsyncs per update (>= one per key),
+        // proving the secondary path provably fires for every key.
+        let strict = secondary_update_fsyncs(N, false);
+        assert!(
+            strict >= u64::from(N),
+            "strict mode must fsync per secondary update: {N} keys gave only {strict} fsyncs \
+             (the path under test did not fire)"
+        );
+
+        // Buffered mode must coalesce: the only fsync is the single explicit
+        // flush_all_redo at the end. No per-key fsync on the append path.
+        let buffered = secondary_update_fsyncs(N, true);
+        assert_eq!(
+            buffered, 1,
+            "buffered secondary updates must not fsync on the ack path; expected exactly the \
+             one trailing flush, got {buffered}"
+        );
+        assert!(
+            buffered * 4 < strict,
+            "buffered ({buffered}) must use far fewer fsyncs than strict ({strict})"
         );
     }
 
@@ -14547,7 +15547,7 @@ mod tests {
             record_offset: 4096,
             utxo_count: 1,
             is_conflicting: false,
-            record_bytes: vec![0xEE; 8192],
+            record_bytes: vec![0xEE; 8192].into(),
             parent_txids: Vec::new(),
         };
         let err = engine
@@ -14694,6 +15694,177 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ))
+    }
+
+    /// Sharded-secondary consistency under concurrency: drive concurrent
+    /// `create` (→ unmined hot helper) + `mark_on_longest_chain` (→ the H1
+    /// `sync_primary_and_both_secondary_atomic` path that touches BOTH secondary
+    /// indexes under the primary shard write guard) + `set_mined` (→ DAH) over
+    /// many disjoint keys, and require the final DAH / unmined membership to
+    /// equal a single-threaded reference run of the SAME workload.
+    ///
+    /// Because each key's operations are deterministic and the key ranges are
+    /// disjoint across threads, any divergence from the reference means the
+    /// sharded secondaries lost, duplicated, or mis-routed an entry — i.e. a
+    /// broken shard route or a lock-ordering regression in the atomic path.
+    #[test]
+    fn secondary_indexes_consistent_under_concurrent_create_setmined() {
+        // txids that spread across BOTH the index-shard bytes [24..32] and the
+        // rest of the key, so the secondaries' per-key routing is exercised.
+        fn spread_txid(n: u64) -> [u8; 32] {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&n.to_le_bytes());
+            txid[8..16].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+            txid[16..24].copy_from_slice(&n.wrapping_mul(0xD1B5_4A32_D192_ED03).to_le_bytes());
+            txid[24..32].copy_from_slice(&n.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).to_le_bytes());
+            txid
+        }
+
+        // Deterministic per-key workload: create the tx as UNMINED (block_height
+        // > 0, no block infos → enters the unmined index), then either clear it
+        // off the unmined index via mark_on_longest_chain (n % 3 == 0) or mine it
+        // on the longest chain via set_mined, which evaluates a delete-at-height
+        // (→ enters the DAH index). The two branches give a mix of final unmined
+        // and DAH entries.
+        fn apply_one(engine: &Engine, n: u64) {
+            let txid = spread_txid(n);
+            let hashes = [[(n as u8).wrapping_add(1); 32]];
+            // The set_mined branch (n not a multiple of 3) creates the tx
+            // CONFLICTING so that the DAH evaluation sets a delete-at-height (the
+            // conflicting branch of `evaluate_delete_at_height` sets DAH
+            // unconditionally when none is set yet); the mark_on_longest_chain
+            // branch (n a multiple of 3) stays clean and only exercises the
+            // unmined transition.
+            let conflicting = !n.is_multiple_of(3);
+            engine
+                .create(&CreateRequest {
+                    tx_id: txid,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 0,
+                    size_in_bytes: 100,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    utxo_hashes: &hashes,
+                    inputs: None,
+                    outputs: None,
+                    inpoints: None,
+                    is_external: false,
+                    created_at: 0,
+                    // Non-zero, no block infos → unmined_since = 700.
+                    block_height: 700,
+                    mined_block_infos: &[],
+                    frozen: false,
+                    conflicting,
+                    locked: false,
+                    external_ref: None,
+                    parent_txids: &[],
+                })
+                .expect("create");
+            let key = TxKey { txid };
+            if conflicting {
+                // Mine on the longest chain: clears unmined AND (because the tx
+                // is conflicting) sets a DAH — exercising the DAH hot helper.
+                engine
+                    .set_mined(&SetMinedRequest {
+                        tx_key: key,
+                        block_id: 1,
+                        block_height: 900,
+                        subtree_idx: 0,
+                        current_block_height: 1000,
+                        block_height_retention: 288,
+                        on_longest_chain: true,
+                        unset_mined: false,
+                    })
+                    .expect("set_mined");
+            } else {
+                // Clear off the unmined index via the atomic both-secondary path.
+                engine
+                    .mark_on_longest_chain(&MarkOnLongestChainRequest {
+                        tx_key: key,
+                        on_longest_chain: true,
+                        current_block_height: 1000,
+                        block_height_retention: 288,
+                    })
+                    .expect("mark_on_longest_chain");
+            }
+        }
+
+        const KEYS: u64 = 4096;
+        const THREADS: u64 = 8;
+
+        // Reference: single-threaded over all keys.
+        let reference = create_sharded_engine(16);
+        for n in 0..KEYS {
+            apply_one(&reference, n);
+        }
+        let ref_dah: std::collections::HashSet<[u8; 32]> = reference
+            .dah_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        let ref_unmined: std::collections::HashSet<[u8; 32]> = reference
+            .unmined_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+
+        // Concurrent: same workload, disjoint key ranges across threads.
+        let concurrent = create_sharded_engine(16);
+        assert!(
+            concurrent.index_shard_count() > 1,
+            "need N>1 to be meaningful"
+        );
+        let per = KEYS / THREADS;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let engine = Arc::clone(&concurrent);
+                std::thread::spawn(move || {
+                    for n in (t * per)..((t + 1) * per) {
+                        apply_one(&engine, n);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        let cc_dah: std::collections::HashSet<[u8; 32]> = concurrent
+            .dah_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+        let cc_unmined: std::collections::HashSet<[u8; 32]> = concurrent
+            .unmined_index()
+            .range_query(u32::MAX)
+            .into_iter()
+            .map(|k| k.txid)
+            .collect();
+
+        assert_eq!(
+            cc_dah, ref_dah,
+            "concurrent DAH membership must equal the single-threaded reference",
+        );
+        assert_eq!(
+            cc_unmined, ref_unmined,
+            "concurrent unmined membership must equal the single-threaded reference",
+        );
+        // Sanity: the workload actually populates DAH and clears most unmined.
+        assert!(!ref_dah.is_empty(), "reference DAH must be non-empty");
+        assert_eq!(
+            reference.dah_index().len(),
+            concurrent.dah_index().len(),
+            "DAH lengths must match (no duplicates / drops)",
+        );
+        assert_eq!(
+            reference.unmined_index().len(),
+            concurrent.unmined_index().len(),
+            "unmined lengths must match (no duplicates / drops)",
+        );
     }
 
     /// Find a `tx_id` (varying only the index-shard bytes `[24..32]`) whose
@@ -15105,6 +16276,55 @@ mod tests {
             Err(CreateError::DuplicateTxId) => {}
             other => panic!("expected DuplicateTxId, got {other:?}"),
         }
+    }
+
+    /// The fused insert-if-absent on the create path must (a) accept a brand
+    /// new txid and grow that key's shard count by one, and (b) reject a
+    /// duplicate txid WITHOUT overwriting the existing index entry and WITHOUT
+    /// perturbing the shard count. A second create whose utxo_count (and hence
+    /// record_offset) differs would change the index entry if the rejected
+    /// insert ever overwrote — this asserts it does not.
+    #[test]
+    fn create_duplicate_txid_does_not_overwrite_or_change_shard_count() {
+        let engine = create_engine();
+
+        // (a) A new txid is accepted; its shard count grows by exactly one.
+        let (_, req_a) = make_create_req(9, 5);
+        let key = req_a.tx_key();
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
+        let count_before = engine.shard_record_count(shard);
+        engine.create(&req_a).unwrap();
+        let count_after_insert = engine.shard_record_count(shard);
+        assert_eq!(
+            count_after_insert,
+            count_before + 1,
+            "a fresh txid must increment its shard count by exactly one",
+        );
+
+        let original = engine.lookup(&key).expect("created entry must exist");
+        assert_eq!(original.utxo_count, 5);
+
+        // (b) A duplicate txid with a DIFFERENT utxo_count is rejected and must
+        // not overwrite the original entry or change the shard count.
+        let (_, mut req_b) = make_create_req(9, 12);
+        // Same txid as req_a (n == 9), but a different record shape.
+        assert_eq!(req_b.tx_key(), key, "test setup: txids must match");
+        req_b.fee = 999; // make the rejected request visibly distinct
+        match engine.create(&req_b) {
+            Err(CreateError::DuplicateTxId) => {}
+            other => panic!("expected DuplicateTxId on overwrite attempt, got {other:?}"),
+        }
+
+        let after_reject = engine.lookup(&key).expect("entry must still exist");
+        assert_eq!(
+            after_reject, original,
+            "rejected duplicate create must leave the index entry byte-identical",
+        );
+        assert_eq!(
+            engine.shard_record_count(shard),
+            count_after_insert,
+            "a rejected duplicate create must not change the shard count",
+        );
     }
 
     // -- Allocation --
@@ -16450,7 +17670,7 @@ mod tests {
     /// Boundary semantics — spendable AT stop (half-open `[start, stop)`).
     /// At `current_block_height == spendable_height` the UTXO MUST be
     /// spendable. Matches Teranode PR #949 fix to `teranode.lua:373`
-    /// and svnode/Aerospike post-fix behaviour. Pre-2026-05 this asserted
+    /// and svnode/the reference UDF post-fix behaviour. Pre-2026-05 this asserted
     /// the inverse (FrozenUntil at exact height) — that was the bug.
     #[test]
     fn reassign_spendable_height_boundary_at_exact_height() {
@@ -17235,42 +18455,6 @@ mod tests {
         );
     }
 
-    /// `purge_aliased_index_entry` must remove the key from ALL THREE secondary
-    /// backends unconditionally by key — it holds no device meta (the footer
-    /// belongs to a different record), so it cannot trust the cache. Without a
-    /// test, a future revert to cache-gated removal in the purge path would
-    /// pass the whole suite while re-introducing the leak.
-    #[test]
-    fn purge_aliased_entry_removes_stale_secondary_backend_entries() {
-        let engine = create_engine();
-        let (_, req) = make_create_req(143, 1);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-
-        // Seed backend entries WITHOUT sync_index_cache — the post-recovery
-        // state where the backends hold entries the primary cache does not
-        // reflect (the leak's precondition).
-        engine.dah_index().insert(8000, key, None).unwrap();
-        engine.preserve_index().insert(8000, key, None).unwrap();
-        engine.unmined_index().insert(500, key, None).unwrap();
-
-        let removed = engine.purge_aliased_index_entry(&key).unwrap();
-        assert!(removed, "the primary-index entry must have been purged");
-
-        assert!(
-            engine.dah_index().range_query(u32::MAX).is_empty(),
-            "purge must remove the DAH backend entry by key",
-        );
-        assert!(
-            engine.preserve_index().range_query(u32::MAX).is_empty(),
-            "purge must remove the preserve backend entry by key",
-        );
-        assert!(
-            engine.unmined_index().range_query(u32::MAX).is_empty(),
-            "purge must remove the unmined backend entry by key",
-        );
-    }
-
     /// A record is in the DAH index XOR the preserve index, never both/neither
     /// across the full preserve→DAH→expire lifecycle.
     #[test]
@@ -17499,7 +18683,8 @@ mod tests {
             })
             .unwrap();
 
-        let rebuilt = PrimaryBackend::rebuild(engine.device(), &engine.allocator().lock()).unwrap();
+        let rebuilt =
+            PrimaryBackend::rebuild(engine.device(), &**engine.allocator().lock()).unwrap();
         assert!(
             rebuilt.lookup(&key).is_none(),
             "rebuild must ignore freed records whose metadata was tombstoned",
@@ -17507,345 +18692,6 @@ mod tests {
     }
 
     // -- Deletion tombstones (deletion-tombstone Phase 3) --
-
-    /// Attach a fresh in-memory-device tombstone log + a tempdir redb
-    /// tombstone index to an engine (tombstones enabled by default). Returns
-    /// the tombstone log handle and index handle so the test can inspect them,
-    /// plus the `TempDir` whose lifetime must outlive the index.
-    fn wire_tombstones(
-        engine: &Engine,
-    ) -> (
-        Arc<parking_lot::Mutex<crate::tombstone::TombstoneLog>>,
-        Arc<parking_lot::Mutex<crate::index::redb_tombstone::RedbTombstoneIndex>>,
-        tempfile::TempDir,
-    ) {
-        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
-        let log = crate::tombstone::TombstoneLog::create(dev, 0, 8 * 1024 * 1024).unwrap();
-        let log = Arc::new(parking_lot::Mutex::new(log));
-        let dir = tempfile::tempdir().unwrap();
-        let idx = crate::index::redb_tombstone::RedbTombstoneIndex::open(
-            &dir.path().join("tombstone.redb"),
-            16 * 1024 * 1024,
-        )
-        .unwrap();
-        let idx = Arc::new(parking_lot::Mutex::new(idx));
-        engine.set_tombstone_log(log.clone());
-        engine.set_tombstone_index(idx.clone());
-        (log, idx, dir)
-    }
-
-    #[test]
-    fn delete_with_tombstones_enabled_writes_tombstone() {
-        let engine = create_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        assert!(engine.tombstones_enabled());
-        assert!(engine.tombstone_write_active());
-
-        let (_, req) = make_create_req(130, 5);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-        let gen_before_delete = engine.lookup(&key).unwrap().generation;
-
-        // Admin delete (due_guard None) at the engine's observed tip (0 here).
-        engine
-            .delete(&DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            })
-            .unwrap();
-
-        // The redb index records it.
-        assert!(idx.lock().is_tombstoned(&key));
-        let v = idx.lock().get(&key).unwrap();
-        let expected_shard = crate::cluster::shards::ShardTable::shard_for_key(&key);
-        assert_eq!(v.shard, expected_shard);
-        assert_eq!(v.generation, gen_before_delete);
-        assert_eq!(v.deletion_height, 0, "admin delete tip is 0 in this engine");
-        assert_eq!(v.cause, crate::tombstone::TombstoneCause::Admin.as_u8());
-
-        // The durable log carries exactly one entry with the same fields.
-        let scanned = log.lock().scan().unwrap();
-        assert_eq!(scanned.len(), 1);
-        let t = &scanned[0];
-        let t_txid = t.txid;
-        let t_shard = t.shard;
-        let t_gen = t.generation;
-        assert_eq!(t_txid, key.txid);
-        assert_eq!(t_shard, expected_shard);
-        assert_eq!(t_gen, gen_before_delete);
-        assert_eq!(t.cause().unwrap(), crate::tombstone::TombstoneCause::Admin);
-    }
-
-    #[test]
-    fn delete_returning_tombstone_reports_written_fields() {
-        // Deletion-tombstone §6 master emit: the foreground delete returns the
-        // exact fields it wrote so the master can emit a matching `DeleteV2`.
-        let engine = create_engine();
-        let (_log, idx, _dir) = wire_tombstones(&engine);
-
-        let (_, req) = make_create_req(140, 5);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-        let gen_before = engine.lookup(&key).unwrap().generation;
-
-        // Admin delete (due_guard None): no sweep predicate, so it is
-        // unconditional. Cause = Admin, deletion_height = observed tip (0).
-        let info = engine
-            .delete_returning_tombstone(&DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            })
-            .unwrap()
-            .expect("tombstone written → Some(info)");
-
-        assert_eq!(info.deletion_height, 0, "admin delete tip is 0 here");
-        assert_eq!(info.generation, gen_before);
-        assert_eq!(info.cause, crate::tombstone::TombstoneCause::Admin);
-        // And the fields match what landed in the index.
-        let v = idx.lock().get(&key).unwrap();
-        assert_eq!(v.deletion_height, info.deletion_height);
-        assert_eq!(v.generation, info.generation);
-        assert_eq!(v.cause, info.cause.as_u8());
-    }
-
-    #[test]
-    fn delete_returning_tombstone_is_none_when_disabled() {
-        // Fallback: with the feature off the master must emit V1 Delete, so
-        // `delete_returning_tombstone` returns None and writes no tombstone.
-        let engine = create_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        engine.set_tombstones_enabled(false);
-
-        let (_, req) = make_create_req(141, 5);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-
-        let info = engine
-            .delete_returning_tombstone(&DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            })
-            .unwrap();
-        assert!(info.is_none(), "disabled → None (V1 fallback)");
-        assert!(engine.lookup(&key).is_none(), "record still removed");
-        assert!(!idx.lock().is_tombstoned(&key));
-        assert!(log.lock().scan().unwrap().is_empty());
-    }
-
-    #[test]
-    fn apply_replicated_tombstone_writes_exact_fields_for_absent_key() {
-        // Deletion-tombstone §6 pre-arm: a replica that never held the key
-        // still records the tombstone with the master's EXACT carried fields.
-        let engine = create_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-
-        let k = TxKey { txid: [0x77; 32] };
-        assert!(engine.lookup(&k).is_none(), "key absent (pre-arm)");
-
-        engine
-            .apply_replicated_tombstone(
-                &k,
-                812_345,
-                42,
-                crate::tombstone::TombstoneCause::SpentDah.as_u8(),
-            )
-            .unwrap();
-
-        assert!(idx.lock().is_tombstoned(&k));
-        let v = idx.lock().get(&k).unwrap();
-        assert_eq!(v.deletion_height, 812_345);
-        assert_eq!(v.generation, 42);
-        assert_eq!(v.cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
-        assert_eq!(
-            v.shard,
-            crate::cluster::shards::ShardTable::shard_for_key(&k),
-            "shard derived from key, matching the master",
-        );
-        assert_eq!(log.lock().scan().unwrap().len(), 1, "one log entry");
-    }
-
-    #[test]
-    fn apply_replicated_tombstone_is_idempotent() {
-        // Re-applying the same DeleteV2 (re-sent batch) must be a no-op: one
-        // row, one durable log entry, no error, no duplicate append.
-        let engine = create_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-
-        let k = TxKey { txid: [0x55; 32] };
-        let cause = crate::tombstone::TombstoneCause::Admin.as_u8();
-        engine
-            .apply_replicated_tombstone(&k, 100, 7, cause)
-            .unwrap();
-        engine
-            .apply_replicated_tombstone(&k, 100, 7, cause)
-            .unwrap();
-
-        assert_eq!(idx.lock().len(), 1);
-        assert_eq!(
-            log.lock().scan().unwrap().len(),
-            1,
-            "idempotent: no duplicate log append on re-apply",
-        );
-    }
-
-    #[test]
-    fn apply_replicated_tombstone_rejects_unknown_cause() {
-        // A corrupt cause byte must be rejected, not silently decoded.
-        let engine = create_engine();
-        let (_log, _idx, _dir) = wire_tombstones(&engine);
-        let k = TxKey { txid: [0x33; 32] };
-        match engine.apply_replicated_tombstone(&k, 1, 1, 99) {
-            Err(SpendError::StorageError { .. }) => {}
-            other => panic!("expected StorageError for unknown cause, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn apply_replicated_tombstone_inert_without_log() {
-        // No log attached → no-op success (the disabled / no-log fallback).
-        let engine = create_engine();
-        let k = TxKey { txid: [0x22; 32] };
-        engine
-            .apply_replicated_tombstone(&k, 5, 5, crate::tombstone::TombstoneCause::Admin.as_u8())
-            .unwrap();
-    }
-
-    #[test]
-    fn dah_sweep_delete_tombstone_is_spentdah_at_sweep_height() {
-        // A single-UTXO mined record: spending its only UTXO sets DAH and
-        // makes it sweep-due (all-spent ∧ on-longest-chain). The DAH sweep
-        // then deletes it with `due_guard = Some(sweep_height)`, which yields
-        // a SpentDah tombstone at that height.
-        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
-            m.block_entry_count = 1;
-            m.block_entries_inline[0] = BlockEntry {
-                block_id: 1,
-                block_height: 900,
-                subtree_idx: 0,
-            };
-        });
-        let (log, idx, _dir) = wire_tombstones(&h.engine);
-
-        // Spend the only UTXO → sets delete_at_height = 1000 + 288 = 1288.
-        h.engine.spend(&h.spend_req(0)).unwrap();
-        let gen_before = h.engine.lookup(&h.key).unwrap().generation;
-
-        let sweep_height = 1288u32;
-        h.engine
-            .delete(&DeleteRequest {
-                tx_key: h.key,
-                due_guard: Some(sweep_height),
-            })
-            .unwrap();
-
-        let v = idx.lock().get(&h.key).unwrap();
-        assert_eq!(v.cause, crate::tombstone::TombstoneCause::SpentDah.as_u8());
-        assert_eq!(v.deletion_height, sweep_height);
-        assert_eq!(v.generation, gen_before);
-        let scanned = log.lock().scan().unwrap();
-        assert_eq!(scanned.len(), 1);
-        assert_eq!(
-            scanned[0].cause().unwrap(),
-            crate::tombstone::TombstoneCause::SpentDah
-        );
-    }
-
-    #[test]
-    fn delete_with_tombstones_disabled_writes_no_tombstone() {
-        let engine = create_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-        // Disable the feature: delete must behave exactly as before.
-        engine.set_tombstones_enabled(false);
-        assert!(!engine.tombstone_write_active());
-
-        let (_, req) = make_create_req(132, 5);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-        engine
-            .delete(&DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            })
-            .unwrap();
-
-        // Record gone (unchanged behavior), but NO tombstone written.
-        assert!(engine.lookup(&key).is_none());
-        assert!(!idx.lock().is_tombstoned(&key));
-        assert!(log.lock().scan().unwrap().is_empty());
-    }
-
-    #[test]
-    fn delete_without_tombstone_log_attached_is_unchanged() {
-        // No tombstone log wired at all: enabled flag is true but
-        // `tombstone_write_active` is false, so the delete path is identical
-        // to the pre-tombstone behavior.
-        let engine = create_engine();
-        assert!(engine.tombstones_enabled());
-        assert!(!engine.tombstone_write_active());
-
-        let (_, req) = make_create_req(133, 5);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-        engine
-            .delete(&DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            })
-            .unwrap();
-        assert!(engine.lookup(&key).is_none());
-    }
-
-    #[test]
-    fn delete_for_purge_writes_no_new_tombstone() {
-        // R2's primitive: removes the record but must NOT append a tombstone
-        // even when the feature is active (the tombstone already exists).
-        let engine = create_engine();
-        let (log, idx, _dir) = wire_tombstones(&engine);
-
-        let (_, req) = make_create_req(134, 5);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-
-        engine
-            .delete_for_purge(&DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            })
-            .unwrap();
-
-        assert!(engine.lookup(&key).is_none(), "record purged");
-        assert!(
-            log.lock().scan().unwrap().is_empty(),
-            "delete_for_purge must not append a tombstone",
-        );
-        assert!(!idx.lock().is_tombstoned(&key));
-    }
-
-    #[test]
-    fn delete_tombstone_durable_before_index_removal_ordering() {
-        // The tombstone-durable-before-primary-removal invariant (§9.1 #4):
-        // after the delete returns, the tombstone is in the durable log AND
-        // the primary-index row is gone. We assert both post-conditions hold
-        // together — a crash between them (tombstone present, record present)
-        // is the only window, and it is exactly what R2 converges.
-        let engine = create_engine();
-        let (log, _idx, _dir) = wire_tombstones(&engine);
-
-        let (_, req) = make_create_req(135, 4);
-        let key = req.tx_key();
-        engine.create(&req).unwrap();
-        engine
-            .delete(&DeleteRequest {
-                tx_key: key,
-                due_guard: None,
-            })
-            .unwrap();
-
-        // Tombstone durably recorded (log scan re-reads from device).
-        assert_eq!(log.lock().scan().unwrap().len(), 1);
-        // Primary-index row removed.
-        assert!(engine.lookup(&key).is_none());
-    }
 
     #[test]
     fn tombstone_overwrites_metadata_header() {
@@ -19730,29 +20576,6 @@ mod tests {
     }
 
     #[test]
-    fn discard_shard_records_drops_local_copy_without_tombstone() {
-        // The full-resync local discard removes the shard's records and writes
-        // NO tombstone (it is a local drop, not a cluster delete).
-        let h = TestHarness::new(10, TxFlags::empty());
-        let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
-
-        // Precondition: the seeded record is present in its shard.
-        assert_eq!(h.engine.keys_for_shard(shard).len(), 1);
-
-        let discarded = h.engine.discard_shard_records(shard);
-        assert_eq!(discarded, 1, "the one seeded record should be discarded");
-        assert!(
-            h.engine.keys_for_shard(shard).is_empty(),
-            "shard must be empty after discard"
-        );
-
-        // No tombstone attached in this harness, so nothing to assert there;
-        // the key being gone from the index is the local-discard outcome.
-        // Discarding an already-empty shard is a harmless no-op.
-        assert_eq!(h.engine.discard_shard_records(shard), 0);
-    }
-
-    #[test]
     fn read_height_file_missing_or_corrupt_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.height");
@@ -19761,5 +20584,108 @@ mod tests {
         let corrupt = dir.path().join("corrupt.height");
         std::fs::write(&corrupt, b"not a valid height file").unwrap();
         assert_eq!(read_durable_height_file(&corrupt), None);
+    }
+
+    /// Build an in-memory engine whose allocator runs in PACKED mode (set
+    /// before construction so the cached `Store::packed` flag is true and the
+    /// first reservations pack within one device block).
+    fn make_packed_engine() -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        alloc.set_packed(true);
+        Arc::new(Engine::new(
+            dev,
+            Index::new(100).unwrap(),
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    }
+
+    /// Gate #2 (PACKED_RECORD_STORAGE_DESIGN.md §3.1): a single-record create in
+    /// packed mode must RMW only its OWN bytes and never over-write a FORWARD
+    /// block-neighbour. Pack A, B, C contiguously in one block; delete A; then
+    /// single-create D into A's freed hole and assert B and C survive.
+    ///
+    /// Before the gate-#2 fix, `write_full_record_with_cold` padded D's buffer
+    /// to the full 4 KiB block; D's RMW at A's (mid-block) offset then wrote a
+    /// 4096-byte image starting at A's offset, clobbering B and C (which sit in
+    /// `[A_offset, A_offset + 4096)`). The fix pads D's image only to
+    /// `RECORD_ALIGN`, so the RMW touches just D's own bytes.
+    #[test]
+    fn packed_single_create_preserves_forward_block_neighbour() {
+        let engine = make_packed_engine();
+
+        let (_a_h, a_req) = make_create_req(0xA1, 2);
+        let (b_hashes, b_req) = make_create_req(0xB2, 2);
+        let (c_hashes, c_req) = make_create_req(0xC3, 2);
+        let a_key = a_req.tx_key();
+        let b_key = b_req.tx_key();
+        let c_key = c_req.tx_key();
+
+        // Pack A, B, C — the bump allocator places them back-to-back within the
+        // first device block (small 2-utxo records).
+        engine.create(&a_req).expect("create A");
+        engine.create(&b_req).expect("create B");
+        engine.create(&c_req).expect("create C");
+
+        let a_off = engine
+            .lookup_checked(&a_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        let b_off = engine
+            .lookup_checked(&b_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        let c_off = engine
+            .lookup_checked(&c_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        // Preconditions: all three in one block, B and C AFTER A (the forward
+        // neighbours a 4096-padded D-write would clobber).
+        assert_eq!(a_off / 4096, c_off / 4096, "A,B,C must share one block");
+        assert!(b_off > a_off && c_off > b_off, "B,C must follow A in-block");
+        assert!(
+            c_off + 256 <= a_off + 4096,
+            "B and C must sit within A's 4096-byte padding window"
+        );
+
+        // Delete A, freeing its exact packed hole, then single-create D, which
+        // best-fit reuses A's hole (same offset, same block as B and C).
+        engine
+            .delete(&DeleteRequest {
+                tx_key: a_key,
+                due_guard: None,
+            })
+            .expect("delete A");
+        let (_d_h, d_req) = make_create_req(0xD4, 2);
+        let d_key = d_req.tx_key();
+        engine.create(&d_req).expect("create D into A's hole");
+        let d_off = engine
+            .lookup_checked(&d_key)
+            .unwrap()
+            .unwrap()
+            .record_offset;
+        assert_eq!(d_off, a_off, "D must reuse A's freed packed hole");
+
+        // B and C must read back EXACTLY — D's packed single-create must not
+        // have over-written its forward neighbours.
+        let b_slots = engine.read_slots(&b_key).expect("read B slots");
+        assert_eq!(b_slots.len(), 2);
+        for (i, slot) in b_slots.iter().enumerate() {
+            assert_eq!(slot.hash, b_hashes[i], "B slot {i} clobbered by D's write");
+            assert!(!slot.is_spent(), "B slot {i} zeroed by D's write");
+        }
+        let c_slots = engine.read_slots(&c_key).expect("read C slots");
+        assert_eq!(c_slots.len(), 2);
+        for (i, slot) in c_slots.iter().enumerate() {
+            assert_eq!(slot.hash, c_hashes[i], "C slot {i} clobbered by D's write");
+            assert!(!slot.is_spent(), "C slot {i} zeroed by D's write");
+        }
     }
 }

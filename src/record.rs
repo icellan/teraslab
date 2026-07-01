@@ -429,7 +429,7 @@ bitflags! {
         /// Bit 6 — write-once-ish, set by `reassign` on first reassignment
         /// (LP-3). Persisted to device metadata.
         ///
-        /// Mirrors the Aerospike Lua `reassign` which inflates
+        /// Mirrors the reference UDF Lua `reassign` which inflates
         /// `recordUtxos` by 1 (`teranode.lua:945`) so the all-spent check
         /// (`spent_utxos == utxo_count`) can never become true on a
         /// reassigned record — keeping the court-ordered reassignment's
@@ -579,7 +579,7 @@ pub struct TxMetadata {
 
     /// Number of deleted children txids stored for this transaction.
     ///
-    /// F-X-022: parity with Aerospike Lua `addDeletedChildren`. Populated
+    /// F-X-022: parity with the reference UDF Lua `addDeletedChildren`. Populated
     /// whenever a child tx is pruned against this parent — the child's
     /// txid is appended to the per-record list referenced by
     /// `deleted_children_offset`. Consulted by the idempotent-respend

@@ -48,7 +48,6 @@ fn build_engine_for_backend(mode: &IndexBackendMode, dir: &TempDir) -> Arc<Engin
         redb_path: dir.path().join("primary.redb"),
         redb_dah_path: dir.path().join("dah.redb"),
         redb_unmined_path: dir.path().join("unmined.redb"),
-        redb_tombstone_path: dir.path().join("tombstone.redb"),
         redb_cache_size: 16 * 1024 * 1024,
         file_backed_path: dir.path().join("primary.index"),
         index_shards: 16,

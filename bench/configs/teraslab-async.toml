@@ -1,0 +1,97 @@
+# Matched-durability TeraSlab config for the head-to-head against the reference
+# datastore. The reference (as Teranode runs it) uses asynchronous/buffered
+# durability (no commit-to-device; post-write-cache + background flush). The
+# fair TeraSlab match is therefore BUFFERED redo durability + a write-back cache,
+# NOT strict fsync-per-batch. See bench/METHODOLOGY.md "Durability match".
+#
+# IMPORTANT: redo_buffered and all other scalar keys are top-level and MUST come
+# BEFORE any [section] table, or TOML folds them into the preceding section.
+node_id = 0
+listen_addr = "0.0.0.0:3300"
+http_listen_addr = "0.0.0.0:9100"
+seed_nodes = []
+replication_factor = 1
+
+device_paths = ["/data/d0.dat"]
+device_size = 4294967296          # 4 GiB, matches the reference filesize 4G
+device_alignment = 4096
+# Carve the one physical device into N virtual stores = N independent allocators +
+# index-lock domains + per-store redo logs, sharing the one disk's I/O. This is
+# TeraSlab's equivalent of the reference's internal partition parallelism
+# (partition-tree-sprigs 1024 on a single file): same physical disk, more in-process
+# write parallelism. Diagnostic + lever for the ~33k single-store lock-domain cap.
+device_split = 4
+redo_log_size = 268435456   # 256 MiB/store x device_split=4 = ~1 GiB total, matching the reference 1024M write cache (fair). The ring reclaims continuously, so per-store 256 MiB is ample.
+                            # both are the async-durability write buffer. A larger log
+                            # gives the NON-blocking (fuzzy) checkpoint a wide
+                            # high->emergency margin so it reclaims before the redo can
+                            # reach the emergency BLOCKING (stop-the-world) threshold
+                            # under sustained write load — keeping the checkpoint
+                            # non-blocking (its design intent) and removing the ~10s
+                            # serving freeze that otherwise dominates tail latency.
+index_snapshot_path = "/data/index.snap"
+expected_records = 2000000
+lock_stripes = 65536
+max_batch_size = 8192
+max_connections = 1024
+# Allow the client to express the offered concurrency. The default per-IP cap (64)
+# throttles a single-host load generator to ~64 connections; with pipeline_depth=1
+# that pins server-side concurrency at ~64 ops regardless of the offered IN_FLIGHT,
+# capping throughput well below the engine's capacity (CPU sits idle). The
+# reference's client keeps hundreds of requests in flight; this lets TeraSlab
+# express the same offered load. Local bench only.
+max_connections_per_ip = 1024
+# Pipeline depth > 1 lets each connection dispatch multiple in-flight requests on a
+# bounded worker pool (responses matched by request_id), so the offered concurrency
+# reaches the redo group-commit without needing one OS connection per in-flight op.
+# This is the per-connection-serial throughput lever (see config doc). The bench's
+# ops are independent per worker, so the >1 reordering caveat is irrelevant.
+pipeline_depth = 16
+block_height_retention = 288
+
+# Async durability to match the reference's no-commit-to-device posture.
+redo_buffered = true
+redo_flush_interval_ms = 50
+# Open the redo log through the OS page cache (NOT O_DIRECT/F_NOCACHE) and have
+# the background flusher pwrite WITHOUT a per-flush fsync — matching the
+# reference's async page-cache writes. The DATA device stays O_DIRECT. Durability
+# for the redo comes from OS writeback + the checkpoint barrier (which still
+# fsyncs the redo before it reclaims), so reclamation safety is unchanged. This
+# removes the periodic redo fsync that stalls the macOS-Docker VM ~tens of ms.
+redo_buffered_io = true
+
+# Checkpoint watermarks: keep the NON-blocking (fuzzy) checkpoint the common case.
+# Trigger it early (0.50) with a wide gap to the emergency blocking threshold
+# (0.90) so it always reclaims the redo prefix before usage can reach emergency
+# under sustained writes. The blocking checkpoint (which freezes serving for the
+# full snapshot+compaction) then effectively never fires in steady state.
+checkpoint_high_water = 0.50
+checkpoint_low_water = 0.15
+checkpoint_emergency_water = 0.90
+checkpoint_poll_interval_ms = 250
+
+# Lever 7: segment-ring redo layout. Reclamation is an O(freed) pointer advance
+# (advance the oldest-segment marker) instead of a stop-the-world compaction/reset,
+# so it is independent of index size and append rate: the slow fuzzy index snapshot
+# no longer pins redo space, the emergency BLOCKING checkpoint never fires (the
+# checkpoint loop skips it for a ring), and sustained writes never freeze serving.
+# A fresh redo region (the bench wipes its volume each run) adopts this cleanly.
+redo_segment_ring = true
+
+strict_auth = false
+enable_remote_bind = true
+enable_admin_endpoints = true     # /metrics /debug/* needed for profiling
+admin_token = "bench-local-admin-token-0001"  # ≥16B; local bench only
+
+[index]
+backend = "memory"
+
+[cache]
+bytes = 4294967296                # 4 GiB cache (covers the 4 GiB device), parity
+                                  # with the reference's RAM-resident dataset
+writeback = true
+writeback_interval_ms = 50
+
+[storage]
+packed = true
+placement = "txid"

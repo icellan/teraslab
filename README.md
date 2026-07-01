@@ -39,7 +39,7 @@ The production write path is synchronous `O_DIRECT` I/O via `src/device.rs` (`Di
 
 **Documented design choices** (deliberate scope decisions, not bugs):
 
-- **Single-interval freeze model.** `spendable_height` is a single `u32` per output (mirrors Aerospike). svnode's `enforceAtHeight` supports a multi-interval array. If Teranode's contract evolves to require multi-interval freezes (e.g. two disjoint locked windows on the same UTXO), a new op type (`OP_FREEZE_INTERVAL_BATCH` or similar) is required; the on-disk slot layout reserves enough spending-data bytes to extend without a format break, but the engine match arms and the wire protocol need additions.
+- **Single-interval freeze model.** `spendable_height` is a single `u32` per output (mirrors the reference UDF). svnode's `enforceAtHeight` supports a multi-interval array. If Teranode's contract evolves to require multi-interval freezes (e.g. two disjoint locked windows on the same UTXO), a new op type (`OP_FREEZE_INTERVAL_BATCH` or similar) is required; the on-disk slot layout reserves enough spending-data bytes to extend without a format break, but the engine match arms and the wire protocol need additions.
 
 **Known residual coverage gaps** (tracked, low risk):
 
@@ -364,6 +364,116 @@ Ports exposed per container:
 | 3300 | TCP | Client binary protocol |
 | 3301 | UDP | SWIM membership |
 | 9100 | HTTP | Observability |
+
+## Load testing & profiling
+
+A self-contained, reusable harness lives in `teraslab-tests/bench/`. It boots a
+single node in Docker, drives a mixed over-the-wire workload, and scrapes the
+server's Prometheus `/metrics` for per-stage pipeline histograms — so you can
+attribute latency to a stage instead of guessing.
+
+```bash
+# Builds the image + loadgen if missing, runs both store-count variants.
+teraslab-tests/bench/run_bench.sh
+
+# Tunables (env): DUR (seconds), WORKERS (in-flight concurrency), RATE
+# (target ops/s; default is effectively unthrottled to saturate the server),
+# VARIANTS ("1store", "4store", or both).
+DUR=60 WORKERS=48 VARIANTS="4store" teraslab-tests/bench/run_bench.sh
+```
+
+Files:
+- `bench-1store.toml` / `bench-4store.toml` — standalone single-node configs
+  (no cluster, `strict_auth=false`, admin off). They differ only in
+  `device_paths`: one device vs four, i.e. `num_stores = 1` vs `4`. Four stores
+  means four independent redo logs that fsync in parallel.
+- `run_bench.sh` — orchestrates a clean boot per variant (fresh volume so every
+  `/metrics` counter starts at 0), runs `teraslab-loadgen`, and writes results
+  to `teraslab-tests/results/bench_<timestamp>/` (gitignored):
+  `<variant>_loadgen.txt`, `<variant>_metrics.txt`, `<variant>_status.json`,
+  `<variant>_server.log`.
+
+The load generator is `client/rust/src/bin/loadgen.rs` (`teraslab-loadgen`),
+which issues a mixed create / spend / read / set_mined workload via the Rust
+client.
+
+### Reading the pipeline metrics
+
+The key histograms in `<variant>_metrics.txt`:
+
+| Metric | What it tells you |
+|--------|-------------------|
+| `teraslab_<op>_latency_ns` | End-to-end server handler time per op (create/spend/get/set_mined) |
+| `teraslab_redo_flush_latency_ns` | The redo fsync (group-commit) cost — usually the write bottleneck |
+| `teraslab_redo_entries_per_flush` | Group-commit coalescing degree. `≈ flush_count` means one fsync per op (no coalescing) |
+| `teraslab_lock_wait_ns` | Stripe-lock contention (empty ⇒ not lock-bound) |
+
+### Findings (single-node, mixed workload, macOS Docker Desktop)
+
+**1. Single-item RPCs (`--batch 1`) — fsync-floor bound.** 32 workers:
+
+| | 1 store | 4 stores |
+|---|---|---|
+| Throughput | 241 ops/s | **290 ops/s** (+20%) |
+| Write latency p50 (create/spend) | 4.19 ms | **2.10 ms** |
+| Redo fsync mean / p99 | 1.54 / 4.19 ms | 1.22 / 2.10 ms |
+| Read (get) p50 | 16 µs | 16 µs |
+
+`lock_wait` is empty (not lock-bound) and `flush_count ≈ write_ops`,
+`entries_per_flush ≈ 1.5` — i.e. **one fsync per op, no group-commit coalescing
+across concurrent single-item RPCs**. Write throughput is gated by
+`write_concurrency / fsync_latency`. Reads are ~free (in-memory index).
+Multi-device helps (4 independent redo logs fsync in parallel) even on one
+shared volume.
+
+**2. Batched RPCs (`--batch 256`) — fsync floor removed, now device-I/O bound.**
+32 workers:
+
+| | 1 store | 4 stores |
+|---|---|---|
+| Throughput | ~16–17k ops/s | ~17k ops/s |
+| `entries_per_flush` | ~300 | ~87 |
+| `create` latency / batch | ~0.7 ms | — |
+| `spend` latency / 256-item batch | ~20 ms | — |
+| `set_mined` latency / 256-item batch | ~14 ms | — |
+
+Batching amortizes the fsync across ~300 entries/flush, lifting throughput ~65×
+(250 → ~17k). The bottleneck then moves to the **read-modify-write device I/O**
+on `spend`/`set_mined` (each reads the record from the device, mutates, writes
+back). At this point the server uses only **~0.75 of 8 cores** (RAM ~150 MiB,
+client ~1% CPU) — it is **I/O-wait bound, not CPU/lock/client bound**.
+
+> ⚠️ **Absolute throughput here is a floor, not the target**, and on this host
+> it is gated by the **macOS Docker Desktop virtual disk**, which behaves like an
+> effective **queue depth of ~1**: concurrent `pread`/`pwrite` do not overlap at
+> the virtualization layer (~1–1.5 ms fsync, slow random reads, vs <100 µs on
+> NVMe). The read fan-out in `handle_spend_batch`/`handle_set_mined_batch`
+> (mirroring `get_batch`) is correct and tested, but yields **no measurable gain
+> on this disk** because the device serializes the I/O it issues — CPU stays
+> pinned at ~0.75 core regardless. On bare-metal NVMe (deep queues, parallel
+> channels) that fan-out, plus separate `device_paths` per physical device and
+> large client batches, is what unlocks the design target. Use this harness for
+> **relative** comparisons and **stage attribution**, not headline numbers — and
+> to actually measure the I/O-parallel paths, run it on real NVMe.
+
+**3. Optional data-device cache (`[cache]`) — see `docs/WRITE_CACHE_SPEC.md`.**
+Batched (`--batch 256`), 32 workers, 1 GiB cache covering the device:
+
+| metric (server-side, per 256-item batch) | no cache | write-through | write-back |
+|---|---|---|---|
+| `spend` latency | 21.3 ms | 20.5 ms | **7.3 ms** |
+| `set_mined` latency | 13.3 ms | 12.2 ms | **6.3 ms** |
+| `get` latency | 1.54 ms | 0.71 ms | **0.56 ms** |
+| overall throughput | ~17k ops/s | ~17k ops/s | ~17k ops/s |
+
+The cache does what it should at the device layer: write-through serves the
+read-modify-write **reads** from RAM (~2–3× lower `get`); write-back also defers
+the **writes**, cutting `spend`/`set_mined` ~2–3×. But **overall throughput is
+unchanged** — once the data device is cached, the limiter moves to (a) the
+redo-log fsync, which is correctly **never** cached (durability), and (b) the
+loadgen's single shared `tokio::Mutex` work-queue (a client-side artifact). So
+the cache is a **latency** win on read-modify-write paths; raising end-to-end
+throughput needs a faster WAL path and a lock-free client.
 
 ## Wire protocol
 

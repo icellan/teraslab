@@ -245,7 +245,7 @@ local function isFrozen(spendingData)
     return true
 end
 
--- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
+-- The first argument is the record to update. This is passed to the UDF by store based on the Key that the UDF is getting executed on
 -- offset number - the offset in the utxos list (vout % utxoBatchSize)
 -- utxoHash []byte - 32 byte little-endian hash of the UTXO
 -- spendingData []byte - 36 byte little-endian hash of the spending data
@@ -284,7 +284,7 @@ end
 function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHeight, blockHeightRetention)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -441,7 +441,7 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
 
     local signal, childCount = setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)
 
-    aerospike:update(rec)
+    store:update(rec)
 
     -- Build response
     if map.size(errors) > 0 then
@@ -465,7 +465,7 @@ function spendMulti(rec, spends, ignoreConflicting, ignoreLocked, currentBlockHe
     return response
 end
 
--- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
+-- The first argument is the record to update. This is passed to the UDF by store based on the Key that the UDF is getting executed on
 -- offset number - the offset in the utxos list (vout % utxoBatchSize)
 -- utxoHash []byte - 32 byte little-endian hash of the UTXO
 -- expectedSpendingData []byte - 36 byte spending data the caller expects to be currently stored.
@@ -484,7 +484,7 @@ end
 function unspend(rec, offset, utxoHash, expectedSpendingData, currentBlockHeight, blockHeightRetention)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -541,7 +541,7 @@ function unspend(rec, offset, utxoHash, expectedSpendingData, currentBlockHeight
 
     local signal, childCount = setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)
 
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
     if signal and signal ~= "" then
@@ -558,7 +558,7 @@ end
 function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blockHeightRetention, onLongestChain, unsetMined)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -657,7 +657,7 @@ function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blo
     local signal, childCount = setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)
 
     -- Update the record to save changes
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
     if signal and signal ~= "" then
@@ -696,7 +696,7 @@ function setMined(rec, blockID, blockHeight, subtreeIdx, currentBlockHeight, blo
     return response
 end
 
--- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
+-- The first argument is the record to update. This is passed to the UDF by store based on the Key that the UDF is getting executed on
 -- offset number - the offset in the utxos list (vout % utxoBatchSize)
 -- utxoHash []byte - 32 byte little-endian hash of the UTXO
 --   __
@@ -707,7 +707,7 @@ end
 function freeze(rec, offset, utxoHash)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -771,14 +771,14 @@ function freeze(rec, offset, utxoHash)
     utxos[offset + 1] = newUtxo
     rec[BIN_UTXOS] = utxos
 
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
 
     return response
 end
 
--- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
+-- The first argument is the record to update. This is passed to the UDF by store based on the Key that the UDF is getting executed on
 -- offset number - the offset in the utxos list (vout % utxoBatchSize)
 -- utxoHash []byte - 32 byte little-endian hash of the UTXO
 --               __
@@ -789,7 +789,7 @@ end
 function unfreeze(rec, offset, utxoHash)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -844,14 +844,14 @@ function unfreeze(rec, offset, utxoHash)
 
     rec[BIN_UTXOS] = utxos
 
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
 
     return response
 end
 
--- The first argument is the record to update. This is passed to the UDF by aerospike based on the Key that the UDF is getting executed on
+-- The first argument is the record to update. This is passed to the UDF by store based on the Key that the UDF is getting executed on
 -- offset number - the offset in the utxos list (vout % utxoBatchSize)
 -- utxoHash []byte - 32 byte little-endian hash of the UTXO
 -- newUtxoHash []byte - 32 byte little-endian hash of the new UTXO
@@ -864,7 +864,7 @@ end
 function reassign(rec, offset, utxoHash, newUtxoHash, blockHeight, spendableAfter)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -944,7 +944,7 @@ function reassign(rec, offset, utxoHash, newUtxoHash, blockHeight, spendableAfte
     -- Ensure record is not DAH'd when all UTXOs are spent
     rec[BIN_RECORD_UTXOS] = rec[BIN_RECORD_UTXOS] + 1
 
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
 
@@ -1066,7 +1066,7 @@ end
 function setConflicting(rec, setValue, currentBlockHeight, blockHeightRetention)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -1078,7 +1078,7 @@ function setConflicting(rec, setValue, currentBlockHeight, blockHeightRetention)
 
     local signal, childCount = setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)
 
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
     if signal and signal ~= "" then
@@ -1108,7 +1108,7 @@ end
 function preserveUntil(rec, blockHeight)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -1123,7 +1123,7 @@ function preserveUntil(rec, blockHeight)
     rec[BIN_PRESERVE_UNTIL] = blockHeight
 
     -- Update the record
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
 
@@ -1150,7 +1150,7 @@ end
 function addDeletedChildren(rec, childHashes)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -1168,7 +1168,7 @@ function addDeletedChildren(rec, childHashes)
     end
 
     rec[BIN_DELETED_CHILDREN] = deletedChildren
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
 
@@ -1190,7 +1190,7 @@ end
 function setLocked(rec, setValue)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -1207,7 +1207,7 @@ function setLocked(rec, setValue)
         rec[BIN_DELETE_AT_HEIGHT] = nil
     end
 
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
     response[FIELD_CHILD_COUNT] = totalExtraRecs
@@ -1226,7 +1226,7 @@ end
 function incrementSpentExtraRecs(rec, inc, currentBlockHeight, blockHeightRetention)
     local response = map()
 
-    if not aerospike:exists(rec) then
+    if not store:exists(rec) then
         response[FIELD_STATUS] = STATUS_ERROR
         response[FIELD_ERROR_CODE] = ERROR_CODE_TX_NOT_FOUND
         response[FIELD_MESSAGE] = ERR_TX_NOT_FOUND
@@ -1266,7 +1266,7 @@ function incrementSpentExtraRecs(rec, inc, currentBlockHeight, blockHeightRetent
 
     local signal, childCount = setDeleteAtHeight(rec, currentBlockHeight, blockHeightRetention)
 
-    aerospike:update(rec)
+    store:update(rec)
 
     response[FIELD_STATUS] = STATUS_OK
     if signal and signal ~= "" then
