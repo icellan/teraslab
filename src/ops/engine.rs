@@ -2464,26 +2464,20 @@ impl Engine {
             }
             Ok(())
         } else {
-            let device = self.device_for(device_id);
-            let align = device.alignment();
-            let aligned_base = record_offset / align as u64 * align as u64;
-            let intra_offset = (record_offset - aligned_base) as usize;
-            let total_size = io::align_up(intra_offset + METADATA_SIZE, align);
-
-            let mut buf = AlignedBuf::new(total_size, align);
-            if intra_offset != 0 || !METADATA_SIZE.is_multiple_of(align) {
-                device.pread_exact_at(&mut buf, aligned_base).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("{e}"),
-                    }
-                })?;
-            }
-            buf[intra_offset..intra_offset + METADATA_SIZE].copy_from_slice(&header);
-            device
-                .pwrite_all_at(&buf, aligned_base)
-                .map_err(|e| SpendError::StorageError {
+            // F-X-007 (BC-02): route through `write_record_bytes`, which holds
+            // the per-block write guard (`lock_span_blocks`) across its RMW. The
+            // previous bare pread+patch+pwrite here held NO lock, so for a PACKED
+            // record it read the covering block, overlaid this record's tombstone
+            // header, and wrote the WHOLE block back — clobbering a block-neighbour
+            // packed record that a concurrent (differently-keyed) writer had just
+            // written, leaving the neighbour all-zero. That surfaced as
+            // `CRC mismatch: expected 0x00000000` on a later setMined/delete read
+            // of the clobbered neighbour (segment engine, packed, under load).
+            io::write_record_bytes(&**self.device_for(device_id), record_offset, &header).map_err(
+                |e| SpendError::StorageError {
                     detail: format!("{e}"),
-                })
+                },
+            )
         }
     }
 
@@ -6177,6 +6171,14 @@ impl Engine {
         let aligned_base = offset / align as u64 * align as u64;
         let intra = (offset - aligned_base) as usize;
         let write_len = (intra + children.len() * 32).div_ceil(align) * align;
+        // F-X-007 (BC-02): hold the per-block write guard across the RMW. Without
+        // it, a PACKED children-block RMW reads the covering block, overlays only
+        // the children bytes, and writes the WHOLE block back — clobbering a
+        // block-neighbour packed record a concurrent writer just wrote (all-zero
+        // neighbour → spurious `CRC mismatch: expected 0x00000000` on a later
+        // read). Mirrors `io::write_record_bytes`; the guard KEY is the block, so
+        // it excludes every other writer/reader of the shared block.
+        let _guards = io::lock_span_blocks(offset, write_len as u64);
         let mut buf = crate::device::AlignedBuf::new(write_len, align);
         if self.store_is_packed(device_id) {
             // Preserve packed neighbours: read the live block(s) before overlaying.
@@ -10478,6 +10480,82 @@ mod tests {
         assert!(
             matches!(gone, Err(SpendError::TxNotFound)),
             "unmapped key → benign race must resolve to TxNotFound, got {gone:?}"
+        );
+    }
+
+    /// F-X-007 (BC-02) regression: the cache-path `write_zeroed_metadata_header`
+    /// (delete's tombstone) must hold the per-block write guard across its RMW.
+    /// Before the fix it did a bare pread+patch+pwrite with NO lock, so for a
+    /// packed record it wrote the WHOLE covering block back and clobbered a
+    /// block-neighbour packed record a concurrent writer had just written
+    /// (all-zero neighbour → `CRC mismatch: expected 0x00000000` on a later
+    /// setMined/delete read; observed on the segment engine under load).
+    ///
+    /// A cache-backed device (`as_raw_ptr == None`) forces the cache branch. The
+    /// test holds the block's write guard and asserts the tombstone BLOCKS on it
+    /// (it completes only once the guard is released) — proving the RMW is now
+    /// serialized against every other writer of the shared block.
+    #[test]
+    fn tombstone_cache_path_holds_block_write_guard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mem: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let dev: Arc<dyn BlockDevice> = Arc::new(crate::cache::CachingDevice::new(
+            mem,
+            64 * 1024 * 1024,
+            true,
+            3_600_000,
+        ));
+        let seg =
+            crate::segment_allocator::SegmentAllocator::new(dev.clone(), 8 * 1024 * 1024).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev.clone(),
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        // The whole point: the cache device exposes no raw pointer, so the
+        // tombstone takes the (previously unlocked) cache branch.
+        assert!(engine.device_ptr_for(0).is_null());
+
+        let utxo_count = 4u32;
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = [0x5A; 32];
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|_| UtxoSlot::new_unspent([0u8; 32]))
+            .collect();
+        io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+
+        // Hold the per-block write guard the fixed tombstone must acquire.
+        let guards = io::lock_span_blocks(offset, METADATA_SIZE as u64);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let e2 = engine.clone();
+        let d2 = done.clone();
+        let h = std::thread::spawn(move || {
+            e2.write_zeroed_metadata_header(0, offset, record_size)
+                .unwrap();
+            d2.store(true, Ordering::SeqCst);
+        });
+        // While the guard is held the tombstone cannot make progress.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "tombstone must block on the per-block write guard (unlocked = clobbers neighbours)"
+        );
+        drop(guards);
+        h.join().unwrap();
+        assert!(
+            done.load(Ordering::SeqCst),
+            "tombstone completes once the block write guard is released"
         );
     }
 

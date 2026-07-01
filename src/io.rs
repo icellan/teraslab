@@ -1334,7 +1334,7 @@ fn write_image_rmw(device: &dyn BlockDevice, offset: u64, image: &[u8]) -> Resul
 /// Locks the same stripe(s) `write_utxo_slot` / `read_record_identity_and_slots`
 /// take for any record in those blocks, so a create into a shared block and a
 /// spend of its neighbour are mutually exclusive.
-fn lock_span_blocks(
+pub(crate) fn lock_span_blocks(
     offset: u64,
     span_bytes: u64,
 ) -> Vec<parking_lot::RwLockWriteGuard<'static, ()>> {
