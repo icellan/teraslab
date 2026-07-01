@@ -2084,6 +2084,18 @@ pub trait RecordAllocator: Send {
         0
     }
 
+    /// Defrag compaction candidates (log-structured engine): the device
+    /// `[start, end)` byte ranges of up to `max` PARTIALLY-dead segments whose
+    /// dead fraction is at least `min_dead_frac`, most-dead-first. The caller (the
+    /// engine) relocates the few live records inside each range out to the cursor,
+    /// after which the segment drains fully and the fast path
+    /// ([`Self::reclaim_fully_dead_segments`]) reclaims it. Default empty: the
+    /// in-place [`SlotAllocator`] has no segments. The segment allocator overrides.
+    fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
+        let _ = (min_dead_frac, max);
+        Vec::new()
+    }
+
     /// Test/fault-injection only: arm the next persist to fail once. On the trait
     /// so checkpoint crash tests can trigger it through the engine's boxed
     /// allocator. Compiled out of production builds.
@@ -2191,6 +2203,9 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn reclaim_fully_dead_segments(&mut self) -> usize {
         (**self).reclaim_fully_dead_segments()
+    }
+    fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
+        (**self).defrag_victim_ranges(min_dead_frac, max)
     }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {

@@ -7653,6 +7653,78 @@ impl Engine {
         total
     }
 
+    /// Defrag COMPACTION (log-structured engine): relocate the few live records
+    /// out of up to `max_segments` partially-dead victim segments (dead fraction ≥
+    /// `min_dead_frac`, most-dead-first) so they DRAIN and the fast path can then
+    /// reclaim them. This is the long-lived-record tail case the fully-dead fast
+    /// path ([`Self::defrag_reclaim_fully_dead`]) cannot reach on its own. Returns
+    /// the number of records relocated.
+    ///
+    /// Each live record is moved VERBATIM to the append cursor via
+    /// [`Self::relocate_record`] under its stripe lock — the same primitive and
+    /// atomicity a spend uses, with empty slot mutations and its current metadata,
+    /// so it re-points the index, journals a buffered `Relocate`, and frees the old
+    /// extent. Best-effort + rate-limited: caller bounds `max_segments` (and thus
+    /// the copy amplification); a per-record error is logged and skipped, never
+    /// aborting the sweep.
+    ///
+    /// Concurrency: the key set is snapshotted lock-free, then each record is
+    /// RE-CHECKED under its stripe lock — a concurrent spend/delete that already
+    /// moved or removed it (so it is no longer in a victim range) is skipped. A new
+    /// offset always lands in the open/free region, never a victim (victims exclude
+    /// the open segment), so a relocated record never re-enters a victim.
+    pub fn defrag_compact(&self, max_segments: usize, min_dead_frac: f64) -> usize {
+        let mut relocated = 0usize;
+        for (store_idx, store) in self.stores.iter().enumerate() {
+            if !store.log_structured {
+                continue;
+            }
+            let device_id = store_idx as u8;
+            let ranges = store
+                .allocator
+                .lock()
+                .defrag_victim_ranges(min_dead_frac, max_segments);
+            if ranges.is_empty() {
+                continue;
+            }
+            let in_victim = |off: u64| ranges.iter().any(|&(s, e)| off >= s && off < e);
+
+            // Snapshot the keys whose live record currently sits in a victim.
+            let mut keys: Vec<TxKey> = Vec::new();
+            self.index.for_each(|key, e| {
+                if e.device_id == device_id && in_victim(e.record_offset) {
+                    keys.push(key);
+                }
+            });
+
+            for key in keys {
+                let _guard = self.locks.lock(&key);
+                // Re-check under the lock: a concurrent spend/delete may have moved
+                // or removed the record since the snapshot.
+                let Some(e) = self.index.lookup(&key) else {
+                    continue;
+                };
+                if e.device_id != device_id || !in_victim(e.record_offset) {
+                    continue;
+                }
+                let meta = match self.read_metadata_fast(device_id, e.record_offset) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        tracing::warn!(target: "teraslab::defrag", err = %err, "compaction: read metadata failed; skipping record");
+                        continue;
+                    }
+                };
+                match self.relocate_record(device_id, &key, &meta, &[]) {
+                    Ok(_) => relocated += 1,
+                    Err(err) => {
+                        tracing::warn!(target: "teraslab::defrag", err = %err, "compaction: relocate failed; skipping record");
+                    }
+                }
+            }
+        }
+        relocated
+    }
+
     /// Force the primary, DAH, and unmined index backends durable on
     /// their own storage (G-1 audit fix).
     ///
@@ -10494,6 +10566,112 @@ mod tests {
             UnminedIndex::new(),
         );
         assert_eq!(engine.defrag_reclaim_fully_dead(), 0);
+    }
+
+    /// Increment 5c-2: compaction relocates the few LIVE records out of a
+    /// partially-dead victim segment so it drains and can be reclaimed.
+    #[test]
+    fn defrag_compact_relocates_live_records_out_of_a_victim_segment() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg_size = 4 * 4096; // 4-block segments
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), seg_size).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            Index::new(256).unwrap(),
+            seg,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let record_size = TxMetadata::record_size_for(1);
+
+        // Fill seg0 with 4 one-block reservations; only the LAST holds a live,
+        // indexed record. The first three are dead-marked below (simulating
+        // records that were deleted / relocated away), leaving seg0 75% dead.
+        let o0 = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let o1 = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let o2 = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let o_live = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        let seg0_start = o0; // first allocation is the segment-0 base
+        let seg0_end = seg0_start + seg_size;
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0x5C;
+        let key = TxKey { txid };
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        let slots = vec![UtxoSlot::new_unspent([0x5C; 32])];
+        io::write_full_record(&*dev, o_live, &meta, &slots).unwrap();
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: o_live,
+                    utxo_count: 1,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 0,
+                },
+            )
+            .unwrap();
+        // Advance past seg0 (seal it) and dead-mark the three unindexed blocks.
+        let _ = engine
+            .allocator_for(0)
+            .lock()
+            .allocate(record_size)
+            .unwrap();
+        for off in [o0, o1, o2] {
+            engine
+                .allocator_for(0)
+                .lock()
+                .free(off, record_size)
+                .unwrap();
+        }
+        // seg0 is now 3/4 dead with one live record — a compaction victim.
+        assert!((seg0_start..seg0_end).contains(&engine.lookup(&key).unwrap().record_offset));
+
+        let relocated = engine.defrag_compact(4, 0.7);
+        assert_eq!(relocated, 1, "the one live record must be relocated out");
+
+        // The record now lives OUTSIDE seg0, and reads through the index still see
+        // it (relocate re-pointed the index).
+        let new_off = engine.lookup(&key).unwrap().record_offset;
+        assert!(
+            !(seg0_start..seg0_end).contains(&new_off),
+            "relocated record must leave the victim segment"
+        );
+        assert_eq!(engine.read_slot(&key, 0).unwrap().hash, [0x5C; 32]);
+        // seg0 is now fully dead and reclaims.
+        assert_eq!(engine.defrag_reclaim_fully_dead(), 1);
+    }
+
+    /// Compaction is a no-op when nothing is dead enough (self-gating).
+    #[test]
+    fn defrag_compact_is_noop_below_the_dead_threshold() {
+        let (engine, _dev, _key, _meta, _slots, _off) = seg_engine_with_record();
+        // A single all-live record: no segment is partially dead.
+        assert_eq!(engine.defrag_compact(4, 0.75), 0);
     }
 
     /// Increment 4c: a spend on the segment engine, driven through the PRODUCTION

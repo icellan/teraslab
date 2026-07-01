@@ -61,6 +61,17 @@ use crate::redo::RedoLog;
 
 type ResetGuard = Arc<dyn Fn(u64) -> bool + Send + Sync + 'static>;
 
+/// Max partially-dead segments the defrag compaction relocates out of PER
+/// checkpoint. Bounds the live-record copy amplification and the checkpoint's
+/// added duration; the fully-dead fast path (unbounded, cheap) does the bulk of
+/// the reclaim, so compaction only needs to chip at the long-lived-record tail.
+const DEFRAG_COMPACT_MAX_SEGMENTS: usize = 4;
+/// Only compact segments this dead or more (0.0..=1.0). A high threshold means few
+/// live records to copy per segment reclaimed (≤25% live at 0.75), keeping the
+/// amplification favorable, and makes compaction self-gating (no work until a
+/// segment is mostly dead).
+const DEFRAG_COMPACT_MIN_DEAD_FRAC: f64 = 0.75;
+
 /// Configuration for the background checkpoint task.
 ///
 /// BC-01: the task uses hysteresis to avoid back-to-back checkpoints
@@ -577,6 +588,24 @@ where
         None
     };
     let started_at = std::time::Instant::now();
+
+    // 0. Defrag COMPACTION (log-structured engine): relocate the few live records
+    //    out of the most-dead partially-dead segments so they drain and can be
+    //    reclaimed below. Runs BEFORE the snapshot so it captures the relocated
+    //    (new) offsets; the relocate writes are fsynced by `persist_allocator`'s
+    //    device barrier before the redo is fenced. Rate-limited (few victims,
+    //    high dead threshold) so the copy amplification and checkpoint duration
+    //    stay bounded; self-gating (no work when nothing is that dead) so it is a
+    //    no-op for the short-lived-record workload the fast path already covers.
+    //    No-op for the in-place engine.
+    let compacted =
+        engine.defrag_compact(DEFRAG_COMPACT_MAX_SEGMENTS, DEFRAG_COMPACT_MIN_DEAD_FRAC);
+    if compacted > 0 {
+        tracing::debug!(
+            compacted,
+            "checkpoint: defrag relocated live records out of victim segments"
+        );
+    }
 
     // 1. Snapshot index + DAH + unmined to disk (tempfile + rename).
     //    `snapshot_index` serializes each shard under its own short-lived read

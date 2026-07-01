@@ -542,6 +542,21 @@ impl SegmentAllocator {
         self.free_segments.len()
     }
 
+    /// The device `[start, end)` byte ranges of up to `max` compaction victims
+    /// (partially-dead segments, dead fraction ≥ `min_dead_frac`, most-dead-first).
+    /// The engine relocates the live records in each range out, draining the
+    /// segment so the fast path can reclaim it. See [`Self::defrag_victims`].
+    pub fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
+        self.defrag_victims(min_dead_frac)
+            .into_iter()
+            .take(max)
+            .map(|idx| {
+                let start = self.segment_start(idx);
+                (start, start + self.segment_size)
+            })
+            .collect()
+    }
+
     /// Mark a previously-allocated region as dead.
     ///
     /// Phase 1 does NOT reclaim space — this only updates the owning segment's
@@ -1217,6 +1232,9 @@ impl RecordAllocator for SegmentAllocator {
     }
     fn reclaim_fully_dead_segments(&mut self) -> usize {
         SegmentAllocator::reclaim_fully_dead_segments(self).len()
+    }
+    fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
+        SegmentAllocator::defrag_victim_ranges(self, min_dead_frac, max)
     }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {
