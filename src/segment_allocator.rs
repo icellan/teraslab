@@ -231,6 +231,14 @@ pub struct SegmentAllocator {
     segment_count: u32,
     /// Per-segment accounting, length == `segment_count`.
     segments: Vec<SegmentMeta>,
+    /// Segments reclaimed by defrag (fully dead) and available for reuse. When
+    /// [`Self::advance_to_next_segment`] needs a fresh segment it pops one of
+    /// these before advancing the high-water past `open_segment` — this is what
+    /// BOUNDS device growth under the relocate-heavy segment engine (Phase 3
+    /// defrag). Empty until [`Self::reclaim_fully_dead_segments`] runs; a fresh
+    /// (never-reclaimed) device therefore behaves exactly as pure append. Held in
+    /// FIFO order (oldest-reclaimed first) so reuse is deterministic.
+    free_segments: std::collections::VecDeque<u32>,
     /// The currently-open (appendable) segment.
     open_segment: u32,
     /// Absolute device offset of the next allocation (inside `open_segment`).
@@ -296,6 +304,7 @@ impl SegmentAllocator {
             segment_size,
             segment_count,
             segments: vec![SegmentMeta::default(); segment_count as usize],
+            free_segments: std::collections::VecDeque::new(),
             open_segment: 0,
             cursor: data_region_start,
             packed: false,
@@ -424,9 +433,27 @@ impl SegmentAllocator {
     }
 
     /// Seal the open segment and open the next one. Returns `false` when there
-    /// is no further segment (device full). Phase 1 is pure append: the next
-    /// segment is always `open_segment + 1` (no free-segment reuse yet).
+    /// is no further segment (device full).
+    ///
+    /// A defrag-reclaimed segment ([`Self::free_segments`], FIFO) is REUSED before
+    /// the high-water advances — this is what bounds device growth under the
+    /// relocate-heavy segment engine: spent records relocate out of old segments,
+    /// those segments drain to fully-dead and get reclaimed, and their space is
+    /// handed back here instead of forever advancing into virgin segments. A
+    /// reused segment starts empty (its `SegmentMeta` was reset at reclaim). With
+    /// no reclaimed segments this is exactly the Phase 1 pure append
+    /// (`open_segment + 1`).
     fn advance_to_next_segment(&mut self) -> bool {
+        if let Some(reused) = self.free_segments.pop_front() {
+            debug_assert!(
+                self.segments[reused as usize].used == 0
+                    && self.segments[reused as usize].dead == 0,
+                "a reclaimed segment must be reset to empty before reuse"
+            );
+            self.open_segment = reused;
+            self.cursor = self.segment_start(reused);
+            return true;
+        }
         let next = self.open_segment + 1;
         if next >= self.segment_count {
             return false;
@@ -434,6 +461,79 @@ impl SegmentAllocator {
         self.open_segment = next;
         self.cursor = self.segment_start(next);
         true
+    }
+
+    /// Live bytes in segment `idx` (`used - dead`). A fully-drained segment has
+    /// `live == 0` (every record it held has been relocated out or deleted). Used
+    /// by the defrag worker to pick and verify victims (observability).
+    pub fn segment_live(&self, idx: u32) -> u64 {
+        let s = &self.segments[idx as usize];
+        s.used.saturating_sub(s.dead)
+    }
+
+    /// Reclaim every FULLY-DEAD segment (`used > 0 && live == 0`) that is not the
+    /// currently-open one: reset its accounting to empty and add it to the reuse
+    /// free list. Returns the reclaimed segment indices.
+    ///
+    /// This is the defrag fast path — under the create→spend(relocate)→delete UTXO
+    /// lifecycle a segment's records all eventually leave it (spend relocates them
+    /// to the cursor; delete dead-marks them), so the segment drains to fully-dead
+    /// WITHOUT any live-record copying and can be reclaimed for free. Partially-
+    /// dead segments (some records still live) need compaction — relocate the live
+    /// records out first — which is the next increment ([`Self::defrag_victims`]
+    /// selects them). The open segment is never reclaimed (the cursor is inside
+    /// it). Already-free segments are skipped (idempotent).
+    pub fn reclaim_fully_dead_segments(&mut self) -> Vec<u32> {
+        let mut reclaimed = Vec::new();
+        for idx in 0..self.segment_count {
+            if idx == self.open_segment {
+                continue;
+            }
+            let s = &self.segments[idx as usize];
+            // used == 0 means never-written OR already-reclaimed: nothing to do.
+            if s.used == 0 || s.used != s.dead {
+                continue;
+            }
+            self.segments[idx as usize] = SegmentMeta::default();
+            self.free_segments.push_back(idx);
+            reclaimed.push(idx);
+        }
+        reclaimed
+    }
+
+    /// Select partially-dead segments worth COMPACTING (relocate their few live
+    /// records out, then reclaim), ordered most-dead-first. A segment qualifies
+    /// when it is sealed (not the open segment), has been written (`used > 0`),
+    /// still holds some live bytes (`live > 0` — fully-dead ones go through the
+    /// free [`Self::reclaim_fully_dead_segments`] path), and its dead fraction is
+    /// at least `min_dead_frac` (0.0..=1.0). Returns indices sorted by descending
+    /// dead fraction so the caller compacts the cheapest-to-empty segments first.
+    ///
+    /// Read-only: the caller (the Phase 3 defrag worker) drives the actual live-
+    /// record relocation via the engine, then reclaims the drained segment.
+    pub fn defrag_victims(&self, min_dead_frac: f64) -> Vec<u32> {
+        let frac = min_dead_frac.clamp(0.0, 1.0);
+        let mut victims: Vec<(u32, f64)> = Vec::new();
+        for idx in 0..self.segment_count {
+            if idx == self.open_segment {
+                continue;
+            }
+            let s = &self.segments[idx as usize];
+            if s.used == 0 || s.dead == 0 || s.dead >= s.used {
+                continue; // never-written, all-live, or fully-dead (free path)
+            }
+            let df = s.dead as f64 / s.used as f64;
+            if df >= frac {
+                victims.push((idx, df));
+            }
+        }
+        victims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        victims.into_iter().map(|(idx, _)| idx).collect()
+    }
+
+    /// Number of segments currently on the reclaimed free list (observability).
+    pub fn free_segment_count(&self) -> usize {
+        self.free_segments.len()
     }
 
     /// Mark a previously-allocated region as dead.
@@ -870,6 +970,12 @@ impl SegmentAllocator {
             segment_size,
             segment_count,
             segments,
+            // The reclaimed-segment free list is NOT yet part of the persisted
+            // header (Phase 3 recovery increment co-designs the format + the
+            // redo-reconciliation for a non-monotonic layout). Recover it empty:
+            // in-production reuse is not wired until then, so a recovered device is
+            // always the pure-append layout this reads back correctly.
+            free_segments: std::collections::VecDeque::new(),
             open_segment,
             cursor,
             packed,
@@ -1162,6 +1268,98 @@ mod tests {
         assert_eq!(o1, DATA_REGION_OFFSET + 4096);
         assert_eq!(a.open_segment(), 1);
         assert_eq!(o2, a.data_region_start() + seg); // start of segment 1
+    }
+
+    #[test]
+    fn reclaim_fully_dead_segment_and_reuse_bounds_growth() {
+        // 2 blocks/segment. Fill seg0, advance to seg1, then dead-mark ALL of
+        // seg0 -> reclaim -> it goes on the free list -> the NEXT segment advance
+        // REUSES seg0 instead of growing into seg2. This is what bounds growth.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let o0 = a.allocate(4096).unwrap(); // seg0 b0
+        let o1 = a.allocate(4096).unwrap(); // seg0 b1 (full)
+        let _o2 = a.allocate(4096).unwrap(); // -> seg1 b0
+        assert_eq!(a.open_segment(), 1);
+
+        // Dead-mark all of seg0.
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap();
+        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.free_segment_count(), 1);
+        // seg0's accounting was reset.
+        assert_eq!(a.segment_live(0), 0);
+
+        let _o3 = a.allocate(4096).unwrap(); // seg1 b1 (fills seg1)
+        assert_eq!(a.open_segment(), 1);
+        let o4 = a.allocate(4096).unwrap(); // must REUSE seg0, not grow to seg2
+        assert_eq!(
+            a.open_segment(),
+            0,
+            "advance must reuse the reclaimed seg0, not grow into seg2"
+        );
+        assert_eq!(o4, DATA_REGION_OFFSET, "reused seg0 starts at its base");
+        assert_eq!(a.free_segment_count(), 0);
+    }
+
+    #[test]
+    fn reclaim_skips_open_partially_dead_and_all_live_segments() {
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let a0 = a.allocate(4096).unwrap();
+        let a1 = a.allocate(4096).unwrap(); // seg0 full (all-live)
+        let b0 = a.allocate(4096).unwrap();
+        let _b1 = a.allocate(4096).unwrap(); // seg1 full
+        let _c0 = a.allocate(4096).unwrap(); // seg2 open (1 live)
+        assert_eq!(a.open_segment(), 2);
+
+        a.free(b0, 4096).unwrap(); // seg1 partially dead (1/2)
+        // Nothing fully dead yet: seg0 all-live, seg1 partial, seg2 open.
+        assert!(a.reclaim_fully_dead_segments().is_empty());
+
+        // Now fully dead-mark seg0.
+        a.free(a0, 4096).unwrap();
+        a.free(a1, 4096).unwrap();
+        // seg0 reclaims; seg1 (partial) and seg2 (open) do NOT.
+        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.free_segment_count(), 1);
+    }
+
+    #[test]
+    fn defrag_victims_ranks_partially_dead_segments_most_dead_first() {
+        // 4 blocks/segment so we can make distinct dead fractions.
+        let seg = 4 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let mut seg_offsets: Vec<Vec<u64>> = Vec::new();
+        for _ in 0..3 {
+            let mut offs = Vec::new();
+            for _ in 0..4 {
+                offs.push(a.allocate(4096).unwrap());
+            }
+            seg_offsets.push(offs);
+        }
+        let _open = a.allocate(4096).unwrap(); // seg3 open
+        assert_eq!(a.open_segment(), 3);
+
+        // seg0: dead 1/4; seg1: dead 3/4; seg2: dead 2/4.
+        a.free(seg_offsets[0][0], 4096).unwrap();
+        for i in 0..3 {
+            a.free(seg_offsets[1][i], 4096).unwrap();
+        }
+        for i in 0..2 {
+            a.free(seg_offsets[2][i], 4096).unwrap();
+        }
+
+        // Most-dead-first: seg1 (0.75), seg2 (0.5), seg0 (0.25).
+        assert_eq!(a.defrag_victims(0.0), vec![1, 2, 0]);
+        // A threshold filters the low-dead segment.
+        assert_eq!(a.defrag_victims(0.5), vec![1, 2]);
+        // Dead-mark seg0's remaining 3 blocks so it is now FULLY dead (4/4) ->
+        // excluded from victims (it goes the free reclaim path, not compaction).
+        for i in 1..4 {
+            a.free(seg_offsets[0][i], 4096).unwrap();
+        }
+        assert!(!a.defrag_victims(0.0).contains(&0));
     }
 
     #[test]
