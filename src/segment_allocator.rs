@@ -51,8 +51,14 @@ pub const RECORD_ALIGN: u64 = 8;
 /// fails closed when opened by the other (rather than misreading the header).
 const SEG_MAGIC: u64 = 0x5445_5241_5345_474C; // "TERASEGL"
 
-/// Current segment-header layout version.
-const SEG_HEADER_VERSION: u32 = 1;
+/// Current segment-header layout version. v2 persists up to the highest-USED
+/// segment (not just `open_segment`) so a defrag-reclaimed non-monotonic layout
+/// round-trips; v1 (persist up to `open_segment`) is a subset (no reuse gaps) and
+/// still reads correctly. See [`SegmentAllocator::persist_header_no_sync`].
+const SEG_HEADER_VERSION: u32 = 2;
+/// Minimum header version this build can read. v1 and v2 share the read format;
+/// v2 merely allows `used == 0` reuse gaps below the highest-used segment.
+const SEG_HEADER_MIN_READABLE: u32 = 1;
 
 // Fixed byte offsets within the header (little-endian fields).
 const OFF_MAGIC: usize = 0; // u64
@@ -801,9 +807,25 @@ impl SegmentAllocator {
     /// so the checkpoint can write every store's header under the lock and sync
     /// all devices once, outside the lock.
     pub(crate) fn persist_header_no_sync(&self) -> Result<()> {
-        // Persist every segment up to and including the open one. Segments
-        // beyond `open_segment` have never been touched (used==dead==0).
-        let entry_count = self.open_segment as usize + 1;
+        // Persist every segment up to and including the HIGHEST-USED one (v2).
+        //
+        // Under defrag reuse the layout is non-monotonic: a reclaimed low segment
+        // can be reused while higher segments hold live records, so `open_segment`
+        // is no longer the high-water. Persisting only up to `open_segment` (the
+        // v1 rule) would drop the accounting of higher used segments. Instead
+        // persist up to `max(open_segment, highest used index)`; segments ABOVE
+        // that are virgin (never written) and recovered as default, while a
+        // `used == 0` gap BELOW it is a defrag-reclaimed free segment (rebuilt into
+        // `free_segments` at recovery — the free list needs no separate on-disk
+        // representation). Without reuse `highest_used == open_segment`, so this is
+        // byte-identical to the v1 layout.
+        let highest_used = self
+            .segments
+            .iter()
+            .rposition(|s| s.used > 0)
+            .map(|i| i as u32)
+            .unwrap_or(0);
+        let entry_count = self.open_segment.max(highest_used) as usize + 1;
         if entry_count > MAX_PERSISTED_SEGMENTS {
             return Err(SegmentAllocatorError::SegmentTableOverflow {
                 entries: entry_count,
@@ -875,7 +897,7 @@ impl SegmentAllocator {
         }
 
         let version = u32::from_le_bytes(rd4(&prefix, OFF_VERSION)?);
-        if version != SEG_HEADER_VERSION {
+        if !(SEG_HEADER_MIN_READABLE..=SEG_HEADER_VERSION).contains(&version) {
             return Err(SegmentAllocatorError::UnsupportedVersion(version));
         }
 
@@ -913,10 +935,16 @@ impl SegmentAllocator {
                 "segment_count disagrees with device geometry",
             ));
         }
-        if entry_count > MAX_PERSISTED_SEGMENTS
+        // v2: `entry_count` covers up to the highest-USED segment, so it may
+        // exceed `open_segment + 1` (a reused low open segment with higher used
+        // segments) — require only that the open segment falls within the
+        // persisted range and the count is geometrically sane. (v1 devices satisfy
+        // `entry_count == open_segment + 1`, a subset of this.)
+        if entry_count == 0
+            || entry_count > MAX_PERSISTED_SEGMENTS
             || entry_count > segment_count as usize
             || open_segment >= segment_count
-            || entry_count != open_segment as usize + 1
+            || open_segment as usize >= entry_count
         {
             return Err(SegmentAllocatorError::CorruptedHeader(
                 "entry_count/open_segment inconsistent",
@@ -960,6 +988,24 @@ impl SegmentAllocator {
             seg.used = u64::from_le_bytes(rd8(&buf, base)?);
             seg.dead = u64::from_le_bytes(rd8(&buf, base + 8)?);
         }
+        // Rebuild the reclaimed-segment free list: a `used == 0` gap BELOW the
+        // highest-persisted index (`entry_count`) is a defrag-reclaimed segment
+        // (segments above `entry_count` are the never-written virgin tail the
+        // append cursor grows into first). Exclude the open segment (it may sit at
+        // `used == 0` right after an advance but is not free). Ascending order is a
+        // deterministic reuse order; it only affects future placement, never the
+        // recovered records. `dead > 0 && used == 0` would be a torn header.
+        let mut free_segments = std::collections::VecDeque::new();
+        for (i, seg) in segments.iter().enumerate().take(entry_count) {
+            if seg.used == 0 && i as u32 != open_segment {
+                if seg.dead != 0 {
+                    return Err(SegmentAllocatorError::CorruptedHeader(
+                        "segment has dead bytes but zero used",
+                    ));
+                }
+                free_segments.push_back(i as u32);
+            }
+        }
 
         Ok(Self {
             device,
@@ -970,12 +1016,10 @@ impl SegmentAllocator {
             segment_size,
             segment_count,
             segments,
-            // The reclaimed-segment free list is NOT yet part of the persisted
-            // header (Phase 3 recovery increment co-designs the format + the
-            // redo-reconciliation for a non-monotonic layout). Recover it empty:
-            // in-production reuse is not wired until then, so a recovered device is
-            // always the pure-append layout this reads back correctly.
-            free_segments: std::collections::VecDeque::new(),
+            // Reclaimed-segment free list, rebuilt above from the persisted table's
+            // used==0 gaps (v2). Empty for a monotonic (v1 / never-defragged)
+            // device.
+            free_segments,
             open_segment,
             cursor,
             packed,
@@ -1461,6 +1505,45 @@ mod tests {
         let mut b = b;
         let o3 = b.allocate(4096).unwrap();
         assert_eq!(o3, o2 + 4096);
+    }
+
+    #[test]
+    fn persist_recover_roundtrips_a_reused_nonmonotonic_layout() {
+        // v2: a defrag-reclaimed low segment (a used==0 gap below the highest-used
+        // segment) must round-trip, and the recovered allocator must reuse it —
+        // so bounded growth survives a restart.
+        let device = dev(64);
+        let seg = 2 * ALIGN as u64;
+        let mut a = SegmentAllocator::new(device.clone(), seg).unwrap();
+        let o0 = a.allocate(4096).unwrap();
+        let o1 = a.allocate(4096).unwrap(); // seg0 full
+        let _ = a.allocate(4096).unwrap(); // seg1 b0
+        let _ = a.allocate(4096).unwrap(); // seg1 full
+        let _ = a.allocate(4096).unwrap(); // seg2 open
+        assert_eq!(a.open_segment(), 2);
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap();
+        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.free_segment_count(), 1);
+        let before = a.stats();
+        a.persist().unwrap();
+
+        let mut b = SegmentAllocator::recover(device).unwrap();
+        assert_eq!(b.open_segment(), 2);
+        assert_eq!(b.cursor(), a.cursor());
+        assert_eq!(b.stats(), before, "used/dead/live round-trip");
+        assert_eq!(
+            b.free_segment_count(),
+            1,
+            "the reclaimed-seg0 gap must be rebuilt into the free list"
+        );
+        // Fill seg2, then the next advance must REUSE seg0 (not grow to seg3).
+        let _ = b.allocate(4096).unwrap(); // seg2 b1 (fills seg2)
+        assert_eq!(b.open_segment(), 2);
+        let o = b.allocate(4096).unwrap();
+        assert_eq!(b.open_segment(), 0, "reclaimed seg0 reused after recovery");
+        assert_eq!(o, DATA_REGION_OFFSET);
+        assert_eq!(b.free_segment_count(), 0);
     }
 
     #[test]
