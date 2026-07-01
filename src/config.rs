@@ -669,10 +669,14 @@ const fn default_segment_size() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StorageEngine {
     /// Best-fit freelist allocator (records placed at home offsets, updated in
-    /// place). The historical default.
-    #[default]
+    /// place). Required for clustered/replicated nodes and for strict redo
+    /// durability (set `engine = "in_place"` explicitly for those).
     InPlace,
-    /// Log-structured append-cursor allocator (creates append sequentially).
+    /// Log-structured append-cursor allocator (creates append sequentially,
+    /// spends relocate-on-write). The default: higher throughput and lower tail
+    /// latency on the standalone UTXO workload. Requires buffered redo
+    /// durability (now the default) and a non-clustered node.
+    #[default]
     Segment,
 }
 
@@ -686,8 +690,10 @@ where
 {
     let s = String::deserialize(deserializer)?;
     match s.as_str() {
-        "in_place" | "" => Ok(StorageEngine::InPlace),
-        "segment" => Ok(StorageEngine::Segment),
+        "in_place" => Ok(StorageEngine::InPlace),
+        // Empty string falls through to the default engine (segment), matching
+        // an absent `[storage] engine` key.
+        "segment" | "" => Ok(StorageEngine::Segment),
         other => Err(serde::de::Error::custom(format!(
             "unknown storage engine: {other:?} (expected \"in_place\" or \"segment\")"
         ))),
@@ -1248,7 +1254,12 @@ impl Default for ServerConfig {
             stream_idle_timeout_secs: Self::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             max_inflight_request_bytes: 256 * 1024 * 1024,
             pipeline_depth: 1,
-            redo_buffered: false,
+            // Buffered redo durability is the default: it matches the reference
+            // datastore's async-durability posture and is REQUIRED by the
+            // default segment engine (whose relocate-on-spend journals after the
+            // data write). Set `redo_buffered = false` for strict durability —
+            // which also requires `engine = "in_place"`.
+            redo_buffered: true,
             redo_flush_interval_ms: 5,
             redo_buffered_io: false,
             redo_segment_ring: false,
@@ -2238,12 +2249,14 @@ backend = ""
 
     #[test]
     fn best_effort_with_rf_3_is_rejected() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 3,
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
+        // Clustered nodes require the in_place engine (segment is standalone-only).
+        cfg.storage.engine = StorageEngine::InPlace;
 
         let err = cfg.validate_cluster_safety().unwrap_err();
         assert!(err.contains("replication_degraded_mode"));
@@ -2253,12 +2266,13 @@ backend = ""
 
     #[test]
     fn best_effort_with_rf_2_is_rejected() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 2,
             replication_factor: 2,
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
+        cfg.storage.engine = StorageEngine::InPlace;
 
         let err = cfg.validate_cluster_safety().unwrap_err();
         assert!(err.contains("replication_factor = 2"));
@@ -2266,13 +2280,14 @@ backend = ""
 
     #[test]
     fn ack_policy_best_effort_requires_degraded_mode_best_effort() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 3,
             ack_policy: "best_effort".to_string(),
             replication_degraded_mode: "reject".to_string(),
             ..ServerConfig::default()
         };
+        cfg.storage.engine = StorageEngine::InPlace;
 
         let err = cfg.validate_cluster_safety().unwrap_err();
         assert!(err.contains("ack_policy"), "error was: {err}");
@@ -2283,12 +2298,14 @@ backend = ""
     #[test]
     fn best_effort_with_rf_1_is_accepted() {
         // RF=1 means no replicas — best_effort is a no-op and permitted.
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 1,
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
+        // node_id>0 is clustered → in_place (segment is standalone-only).
+        cfg.storage.engine = StorageEngine::InPlace;
 
         cfg.validate_cluster_safety()
             .expect("RF=1 with best_effort must validate successfully");
@@ -2419,9 +2436,23 @@ backend = ""
     }
 
     #[test]
-    fn storage_engine_defaults_to_in_place() {
+    fn storage_engine_defaults_to_segment() {
         let cfg = ServerConfig::default();
-        assert_eq!(cfg.storage.engine, StorageEngine::InPlace);
+        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
+        // The default is a bootable standalone config: segment requires buffered
+        // durability (also now the default) and a non-clustered node.
+        assert!(
+            cfg.redo_buffered_effective(),
+            "default durability is buffered"
+        );
+        cfg.validate_cluster_safety()
+            .expect("default (segment + buffered + standalone) must validate");
+    }
+
+    #[test]
+    fn empty_engine_string_resolves_to_default_segment() {
+        let cfg: ServerConfig = toml::from_str("[storage]\nengine = \"\"\n").unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
     }
 
     #[test]
@@ -2518,12 +2549,24 @@ backend = ""
 
     #[test]
     fn redo_buffered_io_defaults_off_and_implies_buffered_durability() {
-        // Default: both off → strict durability, no buffered effect.
+        // redo_buffered_io still defaults OFF; redo_buffered now defaults ON
+        // (buffered durability is the default — see `redo_buffered`).
         let cfg = ServerConfig::default();
         assert!(!cfg.redo_buffered_io, "redo_buffered_io must default OFF");
-        assert!(!cfg.redo_buffered);
+        assert!(cfg.redo_buffered, "redo_buffered now defaults ON");
         assert!(
-            !cfg.redo_buffered_effective(),
+            cfg.redo_buffered_effective(),
+            "default durability is buffered"
+        );
+
+        // Explicit strict durability (both off) → not buffered.
+        let strict = ServerConfig {
+            redo_buffered: false,
+            redo_buffered_io: false,
+            ..ServerConfig::default()
+        };
+        assert!(
+            !strict.redo_buffered_effective(),
             "neither flag set → not buffered"
         );
 
@@ -2696,12 +2739,13 @@ backend = ""
 
     #[test]
     fn reject_mode_with_rf_3_is_accepted() {
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             node_id: 7,
             replication_factor: 3,
             replication_degraded_mode: "reject".to_string(),
             ..ServerConfig::default()
         };
+        cfg.storage.engine = StorageEngine::InPlace;
 
         cfg.validate_cluster_safety()
             .expect("reject mode must always validate");
