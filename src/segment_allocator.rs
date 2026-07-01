@@ -1215,6 +1215,9 @@ impl RecordAllocator for SegmentAllocator {
     fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
         SegmentAllocator::reconcile_recovered_free_list(self, live_offsets);
     }
+    fn reclaim_fully_dead_segments(&mut self) -> usize {
+        SegmentAllocator::reclaim_fully_dead_segments(self).len()
+    }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {
         // No fault-injection hook on the segment allocator (yet); no-op so the

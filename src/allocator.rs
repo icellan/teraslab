@@ -2072,6 +2072,18 @@ pub trait RecordAllocator: Send {
         let _ = live_offsets;
     }
 
+    /// Defrag fast path (log-structured engine): reclaim every fully-dead segment
+    /// (all its records relocated out or deleted) for reuse, bounding device
+    /// growth. Returns the number of segments reclaimed. Default 0: the in-place
+    /// [`SlotAllocator`] reclaims freed space through its freelist, not segments.
+    /// The segment allocator overrides it. Safe to call under the allocator lock;
+    /// the reclaimed state is re-derivable on recovery
+    /// ([`Self::reconcile_recovered_free_list`]), so it needs no journaling — the
+    /// checkpoint persists it in the header on its next pass.
+    fn reclaim_fully_dead_segments(&mut self) -> usize {
+        0
+    }
+
     /// Test/fault-injection only: arm the next persist to fail once. On the trait
     /// so checkpoint crash tests can trigger it through the engine's boxed
     /// allocator. Compiled out of production builds.
@@ -2176,6 +2188,9 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
         (**self).reconcile_recovered_free_list(live_offsets)
+    }
+    fn reclaim_fully_dead_segments(&mut self) -> usize {
+        (**self).reclaim_fully_dead_segments()
     }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {

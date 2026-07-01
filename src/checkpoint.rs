@@ -587,6 +587,19 @@ where
         .snapshot_index(&config.snapshot_path)
         .map_err(|e| format!("snapshot_index: {e}"))?;
 
+    // 1b. Defrag fast path: reclaim fully-dead segments (log-structured engine)
+    //     so the header persisted next reflects the reclaimed, reused layout —
+    //     this is what bounds device growth under relocate-on-spend. No-op for the
+    //     in-place engine; re-derivable from the index on crash, so it is not
+    //     journaled.
+    let reclaimed = engine.defrag_reclaim_fully_dead();
+    if reclaimed > 0 {
+        tracing::debug!(
+            reclaimed,
+            "checkpoint: defrag reclaimed fully-dead segments"
+        );
+    }
+
     // 2. Persist allocator state to its on-disk header (fsynced before
     //    returning).
     engine

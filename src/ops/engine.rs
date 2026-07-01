@@ -7631,6 +7631,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Defrag fast path: reclaim every fully-dead segment across all stores for
+    /// reuse, bounding device growth under the log-structured (segment) engine.
+    /// Returns the total number of segments reclaimed.
+    ///
+    /// Called by the checkpoint immediately BEFORE [`Self::persist_allocator`], so
+    /// the reclaimed state (reset segments + grown free list) lands in the on-disk
+    /// header atomically with the rest of the checkpoint. In-place stores are a
+    /// no-op (their allocator's trait method returns 0). Runs under each store's
+    /// allocator lock — brief, and mutually exclusive with allocate/free, which
+    /// only ever touch the OPEN segment (never a sealed fully-dead one).
+    ///
+    /// No journaling: a crash before the persisting checkpoint simply loses the
+    /// reclaim, and recovery re-derives the free list from the live index
+    /// ([`crate::allocator::RecordAllocator::reconcile_recovered_free_list`]).
+    pub fn defrag_reclaim_fully_dead(&self) -> usize {
+        let mut total = 0;
+        for store in &self.stores {
+            total += store.allocator.lock().reclaim_fully_dead_segments();
+        }
+        total
+    }
+
     /// Force the primary, DAH, and unmined index backends durable on
     /// their own storage (G-1 audit fix).
     ///
@@ -10418,6 +10440,60 @@ mod tests {
             }
             other => panic!("expected StorageError, got {other:?}"),
         }
+    }
+
+    /// Increment 5c: the checkpoint's defrag fast path reclaims a drained segment
+    /// through the engine, bounding growth. Drains a segment via the allocator,
+    /// then `defrag_reclaim_fully_dead` (what the checkpoint calls) reclaims it.
+    #[test]
+    fn defrag_reclaim_fully_dead_reclaims_a_drained_segment() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        // 2-block segments so a single segment drains quickly.
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 2 * 4096).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        // Fill seg0, advance into seg1, then dead-mark all of seg0.
+        {
+            let alloc = engine.allocator_for(0);
+            let mut a = alloc.lock();
+            let o0 = a.allocate(4096).unwrap();
+            let o1 = a.allocate(4096).unwrap(); // seg0 full
+            let _ = a.allocate(4096).unwrap(); // seg1 open
+            a.free(o0, 4096).unwrap();
+            a.free(o1, 4096).unwrap(); // seg0 fully dead
+        }
+        assert_eq!(
+            engine.defrag_reclaim_fully_dead(),
+            1,
+            "the drained seg0 must be reclaimed"
+        );
+        // Idempotent: nothing left to reclaim.
+        assert_eq!(engine.defrag_reclaim_fully_dead(), 0);
+    }
+
+    /// An in-place (SlotAllocator) engine reclaims nothing — the fast path is a
+    /// no-op there (freelist reuse, not segments).
+    #[test]
+    fn defrag_reclaim_is_noop_for_in_place_engine() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let slot = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            slot,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert_eq!(engine.defrag_reclaim_fully_dead(), 0);
     }
 
     /// Increment 4c: a spend on the segment engine, driven through the PRODUCTION
