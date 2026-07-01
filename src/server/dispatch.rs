@@ -533,6 +533,19 @@ pub(crate) fn handle_request(
         return err_resp;
     }
 
+    // Pre-barrier redo backpressure (block 269 / redo-full fix): stall a
+    // redo-appending mutation — holding NO barrier — until the log has
+    // headroom, so a large-block write burst can never fill the redo
+    // mid-append and fail a valid block. This MUST run before acquiring the
+    // exclusive barrier below: the checkpoint drain that frees the space needs
+    // that same barrier, so blocking while holding it would deadlock. A no-op
+    // until the checkpoint task arms the coordinator (no drain → nothing to
+    // wait for → full-log append falls through to LogFull → rollback →
+    // ERR_STORAGE, the historical behaviour).
+    if needs_exclusive_visibility_barrier(request.op_code) {
+        redo_backpressure_gate(engine);
+    }
+
     let mut _visibility_guard =
         acquire_dispatch_visibility_guard(engine, request.op_code, request.flags);
     // C-1: for mutation ops, borrow the exclusive barrier out as a
@@ -4277,6 +4290,60 @@ fn manages_own_visibility(op: u16) -> bool {
             | OP_GET_SPEND_BATCH
             | OP_DELETE_BATCH
     )
+}
+
+/// Free-space headroom (PHYSICAL forward room — see
+/// [`crate::redo::RedoAtomics::available_space`]) a mutation requires before it
+/// may proceed, as a fraction (1/N) of the per-store redo entries-region
+/// capacity. Chosen above the checkpoint high-water mark so the gate engages
+/// only in an extreme burst the fuzzy/blocking checkpoints cannot keep pace
+/// with — steady-state mutations pass the lock-free fast path untouched.
+///
+/// This is a SOFT admission gate sized for the common case, not a hard
+/// guarantee that every admitted batch fits: a single oversized request (e.g.
+/// fat cold-data) can exceed the reserve, and several requests can pass on one
+/// free-space snapshot before serialising on the exclusive barrier. The HARD
+/// safety net is the per-store `would_fit` pre-flight in
+/// [`crate::ops::engine::Engine::append_redo_ops_routed`], which rejects an
+/// over-capacity batch CLEANLY (`ERR_STORAGE` + reservation rollback) instead
+/// of poisoning/bricking the store's log.
+const REDO_BACKPRESSURE_RESERVE_DIVISOR: u64 = 8;
+
+/// Upper bound on how long the gate stalls before giving up and letting the
+/// append proceed (which may then fail with `LogFull`). A safety valve for a
+/// genuinely stuck drain (snapshot device fault, replicas pinning the log) so
+/// the node degrades to the historical behaviour instead of hanging forever.
+/// In normal operation a reclaim frees space in milliseconds and the gate
+/// returns long before this.
+const REDO_BACKPRESSURE_MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// Pre-barrier redo backpressure gate.
+///
+/// Blocks the caller — holding NO engine visibility barrier — until every redo
+/// store has a safety reserve of free space. This is the load-bearing half of
+/// the backpressure fix: a write burst that would overflow a store's log
+/// STALLS here instead of failing the append after the exclusive mutation
+/// barrier is taken. Blocking at the literal append (under the barrier) would
+/// deadlock, because the checkpoint drain that frees the space needs that
+/// **same** exclusive barrier to run.
+///
+/// No-op when no redo logs are attached, or until the checkpoint task arms the
+/// coordinator (no drain → nothing to reclaim a full log → blocking would
+/// hang; a full-log append then degrades to `LogFull` → rollback →
+/// `ERR_STORAGE`).
+fn redo_backpressure_gate(engine: &Engine) {
+    let Some(bp) = engine.redo_backpressure() else {
+        return;
+    };
+    let reserve = (bp.capacity() / REDO_BACKPRESSURE_RESERVE_DIVISOR).max(1);
+    if !bp.wait_for_capacity(reserve, REDO_BACKPRESSURE_MAX_WAIT) {
+        tracing::warn!(
+            reserve,
+            available = bp.available_space(),
+            "redo backpressure gate timed out waiting for capacity; proceeding \
+             (drain may be stuck — check the checkpoint task and replica lag)"
+        );
+    }
 }
 
 /// Owns whichever side of the `dispatch_visibility_barrier` rwlock is
@@ -8884,16 +8951,23 @@ fn handle_process_expired(
     };
 
     // Phase 0 — expired-preservation processing (KO-1 / spec §3.18 Phase 3).
-    // Scan the primary index for records whose preservation has elapsed and
-    // schedule them for deletion (set DAH = current + retention, clear
-    // preserve_until). There is no dedicated preserve secondary index, so we
-    // use the cached HAS_PRESERVE_UNTIL discriminant + `dah_or_preserve`
-    // (which holds `preserve_until` when that bit is set) to filter the scan
-    // cheaply before reading device metadata. Each match is re-validated
-    // under the stripe lock inside `expire_preservation_set_dah`. Skipped
-    // entirely when retention is 0 (legacy 4-byte payload).
+    // Range-query the preserve secondary index for records whose preservation
+    // window has elapsed (preserve_until in [1, current_height]) and schedule
+    // them for deletion (set DAH = current + retention, clear preserve_until).
+    // This is O(expired), mirroring the Phase-2 DAH query below — it replaces
+    // the former O(index-size) primary-index walk that pinned a core during
+    // sync (#25). Each match is re-validated under the stripe lock inside
+    // `expire_preservation_set_dah`, so a preserve_until cleared or pushed
+    // forward since the query is handled correctly there. Skipped entirely
+    // when retention is 0 (legacy 4-byte payload).
+    //
+    // Bounded to `max_batch` per call (lowest-`preserve_until` first) so a
+    // large catch-up backlog can't peg a core in one request; the pruner fires
+    // on every persisted block, so the remainder drains on subsequent calls.
     if block_height_retention != 0 {
-        let expired_candidates = engine.scan_expired_preservations(current_height);
+        let expired_candidates = engine
+            .preserve_index()
+            .range_query_limited(current_height, max_batch as usize);
         for key in &expired_candidates {
             // Ownership: only the master schedules expiry for its records.
             if check_shard_ownership(&key.txid, 0, cluster, false).is_some() {
@@ -8916,14 +8990,31 @@ fn handle_process_expired(
         }
     }
 
-    // Query DAH index for transactions due for deletion. The DAH index
+    // Query the DAH index for transactions due for deletion. The DAH index
     // is per-node and reflects only records this node knows about, so
     // it is already (mostly) ownership-filtered when running in cluster
     // mode — but we still re-check ownership explicitly below because
     // (a) DAH may transiently include non-master records during
     // migration, and (b) the index can lag behind the on-device
     // metadata.
-    let candidates = engine.dah_index().range_query(current_height);
+    //
+    // BOUNDED at `max_batch` candidates per call (#25 follow-up). The full
+    // due-set can reach the entire UTXO set during a catch-up sync. Processing
+    // it in one request was doubly broken: (1) it built a single
+    // OP_DELETE_BATCH bigger than the delete handler's own `max_batch` limit,
+    // so the batch was rejected with PAYLOAD_MALFORMED and NOTHING was ever
+    // deleted — the index could only grow; (2) the per-candidate under-lock
+    // re-validation below pegged a core over the whole due-set. Capping the
+    // query (lowest-`delete_at_height` first) fixes both: `owned_due` can never
+    // exceed `max_batch`, so the single delete dispatch below always fits (no
+    // chunking needed, and the C-1 barrier hand-off stays a single move), and
+    // the re-validation loop is bounded. The pruner fires on every persisted
+    // block, so the remaining due records drain on subsequent calls — the
+    // response's count reflects only what THIS call handled, so the caller
+    // converges across calls.
+    let candidates = engine
+        .dah_index()
+        .range_query_limited(current_height, max_batch as usize);
 
     // Phase 1: filter by ownership + re-validate against current metadata.
     // A DAH entry is a hint; the metadata is authoritative. The
@@ -11343,6 +11434,110 @@ mod tests {
         assert!(
             h.engine.lookup(&key).is_none(),
             "record gone after expiry + sweep (KO-1)"
+        );
+    }
+
+    /// #25: the expiry sweep sources its candidates from the preserve
+    /// secondary index, NOT an O(index-size) primary walk. Proof: clear the
+    /// preserve index out from under a genuinely-preserved record; the sweep
+    /// then finds nothing to expire even though the on-device metadata still
+    /// says `preserve_until <= current`. A metadata scan would have found it.
+    #[test]
+    fn process_expired_sources_candidates_from_preserve_index() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(44);
+        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+        let key = TxKey { txid };
+        assert_eq!(preserve_until(&h, txid, 100).status, STATUS_OK);
+        assert_eq!(
+            h.engine.preserve_index().range_query(100),
+            vec![key],
+            "preserve_until must populate the preserve index"
+        );
+
+        // Drop the index entry while the metadata stays preserved.
+        h.engine.preserve_index().clear().unwrap();
+
+        let resp = h.request(
+            OP_PROCESS_EXPIRED_PRESERVATIONS,
+            process_expired_payload(100, 10),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(
+            deleted, 0,
+            "with the preserve index empty the sweep must find nothing — it \
+             does not fall back to an O(index) metadata scan"
+        );
+        // Metadata untouched: expiry never ran for this record.
+        let meta = h.engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.preserve_until }, 100);
+        assert_eq!({ meta.delete_at_height }, 0);
+    }
+
+    /// #25 follow-up (DAH-sweep cap): with more than `max_batch` DAH-due
+    /// records, a single OP_PROCESS_EXPIRED_PRESERVATIONS call must succeed
+    /// (NOT fail with PAYLOAD_MALFORMED from an oversized delete batch),
+    /// delete a slice capped at `max_batch`, and repeated per-block calls must
+    /// drain the DAH index to zero. Pre-fix the sweep built one delete batch
+    /// of the entire due-set, which the delete handler rejected once it
+    /// exceeded `max_batch` — so nothing was ever deleted and the index only
+    /// grew, stalling a live teratestnet sync.
+    #[test]
+    fn process_expired_dah_sweep_caps_batch_and_converges() {
+        let h = DispatchTestHarness::new();
+        let max_batch = 4u32;
+        let retention = 10u32;
+        let n = 11usize; // > 2 * max_batch → needs at least 3 capped calls
+
+        for i in 0..n {
+            let txid = DispatchTestHarness::make_txid(50 + i as u8);
+            assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
+            // set_mined at height 50 + spend-all at height 100 with `retention`
+            // → DAH = 100 + 10 = 110, all-spent, on-longest-chain → due.
+            make_record_dah_eligible(&h, txid, retention);
+        }
+        assert_eq!(
+            h.engine.dah_index().range_query(u32::MAX).len(),
+            n,
+            "all seeded records must be in the DAH index",
+        );
+
+        // Sweep at a height past the DAH (110) with a small `max_batch` so the
+        // cap engages well below the seeded count.
+        let mut calls = 0u32;
+        while !h.engine.dah_index().range_query(u32::MAX).is_empty() {
+            let resp = h.request_with_max_batch(
+                OP_PROCESS_EXPIRED_PRESERVATIONS,
+                process_expired_payload(200, retention),
+                max_batch,
+            );
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "DAH sweep must succeed without PAYLOAD_MALFORMED (status {})",
+                resp.status,
+            );
+            let deleted = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+            assert!(
+                deleted <= max_batch,
+                "per-call deletes {deleted} must be capped at max_batch {max_batch}",
+            );
+            assert!(deleted > 0, "a call with due records must make progress");
+            calls += 1;
+            assert!(
+                calls <= n as u32 + 2,
+                "sweep must converge, not loop forever"
+            );
+        }
+
+        assert!(
+            h.engine.dah_index().range_query(u32::MAX).is_empty(),
+            "repeated capped sweeps must drain the DAH index to zero",
+        );
+        let min_calls = (n as u32).div_ceil(max_batch);
+        assert!(
+            calls >= min_calls,
+            "draining {n} records at <= {max_batch}/call needs >= {min_calls} calls; took {calls}",
         );
     }
 
@@ -21056,6 +21251,238 @@ mod tests {
     /// (redo log full) returns `ERR_STORAGE_IO` and ticks `creates_failed` +
     /// `operations{create,err_storage}`.
     ///
+    /// Build `payload` bytes of inline cold data for a create item so each
+    /// CreateV2 redo entry is fat enough to fill a small log fast.
+    fn burst_create_items(batch_tag: u8, count: usize, payload: usize) -> Vec<WireCreateItem> {
+        (0..count)
+            .map(|k| {
+                let mut txid = [0u8; 32];
+                txid[0] = 0xD0;
+                txid[1] = batch_tag;
+                txid[2] = k as u8;
+                // Distinct txids per item. (Placement is round-robin, not
+                // txid-hashed, so it spreads records across stores regardless;
+                // uniqueness here just keeps the index entries distinct.)
+                txid[31] = (batch_tag).wrapping_mul(31).wrapping_add(k as u8);
+                WireCreateItem {
+                    txid,
+                    tx_version: 1,
+                    locktime: 0,
+                    fee: 500,
+                    size_in_bytes: 250,
+                    extended_size: 0,
+                    is_coinbase: false,
+                    spending_height: 0,
+                    created_at: 1_700_000_000_000,
+                    flags: 0,
+                    utxo_hashes: vec![[k as u8; 32], [(k as u8).wrapping_add(1); 32]],
+                    cold_data: vec![0xCD; payload],
+                    block_height: 0,
+                    mined_block_id: None,
+                    mined_block_height: None,
+                    mined_subtree_idx: None,
+                    parent_txids: vec![],
+                }
+            })
+            .collect()
+    }
+
+    /// Drive a create burst exceeding the redo capacity through `handle_request`
+    /// against `engine` (with its checkpoint task already running and the
+    /// backpressure coordinator armed), returning the count of `ERR_STORAGE_IO`
+    /// responses. Zero means backpressure kept the burst flowing.
+    /// Drive a create burst through the dispatch gate with a
+    /// DRAIN-ONLY-WHEN-BLOCKED reclaimer; returns (storage_io_failures,
+    /// peak_blocked, created_txids).
+    ///
+    /// The reclaimer thread resets `drain_logs` ONLY while an appender is
+    /// stalled on the gate (`blocked_appenders() > 0`). So forward progress
+    /// REQUIRES the gate to block: if the gate degraded to a no-op the producer
+    /// would never stall, the reclaimer would never fire, the log would fill,
+    /// and `storage_io` would be > 0 — i.e. `storage_io == 0` alone proves the
+    /// gate is load-bearing, and `peak_blocked > 0` confirms it. This is
+    /// deterministic and machine-independent, unlike asserting a peak against a
+    /// free-running timed checkpoint (whose drain rate races the producer). The
+    /// gate is armed directly here (production arms it when the checkpoint task
+    /// spawns).
+    fn run_create_burst(
+        engine: &Engine,
+        dispatch_log: &Arc<Mutex<RedoLog>>,
+        drain_logs: &[Arc<Mutex<RedoLog>>],
+        batches: usize,
+    ) -> (u32, usize, Vec<[u8; 32]>) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let bp = engine
+            .redo_backpressure()
+            .expect("coordinator built on redo-log attach");
+        bp.arm();
+
+        let peak = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reclaimer = {
+            let bp = bp.clone();
+            let peak = peak.clone();
+            let stop = stop.clone();
+            let logs: Vec<_> = drain_logs.to_vec();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let blocked = bp.blocked_appenders();
+                    peak.fetch_max(blocked, Ordering::Relaxed);
+                    if blocked > 0 {
+                        // The stalled producer holds no log lock (the gate is
+                        // before the barrier), so reclaiming here is safe. reset
+                        // frees the whole region and wakes the gate.
+                        for log in &logs {
+                            let _ = log.lock().reset();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+
+        let mut cs = crate::server::ConnectionState::new();
+        let mut storage_io = 0u32;
+        let mut txids = Vec::with_capacity(batches * 8);
+        for b in 0..batches {
+            let items = burst_create_items(b as u8, 8, 2048);
+            txids.extend(items.iter().map(|it| it.txid));
+            let req = RequestFrame {
+                request_id: (b as u64) + 1,
+                op_code: OP_CREATE_BATCH,
+                flags: 0,
+                payload: encode_create_batch(&items).into(),
+            };
+            let resp = handle_request(&req, engine, 8192, None, Some(dispatch_log), &mut cs, None);
+            if resp.status == STATUS_ERROR
+                && matches!(decode_error_payload(&resp.payload), Some((c, _)) if c == ERR_STORAGE_IO)
+            {
+                storage_io += 1;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = reclaimer.join();
+        (storage_io, peak.load(Ordering::Relaxed), txids)
+    }
+
+    /// Assert every created txid is retrievable from the engine index (the
+    /// burst's writes actually landed, not just "didn't error").
+    fn assert_all_retrievable(engine: &Engine, txids: &[[u8; 32]]) {
+        for txid in txids {
+            assert!(
+                matches!(engine.lookup_checked(&TxKey { txid: *txid }), Ok(Some(_))),
+                "created txid must be retrievable after the burst"
+            );
+        }
+    }
+
+    /// Block 269 regression at the dispatch layer: a create burst that writes
+    /// MORE than the redo capacity, with a live checkpoint task draining and
+    /// the backpressure gate armed, must NEVER return `ERR_STORAGE` from a full
+    /// log. Pre-fix the burst hit "redo log full: …", the create failed with
+    /// STORAGE_IO, the block was rejected, and the sync peer dropped.
+    #[test]
+    fn create_burst_with_drain_never_returns_storage_io_single_store() {
+        let _g = metrics_test_lock();
+        let data_dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            data_dev.clone() as Arc<dyn BlockDevice>,
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        // Small 132 KiB log (reserve = capacity/8 ≈ 16 KiB) so the burst's redo
+        // (≈ one 4 KiB block per batch) fills it well past the reserve within
+        // the run, forcing the gate to stall (the reclaimer then frees it).
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+        let redo_log = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 132 * 1024).unwrap()));
+        engine.set_redo_log(redo_log.clone());
+
+        // 60 batches >> the ~28 it takes to fill past the reserve; the
+        // drain-only-when-blocked reclaimer guarantees the gate must stall.
+        let (storage_io, peak_blocked, txids) =
+            run_create_burst(&engine, &redo_log, std::slice::from_ref(&redo_log), 60);
+
+        assert_eq!(
+            storage_io, 0,
+            "backpressure must keep a capacity-exceeding create burst flowing — \
+             no create may fail with ERR_STORAGE from a full redo log",
+        );
+        assert!(
+            peak_blocked > 0,
+            "the gate must have stalled at least one appender during the burst — \
+             a zero peak means the gate degraded to a no-op",
+        );
+        assert_all_retrievable(&engine, &txids);
+    }
+
+    /// Same guarantee under PR23's per-store redo: a 2-store engine with a
+    /// per-store redo log each. The gate admits a mutation only when EVERY
+    /// store has headroom (min-available), and the single checkpoint task
+    /// drains all stores via the engine helpers. A create burst that shards
+    /// across both stores must never return `ERR_STORAGE` from a full log.
+    #[test]
+    fn create_burst_with_drain_never_returns_storage_io_multi_store() {
+        let _g = metrics_test_lock();
+        let dev0: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc0 = SlotAllocator::new(dev0.clone()).unwrap();
+        let dev1: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc1 = SlotAllocator::new(dev1.clone()).unwrap();
+        let index = crate::index::ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        let engine = Arc::new(Engine::new_multi_store(
+            dev0,
+            Box::new(alloc0),
+            vec![(dev1, Box::new(alloc1) as crate::allocator::BoxedAllocator)],
+            index,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        assert_eq!(engine.store_count(), 2);
+
+        // Small 132 KiB per-store logs (reserve ≈ 16 KiB) so each store fills
+        // past its reserve during the burst and the min-available gate stalls.
+        let mk_redo = || -> Arc<Mutex<RedoLog>> {
+            let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(132 * 1024, 4096).unwrap());
+            Arc::new(Mutex::new(RedoLog::open(dev, 0, 132 * 1024).unwrap()))
+        };
+        let log0 = mk_redo();
+        let log1 = mk_redo();
+        // Share the global sequence counter across both logs (production wiring).
+        let floor = RedoLog::shared_sequence_floor(&[&log0.lock(), &log1.lock()]);
+        let shared = Arc::new(std::sync::atomic::AtomicU64::new(floor));
+        log0.lock().attach_shared_sequence(shared.clone());
+        log1.lock().attach_shared_sequence(shared);
+        engine.set_redo_logs(vec![log0.clone(), log1.clone()]);
+
+        // 100 batches sharded across 2 stores easily exceeds a 512 KiB per-store
+        // log; the drain-only-when-blocked reclaimer (resetting BOTH stores)
+        // makes the min-available gate's stall deterministic regardless of how
+        // the round-robin placement splits the batch across stores.
+        let (storage_io, peak_blocked, txids) =
+            run_create_burst(&engine, &log0, &[log0.clone(), log1.clone()], 100);
+
+        assert_eq!(
+            storage_io, 0,
+            "per-store backpressure must keep a multi-store create burst flowing — \
+             no create may fail with ERR_STORAGE from any store's full redo log",
+        );
+        assert!(
+            peak_blocked > 0,
+            "the gate must have stalled at least one appender during the burst — \
+             a zero peak means the gate degraded to a no-op",
+        );
+        assert_all_retrievable(&engine, &txids);
+    }
+
     /// Issue #14: with the atomic `AllocateRegion`+`Create` batch, a create
     /// that FITS the remaining redo space now succeeds in ONE flush (the old
     /// code did two flushes and could fail the second after durably allocating
@@ -21549,7 +21976,7 @@ mod tests {
         );
 
         let hists = crate::metrics::ThreadHistograms::new();
-        let text = crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0);
+        let text = crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0, 0);
 
         // Every (op, outcome) cell must appear exactly once with matching value.
         let mut found_spend_ok = false;

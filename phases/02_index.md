@@ -1,6 +1,6 @@
 # Phase 2: Index
 
-**Status:** shipped — `src/index/` with both in-memory hashtable and redb on-disk backends + secondary indexes (DAH, unmined); F-G3-* fixes from the May 2026 campaign landed in main.
+**Status:** shipped — `src/index/` with both in-memory hashtable and redb on-disk backends + secondary indexes (DAH, unmined, preserve); F-G3-* fixes from the May 2026 campaign landed in main. The preserve-until secondary index (§2.8b) was added for issue #25.
 
 ## Goal
 
@@ -15,7 +15,7 @@ Phase 1 must be complete with all tests passing.
 - `specs/BSV_UTXO_STORE_SPEC.md` §5 (Index) — including §5.5 (secondary indexes for pruner)
 - The original implementation's primary index uses 64 bytes per entry in red-black tree sprigs. Our index should use ~24-32 bytes per entry in a flat hash table — no tree traversal, no pointer chasing.
 
-**Note**: This phase covers the primary hash index only. The secondary indexes for pruner queries (DAH index, Unmined index per spec §5.5) should also be built in this phase — they are lightweight B-tree/sorted structures maintained in memory alongside the primary index.
+**Note**: This phase covers the primary hash index only. The secondary indexes for pruner queries (DAH index, Unmined index, Preserve index per spec §5.5) should also be built in this phase — they are lightweight B-tree/sorted structures maintained in memory alongside the primary index.
 
 ## What to build
 
@@ -317,7 +317,7 @@ This is inherently slow (reads every record header) but only happens on first bo
 
 ## Secondary Indexes (Spec §5.5)
 
-The pruner needs to find records by `delete_at_height` and `unmined_since` — queries the primary txid hash index cannot serve. These are lightweight in-memory sorted structures maintained alongside the primary index. Both are small relative to the primary index (at most a few million entries each) so a `BTreeMap` is the right trade-off: simple, correct, cache-friendly iteration for range queries, and no custom implementation to maintain.
+The pruner needs to find records by `delete_at_height`, `unmined_since`, and `preserve_until` — queries the primary txid hash index cannot serve. These are lightweight in-memory sorted structures maintained alongside the primary index. All are small relative to the primary index (at most a few million entries each) so a `BTreeMap` is the right trade-off: simple, correct, cache-friendly iteration for range queries, and no custom implementation to maintain.
 
 ### 2.7 DAH Secondary Index — `src/index/dah_index.rs`
 
@@ -455,9 +455,41 @@ pub struct UnminedRedoEntry {
 
 On recovery, the redo log is replayed to bring the unmined index up to date from the last checkpoint. This adds ~36 bytes per redo entry, but `unmined_since` changes are infrequent relative to spends, so the overhead is negligible.
 
+### 2.8b Preserve Secondary Index — `src/index/preserve_index.rs`
+
+Maps `preserve_until` values to the set of transactions whose preservation expires at that height. The expired-preservation sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`, spec §3.18 Phase 3) calls `range_query(current_height)` each call to find records whose preservation window elapsed — `[1, current_height]` — instead of walking the entire primary index. The pre-#25 sweep did an O(index-size) single-core walk on every call, which pinned a core and stalled ingestion as the UTXO set grew.
+
+Structurally identical to `DahIndex`. Two divergences:
+
+1. **Query range starts at 1**, not 0: `preserve_until == 0` is the "not preserved" sentinel and must never be reported as expired. `range_query(0)` returns empty (and the `1..=0` range is guarded so it never panics).
+2. **No redo entry / no `replay_redo`**: like the DAH index (and unlike the unmined index), the preserve index is non-critical and NOT journaled. A stale preserve index only delays the Phase-3 preserve→DAH transition, after which the delete still happens one `BlockHeightRetention` window later — harmless.
+
+```rust
+/// Secondary index mapping preserve_until → transactions.
+/// NOT critical for crash safety; NOT journaled to the redo log. Re-derived
+/// from each record's cached `preserve_until` at boot.
+pub struct PreserveIndex {
+    by_height: BTreeMap<u32, Vec<TxKey>>,  // preserve_until → txids
+    by_txid: HashMap<TxKey, u32>,          // txid → current preserve_until
+}
+```
+
+**When the preserve index is updated:**
+
+| Operation | Preserve index action |
+|-----------|----------------------|
+| `preserveUntil` (sets `preserve_until != 0`) | `insert(preserve_until, key)` (and the record's DAH entry is removed — mutual exclusion) |
+| `preserveUntil` with height 0 (replication-compensation undo) | `remove(key)` |
+| Expired-preservation processing (Phase 3, clears `preserve_until`, sets DAH) | `remove(key)` (the record moves to the DAH index) |
+| Record deleted/pruned | `remove(key)` |
+
+A record is in the DAH index XOR the preserve index, never both: `preserveUntil` clears DAH when it sets preserve, and Phase-3 expiry clears preserve when it sets DAH.
+
+**Crash safety**: Non-critical, same class as the DAH index. NOT in the redo log and NOT checkpointed. On recovery, after the primary index is reconstructed, the preserve index is re-derived in a single pass by reading each record's authoritative on-device `preserve_until` (`Engine::rebuild_preserve_index_from_device`). It reads the device, not the index cache, because `HAS_PRESERVE_UNTIL` is index-only (not persisted) and the redo-replay / replica-create recovery paths write `preserve_until` to the footer without updating the cache — so only the footer is authoritative at boot (the DAH sweep tolerates the same cache lag by re-reading the device in `is_due_for_sweep`). The one-time O(store) rebuild at boot replaces the old O(index) walk that ran on *every* sweep.
+
 ### 2.9 Checkpoint format for secondary indexes
 
-Both secondary indexes are checkpointed alongside the primary index snapshot. The snapshot format from §2.5 is extended:
+The DAH and unmined indexes are checkpointed alongside the primary index snapshot. The preserve index (§2.8b) is **NOT** checkpointed — it is always re-derived from the recovered primary index at boot, so no `PRSI` section is added. The snapshot format from §2.5 is extended:
 
 ```
 [Primary Index Header + Entries + Checksum]     (existing, unchanged)

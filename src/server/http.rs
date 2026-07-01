@@ -692,6 +692,7 @@ async fn handle_metrics(
         state.engine.index_len() as u64,
         state.engine.dah_index().len() as u64,
         state.engine.unmined_index().len() as u64,
+        state.engine.preserve_index().len() as u64,
         state.active_connections.load(Ordering::Relaxed) as u64,
     );
 
@@ -715,6 +716,7 @@ pub(crate) fn render_metrics_text(
     index_entries: u64,
     dah_entries: u64,
     unmined_entries: u64,
+    preserve_entries: u64,
     active_connections: u64,
 ) -> String {
     let mut out = String::with_capacity(8192);
@@ -1136,6 +1138,11 @@ pub(crate) fn render_metrics_text(
     prom_gauge(&mut out, "teraslab_index_entries", index_entries);
     prom_gauge(&mut out, "teraslab_dah_index_entries", dah_entries);
     prom_gauge(&mut out, "teraslab_unmined_index_entries", unmined_entries);
+    prom_gauge(
+        &mut out,
+        "teraslab_preserve_index_entries",
+        preserve_entries,
+    );
 
     // Connection gauge
     prom_gauge(&mut out, "teraslab_active_connections", active_connections);
@@ -1677,6 +1684,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "total": state.engine.index_len(),
             "dah_index": state.engine.dah_index().len(),
             "unmined_index": state.engine.unmined_index().len(),
+            "preserve_index": state.engine.preserve_index().len(),
         },
         "throughput": {
             "spends_attempted": m.spends_attempted.get(),
@@ -1823,6 +1831,7 @@ async fn handle_admin_memory(State(state): State<Arc<HttpState>>) -> impl IntoRe
         "index_entries": index_stats.entry_count,
         "dah_index_entries": state.engine.dah_index().len(),
         "unmined_index_entries": state.engine.unmined_index().len(),
+        "preserve_index_entries": state.engine.preserve_index().len(),
         "estimated_total_bytes": index_stats.memory_bytes,
     });
     json_response(body)
@@ -1834,6 +1843,7 @@ async fn handle_admin_records(State(state): State<Arc<HttpState>>) -> impl IntoR
         "total_records": state.engine.index_len(),
         "dah_index_count": state.engine.dah_index().len(),
         "unmined_count": state.engine.unmined_index().len(),
+        "preserve_count": state.engine.preserve_index().len(),
     });
     json_response(body)
 }
@@ -3201,7 +3211,7 @@ mod tests {
         h.spend_latency.record_ns(1_000_000); // bucket 12 or nearby
         h.spend_latency.record_ns(1_000_000_000); // bucket 22 or nearby
 
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
 
         // Every bucket boundary must appear exactly once.
         let num = LatencyHistogram::num_buckets();
@@ -3295,7 +3305,7 @@ mod tests {
         let h = ThreadHistograms::new();
 
         // Scrape 1: baseline.
-        let before = render_metrics_text(&m, &h, 0, 0, 0, 0);
+        let before = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
         let before_val = find_counter(&before, "teraslab_spend_multi_items_succeeded_total");
         assert_eq!(before_val, 0, "fresh ThreadMetrics must start at zero");
 
@@ -3303,7 +3313,7 @@ mod tests {
         m.spend_multi_items_succeeded.inc_by(10);
 
         // Scrape 2: observe the delta.
-        let after = render_metrics_text(&m, &h, 0, 0, 0, 0);
+        let after = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
         let after_val = find_counter(&after, "teraslab_spend_multi_items_succeeded_total");
         assert_eq!(
             after_val - before_val,
@@ -3345,7 +3355,7 @@ mod tests {
             .inc_by(OpCode::Spend, Outcome::ErrConflicting, 4);
         m.operations.inc_by(OpCode::Create, Outcome::ErrStorage, 7);
 
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
 
         // The counter type declaration must be present.
         assert!(
@@ -3627,7 +3637,7 @@ mod tests {
 
         let m = ThreadMetrics::new();
         let h = ThreadHistograms::new();
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
 
         // Scalar counter / gauge series.
         for name in [

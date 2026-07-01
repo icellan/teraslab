@@ -182,3 +182,13 @@ harness = false
 [[bench]]
 name = "write_path"
 harness = false
+
+[profile.dev]
+# Keep readable backtraces (file:line) but drop full DWARF, which dominates
+# target/ size: the 68 integration-test binaries under tests/ each statically
+# link the whole dep graph, and the `test` profile inherits this debug setting
+# from `dev`. line-tables-only emits no slower than full debug (less codegen +
+# link I/O), so this shrinks target/ — including every parallel-agent worktree
+# checkout — without slowing builds. Trade-off: no local-variable inspection in
+# an interactive debugger; panic/RUST_BACKTRACE traces are unaffected.
+debug = "line-tables-only"

@@ -1369,6 +1369,20 @@ fn main() {
     // re-derived here from each record's authoritative CONFLICTING flag.
     engine.rebuild_conflicting_index();
 
+    // Rebuild the in-memory preserve index the same way (#25): it is not
+    // journaled, so it is re-derived from each record's authoritative on-device
+    // `preserve_until` before any client traffic. From here the per-mutation
+    // `update_preserve_index` calls keep it current. This is the SOLE
+    // O(store) preserve scan — the expiry sweep is now O(expired).
+    if let Err(e) = engine.rebuild_preserve_index_from_device() {
+        tracing::error!(
+            err = %e,
+            "FATAL: failed to rebuild the preserve index from the recovered \
+             primary index; aborting startup",
+        );
+        std::process::exit(1);
+    }
+
     // Attach the per-store redo logs so the engine performs two-phase durability
     // for secondary index updates (redo fsync BEFORE redb commit), routing each
     // intent to the owning store's log. This is the SOLE attach point: store 0's

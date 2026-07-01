@@ -2842,19 +2842,30 @@ mod tests {
         let _ = h3.join();
     }
 
-    /// Stronger parallelism test: 3 replicas that each sleep 150ms
-    /// before ACKing. Serial execution would take ~450ms; parallel
-    /// execution takes ~150ms. Assert the wall time is strictly less
-    /// than what serial would require.
+    /// Stronger parallelism test: 3 replicas dispatched by one
+    /// `replicate_batch`. Concurrency is proven STRUCTURALLY with a 3-way
+    /// barrier rather than a wall-clock bound — each replica's ack thread must
+    /// reach the barrier before any can ack, so the barrier releases ONLY if
+    /// all three were dispatched concurrently. Serial dispatch would block on
+    /// the first replica's barrier wait forever (the other two not yet
+    /// dispatched), `replicate_batch` would hit its 2s timeout, and the
+    /// `.unwrap()` below would panic — so a clean return is the proof of
+    /// parallel dispatch. (The previous version asserted `elapsed < 300ms`,
+    /// which flaked on contended CI where limited cores serialise "parallel"
+    /// threads and scheduler jitter inflates the wall time.)
     #[test]
     fn replicate_batch_three_slow_replicas_run_concurrently() {
-        fn spawn_delayed_ack(
+        use std::sync::Barrier;
+
+        fn spawn_barriered_ack(
             rt: InMemoryTransport,
-            delay: Duration,
+            barrier: Arc<Barrier>,
         ) -> std::thread::JoinHandle<()> {
             std::thread::spawn(move || {
                 while let Ok(batch) = rt.recv_batch(Duration::from_secs(2)) {
-                    std::thread::sleep(delay);
+                    // Block until ALL replicas have been dispatched and reached
+                    // here. Only concurrent dispatch can release this.
+                    barrier.wait();
                     let ack = ReplicaAck::Ok {
                         through_sequence: batch.last_sequence(),
                     };
@@ -2869,10 +2880,10 @@ mod tests {
         let (mt2, rt2) = InMemoryTransport::pair();
         let (mt3, rt3) = InMemoryTransport::pair();
 
-        let per_replica_delay = Duration::from_millis(150);
-        let h1 = spawn_delayed_ack(rt1, per_replica_delay);
-        let h2 = spawn_delayed_ack(rt2, per_replica_delay);
-        let h3 = spawn_delayed_ack(rt3, per_replica_delay);
+        let barrier = Arc::new(Barrier::new(3));
+        let h1 = spawn_barriered_ack(rt1, barrier.clone());
+        let h2 = spawn_barriered_ack(rt2, barrier.clone());
+        let h3 = spawn_barriered_ack(rt3, barrier);
 
         let mut mgr = ReplicationManager::new(
             ReplicationConfig {
@@ -2889,19 +2900,11 @@ mod tests {
             master_generation: 0,
         }];
 
-        let start = std::time::Instant::now();
-        mgr.replicate_batch(&ops).unwrap();
-        let elapsed = start.elapsed();
-
-        // Serial lower bound: 3 * 150ms = 450ms.
-        // Parallel upper bound: ~150ms + thread-spawn overhead.
-        // Assert well below 3x to guarantee concurrency — allow generous
-        // headroom (300ms) for CI scheduler jitter.
-        assert!(
-            elapsed < Duration::from_millis(300),
-            "expected parallel dispatch (~150ms), got {:?} (serial would be ~450ms)",
-            elapsed
-        );
+        // Returns Ok ONLY if all three replicas were dispatched concurrently
+        // (the barrier released). Serial dispatch deadlocks the barrier and
+        // this times out -> unwrap panics -> test fails.
+        mgr.replicate_batch(&ops)
+            .expect("parallel dispatch must let the 3-way ack barrier release within the timeout");
 
         drop(mgr);
         let _ = h1.join();

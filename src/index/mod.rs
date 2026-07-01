@@ -3,6 +3,7 @@
 //! - [`Index`]: primary hash index mapping `TxKey` → `TxIndexEntry` (device location)
 //! - [`DahIndex`]: secondary index for `delete_at_height` pruner queries
 //! - [`UnminedIndex`]: secondary index for `unmined_since` pruner queries
+//! - [`PreserveIndex`]: secondary index for `preserve_until` expiry sweeps
 
 pub mod backend;
 pub mod conflicting_index;
@@ -10,6 +11,8 @@ pub mod dah_index;
 pub mod hashmix;
 pub mod hashtable;
 pub mod migration;
+pub mod preserve_backend;
+pub mod preserve_index;
 pub mod redb_dah;
 pub mod redb_primary;
 pub mod redb_unmined;
@@ -23,6 +26,8 @@ pub use backend::PrimaryBackend;
 pub use conflicting_index::ConflictingIndex;
 pub use dah_index::{DahIndex, DahRedoEntry};
 pub use hashtable::{TxIndexEntry, TxKey};
+pub use preserve_backend::PreserveBackend;
+pub use preserve_index::PreserveIndex;
 pub use redb_primary::CachedFieldsUpdate;
 pub use secondary_backend::{DahBackend, UnminedBackend};
 pub use sharded::ShardedIndex;

@@ -399,6 +399,30 @@ impl<B: SecondaryBackend> ShardedSecondary<B> {
         out
     }
 
+    /// Up to `limit` txids whose height is in `[0, current_height]` — the capped
+    /// form of [`Self::range_query`] backing the per-call Phase-2 DAH sweep
+    /// bound (#25). Like `range_query`, the result is NOT globally
+    /// height-ordered across shards (the pruner re-validates each candidate
+    /// against authoritative metadata, so order does not matter); it only
+    /// guarantees the returned set is bounded by `limit`. Because the sweep
+    /// DELETES the eligible candidates it returns, low-height entries drain on
+    /// subsequent calls — no starvation.
+    pub fn range_query_limited(&self, current_height: u32, limit: usize) -> Vec<TxKey> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(limit.min(self.len()));
+        for shard in &self.shards {
+            for k in shard.lock().range_query(current_height) {
+                out.push(k);
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
     /// Total number of entries across all shards.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().len()).sum()

@@ -719,8 +719,9 @@ Operations return signals that drive follow-up actions:
 2. Clear `delete_at_height` to `0`
 3. Set `preserve_until = block_height`
 4. `pwrite` metadata
-5. Release lock
-6. If `external == true`: return signal `PRESERVE`
+5. Update the secondary indexes: remove any DAH-index entry (step 2 cleared `delete_at_height`) and insert/move the record into the preserve index (§5.5.3) at `block_height`. A `block_height` of 0 (the replication-compensation undo path) removes the preserve entry instead.
+6. Release lock
+7. If `external == true`: return signal `PRESERVE`
 
 **Atomicity**: Per-record.
 **Idempotency**: Setting same value is a no-op.
@@ -891,12 +892,29 @@ Point read of a single UTXO slot plus the record's locktime. Used for double-spe
      (`due_guard == None`) stays unconditional.
 3. **Phase 3 — Expired preservation processing** (KO-1, implemented as a
    pre-pass inside `OP_PROCESS_EXPIRED_PRESERVATIONS`):
-   - Scan for records where `preserve_until` is in `[1, current_height]`
-   - For each: set `delete_at_height = current_height + BlockHeightRetention`
-     and clear `preserve_until` (unconditional, matching the reference UDF pruner
-     `ProcessExpiredPreservations`; the elapsed preservation window is itself
-     the signal that the record may be reclaimed). The record is then deleted
-     `BlockHeightRetention` blocks later by the Phase 2 sweep.
+   - Range-query the preserve index (§5.5.3) for records where `preserve_until`
+     is in `[1, current_height]` — O(expired), mirroring the Phase-2 DAH query.
+     (This replaced an O(index-size) walk of the entire primary index that
+     pinned a core during sync, issue #25; the *semantics* below are unchanged,
+     only how the expired records are found.) Each candidate is re-validated
+     under the per-tx stripe lock before its transition.
+   - For each: clear `preserve_until`, and set
+     `delete_at_height = current_height + BlockHeightRetention` **only if the
+     record is sweep-eligible** — i.e. it would pass the Phase-2 due predicate
+     once that height arrives: CONFLICTING, or (all-spent ∧ on-longest-chain ∧
+     not REASSIGNED). The elapsed preservation window signals the record *may*
+     be reclaimed, but a record with unspent outputs / unmined / reassigned is
+     not deletable (Phase 2 would reject it forever), so scheduling a DAH for it
+     would plant an immortal, never-draining DAH-index entry — which, under the
+     per-call Phase-2 cap (#25), can starve the sweep (≥ `max_batch` such
+     low-height entries → every capped query returns only them → genuinely-due
+     records never reached). A non-eligible record therefore just reverts to the
+     normal lifecycle: it acquires a DAH later, via the spend / setMined path,
+     once it actually becomes deletable. (This refines the original
+     "unconditional, matching the reference pruner" behaviour; the Rust Phase-2
+     sweep already declines to delete non-all-spent records — KO-2/KO-3 — so the
+     unconditional DAH only ever produced entries Phase 2 rejected.) Eligible
+     records are deleted `BlockHeightRetention` blocks later by the Phase 2 sweep.
    - **Wire payload:** `OP_PROCESS_EXPIRED_PRESERVATIONS` takes
      `[current_height:4]` (legacy: expiry pre-pass skipped) or
      `[current_height:4][block_height_retention:4]` (the 8-byte form supplies
@@ -1084,7 +1102,7 @@ The index is a derived data structure — it can be rebuilt from a scan of all r
 
 ### 5.5 Secondary Indexes for Pruner Queries
 
-The pruner needs to efficiently find records by `delete_at_height` and `unmined_since` — queries that the primary txid hash index cannot serve. The previous system used secondary indexes on those bins. The Rust system maintains two lightweight secondary structures:
+The pruner needs to efficiently find records by `delete_at_height`, `unmined_since`, and `preserve_until` — queries that the primary txid hash index cannot serve. The previous system used secondary indexes on those bins. The Rust system maintains three lightweight secondary structures:
 
 #### 5.5.1 DAH Index (delete_at_height)
 
@@ -1112,13 +1130,30 @@ A sorted structure mapping `unmined_since → Vec<txid>`, enabling the pruner to
 
 **Size**: Proportional to mempool size. Even with millions of unmined transactions, this is manageable in memory.
 
-**Crash safety differs between the two indexes:**
+#### 5.5.3 Preserve Index (preserve_until)
+
+A sorted structure mapping `preserve_until → Vec<txid>`, enabling the expired-preservation sweep (`ProcessExpiredPreservations`, §3.18 Phase 3) to query "all records whose preservation window has elapsed" in time proportional to the *expired* set rather than the whole index. Before this index existed the sweep walked the entire primary index on every call — an O(index-size) single-core scan that pinned a core and stalled ingestion as the UTXO set grew (issue #25).
+
+**Implementation**: Same B-tree/sorted-array approach as the DAH index.
+
+**Maintenance**:
+- **Insert**: When `preserveUntil` sets a non-zero `preserve_until` (which also removes any prior DAH-index entry — see below)
+- **Remove**: When the expired-preservation processing clears `preserve_until` (Phase 3, which then sets a DAH entry instead), when `preserveUntil` is called with height 0 (the replication-compensation undo), or when the record is deleted
+- **Query**: `range_scan(1..=current_height)` returns the txids whose preservation expired. The lower bound is **1**, not 0: a `preserve_until` of 0 is the "not preserved" sentinel and must never be reported as expired (this is the one semantic divergence from the DAH index's `0..=current_height`).
+
+**Mutual exclusion with the DAH index**: a record is in the DAH index XOR the preserve index, never both. `preserveUntil` (§3.12) clears `delete_at_height` (removing the DAH entry) when it sets `preserve_until`; the Phase-3 expiry clears `preserve_until` (removing the preserve entry) when it sets `delete_at_height`. So a record carries at most one of `{delete_at_height, preserve_until}` and appears in at most one of the two indexes.
+
+**Size**: At most one entry per preserved record. Preservations are created by Phase-1 parent preservation over the `ParentPreservationBlocks` window, a small fraction of the store — smaller than the DAH set.
+
+**Crash safety differs across the three indexes:**
 
 - **Unmined Index**: Critical for correctness — a stale unmined index would miss transactions that need parent preservation, leading to data loss. Unmined index mutations (`unmined_since` changes) are included in the redo log and replayed on recovery. This adds ~36 bytes per redo entry (txid + old/new height) but unmined_since changes are infrequent relative to spends.
 
 - **DAH Index**: Not critical — a stale DAH index only delays pruning, which is a background optimization. The DAH index is rebuilt from a full device scan on recovery. This is acceptable because: (a) DAH records are a small fraction of total records, (b) delayed pruning is harmless, (c) the scan can run in the background while the node serves traffic.
 
-Both indexes are checkpointed alongside the primary index for fast normal-case startup.
+- **Preserve Index**: Not critical — same class as the DAH index. A stale preserve index only delays the Phase-3 transition (preserve → DAH), after which the eventual delete still happens one `BlockHeightRetention` window later, which is harmless. It is therefore **not journaled to the redo log**. It is re-derived at startup, after recovery has reconstructed the primary index, by reading each record's **authoritative on-device `preserve_until`** (the device footer is authoritative; the in-memory `HAS_PRESERVE_UNTIL` cache discriminant is *not* persisted and the redo-replay / replica-create recovery paths update the footer without updating the cache, so the rebuild must read the device — exactly as the DAH-sweep re-validation re-reads the device rather than trusting the cache). The one-time O(store) rebuild scan at boot replaces the old O(index) walk that ran on *every* sweep.
+
+The DAH and unmined indexes are checkpointed alongside the primary index for fast normal-case startup; the preserve index is not checkpointed — it is always re-derived from the recovered primary index at boot.
 
 ---
 
@@ -1886,6 +1921,7 @@ struct GlobalGauges {
 | `teraslab.index.max_probe_depth` | Gauge | Worst-case probe chain length |
 | `teraslab.index.dah_entries` | Gauge | DAH secondary index entries |
 | `teraslab.index.unmined_entries` | Gauge | Unmined secondary index entries |
+| `teraslab.index.preserve_entries` | Gauge | Preserve secondary index entries |
 
 #### Replication & crash safety
 
@@ -1993,7 +2029,8 @@ The `/status` endpoint provides a single-glance view of what the node is storing
     "load_factor": 0.75,
     "max_probe_depth": 12,
     "dah_entries": 3200000,
-    "unmined_entries": 850000
+    "unmined_entries": 850000,
+    "preserve_entries": 120000
   },
   "replication": {
     "factor": 2,
@@ -2175,7 +2212,7 @@ teraslab-cli records --external         # list records with EXTERNAL flag (large
 
 ```
 teraslab-cli index                      # index stats (entries, load factor, probe depth)
-teraslab-cli index --secondary          # DAH + unmined secondary index stats
+teraslab-cli index --secondary          # DAH + unmined + preserve secondary index stats
 ```
 
 #### Record inspection
