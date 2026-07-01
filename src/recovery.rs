@@ -3594,22 +3594,32 @@ pub fn recover_allocator_frontiers(
     devices: &[std::sync::Arc<dyn BlockDevice>],
     allocators: &mut [BoxedAllocator],
 ) -> std::result::Result<(), DeviceError> {
-    // Highest record offset per store (one O(index) pass, no device reads).
-    let mut max_off: Vec<Option<u64>> = vec![None; allocators.len()];
+    // Collect every LIVE record offset per store in one O(index) pass. The full
+    // offset list (not just the max) is needed by the segment engine's defrag
+    // reconciliation, which rebuilds the reclaimed-segment free list from the set
+    // of segments that still hold a live record (design §3.2). The in-place
+    // SlotAllocator ignores the list (its `reconcile_recovered_free_list` is a
+    // no-op) and only uses the frontier.
+    let n = allocators.len();
+    let mut live_offsets: Vec<Vec<u64>> = vec![Vec::new(); n];
     index.for_each(|_key, e| {
         let s = e.device_id as usize;
-        if s < max_off.len() && max_off[s].is_none_or(|m| e.record_offset > m) {
-            max_off[s] = Some(e.record_offset);
+        if s < n {
+            live_offsets[s].push(e.record_offset);
         }
     });
-    for (s, off) in max_off.iter().enumerate() {
-        let Some(off) = *off else { continue };
-        let meta = io::read_metadata(&*devices[s], off)?;
-        let align = devices[s].alignment() as u64;
-        // End rounded up to a device block: a safe over-estimate (the cursor must
-        // be strictly PAST the record's bytes; never under).
-        let end = (off + meta.record_size as u64).div_ceil(align) * align;
-        allocators[s].recover_frontier_at_least(end);
+    for s in 0..n {
+        // 1) Advance the frontier past the highest live record so a fresh
+        //    allocation cannot overwrite it (over-estimate, block-rounded).
+        if let Some(&max) = live_offsets[s].iter().max() {
+            let meta = io::read_metadata(&*devices[s], max)?;
+            let align = devices[s].alignment() as u64;
+            let end = (max + meta.record_size as u64).div_ceil(align) * align;
+            allocators[s].recover_frontier_at_least(end);
+        }
+        // 2) Segment engine: rebuild the reuse free list from the live set (so a
+        //    defragged bounded-growth layout survives the crash). No-op in-place.
+        allocators[s].reconcile_recovered_free_list(&live_offsets[s]);
     }
     Ok(())
 }

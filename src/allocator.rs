@@ -2060,6 +2060,18 @@ pub trait RecordAllocator: Send {
         let _ = end;
     }
 
+    /// Recovery reconciliation for the log-structured (segment) engine: rebuild
+    /// the reclaimed-segment free list from the LIVE index so a defragged
+    /// (bounded-growth, non-monotonic) layout survives a crash. `live_offsets` are
+    /// the record offsets of every live index entry on this store. Called AFTER
+    /// [`Self::recover_frontier_at_least`] has set the cursor/open segment.
+    /// Default no-op: the in-place [`SlotAllocator`] has no segments to reclaim.
+    /// The segment allocator overrides it — every already-used segment holding no
+    /// live record is a defrag hole it returns to the reuse free list.
+    fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
+        let _ = live_offsets;
+    }
+
     /// Test/fault-injection only: arm the next persist to fail once. On the trait
     /// so checkpoint crash tests can trigger it through the engine's boxed
     /// allocator. Compiled out of production builds.
@@ -2161,6 +2173,9 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn recover_frontier_at_least(&mut self, end: u64) {
         (**self).recover_frontier_at_least(end)
+    }
+    fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
+        (**self).reconcile_recovered_free_list(live_offsets)
     }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {

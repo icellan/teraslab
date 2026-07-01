@@ -718,6 +718,42 @@ impl SegmentAllocator {
         self.open_segment = (idx as u32).min(self.segment_count.saturating_sub(1));
     }
 
+    /// Crash-recovery reconciliation (design §3.2, defrag): rebuild the
+    /// reclaimed-segment free list from the LIVE index so a defragged
+    /// (bounded-growth, non-monotonic) layout survives a crash. Call AFTER
+    /// [`Self::set_cursor_at_least`] has set the cursor + open segment from the
+    /// highest live record offset.
+    ///
+    /// `live_offsets` are the record offsets of every LIVE index entry on this
+    /// store. Every segment strictly BELOW `open_segment` (the already-used
+    /// region) that holds NO live record is a defrag hole — its records were all
+    /// relocated out (spend) or deleted — so reset it to empty and return it to the
+    /// reuse free list. Segments with live records keep their (checkpoint-recovered)
+    /// accounting.
+    ///
+    /// Correctness: this is EXACT for the free list, which is what matters — future
+    /// appends only ever reuse a live-free segment, so no live record is
+    /// overwritten. Per-segment dead-byte accounting for the non-free segments
+    /// stays at its last-checkpoint value (a crash loses the post-checkpoint dead
+    /// deltas); that only skews compaction victim RANKING, not safety, and
+    /// self-heals as new spends dead-mark. The open segment is never freed (the
+    /// cursor is inside it, and it holds the highest live record by construction).
+    pub fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
+        let mut has_live = vec![false; self.segment_count as usize];
+        for &off in live_offsets {
+            if let Some(s) = self.segment_of(off) {
+                has_live[s as usize] = true;
+            }
+        }
+        self.free_segments.clear();
+        for idx in 0..self.open_segment {
+            if !has_live[idx as usize] {
+                self.segments[idx as usize] = SegmentMeta::default();
+                self.free_segments.push_back(idx);
+            }
+        }
+    }
+
     /// The device identity formatted as a 32-character lowercase hex string.
     fn device_id_hex_impl(&self) -> String {
         self.device_id
@@ -1176,6 +1212,9 @@ impl RecordAllocator for SegmentAllocator {
     fn recover_frontier_at_least(&mut self, end: u64) {
         self.set_cursor_at_least(end);
     }
+    fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
+        SegmentAllocator::reconcile_recovered_free_list(self, live_offsets);
+    }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {
         // No fault-injection hook on the segment allocator (yet); no-op so the
@@ -1544,6 +1583,43 @@ mod tests {
         assert_eq!(b.open_segment(), 0, "reclaimed seg0 reused after recovery");
         assert_eq!(o, DATA_REGION_OFFSET);
         assert_eq!(b.free_segment_count(), 0);
+    }
+
+    #[test]
+    fn reconcile_recovered_free_list_rebuilds_holes_from_the_live_set() {
+        // Crash recovery: the header restored the cursor/open segment, but the
+        // free list must be rebuilt from the LIVE index — a used segment holding
+        // no live record is a defrag hole to reclaim.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let o0 = a.allocate(4096).unwrap(); // seg0 b0
+        let _o1 = a.allocate(4096).unwrap(); // seg0 b1
+        let o2 = a.allocate(4096).unwrap(); // seg1 b0
+        let _o3 = a.allocate(4096).unwrap(); // seg1 b1
+        let o4 = a.allocate(4096).unwrap(); // seg2 open
+        assert_eq!(a.open_segment(), 2);
+        assert_eq!(a.free_segment_count(), 0);
+
+        // Live records survive only in seg1 (o2) and the open seg2 (o4); seg0's
+        // records (o0, o1) have relocated away (dead). Reconcile from that set.
+        let _ = o0;
+        a.reconcile_recovered_free_list(&[o2, o4]);
+        assert_eq!(
+            a.free_segment_count(),
+            1,
+            "seg0 (no live) becomes a free hole"
+        );
+        assert_eq!(a.segment_live(0), 0);
+
+        // The reclaimed hole is reused: fill seg2, next advance goes to seg0.
+        let _ = a.allocate(4096).unwrap(); // seg2 b1 (fills seg2)
+        let o = a.allocate(4096).unwrap();
+        assert_eq!(
+            a.open_segment(),
+            0,
+            "reconciled free seg0 reused after recovery"
+        );
+        assert_eq!(o, DATA_REGION_OFFSET);
     }
 
     #[test]
