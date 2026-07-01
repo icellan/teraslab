@@ -7674,6 +7674,13 @@ fn handle_delete_batch(
         let is_external = match engine.lookup(&key) {
             Some(_) => match engine.read_metadata(&key) {
                 Ok(m) => m.flags.contains(crate::record::TxFlags::EXTERNAL),
+                // The record was concurrently deleted/relocated between the lookup
+                // and the read (a benign lock-free-reader race — `read_metadata`
+                // re-resolved the key and found it moved or gone). Nothing to
+                // external-guard; fall through to the idempotent prune below, which
+                // no-ops on an absent record. Do NOT fail: this used to surface as
+                // a spurious STORAGE_ERROR (the delete failure this fixes).
+                Err(crate::ops::error::SpendError::TxNotFound) => false,
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,
@@ -7705,6 +7712,9 @@ fn handle_delete_batch(
         // for that topology).
         let parent_txids = match engine.parent_txids_for_child(&key) {
             Ok(p) => p,
+            // The child was concurrently deleted/relocated (race): no parents to
+            // prune. Skip to the idempotent prune below rather than failing.
+            Err(crate::ops::error::SpendError::TxNotFound) => Vec::new(),
             Err(e) => {
                 errors.push(BatchItemError {
                     item_index: i as u32,
@@ -7730,6 +7740,10 @@ fn handle_delete_batch(
             let parent_key = TxKey { txid: parent_txid };
             let offsets = match engine.slots_spent_by_child(&parent_key, key.txid) {
                 Ok(o) => o,
+                // The parent was concurrently deleted/relocated (race): its slots
+                // are moot to prune. Skip THIS parent rather than failing the child
+                // delete — the prune is idempotent and best-effort.
+                Err(crate::ops::error::SpendError::TxNotFound) => continue,
                 Err(e) => {
                     errors.push(BatchItemError {
                         item_index: i as u32,

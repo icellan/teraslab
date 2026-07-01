@@ -1029,6 +1029,17 @@ pub unsafe fn write_utxo_slot_direct(
 /// Reads the first `METADATA_SIZE` bytes from the device at the given
 /// record offset. The read is rounded up to the device alignment.
 pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxMetadata> {
+    // F-G2 (torn-read fix): hold the per-offset read guard for the whole read.
+    // The metadata header can straddle a device-block boundary (packed records
+    // start mid-block), so without this guard a concurrent `write_metadata`
+    // (setMined / spend footer update on the write-through-cache path) writing
+    // block N then N+1 could be observed as block-N-new + block-(N+1)-old — a torn
+    // header that fails CRC and surfaces as a spurious STORAGE_ERROR. The
+    // direct-ptr fast path (`read_metadata_direct`) already takes this guard;
+    // the trait/cache path did not. Excludes `write_metadata`/`write_utxo_slot`/
+    // `write_record_bytes` (all take the write side) for the same offset.
+    let _r = io_locks().read(record_offset);
+
     let align = device.alignment();
 
     // Record offset must be aligned (allocator guarantees this).
@@ -1060,6 +1071,12 @@ pub fn write_metadata(
     record_offset: u64,
     metadata: &TxMetadata,
 ) -> Result<()> {
+    // Hold the per-offset write guard across the (possibly multi-block, RMW)
+    // header write so a concurrent lock-free `read_metadata` for the same offset
+    // never observes a torn header — the write counterpart of the guard added to
+    // `read_metadata`.
+    let _w = io_locks().write(record_offset);
+
     let align = device.alignment();
     let aligned_base = record_offset / align as u64 * align as u64;
     let intra_offset = (record_offset - aligned_base) as usize;

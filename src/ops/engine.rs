@@ -2344,7 +2344,40 @@ impl Engine {
         key: &TxKey,
         record_offset: u64,
     ) -> std::result::Result<TxMetadata, SpendError> {
-        let meta = self.read_metadata_fast(device_id, record_offset)?;
+        let meta = match self.read_metadata_fast(device_id, record_offset) {
+            Ok(m) => m,
+            Err(e) => {
+                // A CRC/torn/zeroed read at a lock-free-captured offset usually
+                // means the record was concurrently DELETED underneath us: the
+                // delete zeroes the header (tombstone) AFTER unregistering the
+                // index (see `delete_inner`), so a reader that grabbed the offset
+                // before the unregister can read the just-zeroed header. That is a
+                // benign race, not corruption — and the answer the caller should
+                // get is exactly what it would get post-delete: TxNotFound.
+                //
+                // Distinguish race from GENUINE corruption by re-resolving the
+                // key: if it no longer maps to THIS (device, offset) — moved by a
+                // relocate, or gone by a delete — report TxNotFound; only a
+                // still-current mapping is real corruption worth surfacing. The
+                // unregister-before-tombstone ordering guarantees the re-lookup
+                // observes the removal whenever the tombstone was observable.
+                match self.index.lookup_checked(key) {
+                    Ok(Some(cur))
+                        if cur.record_offset == record_offset && cur.device_id == device_id =>
+                    {
+                        return Err(e); // still mapped here → genuine corruption
+                    }
+                    Ok(_) => return Err(SpendError::TxNotFound), // moved or gone → race
+                    Err(ie) => {
+                        return Err(SpendError::StorageError {
+                            detail: format!(
+                                "metadata read failed then index re-lookup failed: {ie}"
+                            ),
+                        });
+                    }
+                }
+            }
+        };
         if meta.tx_id != key.txid {
             return Err(SpendError::TxNotFound);
         }
@@ -6961,15 +6994,41 @@ impl Engine {
             ({ meta.record_size }) as u64
         };
 
-        // Step 2: Tombstone the metadata before freeing the region so crash-time
-        // index rebuilds cannot resurrect this record from stale bytes in freed
-        // space. The marker overwrites the full header (zeroing all but its own
-        // prefix), so freed regions can be reallocated later without old tx
-        // metadata remaining readable. It also carries `record_size` so a
-        // post-crash device-scan rebuild skips the WHOLE deleted record, not
-        // just its first alignment block (multi-block boot-loop fix).
+        // Step 2: Remove from the primary index (+ shard count) FIRST — BEFORE
+        // zeroing the header. This closes a lock-free-reader race: the header
+        // tombstone below (CRC-zeroing the record) used to run while the index
+        // still pointed at this offset, so a concurrent LOCK-FREE metadata read
+        // (a sibling delete's external-blob pre-check, a GET, a setMined) could
+        // `lookup(tx_key)` → offset → read the just-zeroed header → fail with a
+        // spurious `record corruption: CRC mismatch` (STORAGE_ERROR). Unregister
+        // first: once removed, no `lookup(tx_key)` reaches this offset, so a
+        // reader either observed it BEFORE (and reads the still-intact header) or
+        // AFTER (gets `None` → clean `TxNotFound`) — never the zeroed window.
+        //
+        // Ordering invariants preserved: this still precedes the allocator free
+        // (F-G2-001 — a freed+reused offset must never be reachable via a live
+        // index entry), and it now also precedes the tombstone. Recovery is
+        // unaffected: the delete is journaled (redo `Delete`), so redo-replay
+        // removes the record regardless of tombstone timing; the tombstone remains
+        // only the device-scan-rebuild fallback's guard.
+        //
+        // `unregister_with_shard_count` only decrements when an entry was actually
+        // removed (H2: no underflow if the key was concurrently removed). G-4: if
+        // the backend remove fails, propagate it and DO NOT tombstone/free/touch
+        // secondaries — the row would otherwise stay in redb pointing at a region
+        // we are about to zero and return to the allocator.
+        self.unregister_with_shard_count(&req.tx_key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index unregister failed: {e}"),
+            })?;
+
+        // Step 3: Tombstone the metadata header (now unreachable via the index) so
+        // a crash-time DEVICE-SCAN rebuild cannot resurrect this record from stale
+        // bytes in freed space. The marker overwrites the full header, carrying
+        // `record_size` so a device scan skips the WHOLE deleted record, not just
+        // its first alignment block (multi-block boot-loop fix).
         self.write_zeroed_metadata_header(entry.device_id, entry.record_offset, record_size)?;
-        // Step 3: Sync so the zeroed header is durable before any reuse.
+        // Step 4: Sync so the zeroed header is durable before any reuse.
         //
         // Under BUFFERED (relaxed) durability we skip this synchronous fsync on
         // the hot path: the zeroed-header write has already landed in the
@@ -6989,29 +7048,9 @@ impl Engine {
                 })?;
         }
 
-        // Step 4: Remove from primary index AND decrement shard_counts in
-        // the same critical section so the two can never drift (H2
-        // correctness fix). `unregister_with_shard_count` only decrements
-        // when an entry was actually removed, preventing underflow if the
-        // key was concurrently removed between the earlier `lookup` and
-        // this point. This MUST precede the allocator free (F-G2-001):
-        // otherwise a concurrent `create_at_offset` could re-allocate the
-        // same offset and write a fresh, CRC-valid `TxMetadata` for a
-        // different transaction; a lock-free reader holding the offset
-        // returned by the still-live primary-index entry would then read
-        // that unrelated metadata back as if it belonged to `tx_key`.
-        //
-        // G-4: if the backend remove fails, propagate it and DO NOT free
-        // the region or touch secondaries — otherwise the row would remain
-        // in redb pointing at a region we just returned to the allocator.
-        self.unregister_with_shard_count(&req.tx_key)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("index unregister failed: {e}"),
-            })?;
-
         // Step 5: Return the region to the allocator. From this point on
         // the offset can be handed out to a future `create`/`create_at_offset`.
-        // Because step 4 already removed the primary-index entry, no
+        // Because step 2 already removed the primary-index entry, no
         // reader can reach this offset via `lookup(req.tx_key)` any longer.
         {
             let mut alloc = self.allocator_for(entry.device_id).lock();
@@ -10393,6 +10432,53 @@ mod tests {
             .unwrap();
 
         (engine, dev, key, meta, slots, offset)
+    }
+
+    /// F-G2-001: `read_metadata_for_key` must tell a benign delete/relocate
+    /// race (record gone under a lock-free-captured offset) apart from genuine
+    /// on-device corruption. When the CRC-checked fast read fails, it
+    /// re-resolves the key through the primary index:
+    ///   - still mapped to THIS (device, offset) → surface the StorageError
+    ///     (real corruption worth reporting);
+    ///   - moved or unmapped                      → return TxNotFound (the
+    ///     post-delete answer; the unregister→tombstone ordering guarantees the
+    ///     re-lookup observes the removal whenever the zeroed header is visible).
+    #[test]
+    fn read_metadata_for_key_distinguishes_race_from_corruption() {
+        let (engine, dev, key, _meta, _slots, offset) = seg_engine_with_record();
+
+        // Corrupt the on-device metadata header: overwrite it with raw zeros so
+        // the stored CRC (0x0000_0000) no longer matches the computed CRC and
+        // the lock-free read fails — the exact shape a just-tombstoned/torn
+        // header presents to a reader that captured the offset pre-unregister.
+        let align = dev.alignment();
+        let zbuf = AlignedBuf::new(io::align_up(METADATA_SIZE, align), align);
+        dev.pwrite_all_at(&zbuf, offset).unwrap();
+
+        // Sanity: the raw fast read now errors on the zeroed header.
+        let raw = engine.read_metadata_fast(0, offset);
+        assert!(
+            matches!(raw, Err(SpendError::StorageError { .. })),
+            "zeroed header must fail the CRC-checked fast read, got {raw:?}"
+        );
+
+        // Case A — key STILL maps to this (device, offset): genuine corruption,
+        // surface the storage error rather than masking it as a missing tx.
+        let still_here = engine.read_metadata_for_key(0, &key, offset);
+        assert!(
+            matches!(still_here, Err(SpendError::StorageError { .. })),
+            "current mapping → corruption must surface as StorageError, got {still_here:?}"
+        );
+
+        // Case B — the delete unregistered the key first (unregister→tombstone
+        // ordering): the re-lookup observes the removal and the same failed read
+        // now resolves to TxNotFound, the post-delete answer the caller expects.
+        engine.index.unregister(&key);
+        let gone = engine.read_metadata_for_key(0, &key, offset);
+        assert!(
+            matches!(gone, Err(SpendError::TxNotFound)),
+            "unmapped key → benign race must resolve to TxNotFound, got {gone:?}"
+        );
     }
 
     #[test]
