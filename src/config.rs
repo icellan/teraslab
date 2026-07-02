@@ -565,7 +565,7 @@ impl CacheConfig {
 }
 
 /// On-device storage layout configuration (`[storage]` TOML section).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct StorageConfig {
     /// Pack multiple sub-block records contiguously within a single device
@@ -658,6 +658,27 @@ pub struct StorageConfig {
     /// write pattern the EC2 A/B measured).
     #[serde(default)]
     pub streaming: bool,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        // MUST match the per-field `#[serde(default = ...)]` attributes: when the
+        // whole `[storage]` section is absent from the config, serde uses THIS
+        // `Default` (via the struct-level `#[serde(default)]`) rather than the
+        // field-level defaults. In particular `segment_size` MUST be
+        // `default_segment_size()` (8 MiB), not 0 — a derived `Default` left it 0,
+        // which fails `SegmentAllocator::new` (InvalidSegmentSize) and, since
+        // `Segment` is the default engine, prevented a minimal-config node from
+        // starting at all.
+        Self {
+            packed: false,
+            placement: crate::subdevice::PlacementStrategy::default(),
+            append_only: false,
+            engine: StorageEngine::default(),
+            segment_size: default_segment_size(),
+            streaming: false,
+        }
+    }
 }
 
 /// Default segment size (8 MiB) for the segment storage engine.
@@ -2538,6 +2559,28 @@ backend = ""
             toml::from_str("[storage]\nengine = \"segment\"\nstreaming = true\n").unwrap();
         assert!(on.storage.streaming, "streaming = true must parse");
         assert_eq!(on.storage.engine, StorageEngine::Segment);
+    }
+
+    #[test]
+    fn storage_segment_size_defaults_to_8mib_when_section_absent() {
+        // Regression: a minimal config with NO [storage] section must still get a
+        // valid segment_size. `StorageConfig::default()` (used when the section is
+        // absent) once left segment_size = 0 (derived Default), which failed
+        // SegmentAllocator::new and — since Segment is the default engine —
+        // prevented a minimal-config node from starting at all.
+        assert_eq!(StorageConfig::default().segment_size, 8 * 1024 * 1024);
+        let cfg: ServerConfig =
+            toml::from_str("listen_addr = \"127.0.0.1:3300\"\nstrict_auth = false\n").unwrap();
+        assert_eq!(
+            cfg.storage.engine,
+            StorageEngine::Segment,
+            "segment is default"
+        );
+        assert_eq!(
+            cfg.storage.segment_size,
+            8 * 1024 * 1024,
+            "segment_size must default to 8 MiB even with no [storage] section"
+        );
     }
 
     #[test]

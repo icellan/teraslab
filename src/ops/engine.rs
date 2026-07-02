@@ -14837,6 +14837,7 @@ mod tests {
     /// engine plus the underlying store devices and a snapshot of their
     /// allocators (for a recovery-by-device-scan test). Devices are shared
     /// `Arc`s, so writes through the engine are visible on the returned handles.
+    #[allow(clippy::type_complexity)]
     fn create_two_store_engine_txid() -> (
         Engine,
         Vec<Arc<dyn BlockDevice>>,
