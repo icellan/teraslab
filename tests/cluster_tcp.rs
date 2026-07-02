@@ -1123,6 +1123,200 @@ fn segment_cluster_migrates_shard_with_records_to_new_node() {
     shutdown_node(&node2);
 }
 
+/// Phase 6 (specs/SEGMENT_CLUSTERING_DESIGN.md): MASTER FAILOVER on the segment
+/// engine. A record written on its master under RF=2 is replicated to its replica
+/// (proving segment write replication reaches the replica's engine); when the
+/// master is killed, the replica is promoted and the record SURVIVES on it — no
+/// lost data across a segment master failover.
+#[test]
+fn segment_cluster_master_failover_preserves_replicated_record() {
+    let node1 = create_segment_node(461, 0, 0, &[], 2);
+    let node2 = create_segment_node(462, 0, 0, &[node1.swim_port], 2);
+    let node3 = create_segment_node(463, 0, 0, &[node1.swim_port], 2);
+    let node_by_id = |id: u64| -> &TestNode {
+        match id {
+            461 => &node1,
+            462 => &node2,
+            463 => &node3,
+            other => panic!("unknown node id {other}"),
+        }
+    };
+
+    // 3-node topology committed on every node.
+    wait_until(
+        || {
+            [&node1, &node2, &node3]
+                .iter()
+                .all(|n| n.cluster.committed_topology_members().len() == 3)
+        },
+        Duration::from_secs(30),
+    )
+    .expect("3-node segment topology should commit");
+
+    // Wait until the chosen key has a SERVING master (a node answering
+    // is_master==Yes) — the real readiness signal, and no fence in flight.
+    let txid = make_txid(60001);
+    let key = TxKey { txid };
+    wait_until(
+        || {
+            [461u64, 462, 463].into_iter().any(|id| {
+                matches!(
+                    node_by_id(id).cluster.is_master(&key),
+                    MasterQueryResult::Yes
+                )
+            })
+        },
+        Duration::from_secs(30),
+    )
+    .expect("the key must have a serving master after the cluster forms");
+    let master_id = [461u64, 462, 463]
+        .into_iter()
+        .find(|id| {
+            matches!(
+                node_by_id(*id).cluster.is_master(&key),
+                MasterQueryResult::Yes
+            )
+        })
+        .expect("some node must master the key");
+    let master = node_by_id(master_id);
+    let replica_id = {
+        let shard = ShardTable::shard_for_key(&key);
+        let table = master.cluster.shard_table();
+        let a = table.read().assignment(shard).clone();
+        assert!(
+            !a.replicas.is_empty(),
+            "RF=2 shard must have a replica assigned"
+        );
+        a.replicas[0].0
+    };
+    let replica = node_by_id(replica_id);
+
+    // Create the record on its MASTER via the wire, retrying through a transient
+    // partial-error (a brief fence during cluster settle) until it lands.
+    let hash = make_txid(70001);
+    let mut master_stream = TcpStream::connect(format!("127.0.0.1:{}", master.tcp_port)).unwrap();
+    master_stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until(
+        || {
+            let resp = send_request(
+                &mut master_stream,
+                &RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: encode_multi_create_payload(&[(txid, hash)]).into(),
+                },
+            );
+            resp.status == STATUS_OK && master.server.engine().lookup(&key).is_some()
+        },
+        Duration::from_secs(10),
+    )
+    .expect("create on the shard master must succeed and land on its engine");
+
+    // RF=2: the write must replicate to the REPLICA's segment engine.
+    wait_until(
+        || replica.server.engine().lookup(&key).is_some(),
+        Duration::from_secs(10),
+    )
+    .expect("RF=2 must replicate the create to the replica's segment engine");
+    let replicated = replica.server.engine().lookup(&key).unwrap();
+    assert_eq!(
+        replicated.utxo_count, 1,
+        "replicated record shape preserved"
+    );
+
+    // Kill the MASTER.
+    shutdown_node(node_by_id(master_id));
+
+    // A survivor observes the master leave, then the replica is promoted to master
+    // of the shard and STILL holds the record — the failover lost nothing.
+    wait_until(
+        || {
+            !replica
+                .cluster
+                .node_addresses()
+                .contains_key(&NodeId(master_id))
+        },
+        Duration::from_secs(10),
+    )
+    .expect("survivors should drop the killed master after suspicion");
+    wait_until(
+        || matches!(replica.cluster.is_master(&key), MasterQueryResult::Yes),
+        Duration::from_secs(15),
+    )
+    .expect("the replica must be promoted to master of the shard after failover");
+    assert!(
+        replica.server.engine().lookup(&key).is_some(),
+        "the replicated record must survive master failover on the promoted node"
+    );
+
+    // Clean up the survivors (the killed master is already down).
+    for id in [461u64, 462, 463] {
+        if id != master_id {
+            shutdown_node(node_by_id(id));
+        }
+    }
+}
+
+/// Phase 6: a segment node LEAVES the cluster and a fresh segment node REJOINS —
+/// it re-discovers peers, re-commits a 2-node topology, and takes shard ownership,
+/// proving a segment node re-participates after a membership change.
+#[test]
+fn segment_node_rejoins_and_takes_shard_ownership() {
+    let node1 = create_segment_node(471, 0, 0, &[], 2);
+    let node2 = create_segment_node(472, 0, 0, &[node1.swim_port], 2);
+    let seed = node1.swim_port;
+
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(20),
+    )
+    .expect("initial 2-node segment topology should commit");
+
+    // node2 leaves.
+    shutdown_node(&node2);
+    wait_until(
+        || !node1.cluster.node_addresses().contains_key(&NodeId(472)),
+        Duration::from_secs(10),
+    )
+    .expect("node1 should drop node2 after it leaves");
+
+    // A FRESH segment node rejoins via the same seed.
+    let node2b = create_segment_node(473, 0, 0, &[seed], 2);
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2b.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(20),
+    )
+    .expect("rejoined segment node should re-commit a 2-node topology");
+    // The rejoined node takes ownership of shards.
+    wait_until(
+        || {
+            node2b
+                .cluster
+                .shard_table()
+                .read()
+                .shard_counts()
+                .get(&NodeId(473))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        },
+        Duration::from_secs(15),
+    )
+    .expect("rejoined segment node must own shards after rebalance");
+
+    shutdown_node(&node1);
+    shutdown_node(&node2b);
+}
+
 #[test]
 fn during_migration_writes_redirect_to_new_node() {
     // In a 2-node cluster, keys not owned by this node get a Redirect response.

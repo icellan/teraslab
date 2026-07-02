@@ -23,17 +23,19 @@ WAL-first by the dispatch spend path on the master and by
 | 3 | Durability: `SpendV2` is WAL-first + convertible + self-sufficient for local recovery (replays the spend IN PLACE against the durable append-only pre-spend record). `RelocateV2` **retired** (unemitted). | ✅ |
 | 4 | Migration / rejoin validation for segment (non-spend ops RMW in place; migration-create; full-coordinator migration) | ✅ (tests) |
 | 5 | Relax the config gate; keep buffered-durability requirement (`config.rs`) | ✅ |
-| 6 | Cluster e2e tests: spend convergence (full logical fingerprint), all-vouts-spent DAH convergence, defrag convergence, non-spend replication, full-coordinator migration, and a real engine→crash→`recover()` composition | ✅ (see caveat) |
+| 6 | Cluster e2e tests: spend convergence (full logical fingerprint), all-vouts-spent DAH convergence, defrag convergence, non-spend replication, full-coordinator migration, real engine→crash→`recover()` composition, master-failover-no-lost-data, node rejoin, and strict-mode redo-only reconstruction | ✅ |
 
-**Phase 6 test caveat.** The e2e suite covers spend/DAH convergence, per-node
-defrag, non-spend replication, migration, and real-engine crash-recovery. It does
-NOT yet include a dedicated **master-failover-mid-spend-stream** or
-**stale-node-rejoin/resync** e2e for the segment engine. Both mechanisms are
-engine-agnostic (leader election, term ordering, migration transport) and unchanged
-by this work; the segment-specific guarantee they rely on — a promoted replica
-holds the master's exact logical state — is proven by the convergence tests, and a
-joining segment node receiving + serving records is proven by the migration tests.
-A dedicated segment failover/rejoin e2e remains a worthwhile follow-up.
+**Phase 6 coverage.** The e2e suite covers spend/DAH convergence, per-node
+defrag, non-spend replication, migration, and real-engine crash-recovery. It now
+also includes, on the segment engine under the real coordinator:
+`segment_cluster_master_failover_preserves_replicated_record` (RF=2 create
+replicates to the replica's engine → kill the master → the promoted replica still
+holds the record: no lost data across failover) and
+`segment_node_rejoins_and_takes_shard_ownership` (a segment node leaves and a fresh
+one rejoins, re-commits topology, and takes shard ownership). The strict "true
+Option A" durability path has `strict_clustered_segment_reconstructs_create_and_spend_from_redo_alone`
+(recovers an acked create+spend onto a fresh, empty device from the fsync'd redo
+alone).
 
 **Why the revision (review P0s, all now fixed at the root).** Option A journaled
 only the physical `RelocateV2`, which `redo_entry_to_replica_op` maps to `None` —
@@ -48,19 +50,34 @@ retiring the fat op fixes all four at the root — and moots the redo-amplificat
 packed-replay, LogFull-mid-apply, and catch-up-watermark P1s, because a clustered
 segment spend now journals exactly what an in-place spend does.
 
-**Durability (as implemented).** Under the required buffered mode, a clustered
-segment node's durability = replication quorum before ack + failover +
-rejoin-resync — identical to the in-place clustered default (neither fsyncs on the
-ack path). `SpendV2` is journaled WAL-first (dispatch Phase 3) and is
+**Durability — two modes (both implemented).**
+
+- **BUFFERED (default).** Durability = replication quorum before ack + failover +
+  rejoin-resync — identical to the in-place clustered default (neither fsyncs on
+  the ack path). Accepts a correlated-crash window (master + whole quorum lose
+  un-flushed buffers together), bounded to the unmined tail.
+- **STRICT — "true Option A" (opt-in: `redo_buffered = false` on a clustered
+  node).** An acked write is fsync-durable LOCALLY on the master before ack (AND
+  quorum-replicated), eliminating the correlated-crash window. This works because
+  the clustered spend's authoritative redo is the self-sufficient `SpendV2`
+  (fsync'd before ack via the group-commit coordinator; replays the spend IN
+  PLACE), and under strict the create emits the fat image-carrying `RedoOp::Create`
+  (`dispatch.rs`, keyed on `redo_buffered()`), so the master's whole redo chain
+  reconstructs every acked write from the redo ALONE — proven by
+  `recovery.rs::strict_clustered_segment_reconstructs_create_and_spend_from_redo_alone`
+  (recovers onto a fresh, empty device). `validate_cluster_safety` allows strict
+  only when clustered; STANDALONE segment still requires buffered (its thin
+  `Relocate` reads the record back from a buffered-lost offset on replay).
+
+In both modes `SpendV2` is journaled WAL-first (dispatch Phase 3) and is
 self-sufficient: on replay it re-applies the spend in place against the durable,
-append-only pre-spend record (which its own create/earlier-spend redo
-reconstructs first), so no fat image or data-device fsync is needed. Tests:
+append-only pre-spend record (which its own create/earlier-spend redo reconstructs
+first), so no physical relocate redo is needed. Tests:
 `tests/segment_cluster_e2e.rs`,
-`tests/cluster_tcp.rs::segment_cluster_migrates_shard_with_records_to_new_node`,
-and the `recovery.rs` `clustered_segment_spendv2_*` + `receiver.rs`
-multi-vout/baked-generation unit tests. The retired `RelocateV2` op + replay are
-kept only so any legacy in-flight redo decodes (clustered segment is unreleased);
-full removal is a safe follow-up.
+`tests/cluster_tcp.rs::{segment_cluster_migrates_shard_with_records_to_new_node,
+segment_cluster_failover_*}`, and the `recovery.rs` `clustered_segment_spendv2_*` /
+`strict_clustered_*` + `receiver.rs` multi-vout/baked-generation/composition unit
+tests.
 
 ---
 **Naming:** the comparison KV store is referred to throughout as *the reference

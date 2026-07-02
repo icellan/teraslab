@@ -5112,6 +5112,96 @@ mod tests {
         assert_eq!(s[1].spending_data, spending_data);
     }
 
+    /// STRICT "true Option A" for CLUSTERED segment: an acked create+spend must be
+    /// reconstructable from the fsync'd redo ALONE, with the buffered data device
+    /// entirely lost. Under strict durability the master's create emits the FAT
+    /// `RedoOp::Create` (image-carrying) and the spend emits `SpendV2`; recovering
+    /// that redo onto a FRESH, EMPTY device rebuilds the spent record byte-for-byte
+    /// — proving no acked write depends on the buffered data write surviving.
+    #[test]
+    fn strict_clustered_segment_reconstructs_create_and_spend_from_redo_alone() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x64;
+        let key = TxKey { txid };
+        let rec_size = TxMetadata::record_size_for(utxo_count);
+        let off = h.alloc.allocate(rec_size).unwrap();
+        let slot_hashes: Vec<[u8; 32]> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                hh
+            })
+            .collect();
+
+        // Build the created record's image on a SCRATCH device (never the recovery
+        // device), exactly as the fat Create carries it. generation 1, unspent.
+        let image: Vec<u8> = {
+            let scratch: Arc<dyn BlockDevice> =
+                Arc::new(crate::device::MemoryDevice::new(1 << 20, 4096).unwrap());
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.generation = 1;
+            let slots: Vec<UtxoSlot> = slot_hashes
+                .iter()
+                .map(|h| UtxoSlot::new_unspent(*h))
+                .collect();
+            // Build the image at a block-aligned offset (0); the bytes are
+            // position-independent — the fat Create writes them at `off`.
+            io::write_full_record(&*scratch, 0, &meta, &slots).unwrap();
+            let aligned = io::align_up(rec_size as usize, 4096);
+            let mut buf = crate::device::AlignedBuf::new(aligned, 4096);
+            scratch.pread_exact_at(&mut buf, 0).unwrap();
+            buf[..rec_size as usize].to_vec()
+        };
+
+        // The recovery device is FRESH/empty — nothing was ever durably written to
+        // it. The redo is the ONLY source of truth (data device "lost").
+        assert!(h.index.lookup(&key).is_none());
+        let spending_data = [0xEEu8; 36];
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off,
+            utxo_count,
+            is_conflicting: false,
+            record_bytes: Arc::from(image.as_slice()),
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 2,
+            spending_data,
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 2,
+            updated_at: 0,
+            utxo_hash: Some(slot_hashes[2]),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 2, "fat Create + SpendV2 replay");
+
+        // Reconstructed from the redo alone: the fat Create wrote the record to the
+        // fresh device, then SpendV2 spent vout 2 in place.
+        let ie = h
+            .index
+            .lookup(&key)
+            .expect("record rebuilt from redo alone");
+        let m = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ m.tx_id }, txid);
+        assert_eq!({ m.spent_utxos }, 1, "the acked spend survived (redo-only)");
+        let s = io::read_all_utxo_slots(&*h.data_dev, ie.record_offset, utxo_count).unwrap();
+        assert_eq!(s[2].status, UTXO_SPENT);
+        assert_eq!(s[2].spending_data, spending_data);
+        assert_eq!(s[0].status, UTXO_UNSPENT);
+    }
+
     /// A relocation of a tx that is NOT (durably) indexed is moot — recovery
     /// must skip it, never register the tx from a relocate alone.
     #[test]

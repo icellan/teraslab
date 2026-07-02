@@ -1564,25 +1564,34 @@ impl ServerConfig {
         // quorum before ack, plus failover + rejoin-resync healing a crashed
         // master's un-flushed tail. The former blanket refusal is therefore removed.
         //
-        // The segment engine still requires BUFFERED redo durability. The engine's
-        // DATA writes are buffered by design (sequential appends flushed at the
-        // checkpoint barrier, not per-write), and crash safety relies on that
-        // barrier — which fsyncs every store's data device before reclaiming any
-        // redo prefix — to make the relocated image and its redo durable together.
-        // STANDALONE's thin `Relocate` reads the record back from the device on
-        // replay; CLUSTERED's `SpendV2` replays the spend in place against the
-        // durable pre-spend record; both depend on the checkpoint barrier the
-        // buffered mode pairs with. Strict redo durability would fsync the redo
-        // per-op while the data stayed checkpoint-only, so refuse it rather than
-        // silently weaken the crash contract. (A strict "true Option A" — fsync
-        // both redo and data before ack — is a possible future opt-in.)
-        if self.storage.engine == StorageEngine::Segment && !self.redo_buffered_effective() {
+        // STANDALONE segment requires BUFFERED redo durability. Its spend journals
+        // a thin `Relocate` (a buffered append that reads the record back from the
+        // new, still-buffered offset on replay), so under strict durability an acked
+        // spend whose buffered data write is lost on crash would be silently
+        // reverted — refuse it.
+        //
+        // CLUSTERED segment MAY use strict durability — this is the "true Option A"
+        // (fsync-before-ack / commit-to-device). Its authoritative spend redo is the
+        // self-sufficient `SpendV2` (fsync'd before ack via the group-commit
+        // coordinator; on replay it re-applies the spend IN PLACE against the
+        // pre-spend record), and under strict the create emits the fat, image-
+        // carrying `RedoOp::Create` (`dispatch.rs`, keyed on `redo_buffered()`), so
+        // the master's whole redo chain reconstructs every acked write from the redo
+        // ALONE — no acked write can be lost (master fsync-durable + quorum). The
+        // default remains buffered (replication-quorum durability); strict is the
+        // stronger opt-in.
+        let clustered = self.is_clustered() || self.replication_factor > 1;
+        if self.storage.engine == StorageEngine::Segment
+            && !self.redo_buffered_effective()
+            && !clustered
+        {
             return Err(
-                "storage.engine = \"segment\" requires buffered redo durability: set \
-                 redo_buffered = true (or redo_buffered_io = true). The log-structured \
-                 engine buffers its data writes and depends on the checkpoint barrier \
-                 fsyncing the data device before reclaiming the redo — a guarantee \
-                 strict durability does not provide."
+                "storage.engine = \"segment\" requires buffered redo durability on a \
+                 STANDALONE node: set redo_buffered = true (or redo_buffered_io = true). \
+                 The log-structured spend's thin Relocate reads the record back from a \
+                 buffered offset on replay, which strict durability does not make safe. \
+                 (A CLUSTERED segment node MAY use strict durability — its SpendV2 redo \
+                 is self-sufficient and fsync'd before ack.)"
                     .to_string(),
             );
         }
@@ -2491,10 +2500,11 @@ backend = ""
     }
 
     #[test]
-    fn segment_engine_clustered_still_requires_buffered_durability() {
-        // Even clustered, the segment engine requires buffered durability (the
-        // standalone relocate is post-write; the clustered rejoin-resync story
-        // assumes the checkpoint barrier). Strict + clustered segment → refused.
+    fn segment_engine_clustered_allows_strict_durability() {
+        // "True Option A": a CLUSTERED segment node MAY run strict durability — its
+        // SpendV2 redo is self-sufficient and fsync'd before ack, and the fat Create
+        // (emitted under strict) makes the whole redo chain reconstruct every acked
+        // write from the redo alone. So strict + clustered segment validates.
         let mut cfg = ServerConfig {
             node_id: 1,
             replication_factor: 3,
@@ -2503,13 +2513,9 @@ backend = ""
         cfg.storage.engine = StorageEngine::Segment;
         cfg.redo_buffered = false;
         cfg.redo_buffered_io = false;
-        let err = cfg
-            .validate_cluster_safety()
-            .expect_err("strict + clustered segment must be refused");
-        assert!(
-            err.contains("segment") && err.contains("buffered"),
-            "error must explain the buffered requirement: {err}",
-        );
+        assert!(cfg.is_clustered());
+        cfg.validate_cluster_safety()
+            .expect("strict + clustered segment must be allowed (true Option A)");
     }
 
     #[test]
