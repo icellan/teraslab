@@ -2366,6 +2366,9 @@ mod tests {
             Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
         engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        // Match the shape a clustered segment node actually boots (config forces
+        // buffered durability for segment).
+        engine.set_buffered_durability(true);
         engine.set_clustered(true);
         Arc::new(engine)
     }
@@ -2926,6 +2929,80 @@ mod tests {
             spendv2_count, 3,
             "one SpendV2 per spent vout must be journaled"
         );
+    }
+
+    #[test]
+    fn clustered_segment_spend_recovers_via_real_engine_and_redo() {
+        // #20: full composition — a REAL clustered segment engine journals a real
+        // spend (replica apply path → relocate + SpendV2), then recover() rebuilds
+        // the SPENT record from that engine's OWN device + redo. No hand-built redo
+        // and no pre-manufactured index state — the create and the spend both flow
+        // through the engine, and a fresh index is reconstructed from the journal.
+        use crate::index::{PrimaryBackend, ShardedIndex};
+
+        let engine = make_seg_engine_clustered();
+        let k = key(41);
+        // Both the create AND the spend flow through the replica apply path so both
+        // are journaled (a real replica receives a ReplicaOp::Create, which journals
+        // a ReplicaCreate; a direct engine.create does not journal).
+        let hashes: Vec<[u8; 32]> = (0..4u32)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[4..8].copy_from_slice(&k.txid[0..4]);
+                h
+            })
+            .collect();
+        apply_op_journal(
+            &engine,
+            &ReplicaOp::Create {
+                tx_key: k,
+                metadata_bytes: vec![],
+                utxo_hashes: hashes,
+                cold_data: None,
+                is_external: false,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply_op_journal(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 1,
+                spending_data: [0x77; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                master_generation: 1,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        engine.flush_all_redo().unwrap();
+
+        // Crash + recover into a FRESH index from the engine's own device + redo.
+        let fresh = ShardedIndex::from_single(PrimaryBackend::new_in_memory(10_000).unwrap());
+        let redo = engine.redo_log().unwrap();
+        let stats = crate::recovery::recover(engine.device(), &redo.lock(), &fresh).unwrap();
+        assert!(
+            stats.entries_replayed >= 1,
+            "the create + spend redo must replay"
+        );
+
+        // The reconstructed record is SPENT at vout 1 with the master's baked
+        // generation — rebuilt purely from the journal.
+        let ie = fresh.lookup(&k).expect("recovered record must be indexed");
+        let m = crate::io::read_metadata(engine.device(), ie.record_offset).unwrap();
+        assert_eq!({ m.spent_utxos }, 1, "recovered record is spent");
+        assert_eq!(
+            { m.generation },
+            1,
+            "recovered generation == master's baked value"
+        );
+        let s = crate::io::read_utxo_slot(engine.device(), ie.record_offset, 1).unwrap();
+        assert_eq!(s.status, UTXO_SPENT);
     }
 
     #[test]

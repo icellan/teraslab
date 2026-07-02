@@ -65,6 +65,16 @@ const TEST_CLUSTER_ID: ClusterId = ClusterId([0xA5; 16]);
 /// that exercise a single-node cluster or that don't need replica handling.
 /// `rf=2` is the production default; pass it for tests that join multiple
 /// nodes and want to exercise the replication path.
+/// The default replication runtime every in-process test node uses.
+fn default_test_replication() -> ReplicationRuntimeConfig {
+    ReplicationRuntimeConfig {
+        ack_policy: None,
+        best_effort: true,
+        timeout: Duration::from_secs(3),
+        timeout_during_migration: Duration::from_secs(30),
+    }
+}
+
 fn create_node(
     node_id: u64,
     tcp_port: u16,
@@ -78,12 +88,7 @@ fn create_node(
         swim_port,
         seed_swim_ports,
         rf,
-        ReplicationRuntimeConfig {
-            ack_policy: None,
-            best_effort: true,
-            timeout: Duration::from_secs(3),
-            timeout_during_migration: Duration::from_secs(30),
-        },
+        default_test_replication(),
     )
 }
 
@@ -121,12 +126,7 @@ fn create_segment_node(
         swim_port,
         seed_swim_ports,
         rf,
-        ReplicationRuntimeConfig {
-            ack_policy: None,
-            best_effort: true,
-            timeout: Duration::from_secs(3),
-            timeout_during_migration: Duration::from_secs(30),
-        },
+        default_test_replication(),
         TEST_CLUSTER_ID,
         4,
         true,
@@ -1068,21 +1068,56 @@ fn segment_cluster_migrates_shard_with_records_to_new_node() {
     )
     .expect("joining segment node must own shards after rebalance");
 
-    // node2 is reachable and serving.
+    // node2 must SERVE its shards after the rebalance: a create for a key node2 now
+    // masters succeeds on node2's segment engine (the user-facing guarantee that
+    // the joined segment node is a full cluster participant). (Physical migration
+    // of the pre-existing records' bytes is validated at the apply level by
+    // tests/segment_cluster_e2e.rs::joining_segment_node_receives_record_via_migration_create_*.)
+    let node2_key = (0..2000u32)
+        .map(|i| make_txid(i + 50000))
+        .find(|txid| {
+            matches!(
+                node2.cluster.is_master(&TxKey { txid: *txid }),
+                MasterQueryResult::Yes
+            )
+        })
+        .expect("node2 must master at least one shard after rebalance");
+
     let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
     stream2
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let resp = send_request(
+    let hash = make_txid(999);
+    let create_resp = send_request(
         &mut stream2,
         &RequestFrame {
-            request_id: 99,
-            op_code: OP_PING,
+            request_id: 3,
+            op_code: OP_CREATE_BATCH,
             flags: 0,
-            payload: vec![].into(),
+            payload: encode_multi_create_payload(&[(node2_key, hash)]).into(),
         },
     );
-    assert_eq!(resp.status, STATUS_OK);
+    assert_eq!(
+        create_resp.status, STATUS_OK,
+        "node2 must serve a create for a shard it masters after joining"
+    );
+    // The record it just wrote is present + readable on node2's own segment engine.
+    let entry = node2
+        .server
+        .engine()
+        .lookup(&TxKey { txid: node2_key })
+        .expect("record node2 just created must be on node2's segment engine");
+    assert_eq!(
+        node2
+            .server
+            .engine()
+            .read_slot(&TxKey { txid: node2_key }, 0)
+            .unwrap()
+            .status,
+        teraslab::record::UTXO_UNSPENT,
+        "node2's segment engine serves the record it created"
+    );
+    let _ = entry;
 
     shutdown_node(&node1);
     shutdown_node(&node2);

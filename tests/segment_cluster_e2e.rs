@@ -110,27 +110,39 @@ fn create_record(engine: &Engine, tx_n: u32, utxo_count: u32) -> TxKey {
 
 /// Logical fingerprint of a record — the state that MUST be identical across
 /// nodes. Physical offset is deliberately excluded (it legitimately diverges).
+/// Covers every logically-significant field: metadata footer (counts, generation,
+/// flags, DAH, mined-block entries, unmined marker) AND every slot's full state.
 #[derive(Debug, PartialEq, Eq)]
 struct LogicalState {
     utxo_count: u32,
     spent_utxos: u32,
     generation: u32,
-    slot0_status: u8,
-    slot1_status: u8,
-    slot1_spending_data: [u8; 36],
+    tx_flags: u8,
+    delete_at_height: u32,
+    block_entry_count: u8,
+    unmined_since: u32,
+    /// (status, spending_data) for every slot, in vout order.
+    slots: Vec<(u8, [u8; 36])>,
 }
 
 fn logical_state(engine: &Engine, key: &TxKey) -> LogicalState {
     let m = engine.read_metadata(key).unwrap();
-    let s0 = engine.read_slot(key, 0).unwrap();
-    let s1 = engine.read_slot(key, 1).unwrap();
+    let utxo_count = { m.utxo_count };
+    let slots: Vec<(u8, [u8; 36])> = (0..utxo_count)
+        .map(|v| {
+            let s = engine.read_slot(key, v).unwrap();
+            (s.status, s.spending_data)
+        })
+        .collect();
     LogicalState {
-        utxo_count: { m.utxo_count },
+        utxo_count,
         spent_utxos: { m.spent_utxos },
         generation: { m.generation },
-        slot0_status: s0.status,
-        slot1_status: s1.status,
-        slot1_spending_data: s1.spending_data,
+        tx_flags: { m.flags }.bits(),
+        delete_at_height: { m.delete_at_height },
+        block_entry_count: { m.block_entry_count },
+        unmined_since: { m.unmined_since },
+        slots,
     }
 }
 
@@ -188,14 +200,15 @@ fn segment_spend_replicates_logical_state_with_diverging_offsets() {
     )
     .unwrap();
 
-    // LOGICAL convergence — identical spent state, count, and generation.
+    // LOGICAL convergence — the full fingerprint (counts, generation, flags, DAH,
+    // block entries, unmined marker, and every slot) is identical.
     let ms = logical_state(&master, &key);
     let rs = logical_state(&replica, &key);
     assert_eq!(ms, rs, "master and replica must converge logically");
-    assert_eq!(ms.slot1_status, UTXO_SPENT);
-    assert_eq!(ms.slot1_spending_data, sd);
+    assert_eq!(ms.slots[1].0, UTXO_SPENT);
+    assert_eq!(ms.slots[1].1, sd);
     assert_eq!(ms.spent_utxos, 1);
-    assert_eq!(ms.slot0_status, UTXO_UNSPENT);
+    assert_eq!(ms.slots[0].0, UTXO_UNSPENT);
 
     // PHYSICAL divergence — both relocated (offset moved off the create site),
     // and to DIFFERENT offsets (the decoy skewed the replica's cursor).
@@ -207,6 +220,98 @@ fn segment_spend_replicates_logical_state_with_diverging_offsets() {
         master_post_offset, replica_post_offset,
         "offsets legitimately diverge across nodes"
     );
+}
+
+#[test]
+fn segment_spend_all_vouts_sets_dah_and_replicates() {
+    // Spend EVERY vout of a mined, on-longest-chain record so the all-spent →
+    // deleteAtHeight path fires, and assert the master and replica converge on the
+    // FULL logical fingerprint — including delete_at_height, block-entry count, and
+    // every slot — not just a single slot.
+    use teraslab::ops::set_mined::SetMinedRequest;
+
+    let master = make_clustered_seg_engine();
+    let replica = make_clustered_seg_engine();
+    let key = create_record(&master, 200, 3);
+    assert_eq!(create_record(&replica, 200, 3), key);
+
+    // Mine the record on the longest chain on both nodes (setMined RMWs in place
+    // on segment — no relocate).
+    master
+        .set_mined(&SetMinedRequest {
+            tx_key: key,
+            block_id: 77,
+            block_height: 800_000,
+            subtree_idx: 2,
+            current_block_height: 800_050,
+            block_height_retention: 100,
+            on_longest_chain: true,
+            unset_mined: false,
+        })
+        .unwrap();
+    apply_op_journal(
+        &replica,
+        &ReplicaOp::SetMined {
+            tx_key: key,
+            block_id: 77,
+            block_height: 800_000,
+            subtree_idx: 2,
+            on_longest_chain: true,
+            current_block_height: 800_050,
+            block_height_retention: 100,
+            master_generation: 1,
+        },
+        true,
+        false,
+    )
+    .unwrap();
+
+    // Spend all 3 vouts on the master; ship each logical Spend to the replica.
+    for vout in 0u32..3 {
+        let mut sd = [0u8; 36];
+        sd[0] = 0x30 | vout as u8;
+        master
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: vout,
+                utxo_hash: utxo_hash(200, vout),
+                spending_data: sd,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 800_050,
+                block_height_retention: 100,
+            })
+            .unwrap();
+        let master_generation = { master.read_metadata(&key).unwrap().generation };
+        apply_op_journal(
+            &replica,
+            &ReplicaOp::Spend {
+                tx_key: key,
+                offset: vout,
+                spending_data: sd,
+                current_block_height: 800_050,
+                block_height_retention: 100,
+                master_generation,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+    }
+
+    let ms = logical_state(&master, &key);
+    let rs = logical_state(&replica, &key);
+    assert_eq!(
+        ms, rs,
+        "master and replica must converge on the full fingerprint (incl. DAH + block entries)"
+    );
+    assert_eq!(ms.spent_utxos, 3, "all vouts spent");
+    assert!(ms.slots.iter().all(|(st, _)| *st == UTXO_SPENT));
+    assert!(
+        ms.delete_at_height != 0,
+        "all-spent on the longest chain must set delete_at_height"
+    );
+    assert!(ms.block_entry_count >= 1, "mined block entry recorded");
 }
 
 // ---------------------------------------------------------------------------
@@ -330,13 +435,23 @@ fn joining_segment_node_receives_record_via_migration_create_and_can_spend() {
     let key = TxKey { txid: txid(555) };
     let hashes: Vec<[u8; 32]> = (0..4u32).map(|v| utxo_hash(555, v)).collect();
 
+    // Ship the FULL 70-byte extended-lifecycle metadata payload the migration
+    // baseline sends (not the degenerate empty one), carrying a distinctive
+    // generation so we can prove metadata is preserved through segment migration.
+    // Layout mirrors coordinator.rs baseline serialization; generation sits at
+    // offset 46 (see receiver.rs `incoming_create_generation`).
+    const MIGRATED_GENERATION: u32 = 42;
+    let mut meta_bytes = vec![0u8; 70];
+    meta_bytes[0..4].copy_from_slice(&1u32.to_le_bytes()); // tx_version
+    meta_bytes[46..50].copy_from_slice(&MIGRATED_GENERATION.to_le_bytes()); // generation
+
     // Migration ships the record via the Create path; the joiner's engine.create
     // allocates its OWN offset (index-only CreateV2 under the hood).
     apply_op_journal(
         &joiner,
         &ReplicaOp::Create {
             tx_key: key,
-            metadata_bytes: vec![],
+            metadata_bytes: meta_bytes,
             utxo_hashes: hashes,
             cold_data: None,
             is_external: false,
@@ -346,12 +461,18 @@ fn joining_segment_node_receives_record_via_migration_create_and_can_spend() {
     )
     .unwrap();
 
-    // The record landed and is fully readable.
+    // The record landed and is fully readable, and its migrated generation was
+    // preserved (the non-degenerate metadata payload path, not just index bytes).
     let entry = joiner
         .lookup(&key)
         .expect("migrated record must be indexed");
     assert_eq!(entry.utxo_count, 4);
     assert_eq!(joiner.read_slot(&key, 0).unwrap().status, UTXO_UNSPENT);
+    assert_eq!(
+        { joiner.read_metadata(&key).unwrap().generation },
+        MIGRATED_GENERATION,
+        "segment migration must preserve the record's generation from metadata_bytes"
+    );
 
     // And it is immediately spendable on the joiner — the segment spend relocates
     // it to a fresh offset, proving the migrated record is a first-class citizen.
