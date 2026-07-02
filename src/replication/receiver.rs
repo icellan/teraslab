@@ -2774,6 +2774,163 @@ mod tests {
     }
 
     #[test]
+    fn apply_multi_vout_same_txid_spends_all_get_applied() {
+        // A master spending N vouts of the SAME txid in one batch bumps the
+        // record generation ONCE (post_generation = pre+1) and ships N
+        // ReplicaOp::Spend, EVERY one carrying master_generation = pre+1. The
+        // replica must apply ALL N. If it locally increments generation per op
+        // (pre+1, pre+2, …), the staleness guard drops the 3rd+ op as "already
+        // superseded", diverging replica from master (a spent output stays
+        // UNSPENT on the replica → double-spend on failover).
+        let engine = make_engine();
+        let k = key(9);
+        create_record(&engine, k, 4); // fresh record, generation 0
+        let master_generation = 1; // what the master ships for all vouts
+
+        for vout in 0u32..3 {
+            let mut sd = [0u8; 36];
+            sd[0] = 0xE0 | vout as u8;
+            apply_op(
+                &engine,
+                &ReplicaOp::Spend {
+                    tx_key: k,
+                    offset: vout,
+                    spending_data: sd,
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
+                    master_generation,
+                },
+            )
+            .unwrap();
+        }
+
+        for vout in 0u32..3 {
+            let slot = engine.read_slot(&k, vout).unwrap();
+            assert_eq!(
+                slot.status, UTXO_SPENT,
+                "vout {vout} of a multi-vout same-txid batch must be spent on the replica"
+            );
+        }
+        // The replica's generation equals the master's (baked in, not per-op
+        // incremented).
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { meta.generation },
+            master_generation,
+            "replica generation must match the master's (baked in)"
+        );
+    }
+
+    #[test]
+    fn apply_multi_vout_same_txid_spends_all_get_applied_on_segment() {
+        // Same as the in-place test but on a CLUSTERED SEGMENT replica — each op
+        // RELOCATES the record. All N vouts must still be applied and the
+        // generation baked to the master's value (not per-op incremented), or the
+        // staleness guard drops the 3rd+ relocated spend and the replica diverges.
+        let engine = make_seg_engine_clustered();
+        let k = key(19);
+        create_record(&engine, k, 4);
+        let master_generation = 1;
+
+        for vout in 0u32..3 {
+            let mut sd = [0u8; 36];
+            sd[0] = 0xF0 | vout as u8;
+            apply_op(
+                &engine,
+                &ReplicaOp::Spend {
+                    tx_key: k,
+                    offset: vout,
+                    spending_data: sd,
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
+                    master_generation,
+                },
+            )
+            .unwrap();
+        }
+
+        for vout in 0u32..3 {
+            assert_eq!(
+                engine.read_slot(&k, vout).unwrap().status,
+                UTXO_SPENT,
+                "segment replica: vout {vout} of a multi-vout same-txid batch must be spent"
+            );
+        }
+        assert_eq!(
+            { engine.read_metadata(&k).unwrap().generation },
+            master_generation,
+            "segment replica generation must match the master's (baked in)"
+        );
+    }
+
+    #[test]
+    fn segment_replica_journals_spendv2_with_baked_master_generation() {
+        // #3 regression: the replica bakes the master's generation AFTER apply
+        // (set_record_generation) and journals the post-apply SpendV2 AFTER that,
+        // so the journaled redo carries master_generation — NOT the per-op
+        // locally-incremented value. (The prior fat RelocateV2 was journaled
+        // mid-apply with the pre-bake generation, so crash-replay resurrected a
+        // generation ahead of the master and the staleness guard then dropped
+        // legitimately re-delivered ops. Retiring RelocateV2 closes that.)
+        use crate::redo::RedoOp;
+        let engine = make_seg_engine_clustered();
+        let k = key(29);
+        create_record(&engine, k, 4);
+        let master_generation = 1u32;
+
+        for vout in 0u32..3 {
+            let mut sd = [0u8; 36];
+            sd[0] = 0xC0 | vout as u8;
+            apply_op_journal(
+                &engine,
+                &ReplicaOp::Spend {
+                    tx_key: k,
+                    offset: vout,
+                    spending_data: sd,
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
+                    master_generation,
+                },
+                true,
+                false,
+            )
+            .unwrap();
+        }
+
+        // Every journaled SpendV2 for this key carries the BAKED master generation,
+        // and NO RelocateV2 (which would have carried the pre-bake generation) was
+        // journaled — so a crash-replay reconstructs generation == master's.
+        engine.flush_all_redo().unwrap();
+        let entries = engine.redo_log().unwrap().lock().recover().unwrap();
+        let mut spendv2_count = 0;
+        for e in &entries {
+            match &e.op {
+                RedoOp::SpendV2 {
+                    tx_key,
+                    target_generation,
+                    ..
+                } if *tx_key == k => {
+                    assert_eq!(
+                        *target_generation, master_generation,
+                        "journaled SpendV2 must carry the baked master generation"
+                    );
+                    spendv2_count += 1;
+                }
+                RedoOp::Relocate { tx_key, .. } | RedoOp::RelocateV2 { tx_key, .. }
+                    if *tx_key == k =>
+                {
+                    panic!("clustered segment replica must not journal a relocate redo");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            spendv2_count, 3,
+            "one SpendV2 per spent vout must be journaled"
+        );
+    }
+
+    #[test]
     fn apply_spend_op() {
         let engine = make_engine();
         let k = key(1);
