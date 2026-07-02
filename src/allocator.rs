@@ -90,6 +90,24 @@ pub enum AllocatorError {
     #[error("corrupted freelist header")]
     CorruptedHeader,
 
+    /// The configured `segment_size` is unusable for the segment engine —
+    /// zero, not a multiple of the device alignment, or larger than the data
+    /// region. A CONFIG error, not device corruption: fix
+    /// `[storage] segment_size` (default 8388608 = 8 MiB).
+    #[error(
+        "invalid segment_size {segment_size}: must be a positive multiple of device \
+         alignment {alignment} and fit the data region ({data_capacity} bytes) — \
+         config error, not device corruption"
+    )]
+    InvalidSegmentSize {
+        /// The rejected segment size (bytes).
+        segment_size: u64,
+        /// Device I/O alignment (bytes).
+        alignment: usize,
+        /// Usable data-region capacity (bytes).
+        data_capacity: u64,
+    },
+
     /// Attempted to free a region that is outside the data area.
     #[error("invalid free: offset {offset} + size {size} outside data region")]
     InvalidFree { offset: u64, size: u64 },
