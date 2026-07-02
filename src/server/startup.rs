@@ -1455,6 +1455,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recover_or_create_boxed_allocator_fresh_device_default_config_boots_segment() {
+        // Boot-path regression (c0dd2eb): a config with NO [storage] table
+        // yields StorageConfig::default(); over a fresh device this must
+        // create a working segment allocator, not die on segment_size = 0
+        // with a bogus "corrupted freelist header".
+        use crate::config::StorageConfig;
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let storage = StorageConfig::default();
+        let (mut alloc, origin) =
+            recover_or_create_boxed_allocator(dev, storage.engine, storage.segment_size)
+                .expect("fresh device + default config must boot the segment engine");
+        assert_eq!(origin, AllocatorOrigin::Fresh);
+        let offset = alloc
+            .allocate(4096)
+            .expect("fresh segment allocator must allocate");
+        assert_eq!(offset % 4096, 0);
+    }
+
     // -----------------------------------------------------------------------
     // Packed-mode startup wiring (apply_packed_mode): fresh adopts config,
     // recovered honors the device (device format wins).
