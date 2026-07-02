@@ -1091,9 +1091,10 @@ impl SegmentAllocator {
 }
 
 /// Map a segment-allocator error into the common [`crate::allocator::AllocatorError`]
-/// used by the [`RecordAllocator`] trait. Only the variants reachable from the
-/// trait's `Result`-returning methods (allocate/free/persist/reserve) need a
-/// precise mapping; constructor-only variants fall back to `CorruptedHeader`.
+/// used by the [`RecordAllocator`] trait. Every variant maps precisely —
+/// including constructor-only ones like `InvalidSegmentSize`, which surfaces
+/// as its own config-error variant (never `CorruptedHeader`, which would
+/// misreport a config mistake as on-disk corruption).
 impl From<SegmentAllocatorError> for crate::allocator::AllocatorError {
     fn from(e: SegmentAllocatorError) -> Self {
         use crate::allocator::AllocatorError as A;
