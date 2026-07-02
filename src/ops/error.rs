@@ -252,4 +252,30 @@ pub enum SpendError {
         /// The capacity that was hit (the on-disk `u8` count maximum, 255).
         cap: usize,
     },
+
+    /// Issue #34 (defense-in-depth): an INLINE record's cold-data blob is
+    /// internally inconsistent — the length prefixes it carries
+    /// (`[inputs_len][outputs_len][inpoints_len]`) declare more bytes than the
+    /// record's actual on-disk cold region (`cold_size`) holds.
+    ///
+    /// This mirrors the EXTERNAL blob's `total_size` / digest integrity checks
+    /// in [`crate::ops::engine::Engine::read_cold_data`]: rather than returning
+    /// a byte-for-byte-short buffer that a downstream `FieldColdData` decode
+    /// then reports as an opaque "inpoints truncated", the read fails closed
+    /// with this typed error so the corruption is attributable to a specific
+    /// record instead of silently wedging a consumer (e.g. legacy catch-up
+    /// sync during previous-output decoration of an already-spent parent).
+    ///
+    /// `declared` is the smallest number of cold bytes the inner length
+    /// prefixes require; `available` is the record's real cold region size.
+    /// `declared > available` is the only case that produces this error.
+    #[error(
+        "COLD_DATA_INCONSISTENT: inline cold blob declares {declared} bytes but only {available} are stored"
+    )]
+    ColdDataInconsistent {
+        /// Minimum cold-region byte length the inner length prefixes require.
+        declared: u64,
+        /// Actual on-disk cold-region byte length (`record_size - slots`).
+        available: u64,
+    },
 }

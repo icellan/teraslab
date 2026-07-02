@@ -9692,6 +9692,12 @@ fn spend_error_to_batch_error(item_index: u32, err: &SpendError) -> BatchItemErr
         // structural limit (the on-disk `u8` count cannot hold the 256th
         // distinct block_id). Bucketed with the storage/integrity errors.
         SpendError::BlockEntriesFull { .. } => (ERR_STORAGE_IO, vec![]),
+        // Issue #34: an internally-inconsistent inline cold blob is a
+        // storage-integrity failure (the stored bytes cannot satisfy the
+        // record's own length prefixes). Bucketed with the storage errors so
+        // the caller sees a hard read failure instead of decoding a short,
+        // "truncated" buffer.
+        SpendError::ColdDataInconsistent { .. } => (ERR_STORAGE_IO, vec![]),
     };
     BatchItemError {
         item_index,
@@ -9740,6 +9746,9 @@ pub(crate) fn classify_spend_error(err: &SpendError) -> crate::metrics::Outcome 
         // BUG-2: block-entry-list capacity overflow — same storage-integrity
         // bucket as the conflicting-children overflow.
         | SpendError::BlockEntriesFull { .. }
+        // Issue #34: inline cold blob internal inconsistency — a
+        // storage-integrity loss bucketed with the other storage errors.
+        | SpendError::ColdDataInconsistent { .. }
         | SpendError::ReassignOverflow { .. } => Outcome::ErrStorage,
         SpendError::CoinbaseImmature { .. }
         | SpendError::UtxoNotFound { .. }
