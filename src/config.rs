@@ -565,7 +565,7 @@ impl CacheConfig {
 }
 
 /// On-device storage layout configuration (`[storage]` TOML section).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct StorageConfig {
     /// Pack multiple sub-block records contiguously within a single device
@@ -658,6 +658,26 @@ pub struct StorageConfig {
     /// write pattern the EC2 A/B measured).
     #[serde(default)]
     pub streaming: bool,
+}
+
+// Manual Default (not derived): the derived impl zeroed `segment_size`, and
+// ServerConfig's container-level `#[serde(default)]` fills an ABSENT
+// `[storage]` table from this impl — the field-level serde default only fires
+// when the table is present. Derived `Default` + segment-engine default made
+// every config without a `[storage]` section fatal at boot (c0dd2eb
+// regression). This impl must stay in lockstep with the field-level serde
+// defaults.
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            packed: false,
+            placement: crate::subdevice::PlacementStrategy::default(),
+            append_only: false,
+            engine: StorageEngine::default(),
+            segment_size: default_segment_size(),
+            streaming: false,
+        }
+    }
 }
 
 /// Default segment size (8 MiB) for the segment storage engine.
@@ -2468,6 +2488,27 @@ backend = ""
             toml::from_str("[storage]\nengine = \"in_place\"\nsegment_size = 16777216\n").unwrap();
         assert_eq!(cfg.storage.engine, StorageEngine::InPlace);
         assert_eq!(cfg.storage.segment_size, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn storage_config_default_segment_size_is_8_mib() {
+        // Regression (c0dd2eb): the derived Default gave segment_size = 0 —
+        // fatal now that the segment engine is the default. The programmatic
+        // Default must match the serde field default (default_segment_size).
+        assert_eq!(StorageConfig::default().segment_size, 8 * 1024 * 1024);
+        assert_eq!(StorageConfig::default().engine, StorageEngine::Segment);
+    }
+
+    #[test]
+    fn absent_storage_table_defaults_to_bootable_segment_config() {
+        // NO [storage] table at all. ServerConfig's container-level
+        // #[serde(default)] fills the field from StorageConfig::default() —
+        // the field-level #[serde(default = "default_segment_size")] never
+        // fires on this path. Must yield the same bootable config as
+        // `[storage]\nengine = "segment"` with no segment_size key.
+        let cfg: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
+        assert_eq!(cfg.storage.segment_size, 8 * 1024 * 1024, "default 8 MiB");
     }
 
     #[test]
