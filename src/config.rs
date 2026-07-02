@@ -669,13 +669,14 @@ const fn default_segment_size() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StorageEngine {
     /// Best-fit freelist allocator (records placed at home offsets, updated in
-    /// place). Required for clustered/replicated nodes and for strict redo
-    /// durability (set `engine = "in_place"` explicitly for those).
+    /// place). Required for strict redo durability (set `engine = "in_place"`
+    /// explicitly for that).
     InPlace,
     /// Log-structured append-cursor allocator (creates append sequentially,
     /// spends relocate-on-write). The default: higher throughput and lower tail
-    /// latency on the standalone UTXO workload. Requires buffered redo
-    /// durability (now the default) and a non-clustered node.
+    /// latency on the UTXO workload. Requires buffered redo durability (now the
+    /// default). Clusters/replicates fine (a spend's replication is carried by the
+    /// convertible `SpendV2` — see `specs/SEGMENT_CLUSTERING_DESIGN.md`).
     #[default]
     Segment,
 }
@@ -1563,23 +1564,25 @@ impl ServerConfig {
         // quorum before ack, plus failover + rejoin-resync healing a crashed
         // master's un-flushed tail. The former blanket refusal is therefore removed.
         //
-        // The segment engine still requires BUFFERED redo durability. STANDALONE,
-        // the relocate journals its thin `Relocate` intent AFTER writing the
-        // relocated record (the new append-cursor offset is only known once
-        // allocated), so crash safety relies on the checkpoint barrier — which
-        // fsyncs every store's data device before reclaiming any redo prefix — to
-        // make the relocated image, its redo, and the old-extent dead-mark durable
-        // together. CLUSTERED inherits the same buffered mode (quorum-based
-        // durability). Strict durability does not provide that ordering, so refuse
-        // to start rather than silently weaken the crash contract.
+        // The segment engine still requires BUFFERED redo durability. The engine's
+        // DATA writes are buffered by design (sequential appends flushed at the
+        // checkpoint barrier, not per-write), and crash safety relies on that
+        // barrier — which fsyncs every store's data device before reclaiming any
+        // redo prefix — to make the relocated image and its redo durable together.
+        // STANDALONE's thin `Relocate` reads the record back from the device on
+        // replay; CLUSTERED's `SpendV2` replays the spend in place against the
+        // durable pre-spend record; both depend on the checkpoint barrier the
+        // buffered mode pairs with. Strict redo durability would fsync the redo
+        // per-op while the data stayed checkpoint-only, so refuse it rather than
+        // silently weaken the crash contract. (A strict "true Option A" — fsync
+        // both redo and data before ack — is a possible future opt-in.)
         if self.storage.engine == StorageEngine::Segment && !self.redo_buffered_effective() {
             return Err(
                 "storage.engine = \"segment\" requires buffered redo durability: set \
                  redo_buffered = true (or redo_buffered_io = true). The log-structured \
-                 spend journals its Relocate intent after writing the relocated record, \
-                 so crash safety depends on the checkpoint barrier fsyncing the data \
-                 device before reclaiming the redo — a guarantee strict durability does \
-                 not provide."
+                 engine buffers its data writes and depends on the checkpoint barrier \
+                 fsyncing the data device before reclaiming the redo — a guarantee \
+                 strict durability does not provide."
                     .to_string(),
             );
         }

@@ -213,16 +213,15 @@ pub struct Engine {
     /// (`config.is_clustered() || replication_factor > 1`). Set once at boot via
     /// [`Self::set_clustered`]; defaults to `false` (standalone).
     ///
-    /// Governs the segment engine's relocate durability model. When `false`
-    /// (standalone), a spend relocate journals a THIN index-only
-    /// [`crate::redo::RedoOp::Relocate`] AFTER the buffered data write and relies
-    /// on the checkpoint barrier for crash safety. When `true` (clustered), the
-    /// relocate is reordered WAL-first and journals a FAT, self-sufficient
-    /// [`crate::redo::RedoOp::RelocateV2`] (carrying the record image) through the
-    /// group-commit coordinator — one coalesced redo fsync restores the exact
-    /// in-place spend durability contract (fsync-durable-or-replicated before ack)
-    /// that clustered replication requires, while the data device stays buffered.
-    /// See `specs/SEGMENT_CLUSTERING_DESIGN.md` §7.1 (Option A).
+    /// Governs the segment engine's spend redo. When `false` (standalone), a spend
+    /// relocate journals a THIN index-only [`crate::redo::RedoOp::Relocate`] for
+    /// recovery. When `true` (clustered), the relocate journals NOTHING — the
+    /// authoritative redo is the convertible per-vout [`crate::redo::RedoOp::SpendV2`]
+    /// emitted WAL-first by the caller (dispatch on the master,
+    /// `build_post_apply_redo_op` on the replica): it is replication-convertible AND
+    /// self-sufficient for local recovery (it replays the spend in place against the
+    /// durable, append-only pre-spend record). See
+    /// `specs/SEGMENT_CLUSTERING_DESIGN.md`.
     clustered: std::sync::atomic::AtomicBool,
     /// One shared redo backpressure coordinator across all per-store logs,
     /// built and injected in [`Self::set_redo_logs`]. The dispatch gate
@@ -622,10 +621,9 @@ impl Engine {
 
     /// Declare whether this node runs clustered / replicated. Call once at boot
     /// (after [`Self::set_redo_logs`]) with `config.is_clustered() ||
-    /// replication_factor > 1`. Switches the segment engine's spend relocate to
-    /// the WAL-first, group-committed, fat-[`crate::redo::RedoOp::RelocateV2`]
-    /// durability model (see [`Self::clustered`] field docs and the relocate
-    /// primitive [`Self::relocate_record`]).
+    /// replication_factor > 1`. Switches the segment engine's spend redo to the
+    /// convertible [`crate::redo::RedoOp::SpendV2`] model (relocate journals
+    /// nothing) — see [`Self::clustered`] field docs and [`Self::relocate_record`].
     pub fn set_clustered(&self, clustered: bool) {
         self.clustered
             .store(clustered, std::sync::atomic::Ordering::Release);
@@ -3334,18 +3332,16 @@ impl Engine {
         if log_structured {
             // Segment (log-structured) engine: RELOCATE — append the full record
             // (spent slot + updated metadata baked in) at a fresh append-cursor
-            // offset, re-point the index, and journal the relocation (fat
-            // `RelocateV2` when clustered, thin `Relocate` otherwise), dead-marking
-            // the old extent. This mirrors the batch spend path
-            // (`PreparedSpend::apply_locked`) exactly and reuses the same
-            // packed-safe primitive, so the SOLE production caller of this
-            // single-spend entry point — the replica apply path
-            // (`receiver.rs::apply_op` → `ReplicaOp::Spend`) — physically mirrors
-            // the master (relocate-on-spend). `relocate_record` re-points the index
-            // in full (identically to recovery), so NO `sync_index_cache` follows.
-            // The relocate redo is journaled INSIDE `relocate_record`; the replica
-            // therefore adds NO post-apply redo for a log-structured Spend (see
-            // `build_post_apply_redo_op`), avoiding a double-journal.
+            // offset, re-point the index, and (STANDALONE only) journal a thin
+            // `Relocate`, dead-marking the old extent. This mirrors the batch spend
+            // path (`PreparedSpend::apply_locked`) and reuses the same packed-safe
+            // primitive, so the SOLE production caller of this single-spend entry
+            // point — the replica apply path (`receiver.rs::apply_op` →
+            // `ReplicaOp::Spend`) — physically mirrors the master. `relocate_record`
+            // re-points the index in full (identically to recovery), so NO
+            // `sync_index_cache` follows. On a CLUSTERED node the relocate journals
+            // nothing; the replica's `build_post_apply_redo_op` emits the
+            // authoritative, convertible `SpendV2` after this.
             self.relocate_record(device_id, &req.tx_key, &metadata, &[(req.offset, new_slot)])?;
         } else {
             // In-place RMW. R-004: propagate the write error rather than
@@ -8349,16 +8345,17 @@ impl PreparedSpend {
         // 9. Persist the mutation.
         if log_structured {
             // Segment engine: append the full record (spent slots + updated
-            // metadata baked in) at a fresh cursor offset, re-point the index,
-            // journal a buffered `Relocate`, and dead-mark the old extent — all
-            // under the stripe lock the caller holds. `relocate_record` sets the
-            // index entry in full (identically to recovery), so NO subsequent
-            // `sync_index_cache` is needed (or wanted — it would update the old
-            // key's cached fields without moving the offset). The Relocate redo
-            // is journaled here, AFTER the WAL-first flush of this RPC, which is
-            // why the segment engine requires BUFFERED durability (enforced at
-            // boot): image + redo + dead-mark become durable together at the
-            // checkpoint barrier; a crash before it keeps the old record intact.
+            // metadata baked in) at a fresh cursor offset, re-point the index, and
+            // dead-mark the old extent — all under the stripe lock the caller holds.
+            // `relocate_record` sets the index entry in full (identically to
+            // recovery), so NO subsequent `sync_index_cache` is needed (or wanted —
+            // it would update the old key's cached fields without moving the
+            // offset). The spend's redo differs by node role: STANDALONE journals a
+            // thin buffered `Relocate` inside `relocate_record` (crash safety = the
+            // checkpoint barrier, which is why segment requires BUFFERED durability);
+            // CLUSTERED journals nothing here — the WAL-first `SpendV2` emitted in
+            // dispatch Phase 3 (already fsync-ordered before this apply) is the
+            // authoritative, convertible redo.
             engine.relocate_record(device_id, &tx_key, &metadata, &valid_spends)?;
         } else {
             // In-place RMW: targeted spend footer when direct, full otherwise.
@@ -11026,7 +11023,7 @@ mod tests {
         // Attach a redo log and declare clustered. A clustered relocate must
         // journal NOTHING itself — the spend's convertible per-vout SpendV2
         // (emitted by the dispatch / replica caller) is the authoritative redo, so
-        // `relocate_record` neither writes a thin Relocate nor a fat RelocateV2.
+        // `relocate_record` writes no relocate redo at all.
         let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
         engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
@@ -11050,15 +11047,14 @@ mod tests {
         assert_eq!(entry.record_offset, new_offset);
         assert_eq!(entry.generation, 9);
 
-        // But it journaled NOTHING for this key — no Relocate, no RelocateV2.
+        // But it journaled NOTHING for this key — no relocate redo at all.
         engine.flush_all_redo().unwrap();
         let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
         let entries = log2.recover().unwrap();
         assert!(
             !entries.iter().any(|e| matches!(
                 &e.op,
-                RedoOp::Relocate { tx_key, .. } | RedoOp::RelocateV2 { tx_key, .. }
-                    if *tx_key == key
+                RedoOp::Relocate { tx_key, .. } if *tx_key == key
             )),
             "clustered relocate must journal no relocate redo — SpendV2 is the redo"
         );
@@ -11145,12 +11141,6 @@ mod tests {
                     if *tx_key == key && *record_offset == new_offset
             )),
             "standalone relocate must journal a thin Relocate"
-        );
-        assert!(
-            !entries
-                .iter()
-                .any(|e| matches!(&e.op, RedoOp::RelocateV2 { tx_key, .. } if *tx_key == key)),
-            "standalone relocate must NOT journal the fat RelocateV2"
         );
     }
 

@@ -2897,9 +2897,9 @@ mod tests {
             .unwrap();
         }
 
-        // Every journaled SpendV2 for this key carries the BAKED master generation,
-        // and NO RelocateV2 (which would have carried the pre-bake generation) was
-        // journaled — so a crash-replay reconstructs generation == master's.
+        // Every journaled SpendV2 for this key carries the BAKED master generation
+        // (the relocate move journals nothing), so a crash-replay reconstructs
+        // generation == master's — no stale relocate op resurrecting a wrong gen.
         engine.flush_all_redo().unwrap();
         let entries = engine.redo_log().unwrap().lock().recover().unwrap();
         let mut spendv2_count = 0;
@@ -2916,9 +2916,7 @@ mod tests {
                     );
                     spendv2_count += 1;
                 }
-                RedoOp::Relocate { tx_key, .. } | RedoOp::RelocateV2 { tx_key, .. }
-                    if *tx_key == k =>
-                {
+                RedoOp::Relocate { tx_key, .. } if *tx_key == k => {
                     panic!("clustered segment replica must not journal a relocate redo");
                 }
                 _ => {}
