@@ -4923,14 +4923,21 @@ fn handle_spend_batch(
             prepared.transitions().iter().map(|(off, _)| *off).collect();
 
         // Segment (log-structured) store: the spend RELOCATES the record, and
-        // `PreparedSpend::apply_locked` journals a single `RedoOp::Relocate` for
-        // the whole group at apply time (buffered, carrying the new append-cursor
-        // offset that is only known once allocated). So this store must NOT also
-        // emit the in-place per-slot `SpendV2` WAL-first redo — replaying a
-        // `SpendV2` against a relocated record would RMW the stale (now-dead)
-        // offset. Replication is likewise skipped: the segment engine is
-        // non-clustered in v1 (`validate_cluster_safety`), so there are no
-        // replicas to feed. The in-place store keeps the exact prior behaviour.
+        // `PreparedSpend::apply_locked` journals a `Relocate` / (clustered)
+        // `RelocateV2` for the whole group at apply time (the new append-cursor
+        // offset is only known once allocated). So this store must NOT also emit
+        // the in-place per-slot `SpendV2` WAL-first redo — replaying a `SpendV2`
+        // against a relocated record would RMW the stale (now-dead) offset.
+        //
+        // Replication, HOWEVER, IS emitted for the segment engine (Phase 1 of
+        // specs/SEGMENT_CLUSTERING_DESIGN.md): `ReplicaOp::Spend` is LOGICAL
+        // (tx_key + vout + spending_data + master_generation, no offset), so it is
+        // engine-agnostic — the replica applies it through its own `engine.spend()`
+        // and allocates its own offset. Only the physical local redo (`SpendV2`)
+        // is engine-specific and stays in-place-only. Building the replica op on a
+        // standalone segment node is harmless (it is only shipped when replication
+        // is active), and mirrors the in-place path, which also builds it
+        // unconditionally on a real transition.
         let log_structured = engine.store_is_log_structured(prepared.device_id);
 
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
@@ -4955,15 +4962,15 @@ fn handle_spend_batch(
                         // rebuild a CRC-failing spent slot from this intent.
                         utxo_hash: Some(item.utxo_hash),
                     });
-                    key_repl_ops.push(ReplicaOp::Spend {
-                        tx_key: key,
-                        offset: item.vout,
-                        spending_data: item.spending_data,
-                        current_block_height: params.current_block_height,
-                        block_height_retention: params.block_height_retention,
-                        master_generation: post_generation,
-                    });
                 }
+                key_repl_ops.push(ReplicaOp::Spend {
+                    tx_key: key,
+                    offset: item.vout,
+                    spending_data: item.spending_data,
+                    current_block_height: params.current_block_height,
+                    block_height_retention: params.block_height_retention,
+                    master_generation: post_generation,
+                });
             }
         }
 

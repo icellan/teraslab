@@ -25,7 +25,9 @@ use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::{WireCreateItem, encode_create_batch};
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
+use teraslab::redo::RedoLog;
 use teraslab::replication::manager::AckPolicy;
+use teraslab::segment_allocator::SegmentAllocator;
 use teraslab::server::Server;
 
 #[allow(dead_code)]
@@ -105,6 +107,32 @@ fn create_node_with_replication_runtime(
     )
 }
 
+/// A clustered node running the log-structured SEGMENT engine (Phase 5/6).
+fn create_segment_node(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+) -> TestNode {
+    create_node_full_engine(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        ReplicationRuntimeConfig {
+            ack_policy: None,
+            best_effort: true,
+            timeout: Duration::from_secs(3),
+            timeout_during_migration: Duration::from_secs(30),
+        },
+        TEST_CLUSTER_ID,
+        4,
+        true,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_node_full(
     node_id: u64,
@@ -115,6 +143,34 @@ fn create_node_full(
     replication: ReplicationRuntimeConfig,
     cluster_id: ClusterId,
     migration_pool_size: usize,
+) -> TestNode {
+    create_node_full_engine(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        replication,
+        cluster_id,
+        migration_pool_size,
+        false,
+    )
+}
+
+/// Like [`create_node_full`] but selects the storage engine. `segment == true`
+/// builds a clustered log-structured node (redo log attached, buffered
+/// durability, `set_clustered`) — the shape a clustered segment node runs.
+#[allow(clippy::too_many_arguments)]
+fn create_node_full_engine(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+    replication: ReplicationRuntimeConfig,
+    cluster_id: ClusterId,
+    migration_pool_size: usize,
+    segment: bool,
 ) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
@@ -132,16 +188,35 @@ fn create_node_full(
     };
 
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
-    let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1000).unwrap();
-    let engine = Arc::new(Engine::new(
-        dev,
-        index,
-        alloc,
-        StripedLocks::new(256),
-        DahIndex::new(),
-        UnminedIndex::new(),
-    ));
+    let engine = if segment {
+        let seg = SegmentAllocator::new(dev.clone(), 64 * 4096).unwrap();
+        let engine = Engine::new(
+            dev,
+            index,
+            seg,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev, 0, 16 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        engine.set_buffered_durability(true);
+        engine.set_clustered(true);
+        Arc::new(engine)
+    } else {
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    };
 
     let seeds: Vec<std::net::SocketAddr> = seed_swim_ports
         .iter()
@@ -914,6 +989,90 @@ fn migrate_shard_with_records_to_new_node() {
         .unwrap();
 
     // Ping to verify connectivity
+    let resp = send_request(
+        &mut stream2,
+        &RequestFrame {
+            request_id: 99,
+            op_code: OP_PING,
+            flags: 0,
+            payload: vec![].into(),
+        },
+    );
+    assert_eq!(resp.status, STATUS_OK);
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+}
+
+/// Phase 4/6 (specs/SEGMENT_CLUSTERING_DESIGN.md): a full multi-node cluster
+/// running the log-structured SEGMENT engine discovers peers over SWIM, commits
+/// a 2-node topology, and migrates shards (with records) to a joining segment
+/// node — the real coordinator + migration path, end to end, on segment.
+#[test]
+fn segment_cluster_migrates_shard_with_records_to_new_node() {
+    // Single segment node, RF=1 (writes land on node1 alone before node2 joins).
+    let node1 = create_segment_node(361, 13560, 13561, &[], 1);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Create 100 records on the segment node.
+    let records: Vec<_> = (0..100u32)
+        .map(|i| (make_txid(i + 30000), make_txid(i + 40000)))
+        .collect();
+    for chunk in records.chunks(10) {
+        let payload = encode_multi_create_payload(chunk);
+        let resp = send_request(
+            &mut stream,
+            &RequestFrame {
+                request_id: 1,
+                op_code: OP_CREATE_BATCH,
+                flags: 0,
+                payload: payload.into(),
+            },
+        );
+        assert!(
+            resp.status == STATUS_OK || resp.status == STATUS_PARTIAL_ERROR,
+            "segment create should succeed, got status {}",
+            resp.status
+        );
+    }
+
+    // A second SEGMENT node joins → SWIM discovery + rebalance + migration.
+    let node2 = create_segment_node(362, 13562, 13563, &[13561], 1);
+
+    wait_until(
+        || node2.cluster.committed_topology_members().len() == 2,
+        Duration::from_secs(5),
+    )
+    .expect("2-node segment topology should commit on node2 after it joins");
+
+    // The rebalance moves shards to node2. Wait for the shard table to reflect
+    // node2 ownership (the rebalance/migration runs async after the topology
+    // commits; a bare read races it under parallel-test CPU load).
+    wait_until(
+        || {
+            node2
+                .cluster
+                .shard_table()
+                .read()
+                .shard_counts()
+                .get(&NodeId(362))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        },
+        Duration::from_secs(10),
+    )
+    .expect("joining segment node must own shards after rebalance");
+
+    // node2 is reachable and serving.
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
+    stream2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let resp = send_request(
         &mut stream2,
         &RequestFrame {

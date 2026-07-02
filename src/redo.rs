@@ -528,6 +528,9 @@ const OP_CREATE_V2: u8 = 39;
 /// relocate never needs op-based replication conversion (a logical spend op
 /// would; design §0.x). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
 const OP_RELOCATE: u8 = 40;
+/// Self-sufficient (fat) relocation carrying the record image — clustered
+/// segment engine. See [`RedoOp::RelocateV2`].
+const OP_RELOCATE_V2: u8 = 41;
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `Create` redo entry. Bitcoin transactions in practice rarely have
@@ -764,6 +767,38 @@ pub enum RedoOp {
         record_offset: u64,
         /// Number of UTXO slots in the record.
         utxo_count: u32,
+    },
+    /// Self-sufficient record relocation (clustered segment engine): like
+    /// [`RedoOp::Relocate`], but carries the FULL relocated record image so the
+    /// redo is durable-on-its-own — recovery re-writes `record_bytes` at
+    /// `record_offset` rather than reading the (possibly-not-yet-flushed) device
+    /// back. This is the fat sibling of `Relocate` exactly as [`RedoOp::Create`]
+    /// is the fat sibling of [`RedoOp::CreateV2`].
+    ///
+    /// Emitted only when the store is clustered: a clustered segment spend must
+    /// be WAL-first (fsynced before the `ReplicaOp` ships and before the client
+    /// ack), and the buffered data write to `record_offset` may not be durable
+    /// at that point — so the image rides in the redo. A standalone segment
+    /// store keeps the thin index-only `Relocate` + checkpoint-only durability
+    /// (unchanged, maximally fast). See `specs/SEGMENT_CLUSTERING_DESIGN.md` §7.1.
+    ///
+    /// Wire layout (after the type byte): `tx_key[32] | device_id[1] |
+    /// record_offset[8 LE] | utxo_count[4 LE] | record_len[4 LE] |
+    /// record_bytes[record_len]`.
+    RelocateV2 {
+        /// Primary key of the relocated transaction.
+        tx_key: TxKey,
+        /// Store the record lives on (unchanged by relocation — within a store).
+        device_id: u8,
+        /// NEW device byte offset where the record now starts.
+        record_offset: u64,
+        /// Number of UTXO slots in the record.
+        utxo_count: u32,
+        /// The exact bytes the engine wrote at `record_offset` (metadata +
+        /// slots + inline cold data). `Arc<[u8]>` so cloning the op on the
+        /// journaling path is a refcount bump, not a copy — mirroring
+        /// [`RedoOp::Create`].
+        record_bytes: Arc<[u8]>,
     },
     Delete {
         tx_key: TxKey,
@@ -1061,6 +1096,7 @@ impl RedoOp {
             RedoOp::Create { .. } => OP_CREATE,
             RedoOp::CreateV2 { .. } => OP_CREATE_V2,
             RedoOp::Relocate { .. } => OP_RELOCATE,
+            RedoOp::RelocateV2 { .. } => OP_RELOCATE_V2,
             RedoOp::Delete { .. } => OP_DELETE,
             RedoOp::SetConflicting { .. } => OP_SET_CONFLICTING,
             RedoOp::AppendConflictingChild { .. } => OP_APPEND_CONFLICTING_CHILD,
@@ -1106,6 +1142,7 @@ impl RedoOp {
             | RedoOp::Create { tx_key, .. }
             | RedoOp::CreateV2 { tx_key, .. }
             | RedoOp::Relocate { tx_key, .. }
+            | RedoOp::RelocateV2 { tx_key, .. }
             | RedoOp::Delete { tx_key, .. }
             | RedoOp::SetConflicting { tx_key, .. }
             | RedoOp::SetLocked { tx_key, .. }
@@ -1183,6 +1220,7 @@ impl RedoOp {
             | RedoOp::Create { .. }
             | RedoOp::CreateV2 { .. }
             | RedoOp::Relocate { .. }
+            | RedoOp::RelocateV2 { .. }
             | RedoOp::Delete { .. }
             | RedoOp::AppendConflictingChild { .. }
             | RedoOp::RemoveConflictingChild { .. }
@@ -1238,6 +1276,7 @@ impl RedoOp {
                 32 + 1 + 8 + 4 + 1 + 2 + parent_txids.len() * 32
             }
             RedoOp::Relocate { .. } => 32 + 1 + 8 + 4,
+            RedoOp::RelocateV2 { record_bytes, .. } => 32 + 1 + 8 + 4 + 4 + record_bytes.len(),
             RedoOp::Delete { .. } => 32 + 8 + 8,
             RedoOp::SetConflicting { .. } => 32 + 1 + 4 + 4,
             RedoOp::AppendConflictingChild { .. }
@@ -1470,6 +1509,21 @@ impl RedoOp {
                 buf.push(*device_id);
                 buf.extend_from_slice(&record_offset.to_le_bytes());
                 buf.extend_from_slice(&utxo_count.to_le_bytes());
+            }
+            RedoOp::RelocateV2 {
+                tx_key,
+                device_id,
+                record_offset,
+                utxo_count,
+                record_bytes,
+            } => {
+                buf.extend_from_slice(&tx_key.txid);
+                buf.push(*device_id);
+                buf.extend_from_slice(&record_offset.to_le_bytes());
+                buf.extend_from_slice(&utxo_count.to_le_bytes());
+                let record_len = record_bytes.len() as u32;
+                buf.extend_from_slice(&record_len.to_le_bytes());
+                buf.extend_from_slice(record_bytes);
             }
             RedoOp::Delete {
                 tx_key,
@@ -1954,6 +2008,33 @@ impl RedoOp {
                     device_id: data[32],
                     record_offset: u64::from_le_bytes(data[33..41].try_into().unwrap()),
                     utxo_count: u32::from_le_bytes(data[41..45].try_into().unwrap()),
+                })
+            }
+            OP_RELOCATE_V2 if data.len() >= 49 => {
+                // Layout: tx_key(32) + device_id(1) + record_offset(8)
+                //       + utxo_count(4) + record_len(4) + record_bytes(N)
+                let mut txid = [0u8; 32];
+                txid.copy_from_slice(&data[..32]);
+                let device_id = data[32];
+                let record_offset = u64::from_le_bytes(data[33..41].try_into().unwrap());
+                let utxo_count = u32::from_le_bytes(data[41..45].try_into().unwrap());
+                let record_len = u32::from_le_bytes(data[45..49].try_into().unwrap()) as usize;
+                // F-G4-006: cap `record_len` (same bound as OP_CREATE) so a
+                // corrupt-but-CRC-valid entry cannot inflate startup memory.
+                if record_len > MAX_CREATE_RECORD_BYTES {
+                    return None;
+                }
+                let record_end = 49usize.checked_add(record_len)?;
+                if data.len() < record_end {
+                    return None;
+                }
+                let record_bytes: Arc<[u8]> = Arc::from(&data[49..record_end]);
+                Some(RedoOp::RelocateV2 {
+                    tx_key: TxKey { txid },
+                    device_id,
+                    record_offset,
+                    utxo_count,
+                    record_bytes,
                 })
             }
             OP_DELETE if data.len() >= 48 => {
@@ -6615,6 +6696,40 @@ mod tests {
         assert_eq!(op.op_type(), OP_RELOCATE);
         assert_ne!(op.op_type(), OP_CREATE_V2);
         assert_round_trip(op);
+    }
+
+    /// Clustered segment engine: the fat, self-sufficient relocation op
+    /// round-trips through the full redo-entry path (serialize + CRC + length
+    /// framing → deserialize), carries its own opcode, and reports the correct
+    /// footprint via `serialized_data_len` (used by the backpressure `would_fit`
+    /// pre-flight). A non-empty and an empty record image are both exercised.
+    #[test]
+    fn round_trip_relocate_v2() {
+        let record: Vec<u8> = (0..1400u32).map(|i| (i % 251) as u8).collect();
+        let op = RedoOp::RelocateV2 {
+            tx_key: make_txid(0x97),
+            device_id: 3,
+            record_offset: 0x0000_1234_5678_9AB0,
+            utxo_count: 42,
+            record_bytes: Arc::from(record.as_slice()),
+        };
+        assert_eq!(op.op_type(), OP_RELOCATE_V2);
+        assert_ne!(op.op_type(), OP_RELOCATE);
+        // Footprint = tx_key(32)+device_id(1)+offset(8)+utxo_count(4)
+        //           + record_len(4) + record_bytes(1400)
+        assert_eq!(op.serialized_data_len(), 32 + 1 + 8 + 4 + 4 + 1400);
+        assert_round_trip(op);
+
+        // Empty image (a zero-utxo record) still round-trips.
+        let empty = RedoOp::RelocateV2 {
+            tx_key: make_txid(0x98),
+            device_id: 0,
+            record_offset: 4096,
+            utxo_count: 0,
+            record_bytes: Arc::from([].as_slice()),
+        };
+        assert_eq!(empty.serialized_data_len(), 32 + 1 + 8 + 4 + 4);
+        assert_round_trip(empty);
     }
 
     /// PERF: `RedoOp::Create.record_bytes` was changed from `Vec<u8>` to

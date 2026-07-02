@@ -1390,6 +1390,12 @@ fn main() {
     // migration suppression read via `engine.redo_log()`).
     if let Some(ref logs) = redo_logs_arc {
         engine.set_redo_logs(logs.clone());
+        // Declare clustered/replicated mode so the segment engine's spend
+        // relocate switches to the WAL-first, group-committed, fat-RelocateV2
+        // durability model (specs/SEGMENT_CLUSTERING_DESIGN.md §7.1). Standalone
+        // nodes keep the thin index-only Relocate + checkpoint-only durability.
+        // Must follow set_redo_logs so the committers exist for the fat path.
+        engine.set_clustered(config.is_clustered() || config.replication_factor > 1);
         // Apply buffered (relaxed) redo durability if configured. Must follow
         // set_redo_logs so the per-store group-commit coordinators exist.
         // `redo_buffered_io` implies buffered durability (see

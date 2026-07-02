@@ -1549,31 +1549,28 @@ impl ServerConfig {
     /// — the runtime signal emitted when RF > 1 best-effort is *not* in use
     /// but individual best-effort paths fall back because replicas ACK-failed.
     pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
-        // The log-structured segment engine is NON-CLUSTERED in v1: its spends
-        // relocate the record (a physical move) rather than journaling a logical
-        // op, so the redo entries cannot be converted to replica ops. Refuse to
-        // start a clustered / replicated node on the segment engine rather than
-        // silently dropping replication. (See increment 4 / the design doc.)
-        if self.storage.engine == StorageEngine::Segment
-            && (self.is_clustered() || self.replication_factor > 1)
-        {
-            return Err(format!(
-                "storage.engine = \"segment\" is not supported with clustering \
-                 (node_id = {}, replication_factor = {}): the log-structured engine \
-                 is non-clustered in v1. Use storage.engine = \"in_place\" for clustered \
-                 nodes, or run this node standalone (node_id = 0, replication_factor = 1).",
-                self.node_id, self.replication_factor,
-            ));
-        }
-        // The segment engine's spend journals its `Relocate` intent AFTER writing
-        // the relocated record (not WAL-first): the new append-cursor offset is
-        // only known once allocated during apply. Crash safety therefore relies on
-        // BUFFERED durability — the checkpoint barrier fsyncs every store's data
-        // device before reclaiming any redo prefix, so the relocated image, its
-        // `Relocate` redo, and the old-extent dead-mark become durable together (a
-        // crash before the barrier loses all three and leaves the pre-relocation
-        // record intact). Under STRICT durability that ordering is not guaranteed,
-        // so refuse to start rather than silently weaken the crash contract.
+        // The log-structured segment engine is CLUSTERABLE as of the segment
+        // clustering work (specs/SEGMENT_CLUSTERING_DESIGN.md). Replication is
+        // LOGICAL — the master ships a vout-based `ReplicaOp::Spend` (no offset)
+        // that the replica applies through its own `engine.spend()`, relocating to
+        // its own offset (Phases 1–2). Crash safety uses the fat, self-sufficient
+        // `RedoOp::RelocateV2` journaled WAL-first through the group-commit
+        // coordinator (Phase 3 / Option A), so the redo reconstructs the relocated
+        // image on replay without depending on the data device being flushed
+        // first. Durability under the (required) buffered mode below is the SAME
+        // as the in-place clustered default: replication quorum before ack, plus
+        // failover + rejoin-resync healing a crashed master's un-flushed tail. The
+        // former blanket refusal is therefore removed.
+        //
+        // The segment engine still requires BUFFERED redo durability. STANDALONE,
+        // the relocate journals its thin `Relocate` intent AFTER writing the
+        // relocated record (the new append-cursor offset is only known once
+        // allocated), so crash safety relies on the checkpoint barrier — which
+        // fsyncs every store's data device before reclaiming any redo prefix — to
+        // make the relocated image, its redo, and the old-extent dead-mark durable
+        // together. CLUSTERED inherits the same buffered mode (quorum-based
+        // durability). Strict durability does not provide that ordering, so refuse
+        // to start rather than silently weaken the crash contract.
         if self.storage.engine == StorageEngine::Segment && !self.redo_buffered_effective() {
             return Err(
                 "storage.engine = \"segment\" requires buffered redo durability: set \
@@ -2304,7 +2301,8 @@ backend = ""
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
-        // node_id>0 is clustered → in_place (segment is standalone-only).
+        // Pin in_place so this test isolates the ack_policy/degraded-mode rules
+        // from the engine-specific buffered-durability requirement.
         cfg.storage.engine = StorageEngine::InPlace;
 
         cfg.validate_cluster_safety()
@@ -2471,19 +2469,42 @@ backend = ""
     }
 
     #[test]
-    fn segment_engine_rejected_with_clustering() {
-        // node_id > 0 → clustered → segment engine must be refused.
+    fn segment_engine_allowed_with_clustering_when_buffered() {
+        // Phase 5 (specs/SEGMENT_CLUSTERING_DESIGN.md): the segment engine now
+        // clusters. node_id > 0 → clustered; with buffered durability (the
+        // default) the config validates — replication is logical and crash safety
+        // uses the WAL-first fat RelocateV2.
         let mut cfg = ServerConfig {
             node_id: 1,
+            replication_factor: 3,
             ..ServerConfig::default()
         };
         cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = true;
+        assert!(cfg.is_clustered(), "node_id > 0 must be clustered");
+        cfg.validate_cluster_safety()
+            .expect("clustered segment engine must validate under buffered durability");
+    }
+
+    #[test]
+    fn segment_engine_clustered_still_requires_buffered_durability() {
+        // Even clustered, the segment engine requires buffered durability (the
+        // standalone relocate is post-write; the clustered rejoin-resync story
+        // assumes the checkpoint barrier). Strict + clustered segment → refused.
+        let mut cfg = ServerConfig {
+            node_id: 1,
+            replication_factor: 3,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = false;
+        cfg.redo_buffered_io = false;
         let err = cfg
             .validate_cluster_safety()
-            .expect_err("segment engine on a clustered node must be refused");
+            .expect_err("strict + clustered segment must be refused");
         assert!(
-            err.contains("segment") && err.contains("clustering"),
-            "error must explain the conflict: {err}",
+            err.contains("segment") && err.contains("buffered"),
+            "error must explain the buffered requirement: {err}",
         );
     }
 

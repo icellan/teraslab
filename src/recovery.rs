@@ -995,6 +995,31 @@ fn replay_one_recovery_entry(
                 )
             }
         }
+        RedoOp::RelocateV2 {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+            record_bytes,
+        } => {
+            let range_len = TxMetadata::record_size_for(*utxo_count);
+            if let Some(alloc) = allocator.as_deref()
+                && !alloc.is_allocated_range(*record_offset, range_len)
+            {
+                ReplayResult::Failed(ReplayCause::LogicError)
+            } else {
+                replay_relocate_v2(
+                    device,
+                    *device_id,
+                    index,
+                    offset_owners,
+                    tx_key,
+                    *record_offset,
+                    *utxo_count,
+                    record_bytes,
+                )
+            }
+        }
         RedoOp::CompensateUnsetMined {
             tx_key,
             block_id,
@@ -1731,6 +1756,22 @@ fn replay_entry(
             tx_key,
             *record_offset,
             *utxo_count,
+        ),
+        RedoOp::RelocateV2 {
+            tx_key,
+            device_id,
+            record_offset,
+            utxo_count,
+            record_bytes,
+        } => replay_relocate_v2(
+            device,
+            *device_id,
+            index,
+            offset_owners,
+            tx_key,
+            *record_offset,
+            *utxo_count,
+            record_bytes,
         ),
         RedoOp::Delete {
             tx_key,
@@ -2884,6 +2925,65 @@ fn replay_relocate(
     };
     if { meta.tx_id } != tx_key.txid || { meta.utxo_count } != utxo_count {
         return ReplayResult::Skipped;
+    }
+    let entry = TxIndexEntry {
+        device_id,
+        record_offset,
+        utxo_count,
+        block_entry_count: meta.block_entry_count,
+        tx_flags: meta.flags.bits(),
+        spent_utxos: { meta.spent_utxos },
+        dah_or_preserve: { meta.delete_at_height },
+        unmined_since: { meta.unmined_since },
+        generation: { meta.generation },
+    };
+    if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
+        return ReplayResult::Failed(ReplayCause::LogicError);
+    }
+    ReplayResult::Applied
+}
+
+/// Replay a self-sufficient relocation ([`RedoOp::RelocateV2`]) — clustered
+/// segment engine. Unlike [`replay_relocate`] (which reads the relocated record
+/// back from the device), the record image rides in the redo, so this WRITES
+/// `record_bytes` at `record_offset` (exactly like [`replay_create`]) and then
+/// registers / re-points the index. That makes the op durable on its own: a
+/// crash that lost the buffered data write to `record_offset` is fully repaired
+/// from the redo. It therefore also does NOT require the key to be pre-indexed —
+/// a `RelocateV2` whose create was itself buffered-lost still reconstructs the
+/// complete record (create-or-repoint). A short/failed write or a metadata
+/// mismatch fails closed rather than registering an entry over incomplete bytes.
+#[allow(clippy::too_many_arguments)]
+fn replay_relocate_v2(
+    device: &dyn BlockDevice,
+    device_id: u8,
+    index: &ShardedIndex,
+    offset_owners: &mut OffsetOwners,
+    tx_key: &TxKey,
+    record_offset: u64,
+    utxo_count: u32,
+    record_bytes: &[u8],
+) -> ReplayResult {
+    use crate::device::AlignedBuf;
+
+    if record_bytes.len() < crate::record::METADATA_SIZE {
+        return ReplayResult::Failed(ReplayCause::CorruptEntry);
+    }
+    let align = device.alignment();
+    let aligned_len = record_bytes.len().div_ceil(align) * align;
+    let mut buf = AlignedBuf::new(aligned_len, align);
+    buf[..record_bytes.len()].copy_from_slice(record_bytes);
+    if let Err(_e) = device.pwrite_all_at(&buf, record_offset) {
+        return ReplayResult::Failed(ReplayCause::MissingRecordBytes);
+    }
+    // Verify-after-write: read the metadata back to populate the cached index
+    // fields and confirm the bytes landed for THIS transaction.
+    let meta = match crate::io::read_metadata(device, record_offset) {
+        Ok(m) => m,
+        Err(_) => return ReplayResult::Failed(ReplayCause::MissingRecordBytes),
+    };
+    if { meta.utxo_count } != utxo_count || { meta.tx_id } != tx_key.txid {
+        return ReplayResult::Failed(ReplayCause::CorruptEntry);
     }
     let entry = TxIndexEntry {
         device_id,
@@ -5023,6 +5123,82 @@ mod tests {
             "cached fields come from the relocated record"
         );
         assert_eq!(ie.spent_utxos, 1);
+    }
+
+    /// Clustered segment engine: `RedoOp::RelocateV2` is SELF-SUFFICIENT — the
+    /// record image rides in the redo, so recovery reconstructs the record from
+    /// the redo ALONE, even when (a) the key was never durably indexed and (b)
+    /// the device offset was never written (the buffered data write was lost on
+    /// crash). This is the property that lets a clustered segment spend stay
+    /// buffered-fast on the data device yet WAL-first-durable via the redo.
+    #[test]
+    fn relocate_v2_replay_reconstructs_record_from_redo_alone() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x61;
+        let key = TxKey { txid };
+        let rec_size = TxMetadata::record_size_for(utxo_count);
+
+        // Build the relocated record IMAGE as raw bytes (generation 7, one
+        // output spent) on a scratch device — WITHOUT touching the recovery
+        // device. These bytes will ride in the redo.
+        let image: Vec<u8> = {
+            let scratch: Arc<dyn BlockDevice> =
+                Arc::new(crate::device::MemoryDevice::new(1 << 20, 4096).unwrap());
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.generation = 7;
+            meta.spent_utxos = 1;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    let mut hh = [0u8; 32];
+                    hh[0] = i as u8;
+                    UtxoSlot::new_unspent(hh)
+                })
+                .collect();
+            io::write_full_record(&*scratch, 0, &meta, &slots).unwrap();
+            let aligned = (rec_size as usize).div_ceil(4096) * 4096;
+            let mut buf = crate::device::AlignedBuf::new(aligned, 4096);
+            scratch.pread_exact_at(&mut buf, 0).unwrap();
+            buf[..rec_size as usize].to_vec()
+        };
+
+        // A fresh append-cursor offset that is NEVER written to the device.
+        let off = h.alloc.allocate(rec_size).unwrap();
+
+        // The key is deliberately NOT pre-indexed and off is NOT pre-written.
+        assert!(h.index.lookup(&key).is_none());
+
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::RelocateV2 {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off,
+            utxo_count,
+            record_bytes: Arc::from(image.as_slice()),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1, "the RelocateV2 must replay");
+
+        // Index registered from the redo-carried image.
+        let ie = h
+            .index
+            .lookup(&key)
+            .expect("RelocateV2 must reconstruct the index entry from the redo alone");
+        assert_eq!(ie.record_offset, off);
+        assert_eq!(ie.generation, 7, "cached fields come from the redo image");
+        assert_eq!(ie.spent_utxos, 1);
+
+        // The record bytes were WRITTEN to the device from the redo (proving
+        // self-sufficiency: the offset was never written before recovery).
+        let m = io::read_metadata(&*h.data_dev, off)
+            .expect("replay must have written the record image to the device");
+        assert_eq!({ m.tx_id }, txid);
+        assert_eq!({ m.generation }, 7);
+        assert_eq!({ m.spent_utxos }, 1);
     }
 
     /// A relocation of a tx that is NOT (durably) indexed is moot — recovery
