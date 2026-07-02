@@ -4923,22 +4923,32 @@ fn handle_spend_batch(
             prepared.transitions().iter().map(|(off, _)| *off).collect();
 
         // Segment (log-structured) store: the spend RELOCATES the record, and
-        // `PreparedSpend::apply_locked` journals a `Relocate` / (clustered)
-        // `RelocateV2` for the whole group at apply time (the new append-cursor
-        // offset is only known once allocated). So this store must NOT also emit
-        // the in-place per-slot `SpendV2` WAL-first redo — replaying a `SpendV2`
-        // against a relocated record would RMW the stale (now-dead) offset.
+        // `PreparedSpend::apply_locked` journals a `Relocate` (standalone) /
+        // `RelocateV2` (clustered) for the whole group at apply time (the new
+        // append-cursor offset is only known once allocated) — that is the
+        // AUTHORITATIVE local-recovery redo for the moved record.
         //
-        // Replication, HOWEVER, IS emitted for the segment engine (Phase 1 of
-        // specs/SEGMENT_CLUSTERING_DESIGN.md): `ReplicaOp::Spend` is LOGICAL
-        // (tx_key + vout + spending_data + master_generation, no offset), so it is
-        // engine-agnostic — the replica applies it through its own `engine.spend()`
-        // and allocates its own offset. Only the physical local redo (`SpendV2`)
-        // is engine-specific and stays in-place-only. Building the replica op on a
-        // standalone segment node is harmless (it is only shipped when replication
-        // is active), and mirrors the in-place path, which also builds it
-        // unconditionally on a real transition.
+        // For a CLUSTERED segment store we ALSO emit the per-vout `SpendV2` here,
+        // WAL-first in Phase 3, exactly like the in-place engine. `SpendV2` is the
+        // only redo op the replication machinery can convert to a `ReplicaOp`
+        // (`redo_entry_to_replica_op`), and it is what the durable replication
+        // intent tracker (`write_replicated_redo_ops`), the startup / lag catch-up,
+        // and the migration delta all read. Without it, a segment spend applied
+        // locally but not yet shipped (crash between apply and Phase-5 replicate)
+        // could never be re-driven — the only redo, `RelocateV2`, is physical and
+        // maps to `None` in the converter — leaving master SPENT / replica UNSPENT
+        // permanently (double-spend on failover). Emitting BOTH is safe: on replay
+        // the `SpendV2` applies the spend in place at the record's scanned offset,
+        // then the later-sequenced `RelocateV2` re-writes the authoritative image
+        // at the new offset and re-points the index; the two converge. `SpendV2`
+        // replay is idempotent (already-spent → Skipped) and recomputes the spent
+        // counter from the slots, so the double redo cannot double-count.
+        //
+        // STANDALONE segment (not clustered) emits NEITHER `SpendV2` nor a replica
+        // op — it has no replicas and relies solely on the thin `Relocate` for
+        // recovery (the shipped v0.8.0 behaviour, unchanged).
         let log_structured = engine.store_is_log_structured(prepared.device_id);
+        let emit_spend_v2 = !log_structured || engine.clustered();
 
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
@@ -4948,7 +4958,7 @@ fn handle_spend_batch(
                 // re-spends do not emit redo/replication or bump generation;
                 // they match the single-spend no-op contract.
                 running_count = running_count.wrapping_add(1);
-                if !log_structured {
+                if emit_spend_v2 {
                     out.redo_ops.push(RedoOp::SpendV2 {
                         tx_key: key,
                         offset: item.vout,
