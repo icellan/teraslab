@@ -1356,7 +1356,7 @@ impl Engine {
     /// The highest block height this node has durably observed (design §4).
     ///
     /// Served over the wire by `OP_GET_NODE_HEIGHT` and consumed by the GC
-    /// horizon ([`crate::cluster::coordinator::RunningCluster::min_member_finalized_height`])
+    /// horizon (`RunningCluster::min_member_finalized_height`)
     /// and the rejoin-eligibility gate. Monotone within a process; restored
     /// (and floored) across restarts by [`Self::restore_last_durable_height`].
     pub fn last_durable_height(&self) -> u32 {
@@ -1365,7 +1365,7 @@ impl Engine {
     }
 
     /// Attach the path of the tiny durable height file (design §4, height
-    /// subsystem). Mirrors [`Self::set_redo_log`] / [`Self::set_tombstone_log`]
+    /// subsystem). Mirrors [`Self::set_redo_log`] / `set_tombstone_log`
     /// so existing `Engine::new` call sites are untouched. Call once at
     /// startup, before [`Self::persist_last_durable_height`] is invoked by the
     /// checkpoint task. When unset, persistence is a no-op and recovery relies

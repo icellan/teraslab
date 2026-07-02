@@ -490,7 +490,7 @@ pub fn recover_all(
 ///
 /// This is the full-recovery entry point. When `allocator` is `Some`, every
 /// [`RedoOp::AllocateRegion`] and [`RedoOp::FreeRegion`] entry is applied
-/// via [`SlotAllocator::replay_redo`], which is idempotent. Callers that
+/// via `SlotAllocator::replay_redo`, which is idempotent. Callers that
 /// have already persisted the allocator snapshot may still call this — the
 /// idempotency check skips allocations already reflected in the snapshot.
 ///
@@ -498,7 +498,7 @@ pub fn recover_all(
 /// preserving redo log ordering.
 ///
 /// After a successful call, callers SHOULD invoke
-/// [`SlotAllocator::persist`] and then checkpoint/truncate the redo log so
+/// `SlotAllocator::persist` and then checkpoint/truncate the redo log so
 /// the next startup can skip replay.
 pub fn recover_all_with_allocator(
     device: &dyn BlockDevice,

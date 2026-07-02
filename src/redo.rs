@@ -2587,7 +2587,7 @@ impl RingState {
 /// in-place wrap — see the module-level documentation for the full
 /// rationale (R-027 / BC-13).
 ///
-/// Lever 7: when [`Self::ring`] is `Some`, the log instead uses an in-device
+/// Lever 7: when `Self::ring` is `Some`, the log instead uses an in-device
 /// **segment ring** ([`RingState`], `docs/REDO_SEGMENT_RING_DESIGN.md`) — the
 /// `write_pos`/`logical_start` linear fields are unused and the append/flush
 /// paths key off the ring pointers.

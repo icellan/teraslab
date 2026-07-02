@@ -2104,7 +2104,7 @@ pub trait RecordAllocator: Send {
 }
 
 /// A heap-allocated, dynamically-dispatched [`RecordAllocator`] — the concrete
-/// type a [`crate::ops::Engine`] store holds so it can be backed by either the
+/// type a [`crate::ops::engine::Engine`] store holds so it can be backed by either the
 /// in-place or the log-structured allocator.
 pub type BoxedAllocator = Box<dyn RecordAllocator>;
 
