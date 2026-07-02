@@ -1,33 +1,56 @@
 # Clustering the Segment (Log-Structured) Storage Engine
 
-**Status:** IMPLEMENTED (Option A). Phases 0–6 landed; C+E (§7.3) is the future
-reference-parity performance milestone and remains unimplemented.
+**Status:** IMPLEMENTED. Phases 0–6 landed; a max-effort review then found that
+Option A's fat `RelocateV2` was the root of four P0s, and the design was
+**revised** to the simpler, proven model below. C+E (§7.3) remains the future
+reference-parity performance milestone.
 **Scope:** make `storage.engine = "segment"` run on a clustered / replicated node
 (`validate_cluster_safety` now allows it under buffered durability).
 
-## Implementation status
+## Implementation status (post-review revision)
+
+The final model is: **a clustered segment spend's authoritative redo is the
+convertible per-vout `RedoOp::SpendV2` — the exact op the in-place engine uses.**
+The relocate itself (the physical move) journals NOTHING; `SpendV2` is emitted
+WAL-first by the dispatch spend path on the master and by
+`build_post_apply_redo_op` on the replica.
 
 | Phase | What | Status |
 |---|---|---|
 | 0 | Design + invariants (this doc) | ✅ |
-| 1 | Emit logical `ReplicaOp::Spend` for segment spends (`dispatch.rs`) | ✅ |
-| 2 | Replica-side `engine.spend()` relocates; post-apply redo `None` for segment (`engine.rs`, `receiver.rs`) | ✅ |
-| 3 | Option A: WAL-first fat `RedoOp::RelocateV2` via group-commit, gated on `clustered()` (`redo.rs`, `recovery.rs`, `engine.rs`) | ✅ |
+| 1 | Emit logical `ReplicaOp::Spend` + WAL-first `RedoOp::SpendV2` for clustered segment spends (`dispatch.rs`, gated on `engine.clustered()`) | ✅ |
+| 2 | Replica-side `engine.spend()` relocates; post-apply journals `SpendV2` (`engine.rs`, `receiver.rs`) | ✅ |
+| 3 | Durability: `SpendV2` is WAL-first + convertible + self-sufficient for local recovery (replays the spend IN PLACE against the durable append-only pre-spend record). `RelocateV2` **retired** (unemitted). | ✅ |
 | 4 | Migration / rejoin validation for segment (non-spend ops RMW in place; migration-create; full-coordinator migration) | ✅ (tests) |
 | 5 | Relax the config gate; keep buffered-durability requirement (`config.rs`) | ✅ |
-| 6 | Cluster e2e tests (spend convergence, defrag convergence, non-spend replication, migration; crash-consistency via `replay_relocate_v2`) | ✅ |
+| 6 | Cluster e2e tests (spend convergence, defrag convergence, non-spend replication, migration; crash-consistency via `replay_spend`) | ✅ |
 
-**Durability note (as implemented).** Under the required buffered mode, a
-clustered segment node's durability = replication quorum before ack + failover +
-rejoin-resync — identical to the in-place clustered default (neither fsyncs on
-the ack path). The fat `RelocateV2` is still load-bearing: it lets the redo be
-flushed independently of the data device (background flusher / replication) and
-still reconstruct the image on replay — the thin `Relocate` would read garbage
-at the un-flushed new offset. The "true" Option A (local fsync-before-ack) is the
-strict-durability variant, which the config gate currently reserves for a future
-opt-in (strict + segment is refused today). Tests: `tests/segment_cluster_e2e.rs`,
+**Why the revision (review P0s, all now fixed at the root).** Option A journaled
+only the physical `RelocateV2`, which `redo_entry_to_replica_op` maps to `None` —
+so segment spends were invisible to the durable replication-intent tracker, the
+startup/lag catch-up, and the migration delta. A spend applied locally but not
+yet shipped could never be re-driven (master SPENT / replica UNSPENT forever →
+double-spend on failover; #1/#4). The fat image was also an oversized-entry
+truncation hazard (#2) and, journaled mid-apply with the pre-bake generation, it
+resurrected a wrong generation on crash-replay so the staleness guard dropped
+re-delivered ops (#3). Emitting the convertible `SpendV2` (like in-place) and
+retiring the fat op fixes all four at the root — and moots the redo-amplification,
+packed-replay, LogFull-mid-apply, and catch-up-watermark P1s, because a clustered
+segment spend now journals exactly what an in-place spend does.
+
+**Durability (as implemented).** Under the required buffered mode, a clustered
+segment node's durability = replication quorum before ack + failover +
+rejoin-resync — identical to the in-place clustered default (neither fsyncs on the
+ack path). `SpendV2` is journaled WAL-first (dispatch Phase 3) and is
+self-sufficient: on replay it re-applies the spend in place against the durable,
+append-only pre-spend record (which its own create/earlier-spend redo
+reconstructs first), so no fat image or data-device fsync is needed. Tests:
+`tests/segment_cluster_e2e.rs`,
 `tests/cluster_tcp.rs::segment_cluster_migrates_shard_with_records_to_new_node`,
-and the `redo.rs` / `recovery.rs` `relocate_v2*` unit tests.
+and the `recovery.rs` `clustered_segment_spendv2_*` + `receiver.rs`
+multi-vout/baked-generation unit tests. The retired `RelocateV2` op + replay are
+kept only so any legacy in-flight redo decodes (clustered segment is unreleased);
+full removal is a safe follow-up.
 
 ---
 **Naming:** the comparison KV store is referred to throughout as *the reference
