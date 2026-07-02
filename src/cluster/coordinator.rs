@@ -6659,10 +6659,14 @@ pub fn redo_entry_to_replica_op(
         | RedoOp::CompensateUnsetMined { .. }
         | RedoOp::CompensateReassign { .. }
         | RedoOp::CompensatePrune { .. }
-        // Relocate is a segment-engine physical move (recovery-only); the segment
-        // engine is non-clustered in v1, so a relocate is never shipped to a
-        // replica (the logical mutation would be, via its own op).
+        // Relocate / RelocateV2 are segment-engine physical moves. They are NOT
+        // shipped through this redo→ReplicaOp catch-up converter: the logical
+        // spend is replicated via its own `ReplicaOp::Spend`, and a lagging
+        // clustered segment replica is caught up by state-transfer through the
+        // migration-delta path, not by replaying physical relocations. See
+        // `specs/SEGMENT_CLUSTERING_DESIGN.md` §7.3 (C.4).
         | RedoOp::Relocate { .. }
+        | RedoOp::RelocateV2 { .. }
         | RedoOp::CompensateSetLocked { .. } => None,
     }
 }
