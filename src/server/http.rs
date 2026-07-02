@@ -1448,7 +1448,17 @@ fn prom_histogram_ns(out: &mut String, name: &str, hist: &LatencyHistogram) {
 // /health/live and /health/ready
 // ---------------------------------------------------------------------------
 
-async fn handle_health_live(State(_state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn handle_health_live(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    // Issue #32: a poisoned redo log makes the node write-dead — every mutation
+    // fails until a restart + recovery. Report NOT-live so the container /
+    // orchestrator liveness probe restarts the process (the only remedy),
+    // instead of leaving a green node that silently rejects all writes.
+    if !state.engine.write_healthy() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "redo log poisoned — writes are failing; restart required",
+        );
+    }
     (StatusCode::OK, "ok")
 }
 
@@ -1497,6 +1507,12 @@ enum ReadyState {
 fn compute_health_ready(state: &HttpState) -> ReadyState {
     if !state.ready.load(Ordering::Relaxed) {
         return ReadyState::NotReady("not ready (recovery in progress)");
+    }
+    // Issue #32: a poisoned redo log rejects every write until a restart, so the
+    // node must NOT receive traffic — drain it. Read is lock-free (does not block
+    // on the redo writer mutex).
+    if !state.engine.write_healthy() {
+        return ReadyState::NotReady("redo log poisoned — writes are failing; restart required");
     }
     // F-G6-001: dispatch flips the secondary readiness flags to `false`
     // at startup when the DAH or unmined index rebuild fails. The TCP
@@ -1694,6 +1710,11 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "spend_multi_batches": m.spend_multi_batches.get(),
         },
         "ready": state.ready.load(Ordering::Relaxed),
+        // Issue #32: surface redo write-health so it is scrapable. `write_healthy`
+        // is false (and `redo_poisoned` true) once any store's redo log is
+        // poisoned by a flush failure and the node is rejecting all writes.
+        "write_healthy": state.engine.write_healthy(),
+        "redo_poisoned": !state.engine.write_healthy(),
     });
 
     (
@@ -4011,6 +4032,114 @@ mod tests {
             replica_lag_warn_threshold_ops: 0,
             replica_lag_cache: AtomicU64::new(0),
         })
+    }
+
+    /// Build a `ready` test state with a real redo log attached to the engine.
+    /// When `poison` is true the log is poisoned up front, so the engine reports
+    /// `write_healthy() == false` — the issue #32 write-dead condition. Returns
+    /// the state plus the log handle so a test can flip the poison after the
+    /// fact if it wants.
+    fn build_ready_test_state_with_redo(
+        ready_flag: bool,
+        poison: bool,
+    ) -> (Arc<HttpState>, Arc<parking_lot::Mutex<RedoLog>>) {
+        let state = build_ready_test_state(ready_flag, None);
+        // A standalone in-memory device backing the redo log.
+        let redo_dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        if poison {
+            log.lock().poison();
+        }
+        state.engine.set_redo_log(log.clone());
+        (state, log)
+    }
+
+    #[test]
+    fn engine_write_healthy_reflects_redo_poison() {
+        // No redo attached → write-healthy by definition.
+        let (bare, _) = (build_ready_test_state(true, None), ());
+        assert!(
+            bare.engine.write_healthy(),
+            "engine with no redo logs attached must report write-healthy"
+        );
+
+        // Fresh redo attached, not poisoned → healthy.
+        let (state, log) = build_ready_test_state_with_redo(true, false);
+        assert!(
+            state.engine.write_healthy(),
+            "fresh redo log must report write-healthy"
+        );
+
+        // Poison the attached log → engine flips to unhealthy WITHOUT any lock
+        // held by the reader (write_healthy reads the lock-free mirror).
+        log.lock().poison();
+        assert!(
+            !state.engine.write_healthy(),
+            "engine must report write-UNhealthy once its redo log is poisoned"
+        );
+    }
+
+    #[test]
+    fn health_ready_rejects_when_redo_poisoned() {
+        let (state, _log) = build_ready_test_state_with_redo(true, true);
+        assert_eq!(
+            compute_health_ready(&state),
+            ReadyState::NotReady("redo log poisoned — writes are failing; restart required"),
+            "a poisoned redo must make the node NOT ready so it drains",
+        );
+    }
+
+    #[tokio::test]
+    async fn health_live_returns_503_when_redo_poisoned_200_when_healthy() {
+        use axum::extract::State;
+
+        // Healthy: 200 OK.
+        let (healthy, log) = build_ready_test_state_with_redo(true, false);
+        let resp = handle_health_live(State(healthy)).await.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a write-healthy node must report live (200)"
+        );
+
+        // Poison → 503 SERVICE_UNAVAILABLE, which fails the liveness probe and
+        // drives an automatic restart.
+        log.lock().poison();
+        let (poisoned, _) = build_ready_test_state_with_redo(true, true);
+        let resp = handle_health_live(State(poisoned)).await.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a poisoned redo must make /health/live report NOT-live (503)"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_payload_reports_redo_write_health() {
+        use axum::extract::State;
+
+        // Healthy node: write_healthy=true, redo_poisoned=false.
+        let (healthy, _log) = build_ready_test_state_with_redo(true, false);
+        let resp = handle_status(State(healthy)).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["write_healthy"], serde_json::json!(true));
+        assert_eq!(json["redo_poisoned"], serde_json::json!(false));
+
+        // Poisoned node: write_healthy=false, redo_poisoned=true.
+        let (poisoned, _log) = build_ready_test_state_with_redo(true, true);
+        let resp = handle_status(State(poisoned)).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["write_healthy"], serde_json::json!(false));
+        assert_eq!(json["redo_poisoned"], serde_json::json!(true));
     }
 
     /// R-055 baseline: in single-node mode (no cluster) with the
