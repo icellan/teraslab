@@ -1,8 +1,35 @@
 # Clustering the Segment (Log-Structured) Storage Engine
 
-**Status:** design / not yet implemented
+**Status:** IMPLEMENTED (Option A). Phases 0–6 landed; C+E (§7.3) is the future
+reference-parity performance milestone and remains unimplemented.
 **Scope:** make `storage.engine = "segment"` run on a clustered / replicated node
-(today `validate_cluster_safety` refuses it).
+(`validate_cluster_safety` now allows it under buffered durability).
+
+## Implementation status
+
+| Phase | What | Status |
+|---|---|---|
+| 0 | Design + invariants (this doc) | ✅ |
+| 1 | Emit logical `ReplicaOp::Spend` for segment spends (`dispatch.rs`) | ✅ |
+| 2 | Replica-side `engine.spend()` relocates; post-apply redo `None` for segment (`engine.rs`, `receiver.rs`) | ✅ |
+| 3 | Option A: WAL-first fat `RedoOp::RelocateV2` via group-commit, gated on `clustered()` (`redo.rs`, `recovery.rs`, `engine.rs`) | ✅ |
+| 4 | Migration / rejoin validation for segment (non-spend ops RMW in place; migration-create; full-coordinator migration) | ✅ (tests) |
+| 5 | Relax the config gate; keep buffered-durability requirement (`config.rs`) | ✅ |
+| 6 | Cluster e2e tests (spend convergence, defrag convergence, non-spend replication, migration; crash-consistency via `replay_relocate_v2`) | ✅ |
+
+**Durability note (as implemented).** Under the required buffered mode, a
+clustered segment node's durability = replication quorum before ack + failover +
+rejoin-resync — identical to the in-place clustered default (neither fsyncs on
+the ack path). The fat `RelocateV2` is still load-bearing: it lets the redo be
+flushed independently of the data device (background flusher / replication) and
+still reconstruct the image on replay — the thin `Relocate` would read garbage
+at the un-flushed new offset. The "true" Option A (local fsync-before-ack) is the
+strict-durability variant, which the config gate currently reserves for a future
+opt-in (strict + segment is refused today). Tests: `tests/segment_cluster_e2e.rs`,
+`tests/cluster_tcp.rs::segment_cluster_migrates_shard_with_records_to_new_node`,
+and the `redo.rs` / `recovery.rs` `relocate_v2*` unit tests.
+
+---
 **Naming:** the comparison KV store is referred to throughout as *the reference
 datastore* — never by product name (repo naming rule).
 

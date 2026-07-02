@@ -10996,7 +10996,7 @@ mod tests {
         let spent_slot = UtxoSlot::new_spent(slots[1].hash, spending_data);
 
         let new_offset = engine
-            .relocate_record(0, &key, &new_meta, &[(1, spent_slot.clone())])
+            .relocate_record(0, &key, &new_meta, &[(1, spent_slot)])
             .unwrap();
 
         // Baked-in metadata landed.
@@ -11225,7 +11225,7 @@ mod tests {
 
         // vout 4 is out of range for a 4-UTXO record (valid: 0..=3).
         let err = engine
-            .relocate_record(0, &key, &meta, &[(4, slots[0].clone())])
+            .relocate_record(0, &key, &meta, &[(4, slots[0])])
             .unwrap_err();
         match err {
             SpendError::StorageError { detail } => {
