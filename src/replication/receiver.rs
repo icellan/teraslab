@@ -2066,6 +2066,18 @@ fn build_post_apply_redo_op(
             block_height_retention,
             ..
         } => {
+            // Segment (log-structured) replica: `engine.spend()` RELOCATED the
+            // record and journaled the relocation (fat `RelocateV2` when clustered)
+            // INSIDE apply, so there is no post-apply redo to add here — emitting a
+            // `SpendV2` would replay an in-place RMW against the moved (now-dead)
+            // offset on recovery. Only the in-place engine needs the post-apply
+            // `SpendV2` (its apply did an in-place slot+metadata write).
+            if engine
+                .lookup(tx_key)
+                .is_some_and(|e| engine.store_is_log_structured(e.device_id))
+            {
+                return Ok(None);
+            }
             let meta = match engine.read_metadata(tx_key) {
                 Ok(m) => m,
                 Err(_) => return Ok(None),
@@ -2336,6 +2348,30 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ))
+    }
+
+    /// A log-structured (segment) engine with an attached, clustered redo log —
+    /// the shape a replica node runs. Used to prove the replica spend relocates
+    /// and emits no post-apply `SpendV2` (Phase 2).
+    fn make_seg_engine_clustered() -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 256 * 4096).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            dev,
+            index,
+            seg,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        engine.set_clustered(true);
+        Arc::new(engine)
     }
 
     fn make_engine_with_blob_store(
@@ -2763,6 +2799,65 @@ mod tests {
         let slot = engine.read_slot(&k, 0).unwrap();
         assert_eq!(slot.status, UTXO_SPENT);
         assert_eq!(slot.spending_data[0], 0xAB);
+    }
+
+    #[test]
+    fn segment_replica_spend_relocates_and_emits_no_post_apply_spendv2() {
+        // Phase 2: on a log-structured replica, applying a logical `ReplicaOp::Spend`
+        // RELOCATES the record (mirroring the master) and journals the relocate
+        // INSIDE apply, so the post-apply redo builder must emit NOTHING — a
+        // SpendV2 here would replay an in-place RMW against the moved offset.
+        let engine = make_seg_engine_clustered();
+        assert!(
+            engine.redo_log().is_some(),
+            "log attached (else None is trivial)"
+        );
+
+        let k = key(7);
+        create_record(&engine, k, 4);
+        let old = engine.lookup(&k).unwrap().record_offset;
+        assert!(engine.store_is_log_structured(engine.lookup(&k).unwrap().device_id));
+
+        let op = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 1,
+            spending_data: [0x5A; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 1,
+        };
+
+        apply_op(&engine, &op).unwrap();
+
+        // No post-apply SpendV2 — the relocate was journaled during apply.
+        let post = build_post_apply_redo_op(&engine, &op).unwrap();
+        assert!(
+            post.is_none(),
+            "segment replica Spend must not emit a post-apply SpendV2, got {post:?}"
+        );
+
+        // Apply relocated the record and flipped slot 1 SPENT.
+        let new = engine.lookup(&k).unwrap().record_offset;
+        assert_ne!(new, old, "replica spend must relocate on a segment store");
+        let slot = engine.read_slot(&k, 1).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT);
+        assert_eq!(slot.spending_data[0], 0x5A);
+
+        // Contrast: an IN-PLACE replica still emits the post-apply SpendV2.
+        let inplace = make_engine();
+        create_record(&inplace, k, 4);
+        apply_op(&inplace, &op).unwrap();
+        // in-place has no redo log attached here → build returns None for the wrong
+        // reason; attach one to make the contrast meaningful.
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
+        inplace.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        let post_inplace = build_post_apply_redo_op(&inplace, &op).unwrap();
+        assert!(
+            matches!(post_inplace, Some(crate::redo::RedoOp::SpendV2 { .. })),
+            "in-place replica Spend must emit a post-apply SpendV2, got {post_inplace:?}"
+        );
     }
 
     #[test]
