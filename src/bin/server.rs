@@ -1394,7 +1394,22 @@ fn main() {
         // becomes the convertible per-vout SpendV2 (the relocate move journals
         // nothing); standalone nodes keep the thin index-only Relocate + checkpoint
         // durability (specs/SEGMENT_CLUSTERING_DESIGN.md). Must follow set_redo_logs.
-        engine.set_clustered(config.is_clustered() || config.replication_factor > 1);
+        let clustered = config.is_clustered() || config.replication_factor > 1;
+        engine.set_clustered(clustered);
+        // Surface the segment-on-cluster path explicitly: `Segment` is the default
+        // engine (and an empty `[storage] engine` parses to it), so a clustered
+        // node with the engine unset now boots the clustered-segment path where a
+        // pre-cluster build would have refused. Make that non-silent for operators.
+        if clustered && config.storage.engine == teraslab::config::StorageEngine::Segment {
+            tracing::info!(
+                node_id = config.node_id,
+                replication_factor = config.replication_factor,
+                "clustered node running the SEGMENT storage engine: spend replication \
+                 and recovery are carried by the convertible SpendV2 redo; durability \
+                 is replication-quorum + failover + rejoin-resync under the required \
+                 buffered mode (specs/SEGMENT_CLUSTERING_DESIGN.md)"
+            );
+        }
         // Apply buffered (relaxed) redo durability if configured. Must follow
         // set_redo_logs so the per-store group-commit coordinators exist.
         // `redo_buffered_io` implies buffered durability (see

@@ -23,7 +23,17 @@ WAL-first by the dispatch spend path on the master and by
 | 3 | Durability: `SpendV2` is WAL-first + convertible + self-sufficient for local recovery (replays the spend IN PLACE against the durable append-only pre-spend record). `RelocateV2` **retired** (unemitted). | ✅ |
 | 4 | Migration / rejoin validation for segment (non-spend ops RMW in place; migration-create; full-coordinator migration) | ✅ (tests) |
 | 5 | Relax the config gate; keep buffered-durability requirement (`config.rs`) | ✅ |
-| 6 | Cluster e2e tests (spend convergence, defrag convergence, non-spend replication, migration; crash-consistency via `replay_spend`) | ✅ |
+| 6 | Cluster e2e tests: spend convergence (full logical fingerprint), all-vouts-spent DAH convergence, defrag convergence, non-spend replication, full-coordinator migration, and a real engine→crash→`recover()` composition | ✅ (see caveat) |
+
+**Phase 6 test caveat.** The e2e suite covers spend/DAH convergence, per-node
+defrag, non-spend replication, migration, and real-engine crash-recovery. It does
+NOT yet include a dedicated **master-failover-mid-spend-stream** or
+**stale-node-rejoin/resync** e2e for the segment engine. Both mechanisms are
+engine-agnostic (leader election, term ordering, migration transport) and unchanged
+by this work; the segment-specific guarantee they rely on — a promoted replica
+holds the master's exact logical state — is proven by the convergence tests, and a
+joining segment node receiving + serving records is proven by the migration tests.
+A dedicated segment failover/rejoin e2e remains a worthwhile follow-up.
 
 **Why the revision (review P0s, all now fixed at the root).** Option A journaled
 only the physical `RelocateV2`, which `redo_entry_to_replica_op` maps to `None` —

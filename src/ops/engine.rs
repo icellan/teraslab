@@ -4874,6 +4874,12 @@ impl Engine {
         metadata: &TxMetadata,
         slot_mutations: &[(u32, UtxoSlot)],
     ) -> Result<u64, SpendError> {
+        // Re-fetch the old offset here rather than threading it from the caller:
+        // it keeps this consensus-critical primitive self-contained (it validates
+        // the key exists AND reads its offset atomically under the caller's stripe
+        // lock, so the two callers — `Engine::spend` and `PreparedSpend::apply_locked`
+        // — cannot pass a torn/stale offset). The probe is O(1) on the in-memory
+        // primary index the segment engine uses by default.
         let old_entry = self
             .index
             .lookup_checked(tx_key)
