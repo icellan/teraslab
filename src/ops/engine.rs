@@ -253,6 +253,15 @@ pub struct Engine {
     /// paths, in which case [`Self::persist_last_durable_height`] is a no-op
     /// and the height is recovered from the record-derived floor alone.
     last_durable_height_path: std::sync::OnceLock<std::path::PathBuf>,
+    /// Segments the LAST checkpoint's defrag compaction pass relocated live
+    /// records out of. Published by the checkpoint via
+    /// [`Self::record_last_checkpoint_defrag`] and read by the `/status`
+    /// observability endpoint. Relaxed atomics; no hot-path cost. `0` until the
+    /// first checkpoint runs.
+    last_checkpoint_compacted: std::sync::atomic::AtomicU64,
+    /// Segments the LAST checkpoint's fully-dead fast path reclaimed. See
+    /// [`Self::last_checkpoint_compacted`].
+    last_checkpoint_reclaimed: std::sync::atomic::AtomicU64,
     blob_store: Option<Arc<dyn BlobStore>>,
     /// In-flight external-blob pins (F-IJ-002).
     ///
@@ -495,6 +504,8 @@ impl Engine {
             redo_backpressure: std::sync::OnceLock::new(),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
+            last_checkpoint_compacted: std::sync::atomic::AtomicU64::new(0),
+            last_checkpoint_reclaimed: std::sync::atomic::AtomicU64::new(0),
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
@@ -2015,6 +2026,68 @@ impl Engine {
     /// never stalls behind a write burst.
     pub fn allocator_stats_try(&self) -> Option<crate::allocator::AllocatorStats> {
         self.stores[0].allocator.try_lock().map(|g| g.stats())
+    }
+
+    /// Aggregate segment-allocator statistics across every LOG-STRUCTURED store,
+    /// or `None` if no store uses the segment engine (e.g. the in-place engine,
+    /// whose `defrag_compact` is a no-op anyway).
+    ///
+    /// Used by the checkpoint to size the pressure-aware compaction budget
+    /// ([`crate::checkpoint::compaction_budget`]) and by `/status` to report
+    /// on-device dead/live space. The byte counters (`used_bytes`, `dead_bytes`,
+    /// `live_bytes`) are SUMMED across stores; the scalar layout fields
+    /// (`device_size`, `segment_size`, counts, cursor) are taken from the first
+    /// log-structured store as a representative and, for `device_size`,
+    /// accumulated so occupancy is computed against the total device capacity.
+    ///
+    /// Briefly locks each log-structured store's allocator to snapshot it.
+    pub fn segment_allocator_stats(
+        &self,
+    ) -> Option<crate::segment_allocator::SegmentAllocatorStats> {
+        let mut acc: Option<crate::segment_allocator::SegmentAllocatorStats> = None;
+        for store in &self.stores {
+            if !store.log_structured {
+                continue;
+            }
+            let Some(s) = store.allocator.lock().segment_stats() else {
+                continue;
+            };
+            match acc.as_mut() {
+                None => acc = Some(s),
+                Some(a) => {
+                    a.device_size = a.device_size.saturating_add(s.device_size);
+                    a.used_bytes = a.used_bytes.saturating_add(s.used_bytes);
+                    a.dead_bytes = a.dead_bytes.saturating_add(s.dead_bytes);
+                    a.live_bytes = a.live_bytes.saturating_add(s.live_bytes);
+                    a.segment_count = a.segment_count.saturating_add(s.segment_count);
+                }
+            }
+        }
+        acc
+    }
+
+    /// Publish the LAST checkpoint's defrag outcome for `/status` observability:
+    /// `compacted` = partially-dead segments the compaction pass relocated live
+    /// records out of, `reclaimed` = fully-dead segments the fast path reclaimed.
+    /// Overwrites the previous values (relaxed atomics — this is a diagnostic
+    /// gauge, not a monotone counter).
+    pub fn record_last_checkpoint_defrag(&self, compacted: usize, reclaimed: usize) {
+        self.last_checkpoint_compacted
+            .store(compacted as u64, std::sync::atomic::Ordering::Relaxed);
+        self.last_checkpoint_reclaimed
+            .store(reclaimed as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the LAST checkpoint's defrag outcome as `(compacted, reclaimed)`
+    /// segment counts. Both `0` until the first checkpoint runs. See
+    /// [`Self::record_last_checkpoint_defrag`].
+    pub fn last_checkpoint_defrag(&self) -> (u64, u64) {
+        (
+            self.last_checkpoint_compacted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.last_checkpoint_reclaimed
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Get a reference to the allocator mutex.

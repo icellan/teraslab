@@ -1181,6 +1181,9 @@ impl RecordAllocator for SegmentAllocator {
             },
         }
     }
+    fn segment_stats(&self) -> Option<SegmentAllocatorStats> {
+        Some(SegmentAllocator::stats(self))
+    }
     fn next_offset(&self) -> u64 {
         self.cursor
     }

@@ -564,8 +564,168 @@ impl CacheConfig {
     }
 }
 
+/// Pressure-aware segment-defrag compaction tuning (`[storage.defrag]` TOML
+/// subsection).
+///
+/// The segment (log-structured) engine reclaims on-device dead space in two
+/// phases per checkpoint: a cheap unbounded pass that reclaims FULLY-dead
+/// segments, and a rate-limited compaction pass that relocates the few live
+/// records OUT of partially-dead segments so they drain and become
+/// reclaimable. The compaction pass is deliberately conservative at steady
+/// state (few victims, high dead threshold) because short-lived UTXOs make
+/// segments go fully-dead fast, so the cheap pass carries the bulk.
+///
+/// Under a high-spend catchup, though, UTXOs have MIXED lifetimes: segments
+/// settle at 30–70% dead — too alive for the fast path, too alive for the
+/// conservative compaction threshold — and dead space accumulates until the
+/// device ENOSPCs (issue #33/#32). These knobs let compaction spend MORE copy
+/// budget and accept LESS-dead victims as free space runs low, converting the
+/// partially-dead tail into reclaimable segments before the device fills. At
+/// low occupancy the base values reproduce today's behavior byte-for-byte.
+///
+/// See [`crate::checkpoint::compaction_budget`] for the exact occupancy→budget
+/// curve these fields parameterize.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DefragConfig {
+    /// Compaction victim budget at LOW pressure (occupancy below
+    /// `pressure_low`). This is the steady-state cap on partially-dead
+    /// segments relocated per checkpoint; bounds live-record copy
+    /// amplification and checkpoint duration. Default `4`.
+    #[serde(default = "default_defrag_base_max_segments")]
+    pub base_max_segments: usize,
+
+    /// Minimum dead fraction (0.0..=1.0) a segment must reach to be a
+    /// compaction victim at LOW pressure. High so few live records are copied
+    /// per reclaimed segment (≤25% live at 0.75) and compaction is self-gating.
+    /// Default `0.75`.
+    #[serde(default = "default_defrag_base_min_dead_frac")]
+    pub base_min_dead_frac: f64,
+
+    /// Occupancy (used_bytes / device_size, 0.0..=1.0) below which the base
+    /// budget applies unchanged — steady state stays byte-identical to today.
+    /// Default `0.70`.
+    #[serde(default = "default_defrag_pressure_low")]
+    pub pressure_low: f64,
+
+    /// Occupancy (0.0..=1.0) at or above which compaction runs at its most
+    /// aggressive: `max_segments_ceiling` victims and the `min_dead_frac_floor`
+    /// threshold. Between `pressure_low` and this, the budget scales linearly.
+    /// Must be strictly greater than `pressure_low`. Default `0.85`.
+    #[serde(default = "default_defrag_pressure_high")]
+    pub pressure_high: f64,
+
+    /// Upper bound on compaction victims per checkpoint at HIGH pressure.
+    /// Caps the worst-case copy amplification / checkpoint duration even when
+    /// the device is nearly full. Must be `>= base_max_segments`. Default `64`.
+    #[serde(default = "default_defrag_max_segments_ceiling")]
+    pub max_segments_ceiling: usize,
+
+    /// Floor (0.0..=1.0) the min-dead-fraction threshold is never lowered
+    /// below, even at HIGH pressure. Below this, compaction would copy more
+    /// live bytes than it reclaims dead ones (net-negative churn). Must be
+    /// `<= base_min_dead_frac`. Default `0.25`.
+    #[serde(default = "default_defrag_min_dead_frac_floor")]
+    pub min_dead_frac_floor: f64,
+}
+
+/// Default LOW-pressure compaction victim budget (matches the historical
+/// `DEFRAG_COMPACT_MAX_SEGMENTS`).
+const fn default_defrag_base_max_segments() -> usize {
+    4
+}
+/// Default LOW-pressure minimum dead fraction (matches the historical
+/// `DEFRAG_COMPACT_MIN_DEAD_FRAC`).
+const fn default_defrag_base_min_dead_frac() -> f64 {
+    0.75
+}
+/// Default occupancy below which the base budget applies unchanged.
+const fn default_defrag_pressure_low() -> f64 {
+    0.70
+}
+/// Default occupancy at/above which compaction is fully aggressive.
+const fn default_defrag_pressure_high() -> f64 {
+    0.85
+}
+/// Default HIGH-pressure victim ceiling.
+const fn default_defrag_max_segments_ceiling() -> usize {
+    64
+}
+/// Default floor the min-dead-fraction threshold is never lowered below.
+const fn default_defrag_min_dead_frac_floor() -> f64 {
+    0.25
+}
+
+impl Default for DefragConfig {
+    fn default() -> Self {
+        // MUST match the per-field `#[serde(default = ...)]` fns: the
+        // struct-level `#[serde(default)]` uses THIS impl when the whole
+        // `[storage.defrag]` subsection is absent.
+        Self {
+            base_max_segments: default_defrag_base_max_segments(),
+            base_min_dead_frac: default_defrag_base_min_dead_frac(),
+            pressure_low: default_defrag_pressure_low(),
+            pressure_high: default_defrag_pressure_high(),
+            max_segments_ceiling: default_defrag_max_segments_ceiling(),
+            min_dead_frac_floor: default_defrag_min_dead_frac_floor(),
+        }
+    }
+}
+
+impl DefragConfig {
+    /// Validate the defrag tuning: fractions in `[0.0, 1.0]`, the pressure band
+    /// strictly ordered, the aggressive ceiling/floor consistent with the base
+    /// values. Returns a typed [`ConfigError::InvalidSizing`] describing the
+    /// first violation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidSizing`] if any fraction is outside
+    /// `[0.0, 1.0]`, `pressure_low >= pressure_high`,
+    /// `max_segments_ceiling < base_max_segments`,
+    /// `min_dead_frac_floor > base_min_dead_frac`, or `base_max_segments == 0`.
+    pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+        let frac = |name: &str, v: f64| -> std::result::Result<(), ConfigError> {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "storage.defrag.{name} = {v} must be in [0.0, 1.0]"
+                )));
+            }
+            Ok(())
+        };
+        frac("base_min_dead_frac", self.base_min_dead_frac)?;
+        frac("pressure_low", self.pressure_low)?;
+        frac("pressure_high", self.pressure_high)?;
+        frac("min_dead_frac_floor", self.min_dead_frac_floor)?;
+        if self.base_max_segments == 0 {
+            return Err(ConfigError::InvalidSizing(
+                "storage.defrag.base_max_segments must be non-zero".to_string(),
+            ));
+        }
+        if self.pressure_low >= self.pressure_high {
+            return Err(ConfigError::InvalidSizing(format!(
+                "storage.defrag.pressure_low ({}) must be strictly less than pressure_high ({})",
+                self.pressure_low, self.pressure_high
+            )));
+        }
+        if self.max_segments_ceiling < self.base_max_segments {
+            return Err(ConfigError::InvalidSizing(format!(
+                "storage.defrag.max_segments_ceiling ({}) must be >= base_max_segments ({})",
+                self.max_segments_ceiling, self.base_max_segments
+            )));
+        }
+        if self.min_dead_frac_floor > self.base_min_dead_frac {
+            return Err(ConfigError::InvalidSizing(format!(
+                "storage.defrag.min_dead_frac_floor ({}) must be <= base_min_dead_frac ({})",
+                self.min_dead_frac_floor, self.base_min_dead_frac
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// On-device storage layout configuration (`[storage]` TOML section).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StorageConfig {
     /// Pack multiple sub-block records contiguously within a single device
@@ -658,6 +818,12 @@ pub struct StorageConfig {
     /// write pattern the EC2 A/B measured).
     #[serde(default)]
     pub streaming: bool,
+
+    /// Pressure-aware segment-defrag compaction tuning (`[storage.defrag]`).
+    /// Only meaningful with `engine = "segment"`. Defaults reproduce the
+    /// historical conservative behavior; see [`DefragConfig`].
+    #[serde(default)]
+    pub defrag: DefragConfig,
 }
 
 impl Default for StorageConfig {
@@ -677,6 +843,7 @@ impl Default for StorageConfig {
             engine: StorageEngine::default(),
             segment_size: default_segment_size(),
             streaming: false,
+            defrag: DefragConfig::default(),
         }
     }
 }
@@ -2087,6 +2254,10 @@ impl ServerConfig {
             self.checkpoint_poll_interval_ms,
         )?;
 
+        // Pressure-aware segment defrag tuning (fractions in range, pressure
+        // band ordered, ceiling/floor consistent with the base values).
+        self.storage.defrag.validate()?;
+
         // device_size must be large enough to hold at least one record's
         // worth of data; the runtime allocator otherwise hits a divide-by-
         // zero. Use UTXO_SLOT_SIZE+METADATA_SIZE as the lower bound here.
@@ -2559,6 +2730,116 @@ backend = ""
             toml::from_str("[storage]\nengine = \"segment\"\nstreaming = true\n").unwrap();
         assert!(on.storage.streaming, "streaming = true must parse");
         assert_eq!(on.storage.engine, StorageEngine::Segment);
+    }
+
+    #[test]
+    fn defrag_config_defaults_match_historical_behavior() {
+        // Absent [storage.defrag] → the documented conservative defaults, which
+        // reproduce the pre-#33 behavior byte-for-byte.
+        let d = DefragConfig::default();
+        assert_eq!(d.base_max_segments, 4);
+        assert_eq!(d.base_min_dead_frac, 0.75);
+        assert_eq!(d.pressure_low, 0.70);
+        assert_eq!(d.pressure_high, 0.85);
+        assert_eq!(d.max_segments_ceiling, 64);
+        assert_eq!(d.min_dead_frac_floor, 0.25);
+
+        // Same via a full config with no [storage.defrag] subsection.
+        let cfg: ServerConfig = toml::from_str("[storage]\nengine = \"segment\"\n").unwrap();
+        assert_eq!(cfg.storage.defrag, DefragConfig::default());
+    }
+
+    #[test]
+    fn defrag_config_parses_custom_keys() {
+        let cfg: ServerConfig = toml::from_str(
+            "[storage.defrag]\n\
+             base_max_segments = 8\n\
+             base_min_dead_frac = 0.6\n\
+             pressure_low = 0.5\n\
+             pressure_high = 0.9\n\
+             max_segments_ceiling = 128\n\
+             min_dead_frac_floor = 0.1\n",
+        )
+        .unwrap();
+        let d = &cfg.storage.defrag;
+        assert_eq!(d.base_max_segments, 8);
+        assert_eq!(d.base_min_dead_frac, 0.6);
+        assert_eq!(d.pressure_low, 0.5);
+        assert_eq!(d.pressure_high, 0.9);
+        assert_eq!(d.max_segments_ceiling, 128);
+        assert_eq!(d.min_dead_frac_floor, 0.1);
+        d.validate().expect("custom defrag config is valid");
+    }
+
+    #[test]
+    fn defrag_config_rejects_out_of_range_fraction() {
+        let d = DefragConfig {
+            base_min_dead_frac: 1.5,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("base_min_dead_frac") && msg.contains("[0.0, 1.0]"),
+                    "message must name the field and range: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defrag_config_rejects_unordered_pressure_band() {
+        let d = DefragConfig {
+            pressure_low: 0.9,
+            pressure_high: 0.8,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("pressure_low") && msg.contains("pressure_high"),
+                    "message must name both thresholds: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defrag_config_rejects_ceiling_below_base() {
+        let d = DefragConfig {
+            base_max_segments: 10,
+            max_segments_ceiling: 4,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("max_segments_ceiling") && msg.contains("base_max_segments"),
+                    "message must relate ceiling to base: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defrag_config_rejects_floor_above_base_frac() {
+        let d = DefragConfig {
+            base_min_dead_frac: 0.5,
+            min_dead_frac_floor: 0.8,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("min_dead_frac_floor") && msg.contains("base_min_dead_frac"),
+                    "message must relate floor to base: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
     }
 
     #[test]

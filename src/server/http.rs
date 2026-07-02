@@ -1628,6 +1628,18 @@ async fn wait_for_cluster_drain(cluster: &RunningCluster, wait_seconds: u64) -> 
 }
 
 async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let status = build_status_json(&state);
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        status.to_string(),
+    )
+}
+
+/// Build the `/status` JSON payload. Split out of the async handler so unit
+/// tests can assert the payload shape (records, storage/defrag health, cluster
+/// counts) without spinning up an HTTP listener.
+fn build_status_json(state: &HttpState) -> serde_json::Value {
     let m = state.metrics;
 
     let cluster_info = if let Some(ref cluster) = state.cluster {
@@ -1670,6 +1682,29 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         })
     };
 
+    // On-device space + defrag health. `used_bytes` is the on-device footprint
+    // (live + dead); `dead_fraction` is the reclaimable share that the
+    // pressure-aware compaction (issue #33) targets. `compacted`/`reclaimed`
+    // are the LAST checkpoint's defrag pass outcomes (segments), so an operator
+    // can see the reclaimer keeping pace with dead-space growth. Non-blocking
+    // allocator read; falls back to a blocking read only when momentarily
+    // contended so the health endpoint stays cheap.
+    let alloc = state
+        .engine
+        .allocator_stats_try()
+        .unwrap_or_else(|| state.engine.allocator_stats());
+    let (compacted, reclaimed) = state.engine.last_checkpoint_defrag();
+    // For the segment engine the trait-level `used_bytes` is LIVE bytes and
+    // `total_free_bytes` is DEAD bytes; the on-device footprint is their sum.
+    let live_bytes = alloc.used_bytes;
+    let dead_bytes = alloc.total_free_bytes;
+    let used_bytes = live_bytes.saturating_add(dead_bytes);
+    let dead_fraction = if used_bytes > 0 {
+        dead_bytes as f64 / used_bytes as f64
+    } else {
+        0.0
+    };
+
     let status = serde_json::json!({
         "node_id": cluster_info["node_id"],
         "cluster_size": cluster_info["cluster_size"],
@@ -1686,6 +1721,15 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "unmined_index": state.engine.unmined_index().len(),
             "preserve_index": state.engine.preserve_index().len(),
         },
+        "storage": {
+            "used_bytes": used_bytes,
+            "dead_bytes": dead_bytes,
+            "live_bytes": live_bytes,
+            "dead_fraction": dead_fraction,
+            "total_bytes": alloc.device_size,
+            "compacted": compacted,
+            "reclaimed": reclaimed,
+        },
         "throughput": {
             "spends_attempted": m.spends_attempted.get(),
             "spends_succeeded": m.spends_succeeded.get(),
@@ -1696,11 +1740,7 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         "ready": state.ready.load(Ordering::Relaxed),
     });
 
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        status.to_string(),
-    )
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -2032,6 +2072,19 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
         })
     };
 
+    // Segment-engine defrag health (issue #33). For the segment engine the
+    // trait-level `used_bytes` is LIVE bytes and `total_free_bytes` is DEAD
+    // bytes; the on-device footprint is their sum.
+    let storage_dead_bytes = alloc_stats.total_free_bytes;
+    let storage_live_bytes = alloc_stats.used_bytes;
+    let storage_footprint = storage_live_bytes.saturating_add(storage_dead_bytes);
+    let storage_dead_fraction = if storage_footprint > 0 {
+        storage_dead_bytes as f64 / storage_footprint as f64
+    } else {
+        0.0
+    };
+    let (storage_compacted, storage_reclaimed) = state.engine.last_checkpoint_defrag();
+
     serde_json::json!({
         "node_id": node_id,
         "timestamp_ms": timestamp_ms,
@@ -2072,6 +2125,13 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
             "total_bytes": alloc_stats.device_size,
             "utilization": alloc_stats.utilization,
             "free_regions": alloc_stats.free_region_count,
+            // Segment-engine defrag health (issue #33): dead/live split and the
+            // last checkpoint's compact/reclaim segment counts.
+            "dead_bytes": storage_dead_bytes,
+            "live_bytes": storage_live_bytes,
+            "dead_fraction": storage_dead_fraction,
+            "compacted": storage_compacted,
+            "reclaimed": storage_reclaimed,
         },
         "redo": redo,
         "connections": state.active_connections.load(Ordering::Relaxed),
@@ -3585,6 +3645,104 @@ mod tests {
                 .unwrap(),
             0,
         );
+    }
+
+    /// Issue #33: `/status` exposes segment-defrag health — dead/live bytes,
+    /// dead_fraction, and the last checkpoint's compacted/reclaimed segment
+    /// counts — reflecting a known allocator state.
+    #[test]
+    fn status_reports_defrag_health_for_segment_engine() {
+        use crate::device::{BlockDevice, MemoryDevice};
+        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::locks::StripedLocks;
+        use crate::ops::engine::Engine;
+        use crate::record::TxMetadata;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg_size = 8 * 4096; // 8-block segments
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), seg_size).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            Index::new(256).unwrap(),
+            seg,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Allocate four one-block records, then free two → half the on-device
+        // footprint is dead. record_size is block-rounded, so live == dead here.
+        let record_size = TxMetadata::record_size_for(1);
+        let mut offsets = Vec::new();
+        for _ in 0..4 {
+            offsets.push(
+                engine
+                    .allocator_for(0)
+                    .lock()
+                    .allocate(record_size)
+                    .unwrap(),
+            );
+        }
+        for &off in &offsets[..2] {
+            engine
+                .allocator_for(0)
+                .lock()
+                .free(off, record_size)
+                .unwrap();
+        }
+
+        // Publish a known last-checkpoint defrag outcome.
+        engine.record_last_checkpoint_defrag(3, 7);
+
+        // Cross-check the expected numbers against the allocator's own view.
+        let seg_stats = engine.segment_allocator_stats().expect("segment engine");
+        let expected_dead = seg_stats.dead_bytes;
+        let expected_live = seg_stats.live_bytes;
+        let expected_used = seg_stats.used_bytes;
+        assert!(expected_dead > 0, "the two frees must create dead space");
+        assert_eq!(
+            expected_dead + expected_live,
+            expected_used,
+            "dead + live == on-device footprint"
+        );
+
+        let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
+        let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
+        let state = HttpState {
+            engine,
+            metrics,
+            histograms,
+            ready: Arc::new(AtomicBool::new(true)),
+            log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
+            cluster: None,
+            redo_log: None,
+            redo_atomics: None,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            http_port: 0,
+            replica_lag_warn_threshold_ops: 10_000,
+            replica_lag_cache: AtomicU64::new(0),
+        };
+
+        let status = build_status_json(&state);
+        let storage = status["storage"]
+            .as_object()
+            .expect("/status must include a storage object");
+
+        assert_eq!(storage["dead_bytes"].as_u64().unwrap(), expected_dead);
+        assert_eq!(storage["live_bytes"].as_u64().unwrap(), expected_live);
+        assert_eq!(storage["used_bytes"].as_u64().unwrap(), expected_used);
+
+        let dead_fraction = storage["dead_fraction"].as_f64().unwrap();
+        let want_fraction = expected_dead as f64 / expected_used as f64;
+        assert!(
+            (dead_fraction - want_fraction).abs() < 1e-9,
+            "dead_fraction {dead_fraction} must equal dead/used {want_fraction}"
+        );
+
+        assert_eq!(storage["compacted"].as_u64().unwrap(), 3);
+        assert_eq!(storage["reclaimed"].as_u64().unwrap(), 7);
     }
 
     /// Parse a labeled Prometheus counter line of the form
