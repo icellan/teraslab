@@ -1553,14 +1553,15 @@ impl ServerConfig {
         // clustering work (specs/SEGMENT_CLUSTERING_DESIGN.md). Replication is
         // LOGICAL — the master ships a vout-based `ReplicaOp::Spend` (no offset)
         // that the replica applies through its own `engine.spend()`, relocating to
-        // its own offset (Phases 1–2). Crash safety uses the fat, self-sufficient
-        // `RedoOp::RelocateV2` journaled WAL-first through the group-commit
-        // coordinator (Phase 3 / Option A), so the redo reconstructs the relocated
-        // image on replay without depending on the data device being flushed
-        // first. Durability under the (required) buffered mode below is the SAME
-        // as the in-place clustered default: replication quorum before ack, plus
-        // failover + rejoin-resync healing a crashed master's un-flushed tail. The
-        // former blanket refusal is therefore removed.
+        // its own offset. Crash safety AND replication recovery both key off the
+        // convertible per-vout `RedoOp::SpendV2`, emitted WAL-first exactly like the
+        // in-place engine: it is what the durable replication-intent tracker,
+        // startup/lag catch-up, and migration delta convert to `ReplicaOp`s, and on
+        // local recovery it replays the spend in place against the durable,
+        // append-only pre-spend record. Durability under the (required) buffered
+        // mode below is the SAME as the in-place clustered default: replication
+        // quorum before ack, plus failover + rejoin-resync healing a crashed
+        // master's un-flushed tail. The former blanket refusal is therefore removed.
         //
         // The segment engine still requires BUFFERED redo durability. STANDALONE,
         // the relocate journals its thin `Relocate` intent AFTER writing the
@@ -2473,7 +2474,7 @@ backend = ""
         // Phase 5 (specs/SEGMENT_CLUSTERING_DESIGN.md): the segment engine now
         // clusters. node_id > 0 → clustered; with buffered durability (the
         // default) the config validates — replication is logical and crash safety
-        // uses the WAL-first fat RelocateV2.
+        // + replication recovery both key off the convertible per-vout SpendV2.
         let mut cfg = ServerConfig {
             node_id: 1,
             replication_factor: 3,

@@ -4835,25 +4835,25 @@ impl Engine {
     /// - The store MUST be log-structured ([`Self::store_is_log_structured`]) so
     ///   `free` dead-marks rather than returning the extent to a reuse freelist,
     ///   and append-only never overwrites the old extent before defrag.
-    /// - Durability model depends on [`Self::clustered`]:
-    ///   - STANDALONE (`clustered() == false`): BUFFERED — the new image, the thin
-    ///     index-only `Relocate` redo, and the dead-mark all become durable
-    ///     together at the checkpoint barrier (which fsyncs the data device before
-    ///     reclaiming any redo prefix). A crash before that barrier loses all
-    ///     three together and leaves the pre-relocation record intact at the old
-    ///     offset — the buffered-tail-loss contract `replay_relocate` enforces.
-    ///   - CLUSTERED (`clustered() == true`): WAL-FIRST — a FAT, self-sufficient
-    ///     `RelocateV2` (carrying the record image) is journaled through the
-    ///     group-commit coordinator and fsync'd BEFORE the (still buffered) data
-    ///     write. `replay_relocate_v2` re-writes the image from the redo alone, so
-    ///     an ack means fsync-durable-locally exactly like the in-place `SpendV2`
-    ///     contract — the durability replication requires. See
-    ///     `specs/SEGMENT_CLUSTERING_DESIGN.md` §7.1 (Option A).
+    /// - Durability is BUFFERED (the image write and dead-mark become durable at
+    ///   the checkpoint barrier, which fsyncs the data device before reclaiming any
+    ///   redo prefix). The REDO that makes a spend crash-safe is journaled by the
+    ///   CALLER, not here, and differs by [`Self::clustered`]:
+    ///   - STANDALONE (`clustered() == false`): this fn appends a thin index-only
+    ///     `Relocate` (recovery reads the record back from `new_offset`); a crash
+    ///     before the barrier loses image + redo + dead-mark together and leaves
+    ///     the pre-relocation record intact — the contract `replay_relocate`
+    ///     enforces.
+    ///   - CLUSTERED (`clustered() == true`): this fn journals NOTHING. The spend's
+    ///     convertible per-vout `RedoOp::SpendV2` — emitted WAL-first by the
+    ///     dispatch spend path and by the replica's post-apply journalling — is the
+    ///     authoritative redo: replication-convertible AND self-sufficient for
+    ///     local recovery (it replays the spend IN PLACE against the durable,
+    ///     append-only pre-spend record). See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
     ///
     /// # Ordering (consensus-critical)
-    /// STANDALONE: allocate → write new image → journal thin `Relocate` → repoint
-    /// index → free old. CLUSTERED: allocate → journal fat `RelocateV2` +
-    /// group-commit fsync → write new image (buffered) → repoint index → free old.
+    /// allocate → write new image (buffered) → [STANDALONE: journal thin
+    /// `Relocate`] → repoint index → free old.
     /// A lock-free reader that grabbed the old offset before the repoint still
     /// reads valid bytes: the old extent stays intact (append-only never reuses a
     /// freed offset until defrag), and the index swap is atomic. The repoint
@@ -4961,82 +4961,48 @@ impl Engine {
                 })?
         };
 
-        // Steps 4–5 split by durability model (see `clustered` field docs and
-        // `specs/SEGMENT_CLUSTERING_DESIGN.md` §7.1):
-        //
-        // - STANDALONE: write the buffered image, THEN append a thin index-only
-        //   `Relocate` (recovery reads the record back from `new_offset`); crash
-        //   safety is the checkpoint barrier.
-        // - CLUSTERED: reorder WAL-first — journal a FAT, self-sufficient
-        //   `RelocateV2` (carrying the image) through the group-commit coordinator
-        //   so ONE coalesced redo fsync makes the mutation durable BEFORE the
-        //   (still buffered) data write. `replay_relocate_v2` re-writes the image
-        //   from the redo alone, so no data-device fsync is needed and the
-        //   in-place spend durability contract (durable-or-replicated before ack)
-        //   holds. Migration-baseline suppression (no committer) skips journaling
-        //   in both models identically — baseline data is re-drivable from source.
-        if self.clustered() {
-            // 4c (WAL-first). Journal the fat RelocateV2 + group-commit fsync
-            // BEFORE the data write. On journal failure nothing is durable — roll
-            // the speculative allocation back and fail.
-            if let Some(committer) = self.redo_committer_for_device(device_id) {
-                let record_bytes: std::sync::Arc<[u8]> =
-                    std::sync::Arc::from(&image[..reservation]);
-                committer
-                    .commit(vec![crate::redo::RedoOp::RelocateV2 {
-                        tx_key: *tx_key,
-                        device_id,
-                        record_offset: new_offset,
-                        utxo_count,
-                        record_bytes,
-                    }])
-                    .map_err(|e| {
-                        let mut alloc = self.allocator_for(device_id).lock();
-                        let _ = alloc.free(new_offset, record_size);
-                        SpendError::StorageError {
-                            detail: format!("relocate: journal RelocateV2: {e}"),
-                        }
-                    })?;
+        // 4. Write the relocated image at the new offset (RMW-safe for packed
+        // sub-block records, holding every covered block's write guard). BUFFERED
+        // in both durability models — see step 5.
+        io::write_record_bytes(&**self.device_for(device_id), new_offset, &image).map_err(|e| {
+            // Roll the speculative allocation back so a write failure does not leak
+            // the cursor advance.
+            let mut alloc = self.allocator_for(device_id).lock();
+            let _ = alloc.free(new_offset, record_size);
+            SpendError::StorageError {
+                detail: format!("relocate: write new image: {e}"),
             }
-            // 5c. Write the (buffered) image. Post-fsync the redo is
-            // self-sufficient, so a crash here is healed by `replay_relocate_v2`.
-            // A synchronous write error is a hard device fault; surface it but do
-            // NOT free the extent — the durable redo owns `new_offset` and will
-            // reconstruct the image on restart.
-            io::write_record_bytes(&**self.device_for(device_id), new_offset, &image).map_err(
-                |e| SpendError::StorageError {
-                    detail: format!("relocate: write new image (clustered): {e}"),
-                },
-            )?;
-        } else {
-            // 4. Write the relocated image at the new offset (RMW-safe for packed
-            // sub-block records, holding every covered block's write guard).
-            io::write_record_bytes(&**self.device_for(device_id), new_offset, &image).map_err(
-                |e| {
-                    // Roll the speculative allocation back so a write failure does
-                    // not leak the cursor advance.
-                    let mut alloc = self.allocator_for(device_id).lock();
-                    let _ = alloc.free(new_offset, record_size);
-                    SpendError::StorageError {
-                        detail: format!("relocate: write new image: {e}"),
-                    }
-                },
-            )?;
+        })?;
 
-            // 5. Journal the relocation intent (BUFFERED — see preconditions). No
-            // embedded bytes: recovery reads the record back from `new_offset`.
-            if let Some(log) = self.redo_log_for_device(device_id) {
-                log.lock()
-                    .append(crate::redo::RedoOp::Relocate {
-                        tx_key: *tx_key,
-                        device_id,
-                        record_offset: new_offset,
-                        utxo_count,
-                    })
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("relocate: journal Relocate: {e}"),
-                    })?;
-            }
+        // 5. Journal the relocation for recovery — STANDALONE only.
+        //
+        // STANDALONE segment relies on the thin index-only `Relocate` (recovery
+        // reads the record back from `new_offset`), made durable together with the
+        // data at the checkpoint barrier.
+        //
+        // CLUSTERED segment journals NOTHING here: the spend's convertible per-vout
+        // `RedoOp::SpendV2` — emitted WAL-first by the dispatch spend path
+        // (`handle_spend_batch`) and by the replica's post-apply journalling
+        // (`build_post_apply_redo_op`) — is the authoritative redo. It is
+        // replication-convertible AND self-sufficient for local recovery: on replay
+        // it re-applies the spend IN PLACE against the durable, append-only
+        // pre-spend record (append-only never overwrites the old extent until
+        // defrag), so a physical relocate redo would be redundant. A fat
+        // image-carrying redo would also be a redo-amplification and oversized-entry
+        // hazard. See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
+        if !self.clustered()
+            && let Some(log) = self.redo_log_for_device(device_id)
+        {
+            log.lock()
+                .append(crate::redo::RedoOp::Relocate {
+                    tx_key: *tx_key,
+                    device_id,
+                    record_offset: new_offset,
+                    utxo_count,
+                })
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("relocate: journal Relocate: {e}"),
+                })?;
         }
 
         // 6. Re-point the index to the new offset, rebuilding ALL cached fields
@@ -11052,19 +11018,20 @@ mod tests {
     }
 
     #[test]
-    fn clustered_relocate_journals_fat_relocate_v2_wal_first() {
+    fn clustered_relocate_journals_nothing_spendv2_is_the_redo() {
         use crate::redo::{RedoLog, RedoOp};
 
-        let (engine, _dev, key, meta, slots, _old) = seg_engine_with_record();
+        let (engine, dev, key, meta, slots, _old) = seg_engine_with_record();
 
-        // Attach a redo log (→ group-commit committers) and declare clustered so
-        // the relocate takes the WAL-first, fat-RelocateV2 branch.
+        // Attach a redo log and declare clustered. A clustered relocate must
+        // journal NOTHING itself — the spend's convertible per-vout SpendV2
+        // (emitted by the dispatch / replica caller) is the authoritative redo, so
+        // `relocate_record` neither writes a thin Relocate nor a fat RelocateV2.
         let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
         engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
         engine.set_clustered(true);
 
-        // A real spend shape: flip slot 1 SPENT + bump the spend bookkeeping.
         let mut new_meta = meta;
         new_meta.spent_utxos = 1;
         new_meta.generation = 9;
@@ -11075,58 +11042,26 @@ mod tests {
             .relocate_record(0, &key, &new_meta, &[(1, spent_slot)])
             .unwrap();
 
-        // The committer's group-commit already fsync'd the redo (WAL-first), so a
-        // fresh reopen recovers a FAT RelocateV2 — carrying the image, NOT the thin
-        // index-only Relocate. Prove the embedded image is self-sufficient: its
-        // metadata + spent slot match the mutation, so recovery needs no read-back.
-        let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
-        let entries = log2.recover().unwrap();
-        let v2 = entries
-            .iter()
-            .find_map(|e| match &e.op {
-                RedoOp::RelocateV2 {
-                    tx_key,
-                    device_id,
-                    record_offset,
-                    utxo_count,
-                    record_bytes,
-                } if *tx_key == key => Some((
-                    *device_id,
-                    *record_offset,
-                    *utxo_count,
-                    record_bytes.clone(),
-                )),
-                _ => None,
-            })
-            .expect("clustered relocate must journal a fat RelocateV2");
-        assert_eq!(v2.0, 0, "device_id");
-        assert_eq!(v2.1, new_offset, "record_offset == the new append offset");
-        assert_eq!(v2.2, 4, "utxo_count");
-
-        // The embedded image is the exact bytes written at new_offset (the spend
-        // baked in): metadata footer + spent slot 1 are recoverable from the redo
-        // alone.
-        let img_meta = TxMetadata::from_bytes(&v2.3[..METADATA_SIZE]).unwrap();
-        assert_eq!({ img_meta.tx_id }, key.txid);
-        assert_eq!({ img_meta.spent_utxos }, 1);
-        assert_eq!({ img_meta.generation }, 9);
-        let slot1_off = METADATA_SIZE + UTXO_SLOT_SIZE;
-        let img_slot1 = UtxoSlot::from_bytes(&v2.3[slot1_off..slot1_off + UTXO_SLOT_SIZE]).unwrap();
-        assert_eq!(img_slot1.status, UTXO_SPENT);
-        assert_eq!(img_slot1.spending_data, spending_data);
-
-        // NO thin Relocate for this key — clustered emits the fat form only.
-        assert!(
-            !entries
-                .iter()
-                .any(|e| matches!(&e.op, RedoOp::Relocate { tx_key, .. } if *tx_key == key)),
-            "clustered relocate must NOT also journal a thin Relocate"
-        );
-
-        // Live index re-pointed to the new offset (identical to standalone).
+        // The relocate still MOVES the record + bakes in the spend on the device.
+        let s = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        assert_eq!(s[1].status, UTXO_SPENT);
+        assert_eq!(s[1].spending_data, spending_data);
         let entry = engine.lookup(&key).unwrap();
         assert_eq!(entry.record_offset, new_offset);
         assert_eq!(entry.generation, 9);
+
+        // But it journaled NOTHING for this key — no Relocate, no RelocateV2.
+        engine.flush_all_redo().unwrap();
+        let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert!(
+            !entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::Relocate { tx_key, .. } | RedoOp::RelocateV2 { tx_key, .. }
+                    if *tx_key == key
+            )),
+            "clustered relocate must journal no relocate redo — SpendV2 is the redo"
+        );
     }
 
     #[test]

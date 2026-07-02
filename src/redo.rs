@@ -768,19 +768,19 @@ pub enum RedoOp {
         /// Number of UTXO slots in the record.
         utxo_count: u32,
     },
-    /// Self-sufficient record relocation (clustered segment engine): like
-    /// [`RedoOp::Relocate`], but carries the FULL relocated record image so the
-    /// redo is durable-on-its-own — recovery re-writes `record_bytes` at
-    /// `record_offset` rather than reading the (possibly-not-yet-flushed) device
-    /// back. This is the fat sibling of `Relocate` exactly as [`RedoOp::Create`]
-    /// is the fat sibling of [`RedoOp::CreateV2`].
+    /// RETIRED — no longer emitted by any code path (unreleased; safe to remove
+    /// in a follow-up). Superseded by the convertible per-vout `RedoOp::SpendV2`,
+    /// which is now the authoritative redo for a CLUSTERED segment spend: it is
+    /// replication-convertible (a fat physical relocate is not) AND self-sufficient
+    /// for local recovery (it replays the spend in place against the durable,
+    /// append-only pre-spend record). The variant + [`crate::recovery`] replay are
+    /// retained only so any legacy in-flight redo still decodes; the round-trip and
+    /// replay tests keep it honest. See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
     ///
-    /// Emitted only when the store is clustered: a clustered segment spend must
-    /// be WAL-first (fsynced before the `ReplicaOp` ships and before the client
-    /// ack), and the buffered data write to `record_offset` may not be durable
-    /// at that point — so the image rides in the redo. A standalone segment
-    /// store keeps the thin index-only `Relocate` + checkpoint-only durability
-    /// (unchanged, maximally fast). See `specs/SEGMENT_CLUSTERING_DESIGN.md` §7.1.
+    /// Self-sufficient record relocation: like [`RedoOp::Relocate`], but carries
+    /// the FULL relocated record image so the redo is durable-on-its-own —
+    /// recovery re-writes `record_bytes` at `record_offset` rather than reading the
+    /// (possibly-not-yet-flushed) device back.
     ///
     /// Wire layout (after the type byte): `tx_key[32] | device_id[1] |
     /// record_offset[8 LE] | utxo_count[4 LE] | record_len[4 LE] |

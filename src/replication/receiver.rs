@@ -2066,18 +2066,14 @@ fn build_post_apply_redo_op(
             block_height_retention,
             ..
         } => {
-            // Segment (log-structured) replica: `engine.spend()` RELOCATED the
-            // record and journaled the relocation (fat `RelocateV2` when clustered)
-            // INSIDE apply, so there is no post-apply redo to add here — emitting a
-            // `SpendV2` would replay an in-place RMW against the moved (now-dead)
-            // offset on recovery. Only the in-place engine needs the post-apply
-            // `SpendV2` (its apply did an in-place slot+metadata write).
-            if engine
-                .lookup(tx_key)
-                .is_some_and(|e| engine.store_is_log_structured(e.device_id))
-            {
-                return Ok(None);
-            }
+            // BOTH engines journal a post-apply `SpendV2`. In-place applied the
+            // spend with an in-place slot+metadata write; the SEGMENT replica
+            // RELOCATED the record but journals NOTHING inside `relocate_record`
+            // (clustered) — so `SpendV2` is its authoritative local redo, exactly
+            // as on the master's dispatch path. On recovery a segment `SpendV2`
+            // replays the spend IN PLACE against the durable append-only pre-spend
+            // record (idempotent; the spent counter is recomputed from the slots),
+            // reconstructing the spend without needing the record's new offset.
             let meta = match engine.read_metadata(tx_key) {
                 Ok(m) => m,
                 Err(_) => return Ok(None),
@@ -2802,11 +2798,13 @@ mod tests {
     }
 
     #[test]
-    fn segment_replica_spend_relocates_and_emits_no_post_apply_spendv2() {
-        // Phase 2: on a log-structured replica, applying a logical `ReplicaOp::Spend`
-        // RELOCATES the record (mirroring the master) and journals the relocate
-        // INSIDE apply, so the post-apply redo builder must emit NOTHING — a
-        // SpendV2 here would replay an in-place RMW against the moved offset.
+    fn segment_replica_spend_relocates_and_emits_post_apply_spendv2() {
+        // On a log-structured replica, applying a logical `ReplicaOp::Spend`
+        // RELOCATES the record (mirroring the master) but journals NOTHING inside
+        // `relocate_record` — so the post-apply builder emits the convertible,
+        // self-sufficient `SpendV2`, exactly as the in-place engine does. That
+        // SpendV2 is the replica's authoritative local redo (on recovery it
+        // replays the spend in place against the durable pre-spend record).
         let engine = make_seg_engine_clustered();
         assert!(
             engine.redo_log().is_some(),
@@ -2829,13 +2827,6 @@ mod tests {
 
         apply_op(&engine, &op).unwrap();
 
-        // No post-apply SpendV2 — the relocate was journaled during apply.
-        let post = build_post_apply_redo_op(&engine, &op).unwrap();
-        assert!(
-            post.is_none(),
-            "segment replica Spend must not emit a post-apply SpendV2, got {post:?}"
-        );
-
         // Apply relocated the record and flipped slot 1 SPENT.
         let new = engine.lookup(&k).unwrap().record_offset;
         assert_ne!(new, old, "replica spend must relocate on a segment store");
@@ -2843,12 +2834,21 @@ mod tests {
         assert_eq!(slot.status, UTXO_SPENT);
         assert_eq!(slot.spending_data[0], 0x5A);
 
-        // Contrast: an IN-PLACE replica still emits the post-apply SpendV2.
+        // The post-apply redo is a SpendV2 for the spent vout (convertible +
+        // self-sufficient), NOT a physical relocate op.
+        let post = build_post_apply_redo_op(&engine, &op).unwrap();
+        match post {
+            Some(crate::redo::RedoOp::SpendV2 { tx_key, offset, .. }) => {
+                assert_eq!(tx_key, k);
+                assert_eq!(offset, 1);
+            }
+            other => panic!("segment replica Spend must emit a post-apply SpendV2, got {other:?}"),
+        }
+
+        // Same shape for an in-place replica — the engines are symmetric here.
         let inplace = make_engine();
         create_record(&inplace, k, 4);
         apply_op(&inplace, &op).unwrap();
-        // in-place has no redo log attached here → build returns None for the wrong
-        // reason; attach one to make the contrast meaningful.
         let log_dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();

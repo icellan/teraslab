@@ -5201,129 +5201,16 @@ mod tests {
         assert_eq!({ m.spent_utxos }, 1);
     }
 
-    /// Remediation (SEGMENT_CLUSTERING_DESIGN): a CLUSTERED segment spend now
-    /// journals BOTH the convertible per-vout `SpendV2` (Phase-3, WAL-first, the
-    /// only op the replication machinery can convert) AND the authoritative
-    /// `RelocateV2` (apply-phase). On replay the earlier-sequenced `SpendV2`
-    /// applies the spend IN PLACE at the pre-spend offset, then the later
-    /// `RelocateV2` re-writes the authoritative image at the new offset and
-    /// re-points the index. Prove the two CONVERGE to the relocated spent record
-    /// (the double redo does not double-count or corrupt).
+    /// The CLUSTERED-segment spend recovery path (SEGMENT_CLUSTERING_DESIGN): a
+    /// clustered segment spend's ONLY redo is the convertible per-vout `SpendV2`
+    /// (the `relocate_record` move journals nothing). On recovery that `SpendV2`
+    /// must reconstruct the spend IN PLACE against the durable, append-only
+    /// pre-spend record — reusing the exact in-place `replay_spend` path. This is
+    /// also the invariant that keeps the durable replication intent (the SpendV2
+    /// range) consistent with local state: a crash-between-apply-and-ship re-ships
+    /// the SpendV2 to replicas, so the master MUST also have applied it locally.
     #[test]
-    fn clustered_segment_spendv2_then_relocatev2_converge() {
-        let mut h = RecoveryTestHarness::new();
-        let utxo_count = 4u32;
-        let mut txid = [0u8; 32];
-        txid[0] = 0x62;
-        let key = TxKey { txid };
-        let rec_size = TxMetadata::record_size_for(utxo_count);
-        let slot_hashes: Vec<[u8; 32]> = (0..utxo_count)
-            .map(|i| {
-                let mut hh = [0u8; 32];
-                hh[0] = i as u8;
-                hh
-            })
-            .collect();
-
-        // Pre-spend record at off1 (indexed, generation 1, nothing spent).
-        let off1 = h.alloc.allocate(rec_size).unwrap();
-        let mut meta = TxMetadata::new(utxo_count);
-        meta.tx_id = txid;
-        meta.generation = 1;
-        let slots: Vec<UtxoSlot> = slot_hashes
-            .iter()
-            .map(|h| UtxoSlot::new_unspent(*h))
-            .collect();
-        io::write_full_record(&*h.data_dev, off1, &meta, &slots).unwrap();
-        h.index
-            .register(
-                key,
-                TxIndexEntry {
-                    device_id: 0,
-                    record_offset: off1,
-                    utxo_count,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 1,
-                },
-            )
-            .unwrap();
-
-        // Relocated authoritative image (vout 1 spent, generation 2) at off2.
-        let off2 = h.alloc.allocate(rec_size).unwrap();
-        assert_ne!(off1, off2);
-        let spending_data = [0xABu8; 36];
-        let image: Vec<u8> = {
-            let scratch: Arc<dyn BlockDevice> =
-                Arc::new(crate::device::MemoryDevice::new(1 << 20, 4096).unwrap());
-            let mut m2 = TxMetadata::new(utxo_count);
-            m2.tx_id = txid;
-            m2.generation = 2;
-            m2.spent_utxos = 1;
-            let mut s2 = slots.clone();
-            s2[1] = UtxoSlot::new_spent(slot_hashes[1], spending_data);
-            io::write_full_record(&*scratch, 0, &m2, &s2).unwrap();
-            let aligned = (rec_size as usize).div_ceil(4096) * 4096;
-            let mut buf = crate::device::AlignedBuf::new(aligned, 4096);
-            scratch.pread_exact_at(&mut buf, 0).unwrap();
-            buf[..rec_size as usize].to_vec()
-        };
-
-        // The additive pair, in emission order: SpendV2 (seq N) then RelocateV2.
-        let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SpendV2 {
-            tx_key: key,
-            offset: 1,
-            spending_data,
-            new_spent_count: 1,
-            current_block_height: 0,
-            block_height_retention: 0,
-            target_generation: 2,
-            updated_at: 0,
-            utxo_hash: Some(slot_hashes[1]),
-        })
-        .unwrap();
-        redo.append_and_flush(RedoOp::RelocateV2 {
-            tx_key: key,
-            device_id: 0,
-            record_offset: off2,
-            utxo_count,
-            record_bytes: Arc::from(image.as_slice()),
-        })
-        .unwrap();
-
-        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
-        assert_eq!(
-            stats.entries_replayed, 2,
-            "both SpendV2 and RelocateV2 replay"
-        );
-
-        // CONVERGENCE: the index points at the relocated off2 (RelocateV2 wins),
-        // the record is spent, generation 2, exactly one output spent.
-        let ie = h.index.lookup(&key).unwrap();
-        assert_eq!(
-            ie.record_offset, off2,
-            "RelocateV2 is authoritative: index re-points to the new offset"
-        );
-        assert_eq!(ie.generation, 2);
-        assert_eq!(ie.spent_utxos, 1);
-        let s = io::read_all_utxo_slots(&*h.data_dev, off2, utxo_count).unwrap();
-        assert_eq!(s[1].status, UTXO_SPENT);
-        assert_eq!(s[1].spending_data, spending_data);
-        assert_eq!(s[0].status, UTXO_UNSPENT);
-    }
-
-    /// Crash AFTER the WAL-first `SpendV2` fsync but BEFORE the apply-phase
-    /// `RelocateV2` became durable: the `SpendV2` ALONE must reconstruct the
-    /// spend IN PLACE against the durable pre-spend record. This is the invariant
-    /// that keeps the durable replication intent (the SpendV2 range) consistent
-    /// with local state — a crash-between-apply-and-ship re-ships the SpendV2 to
-    /// replicas, so the master MUST also have applied it locally.
-    #[test]
-    fn clustered_segment_spendv2_alone_reconstructs_when_relocatev2_lost() {
+    fn clustered_segment_spendv2_reconstructs_spend_in_place() {
         let mut h = RecoveryTestHarness::new();
         let utxo_count = 4u32;
         let mut txid = [0u8; 32];
@@ -5362,8 +5249,8 @@ mod tests {
             )
             .unwrap();
 
-        // Only the SpendV2 is durable — the RelocateV2 was lost with the buffered
-        // tail.
+        // The clustered segment spend's sole redo: the convertible SpendV2 (the
+        // relocate move journals nothing).
         let spending_data = [0xCDu8; 36];
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SpendV2 {
@@ -5391,7 +5278,7 @@ mod tests {
         let ie = h.index.lookup(&key).unwrap();
         assert_eq!(
             ie.record_offset, off1,
-            "no RelocateV2 → record stays at off1"
+            "SpendV2 replays in place → record stays at off1"
         );
         let m = io::read_metadata(&*h.data_dev, off1).unwrap();
         assert_eq!({ m.spent_utxos }, 1, "device record reconstructed as spent");
