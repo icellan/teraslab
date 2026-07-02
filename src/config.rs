@@ -226,6 +226,26 @@ pub enum ConfigError {
         device_alignment: usize,
     },
 
+    /// The segment engine was selected (explicitly or by default) with an
+    /// unusable `segment_size` — zero or not a multiple of `device_alignment`.
+    ///
+    /// Rejected at config load so a bad value fails before allocator init,
+    /// instead of surfacing from inside the allocator mid-startup. Data-region
+    /// fit is NOT checked here (device size is unknown at config load) — the
+    /// allocator still owns that check
+    /// ([`crate::allocator::AllocatorError::InvalidSegmentSize`]).
+    #[error(
+        "[storage] segment_size = {segment_size} is invalid for the segment engine: \
+         must be a positive multiple of device_alignment ({device_alignment}); \
+         the default is 8388608 (8 MiB)"
+    )]
+    SegmentSizeInvalid {
+        /// The rejected segment size (bytes).
+        segment_size: u64,
+        /// Configured device alignment (bytes).
+        device_alignment: usize,
+    },
+
     /// `advertise_addr` does not parse as `host:port` (only checked when set).
     /// See F-G10-013.
     #[error(
@@ -1830,6 +1850,23 @@ impl ServerConfig {
         // non-power-of-2 `lock_stripes` produced cryptic runtime panics.
         self.validate_sizes()?;
 
+        // Segment engine needs a usable segment_size — zero or misaligned
+        // values die inside the allocator with a startup-fatal error, so
+        // fail them here at config load with a message naming the key.
+        // Placed after validate_sizes so device_alignment != 0 (safe modulo).
+        if self.storage.engine == StorageEngine::Segment
+            && (self.storage.segment_size == 0
+                || !self
+                    .storage
+                    .segment_size
+                    .is_multiple_of(self.device_alignment as u64))
+        {
+            return Err(ConfigError::SegmentSizeInvalid {
+                segment_size: self.storage.segment_size,
+                device_alignment: self.device_alignment,
+            });
+        }
+
         // (1) + (2): listen_addr.
         let listen_ip =
             parse_bind_host(&self.listen_addr).map_err(|e| ConfigError::InvalidListenAddr {
@@ -2509,6 +2546,71 @@ backend = ""
         let cfg: ServerConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.storage.engine, StorageEngine::Segment);
         assert_eq!(cfg.storage.segment_size, 8 * 1024 * 1024, "default 8 MiB");
+    }
+
+    #[test]
+    fn segment_engine_with_zero_segment_size_is_rejected() {
+        // Explicit segment_size = 0 must fail loudly at config load, before
+        // allocator init — not deep in the allocator as a cryptic error.
+        let cfg = ServerConfig {
+            storage: StorageConfig {
+                segment_size: 0,
+                ..StorageConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        match cfg.validate_safe_defaults() {
+            Err(ConfigError::SegmentSizeInvalid { segment_size, .. }) => {
+                assert_eq!(segment_size, 0);
+            }
+            other => panic!("expected SegmentSizeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_engine_with_misaligned_segment_size_is_rejected() {
+        let cfg = ServerConfig {
+            storage: StorageConfig {
+                segment_size: 8 * 1024 * 1024 + 1,
+                ..StorageConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        match cfg.validate_safe_defaults() {
+            Err(ConfigError::SegmentSizeInvalid {
+                segment_size,
+                device_alignment,
+            }) => {
+                assert_eq!(segment_size, 8 * 1024 * 1024 + 1);
+                assert_eq!(device_alignment, 4096, "default alignment");
+            }
+            other => panic!("expected SegmentSizeInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_place_engine_ignores_segment_size() {
+        // segment_size is documented as ignored by "in_place" — the gate must
+        // not fire for it (pre-c0dd2eb configs may carry stale values).
+        let cfg = ServerConfig {
+            storage: StorageConfig {
+                engine: StorageEngine::InPlace,
+                segment_size: 0,
+                ..StorageConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        cfg.validate_safe_defaults()
+            .expect("in_place must not validate segment_size");
+    }
+
+    #[test]
+    fn default_config_passes_safe_defaults_validation() {
+        // The absent-[storage] default (segment engine, 8 MiB) must validate —
+        // the whole point of this fix.
+        ServerConfig::default()
+            .validate_safe_defaults()
+            .expect("default config must validate");
     }
 
     #[test]
