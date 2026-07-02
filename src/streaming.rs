@@ -204,8 +204,15 @@ impl BlockDevice for StreamingWriteDevice {
                 st.buf.extend_from_slice(&buf[overlap..]);
             }
         } else if offset + len as u64 <= st.base {
-            // Mutation of an already-flushed record — write through.
-            self.inner.pwrite_all_at(buf, offset)?;
+            // Mutation of an already-flushed record — write through. O_DIRECT
+            // requires a block-aligned buffer ADDRESS; the caller's `buf` is a
+            // plain slice with no alignment guarantee, so bounce it through an
+            // `AlignedBuf` before the inner write (mirroring `flush_head`). Passing
+            // `buf` directly fails on a real O_DIRECT device (and on runners whose
+            // allocator hands back an unaligned `Vec`).
+            let mut bounce = AlignedBuf::new(len, self.block_size);
+            bounce[..len].copy_from_slice(buf);
+            self.inner.pwrite_all_at(&bounce, offset)?;
         } else {
             // Genuinely discontiguous (a gap above the tail = segment-boundary
             // cursor jump, or a backward straddle below `base`): flush what we
@@ -551,7 +558,7 @@ mod tests {
         let err = dev.pwrite(&blk(1), 100).unwrap_err();
         assert!(matches!(err, DeviceError::AlignmentViolation { .. }));
         // Length not a block multiple.
-        let err = dev.pwrite(&vec![0u8; 100], 0).unwrap_err();
+        let err = dev.pwrite(&[0u8; 100], 0).unwrap_err();
         assert!(matches!(err, DeviceError::AlignmentViolation { .. }));
     }
 

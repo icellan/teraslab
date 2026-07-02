@@ -4922,16 +4922,28 @@ fn handle_spend_batch(
         let transition_offsets: std::collections::HashSet<u32> =
             prepared.transitions().iter().map(|(off, _)| *off).collect();
 
-        // Segment (log-structured) store: the spend RELOCATES the record, and
-        // `PreparedSpend::apply_locked` journals a single `RedoOp::Relocate` for
-        // the whole group at apply time (buffered, carrying the new append-cursor
-        // offset that is only known once allocated). So this store must NOT also
-        // emit the in-place per-slot `SpendV2` WAL-first redo — replaying a
-        // `SpendV2` against a relocated record would RMW the stale (now-dead)
-        // offset. Replication is likewise skipped: the segment engine is
-        // non-clustered in v1 (`validate_cluster_safety`), so there are no
-        // replicas to feed. The in-place store keeps the exact prior behaviour.
+        // Segment (log-structured) store: the spend RELOCATES the record in
+        // `PreparedSpend::apply_locked`. For a CLUSTERED segment store the
+        // authoritative redo is the per-vout `SpendV2` we emit here, WAL-first in
+        // Phase 3, EXACTLY like the in-place engine — the relocate move itself
+        // journals nothing. `SpendV2` is the only redo op the replication machinery
+        // can convert to a `ReplicaOp` (`redo_entry_to_replica_op`), and it is what
+        // the durable replication-intent tracker (`write_replicated_redo_ops`), the
+        // startup / lag catch-up, and the migration delta all read. Without it, a
+        // segment spend applied locally but not yet shipped (crash between apply and
+        // Phase-5 replicate) could never be re-driven — leaving master SPENT /
+        // replica UNSPENT permanently (double-spend on failover). It is also
+        // self-sufficient for LOCAL recovery: on replay it re-applies the spend in
+        // place against the durable, append-only pre-spend record (idempotent;
+        // recomputes the spent counter from the slots), so no physical relocate redo
+        // is needed.
+        //
+        // STANDALONE segment (not clustered) emits NEITHER `SpendV2` nor a replica
+        // op — it has no replicas and relies solely on the thin `Relocate` its
+        // `relocate_record` journals for recovery (the shipped v0.8.0 behaviour,
+        // unchanged).
         let log_structured = engine.store_is_log_structured(prepared.device_id);
+        let emit_spend_v2 = !log_structured || engine.clustered();
 
         let mut key_repl_ops: Vec<ReplicaOp> = Vec::new();
         let mut running_count = pre_spent_count;
@@ -4941,7 +4953,7 @@ fn handle_spend_batch(
                 // re-spends do not emit redo/replication or bump generation;
                 // they match the single-spend no-op contract.
                 running_count = running_count.wrapping_add(1);
-                if !log_structured {
+                if emit_spend_v2 {
                     out.redo_ops.push(RedoOp::SpendV2 {
                         tx_key: key,
                         offset: item.vout,
@@ -4955,15 +4967,15 @@ fn handle_spend_batch(
                         // rebuild a CRC-failing spent slot from this intent.
                         utxo_hash: Some(item.utxo_hash),
                     });
-                    key_repl_ops.push(ReplicaOp::Spend {
-                        tx_key: key,
-                        offset: item.vout,
-                        spending_data: item.spending_data,
-                        current_block_height: params.current_block_height,
-                        block_height_retention: params.block_height_retention,
-                        master_generation: post_generation,
-                    });
                 }
+                key_repl_ops.push(ReplicaOp::Spend {
+                    tx_key: key,
+                    offset: item.vout,
+                    spending_data: item.spending_data,
+                    current_block_height: params.current_block_height,
+                    block_height_retention: params.block_height_retention,
+                    master_generation: post_generation,
+                });
             }
         }
 

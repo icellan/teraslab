@@ -217,8 +217,9 @@ impl Harness {
     /// Reconstruct the engine through the real recovery pipeline after a
     /// crash and return a fresh engine to inspect final state.
     fn recover(&self) -> Arc<Engine> {
-        let mut alloc =
-            SlotAllocator::recover(self.data_dev.clone() as Arc<dyn BlockDevice>).unwrap();
+        let mut alloc: teraslab::allocator::BoxedAllocator = Box::new(
+            SlotAllocator::recover(self.data_dev.clone() as Arc<dyn BlockDevice>).unwrap(),
+        );
         let primary = PrimaryBackend::rebuild(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         // Recovery now operates on a `ShardedIndex` (interior RwLocks, `&self`).
         // Wrap the rebuilt single backend as a one-shard index — identical
