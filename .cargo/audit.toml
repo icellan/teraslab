@@ -1,0 +1,24 @@
+# cargo-audit configuration (see ci.yml "Cargo audit" step — F-X-010).
+# Policy: bump or replace when possible; a documented ignore is the last
+# resort and must carry a justification + revisit condition.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0194 + RUSTSEC-2026-0195: quick-xml 0.26.0 parsing DoS
+    # (quadratic duplicate-attribute check; unbounded NsReader namespace
+    # allocation). Patched only in quick-xml >= 0.41.0, which is unreachable
+    # for us: quick-xml comes in solely via pprof -> inferno 0.11 (pprof
+    # pins inferno ^0.11 even at pprof 0.15, and inferno 0.11 pins
+    # quick-xml 0.26).
+    #
+    # Not exploitable in this tree: both advisories require parsing
+    # attacker-controlled XML. Our only use is inferno's flamegraph SVG
+    # *generation* (quick-xml Writer) from in-process profiler samples on
+    # the admin-token-gated, single-flight /debug/pprof/profile endpoint —
+    # no untrusted XML is ever parsed.
+    #
+    # Revisit when pprof moves to inferno >= 0.12 (quick-xml >= 0.41):
+    # remove these ignores and `cargo update`.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
