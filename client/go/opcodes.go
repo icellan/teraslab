@@ -182,6 +182,18 @@ const (
 	// individual metadata field bits if set.
 	FieldRawMetadata uint32 = 1 << 23
 
+	// FieldBlockEntriesAll returns the COMPLETE block-entry set — the inline
+	// entries PLUS every on-device overflow entry — uncapped. The wire shape
+	// matches FieldBlockEntries ([count:1] then count × 12-byte entries) but
+	// every entry is present, so BlockEntriesTruncated is always false.
+	//
+	// Request this (instead of FieldBlockEntries) when a transaction may be
+	// mined into more than MaxInlineBlockEntries blocks (e.g. deep-reorg
+	// block-membership queries) and the full set is required. It is a heavier
+	// field than FieldBlockEntries (an extra device read when overflow
+	// exists), hence opt-in and NOT part of FieldAll. Issue #30.
+	FieldBlockEntriesAll uint32 = 1 << 25
+
 	// FieldAllMetadata selects all metadata fields (bits 0-18).
 	FieldAllMetadata uint32 = 0x0007_FFFF
 	// FieldAll includes all client-facing fields (bits 0-22, excludes FieldRawMetadata).

@@ -8492,6 +8492,33 @@ fn decorate_get_item(
                     data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
                 }
             }
+            if field_mask.has(FieldMask::BLOCK_ENTRIES_ALL) {
+                // Issue #30: emit the COMPLETE block-entry set (inline +
+                // overflow), uncapped. Wire shape matches BLOCK_ENTRIES —
+                // [count:u8] then `count` × 12-byte entries — but every entry
+                // is present. On an overflow-read failure, surface
+                // ERR_STORAGE_IO (like the other sub-read branches) rather
+                // than silently truncating the block-membership set.
+                match engine.read_all_block_entries(&key) {
+                    Ok(entries) => {
+                        // Frame the count from the entries actually emitted so
+                        // the wire count always matches the payload (self-
+                        // consistent even under a count/overflow divergence).
+                        // `entries.len()` is bounded by `block_entry_count`
+                        // (u8, <= 255), so the cast cannot truncate.
+                        data.push(entries.len() as u8);
+                        for be in &entries {
+                            data.extend_from_slice(&be.block_id.to_le_bytes());
+                            data.extend_from_slice(&be.block_height.to_le_bytes());
+                            data.extend_from_slice(&be.subtree_idx.to_le_bytes());
+                        }
+                    }
+                    Err(_) => {
+                        inner_read_failed = true;
+                        data.push(0u8);
+                    }
+                }
+            }
             if field_mask.has(FieldMask::CONFLICTING_CHILDREN) {
                 match engine.read_conflicting_children(&key) {
                     Ok(children) => {
@@ -13141,6 +13168,186 @@ mod tests {
         assert!(
             block_entry_count > 0,
             "block_entry_count should be > 0 after SetMined, got {block_entry_count}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #30: BLOCK_ENTRIES_ALL returns the complete inline+overflow set.
+    // -----------------------------------------------------------------------
+
+    /// SetMined `txid` into each of `block_ids` (one SetMined request per
+    /// distinct block), so the record accumulates one block entry per id.
+    fn set_mined_into_blocks(h: &DispatchTestHarness, txid: [u8; 32], block_ids: &[u32]) {
+        for (i, &block_id) in block_ids.iter().enumerate() {
+            let params = SetMinedBatchParams {
+                block_id,
+                block_height: 1000 + i as u32,
+                subtree_idx: i as u32,
+                on_longest_chain: true,
+                unset_mined: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            };
+            let resp = h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&params, &[txid]));
+            assert_eq!(
+                resp.status, STATUS_OK,
+                "SetMined into block {block_id} failed"
+            );
+        }
+    }
+
+    /// Decode a BLOCK_ENTRIES/BLOCK_ENTRIES_ALL section: `[count:u8]` then
+    /// the entries actually present on the wire (each 12 bytes). Returns the
+    /// declared count and the decoded `(block_id, block_height, subtree_idx)`
+    /// tuples.
+    fn decode_block_entries_section(data: &[u8]) -> (u8, Vec<(u32, u32, u32)>) {
+        let count = data[0];
+        let mut pos = 1;
+        let mut out = Vec::new();
+        while pos + 12 <= data.len() {
+            let bid = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            let bh = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+            let si = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap());
+            out.push((bid, bh, si));
+            pos += 12;
+        }
+        (count, out)
+    }
+
+    #[test]
+    fn dispatch_block_entries_all_returns_full_overflow_set() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(80);
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+
+        // Mine into 5 distinct blocks (> INLINE_BLOCK_ENTRIES == 3), so two
+        // entries land in on-device overflow.
+        let block_ids = [10u32, 20, 30, 40, 50];
+        set_mined_into_blocks(&h, txid, &block_ids);
+
+        // BLOCK_ENTRIES_ALL returns all 5 entries in inline-then-overflow order.
+        let resp = h.request(
+            OP_GET_BATCH,
+            encode_get_batch(FieldMask::BLOCK_ENTRIES_ALL, &[txid]),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = decode_get_response(&resp.payload).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, 0, "expected OK status, no truncation");
+        let (count, entries) = decode_block_entries_section(&results[0].data);
+        assert_eq!(count, 5, "declared count should be 5");
+        assert_eq!(
+            entries.len(),
+            5,
+            "all 5 entries must be present on the wire"
+        );
+        // Inline slots 0..3 fill in insertion order; overflow appends 4th/5th.
+        let expected: Vec<(u32, u32, u32)> = block_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &bid)| (bid, 1000 + i as u32, i as u32))
+            .collect();
+        assert_eq!(
+            entries, expected,
+            "block entries must match id/height/subtree in insertion order"
+        );
+
+        // Old BLOCK_ENTRIES field still declares count=5 but ships only 3.
+        let resp = h.request(
+            OP_GET_BATCH,
+            encode_get_batch(FieldMask::BLOCK_ENTRIES, &[txid]),
+        );
+        assert_eq!(resp.status, STATUS_OK);
+        let results = decode_get_response(&resp.payload).unwrap();
+        let (count, entries) = decode_block_entries_section(&results[0].data);
+        assert_eq!(count, 5, "BLOCK_ENTRIES still declares the true count 5");
+        assert_eq!(
+            entries.len(),
+            3,
+            "BLOCK_ENTRIES must remain capped at 3 inline (backward-compat)"
+        );
+        assert_eq!(
+            entries,
+            expected[..3].to_vec(),
+            "the 3 inline entries must be the first three"
+        );
+    }
+
+    #[test]
+    fn dispatch_block_entries_all_matches_block_entries_when_under_cap() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(81);
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+
+        // Only 2 blocks (<= INLINE_BLOCK_ENTRIES): no overflow.
+        set_mined_into_blocks(&h, txid, &[7u32, 9]);
+
+        let all = {
+            let resp = h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::BLOCK_ENTRIES_ALL, &[txid]),
+            );
+            let results = decode_get_response(&resp.payload).unwrap();
+            assert_eq!(results[0].status, 0);
+            results[0].data.clone()
+        };
+        let inline = {
+            let resp = h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::BLOCK_ENTRIES, &[txid]),
+            );
+            let results = decode_get_response(&resp.payload).unwrap();
+            assert_eq!(results[0].status, 0);
+            results[0].data.clone()
+        };
+        assert_eq!(
+            all, inline,
+            "with <= 3 entries the two fields must produce byte-identical sections"
+        );
+        let (count, entries) = decode_block_entries_section(&all);
+        assert_eq!(count, 2);
+        assert_eq!(entries, vec![(7, 1000, 0), (9, 1001, 1)]);
+    }
+
+    #[test]
+    fn engine_read_all_block_entries_inline_and_overflow() {
+        let h = DispatchTestHarness::new();
+
+        // Case 1: count <= 3 → only inline entries, no overflow read.
+        let txid_small = DispatchTestHarness::make_txid(82);
+        assert_eq!(h.create_tx(txid_small, 2).status, STATUS_OK);
+        set_mined_into_blocks(&h, txid_small, &[100u32, 200]);
+        let entries = h
+            .engine
+            .read_all_block_entries(&TxKey { txid: txid_small })
+            .expect("read_all_block_entries should succeed for inline-only record");
+        let got: Vec<(u32, u32, u32)> = entries
+            .iter()
+            .map(|e| (e.block_id, e.block_height, e.subtree_idx))
+            .collect();
+        assert_eq!(got, vec![(100, 1000, 0), (200, 1001, 1)]);
+
+        // Case 2: count > 3 → inline + overflow, in insertion order.
+        let txid_big = DispatchTestHarness::make_txid(83);
+        assert_eq!(h.create_tx(txid_big, 2).status, STATUS_OK);
+        let block_ids = [11u32, 22, 33, 44, 55, 66];
+        set_mined_into_blocks(&h, txid_big, &block_ids);
+        let entries = h
+            .engine
+            .read_all_block_entries(&TxKey { txid: txid_big })
+            .expect("read_all_block_entries should succeed for overflow record");
+        let got: Vec<(u32, u32, u32)> = entries
+            .iter()
+            .map(|e| (e.block_id, e.block_height, e.subtree_idx))
+            .collect();
+        let expected: Vec<(u32, u32, u32)> = block_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &bid)| (bid, 1000 + i as u32, i as u32))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "inline (0..3) then overflow (3..6) in insertion order"
         );
     }
 

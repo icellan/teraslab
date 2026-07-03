@@ -1118,6 +1118,26 @@ impl FieldMask {
     /// needs per-section hashing (deeper #20 work). Deliberately OUTSIDE
     /// [`Self::ALL`] (which already carries full `COLD_DATA`).
     pub const COLD_DATA_OUTPUTS: u32 = 1 << 24;
+    /// Include the COMPLETE block-entry set — inline entries PLUS every
+    /// on-device overflow entry — uncapped.
+    ///
+    /// Wire shape mirrors [`Self::BLOCK_ENTRIES`]: `[count:u8]` followed by
+    /// `count` × 12-byte entries. The difference is that ALL `count` entries
+    /// are emitted, not just the inline `min(count, 3)`. Use this when a
+    /// consumer needs the full block-membership set (e.g. reorg/rewind
+    /// decisions for a tx mined into more than
+    /// [`crate::record::INLINE_BLOCK_ENTRIES`] blocks after a deep reorg),
+    /// where the truncated [`Self::BLOCK_ENTRIES`] view is insufficient.
+    ///
+    /// This is a heavier field than [`Self::BLOCK_ENTRIES`]: when the record
+    /// has overflow entries it triggers an additional device read. It is
+    /// therefore deliberately OUTSIDE [`Self::ALL_METADATA`] and [`Self::ALL`]
+    /// (kept opt-in, matching how [`Self::COLD_DATA`] / [`Self::BLOCK_ENTRIES`]
+    /// sit outside `ALL_METADATA`).
+    ///
+    /// [`Self::BLOCK_ENTRIES`] remains byte-identical for old decoders; a
+    /// caller requests EITHER bit, never both.
+    pub const BLOCK_ENTRIES_ALL: u32 = 1 << 25;
 
     /// Convenience alias: all per-field metadata bits (bits 0-18).
     pub const ALL_METADATA: u32 = 0x0007_FFFF;
