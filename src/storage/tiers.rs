@@ -15,9 +15,13 @@ pub fn inline_cold_offset(utxo_count: u32) -> u64 {
 }
 
 /// Advisory inline-size guideline (IJ-3): cold data up to and including this
-/// serialized size (`<=` 8 KiB = 8192 bytes, i.e. 8180 bytes of user data
-/// plus the 12-byte `ColdData` length prefixes) is *recommended* to be stored
-/// inline in the same NVMe allocation as the hot record.
+/// serialized size (`<=` 1 MiB = 1_048_576 bytes) is *recommended* to be
+/// stored inline in the same NVMe allocation as the hot record.
+///
+/// This value matches the client default upload thresholds
+/// (`BlobUploadThreshold` in the Go client, `BLOB_UPLOAD_THRESHOLD` in the
+/// Rust client) so all documented sources agree on 1 MiB. The clients expose
+/// this as a configurable knob; this constant reflects their default.
 ///
 /// IMPORTANT: this threshold is **not consulted by the server write path**.
 /// Tier placement is client-driven via the `FLAG_EXTERNAL_BLOB` request flag
@@ -25,11 +29,12 @@ pub fn inline_cold_offset(utxo_count: u32) -> u64 {
 /// constant exists as a documented size guideline clients may use to decide
 /// whether to pre-upload a blob via the streaming protocol; the server honors
 /// whatever the client's flag says.
-pub const INLINE_THRESHOLD: usize = 8 * 1024; // 8 KiB, inclusive
+pub const INLINE_THRESHOLD: usize = 1024 * 1024; // 1 MiB, inclusive
 
 /// Which storage tier to use for the given serialized cold data size.
-/// Exactly [`INLINE_THRESHOLD`] bytes is still [`StorageTier::Inline`];
-/// above it, cold data goes to an external blob store.
+/// Exactly [`INLINE_THRESHOLD`] bytes (1 MiB, matching the client default
+/// `BlobUploadThreshold` / `BLOB_UPLOAD_THRESHOLD`) is still
+/// [`StorageTier::Inline`]; above it, cold data goes to an external blob store.
 ///
 /// Earlier phase documents described a middle "separate NVMe" tier. The
 /// production record metadata has no durable fields for a separate cold-data
@@ -174,17 +179,27 @@ mod tests {
     }
 
     #[test]
+    fn inline_threshold_is_one_mib() {
+        // Single source of truth: the advisory threshold matches the client
+        // default upload threshold (1 MiB).
+        assert_eq!(INLINE_THRESHOLD, 1024 * 1024);
+    }
+
+    #[test]
     fn tier_inline() {
         assert_eq!(tier_for_size(100), StorageTier::Inline);
         assert_eq!(tier_for_size(8000), StorageTier::Inline);
         assert_eq!(tier_for_size(INLINE_THRESHOLD), StorageTier::Inline);
+        // Explicit literal boundary: exactly 1 MiB is inline.
+        assert_eq!(tier_for_size(1024 * 1024), StorageTier::Inline);
     }
 
     #[test]
     fn tier_external() {
         // One past the inclusive inline boundary is the smallest External size.
         assert_eq!(tier_for_size(INLINE_THRESHOLD + 1), StorageTier::External);
-        assert_eq!(tier_for_size(500 * 1024), StorageTier::External);
+        // Explicit literal boundary: 1 MiB + 1 byte goes external.
+        assert_eq!(tier_for_size(1024 * 1024 + 1), StorageTier::External);
         assert_eq!(tier_for_size(320 * 1024 * 1024), StorageTier::External);
     }
 

@@ -74,6 +74,17 @@ const BLOB_UPLOAD_THRESHOLD: usize = 1024 * 1024; // 1 MiB
 /// Size of each chunk sent during blob upload.
 const BLOB_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
+/// Whether cold data of the given length must be externalised (pre-uploaded to
+/// the blob store) rather than inlined, for a given threshold.
+///
+/// Cold data strictly larger than `threshold` is externalised; data of exactly
+/// `threshold` bytes stays inline. Centralising this predicate keeps the two
+/// decision sites in `create_batch` in agreement and makes the boundary
+/// unit-testable without a live server.
+fn needs_external_upload(cold_len: usize, threshold: usize) -> bool {
+    cold_len > threshold
+}
+
 use crate::cluster::Cluster;
 use crate::pool::ConnPool;
 
@@ -112,6 +123,14 @@ pub struct ClientConfig {
     /// Applies to every `round_trip` on a pooled connection. Lower it for
     /// latency-sensitive callers; raise it for slow links.
     pub request_timeout: Duration,
+    /// Cold-data size (in bytes) strictly above which `create_batch`
+    /// pre-uploads the data to the external blob store via chunked streaming
+    /// instead of inlining it in the CREATE payload.
+    ///
+    /// Defaults to [`BLOB_UPLOAD_THRESHOLD`] (1 MiB). Tune it (e.g. from a
+    /// connection-URL query param) to change external placement without a
+    /// client release; the runtime default is unchanged at 1 MiB.
+    pub blob_upload_threshold: usize,
 }
 
 impl Default for ClientConfig {
@@ -125,6 +144,7 @@ impl Default for ClientConfig {
             addr_map: std::collections::HashMap::new(),
             cluster_secret: None,
             request_timeout: Duration::from_secs(30),
+            blob_upload_threshold: BLOB_UPLOAD_THRESHOLD,
         }
     }
 }
@@ -141,6 +161,9 @@ pub struct Client {
     /// Shared cluster secret for HMAC-signing inter-node opcodes (e.g.
     /// `OP_GET_PARTITION_MAP` in single-node mode). `None` means unsigned.
     cluster_secret: Option<Vec<u8>>,
+    /// Cold-data size above which `create_batch` externalises via blob upload.
+    /// Taken from `ClientConfig::blob_upload_threshold` (default 1 MiB).
+    blob_upload_threshold: usize,
     /// Kept alive for the cluster refresh task.
     _refresh_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -161,6 +184,7 @@ impl Client {
         // it to each `PipeConn`.
         let mut pool_config = cfg.pool;
         pool_config.request_timeout = cfg.request_timeout;
+        let blob_upload_threshold = cfg.blob_upload_threshold;
 
         if !cfg.seeds.is_empty() {
             let cl = Arc::new(
@@ -179,6 +203,7 @@ impl Client {
                 cluster: Some(cl),
                 pool: None,
                 cluster_secret: cfg.cluster_secret,
+                blob_upload_threshold,
                 _refresh_task: Some(refresh_task),
             })
         } else if let Some(addr) = cfg.addr {
@@ -187,6 +212,7 @@ impl Client {
                 cluster: None,
                 pool: Some(pool),
                 cluster_secret: cfg.cluster_secret,
+                blob_upload_threshold,
                 _refresh_task: None,
             })
         } else {
@@ -1360,8 +1386,10 @@ impl Client {
     /// In cluster mode, items are automatically grouped by txid shard and
     /// sent to the correct nodes in parallel.
     ///
-    /// Items with `cold_data` larger than `BLOB_UPLOAD_THRESHOLD` (1 MiB)
-    /// are automatically uploaded via chunked blob streaming before the
+    /// Items with `cold_data` larger than the configured
+    /// [`ClientConfig::blob_upload_threshold`] (default
+    /// [`BLOB_UPLOAD_THRESHOLD`], 1 MiB) are automatically uploaded via
+    /// chunked blob streaming before the
     /// CREATE request. The wire item is sent with empty `cold_data` and the
     /// [`FLAG_EXTERNAL_BLOB`] flag set so the server knows to fetch from
     /// the blobstore.
@@ -1372,9 +1400,10 @@ impl Client {
     /// on mixed success/failure, or [`ClientError::Connection`] on I/O failure.
     pub async fn create_batch(&self, items: &[CreateItem]) -> Result<BatchResult, ClientError> {
         // Check if any items need blob upload.
+        let threshold = self.blob_upload_threshold;
         let has_large_blobs = items
             .iter()
-            .any(|i| i.cold_data.len() > BLOB_UPLOAD_THRESHOLD);
+            .any(|i| needs_external_upload(i.cold_data.len(), threshold));
 
         if !has_large_blobs {
             // Fast path: no large blobs, send directly.
@@ -1396,7 +1425,7 @@ impl Client {
         let mut modified_items: Vec<CreateItem> = items.to_vec();
 
         for item in &mut modified_items {
-            if item.cold_data.len() > BLOB_UPLOAD_THRESHOLD {
+            if needs_external_upload(item.cold_data.len(), threshold) {
                 // Upload the blob via chunked streaming.
                 self.upload_blob(&item.txid, &item.cold_data).await?;
                 // Clear cold_data and set the EXTERNAL_BLOB flag.
@@ -2575,6 +2604,48 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         drop(socket);
         port
+    }
+
+    #[test]
+    fn default_blob_upload_threshold_is_one_mib() {
+        assert_eq!(BLOB_UPLOAD_THRESHOLD, 1024 * 1024);
+        assert_eq!(
+            ClientConfig::default().blob_upload_threshold,
+            1024 * 1024,
+            "default config threshold must be 1 MiB (no runtime change)"
+        );
+    }
+
+    #[test]
+    fn custom_threshold_selects_items_at_boundary() {
+        // At the default threshold, exactly 1 MiB stays inline and 1 MiB + 1
+        // is externalised.
+        assert!(!needs_external_upload(1024 * 1024, BLOB_UPLOAD_THRESHOLD));
+        assert!(needs_external_upload(
+            1024 * 1024 + 1,
+            BLOB_UPLOAD_THRESHOLD
+        ));
+
+        // A custom (smaller) threshold moves the boundary: exactly `threshold`
+        // stays inline, `threshold + 1` is externalised.
+        let custom = 100usize;
+        assert!(
+            !needs_external_upload(100, custom),
+            "item of exactly the threshold size stays inline"
+        );
+        assert!(
+            needs_external_upload(101, custom),
+            "item one byte over the threshold is externalised"
+        );
+
+        // Selecting from a batch: only items strictly over the threshold.
+        let lens = [0usize, 100, 101, 250];
+        let selected: Vec<usize> = lens
+            .iter()
+            .copied()
+            .filter(|&l| needs_external_upload(l, custom))
+            .collect();
+        assert_eq!(selected, vec![101, 250]);
     }
 
     #[test]
