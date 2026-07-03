@@ -680,15 +680,16 @@ pub struct StorageConfig {
     pub streaming: bool,
 }
 
-// Manual Default (not derived): the derived impl zeroed `segment_size`, and
-// ServerConfig's container-level `#[serde(default)]` fills an ABSENT
-// `[storage]` table from this impl — the field-level serde default only fires
-// when the table is present. Derived `Default` + segment-engine default made
-// every config without a `[storage]` section fatal at boot (c0dd2eb
-// regression). This impl must stay in lockstep with the field-level serde
-// defaults.
 impl Default for StorageConfig {
     fn default() -> Self {
+        // MUST match the per-field `#[serde(default = ...)]` attributes: when the
+        // whole `[storage]` section is absent from the config, serde uses THIS
+        // `Default` (via the struct-level `#[serde(default)]`) rather than the
+        // field-level defaults. In particular `segment_size` MUST be
+        // `default_segment_size()` (8 MiB), not 0 — a derived `Default` left it 0,
+        // which fails `SegmentAllocator::new` (InvalidSegmentSize) and, since
+        // `Segment` is the default engine, prevented a minimal-config node from
+        // starting at all.
         Self {
             packed: false,
             placement: crate::subdevice::PlacementStrategy::default(),
@@ -709,13 +710,14 @@ const fn default_segment_size() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StorageEngine {
     /// Best-fit freelist allocator (records placed at home offsets, updated in
-    /// place). Required for clustered/replicated nodes and for strict redo
-    /// durability (set `engine = "in_place"` explicitly for those).
+    /// place). Required for strict redo durability (set `engine = "in_place"`
+    /// explicitly for that).
     InPlace,
     /// Log-structured append-cursor allocator (creates append sequentially,
     /// spends relocate-on-write). The default: higher throughput and lower tail
-    /// latency on the standalone UTXO workload. Requires buffered redo
-    /// durability (now the default) and a non-clustered node.
+    /// latency on the UTXO workload. Requires buffered redo durability (now the
+    /// default). Clusters/replicates fine (a spend's replication is carried by the
+    /// convertible `SpendV2` — see `specs/SEGMENT_CLUSTERING_DESIGN.md`).
     #[default]
     Segment,
 }
@@ -1589,39 +1591,48 @@ impl ServerConfig {
     /// — the runtime signal emitted when RF > 1 best-effort is *not* in use
     /// but individual best-effort paths fall back because replicas ACK-failed.
     pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
-        // The log-structured segment engine is NON-CLUSTERED in v1: its spends
-        // relocate the record (a physical move) rather than journaling a logical
-        // op, so the redo entries cannot be converted to replica ops. Refuse to
-        // start a clustered / replicated node on the segment engine rather than
-        // silently dropping replication. (See increment 4 / the design doc.)
+        // The log-structured segment engine is CLUSTERABLE as of the segment
+        // clustering work (specs/SEGMENT_CLUSTERING_DESIGN.md). Replication is
+        // LOGICAL — the master ships a vout-based `ReplicaOp::Spend` (no offset)
+        // that the replica applies through its own `engine.spend()`, relocating to
+        // its own offset. Crash safety AND replication recovery both key off the
+        // convertible per-vout `RedoOp::SpendV2`, emitted WAL-first exactly like the
+        // in-place engine: it is what the durable replication-intent tracker,
+        // startup/lag catch-up, and migration delta convert to `ReplicaOp`s, and on
+        // local recovery it replays the spend in place against the durable,
+        // append-only pre-spend record. Durability under the (required) buffered
+        // mode below is the SAME as the in-place clustered default: replication
+        // quorum before ack, plus failover + rejoin-resync healing a crashed
+        // master's un-flushed tail. The former blanket refusal is therefore removed.
+        //
+        // STANDALONE segment requires BUFFERED redo durability. Its spend journals
+        // a thin `Relocate` (a buffered append that reads the record back from the
+        // new, still-buffered offset on replay), so under strict durability an acked
+        // spend whose buffered data write is lost on crash would be silently
+        // reverted — refuse it.
+        //
+        // CLUSTERED segment MAY use strict durability — this is the "true Option A"
+        // (fsync-before-ack / commit-to-device). Its authoritative spend redo is the
+        // self-sufficient `SpendV2` (fsync'd before ack via the group-commit
+        // coordinator; on replay it re-applies the spend IN PLACE against the
+        // pre-spend record), and under strict the create emits the fat, image-
+        // carrying `RedoOp::Create` (`dispatch.rs`, keyed on `redo_buffered()`), so
+        // the master's whole redo chain reconstructs every acked write from the redo
+        // ALONE — no acked write can be lost (master fsync-durable + quorum). The
+        // default remains buffered (replication-quorum durability); strict is the
+        // stronger opt-in.
+        let clustered = self.is_clustered() || self.replication_factor > 1;
         if self.storage.engine == StorageEngine::Segment
-            && (self.is_clustered() || self.replication_factor > 1)
+            && !self.redo_buffered_effective()
+            && !clustered
         {
-            return Err(format!(
-                "storage.engine = \"segment\" is not supported with clustering \
-                 (node_id = {}, replication_factor = {}): the log-structured engine \
-                 is non-clustered in v1. Use storage.engine = \"in_place\" for clustered \
-                 nodes, or run this node standalone (node_id = 0, replication_factor = 1).",
-                self.node_id, self.replication_factor,
-            ));
-        }
-        // The segment engine's spend journals its `Relocate` intent AFTER writing
-        // the relocated record (not WAL-first): the new append-cursor offset is
-        // only known once allocated during apply. Crash safety therefore relies on
-        // BUFFERED durability — the checkpoint barrier fsyncs every store's data
-        // device before reclaiming any redo prefix, so the relocated image, its
-        // `Relocate` redo, and the old-extent dead-mark become durable together (a
-        // crash before the barrier loses all three and leaves the pre-relocation
-        // record intact). Under STRICT durability that ordering is not guaranteed,
-        // so refuse to start rather than silently weaken the crash contract.
-        if self.storage.engine == StorageEngine::Segment && !self.redo_buffered_effective() {
             return Err(
-                "storage.engine = \"segment\" requires buffered redo durability: set \
-                 redo_buffered = true (or redo_buffered_io = true). The log-structured \
-                 spend journals its Relocate intent after writing the relocated record, \
-                 so crash safety depends on the checkpoint barrier fsyncing the data \
-                 device before reclaiming the redo — a guarantee strict durability does \
-                 not provide."
+                "storage.engine = \"segment\" requires buffered redo durability on a \
+                 STANDALONE node: set redo_buffered = true (or redo_buffered_io = true). \
+                 The log-structured spend's thin Relocate reads the record back from a \
+                 buffered offset on replay, which strict durability does not make safe. \
+                 (A CLUSTERED segment node MAY use strict durability — its SpendV2 redo \
+                 is self-sufficient and fsync'd before ack.)"
                     .to_string(),
             );
         }
@@ -2361,7 +2372,8 @@ backend = ""
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
-        // node_id>0 is clustered → in_place (segment is standalone-only).
+        // Pin in_place so this test isolates the ack_policy/degraded-mode rules
+        // from the engine-specific buffered-durability requirement.
         cfg.storage.engine = StorageEngine::InPlace;
 
         cfg.validate_cluster_safety()
@@ -2528,27 +2540,6 @@ backend = ""
     }
 
     #[test]
-    fn storage_config_default_segment_size_is_8_mib() {
-        // Regression (c0dd2eb): the derived Default gave segment_size = 0 —
-        // fatal now that the segment engine is the default. The programmatic
-        // Default must match the serde field default (default_segment_size).
-        assert_eq!(StorageConfig::default().segment_size, 8 * 1024 * 1024);
-        assert_eq!(StorageConfig::default().engine, StorageEngine::Segment);
-    }
-
-    #[test]
-    fn absent_storage_table_defaults_to_bootable_segment_config() {
-        // NO [storage] table at all. ServerConfig's container-level
-        // #[serde(default)] fills the field from StorageConfig::default() —
-        // the field-level #[serde(default = "default_segment_size")] never
-        // fires on this path. Must yield the same bootable config as
-        // `[storage]\nengine = "segment"` with no segment_size key.
-        let cfg: ServerConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg.storage.engine, StorageEngine::Segment);
-        assert_eq!(cfg.storage.segment_size, 8 * 1024 * 1024, "default 8 MiB");
-    }
-
-    #[test]
     fn segment_engine_with_zero_segment_size_is_rejected() {
         // Explicit segment_size = 0 must fail loudly at config load, before
         // allocator init — not deep in the allocator as a cryptic error.
@@ -2614,20 +2605,40 @@ backend = ""
     }
 
     #[test]
-    fn segment_engine_rejected_with_clustering() {
-        // node_id > 0 → clustered → segment engine must be refused.
+    fn segment_engine_allowed_with_clustering_when_buffered() {
+        // Phase 5 (specs/SEGMENT_CLUSTERING_DESIGN.md): the segment engine now
+        // clusters. node_id > 0 → clustered; with buffered durability (the
+        // default) the config validates — replication is logical and crash safety
+        // + replication recovery both key off the convertible per-vout SpendV2.
         let mut cfg = ServerConfig {
             node_id: 1,
+            replication_factor: 3,
             ..ServerConfig::default()
         };
         cfg.storage.engine = StorageEngine::Segment;
-        let err = cfg
-            .validate_cluster_safety()
-            .expect_err("segment engine on a clustered node must be refused");
-        assert!(
-            err.contains("segment") && err.contains("clustering"),
-            "error must explain the conflict: {err}",
-        );
+        cfg.redo_buffered = true;
+        assert!(cfg.is_clustered(), "node_id > 0 must be clustered");
+        cfg.validate_cluster_safety()
+            .expect("clustered segment engine must validate under buffered durability");
+    }
+
+    #[test]
+    fn segment_engine_clustered_allows_strict_durability() {
+        // "True Option A": a CLUSTERED segment node MAY run strict durability — its
+        // SpendV2 redo is self-sufficient and fsync'd before ack, and the fat Create
+        // (emitted under strict) makes the whole redo chain reconstruct every acked
+        // write from the redo alone. So strict + clustered segment validates.
+        let mut cfg = ServerConfig {
+            node_id: 1,
+            replication_factor: 3,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = false;
+        cfg.redo_buffered_io = false;
+        assert!(cfg.is_clustered());
+        cfg.validate_cluster_safety()
+            .expect("strict + clustered segment must be allowed (true Option A)");
     }
 
     #[test]
@@ -2650,6 +2661,28 @@ backend = ""
             toml::from_str("[storage]\nengine = \"segment\"\nstreaming = true\n").unwrap();
         assert!(on.storage.streaming, "streaming = true must parse");
         assert_eq!(on.storage.engine, StorageEngine::Segment);
+    }
+
+    #[test]
+    fn storage_segment_size_defaults_to_8mib_when_section_absent() {
+        // Regression: a minimal config with NO [storage] section must still get a
+        // valid segment_size. `StorageConfig::default()` (used when the section is
+        // absent) once left segment_size = 0 (derived Default), which failed
+        // SegmentAllocator::new and — since Segment is the default engine —
+        // prevented a minimal-config node from starting at all.
+        assert_eq!(StorageConfig::default().segment_size, 8 * 1024 * 1024);
+        let cfg: ServerConfig =
+            toml::from_str("listen_addr = \"127.0.0.1:3300\"\nstrict_auth = false\n").unwrap();
+        assert_eq!(
+            cfg.storage.engine,
+            StorageEngine::Segment,
+            "segment is default"
+        );
+        assert_eq!(
+            cfg.storage.segment_size,
+            8 * 1024 * 1024,
+            "segment_size must default to 8 MiB even with no [storage] section"
+        );
     }
 
     #[test]

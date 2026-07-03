@@ -524,10 +524,14 @@ const OP_CREATE_V2: u8 = 39;
 /// authoritative image back from the data device at the new `record_offset`
 /// (CRC/tx_id verified; a buffered-tail loss keeps the pre-relocation record,
 /// which is still intact because append-only never overwrites the old extent
-/// until defrag). Recovery-only: the segment engine is non-clustered in v1, so a
-/// relocate never needs op-based replication conversion (a logical spend op
-/// would; design §0.x). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+/// until defrag). Recovery-only and STANDALONE-only: it is never emitted on a
+/// clustered node — there a segment spend's replication and recovery are both
+/// carried by the convertible `SpendV2` (the relocate move journals nothing), so
+/// a physical relocate never needs op-based replication conversion. See
+/// `specs/SEGMENT_CLUSTERING_DESIGN.md`.
 const OP_RELOCATE: u8 = 40;
+// Opcode 41 was `OP_RELOCATE_V2` (the retired fat clustered-segment relocate).
+// Superseded by the convertible `SpendV2`; do not reuse 41 without care.
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `Create` redo entry. Bitcoin transactions in practice rarely have
@@ -2583,7 +2587,7 @@ impl RingState {
 /// in-place wrap — see the module-level documentation for the full
 /// rationale (R-027 / BC-13).
 ///
-/// Lever 7: when [`Self::ring`] is `Some`, the log instead uses an in-device
+/// Lever 7: when `Self::ring` is `Some`, the log instead uses an in-device
 /// **segment ring** ([`RingState`], `docs/REDO_SEGMENT_RING_DESIGN.md`) — the
 /// `write_pos`/`logical_start` linear fields are unused and the append/flush
 /// paths key off the ring pointers.

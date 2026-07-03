@@ -490,7 +490,7 @@ pub fn recover_all(
 ///
 /// This is the full-recovery entry point. When `allocator` is `Some`, every
 /// [`RedoOp::AllocateRegion`] and [`RedoOp::FreeRegion`] entry is applied
-/// via [`SlotAllocator::replay_redo`], which is idempotent. Callers that
+/// via `SlotAllocator::replay_redo`, which is idempotent. Callers that
 /// have already persisted the allocator snapshot may still call this — the
 /// idempotency check skips allocations already reflected in the snapshot.
 ///
@@ -498,7 +498,7 @@ pub fn recover_all(
 /// preserving redo log ordering.
 ///
 /// After a successful call, callers SHOULD invoke
-/// [`SlotAllocator::persist`] and then checkpoint/truncate the redo log so
+/// `SlotAllocator::persist` and then checkpoint/truncate the redo log so
 /// the next startup can skip replay.
 pub fn recover_all_with_allocator(
     device: &dyn BlockDevice,
@@ -5023,6 +5023,183 @@ mod tests {
             "cached fields come from the relocated record"
         );
         assert_eq!(ie.spent_utxos, 1);
+    }
+
+    /// The CLUSTERED-segment spend recovery path (SEGMENT_CLUSTERING_DESIGN): a
+    /// clustered segment spend's ONLY redo is the convertible per-vout `SpendV2`
+    /// (the `relocate_record` move journals nothing). On recovery that `SpendV2`
+    /// must reconstruct the spend IN PLACE against the durable, append-only
+    /// pre-spend record — reusing the exact in-place `replay_spend` path. This is
+    /// also the invariant that keeps the durable replication intent (the SpendV2
+    /// range) consistent with local state: a crash-between-apply-and-ship re-ships
+    /// the SpendV2 to replicas, so the master MUST also have applied it locally.
+    #[test]
+    fn clustered_segment_spendv2_reconstructs_spend_in_place() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x63;
+        let key = TxKey { txid };
+        let rec_size = TxMetadata::record_size_for(utxo_count);
+        let mut slot1 = [0u8; 32];
+        slot1[0] = 1;
+
+        let off1 = h.alloc.allocate(rec_size).unwrap();
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = txid;
+        meta.generation = 1;
+        let slots: Vec<UtxoSlot> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                UtxoSlot::new_unspent(hh)
+            })
+            .collect();
+        io::write_full_record(&*h.data_dev, off1, &meta, &slots).unwrap();
+        h.index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: off1,
+                    utxo_count,
+                    block_entry_count: 0,
+                    tx_flags: 0,
+                    spent_utxos: 0,
+                    dah_or_preserve: 0,
+                    unmined_since: 0,
+                    generation: 1,
+                },
+            )
+            .unwrap();
+
+        // The clustered segment spend's sole redo: the convertible SpendV2 (the
+        // relocate move journals nothing).
+        let spending_data = [0xCDu8; 36];
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 1,
+            spending_data,
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 2,
+            updated_at: 0,
+            utxo_hash: Some(slot1),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 1, "the lone SpendV2 must replay");
+
+        // The record stays indexed at the pre-spend offset (the relocate journals
+        // no redo) and is reconstructed SPENT on the device — the source of truth.
+        // The
+        // logical spend survived, so a master crash-between-apply-and-ship (which
+        // re-ships this same SpendV2 to replicas) leaves master and replica in
+        // agreement. (replay_spend writes device state; the index-cache
+        // spent_utxos is reconciled from the device scan in real recovery.)
+        let ie = h.index.lookup(&key).unwrap();
+        assert_eq!(
+            ie.record_offset, off1,
+            "SpendV2 replays in place → record stays at off1"
+        );
+        let m = io::read_metadata(&*h.data_dev, off1).unwrap();
+        assert_eq!({ m.spent_utxos }, 1, "device record reconstructed as spent");
+        let s = io::read_all_utxo_slots(&*h.data_dev, off1, utxo_count).unwrap();
+        assert_eq!(s[1].status, UTXO_SPENT);
+        assert_eq!(s[1].spending_data, spending_data);
+    }
+
+    /// STRICT "true Option A" for CLUSTERED segment: an acked create+spend must be
+    /// reconstructable from the fsync'd redo ALONE, with the buffered data device
+    /// entirely lost. Under strict durability the master's create emits the FAT
+    /// `RedoOp::Create` (image-carrying) and the spend emits `SpendV2`; recovering
+    /// that redo onto a FRESH, EMPTY device rebuilds the spent record byte-for-byte
+    /// — proving no acked write depends on the buffered data write surviving.
+    #[test]
+    fn strict_clustered_segment_reconstructs_create_and_spend_from_redo_alone() {
+        let mut h = RecoveryTestHarness::new();
+        let utxo_count = 4u32;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x64;
+        let key = TxKey { txid };
+        let rec_size = TxMetadata::record_size_for(utxo_count);
+        let off = h.alloc.allocate(rec_size).unwrap();
+        let slot_hashes: Vec<[u8; 32]> = (0..utxo_count)
+            .map(|i| {
+                let mut hh = [0u8; 32];
+                hh[0] = i as u8;
+                hh
+            })
+            .collect();
+
+        // Build the created record's image on a SCRATCH device (never the recovery
+        // device), exactly as the fat Create carries it. generation 1, unspent.
+        let image: Vec<u8> = {
+            let scratch: Arc<dyn BlockDevice> =
+                Arc::new(crate::device::MemoryDevice::new(1 << 20, 4096).unwrap());
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.generation = 1;
+            let slots: Vec<UtxoSlot> = slot_hashes
+                .iter()
+                .map(|h| UtxoSlot::new_unspent(*h))
+                .collect();
+            // Build the image at a block-aligned offset (0); the bytes are
+            // position-independent — the fat Create writes them at `off`.
+            io::write_full_record(&*scratch, 0, &meta, &slots).unwrap();
+            let aligned = io::align_up(rec_size as usize, 4096);
+            let mut buf = crate::device::AlignedBuf::new(aligned, 4096);
+            scratch.pread_exact_at(&mut buf, 0).unwrap();
+            buf[..rec_size as usize].to_vec()
+        };
+
+        // The recovery device is FRESH/empty — nothing was ever durably written to
+        // it. The redo is the ONLY source of truth (data device "lost").
+        assert!(h.index.lookup(&key).is_none());
+        let spending_data = [0xEEu8; 36];
+        let mut redo = h.redo_log();
+        redo.append_and_flush(RedoOp::Create {
+            tx_key: key,
+            device_id: 0,
+            record_offset: off,
+            utxo_count,
+            is_conflicting: false,
+            record_bytes: Arc::from(image.as_slice()),
+            parent_txids: Vec::new(),
+        })
+        .unwrap();
+        redo.append_and_flush(RedoOp::SpendV2 {
+            tx_key: key,
+            offset: 2,
+            spending_data,
+            new_spent_count: 1,
+            current_block_height: 0,
+            block_height_retention: 0,
+            target_generation: 2,
+            updated_at: 0,
+            utxo_hash: Some(slot_hashes[2]),
+        })
+        .unwrap();
+
+        let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        assert_eq!(stats.entries_replayed, 2, "fat Create + SpendV2 replay");
+
+        // Reconstructed from the redo alone: the fat Create wrote the record to the
+        // fresh device, then SpendV2 spent vout 2 in place.
+        let ie = h
+            .index
+            .lookup(&key)
+            .expect("record rebuilt from redo alone");
+        let m = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ m.tx_id }, txid);
+        assert_eq!({ m.spent_utxos }, 1, "the acked spend survived (redo-only)");
+        let s = io::read_all_utxo_slots(&*h.data_dev, ie.record_offset, utxo_count).unwrap();
+        assert_eq!(s[2].status, UTXO_SPENT);
+        assert_eq!(s[2].spending_data, spending_data);
+        assert_eq!(s[0].status, UTXO_UNSPENT);
     }
 
     /// A relocation of a tx that is NOT (durably) indexed is moot — recovery

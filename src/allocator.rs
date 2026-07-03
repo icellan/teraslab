@@ -2122,7 +2122,7 @@ pub trait RecordAllocator: Send {
 }
 
 /// A heap-allocated, dynamically-dispatched [`RecordAllocator`] — the concrete
-/// type a [`crate::ops::Engine`] store holds so it can be backed by either the
+/// type a [`crate::ops::engine::Engine`] store holds so it can be backed by either the
 /// in-place or the log-structured allocator.
 pub type BoxedAllocator = Box<dyn RecordAllocator>;
 
@@ -4695,10 +4695,11 @@ mod tests {
         // gate rejects any on-disk version it does not know. Assert that the
         // packed marker is strictly greater than the v1 max, so such a build
         // hits the `version > max_known` branch and fails CLOSED.
-        assert!(
-            HEADER_VERSION_PACKED > HEADER_VERSION,
-            "packed marker must exceed the v1 max-known version so an old binary fails closed"
-        );
+        // Compile-time invariant: the packed marker must exceed the v1 max-known
+        // version so an old binary hits the `version > max_known` branch and fails
+        // closed. A `const` assertion is checked at compile time and is clippy-clean
+        // (a runtime `assert!` on two consts trips `assertions_on_constants`).
+        const _: () = assert!(HEADER_VERSION_PACKED > HEADER_VERSION);
 
         // Drive the actual rejection: rewrite the version to a value ABOVE the
         // CURRENT build's max-known (HEADER_VERSION_PACKED) so `recover` takes
