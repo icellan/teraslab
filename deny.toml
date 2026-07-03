@@ -24,7 +24,18 @@ yanked = "warn"
 #   proc-macro only (no runtime surface); there is no safe upgrade or
 #   maintained drop-in replacement. Tracked; re-evaluate when ratatui
 #   drops the dependency.
-ignore = ["RUSTSEC-2024-0436"]
+#   RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — quick-xml 0.26 parsing DoS
+#   (quadratic duplicate-attribute check; unbounded NsReader namespace
+#   allocation). Patched only in quick-xml >= 0.41, unreachable for us:
+#   pulled in solely via pprof -> inferno 0.11 (pprof pins inferno ^0.11
+#   even at pprof 0.15; inferno 0.11 pins quick-xml 0.26). Not exploitable:
+#   both advisories require parsing attacker-controlled XML, and inferno
+#   0.11.21 contains no quick_xml::Reader usage at all — Writer + error
+#   types only, generating flamegraph SVG from in-process profiler samples
+#   on the admin-token-gated /debug/pprof/profile endpoint. Same ignore +
+#   rationale in .cargo/audit.toml (cargo audit). Re-evaluate when pprof
+#   moves to inferno >= 0.12.
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
 
 [licenses]
 # License allow-list. New crates with licenses outside this list will be
