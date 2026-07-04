@@ -5155,7 +5155,25 @@ impl Engine {
                 detail: format!("{e}"),
             })?;
 
-        Ok(buf[intra..intra + cold_size as usize].to_vec())
+        let cold = &buf[intra..intra + cold_size as usize];
+
+        // Issue #34 (defense-in-depth): validate the inline blob's own length
+        // prefixes fit within the record's cold region BEFORE handing the bytes
+        // back. This mirrors the EXTERNAL branch's `total_size`/digest checks
+        // above: an inline blob whose declared inner lengths overrun `cold_size`
+        // would otherwise be returned one-or-more bytes short and decode
+        // downstream as an opaque "inpoints truncated", silently wedging the
+        // consumer. Fail closed with a typed, record-attributable error instead.
+        if let Some(declared) = declared_inline_cold_len(cold)
+            && declared > cold_size
+        {
+            return Err(SpendError::ColdDataInconsistent {
+                declared,
+                available: cold_size,
+            });
+        }
+
+        Ok(cold.to_vec())
     }
 
     /// Return the distinct parent txids encoded in a child's cold-data
@@ -8547,6 +8565,62 @@ fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Result<Vec<[u8; 32]
         pos = entry_end;
     }
     Ok(result)
+}
+
+/// Minimum cold-region byte length an inline cold blob's own length prefixes
+/// require, or `None` when the buffer is empty or too short to carry the three
+/// prefixes (an empty/absent cold region is not "inconsistent").
+///
+/// The inline cold layout is
+/// `[inputs_len:4][inputs][outputs_len:4][outputs][inpoints_len:4][inpoints]`.
+/// This walks the three little-endian length prefixes in order and returns the
+/// exact number of bytes they collectively account for
+/// (`12 + inputs_len + outputs_len + inpoints_len`). Issue #34's
+/// defense-in-depth read check compares this against the record's actual
+/// `cold_size`: if the declared length exceeds what is stored, the blob is
+/// internally inconsistent (a byte was lost before the store persisted it) and
+/// [`Engine::read_cold_data`] fails closed with
+/// [`SpendError::ColdDataInconsistent`] instead of returning a short buffer.
+///
+/// All additions are saturating so a corrupt multi-gigabyte prefix can never
+/// overflow `u64`; a saturated value still compares `>` any real `cold_size`
+/// and correctly trips the inconsistency check. Returns `None` (rather than
+/// erroring) when fewer than 12 bytes are present, because a genuinely empty
+/// cold region is handled by the caller before this is consulted.
+fn declared_inline_cold_len(cold: &[u8]) -> Option<u64> {
+    if cold.len() < 12 {
+        return None;
+    }
+    let read_u32 = |off: usize| -> u64 {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&cold[off..off + 4]);
+        u32::from_le_bytes(b) as u64
+    };
+    let inputs_len = read_u32(0);
+    // The outputs length prefix sits at `4 + inputs_len`; if that offset is
+    // already past the stored bytes the blob is short, but we still compute the
+    // declared total from the prefixes we CAN read plus the declared inputs so
+    // the `declared > available` comparison fires. Read remaining prefixes only
+    // when they are actually present; otherwise fold their declared minimum in
+    // as zero-payload prefixes (4 bytes each) which keeps `declared >=` reality.
+    let outputs_off = 4u64.saturating_add(inputs_len);
+    let outputs_len = if (outputs_off as usize).saturating_add(4) <= cold.len() {
+        read_u32(outputs_off as usize)
+    } else {
+        0
+    };
+    let inpoints_off = outputs_off.saturating_add(4).saturating_add(outputs_len);
+    let inpoints_len = if (inpoints_off as usize).saturating_add(4) <= cold.len() {
+        read_u32(inpoints_off as usize)
+    } else {
+        0
+    };
+    Some(
+        12u64
+            .saturating_add(inputs_len)
+            .saturating_add(outputs_len)
+            .saturating_add(inpoints_len),
+    )
 }
 
 /// Build inline cold data from optional inputs/outputs/inpoints.
@@ -16608,6 +16682,33 @@ mod tests {
         assert_eq!(&cold[4..8], &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(u32::from_le_bytes(cold[8..12].try_into().unwrap()), 3); // outputs len
         assert_eq!(&cold[12..15], &[0x0A, 0x0B, 0x0C]);
+    }
+
+    #[test]
+    fn declared_inline_cold_len_matches_build_cold_data() {
+        // A well-formed blob's declared length equals its actual length.
+        let cold = build_cold_data(Some(&[1u8; 190]), Some(&[2u8; 74]), Some(&[3u8; 44]));
+        assert_eq!(cold.len(), 320);
+        assert_eq!(declared_inline_cold_len(&cold), Some(320));
+
+        // Empty / too-short buffers are not "inconsistent" — None.
+        assert_eq!(declared_inline_cold_len(&[]), None);
+        assert_eq!(declared_inline_cold_len(&[0u8; 11]), None);
+
+        // The issue-34 corruption: prefixes declare one more byte than stored.
+        // Inflate the inpoints length prefix (at 4+190+4+74 = 272) to 45.
+        let mut corrupt = cold.clone();
+        corrupt[272..276].copy_from_slice(&45u32.to_le_bytes());
+        // The stored buffer is still 320 bytes, but it now DECLARES 321.
+        assert_eq!(declared_inline_cold_len(&corrupt), Some(321));
+        assert!(declared_inline_cold_len(&corrupt).unwrap() > corrupt.len() as u64);
+
+        // A corrupt multi-gigabyte prefix saturates instead of overflowing and
+        // still trips the `declared > available` comparison.
+        let mut huge = cold.clone();
+        huge[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let declared = declared_inline_cold_len(&huge).unwrap();
+        assert!(declared >= u32::MAX as u64);
     }
 
     #[test]
