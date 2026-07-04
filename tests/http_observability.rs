@@ -52,6 +52,13 @@ fn start_test_http_server_with_admin(
     let log_level = Arc::new(AtomicU8::new(2)); // INFO
 
     let state = Arc::new(HttpState {
+        backup: teraslab::backup::BackupManager::new(
+            engine.clone(),
+            Arc::new(AtomicBool::new(false)),
+            teraslab::backup::BackupParams::default(),
+            teraslab::config::ServerConfig::default(),
+            None,
+        ),
         engine,
         metrics: &TEST_METRICS,
         histograms: &TEST_HISTOGRAMS,

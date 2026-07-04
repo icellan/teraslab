@@ -293,6 +293,12 @@ impl BackupManager {
         inner.progress.lock().clone()
     }
 
+    /// The configured copier throttle in bytes/sec (`0` = unthrottled). Exposed
+    /// for the `teraslab_backup_throttle_bytes_per_sec` metric gauge.
+    pub fn throttle_bytes_per_sec(&self) -> u64 {
+        self.params.throttle_bytes_per_sec
+    }
+
     /// Request cancellation of the in-flight backup. Idempotent; setting the
     /// flag with no backup running is harmless.
     pub fn abort(&self) -> Result<(), BackupError> {

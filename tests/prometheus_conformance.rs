@@ -145,6 +145,13 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
     drop(listener);
 
     let state = Arc::new(HttpState {
+        backup: teraslab::backup::BackupManager::new(
+            engine.clone(),
+            Arc::new(AtomicBool::new(false)),
+            teraslab::backup::BackupParams::default(),
+            teraslab::config::ServerConfig::default(),
+            None,
+        ),
         engine,
         metrics: &TEST_METRICS,
         histograms: &TEST_HISTOGRAMS,
@@ -606,6 +613,12 @@ fn metrics_scrape_parses_under_prometheus_parse() {
         "teraslab_alloc_total",
         "teraslab_swim_probes_sent_total",
         "teraslab_migration_active",
+        // Online-backup series (always emitted; Idle/0 baseline before a run).
+        "teraslab_backup_state",
+        "teraslab_backup_bytes_copied_total",
+        "teraslab_backup_segments_copied",
+        "teraslab_backup_throttle_bytes_per_sec",
+        "teraslab_backup_pinned",
     ] {
         assert!(
             find_sample(&scrape, name).is_some(),

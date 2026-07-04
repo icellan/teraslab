@@ -61,6 +61,13 @@ fn start_test_server() -> (u16, std::sync::MutexGuard<'static, ()>) {
     drop(listener);
 
     let state = Arc::new(HttpState {
+        backup: teraslab::backup::BackupManager::new(
+            engine.clone(),
+            Arc::new(AtomicBool::new(false)),
+            teraslab::backup::BackupParams::default(),
+            teraslab::config::ServerConfig::default(),
+            None,
+        ),
         engine,
         metrics: &CLI_METRICS,
         histograms: &CLI_HISTOGRAMS,

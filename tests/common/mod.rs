@@ -95,6 +95,13 @@ pub fn spawn_write_server() -> WriteServer {
 
     let redo_atomics = redo.lock().atomics();
     let state = Arc::new(HttpState {
+        backup: teraslab::backup::BackupManager::new(
+            engine.clone(),
+            Arc::new(AtomicBool::new(false)),
+            teraslab::backup::BackupParams::default(),
+            ServerConfig::default(),
+            None,
+        ),
         engine,
         metrics: &TEST_METRICS,
         histograms: &TEST_HISTOGRAMS,

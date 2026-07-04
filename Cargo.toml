@@ -150,6 +150,10 @@ prometheus-parse = "0.2"
 proptest = { version = "1", default-features = false, features = ["std"] }
 serial_test = "3"
 tempfile = "3"
+# `ServiceExt::oneshot` drives the axum router in-process (no TCP bind) so the
+# `/admin/backup*` endpoint unit tests exercise real routing + the bearer gate
+# without a loopback socket. Already in the lock graph via axum.
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "spend_throughput"

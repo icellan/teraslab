@@ -139,6 +139,9 @@ pub struct HttpState {
     /// leaked verdicts across instances in multi-node test processes — a
     /// per-instance field keeps each node's readiness independent.
     pub replica_lag_cache: AtomicU64,
+    /// Online-backup coordinator. Drives the bearer-gated `/admin/backup*`
+    /// routes and sources the `teraslab_backup_*` metrics.
+    pub backup: Arc<crate::backup::BackupManager>,
 }
 
 /// Bearer-token state shared with the admin auth middleware.
@@ -400,6 +403,14 @@ pub(crate) fn build_http_router(
         .route("/admin/quiesce", put(handle_admin_quiesce))
         .route("/admin/rebalance", put(handle_admin_rebalance))
         .route("/admin/drain/{node_id}", put(handle_admin_drain))
+        // Online backup: start (POST), poll status (GET), abort (DELETE).
+        .route(
+            "/admin/backup",
+            axum::routing::post(handle_admin_backup_start)
+                .delete(handle_admin_backup_abort)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route("/admin/backup/status", get(handle_admin_backup_status))
         // F-G6-002 / F-G6-003: sensitive read surface moved here so the
         // bearer-token middleware below covers `/admin/top` and `/ws/top`.
         .route("/admin/top", get(handle_admin_top))
@@ -686,6 +697,7 @@ async fn handle_metrics(
 ) -> impl IntoResponse {
     let span = http_span_for(&headers, "/metrics");
     let _entered = span.enter();
+    let backup = state.backup.status();
     let out = render_metrics_text(
         state.metrics,
         state.histograms,
@@ -694,6 +706,11 @@ async fn handle_metrics(
         state.engine.unmined_index().len() as u64,
         state.engine.preserve_index().len() as u64,
         state.active_connections.load(Ordering::Relaxed) as u64,
+        backup_state_code(backup.state),
+        backup.bytes_copied,
+        backup.segments_copied as u64,
+        state.backup.throttle_bytes_per_sec(),
+        u64::from(state.engine.is_segment_lifecycle_pinned()),
     );
 
     let mut resp_headers = HeaderMap::new();
@@ -709,7 +726,10 @@ async fn handle_metrics(
 ///
 /// Split out as a plain function so unit tests can scrape the output without
 /// spinning up an HTTP listener. Parameters are decoupled from `HttpState`
-/// to keep test plumbing light.
+/// to keep test plumbing light. The trailing `backup_*` parameters source the
+/// `teraslab_backup_*` series (state code, bytes/segments copied, configured
+/// throttle, and whether the segment lifecycle is pinned).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_metrics_text(
     m: &ThreadMetrics,
     h: &ThreadHistograms,
@@ -718,6 +738,11 @@ pub(crate) fn render_metrics_text(
     unmined_entries: u64,
     preserve_entries: u64,
     active_connections: u64,
+    backup_state_code: u64,
+    backup_bytes_copied: u64,
+    backup_segments_copied: u64,
+    backup_throttle_bytes_per_sec: u64,
+    backup_pinned: u64,
 ) -> String {
     let mut out = String::with_capacity(8192);
 
@@ -1366,6 +1391,26 @@ pub(crate) fn render_metrics_text(
         );
     }
 
+    // Online-backup series. Always emitted (even with backups disabled) so a
+    // scrape sees a stable `Idle` (0) baseline before any backup runs.
+    prom_gauge(&mut out, "teraslab_backup_state", backup_state_code);
+    prom_counter(
+        &mut out,
+        "teraslab_backup_bytes_copied_total",
+        backup_bytes_copied,
+    );
+    prom_gauge(
+        &mut out,
+        "teraslab_backup_segments_copied",
+        backup_segments_copied,
+    );
+    prom_gauge(
+        &mut out,
+        "teraslab_backup_throttle_bytes_per_sec",
+        backup_throttle_bytes_per_sec,
+    );
+    prom_gauge(&mut out, "teraslab_backup_pinned", backup_pinned);
+
     out
 }
 
@@ -1771,6 +1816,119 @@ async fn handle_admin_migration_status(State(state): State<Arc<HttpState>>) -> i
             StatusCode::OK,
             serde_json::json!({"active_count": 0, "migrations": []}).to_string(),
         ),
+    }
+}
+
+/// The optional JSON body accepted by `POST /admin/backup`.
+///
+/// `dir` names the subdirectory under the configured backup root to write the
+/// image into; it defaults to `"backup"` when omitted and must be a relative
+/// path without `..` (rejected by [`crate::backup::BackupManager::start`]).
+#[derive(Debug, Default, serde::Deserialize)]
+struct BackupStartBody {
+    #[serde(default)]
+    dir: Option<String>,
+}
+
+/// Map a [`crate::backup::BackupError`] returned by
+/// [`crate::backup::BackupManager::start`] onto an HTTP error response:
+/// `AlreadyRunning` → 409, `UnsupportedConfig` → 400, `InsufficientHeadroom`
+/// → 507, everything else → 500.
+fn backup_start_error_response(err: crate::backup::BackupError) -> axum::response::Response {
+    use crate::backup::BackupError;
+    let (status, code) = match &err {
+        BackupError::AlreadyRunning => (StatusCode::CONFLICT, "backup_already_running"),
+        BackupError::UnsupportedConfig(_) => (StatusCode::BAD_REQUEST, "backup_unsupported_config"),
+        BackupError::InsufficientHeadroom { .. } => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "backup_insufficient_headroom",
+        ),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "backup_failed"),
+    };
+    http_error(status, code, err.to_string())
+}
+
+/// `POST /admin/backup` — start an online backup.
+///
+/// The optional JSON body `{ "dir": "name" }` selects the target subdirectory
+/// under the configured backup root (defaults to `"backup"`); an empty body is
+/// accepted. Returns `202 Accepted` with `{"started": true}` once the
+/// background job is spawned. Errors map via [`backup_start_error_response`].
+async fn handle_admin_backup_start(
+    State(state): State<Arc<HttpState>>,
+    body: String,
+) -> axum::response::Response {
+    let subdir = if body.trim().is_empty() {
+        None
+    } else {
+        match serde_json::from_str::<BackupStartBody>(&body) {
+            Ok(b) => b.dir,
+            Err(e) => {
+                return http_error(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    format!("invalid JSON body: {e}"),
+                );
+            }
+        }
+    };
+    match state.backup.start(subdir) {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({ "started": true })),
+        )
+            .into_response(),
+        Err(e) => backup_start_error_response(e),
+    }
+}
+
+/// `GET /admin/backup/status` — the current backup progress as JSON.
+///
+/// Always `200 OK`; the body is the serialized [`crate::backup::BackupProgress`]
+/// (state, fence/tail, bytes/segments copied, catch-up round, error, manifest
+/// path).
+async fn handle_admin_backup_status(
+    State(state): State<Arc<HttpState>>,
+) -> axum::response::Response {
+    let progress = state.backup.status();
+    (StatusCode::OK, axum::Json(progress)).into_response()
+}
+
+/// `DELETE /admin/backup` — request cancellation of the in-flight backup.
+///
+/// Idempotent: setting the cancel flag with no backup running is harmless.
+/// Returns `200 OK` with `{"aborting": true}`.
+async fn handle_admin_backup_abort(
+    State(state): State<Arc<HttpState>>,
+) -> axum::response::Response {
+    match state.backup.abort() {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "aborting": true })),
+        )
+            .into_response(),
+        Err(e) => http_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "backup_abort_failed",
+            e.to_string(),
+        ),
+    }
+}
+
+/// Numeric encoding of [`crate::backup::BackupState`] for the
+/// `teraslab_backup_state` gauge: `Idle=0 … Failed=8`.
+fn backup_state_code(s: crate::backup::BackupState) -> u64 {
+    use crate::backup::BackupState;
+    match s {
+        BackupState::Idle => 0,
+        BackupState::Pinning => 1,
+        BackupState::Fencing => 2,
+        BackupState::Snapshotting => 3,
+        BackupState::Copying => 4,
+        BackupState::CatchUp => 5,
+        BackupState::Finalizing => 6,
+        BackupState::Done => 7,
+        BackupState::Failed => 8,
     }
 }
 
@@ -3211,7 +3369,7 @@ mod tests {
         h.spend_latency.record_ns(1_000_000); // bucket 12 or nearby
         h.spend_latency.record_ns(1_000_000_000); // bucket 22 or nearby
 
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         // Every bucket boundary must appear exactly once.
         let num = LatencyHistogram::num_buckets();
@@ -3305,7 +3463,7 @@ mod tests {
         let h = ThreadHistograms::new();
 
         // Scrape 1: baseline.
-        let before = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
+        let before = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let before_val = find_counter(&before, "teraslab_spend_multi_items_succeeded_total");
         assert_eq!(before_val, 0, "fresh ThreadMetrics must start at zero");
 
@@ -3313,7 +3471,7 @@ mod tests {
         m.spend_multi_items_succeeded.inc_by(10);
 
         // Scrape 2: observe the delta.
-        let after = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
+        let after = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let after_val = find_counter(&after, "teraslab_spend_multi_items_succeeded_total");
         assert_eq!(
             after_val - before_val,
@@ -3355,7 +3513,7 @@ mod tests {
             .inc_by(OpCode::Spend, Outcome::ErrConflicting, 4);
         m.operations.inc_by(OpCode::Create, Outcome::ErrStorage, 7);
 
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         // The counter type declaration must be present.
         assert!(
@@ -3551,6 +3709,13 @@ mod tests {
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
 
         let state = HttpState {
+            backup: crate::backup::BackupManager::new(
+                engine.clone(),
+                Arc::new(AtomicBool::new(false)),
+                crate::backup::BackupParams::default(),
+                crate::config::ServerConfig::default(),
+                None,
+            ),
             engine,
             metrics,
             histograms,
@@ -3637,7 +3802,7 @@ mod tests {
 
         let m = ThreadMetrics::new();
         let h = ThreadHistograms::new();
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         // Scalar counter / gauge series.
         for name in [
@@ -3725,6 +3890,13 @@ mod tests {
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let state = HttpState {
+            backup: crate::backup::BackupManager::new(
+                engine.clone(),
+                Arc::new(AtomicBool::new(false)),
+                crate::backup::BackupParams::default(),
+                crate::config::ServerConfig::default(),
+                None,
+            ),
             engine,
             metrics,
             histograms,
@@ -3812,6 +3984,13 @@ mod tests {
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let state = HttpState {
+            backup: crate::backup::BackupManager::new(
+                engine.clone(),
+                Arc::new(AtomicBool::new(false)),
+                crate::backup::BackupParams::default(),
+                crate::config::ServerConfig::default(),
+                None,
+            ),
             engine,
             metrics,
             histograms,
@@ -3998,6 +4177,13 @@ mod tests {
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         Arc::new(HttpState {
+            backup: crate::backup::BackupManager::new(
+                engine.clone(),
+                Arc::new(AtomicBool::new(false)),
+                crate::backup::BackupParams::default(),
+                crate::config::ServerConfig::default(),
+                None,
+            ),
             engine,
             metrics,
             histograms,
@@ -4264,5 +4450,282 @@ mod tests {
             0,
         ));
         assert!(wait_for_cluster_drain(&drained, 0).await);
+    }
+
+    // ------------------------------------------------------------------
+    // Online-backup: `/admin/backup*` endpoints + metrics.
+    //
+    // This sandbox denies loopback socket binds (os error 49), so the
+    // endpoints are driven in-process through the axum router via
+    // `tower::ServiceExt::oneshot` — no TCP listener. This still exercises
+    // the real router, the bearer-token gate, and each handler.
+    // ------------------------------------------------------------------
+
+    /// A ≥16-byte admin token so `build_http_router` mounts the gated
+    /// sub-router without the short-token warning path.
+    const BACKUP_TEST_TOKEN: &str = "backup-test-admin-token-01";
+
+    /// Build an `HttpState` with a backup manager rooted at `backup_root`
+    /// (`None` disables `start`). Metrics are leaked (test-lifetime).
+    fn build_backup_test_state(backup_root: Option<std::path::PathBuf>) -> Arc<HttpState> {
+        use crate::allocator::SlotAllocator;
+        use crate::device::{BlockDevice, MemoryDevice};
+        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::locks::StripedLocks;
+        use crate::ops::engine::Engine;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1024).unwrap();
+        let locks = StripedLocks::new(64);
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            locks,
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
+        let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
+        let backup = crate::backup::BackupManager::new(
+            engine.clone(),
+            Arc::new(AtomicBool::new(false)),
+            crate::backup::BackupParams::default(),
+            crate::config::ServerConfig::default(),
+            backup_root,
+        );
+        Arc::new(HttpState {
+            backup,
+            engine,
+            metrics,
+            histograms,
+            ready: Arc::new(AtomicBool::new(true)),
+            log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
+            cluster: None,
+            redo_log: None,
+            redo_atomics: None,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            http_port: 0,
+            replica_lag_warn_threshold_ops: 10_000,
+            replica_lag_cache: AtomicU64::new(0),
+        })
+    }
+
+    /// Drive one request through the router (no socket) and return
+    /// `(status, body_text)`.
+    async fn oneshot_request(
+        router: Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: axum::body::Body,
+    ) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(t) = token {
+            builder = builder.header("authorization", format!("Bearer {t}"));
+        }
+        let req = builder.body(body).expect("request builds");
+        let resp = router.oneshot(req).await.expect("router responds");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collects");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The gated backup routes reject an unauthenticated request with 401.
+    #[tokio::test]
+    async fn backup_status_requires_bearer_token() {
+        let state = build_backup_test_state(None);
+        let router = build_http_router(state, true, Some(BACKUP_TEST_TOKEN.to_string()));
+        let (status, _body) = oneshot_request(
+            router,
+            "GET",
+            "/admin/backup/status",
+            None,
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// `GET /admin/backup/status` returns 200 with the serialized progress,
+    /// which starts in the `Idle` state.
+    #[tokio::test]
+    async fn backup_status_returns_idle_progress_json() {
+        let state = build_backup_test_state(None);
+        let router = build_http_router(state, true, Some(BACKUP_TEST_TOKEN.to_string()));
+        let (status, body) = oneshot_request(
+            router,
+            "GET",
+            "/admin/backup/status",
+            Some(BACKUP_TEST_TOKEN),
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("status body is JSON");
+        assert_eq!(
+            v["state"], "Idle",
+            "fresh manager reports Idle; body={body}"
+        );
+        assert_eq!(v["bytes_copied"], 0);
+    }
+
+    /// `POST /admin/backup` with no configured backup root maps the
+    /// `UnsupportedConfig` rejection to 400 with the stable error code.
+    #[tokio::test]
+    async fn backup_start_without_root_maps_to_400() {
+        let state = build_backup_test_state(None);
+        let router = build_http_router(state, true, Some(BACKUP_TEST_TOKEN.to_string()));
+        let (status, body) = oneshot_request(
+            router,
+            "POST",
+            "/admin/backup",
+            Some(BACKUP_TEST_TOKEN),
+            axum::body::Body::from(r#"{"dir":"snapshot-1"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("error body is JSON");
+        assert_eq!(v["code"], "backup_unsupported_config", "body={body}");
+    }
+
+    /// `POST /admin/backup` with a configured backup root spawns the job and
+    /// returns 202 `{"started": true}`. The background job runs against a
+    /// memory engine (no segment store) and fails fast after creating the
+    /// target dir — but `start` returns before that, so the HTTP status is
+    /// deterministic.
+    #[tokio::test]
+    async fn backup_start_with_root_returns_202() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let state = build_backup_test_state(Some(tmp.path().to_path_buf()));
+        let router = build_http_router(state.clone(), true, Some(BACKUP_TEST_TOKEN.to_string()));
+        let (status, body) = oneshot_request(
+            router,
+            "POST",
+            "/admin/backup",
+            Some(BACKUP_TEST_TOKEN),
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("start body is JSON");
+        assert_eq!(v["started"], true, "body={body}");
+        // Ask the manager to stop and keep the temp dir alive until the
+        // background job (which fails fast on a memory engine) has settled.
+        state.backup.abort().expect("abort is infallible");
+        drop(tmp);
+    }
+
+    /// `DELETE /admin/backup` returns 200 `{"aborting": true}` and is
+    /// idempotent (no backup running is fine).
+    #[tokio::test]
+    async fn backup_abort_returns_200() {
+        let state = build_backup_test_state(None);
+        let router = build_http_router(state, true, Some(BACKUP_TEST_TOKEN.to_string()));
+        let (status, body) = oneshot_request(
+            router,
+            "DELETE",
+            "/admin/backup",
+            Some(BACKUP_TEST_TOKEN),
+            axum::body::Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("abort body is JSON");
+        assert_eq!(v["aborting"], true, "body={body}");
+    }
+
+    /// The error → status mapping used by `POST /admin/backup` covers every
+    /// documented case: 409 / 400 / 507 / 500.
+    #[test]
+    fn backup_start_error_response_status_mapping() {
+        use crate::backup::BackupError;
+        assert_eq!(
+            backup_start_error_response(BackupError::AlreadyRunning).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            backup_start_error_response(BackupError::UnsupportedConfig("x".into())).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            backup_start_error_response(BackupError::InsufficientHeadroom {
+                store: 0,
+                have: 1,
+                need: 2,
+            })
+            .status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        assert_eq!(
+            backup_start_error_response(BackupError::Aborted).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            backup_start_error_response(BackupError::CatchupExceeded { rounds: 3 }).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// `backup_state_code` maps every `BackupState` to its documented integer.
+    #[test]
+    fn backup_state_code_covers_all_states() {
+        use crate::backup::BackupState;
+        assert_eq!(backup_state_code(BackupState::Idle), 0);
+        assert_eq!(backup_state_code(BackupState::Pinning), 1);
+        assert_eq!(backup_state_code(BackupState::Fencing), 2);
+        assert_eq!(backup_state_code(BackupState::Snapshotting), 3);
+        assert_eq!(backup_state_code(BackupState::Copying), 4);
+        assert_eq!(backup_state_code(BackupState::CatchUp), 5);
+        assert_eq!(backup_state_code(BackupState::Finalizing), 6);
+        assert_eq!(backup_state_code(BackupState::Done), 7);
+        assert_eq!(backup_state_code(BackupState::Failed), 8);
+    }
+
+    /// `render_metrics_text` emits every `teraslab_backup_*` series with a
+    /// well-formed `# TYPE` line and the expected value.
+    #[test]
+    fn metrics_emits_backup_series_with_type_lines() {
+        let m = ThreadMetrics::new();
+        let h = ThreadHistograms::new();
+        // state=Copying(4), bytes=1234, segments=7, throttle=256 MiB, pinned=1.
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 4, 1234, 7, 268_435_456, 1);
+        for (name, kind, value_line) in [
+            ("teraslab_backup_state", "gauge", "teraslab_backup_state 4"),
+            (
+                "teraslab_backup_bytes_copied_total",
+                "counter",
+                "teraslab_backup_bytes_copied_total 1234",
+            ),
+            (
+                "teraslab_backup_segments_copied",
+                "gauge",
+                "teraslab_backup_segments_copied 7",
+            ),
+            (
+                "teraslab_backup_throttle_bytes_per_sec",
+                "gauge",
+                "teraslab_backup_throttle_bytes_per_sec 268435456",
+            ),
+            (
+                "teraslab_backup_pinned",
+                "gauge",
+                "teraslab_backup_pinned 1",
+            ),
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {name} {kind}")),
+                "missing `# TYPE {name} {kind}`\n{text}"
+            );
+            assert!(
+                text.lines().any(|l| l == value_line),
+                "missing value line `{value_line}`\n{text}"
+            );
+        }
     }
 }

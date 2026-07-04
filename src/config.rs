@@ -163,6 +163,46 @@ pub enum ConfigError {
     )]
     AdminTokenRequired,
 
+    /// `backup.backup_dir` was set (backups enabled) without
+    /// `enable_admin_endpoints = true`. A backup is triggered and monitored
+    /// exclusively through the bearer-gated `/admin/backup*` HTTP routes; with
+    /// the admin surface off there is no way to reach them, so enabling backups
+    /// without the admin surface is a configuration mistake, not a deployment
+    /// choice. Fail closed so the misconfiguration surfaces before startup.
+    #[error(
+        "backup.backup_dir is set (backups enabled) but enable_admin_endpoints = false; the \
+         backup is controlled only through the bearer-gated /admin/backup* routes, which are \
+         not registered when the admin surface is off. Set enable_admin_endpoints = true (and \
+         an admin_token), or unset backup.backup_dir to disable backups"
+    )]
+    BackupRequiresAdminEndpoints,
+
+    /// `backup.abort_headroom_segments >= backup.min_headroom_segments`. The
+    /// mid-run abort floor must sit strictly below the pre-flight floor;
+    /// otherwise a backup that just passed pre-flight could immediately trip
+    /// the abort gate on its first headroom check.
+    #[error(
+        "backup.abort_headroom_segments = {abort} must be strictly below \
+         backup.min_headroom_segments = {min}; the mid-run abort floor has to sit under the \
+         pre-flight floor or a freshly-admitted backup aborts on its first headroom check"
+    )]
+    BackupHeadroomInvalid {
+        /// The configured mid-run abort floor.
+        abort: u32,
+        /// The configured pre-flight floor.
+        min: u32,
+    },
+
+    /// `backup.stall_copy_max_segments == 0`. The catch-up "caught up" window
+    /// must admit at least one segment of slack; a zero window can never
+    /// converge because the append frontier always advances by at least the
+    /// open segment during a stall.
+    #[error(
+        "backup.stall_copy_max_segments = 0 is invalid; the catch-up window must be at least 1 \
+         segment or the copier can never declare a store caught up"
+    )]
+    BackupStallInvalid,
+
     /// `device_paths` was empty. The startup path indexes `device_paths[0]`
     /// to derive the redo log path and cluster state path; an empty vec
     /// would panic. See F-G10-004.
@@ -561,6 +601,125 @@ impl CacheConfig {
     /// Whether the cache is enabled (non-zero budget).
     pub fn is_enabled(&self) -> bool {
         self.bytes > 0
+    }
+}
+
+/// Online-backup tunables (`[backup]` TOML section).
+///
+/// Backups are disabled unless `backup_dir` is set: with no directory there is
+/// nowhere to place the device image + redo tail, and [`BackupConfig::is_enabled`]
+/// returns `false`. When enabled, the remaining knobs map directly onto the
+/// [`crate::backup::BackupParams`] the online-backup job consumes (throttle,
+/// headroom floors, catch-up bounds, and the bounded redo-tee buffer). See
+/// `docs/ONLINE_BACKUP_DESIGN.md`.
+///
+/// # Example (TOML)
+///
+/// ```toml
+/// [backup]
+/// backup_dir = "/var/backups/teraslab"  # unset (default) = backups disabled
+/// throttle_bytes_per_sec = 268435456    # 256 MiB/s copier throttle (0 = unthrottled)
+/// min_headroom_segments = 64            # pre-flight virgin-segment floor per store
+/// abort_headroom_segments = 16          # mid-run abort floor (must be < min)
+/// stall_copy_max_segments = 4           # catch-up "caught up" window (>= 1)
+/// max_catchup_rounds = 10               # catch-up round budget before diverge
+/// tee_buffer_max_bytes = 268435456      # bounded per-store redo-tee buffer
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BackupConfig {
+    /// Directory backups are written under. `None` (default) disables backups
+    /// entirely: [`crate::backup::BackupManager::start`] is constructed with
+    /// no root and rejects every request with `UnsupportedConfig`.
+    pub backup_dir: Option<PathBuf>,
+
+    /// Copier throttle in bytes/sec (`0` = unthrottled). Default 256 MiB/s.
+    pub throttle_bytes_per_sec: u64,
+
+    /// Pre-flight floor: refuse to start a backup for any store with fewer than
+    /// this many virgin segments. Default 64.
+    pub min_headroom_segments: u32,
+
+    /// Mid-run floor: abort a running backup if any store falls below this many
+    /// virgin segments. Must be strictly below [`Self::min_headroom_segments`].
+    /// Default 16.
+    pub abort_headroom_segments: u32,
+
+    /// Catch-up window: a store within this many segments of the copier is
+    /// considered caught up. Must be at least 1. Default 4.
+    pub stall_copy_max_segments: u32,
+
+    /// Catch-up budget: maximum rounds before the append frontier is declared
+    /// diverged and the backup fails. Default 10.
+    pub max_catchup_rounds: u32,
+
+    /// Bounded per-store redo-tail tee buffer, in bytes; overflow aborts the
+    /// backup so a client write is never blocked behind it. Default 256 MiB.
+    pub tee_buffer_max_bytes: usize,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            backup_dir: None,
+            throttle_bytes_per_sec: default_backup_throttle_bytes_per_sec(),
+            min_headroom_segments: default_backup_min_headroom_segments(),
+            abort_headroom_segments: default_backup_abort_headroom_segments(),
+            stall_copy_max_segments: default_backup_stall_copy_max_segments(),
+            max_catchup_rounds: default_backup_max_catchup_rounds(),
+            tee_buffer_max_bytes: default_backup_tee_buffer_max_bytes(),
+        }
+    }
+}
+
+/// Default copier throttle for [`BackupConfig`] (256 MiB/s).
+const fn default_backup_throttle_bytes_per_sec() -> u64 {
+    268_435_456
+}
+
+/// Default pre-flight virgin-segment floor for [`BackupConfig`].
+const fn default_backup_min_headroom_segments() -> u32 {
+    64
+}
+
+/// Default mid-run abort virgin-segment floor for [`BackupConfig`].
+const fn default_backup_abort_headroom_segments() -> u32 {
+    16
+}
+
+/// Default catch-up "caught up" window for [`BackupConfig`].
+const fn default_backup_stall_copy_max_segments() -> u32 {
+    4
+}
+
+/// Default catch-up round budget for [`BackupConfig`].
+const fn default_backup_max_catchup_rounds() -> u32 {
+    10
+}
+
+/// Default bounded redo-tee buffer for [`BackupConfig`] (256 MiB).
+const fn default_backup_tee_buffer_max_bytes() -> usize {
+    268_435_456
+}
+
+impl BackupConfig {
+    /// Whether backups are enabled (a `backup_dir` is configured).
+    pub fn is_enabled(&self) -> bool {
+        self.backup_dir.is_some()
+    }
+
+    /// Project the tunables onto the [`crate::backup::BackupParams`] the
+    /// backup job consumes. Does not include `backup_dir` (that is threaded
+    /// separately as the manager's backup root).
+    pub fn to_params(&self) -> crate::backup::BackupParams {
+        crate::backup::BackupParams {
+            throttle_bytes_per_sec: self.throttle_bytes_per_sec,
+            min_headroom_segments: self.min_headroom_segments,
+            abort_headroom_segments: self.abort_headroom_segments,
+            stall_copy_max_segments: self.stall_copy_max_segments,
+            max_catchup_rounds: self.max_catchup_rounds,
+            tee_buffer_max_bytes: self.tee_buffer_max_bytes,
+        }
     }
 }
 
@@ -1215,6 +1374,10 @@ pub struct ServerConfig {
     /// [`StorageConfig`].
     pub storage: StorageConfig,
 
+    /// Online-backup configuration (`[backup]`). Backups are disabled by
+    /// default (`backup_dir` unset). See [`BackupConfig`].
+    pub backup: BackupConfig,
+
     /// Expected device identity (hex string). If set, the server refuses to
     /// start if the on-disk identity does not match. Use this to prevent
     /// accidentally pointing at the wrong device.
@@ -1309,6 +1472,7 @@ impl Default for ServerConfig {
             index: IndexConfig::default(),
             cache: CacheConfig::default(),
             storage: StorageConfig::default(),
+            backup: BackupConfig::default(),
             device_id: None,
             observability: ObservabilityConfig::default(),
         }
@@ -1921,6 +2085,30 @@ impl ServerConfig {
                 actual: t.len(),
                 min: Self::MIN_REMOTE_ADMIN_TOKEN_LEN,
             });
+        }
+
+        // (5) Backup gates — only enforced when backups are enabled
+        // (`backup.backup_dir` is set). With no backup directory the whole
+        // subsystem is inert, so the tunables are not consulted.
+        if self.backup.backup_dir.is_some() {
+            // (5a) The backup is driven exclusively through the bearer-gated
+            // `/admin/backup*` routes; enabling backups without the admin
+            // surface leaves them unreachable.
+            if !self.enable_admin_endpoints {
+                return Err(ConfigError::BackupRequiresAdminEndpoints);
+            }
+            // (5b) The mid-run abort floor must sit strictly below the
+            // pre-flight floor, or a freshly-admitted backup aborts at once.
+            if self.backup.abort_headroom_segments >= self.backup.min_headroom_segments {
+                return Err(ConfigError::BackupHeadroomInvalid {
+                    abort: self.backup.abort_headroom_segments,
+                    min: self.backup.min_headroom_segments,
+                });
+            }
+            // (5c) The catch-up window must admit at least one segment of slack.
+            if self.backup.stall_copy_max_segments == 0 {
+                return Err(ConfigError::BackupStallInvalid);
+            }
         }
 
         Ok(())
@@ -3703,6 +3891,159 @@ listen_addr = "not-a-socket-addr"
         };
         cfg.validate_safe_defaults()
             .expect("no token is fine when admin surface is off");
+    }
+
+    // ------------------------------------------------------------------
+    // Online backup (`[backup]`) config + validation gates.
+    // ------------------------------------------------------------------
+
+    /// Backups are disabled by default: no `backup_dir`, `is_enabled()` false,
+    /// and the tunable defaults match `BackupParams::default()`.
+    #[test]
+    fn backup_disabled_by_default() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.backup.backup_dir.is_none());
+        assert!(!cfg.backup.is_enabled());
+
+        let params = cfg.backup.to_params();
+        let defaults = crate::backup::BackupParams::default();
+        assert_eq!(
+            params.throttle_bytes_per_sec,
+            defaults.throttle_bytes_per_sec
+        );
+        assert_eq!(params.min_headroom_segments, defaults.min_headroom_segments);
+        assert_eq!(
+            params.abort_headroom_segments,
+            defaults.abort_headroom_segments
+        );
+        assert_eq!(
+            params.stall_copy_max_segments,
+            defaults.stall_copy_max_segments
+        );
+        assert_eq!(params.max_catchup_rounds, defaults.max_catchup_rounds);
+        assert_eq!(params.tee_buffer_max_bytes, defaults.tee_buffer_max_bytes);
+
+        // A default config still passes validation (no backup gates fire).
+        cfg.validate_safe_defaults()
+            .expect("default config (backups off) must validate");
+    }
+
+    /// Enabling backups (`backup_dir` set) without the admin surface is a
+    /// misconfiguration — the `/admin/backup*` routes would be unreachable.
+    #[test]
+    fn backup_dir_without_admin_endpoints_is_rejected() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: false,
+            backup: BackupConfig {
+                backup_dir: Some(PathBuf::from("/var/backups/teraslab")),
+                ..BackupConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("backups enabled without admin endpoints must be rejected");
+        match err {
+            ConfigError::BackupRequiresAdminEndpoints => {}
+            other => panic!("expected BackupRequiresAdminEndpoints, got {other:?}"),
+        }
+    }
+
+    /// The mid-run abort floor must sit strictly below the pre-flight floor.
+    #[test]
+    fn backup_abort_headroom_not_below_min_is_rejected() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: true,
+            admin_token: Some(Secret::new("operator-issued-secret-1234")),
+            backup: BackupConfig {
+                backup_dir: Some(PathBuf::from("/var/backups/teraslab")),
+                min_headroom_segments: 32,
+                abort_headroom_segments: 32, // equal → invalid (must be <)
+                ..BackupConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("abort >= min headroom must be rejected");
+        match err {
+            ConfigError::BackupHeadroomInvalid { abort, min } => {
+                assert_eq!(abort, 32);
+                assert_eq!(min, 32);
+            }
+            other => panic!("expected BackupHeadroomInvalid, got {other:?}"),
+        }
+    }
+
+    /// A zero catch-up window can never converge and is rejected.
+    #[test]
+    fn backup_zero_stall_window_is_rejected() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: true,
+            admin_token: Some(Secret::new("operator-issued-secret-1234")),
+            backup: BackupConfig {
+                backup_dir: Some(PathBuf::from("/var/backups/teraslab")),
+                stall_copy_max_segments: 0,
+                ..BackupConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        let err = cfg
+            .validate_safe_defaults()
+            .expect_err("stall_copy_max_segments = 0 must be rejected");
+        match err {
+            ConfigError::BackupStallInvalid => {}
+            other => panic!("expected BackupStallInvalid, got {other:?}"),
+        }
+    }
+
+    /// A fully-specified, self-consistent backup config passes validation.
+    #[test]
+    fn valid_backup_config_passes() {
+        let cfg = ServerConfig {
+            enable_admin_endpoints: true,
+            admin_token: Some(Secret::new("operator-issued-secret-1234")),
+            backup: BackupConfig {
+                backup_dir: Some(PathBuf::from("/var/backups/teraslab")),
+                throttle_bytes_per_sec: 100 * 1024 * 1024,
+                min_headroom_segments: 64,
+                abort_headroom_segments: 16,
+                stall_copy_max_segments: 4,
+                max_catchup_rounds: 10,
+                tee_buffer_max_bytes: 128 * 1024 * 1024,
+            },
+            ..ServerConfig::default()
+        };
+        cfg.validate_safe_defaults()
+            .expect("a valid backup config must validate");
+        assert!(cfg.backup.is_enabled());
+    }
+
+    /// The `[backup]` TOML section deserializes with `#[serde(default)]` field
+    /// fill-in: an omitted key falls back to its documented default.
+    #[test]
+    fn backup_config_toml_partial_fills_defaults() {
+        let toml_str = r#"
+enable_admin_endpoints = true
+admin_token = "operator-issued-secret-1234"
+
+[backup]
+backup_dir = "/srv/backups"
+throttle_bytes_per_sec = 0
+"#;
+        let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.backup.backup_dir.as_deref(),
+            Some(std::path::Path::new("/srv/backups"))
+        );
+        // Explicitly set key.
+        assert_eq!(cfg.backup.throttle_bytes_per_sec, 0);
+        // Omitted keys fall back to defaults.
+        assert_eq!(cfg.backup.min_headroom_segments, 64);
+        assert_eq!(cfg.backup.abort_headroom_segments, 16);
+        assert_eq!(cfg.backup.stall_copy_max_segments, 4);
+        cfg.validate_safe_defaults()
+            .expect("partial backup TOML must validate");
     }
 
     /// Guards env var so two parallel admin-token tests don't collide.

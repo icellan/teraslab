@@ -21976,7 +21976,8 @@ mod tests {
         );
 
         let hists = crate::metrics::ThreadHistograms::new();
-        let text = crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0, 0);
+        let text =
+            crate::server::http::render_metrics_text(m, &hists, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         // Every (op, outcome) cell must appear exactly once with matching value.
         let mut found_spend_ok = false;
