@@ -229,6 +229,13 @@ pub struct Engine {
     /// checkpoint drainer read it; each store's log signals it on reclaim.
     /// `None` until redo logs are attached (test / no-WAL paths).
     redo_backpressure: std::sync::OnceLock<Arc<crate::redo::RedoBackpressure>>,
+    /// Lock-free write-health mirrors, one per store, captured in
+    /// [`Self::set_redo_logs`] alongside `redo_logs`. Issue #32: a health probe
+    /// must observe whether ANY store's redo log has been poisoned WITHOUT
+    /// taking that log's writer mutex (a probe must never block behind a write
+    /// burst). [`Self::write_healthy`] reads these. `None`/empty in test /
+    /// no-WAL paths, which are treated as write-healthy.
+    redo_atomics: std::sync::OnceLock<Vec<Arc<crate::redo::RedoAtomics>>>,
     /// Highest `current_block_height` this node has durably observed across
     /// every height-bearing op it applied (spend / set_mined /
     /// mark_longest_chain / unspend), monotonically maxed
@@ -502,6 +509,7 @@ impl Engine {
             redo_buffered: std::sync::atomic::AtomicBool::new(false),
             clustered: std::sync::atomic::AtomicBool::new(false),
             redo_backpressure: std::sync::OnceLock::new(),
+            redo_atomics: std::sync::OnceLock::new(),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
             last_checkpoint_compacted: std::sync::atomic::AtomicU64::new(0),
@@ -583,6 +591,9 @@ impl Engine {
         // log, so the gate must not block.
         if !logs.is_empty() {
             let atomics: Vec<_> = logs.iter().map(|l| l.lock().atomics()).collect();
+            // Issue #32: keep the lock-free write-health mirrors so `write_healthy`
+            // can probe every store's poison flag without taking a log mutex.
+            let _ = self.redo_atomics.set(atomics.clone());
             let bp = crate::redo::RedoBackpressure::new(atomics);
             for l in &logs {
                 l.lock().set_backpressure(bp.clone());
@@ -684,6 +695,26 @@ impl Engine {
     /// drainer use this handle.
     pub fn redo_backpressure(&self) -> Option<Arc<crate::redo::RedoBackpressure>> {
         self.redo_backpressure.get().cloned()
+    }
+
+    /// Whether the node can accept writes: `false` if ANY store's redo log has
+    /// been poisoned by a flush failure.
+    ///
+    /// Issue #32: a poisoned redo log rejects every subsequent append/flush with
+    /// [`crate::redo::RedoError::Poisoned`], so every mutation fails until the
+    /// process restarts and recovery rebuilds from the durable on-disk state.
+    /// While poisoned the node is effectively write-dead, and the health
+    /// endpoints must report that so orchestration restarts/drains it.
+    ///
+    /// This reads the lock-free [`crate::redo::RedoAtomics`] mirrors captured at
+    /// [`Self::set_redo_logs`], so a health probe NEVER blocks behind the redo
+    /// writer lock (which a sustained write burst can hold). When no redo logs
+    /// are attached (test / no-WAL paths) the node is considered write-healthy.
+    pub fn write_healthy(&self) -> bool {
+        match self.redo_atomics.get() {
+            Some(atomics) => !atomics.iter().any(|a| a.is_poisoned()),
+            None => true,
+        }
     }
 
     /// The redo log owning store `device_id`, for secondary-index two-phase
