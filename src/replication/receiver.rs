@@ -946,6 +946,34 @@ pub fn handle_replica_batch_with_tracker(
     // journalling — they are normal replicated mutations.
     let journal = !is_migration;
     let start_seq = batch.first_sequence + skip_count as u64;
+
+    // Issue #29 — replica-side redo backpressure. The master mutation path
+    // stalls on this same gate before it fills the redo (see
+    // `handle_request`); the replica apply path is a separate TCP listener that
+    // never reached it, so a replica whose redo legitimately filled (checkpoint
+    // draining slower than sustained catch-up) hit `LogFull` on the first
+    // overflowing append → `poison_all_redo_logs` → the whole node FENCED until
+    // restart. Reuse the master's gate here so the batch STALLS until the drain
+    // frees space, then applies — a stalled replica is a better availability
+    // outcome than a fenced one.
+    //
+    // Placement is deliberate and MUST stay here: after every validation /
+    // stale-epoch / migration-key / dedup gate (the batch is accepted for
+    // application) but BEFORE the per-op apply loop and the post-loop device +
+    // redo fsync barrier. Nothing above holds a lock the checkpoint drain
+    // needs, and the gate itself holds NO barrier while waiting — mirroring the
+    // master's pre-barrier placement. The checkpoint drain that frees the space
+    // needs those same barriers, so gating under any of them would deadlock.
+    //
+    // Covers BOTH the tracked and migration/out-of-band paths: they share this
+    // one apply loop (the `journal` / `is_migration` flags only vary per-op
+    // journalling, not the route), so one gate before the loop backpressures a
+    // migration delta exactly like a normal replicated batch. Inherits the
+    // gate's safety: a no-op when no redo is attached or the coordinator is
+    // unarmed, so a replica with no drain armed degrades to the historical
+    // `LogFull` → poison path rather than hanging.
+    crate::server::dispatch::redo_backpressure_gate(engine);
+
     for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
         if let Err(msg) = apply_op_journal(engine, op, journal, is_migration) {
             let ack = ReplicaAck::Error {
@@ -5070,6 +5098,199 @@ mod tests {
 
         // Tracker still sits at the same high-water mark.
         assert_eq!(tracker.get(stream_key), 12);
+    }
+
+    /// Issue #29 — the replica apply path must honour redo backpressure.
+    ///
+    /// Pre-fix, `handle_replica_batch_with_tracker` never touched the master's
+    /// pre-barrier backpressure gate, so a replica whose redo legitimately
+    /// filled (checkpoint draining slower than sustained catch-up) hit
+    /// `LogFull` on the first overflowing append → `poison_all_redo_logs` → the
+    /// whole node FENCED until restart. This drives the replica apply path with
+    /// an armed backpressure whose redo is (near-)exhausted and a batch that
+    /// would overflow it, then reclaims from another thread once the appender
+    /// blocks. The contract: the call STALLS on the gate and then SUCCEEDS
+    /// (batch applied, ack OK) WITHOUT poisoning the redo — the exact contrast
+    /// with the pre-fix immediate `LogFull` → fence.
+    #[test]
+    fn replica_apply_stalls_on_redo_backpressure_then_applies_without_fencing() {
+        use crate::redo::{RedoError, RedoLog, RedoOp};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Duration;
+
+        // A replica-shaped engine with a SMALL attached redo log so we can
+        // exhaust it cheaply. Keep the log Arc so the reclaim thread can reset
+        // it (mirroring the checkpoint drain freeing space).
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev, 0, 256 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+
+        let bp = engine
+            .redo_backpressure()
+            .expect("attached redo log must expose a backpressure coordinator");
+        // Arm the coordinator: a drain (our reclaim thread below) is present.
+        // Unarmed, the gate is a pure no-op and the append would just LogFull.
+        bp.arm();
+
+        let reserve = (bp.capacity() / 8).max(1);
+
+        // Exhaust the log so `available_space` is BELOW both the gate's reserve
+        // (so the gate blocks) and a single entry (so an append absent the gate
+        // would genuinely LogFull). Fill with fat Create entries direct on the
+        // log handle.
+        let mut filler_seed = 0u8;
+        loop {
+            let avail = bp.available_space();
+            if avail < 4096 {
+                break;
+            }
+            let op = RedoOp::Create {
+                tx_key: TxKey {
+                    txid: [filler_seed; 32],
+                },
+                device_id: 0,
+                record_offset: 4096,
+                utxo_count: 1,
+                is_conflicting: false,
+                record_bytes: vec![0xCD; 2048].into(),
+                parent_txids: Vec::new(),
+            };
+            match log.lock().append_and_flush(op) {
+                Ok(_) => {}
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected error while pre-filling redo: {e}"),
+            }
+            filler_seed = filler_seed.wrapping_add(1);
+        }
+        assert!(
+            bp.available_space() < reserve,
+            "pre-fill must leave the log below the gate reserve so the gate blocks",
+        );
+
+        // Reclaim thread: reset (frees the whole region) ONLY once an appender
+        // is blocked on the gate — this is the real drain handshake. Without
+        // the gate raising `blocked_appenders`, this never fires.
+        let done = Arc::new(AtomicBool::new(false));
+        let blocked_seen = Arc::new(AtomicBool::new(false));
+        let reclaimer = {
+            let log = log.clone();
+            let bp = bp.clone();
+            let done = done.clone();
+            let blocked_seen = blocked_seen.clone();
+            std::thread::spawn(move || {
+                // Keep reclaiming as long as the apply is running: the gate can
+                // in principle re-block if the batch's own appends refill the
+                // log below the reserve, so a one-shot reset could race the
+                // apply loop under load. Reset whenever an appender is blocked
+                // until the main thread signals the batch is done.
+                while !done.load(Ordering::Relaxed) {
+                    if bp.blocked_appenders() > 0 {
+                        blocked_seen.store(true, Ordering::Relaxed);
+                        log.lock().reset().expect("reset reclaims the region");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+
+        // A tracked replica batch of Creates that, applied, journals several
+        // entries — more than the residual free space, so absent the gate the
+        // first append would LogFull and fence the node.
+        let ops: Vec<ReplicaOp> = (0..4)
+            .map(|i| ReplicaOp::Create {
+                tx_key: key(100 + i),
+                metadata_bytes: vec![0u8; 64],
+                utxo_hashes: vec![[0xAA; 32]; 2],
+                cold_data: None,
+                is_external: false,
+            })
+            .collect();
+        let batch = ReplicaBatch {
+            first_sequence: 10,
+            ops,
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-bp:5000";
+        // Seed the watermark so first_sequence=10 is the next-expected position.
+        tracker.set(stream_key, 9);
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        done.store(true, Ordering::Relaxed);
+        reclaimer.join().unwrap();
+
+        // (a) The apply SUCCEEDED — batch applied, ack OK — rather than
+        // erroring / fencing.
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "replica batch under backpressure must apply, not error",
+        );
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 13
+            },
+            "the whole batch must be acked through its last sequence",
+        );
+        // Every op's record is actually present.
+        for i in 0..4 {
+            assert!(
+                engine.lookup(&key(100 + i)).is_some(),
+                "record {i} from the applied batch must exist",
+            );
+        }
+        // The gate genuinely engaged: an appender blocked and the reclaim ran.
+        assert!(
+            blocked_seen.load(Ordering::Relaxed),
+            "the apply must have stalled on the backpressure gate (appender blocked)",
+        );
+
+        // (b) The redo is NOT poisoned — the pre-fix path would have called
+        // `poison_all_redo_logs`, fencing the node. Post-reclaim the log is
+        // empty; a fresh append MUST succeed (a poisoned log returns
+        // `RedoError::Poisoned`).
+        let probe = RedoOp::Create {
+            tx_key: TxKey { txid: [0xEE; 32] },
+            device_id: 0,
+            record_offset: 4096,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: vec![0x11; 128].into(),
+            parent_txids: Vec::new(),
+        };
+        match log.lock().append_and_flush(probe) {
+            Ok(_) => {}
+            Err(RedoError::Poisoned) => {
+                panic!("redo was poisoned — the replica node was fenced (issue #29 regression)")
+            }
+            Err(e) => panic!("unexpected redo error after backpressure apply: {e}"),
+        }
     }
 
     /// `replica_restart_remembers_last_applied_seq`: after persisting

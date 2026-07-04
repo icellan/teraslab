@@ -4331,7 +4331,13 @@ const REDO_BACKPRESSURE_MAX_WAIT: Duration = Duration::from_secs(30);
 /// coordinator (no drain → nothing to reclaim a full log → blocking would
 /// hang; a full-log append then degrades to `LogFull` → rollback →
 /// `ERR_STORAGE`).
-fn redo_backpressure_gate(engine: &Engine) {
+///
+/// `pub(crate)` so the replica apply path
+/// ([`crate::replication::receiver::handle_replica_batch_with_tracker`]) can
+/// reuse the exact same gate (issue #29): a replica whose redo legitimately
+/// fills must stall on the drain here rather than hit `LogFull` and fence the
+/// node. The consts it encapsulates stay private to this module.
+pub(crate) fn redo_backpressure_gate(engine: &Engine) {
     let Some(bp) = engine.redo_backpressure() else {
         return;
     };
