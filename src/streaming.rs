@@ -149,6 +149,27 @@ impl StreamingWriteDevice {
         st.base += flushable as u64;
         Ok(())
     }
+
+    /// Read exactly `buf.len()` bytes from the inner device at `offset`, bypassing
+    /// any inner cache ([`BlockDevice::pread_nocache`]). The cache-bypassing
+    /// analogue of the inner `pread_exact_at`, used by [`Self::pread_nocache`].
+    fn inner_pread_nocache_exact(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let got = self
+                .inner
+                .pread_nocache(&mut buf[done..], offset + done as u64)?;
+            if got == 0 {
+                return Err(DeviceError::ShortRead {
+                    expected: buf.len(),
+                    got: done,
+                    offset,
+                });
+            }
+            done += got;
+        }
+        Ok(())
+    }
 }
 
 impl BlockDevice for StreamingWriteDevice {
@@ -271,6 +292,55 @@ impl BlockDevice for StreamingWriteDevice {
         }
         if let Some((off, start, n)) = above {
             self.inner.pread_exact_at(&mut buf[start..start + n], off)?;
+        }
+        Ok(len)
+    }
+
+    fn pread_nocache(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let len = buf.len();
+        if len == 0 {
+            return Ok(0);
+        }
+        // Identical to `pread` but the inner-device reads bypass any inner cache
+        // (`pread_nocache`). The buffered write tail is ALWAYS served from the
+        // in-memory buffer — those are the newest, not-yet-flushed bytes.
+        let read_end = offset + len as u64;
+        let mut below: Option<(u64, usize, usize)> = None;
+        let mut above: Option<(u64, usize, usize)> = None;
+        {
+            let st = self.state.lock();
+            let bend = st.base + st.buf.len() as u64;
+            if st.buf.is_empty() || read_end <= st.base || offset >= bend {
+                // No overlap — entirely on the inner device.
+            } else {
+                let lo = offset.max(st.base);
+                let hi = read_end.min(bend);
+                let dst_start = (lo - offset) as usize;
+                let src_start = (lo - st.base) as usize;
+                let n = (hi - lo) as usize;
+                buf[dst_start..dst_start + n].copy_from_slice(&st.buf[src_start..src_start + n]);
+                if offset < lo {
+                    below = Some((offset, 0, (lo - offset) as usize));
+                }
+                if read_end > hi {
+                    above = Some((hi, (hi - offset) as usize, (read_end - hi) as usize));
+                }
+            }
+        }
+        if below.is_none() && above.is_none() {
+            let st_empty = {
+                let st = self.state.lock();
+                st.buf.is_empty() || read_end <= st.base || offset >= st.base + st.buf.len() as u64
+            };
+            if st_empty {
+                return self.inner_pread_nocache_exact(buf, offset).map(|()| len);
+            }
+        }
+        if let Some((off, start, n)) = below {
+            self.inner_pread_nocache_exact(&mut buf[start..start + n], off)?;
+        }
+        if let Some((off, start, n)) = above {
+            self.inner_pread_nocache_exact(&mut buf[start..start + n], off)?;
         }
         Ok(len)
     }

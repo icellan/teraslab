@@ -2114,6 +2114,15 @@ pub trait RecordAllocator: Send {
         None
     }
 
+    /// Online backup: serialize the allocator header from memory into an aligned
+    /// buffer WITHOUT touching the device, so the backup captures an untorn
+    /// header even while a checkpoint rewrites the on-disk one. `None` for
+    /// allocators without a segment header (the in-place [`SlotAllocator`]). The
+    /// segment allocator overrides it.
+    fn serialize_backup_header(&self) -> Option<AlignedBuf> {
+        None
+    }
+
     /// Test/fault-injection only: arm the next persist to fail once. On the trait
     /// so checkpoint crash tests can trigger it through the engine's boxed
     /// allocator. Compiled out of production builds.
@@ -2230,6 +2239,9 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn backup_view(&self) -> Option<SegmentBackupView> {
         (**self).backup_view()
+    }
+    fn serialize_backup_header(&self) -> Option<AlignedBuf> {
+        (**self).serialize_backup_header()
     }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {

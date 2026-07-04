@@ -537,6 +537,14 @@ impl Engine {
         self.redo_logs.get().and_then(|v| v.first()).cloned()
     }
 
+    /// All per-store redo logs (one per store, indexed by `device_id`), or an
+    /// empty vec if none are attached (test / no-WAL paths). The online backup
+    /// installs its tail tee on every store's log. All logs share one global
+    /// sequence counter, so `current_sequence()` is identical across them.
+    pub fn redo_logs(&self) -> Vec<Arc<parking_lot::Mutex<crate::redo::RedoLog>>> {
+        self.redo_logs.get().map(|v| v.to_vec()).unwrap_or_default()
+    }
+
     /// Attach the per-store redo logs (one per store, indexed by `device_id`).
     ///
     /// Call once at boot after recovery (this is the SOLE redo-log attach point;
@@ -2050,6 +2058,16 @@ impl Engine {
             .allocator
             .lock()
             .backup_view()
+    }
+
+    /// Serialize store `device_id`'s allocator header from memory (untorn), for
+    /// the online backup to capture at finalize. `None` for a non-segment store.
+    /// Takes the allocator lock briefly.
+    pub fn serialize_store_header(&self, device_id: u8) -> Option<crate::device::AlignedBuf> {
+        self.stores[device_id as usize]
+            .allocator
+            .lock()
+            .serialize_backup_header()
     }
 
     /// The device backing records placed on `device_id` (the index entry's
@@ -8788,8 +8806,9 @@ const DURABLE_HEIGHT_VERSION: u16 = 1;
 const DURABLE_HEIGHT_LEN: usize = 4 + 2 + 2 + 4 + 4;
 
 /// Serialize a node height into the fixed 16-byte durable-file layout with a
-/// trailing CRC32 over the preceding 12 bytes.
-fn encode_durable_height(height: u32) -> [u8; DURABLE_HEIGHT_LEN] {
+/// trailing CRC32 over the preceding 12 bytes. Public so the online-backup
+/// restore path can write a `.height` file offline without an engine.
+pub fn encode_durable_height(height: u32) -> [u8; DURABLE_HEIGHT_LEN] {
     let mut buf = [0u8; DURABLE_HEIGHT_LEN];
     buf[0..4].copy_from_slice(&DURABLE_HEIGHT_MAGIC);
     buf[4..6].copy_from_slice(&DURABLE_HEIGHT_VERSION.to_le_bytes());

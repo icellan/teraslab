@@ -1364,6 +1364,9 @@ impl RecordAllocator for SegmentAllocator {
     fn backup_view(&self) -> Option<SegmentBackupView> {
         Some(SegmentAllocator::backup_view(self))
     }
+    fn serialize_backup_header(&self) -> Option<crate::device::AlignedBuf> {
+        SegmentAllocator::serialize_header_bytes(self).ok()
+    }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {
         // No fault-injection hook on the segment allocator (yet); no-op so the

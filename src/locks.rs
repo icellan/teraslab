@@ -131,6 +131,19 @@ impl StripedRwLocks {
         self.locks[idx].write()
     }
 
+    /// Acquire a shared (read) guard for a specific stripe index.
+    ///
+    /// The read-side counterpart to [`Self::write_index`], used by the online
+    /// backup copier to hold the SAME per-block stripes a writer holds
+    /// exclusively across its pwrite/memcpy, so a chunk read never tears against
+    /// an in-flight RMW. The caller maps each 4 KiB block to its stripe via
+    /// [`Self::stripe_index`], deduplicates, and sorts (the read side is
+    /// shared/reentrant across threads, but dedup avoids redundant guards).
+    #[inline]
+    pub fn read_index(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.locks[idx].read()
+    }
+
     /// Number of stripes in the lock table.
     pub fn stripe_count(&self) -> usize {
         self.locks.len()

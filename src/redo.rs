@@ -3079,13 +3079,34 @@ impl RedoLog {
         frames: &[Vec<u8>],
     ) -> Result<()> {
         let align = device.alignment();
-        let header_block_size = align;
+        let region = Self::build_backup_redo_region(align, fence, tail_end, frames);
+        // O_DIRECT needs an alignment-multiple, alignment-backed buffer.
+        let mut buf = AlignedBuf::new(region.len(), align);
+        buf[..region.len()].copy_from_slice(&region);
+        // Trailing bytes are already zero (AlignedBuf zero-fills) → end-of-log.
+        device.pwrite_all_at(&buf, 0)?;
+        device.sync()?;
+        Ok(())
+    }
 
+    /// Build the raw bytes of a backup redo file (see
+    /// [`Self::write_backup_redo_file`]): a linear-v2 header block padded to
+    /// `align`, a `RecoveryProgress { fence }` marker at sequence `fence`, then
+    /// the teed tail `frames`, with the whole region padded up to an `align`
+    /// multiple (trailing zeros = end-of-log). Returned as an owned `Vec` so the
+    /// backup can write it to a plain file in the backup directory; restore
+    /// installs it at the target redo path.
+    pub fn build_backup_redo_region(
+        align: usize,
+        fence: u64,
+        tail_end: u64,
+        frames: &[Vec<u8>],
+    ) -> Vec<u8> {
         let mut region: Vec<u8> = Vec::new();
         // Header block, padded to one alignment block.
         let header = RedoHeader::linear(tail_end + 1, fence, 0).serialize();
         region.extend_from_slice(&header);
-        region.resize(header_block_size, 0);
+        region.resize(align, 0);
         // Fence marker at sequence `fence`, then the tail frames in order.
         let marker = RedoEntry {
             sequence: fence,
@@ -3098,15 +3119,10 @@ impl RedoLog {
         for frame in frames {
             region.extend_from_slice(frame);
         }
-
-        // O_DIRECT needs an alignment-multiple, alignment-backed buffer.
+        // Pad to an alignment multiple.
         let padded_len = region.len().div_ceil(align) * align;
-        let mut buf = AlignedBuf::new(padded_len, align);
-        buf[..region.len()].copy_from_slice(&region);
-        // Trailing bytes are already zero (AlignedBuf zero-fills) → end-of-log.
-        device.pwrite_all_at(&buf, 0)?;
-        device.sync()?;
-        Ok(())
+        region.resize(padded_len, 0);
+        region
     }
 
     /// This log's own next-sequence high-water mark (the value persisted in
