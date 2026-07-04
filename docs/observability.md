@@ -77,6 +77,17 @@ five groups:
    `teraslab_migration_active`, `teraslab_migration_phase_*`,
    `teraslab_freelist_region_count`, and
    `teraslab_freelist_largest_region_bytes`.
+6. **Online backup (Phase 14)** — `teraslab_backup_state` (gauge, the
+   [`BackupState`] phase encoded `Idle=0 … Failed=8`),
+   `teraslab_backup_bytes_copied_total` (counter),
+   `teraslab_backup_segments_copied` (gauge),
+   `teraslab_backup_throttle_bytes_per_sec` (gauge), and
+   `teraslab_backup_pinned` (gauge `0/1`, whether a backup currently holds the
+   segment-lifecycle pin). Always emitted, so a scrape sees a stable
+   `Idle`/`0` baseline when no backup is running. See
+   `docs/ONLINE_BACKUP_DESIGN.md`.
+
+[`BackupState`]: ../src/backup/mod.rs
 
 ### Prometheus format notes
 
