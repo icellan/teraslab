@@ -247,6 +247,7 @@ fn run_backup_impl(
             0,
             end,
             align,
+            params.abort_headroom_segments,
             &mut throttles[s as usize],
             &mut store_ranges[s as usize],
             cancel,
@@ -278,6 +279,7 @@ fn run_backup_impl(
                 base + 1,
                 new_open,
                 align,
+                params.abort_headroom_segments,
                 &mut throttles[s as usize],
                 &mut store_ranges[s as usize],
                 cancel,
@@ -324,6 +326,7 @@ fn run_backup_impl(
                     base + 1,
                     view.open_segment,
                     align,
+                    params.abort_headroom_segments,
                     &mut unthrottled,
                     &mut store_ranges[s as usize],
                     cancel,
@@ -440,6 +443,12 @@ fn run_backup_impl(
 
 /// Copy segments `start..=end` of store `device_id` into `out`, throttled and
 /// torn-read-safe, updating progress and honouring `cancel`.
+///
+/// Before each segment is copied, the store's LIVE virgin headroom is
+/// re-sampled: if it has fallen below `abort_headroom` the copy aborts with
+/// [`BackupError::InsufficientHeadroom`] so the backup fails BEFORE a client
+/// allocation would (the "backups fail, client writes never do" guarantee).
+/// The RAII pin guard held by the caller still unpins on this early return.
 #[allow(clippy::too_many_arguments)]
 fn copy_segments(
     engine: &Engine,
@@ -448,6 +457,7 @@ fn copy_segments(
     start: u32,
     end: u32,
     align: usize,
+    abort_headroom: u32,
     throttle: &mut TokenBucket,
     out: &mut Vec<RangeBytes>,
     cancel: &AtomicBool,
@@ -458,6 +468,20 @@ fn copy_segments(
     for k in start..=end {
         if cancel.load(Ordering::Relaxed) {
             return Err(BackupError::Aborted);
+        }
+        // Live headroom check: sample the CURRENT virgin headroom (not the
+        // snapshot in `view`) so a backup racing client writes that consume
+        // segments aborts before allocation can fail.
+        if let Some(h) = engine
+            .backup_view_for(device_id)
+            .map(|v| v.virgin_headroom_segments())
+            && h < abort_headroom
+        {
+            return Err(BackupError::InsufficientHeadroom {
+                store: device_id,
+                have: h,
+                need: abort_headroom,
+            });
         }
         let seg_offset = view.segment_offset(k);
         let seg_size = view.segment_size;
@@ -658,6 +682,12 @@ mod tests {
         BackupParams {
             throttle_bytes_per_sec: 0,
             min_headroom_segments: 1,
+            // These tiny test devices have only a handful of virgin segments,
+            // well under the production default abort floor (16). Drop the
+            // mid-run abort floor to 0 so the live headroom monitor never
+            // trips on a device this small — these tests exercise the success
+            // path, not headroom exhaustion.
+            abort_headroom_segments: 0,
             ..BackupParams::default()
         }
     }
@@ -803,5 +833,67 @@ mod tests {
         }
         // The pin must have been released even though pre-flight failed.
         assert!(!engine.is_segment_lifecycle_pinned());
+    }
+
+    /// Mid-run monitor (R14-7): pre-flight passes (`min_headroom_segments`
+    /// low), but `abort_headroom_segments` is set ABOVE the store's actual
+    /// virgin headroom, so the FIRST per-segment live check inside
+    /// `copy_segments` fails — proving the copy loop aborts on headroom
+    /// exhaustion mid-run, not only at pre-flight. The pin must be released.
+    #[test]
+    fn run_backup_aborts_mid_run_when_headroom_below_abort_floor() {
+        let dir = TempDir::new().unwrap();
+        // 8 MiB device, 1 MiB segments → ~6 virgin segments of headroom.
+        let size = 8 * 1024 * 1024;
+        let engine = seg_engine(size);
+        // Write a couple records so the copy loop has at least one segment to
+        // reach the per-segment headroom check.
+        for i in 1..=2u64 {
+            make_record(&engine, i);
+        }
+        let headroom = engine
+            .backup_view_for(0)
+            .expect("segment store")
+            .virgin_headroom_segments();
+        assert!(headroom >= 1, "expected some headroom, got {headroom}");
+
+        let config = test_config(dir.path(), size);
+        let params = BackupParams {
+            throttle_bytes_per_sec: 0,
+            // Pre-flight passes: 1 <= actual headroom.
+            min_headroom_segments: 1,
+            // Mid-run trips: set the abort floor ABOVE the actual headroom so
+            // the first per-segment live sample is below it.
+            abort_headroom_segments: headroom + 1000,
+            ..BackupParams::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let progress = Mutex::new(BackupProgress::default());
+        let blob_pause = AtomicBool::new(false);
+
+        match run_backup(
+            &engine,
+            &blob_pause,
+            &config,
+            &params,
+            &dir.path().join("bk"),
+            &cancel,
+            &progress,
+        ) {
+            Err(BackupError::InsufficientHeadroom { store, have, need }) => {
+                assert_eq!(store, 0);
+                assert_eq!(need, headroom + 1000);
+                assert!(
+                    have <= headroom,
+                    "mid-run sample {have} must be <= pre-flight headroom {headroom}"
+                );
+            }
+            other => panic!("expected mid-run InsufficientHeadroom, got {other:?}"),
+        }
+        // The RAII pin must have been released on the mid-run abort.
+        assert!(!engine.is_segment_lifecycle_pinned());
+        assert_eq!(progress.lock().state, BackupState::Failed);
+        // No manifest is written on abort.
+        assert!(!dir.path().join("bk").join(MANIFEST_FILE).exists());
     }
 }

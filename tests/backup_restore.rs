@@ -36,6 +36,7 @@ const ALIGN: usize = 4096;
 const SEG: u64 = 1024 * 1024; // 1 MiB segments
 const DEVICE_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
 
+#[allow(clippy::field_reassign_with_default)]
 fn source_config(dir: &std::path::Path) -> ServerConfig {
     let mut cfg = ServerConfig::default();
     cfg.device_paths = vec![dir.join("data.dat")];
@@ -117,6 +118,9 @@ fn backup_then_restore_round_trips_device_and_records() {
     let params = BackupParams {
         throttle_bytes_per_sec: 0,
         min_headroom_segments: 1,
+        // Tiny (16 MiB) test device: keep the mid-run abort floor at 0 so the
+        // live headroom monitor never trips on so few virgin segments.
+        abort_headroom_segments: 0,
         ..BackupParams::default()
     };
     let cancel = AtomicBool::new(false);
@@ -248,6 +252,9 @@ fn restore_refuses_geometry_mismatch() {
     let params = BackupParams {
         throttle_bytes_per_sec: 0,
         min_headroom_segments: 1,
+        // Tiny (16 MiB) test device: keep the mid-run abort floor at 0 so the
+        // live headroom monitor never trips on so few virgin segments.
+        abort_headroom_segments: 0,
         ..BackupParams::default()
     };
     let cancel = AtomicBool::new(false);
