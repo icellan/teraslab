@@ -1876,6 +1876,9 @@ fn main() {
         // guarantees `high_water < emergency_water < 1`.
         cfg.emergency_high_water = config.checkpoint_emergency_water;
         cfg.poll_interval = std::time::Duration::from_millis(config.checkpoint_poll_interval_ms);
+        // Pressure-aware segment-defrag tuning from [storage.defrag]. Config
+        // validation (validate_sizes) already checked the ranges/ordering.
+        cfg.defrag = config.storage.defrag.clone();
         if let Some(tracker) = teraslab::server::dispatch::ack_tracker_handle() {
             let reset_guard: std::sync::Arc<dyn Fn(u64) -> bool + Send + Sync + 'static> =
                 std::sync::Arc::new(move |floor_sequence| {

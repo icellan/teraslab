@@ -2013,6 +2013,13 @@ pub trait RecordAllocator: Send {
     fn free_region_count(&self) -> usize;
     /// Observability snapshot.
     fn stats(&self) -> AllocatorStats;
+    /// Segment-engine observability snapshot (on-device used/dead/live bytes and
+    /// segment layout), or `None` for the in-place engine which has no segments.
+    /// The default returns `None`; the [`crate::segment_allocator::SegmentAllocator`]
+    /// overrides it. Consumed by the pressure-aware defrag budget and `/status`.
+    fn segment_stats(&self) -> Option<crate::segment_allocator::SegmentAllocatorStats> {
+        None
+    }
     /// Current high-water mark.
     fn next_offset(&self) -> u64;
     /// Start of the data region.
@@ -2152,6 +2159,9 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn stats(&self) -> AllocatorStats {
         (**self).stats()
+    }
+    fn segment_stats(&self) -> Option<crate::segment_allocator::SegmentAllocatorStats> {
+        (**self).segment_stats()
     }
     fn next_offset(&self) -> u64 {
         (**self).next_offset()

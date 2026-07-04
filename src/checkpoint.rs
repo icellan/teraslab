@@ -61,16 +61,87 @@ use crate::redo::RedoLog;
 
 type ResetGuard = Arc<dyn Fn(u64) -> bool + Send + Sync + 'static>;
 
-/// Max partially-dead segments the defrag compaction relocates out of PER
-/// checkpoint. Bounds the live-record copy amplification and the checkpoint's
-/// added duration; the fully-dead fast path (unbounded, cheap) does the bulk of
-/// the reclaim, so compaction only needs to chip at the long-lived-record tail.
-const DEFRAG_COMPACT_MAX_SEGMENTS: usize = 4;
-/// Only compact segments this dead or more (0.0..=1.0). A high threshold means few
-/// live records to copy per segment reclaimed (≤25% live at 0.75), keeping the
-/// amplification favorable, and makes compaction self-gating (no work until a
-/// segment is mostly dead).
-const DEFRAG_COMPACT_MIN_DEAD_FRAC: f64 = 0.75;
+use crate::config::DefragConfig;
+use crate::segment_allocator::SegmentAllocatorStats;
+
+/// Compute the pressure-aware compaction budget for one checkpoint from the
+/// segment allocator's current occupancy and the operator's [`DefragConfig`].
+///
+/// The segment engine reclaims dead space in two passes per checkpoint: a
+/// cheap unbounded pass reclaims FULLY-dead segments, and this compaction pass
+/// relocates the few live records OUT of partially-dead victim segments so they
+/// drain and become reclaimable. The compaction pass is rate-limited by two
+/// levers this function scales with free-space pressure:
+///
+/// * `max_segments` — how many partially-dead segments to compact this
+///   checkpoint. Higher = more copy budget spent reclaiming space per
+///   checkpoint (and a longer checkpoint).
+/// * `min_dead_frac` — the minimum dead fraction a segment must reach to be a
+///   victim. Lower = more (less-dead) segments qualify, so partially-dead
+///   segments are converted to reclaimable BEFORE the device fills — at the
+///   cost of copying more live bytes per segment reclaimed.
+///
+/// Occupancy is `used_bytes / device_size` (the on-device footprint including
+/// dead space, i.e. what actually fills the device). The curve has three tiers,
+/// parameterized entirely by `cfg`:
+///
+/// * **Low pressure** (occupancy ≤ `pressure_low`, default 0.70): return the
+///   base `(base_max_segments, base_min_dead_frac)` = today's conservative
+///   `(4, 0.75)`. Steady-state cost is byte-identical to the pre-#33 behavior.
+/// * **High pressure** (occupancy ≥ `pressure_high`, default 0.85): return the
+///   aggressive `(max_segments_ceiling, min_dead_frac_floor)` = default
+///   `(64, 0.25)`. Spend the most copy budget and accept the least-dead
+///   victims to drain the device before it ENOSPCs.
+/// * **Mid pressure** (between the thresholds): linearly interpolate both
+///   levers by `t = (occupancy - pressure_low) / (pressure_high - pressure_low)`
+///   — `max_segments` rises toward the ceiling, `min_dead_frac` falls toward
+///   the floor.
+///
+/// `min_dead_frac` is clamped to never drop below `cfg.min_dead_frac_floor`
+/// (below which compaction copies more live bytes than the dead bytes it
+/// reclaims — net-negative churn) and `max_segments` never exceeds
+/// `cfg.max_segments_ceiling`. A `device_size` of 0 (uninitialized / non-device
+/// allocator) is treated as zero occupancy and returns the base budget without
+/// panicking on the division.
+///
+/// Returns `(max_segments, min_dead_frac)` ready to pass to
+/// [`crate::ops::engine::Engine::defrag_compact`].
+pub fn compaction_budget(stats: &SegmentAllocatorStats, cfg: &DefragConfig) -> (usize, f64) {
+    // Guard div-by-zero: a zero device_size means we have no occupancy signal,
+    // so stay at the conservative base budget.
+    if stats.device_size == 0 {
+        return (cfg.base_max_segments, cfg.base_min_dead_frac);
+    }
+    let occupancy = stats.used_bytes as f64 / stats.device_size as f64;
+
+    if occupancy <= cfg.pressure_low {
+        return (cfg.base_max_segments, cfg.base_min_dead_frac);
+    }
+    if occupancy >= cfg.pressure_high {
+        return (cfg.max_segments_ceiling, cfg.min_dead_frac_floor);
+    }
+
+    // Mid tier: linear interpolation. `pressure_high > pressure_low` is
+    // guaranteed by config validation, but guard the denominator anyway so a
+    // programmatically-built config can never divide by zero here.
+    let span = cfg.pressure_high - cfg.pressure_low;
+    let t = if span > 0.0 {
+        ((occupancy - cfg.pressure_low) / span).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+
+    let seg_span = cfg
+        .max_segments_ceiling
+        .saturating_sub(cfg.base_max_segments) as f64;
+    let max_segments = cfg.base_max_segments + (t * seg_span).round() as usize;
+    let max_segments = max_segments.min(cfg.max_segments_ceiling);
+
+    let frac_span = cfg.base_min_dead_frac - cfg.min_dead_frac_floor;
+    let min_dead_frac = (cfg.base_min_dead_frac - t * frac_span).max(cfg.min_dead_frac_floor);
+
+    (max_segments, min_dead_frac)
+}
 
 /// Configuration for the background checkpoint task.
 ///
@@ -112,6 +183,11 @@ pub struct CheckpointConfig {
     /// Where to write the index/dah/unmined snapshot. Must be on the same
     /// filesystem so the tempfile + rename is atomic.
     pub snapshot_path: PathBuf,
+    /// Pressure-aware segment-defrag compaction tuning. Only the segment
+    /// (log-structured) engine consults this; the in-place engine's
+    /// `defrag_compact` is a no-op regardless. Default: [`DefragConfig::default`]
+    /// (the historical conservative budget).
+    pub defrag: DefragConfig,
 }
 
 impl CheckpointConfig {
@@ -127,6 +203,7 @@ impl CheckpointConfig {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(60),
             snapshot_path,
+            defrag: DefragConfig::default(),
         }
     }
 
@@ -675,16 +752,28 @@ where
     //    out of the most-dead partially-dead segments so they drain and can be
     //    reclaimed below. Runs BEFORE the snapshot so it captures the relocated
     //    (new) offsets; the relocate writes are fsynced by `persist_allocator`'s
-    //    device barrier before the redo is fenced. Rate-limited (few victims,
-    //    high dead threshold) so the copy amplification and checkpoint duration
-    //    stay bounded; self-gating (no work when nothing is that dead) so it is a
-    //    no-op for the short-lived-record workload the fast path already covers.
-    //    No-op for the in-place engine.
-    let compacted =
-        engine.defrag_compact(DEFRAG_COMPACT_MAX_SEGMENTS, DEFRAG_COMPACT_MIN_DEAD_FRAC);
+    //    device barrier before the redo is fenced. The victim budget is
+    //    PRESSURE-AWARE (`compaction_budget`): conservative at steady state (few
+    //    victims, high dead threshold → self-gating, no-op for the short-lived-
+    //    record workload the fast path already covers) but escalating as the
+    //    device fills so the mixed-lifetime partially-dead tail (issue #33) is
+    //    converted to reclaimable before ENOSPC. No-op for the in-place engine
+    //    (it reports no segment stats and its `defrag_compact` returns 0).
+    let (max_segments, min_dead_frac) = match engine.segment_allocator_stats() {
+        Some(stats) => compaction_budget(&stats, &config.defrag),
+        // In-place engine (or no log-structured store): use the base budget; the
+        // call is a no-op there anyway.
+        None => (
+            config.defrag.base_max_segments,
+            config.defrag.base_min_dead_frac,
+        ),
+    };
+    let compacted = engine.defrag_compact(max_segments, min_dead_frac);
     if compacted > 0 {
         tracing::debug!(
             compacted,
+            max_segments,
+            min_dead_frac,
             "checkpoint: defrag relocated live records out of victim segments"
         );
     }
@@ -710,6 +799,11 @@ where
             "checkpoint: defrag reclaimed fully-dead segments"
         );
     }
+
+    // Publish this checkpoint's defrag outcome for `/status` observability (the
+    // last-checkpoint compacted/reclaimed counts). Cheap relaxed atomics; read
+    // by the HTTP status handler without touching any lock on the hot path.
+    engine.record_last_checkpoint_defrag(compacted, reclaimed);
 
     // 2. Persist allocator state to its on-disk header (fsynced before
     //    returning).
@@ -842,6 +936,164 @@ mod tests {
     use crate::ops::engine::Engine;
     use crate::redo::{RedoLog, RedoOp};
     use std::sync::Arc;
+
+    /// Build a `SegmentAllocatorStats` with a given on-device footprint
+    /// (`used_bytes`) and `device_size`; the other fields are irrelevant to the
+    /// pressure budget and set to plausible constants.
+    fn seg_stats(used_bytes: u64, device_size: u64) -> SegmentAllocatorStats {
+        SegmentAllocatorStats {
+            data_region_start: 4096,
+            device_size,
+            segment_size: 8 * 1024 * 1024,
+            segment_count: 16,
+            open_segment: 0,
+            cursor: used_bytes,
+            used_bytes,
+            dead_bytes: used_bytes / 2,
+            live_bytes: used_bytes - used_bytes / 2,
+        }
+    }
+
+    #[test]
+    fn compaction_budget_low_pressure_returns_base() {
+        let cfg = DefragConfig::default(); // (4, 0.75), band [0.70, 0.85]
+        // 50% occupancy is below pressure_low (0.70): base budget.
+        let (max, frac) = compaction_budget(&seg_stats(500, 1000), &cfg);
+        assert_eq!(max, 4, "low pressure keeps the base victim cap");
+        assert_eq!(frac, 0.75, "low pressure keeps the base dead threshold");
+        // Exactly at pressure_low is still the base (<=).
+        let (max, frac) = compaction_budget(&seg_stats(700, 1000), &cfg);
+        assert_eq!((max, frac), (4, 0.75));
+    }
+
+    #[test]
+    fn compaction_budget_high_pressure_returns_ceiling_and_floor() {
+        let cfg = DefragConfig::default();
+        // 90% occupancy is above pressure_high (0.85): aggressive.
+        let (max, frac) = compaction_budget(&seg_stats(900, 1000), &cfg);
+        assert_eq!(max, 64, "high pressure spends the ceiling victim budget");
+        assert_eq!(frac, 0.25, "high pressure lowers to the dead-frac floor");
+        // Exactly at pressure_high is already aggressive (>=).
+        let (max, frac) = compaction_budget(&seg_stats(850, 1000), &cfg);
+        assert_eq!((max, frac), (64, 0.25));
+    }
+
+    #[test]
+    fn compaction_budget_mid_pressure_interpolates() {
+        let cfg = DefragConfig::default();
+        // Midpoint of the band [0.70, 0.85] is 0.775 → t = 0.5.
+        // max_segments = 4 + round(0.5 * (64 - 4)) = 4 + 30 = 34.
+        // min_dead_frac = 0.75 - 0.5 * (0.75 - 0.25) = 0.75 - 0.25 = 0.50.
+        let (max, frac) = compaction_budget(&seg_stats(775, 1000), &cfg);
+        assert_eq!(
+            max, 34,
+            "mid pressure raises max_segments toward the ceiling"
+        );
+        assert!(
+            (frac - 0.50).abs() < 1e-9,
+            "mid pressure lowers the dead threshold toward the floor: got {frac}"
+        );
+        // The mid tier is strictly between base and aggressive.
+        assert!(max > cfg.base_max_segments && max < cfg.max_segments_ceiling);
+        assert!(frac < cfg.base_min_dead_frac && frac > cfg.min_dead_frac_floor);
+    }
+
+    #[test]
+    fn compaction_budget_never_drops_below_floor() {
+        // A config whose floor equals its base means the frac never moves, and a
+        // steep interpolation must still clamp at the floor.
+        let cfg = DefragConfig {
+            base_min_dead_frac: 0.4,
+            min_dead_frac_floor: 0.4,
+            ..DefragConfig::default()
+        };
+        // Anywhere in/above the band, frac stays pinned at the shared value.
+        let (_, frac_mid) = compaction_budget(&seg_stats(775, 1000), &cfg);
+        let (_, frac_high) = compaction_budget(&seg_stats(999, 1000), &cfg);
+        assert_eq!(frac_mid, 0.4);
+        assert_eq!(frac_high, 0.4);
+        assert!(
+            frac_mid >= cfg.min_dead_frac_floor && frac_high >= cfg.min_dead_frac_floor,
+            "min_dead_frac must never dip below the floor"
+        );
+    }
+
+    #[test]
+    fn compaction_budget_zero_device_size_returns_base_without_panic() {
+        let cfg = DefragConfig::default();
+        // device_size == 0 must not divide-by-zero; it returns the base budget.
+        let (max, frac) = compaction_budget(&seg_stats(500, 0), &cfg);
+        assert_eq!((max, frac), (4, 0.75));
+    }
+
+    /// End-to-end plumbing: a segment engine reports stats whose
+    /// `compaction_budget` — exactly what the checkpoint passes to
+    /// `defrag_compact` — reflects real occupancy read through
+    /// `segment_allocator_stats`. Fills an 8 MiB device past `pressure_high`
+    /// (0.85) and asserts the budget escalates to the aggressive ceiling/floor,
+    /// not the steady-state base. This proves the pressure signal is wired from
+    /// the allocator all the way to the budget the checkpoint uses.
+    #[test]
+    fn checkpoint_budget_from_engine_stats_escalates_under_high_occupancy() {
+        use crate::device::MemoryDevice;
+        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::locks::StripedLocks;
+        use crate::record::TxMetadata;
+
+        // 8 MiB device (1 MiB header + ~7 MiB data region), 512 KiB segments.
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 512 * 1024).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let record_size = TxMetadata::record_size_for(1); // one block (4 KiB)
+
+        // Fill the data region until occupancy crosses pressure_high. The header
+        // is 1 MiB, so occupancy tops out near (device - 1 MiB) / device ≈ 0.875;
+        // fill nearly the whole data region to clear the 0.85 mark.
+        loop {
+            let s = engine.segment_allocator_stats().expect("segment engine");
+            if s.used_bytes as f64 / s.device_size as f64 >= 0.85 {
+                break;
+            }
+            if engine
+                .allocator_for(0)
+                .lock()
+                .allocate(record_size)
+                .is_err()
+            {
+                break;
+            }
+        }
+        let stats = engine
+            .segment_allocator_stats()
+            .expect("segment engine reports stats");
+        let occupancy = stats.used_bytes as f64 / stats.device_size as f64;
+        assert!(
+            occupancy >= 0.85,
+            "test must reach high pressure; occupancy = {occupancy}"
+        );
+
+        let cfg = DefragConfig::default();
+        let (max, frac) = compaction_budget(&stats, &cfg);
+        assert_eq!(
+            max, cfg.max_segments_ceiling,
+            "high occupancy → ceiling budget"
+        );
+        assert_eq!(
+            frac, cfg.min_dead_frac_floor,
+            "high occupancy → floor threshold"
+        );
+        assert!(
+            max > cfg.base_max_segments && frac < cfg.base_min_dead_frac,
+            "the checkpoint would spend MORE than the steady-state base budget"
+        );
+    }
 
     /// Lever 6d: a `LogFull` checkpoint failure must escalate to a blocking
     /// checkpoint with NO back-off (the redo is full, writes are backpressured,
@@ -2298,6 +2550,7 @@ mod tests {
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_millis(400),
             snapshot_path: PathBuf::from("/dev/null"),
+            defrag: DefragConfig::default(),
         };
         let b0 = next_backoff(Duration::ZERO, &cfg);
         assert_eq!(b0, Duration::from_millis(100), "first failure → initial");
@@ -2392,6 +2645,7 @@ mod tests {
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
             snapshot_path: snap_path.clone(),
+            defrag: DefragConfig::default(),
         };
 
         {
@@ -2453,6 +2707,7 @@ mod tests {
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
             snapshot_path: snap_path.clone(),
+            defrag: DefragConfig::default(),
         };
 
         {
@@ -2508,6 +2763,7 @@ mod tests {
             initial_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(40),
             snapshot_path: dir.path().join("sustained.snap"),
+            defrag: DefragConfig::default(),
         };
 
         let high_water = cfg.high_water;
@@ -2656,6 +2912,7 @@ mod tests {
             initial_backoff: Duration::from_millis(5),
             max_backoff: Duration::from_millis(40),
             snapshot_path: dir.path().join("soak.snap"),
+            defrag: DefragConfig::default(),
         };
         let capacity = redo.lock().capacity();
 
@@ -2731,6 +2988,7 @@ mod tests {
             initial_backoff: Duration::from_millis(2),
             max_backoff: Duration::from_millis(10),
             snapshot_path: snap_path.clone(),
+            defrag: DefragConfig::default(),
         };
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2791,6 +3049,7 @@ mod tests {
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
             snapshot_path: dir.path().join("shutdown.snap"),
+            defrag: DefragConfig::default(),
         };
 
         let shutdown = Arc::new(AtomicBool::new(false));
