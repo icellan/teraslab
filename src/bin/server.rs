@@ -466,7 +466,22 @@ fn main() {
         );
     }
 
-    // 1. Open device
+    // 1. Take the single-instance advisory lock before touching any device, so
+    // a second server (or an offline `teraslab-cli restore`) refuses to race
+    // this instance's data files. Held for the whole process lifetime.
+    let _instance_lock =
+        match teraslab::instance_lock::InstanceLock::acquire(&config.device_paths[0]) {
+            Ok(lock) => {
+                tracing::info!(path = %lock.path().display(), "instance lock acquired");
+                lock
+            }
+            Err(e) => {
+                tracing::error!(err = %e, "failed to acquire single-instance lock");
+                std::process::exit(1);
+            }
+        };
+
+    // 1a. Open device
     let device_path = &config.device_paths[0];
     let device: Arc<dyn BlockDevice> =
         match DirectDevice::open(device_path, config.device_size, config.device_alignment) {
@@ -1940,6 +1955,10 @@ fn main() {
     // aborted streaming uploads, migrations cancelled mid-flight). The
     // tick interval defaults to one hour and can be set to 0 to disable
     // the periodic sweep entirely (recovery-time reconciliation still runs).
+    // The online backup pauses this sweep for the duration of a copy. The flag
+    // is owned here and shared with the backup manager (a clone) so a backup can
+    // toggle it; it defaults to unpaused (GC runs normally).
+    let blob_gc_pause = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let blob_gc_handle: Option<std::thread::JoinHandle<()>> = if config.blob_gc_interval_secs > 0 {
         let cfg = teraslab::storage::blob_gc::BlobGcConfig::new(config.blob_gc_interval_secs);
         Some(teraslab::storage::blob_gc::spawn_blob_gc_task(
@@ -1947,6 +1966,7 @@ fn main() {
             blob_store.clone(),
             engine.clone(),
             shutdown_flag.clone(),
+            blob_gc_pause.clone(),
         ))
     } else {
         tracing::info!("blob-gc periodic sweep disabled (blob_gc_interval_secs = 0)",);

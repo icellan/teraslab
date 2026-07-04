@@ -378,6 +378,7 @@ pub fn spawn_blob_gc_task(
     blob_store: Arc<dyn BlobStore>,
     engine: Arc<Engine>,
     shutdown: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("teraslab-blob-gc".to_string())
@@ -400,6 +401,16 @@ pub fn spawn_blob_gc_task(
                     continue;
                 }
                 elapsed = Duration::ZERO;
+
+                // An online backup pauses the sweep so no blobs are unlinked
+                // while it copies the blob-store tree. GC only ever removes
+                // ORPHAN blobs (no EXTERNAL index entry), so a referenced blob
+                // is never at risk, but skipping the sweep entirely avoids
+                // racing on the directory listing and needless churn.
+                if pause.load(Ordering::Relaxed) {
+                    tracing::debug!("blob-gc sweep skipped (paused for backup)");
+                    continue;
+                }
 
                 let started = std::time::Instant::now();
                 match reconcile_orphan_blobs(blob_store.as_ref(), engine.as_ref()) {

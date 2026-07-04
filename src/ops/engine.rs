@@ -281,6 +281,13 @@ pub struct Engine {
     /// has no intrinsic failure modes for fresh inserts.
     #[cfg(test)]
     fail_next_register: std::sync::atomic::AtomicBool,
+    /// Online-backup lifecycle pin. While set, the segment-defrag entry points
+    /// ([`Self::defrag_reclaim_fully_dead`], [`Self::defrag_compact`]) are
+    /// no-ops so a running backup's used-segment set stays stable. Set via
+    /// [`Self::pin_segment_lifecycle`] (which also freezes each store's
+    /// allocator reuse) and cleared via [`Self::unpin_segment_lifecycle`].
+    /// RAM-only; a crash clears it by construction.
+    lifecycle_pinned: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY (C-6): `Engine::device_ptr` is a raw `*mut u8` into an `Arc`'d
@@ -487,6 +494,7 @@ impl Engine {
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
+            lifecycle_pinned: std::sync::atomic::AtomicBool::new(false),
         };
         // Eager, single-threaded shard-count init from the fully-populated
         // index. Must run before the engine is shared so no writer can race
@@ -2000,6 +2008,48 @@ impl Engine {
     #[inline]
     pub fn store_count(&self) -> usize {
         self.stores.len()
+    }
+
+    /// Pin the segment lifecycle for an online backup: freeze the engine-level
+    /// defrag entry points AND each store's allocator reuse so the used-segment
+    /// set stays stable and the append frontier stays monotone while the backup
+    /// copies. Idempotent. Paired with [`Self::unpin_segment_lifecycle`] — the
+    /// backup job holds the pin in an RAII guard so an abort/panic releases it.
+    pub fn pin_segment_lifecycle(&self) {
+        self.lifecycle_pinned
+            .store(true, std::sync::atomic::Ordering::Release);
+        for store in &self.stores {
+            store.allocator.lock().set_lifecycle_pinned(true);
+        }
+    }
+
+    /// Release the segment-lifecycle pin taken by [`Self::pin_segment_lifecycle`].
+    /// Idempotent.
+    pub fn unpin_segment_lifecycle(&self) {
+        for store in &self.stores {
+            store.allocator.lock().set_lifecycle_pinned(false);
+        }
+        self.lifecycle_pinned
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the segment lifecycle is currently pinned by a backup.
+    pub fn is_segment_lifecycle_pinned(&self) -> bool {
+        self.lifecycle_pinned
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Snapshot store `device_id`'s segment layout for the online backup, or
+    /// `None` if that store is not log-structured. Takes the allocator lock
+    /// briefly. See [`crate::segment_allocator::SegmentBackupView`].
+    pub fn backup_view_for(
+        &self,
+        device_id: u8,
+    ) -> Option<crate::segment_allocator::SegmentBackupView> {
+        self.stores[device_id as usize]
+            .allocator
+            .lock()
+            .backup_view()
     }
 
     /// The device backing records placed on `device_id` (the index entry's
@@ -7962,6 +8012,14 @@ impl Engine {
     /// reclaim, and recovery re-derives the free list from the live index
     /// ([`crate::allocator::RecordAllocator::reconcile_recovered_free_list`]).
     pub fn defrag_reclaim_fully_dead(&self) -> usize {
+        // An online backup pins the lifecycle: skip all reclaim so the used
+        // segment set the backup is copying stays stable.
+        if self
+            .lifecycle_pinned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return 0;
+        }
         let mut total = 0;
         for store in &self.stores {
             total += store.allocator.lock().reclaim_fully_dead_segments();
@@ -7990,6 +8048,14 @@ impl Engine {
     /// offset always lands in the open/free region, never a victim (victims exclude
     /// the open segment), so a relocated record never re-enters a victim.
     pub fn defrag_compact(&self, max_segments: usize, min_dead_frac: f64) -> usize {
+        // An online backup pins the lifecycle: skip compaction (which relocates
+        // live records and drains segments) so the copy sees a stable layout.
+        if self
+            .lifecycle_pinned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return 0;
+        }
         let mut relocated = 0usize;
         for (store_idx, store) in self.stores.iter().enumerate() {
             if !store.log_structured {
@@ -10988,6 +11054,96 @@ mod tests {
         );
         // Idempotent: nothing left to reclaim.
         assert_eq!(engine.defrag_reclaim_fully_dead(), 0);
+    }
+
+    #[test]
+    fn defrag_reclaim_and_compact_are_noop_while_lifecycle_pinned() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 2 * 4096).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        // Drain seg0 so there IS something reclaimable.
+        {
+            let alloc = engine.allocator_for(0);
+            let mut a = alloc.lock();
+            let o0 = a.allocate(4096).unwrap();
+            let o1 = a.allocate(4096).unwrap();
+            let _ = a.allocate(4096).unwrap();
+            a.free(o0, 4096).unwrap();
+            a.free(o1, 4096).unwrap();
+        }
+
+        engine.pin_segment_lifecycle();
+        assert!(engine.is_segment_lifecycle_pinned());
+        assert_eq!(
+            engine.defrag_reclaim_fully_dead(),
+            0,
+            "reclaim must be a no-op while pinned even with a drained segment"
+        );
+        assert_eq!(
+            engine.defrag_compact(4, 0.5),
+            0,
+            "compaction must be a no-op while pinned"
+        );
+
+        engine.unpin_segment_lifecycle();
+        assert!(!engine.is_segment_lifecycle_pinned());
+        assert_eq!(
+            engine.defrag_reclaim_fully_dead(),
+            1,
+            "reclaim resumes after unpin"
+        );
+    }
+
+    #[test]
+    fn backup_view_for_returns_some_for_segment_engine() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 2 * 4096).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            seg,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        {
+            let alloc = engine.allocator_for(0);
+            let mut a = alloc.lock();
+            a.allocate(4096).unwrap();
+        }
+        let view = engine
+            .backup_view_for(0)
+            .expect("segment engine has a view");
+        assert_eq!(view.used_segments(), vec![0]);
+        assert_eq!(view.open_segment, 0);
+    }
+
+    #[test]
+    fn backup_view_for_returns_none_for_in_place_engine() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let slot = SlotAllocator::new(dev.clone()).unwrap();
+        let engine = Engine::new(
+            dev,
+            Index::new(64).unwrap(),
+            slot,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        assert!(
+            engine.backup_view_for(0).is_none(),
+            "in-place engine exposes no segment backup view"
+        );
     }
 
     /// An in-place (SlotAllocator) engine reclaims nothing — the fast path is a

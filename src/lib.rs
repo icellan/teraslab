@@ -23,6 +23,7 @@ pub mod device;
 pub mod fault_injection;
 pub(crate) mod fsutil;
 pub mod index;
+pub mod instance_lock;
 pub mod io;
 pub mod locks;
 pub mod metrics;
