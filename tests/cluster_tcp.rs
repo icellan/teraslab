@@ -1274,7 +1274,11 @@ fn segment_node_rejoins_and_takes_shard_ownership() {
             node1.cluster.committed_topology_members().len() == 2
                 && node2.cluster.committed_topology_members().len() == 2
         },
-        Duration::from_secs(20),
+        // Generous deadline: SWIM discovery + first topology commit can be slow
+        // on a contended CI runner. `wait_until` returns as soon as the topology
+        // commits, so this costs nothing on a healthy run — it only tolerates a
+        // slow one (macOS-runner flakiness fix).
+        Duration::from_secs(45),
     )
     .expect("initial 2-node segment topology should commit");
 
@@ -1282,7 +1286,9 @@ fn segment_node_rejoins_and_takes_shard_ownership() {
     shutdown_node(&node2);
     wait_until(
         || !node1.cluster.node_addresses().contains_key(&NodeId(472)),
-        Duration::from_secs(10),
+        // Failure detection is SWIM-timeout bound; give it generous headroom on
+        // a slow runner (short-circuits on success, so free on a healthy run).
+        Duration::from_secs(25),
     )
     .expect("node1 should drop node2 after it leaves");
 
@@ -1293,7 +1299,7 @@ fn segment_node_rejoins_and_takes_shard_ownership() {
             node1.cluster.committed_topology_members().len() == 2
                 && node2b.cluster.committed_topology_members().len() == 2
         },
-        Duration::from_secs(20),
+        Duration::from_secs(45),
     )
     .expect("rejoined segment node should re-commit a 2-node topology");
     // The rejoined node takes ownership of shards.
@@ -1309,7 +1315,11 @@ fn segment_node_rejoins_and_takes_shard_ownership() {
                 .unwrap_or(0)
                 > 0
         },
-        Duration::from_secs(15),
+        // Rebalance after a rejoin is the slowest step (topology commit →
+        // shard-table recompute → install); this deadline flaked at 15s on a
+        // contended macOS runner. `wait_until` returns the instant the rejoined
+        // node owns a shard, so the larger deadline only helps a slow runner.
+        Duration::from_secs(30),
     )
     .expect("rejoined segment node must own shards after rebalance");
 

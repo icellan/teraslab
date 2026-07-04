@@ -15552,58 +15552,82 @@ mod tests {
     fn append_redo_ops_routed_coalesces_concurrent_writers() {
         use crate::redo::{RedoLog, RedoOp};
 
-        // Single store, per-store redo over a sync-counting device so we can see
-        // how many fsyncs N concurrent routed writers actually cost.
-        let engine = create_engine();
-        let inner: Arc<dyn BlockDevice> =
-            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
-        let (cdev, syncs) = SyncCountingDevice::new(inner);
-        let log = RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
-        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
-        let baseline = syncs.load(Ordering::SeqCst);
-
         const N: usize = 16;
-        let barrier = Arc::new(std::sync::Barrier::new(N));
-        let handles: Vec<_> = (0..N)
-            .map(|i| {
-                let engine = engine.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    engine
-                        .append_redo_ops_routed(&[RedoOp::Delete {
-                            tx_key: TxKey {
-                                txid: [i as u8; 32],
-                            },
-                            record_offset: i as u64 * 4096,
-                            record_size: 4096,
-                        }])
-                        .expect("routed write ok")
+        // Coalescing is inherently probabilistic: the group-commit window only
+        // coalesces writers that actually overlap in it. On a contended CI
+        // runner the barrier-released threads can serialize, so a single
+        // scheduling may cost one fsync per writer with no coalescing — which
+        // made this test flaky on macOS runners. We therefore retry the
+        // measurement: the correctness invariants (distinct, contiguous,
+        // single-sequence ranges — NOT timing dependent) are asserted on EVERY
+        // attempt, and we require that coalescing (`fsyncs < N`) is observed in
+        // at least one attempt. That still proves the mechanism coalesces and
+        // still fails loudly on a real regression (coalescing never happening),
+        // without depending on a single lucky schedule.
+        const ATTEMPTS: usize = 20;
+        let mut coalesced = false;
+
+        for _ in 0..ATTEMPTS {
+            // Single store, per-store redo over a sync-counting device so we can
+            // see how many fsyncs N concurrent routed writers actually cost.
+            let engine = create_engine();
+            let inner: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+            let (cdev, syncs) = SyncCountingDevice::new(inner);
+            let log = RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
+            engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+            let baseline = syncs.load(Ordering::SeqCst);
+
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let engine = engine.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        engine
+                            .append_redo_ops_routed(&[RedoOp::Delete {
+                                tx_key: TxKey {
+                                    txid: [i as u8; 32],
+                                },
+                                record_offset: i as u64 * 4096,
+                                record_size: 4096,
+                            }])
+                            .expect("routed write ok")
+                    })
                 })
-            })
-            .collect();
-        let mut ranges: Vec<(u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                .collect();
+            let mut ranges: Vec<(u64, u64)> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-        let fsyncs = syncs.load(Ordering::SeqCst) - baseline;
-        assert!(fsyncs >= 1, "must flush at least once");
-        assert!(
-            fsyncs < N as u64,
-            "routed group commit must coalesce concurrent writers: {N} writers used \
-             {fsyncs} fsyncs (expected < {N})"
-        );
+            let fsyncs = syncs.load(Ordering::SeqCst) - baseline;
+            assert!(fsyncs >= 1, "must flush at least once");
 
-        // Every writer got a distinct, contiguous single-sequence range — no
-        // lost, duplicated, or overlapping sequence under the coalescing.
-        ranges.sort();
-        assert_eq!(ranges.len(), N);
-        for i in 1..ranges.len() {
-            assert_eq!(ranges[i].0, ranges[i].1, "one op -> one sequence");
-            assert_eq!(
-                ranges[i].0,
-                ranges[i - 1].0 + 1,
-                "routed ranges must be contiguous with no gap/dup"
-            );
+            // Every writer got a distinct, contiguous single-sequence range — no
+            // lost, duplicated, or overlapping sequence under the coalescing.
+            // This invariant is not timing dependent and MUST hold every attempt.
+            ranges.sort();
+            assert_eq!(ranges.len(), N);
+            for i in 1..ranges.len() {
+                assert_eq!(ranges[i].0, ranges[i].1, "one op -> one sequence");
+                assert_eq!(
+                    ranges[i].0,
+                    ranges[i - 1].0 + 1,
+                    "routed ranges must be contiguous with no gap/dup"
+                );
+            }
+
+            if fsyncs < N as u64 {
+                coalesced = true;
+                break;
+            }
         }
+
+        assert!(
+            coalesced,
+            "routed group commit must coalesce concurrent writers: {N} writers \
+             never used < {N} fsyncs across {ATTEMPTS} attempts (no coalescing observed)"
+        );
     }
 
     /// Drive `n` two-phase secondary-index updates (the `setMined` reorg path
