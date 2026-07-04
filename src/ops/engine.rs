@@ -6214,6 +6214,50 @@ impl Engine {
         self.read_conflicting_children_at(device_id, count, offset)
     }
 
+    /// Read the COMPLETE block-entry set for a transaction — the inline
+    /// entries PLUS every on-device overflow entry.
+    ///
+    /// Returns entries in a stable order: the inline entries first (in their
+    /// on-disk slot order), then the overflow entries (in their stored
+    /// order). This is the same order the setMined path maintains (it fills
+    /// inline slots `0..INLINE_BLOCK_ENTRIES` before appending to overflow),
+    /// so the returned slice is a faithful, uncapped view of the record's
+    /// block membership.
+    ///
+    /// When `block_entry_count <= INLINE_BLOCK_ENTRIES` no device read for
+    /// overflow is performed and only the inline entries are returned.
+    ///
+    /// # Errors
+    ///
+    /// - [`SpendError::TxNotFound`] if the transaction is not in the index.
+    /// - [`SpendError::StorageError`] if the index lookup, the metadata read,
+    ///   or the overflow read fails.
+    pub fn read_all_block_entries(&self, key: &TxKey) -> Result<Vec<BlockEntry>, SpendError> {
+        let entry = self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        let device_id = entry.device_id;
+        let meta = self.read_metadata_fast(device_id, entry.record_offset)?;
+
+        let count = meta.block_entry_count as usize;
+        let inline = count.min(INLINE_BLOCK_ENTRIES);
+        let mut entries: Vec<BlockEntry> = meta.block_entries_inline[..inline].to_vec();
+        if count > INLINE_BLOCK_ENTRIES {
+            let overflow =
+                read_overflow_entries(&**self.device_for(device_id), &meta).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("overflow block-entry read failed: {e}"),
+                    }
+                })?;
+            entries.extend(overflow);
+        }
+        Ok(entries)
+    }
+
     fn append_conflicting_child_best_effort(
         &self,
         parent_key: &TxKey,
