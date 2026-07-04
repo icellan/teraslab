@@ -45,6 +45,14 @@ type ClientConfig struct {
 	// OP_GET_PARTITION_MAP) so the client can bootstrap against a cluster
 	// configured with a shared secret. Leave nil for unsecured clusters.
 	ClusterSecret []byte
+	// ColdDataExternalThreshold is the cold_data size (in bytes) strictly
+	// above which CreateBatch pre-uploads the data to the external blob store
+	// via chunked streaming instead of inlining it in the batch payload.
+	//
+	// 0 (unset) means the default BlobUploadThreshold (1 MiB). Tune it (e.g.
+	// from a connection-URL query param) to change external placement without
+	// a client release; the runtime default is unchanged at 1 MiB.
+	ColdDataExternalThreshold int
 }
 
 // Client is a goroutine-safe TeraSlab client. Use New to create one.
@@ -52,6 +60,11 @@ type Client struct {
 	cfg     ClientConfig
 	cluster *cluster  // non-nil in cluster mode
 	pool    *connPool // non-nil in single-node mode
+
+	// blobUploadThreshold is the effective cold_data size (in bytes) strictly
+	// above which CreateBatch externalises via blob upload. Resolved from
+	// cfg.ColdDataExternalThreshold in New (0 -> BlobUploadThreshold).
+	blobUploadThreshold int
 
 	// negotiatedVersion is the wire protocol version reported by the server via
 	// OP_HELLO, or 1 if the server predates the handshake. Stored as uint32 for
@@ -63,6 +76,12 @@ type Client struct {
 // In cluster mode (Seeds non-empty), it fetches the initial partition map.
 func New(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	c := &Client{cfg: cfg}
+
+	// Resolve the effective external-blob threshold: 0 (unset) means default.
+	c.blobUploadThreshold = cfg.ColdDataExternalThreshold
+	if c.blobUploadThreshold == 0 {
+		c.blobUploadThreshold = BlobUploadThreshold
+	}
 
 	if len(cfg.Seeds) > 0 {
 		cl, err := newCluster(ctx, ClusterConfig{
@@ -905,8 +924,9 @@ func (c *Client) SetMinedBatch(ctx context.Context, params SetMinedBatchParams, 
 
 // CreateBatch creates new transaction records.
 //
-// If any item's cold_data exceeds BlobUploadThreshold, the cold data is
-// pre-uploaded via OP_STREAM_CHUNK / OP_STREAM_END and the item's Flags
+// If any item's cold_data exceeds the configured external threshold
+// (ColdDataExternalThreshold, defaulting to BlobUploadThreshold = 1 MiB), the
+// cold data is pre-uploaded via OP_STREAM_CHUNK / OP_STREAM_END and the item's Flags
 // are updated to include FlagExternalBlob. The inlined TxData in the batch
 // payload is cleared for those items. The caller's items slice is not modified;
 // a shallow copy is made when blob uploads are needed.
@@ -939,14 +959,15 @@ func (c *Client) CreateBatch(ctx context.Context, items []CreateItem) (*BatchRes
 }
 
 // uploadLargeBlobs checks each item's cold_data size and pre-uploads any that
-// exceed BlobUploadThreshold via chunked streaming. Items that are uploaded
+// exceed the configured threshold (c.blobUploadThreshold, defaulting to
+// BlobUploadThreshold = 1 MiB) via chunked streaming. Items that are uploaded
 // have their TxData cleared and FlagExternalBlob set. Returns a (possibly
 // copied) items slice; the original is never mutated.
 func (c *Client) uploadLargeBlobs(ctx context.Context, items []CreateItem) ([]CreateItem, error) {
 	// Fast path: check if any item needs blob upload.
 	needsCopy := false
 	for i := range items {
-		if coldDataSize(&items[i]) > BlobUploadThreshold {
+		if coldDataSize(&items[i]) > c.blobUploadThreshold {
 			needsCopy = true
 			break
 		}
@@ -961,7 +982,7 @@ func (c *Client) uploadLargeBlobs(ctx context.Context, items []CreateItem) ([]Cr
 
 	for i := range copied {
 		cdSize := coldDataSize(&copied[i])
-		if cdSize <= BlobUploadThreshold {
+		if cdSize <= c.blobUploadThreshold {
 			continue
 		}
 

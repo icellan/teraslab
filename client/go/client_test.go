@@ -654,6 +654,99 @@ func TestCreateBatchMixedSmallAndLargeItems(t *testing.T) {
 	}
 }
 
+func TestConfigColdDataThresholdDefaultsToOneMiB(t *testing.T) {
+	ctx := context.Background()
+	ln := startClientTestServer(t)
+	defer ln.Close()
+
+	// Unset (0) ColdDataExternalThreshold must resolve to BlobUploadThreshold.
+	client, err := New(ctx, ClientConfig{
+		Addr: ln.Addr().String(),
+		Pool: PoolConfig{MinConns: 1, MaxConns: 2, DialTimeout: 2 * time.Second, HealthCheck: 1 * time.Hour},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if client.blobUploadThreshold != BlobUploadThreshold {
+		t.Fatalf("effective threshold = %d, want %d (BlobUploadThreshold)",
+			client.blobUploadThreshold, BlobUploadThreshold)
+	}
+	if BlobUploadThreshold != 1024*1024 {
+		t.Fatalf("BlobUploadThreshold = %d, want 1 MiB", BlobUploadThreshold)
+	}
+}
+
+func TestConfigColdDataThresholdCustomBoundary(t *testing.T) {
+	ctx := context.Background()
+	tracker := &blobTracker{}
+	ln := startClientTestServerWithTracker(t, tracker)
+	defer ln.Close()
+
+	// A small threshold: cold data strictly larger than 100 wire bytes is
+	// externalised; exactly 100 stays inline. coldDataSize = 12 + payload for
+	// a single populated field, so 88 -> 100 (inline), 89 -> 101 (external).
+	client, err := New(ctx, ClientConfig{
+		Addr:                      ln.Addr().String(),
+		Pool:                      PoolConfig{MinConns: 1, MaxConns: 2, DialTimeout: 2 * time.Second, HealthCheck: 1 * time.Hour},
+		ColdDataExternalThreshold: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if client.blobUploadThreshold != 100 {
+		t.Fatalf("effective threshold = %d, want 100", client.blobUploadThreshold)
+	}
+
+	// Item at exactly the threshold (100 wire bytes) stays inline.
+	atBoundary := []CreateItem{{
+		TxID:       testTxID(1),
+		TxVersion:  2,
+		UtxoHashes: []UtxoHash{{0xAA}},
+		TxData:     TxData{Outputs: make([]byte, 88)},
+	}}
+	if got := coldDataSize(&atBoundary[0]); got != 100 {
+		t.Fatalf("at-boundary coldDataSize = %d, want 100", got)
+	}
+	result, err := client.uploadLargeBlobs(ctx, atBoundary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result[0].Flags&FlagExternalBlob != 0 {
+		t.Error("item at exactly the threshold must stay inline (no FlagExternalBlob)")
+	}
+	if tracker.endCount.Load() != 0 {
+		t.Errorf("no upload expected at boundary; end count = %d", tracker.endCount.Load())
+	}
+
+	// Item one byte over the threshold (101 wire bytes) is externalised.
+	overBoundary := []CreateItem{{
+		TxID:       testTxID(2),
+		TxVersion:  2,
+		UtxoHashes: []UtxoHash{{0xBB}},
+		TxData:     TxData{Outputs: make([]byte, 89)},
+	}}
+	if got := coldDataSize(&overBoundary[0]); got != 101 {
+		t.Fatalf("over-boundary coldDataSize = %d, want 101", got)
+	}
+	result, err = client.uploadLargeBlobs(ctx, overBoundary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result[0].Flags&FlagExternalBlob == 0 {
+		t.Error("item one byte over the threshold must be externalised (FlagExternalBlob)")
+	}
+	if len(result[0].TxData.Outputs) != 0 {
+		t.Error("externalised item TxData should be cleared")
+	}
+	if tracker.endCount.Load() != 1 {
+		t.Errorf("one upload expected over boundary; end count = %d", tracker.endCount.Load())
+	}
+}
+
 func TestUploadLargeBlobsDoesNotMutateOriginal(t *testing.T) {
 	tracker := &blobTracker{}
 	ln := startClientTestServerWithTracker(t, tracker)
