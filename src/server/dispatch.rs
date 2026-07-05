@@ -4792,8 +4792,18 @@ fn handle_spend_batch(
         return error_response(req.request_id, ERR_STORAGE_IO, &detail);
     }
 
-    // Group items by txid for efficient locking
-    let mut by_txid: HashMap<[u8; 32], Vec<(usize, &WireSpendItem)>> = HashMap::new();
+    // Group items by txid for efficient locking. Use `FastTxHasher` (first 8
+    // txid bytes) instead of the default SipHash: txids are already uniformly
+    // random so SipHash's flood-resistance buys nothing here and is pure CPU on
+    // every item's insert/lookup. Correctness-neutral — `[u8; 32]` `Eq` is
+    // unchanged, so any collision merely probes; grouping semantics are
+    // identical. Mirrors the create-batch dedup set. See
+    // `crate::server::fast_hash`.
+    let mut by_txid: HashMap<
+        [u8; 32],
+        Vec<(usize, &WireSpendItem)>,
+        std::hash::BuildHasherDefault<crate::server::fast_hash::FastTxHasher>,
+    > = HashMap::default();
     for (i, item) in items.iter().enumerate() {
         by_txid.entry(item.txid).or_default().push((i, item));
     }
