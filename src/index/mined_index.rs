@@ -191,6 +191,175 @@ impl ShardedMinedIndex {
             out.extend(local.into_iter().map(|sl| (si, sl)));
         }
     }
+
+    /// Record a tx as mined in `block_id`, adding the block tuple inline (if
+    /// the slot has none yet) or into the shard's overflow list (if the tx is
+    /// already mined in a different block — a competing-chain reorg case).
+    ///
+    /// Idempotent: re-applying a `block_id` already recorded for this slot
+    /// (inline or in overflow) is a no-op and returns `changed: false`.
+    ///
+    /// When `on_longest_chain` is set, clears `unmined_since` (the tx is no
+    /// longer unmined) and updates the shard's height bucket accordingly.
+    ///
+    /// Both the setMined hot path and crash-recovery redo replay call this so
+    /// their mutation semantics stay identical.
+    pub fn apply_set_mined(
+        &self,
+        key: &TxKey,
+        slot: u32,
+        block_id: u32,
+        block_height: u32,
+        subtree_idx: u32,
+        on_longest_chain: bool,
+    ) -> MinedApplyResult {
+        let mut sh = self.shards[self.shard_for(key)].lock();
+
+        let Some(inline_block_id) = sh.get(slot).map(|e| e.block_id) else {
+            // Slot absent (freed or never allocated): nothing to apply.
+            return MinedApplyResult {
+                changed: false,
+                new_unmined_since: 0,
+            };
+        };
+
+        // Dedup: this block_id is already recorded, inline or in overflow.
+        let already_inline = inline_block_id != 0 && inline_block_id == block_id;
+        let already_overflow = sh
+            .overflow
+            .get(&slot)
+            .is_some_and(|v| v.iter().any(|be| be.block_id == block_id));
+        if already_inline || already_overflow {
+            let new_unmined_since = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+            return MinedApplyResult {
+                changed: false,
+                new_unmined_since,
+            };
+        }
+
+        if inline_block_id == 0 {
+            if let Some(e) = sh.get_mut(slot) {
+                e.block_id = block_id;
+                e.block_height = block_height;
+                e.subtree_idx = subtree_idx;
+            }
+        } else {
+            sh.overflow.entry(slot).or_default().push(BlockEntry {
+                block_id,
+                block_height,
+                subtree_idx,
+            });
+            if let Some(e) = sh.get_mut(slot) {
+                e.flags |= MINED_HAS_OVERFLOW;
+            }
+        }
+
+        let old_unmined = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+        let new_unmined_since = if on_longest_chain { 0 } else { old_unmined };
+        if on_longest_chain && let Some(e) = sh.get_mut(slot) {
+            e.unmined_since = 0;
+        }
+        if old_unmined != new_unmined_since {
+            sh.set_unmined(slot, old_unmined, new_unmined_since);
+        }
+
+        MinedApplyResult {
+            changed: true,
+            new_unmined_since,
+        }
+    }
+
+    /// Remove a block tuple previously recorded by [`apply_set_mined`].
+    ///
+    /// If `block_id` is the inline tuple, pulls one entry from overflow into
+    /// its place (if any remain), else clears the inline slot. If `block_id`
+    /// is only in overflow, removes it there. If the record ends up with zero
+    /// blocks, the tx becomes unmined again as of `current_height`.
+    ///
+    /// No-op if the slot is absent or `block_id` isn't recorded for it.
+    pub fn apply_unset(&self, key: &TxKey, slot: u32, block_id: u32, current_height: u32) {
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        let Some(inline_block_id) = sh.get(slot).map(|e| e.block_id) else {
+            return;
+        };
+
+        if inline_block_id == block_id {
+            // Removing the inline tuple: backfill from overflow if present.
+            let replacement = sh
+                .overflow
+                .get_mut(&slot)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.remove(0));
+            let overflow_now_empty = sh.overflow.get(&slot).is_none_or(|v| v.is_empty());
+            if overflow_now_empty {
+                sh.overflow.remove(&slot);
+            }
+
+            if let Some(e) = sh.get_mut(slot) {
+                match replacement {
+                    Some(be) => {
+                        e.block_id = be.block_id;
+                        e.block_height = be.block_height;
+                        e.subtree_idx = be.subtree_idx;
+                        if overflow_now_empty {
+                            e.flags &= !MINED_HAS_OVERFLOW;
+                        }
+                    }
+                    None => {
+                        e.block_id = 0;
+                        e.block_height = 0;
+                        e.subtree_idx = 0;
+                    }
+                }
+            }
+        } else if let Some(v) = sh.overflow.get_mut(&slot) {
+            if let Some(pos) = v.iter().position(|be| be.block_id == block_id) {
+                v.swap_remove(pos);
+            }
+            if v.is_empty() {
+                sh.overflow.remove(&slot);
+                if let Some(e) = sh.get_mut(slot) {
+                    e.flags &= !MINED_HAS_OVERFLOW;
+                }
+            }
+        } else {
+            // block_id not recorded for this slot at all; nothing to do.
+            return;
+        }
+
+        let has_blocks =
+            sh.get(slot).is_some_and(|e| e.block_id != 0) || sh.overflow.contains_key(&slot);
+        if !has_blocks {
+            let old_unmined = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+            if let Some(e) = sh.get_mut(slot) {
+                e.unmined_since = current_height;
+            }
+            sh.set_unmined(slot, old_unmined, current_height);
+        }
+    }
+
+    /// Set or clear the `MINED_ALL_SPENT` flag on the slot's entry.
+    ///
+    /// No-op if the slot is absent.
+    pub fn set_all_spent(&self, key: &TxKey, slot: u32, all_spent: bool) {
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        if let Some(entry) = sh.get_mut(slot) {
+            if all_spent {
+                entry.flags |= MINED_ALL_SPENT;
+            } else {
+                entry.flags &= !MINED_ALL_SPENT;
+            }
+        }
+    }
+}
+
+/// Result of [`ShardedMinedIndex::apply_set_mined`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinedApplyResult {
+    /// `true` if this call recorded a new block tuple (not a dedup no-op).
+    pub changed: bool,
+    /// The entry's `unmined_since` after this call.
+    pub new_unmined_since: u32,
 }
 
 #[cfg(test)]
@@ -282,5 +451,141 @@ mod tests {
             out.iter().any(|&(_s, sl)| sl == slot),
             "created tx appears in unmined range"
         );
+    }
+
+    #[test]
+    fn apply_set_mined_is_idempotent() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [1u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        let first = idx.apply_set_mined(&k, slot, 500, 20, 3, true);
+        assert!(
+            first.changed,
+            "first application of a new block is a real transition"
+        );
+        assert_eq!(
+            first.new_unmined_since, 0,
+            "on_longest_chain clears unmined_since"
+        );
+
+        let second = idx.apply_set_mined(&k, slot, 500, 20, 3, true);
+        assert!(!second.changed, "re-applying the same block_id is a no-op");
+        assert_eq!(second.new_unmined_since, 0);
+
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(e.block_id, 500, "inline tuple holds the single block");
+            assert_eq!(
+                e.flags & MINED_HAS_OVERFLOW,
+                0,
+                "no overflow for a single block"
+            );
+        });
+    }
+
+    #[test]
+    fn apply_set_mined_second_block_spills_to_overflow() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [2u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        let first = idx.apply_set_mined(&k, slot, 500, 20, 3, true);
+        assert!(first.changed);
+        let second = idx.apply_set_mined(&k, slot, 501, 21, 4, true);
+        assert!(second.changed, "a distinct block_id is a real transition");
+
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(e.block_id, 500, "inline tuple keeps the first block");
+            assert_ne!(
+                e.flags & MINED_HAS_OVERFLOW,
+                0,
+                "second distinct block sets the overflow flag"
+            );
+        });
+
+        let sh = idx.shards[idx.shard_for(&k)].lock();
+        let overflow = sh
+            .overflow
+            .get(&slot)
+            .expect("overflow entry for this slot");
+        assert_eq!(overflow.len(), 1);
+        let be = overflow[0];
+        // BlockEntry is `#[repr(C, packed)]`; copy fields out before comparing
+        // to avoid taking unaligned references (E0793).
+        assert_eq!({ be.block_id }, 501);
+        assert_eq!({ be.block_height }, 21);
+        assert_eq!({ be.subtree_idx }, 4);
+    }
+
+    #[test]
+    fn apply_unset_to_zero_restores_unmined() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [3u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        let applied = idx.apply_set_mined(&k, slot, 500, 20, 3, true);
+        assert!(applied.changed);
+        assert_eq!(applied.new_unmined_since, 0);
+
+        // Mined tx must NOT show up as unmined below any height.
+        let mut out = Vec::new();
+        idx.collect_unmined_below(1_000, &mut out);
+        assert!(
+            !out.iter().any(|&(_s, sl)| sl == slot),
+            "mined tx should be out of the unmined bucket"
+        );
+
+        idx.apply_unset(&k, slot, 500, 30);
+
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(
+                e.block_id, 0,
+                "inline tuple cleared once its only block is unset"
+            );
+            assert_eq!(
+                e.unmined_since, 30,
+                "unset restores unmined_since to current height"
+            );
+        });
+
+        out.clear();
+        idx.collect_unmined_below(1_000, &mut out);
+        assert!(
+            out.iter().any(|&(_s, sl)| sl == slot),
+            "unset tx is visible again in the unmined range query"
+        );
+    }
+
+    #[test]
+    fn set_all_spent_toggles_flag() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [4u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(e.flags & MINED_ALL_SPENT, 0, "not set by default");
+        });
+
+        idx.set_all_spent(&k, slot, true);
+        idx.with_entry(&k, slot, |e| {
+            assert_ne!(
+                e.flags & MINED_ALL_SPENT,
+                0,
+                "flag set after set_all_spent(true)"
+            );
+        });
+
+        idx.set_all_spent(&k, slot, false);
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(
+                e.flags & MINED_ALL_SPENT,
+                0,
+                "flag cleared after set_all_spent(false)"
+            );
+        });
     }
 }
