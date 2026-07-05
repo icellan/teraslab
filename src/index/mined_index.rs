@@ -110,6 +110,89 @@ impl MinedShard {
     }
 }
 
+use crate::index::TxKey;
+
+/// Sharded mined-state index routing by txid hash.
+///
+/// Distributes entries across multiple [`MinedShard`] instances based on the
+/// transaction ID to enable concurrent access without a global lock.
+/// Each shard stores its entries locally; the shard index is always
+/// re-derived from the txid via [`shard_for`](Self::shard_for) on every access,
+/// never packed into the returned slot value.
+pub struct ShardedMinedIndex {
+    shards: Box<[parking_lot::Mutex<MinedShard>]>,
+    mask: usize,
+    seed: u64,
+}
+
+impl ShardedMinedIndex {
+    /// Create a new sharded index with at least `shard_count` shards.
+    ///
+    /// The actual shard count is the next power of two at least 16.
+    pub fn new(shard_count: usize) -> Self {
+        let count = shard_count.next_power_of_two().max(16);
+        let shards = (0..count)
+            .map(|_| parking_lot::Mutex::new(MinedShard::default()))
+            .collect::<Vec<_>>();
+        Self {
+            shards: shards.into_boxed_slice(),
+            mask: count - 1,
+            seed: crate::locks::stripe_seed(),
+        }
+    }
+
+    /// Determine which shard a key belongs to.
+    ///
+    /// Routes by bytes 16..24 of the txid through `splitmix64_finalize`,
+    /// seeded with the stripe seed, using a mask to select one of the shards.
+    #[inline]
+    pub fn shard_for(&self, key: &TxKey) -> usize {
+        let raw = u64::from_le_bytes(key.txid[16..24].try_into().unwrap_or([0u8; 8]));
+        (crate::index::hashmix::splitmix64_finalize(raw ^ self.seed) as usize) & self.mask
+    }
+
+    /// Allocate a slot for a freshly-created (unmined) transaction.
+    ///
+    /// Returns the shard-local slot (u32) to store in the primary entry's
+    /// `mined_slot` field. The shard index is NOT packed into the return value;
+    /// it is always re-derived from the txid via [`shard_for`](Self::shard_for).
+    pub fn alloc_created(&self, key: &TxKey, block_height: u32) -> u32 {
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        let slot = sh.alloc(MinedEntry {
+            unmined_since: block_height,
+            ..Default::default()
+        });
+        sh.set_unmined(slot, 0, block_height);
+        slot
+    }
+
+    /// Apply a closure to the entry at the given shard-local slot.
+    ///
+    /// Returns `Some(R)` if the slot is live, or `None` if the slot is absent
+    /// or has been freed.
+    pub fn with_entry<R>(
+        &self,
+        key: &TxKey,
+        slot: u32,
+        f: impl FnOnce(&MinedEntry) -> R,
+    ) -> Option<R> {
+        let sh = self.shards[self.shard_for(key)].lock();
+        sh.get(slot).map(f)
+    }
+
+    /// Collect all unmined entries below a given height.
+    ///
+    /// Iterates through all shards and returns `(shard_index, shard_local_slot)`
+    /// pairs for all entries with `unmined_since < height`.
+    pub fn collect_unmined_below(&self, height: u32, out: &mut Vec<(usize, u32)>) {
+        for (si, shard) in self.shards.iter().enumerate() {
+            let mut local = Vec::new();
+            shard.lock().unmined_below(height, &mut local);
+            out.extend(local.into_iter().map(|sl| (si, sl)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +259,28 @@ mod tests {
         assert!(
             out.is_empty(),
             "freed slot should not appear in unmined_below"
+        );
+    }
+
+    #[test]
+    fn sharded_alloc_and_lookup_by_key_roundtrip() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [7u8; 32] };
+        let slot = idx.alloc_created(&k, 42);
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(
+                e.unmined_since, 42,
+                "created tx is unmined at its block height"
+            );
+            assert_eq!(e.block_id, 0);
+        });
+        // range query sees it as unmined below 100
+        let mut out = Vec::new();
+        idx.collect_unmined_below(100, &mut out);
+        assert!(
+            out.iter().any(|&(_s, sl)| sl == slot),
+            "created tx appears in unmined range"
         );
     }
 }
