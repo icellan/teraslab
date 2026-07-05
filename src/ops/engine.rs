@@ -6,7 +6,7 @@
 use crate::allocator::{BoxedAllocator, RecordAllocator};
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::{
-    DahBackend, PreserveBackend, PrimaryBackend, ShardedDahIndex, ShardedIndex,
+    DahBackend, PreserveBackend, PrimaryBackend, ShardedDahIndex, ShardedIndex, ShardedMinedIndex,
     ShardedUnminedIndex, TxIndexEntry, TxKey, UnminedBackend,
 };
 use crate::io;
@@ -143,6 +143,20 @@ pub struct Engine {
     /// former single global mutex alone cost ~21 % of throughput under the
     /// create-heavy workload.
     unmined_index: ShardedUnminedIndex,
+    /// Dedicated authoritative in-RAM mined-state store (Task 6/7 of
+    /// `specs/MINEDINDEX_SETMINED_DESIGN.md`). Every create allocates a slot
+    /// here (pointed to by the primary entry's `TxIndexEntry::mined_slot`)
+    /// and delete frees it. Sharded at the same count as the primary `index`
+    /// (see [`Self::new_inner`]), though routing uses its own independent
+    /// seed — it does not need to share a shard NUMBER with the primary
+    /// index because, unlike `dah_index`/`unmined_index`, no lock-ordering
+    /// contract requires it (its lock is only ever taken standalone, keyed
+    /// by the already-resolved `mined_slot`, never nested under the primary
+    /// key's shard lock). Currently populated in parallel with the on-device
+    /// block entries but not yet authoritative for reads (Phase 2 of the
+    /// design) — later phases make setMined/spend update it and make it the
+    /// source of truth.
+    mined_index: ShardedMinedIndex,
     /// Secondary index mapping `preserve_until` → txids, serving the
     /// expired-preservation sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`) in
     /// O(expired) instead of an O(index-size) primary walk (issue #25).
@@ -504,6 +518,11 @@ impl Engine {
         let secondary_shards = index.shard_count();
         let dah_index = ShardedDahIndex::shard_in_memory(dah_index, secondary_shards);
         let unmined_index = ShardedUnminedIndex::shard_in_memory(unmined_index, secondary_shards);
+        // Size the mined index to match the primary index's shard count so
+        // they scale together; unlike `dah_index`/`unmined_index` this is a
+        // fresh in-memory structure (not reconciled from an existing
+        // backend), so a plain `new` suffices.
+        let mined_index = ShardedMinedIndex::new(secondary_shards);
         let engine = Self {
             stores: vec![Store {
                 device,
@@ -517,6 +536,7 @@ impl Engine {
             locks,
             dah_index,
             unmined_index,
+            mined_index,
             // Preserve index is unconditionally in-memory (no constructor
             // param): recovery re-derives it from authoritative device metadata
             // via `rebuild_preserve_index_from_device`. Boots empty; populated
@@ -4399,11 +4419,22 @@ impl Engine {
             return Err(e);
         }
 
+        // Allocate a mined-index slot for the new record BEFORE registering it
+        // in the primary index — `entry.mined_slot` must point at a live slot
+        // the instant the entry becomes visible. `alloc_created`'s
+        // `block_height` sets the slot's `unmined_since`, so passing
+        // `meta.unmined_since` mirrors the primary record exactly: nonzero for
+        // a genuinely unmined create, or 0 (a no-op, stays out of the unmined
+        // bucket) for a create that arrived already mined
+        // (`mined_block_infos` non-empty). Freed below on any registration
+        // failure so it never leaks.
+        let mined_slot = self.mined_index.alloc_created(&key, meta.unmined_since);
+
         // Register in index
         let index_entry = TxIndexEntry {
             device_id,
             record_offset,
-            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+            mined_slot,
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
@@ -4413,6 +4444,7 @@ impl Engine {
         let inserted = match self.register_new_with_shard_count(key, index_entry) {
             Ok(inserted) => inserted,
             Err(e) => {
+                self.mined_index.free(&key, mined_slot);
                 self.free_create_allocation_best_effort(device_id, record_offset, total_size);
                 return Err(CreateError::StorageError {
                     detail: format!("{e}"),
@@ -4424,6 +4456,7 @@ impl Engine {
             // can have registered since the lookup above, but if it ever
             // happens, refuse to overwrite the live entry and release the
             // losing reservation instead of leaking it.
+            self.mined_index.free(&key, mined_slot);
             self.free_create_allocation_best_effort(device_id, record_offset, total_size);
             return Err(CreateError::DuplicateTxId);
         }
@@ -4755,10 +4788,15 @@ impl Engine {
             self.write_full_record_with_cold(device_id, record_offset, &meta, &slots, &cold_data)?;
         }
 
+        // Allocate a mined-index slot before registering the primary entry —
+        // see the matching comment in `create`. Freed below on any
+        // registration failure so it never leaks.
+        let mined_slot = self.mined_index.alloc_created(&key, meta.unmined_since);
+
         let index_entry = TxIndexEntry {
             device_id,
             record_offset,
-            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+            mined_slot,
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
@@ -4766,14 +4804,19 @@ impl Engine {
         // existing key atomically with the insert.
         let inserted = self
             .register_new_with_shard_count(key, index_entry)
-            .map_err(|e| CreateError::StorageError {
-                detail: format!("{e}"),
+            .map_err(|e| {
+                self.mined_index.free(&key, mined_slot);
+                CreateError::StorageError {
+                    detail: format!("{e}"),
+                }
             })?;
         if !inserted {
             // The reservation at `record_offset` is owned by the caller
             // (`pre_allocate_create` contract / dispatch batch path), which
             // releases it on any `Err` — do not free it here, that would be
-            // a double free.
+            // a double free. The mined-index slot has no such caller-owns-it
+            // contract, so free it here to avoid leaking it.
+            self.mined_index.free(&key, mined_slot);
             return Err(CreateError::DuplicateTxId);
         }
 
@@ -7540,6 +7583,15 @@ impl Engine {
             self.conflicting_index.lock().remove(&req.tx_key);
         }
 
+        // Release the mined-index slot (if the record was ever registered
+        // through the slot-allocating create path — `entry.mined_slot` was
+        // read from the primary index before it was unregistered above).
+        // `mined_index.free` is a no-op if the slot is already absent, so
+        // this is safe even for a slot that was somehow already freed.
+        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            self.mined_index.free(&req.tx_key, entry.mined_slot);
+        }
+
         Ok(())
     }
 
@@ -7761,6 +7813,17 @@ impl Engine {
     /// status endpoints, and tests.
     pub fn unmined_index(&self) -> &ShardedUnminedIndex {
         &self.unmined_index
+    }
+
+    /// Borrow the sharded mined-state index.
+    ///
+    /// Returns the [`ShardedMinedIndex`] populated by
+    /// [`Self::create`]/[`Self::create_at_offset`] (slot alloc) and
+    /// [`Self::delete`] (slot free) — currently maintained in parallel with
+    /// the on-device block entries, not yet authoritative for reads (Phase 2
+    /// of `specs/MINEDINDEX_SETMINED_DESIGN.md`).
+    pub fn mined_index(&self) -> &ShardedMinedIndex {
+        &self.mined_index
     }
 
     /// Get the preserve index (backs the expired-preservation sweep; also used
@@ -16233,6 +16296,59 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         )
+    }
+
+    /// Task 7: `create` allocates a slot in the engine's `ShardedMinedIndex`
+    /// (pointed to by the primary entry's `mined_slot`) and the newly-created
+    /// unmined tx shows up in the mined index's own unmined range query;
+    /// `delete` frees that slot, so the tx no longer appears there. Proves
+    /// alloc/free stay balanced across the create/delete lifecycle (no leak,
+    /// no double-free) — this is lifecycle state later phases build on.
+    #[test]
+    fn create_allocs_mined_slot_delete_frees_it() {
+        let engine = create_engine_inner();
+        let (_, req) = make_create_req(1, 2);
+        // `make_create_req` leaves `mined_block_infos` empty, so this create
+        // is unmined as of `block_height`.
+        let block_height = req.block_height;
+        let key = req.tx_key();
+
+        engine.create(&req).expect("create succeeds");
+
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "create must allocate a mined-index slot"
+        );
+        let pair = (engine.mined_index().shard_for(&key), entry.mined_slot);
+
+        let mut unmined = Vec::new();
+        engine
+            .mined_index()
+            .collect_unmined_below(block_height + 1, &mut unmined);
+        assert!(
+            unmined.contains(&pair),
+            "newly-created unmined tx's slot must appear in the mined index's \
+             unmined range query"
+        );
+
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key,
+                due_guard: None,
+            })
+            .expect("delete succeeds");
+
+        let mut unmined_after_delete = Vec::new();
+        engine
+            .mined_index()
+            .collect_unmined_below(block_height + 1, &mut unmined_after_delete);
+        assert!(
+            !unmined_after_delete.contains(&pair),
+            "deleted tx's mined-index slot must be freed: no longer in the \
+             unmined range query"
+        );
     }
 
     /// Build an engine whose primary index is a multi-shard `ShardedIndex`

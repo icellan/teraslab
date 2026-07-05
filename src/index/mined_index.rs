@@ -362,6 +362,18 @@ impl ShardedMinedIndex {
         slot
     }
 
+    /// Release a previously-allocated slot back to its shard's free list.
+    ///
+    /// Used to roll back a slot allocated by [`Self::alloc_created`] when the
+    /// caller's subsequent primary-index registration fails (the slot would
+    /// otherwise leak), and to release a live record's slot on delete.
+    /// No-op if the slot is already absent — [`MinedShard::free_slot`] guards
+    /// on liveness internally, so a double-free is safe.
+    pub fn free(&self, key: &TxKey, slot: u32) {
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        sh.free_slot(slot);
+    }
+
     /// Apply a closure to the entry at the given shard-local slot.
     ///
     /// Returns `Some(R)` if the slot is live, or `None` if the slot is absent
