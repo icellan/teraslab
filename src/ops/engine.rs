@@ -3970,6 +3970,21 @@ impl Engine {
                     new_unmined,
                 )?;
 
+                // Dual-write (Task 9): mirror the same mined-state
+                // transition into the authoritative MinedIndex so it stays
+                // in sync with the device. Device remains the read path
+                // until Task 10 reroutes readers.
+                if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+                    self.mined_index().apply_set_mined(
+                        tx_key,
+                        entry.mined_slot,
+                        req.block_id,
+                        req.block_height,
+                        req.subtree_idx,
+                        req.on_longest_chain,
+                    );
+                }
+
                 return Ok(SetMinedResponse {
                     signal,
                     block_ids: vec![req.block_id],
@@ -4171,6 +4186,30 @@ impl Engine {
         let new_dah = { metadata.delete_at_height };
         let new_unmined = { metadata.unmined_since };
         self.update_both_secondary_indexes(tx_key, old_dah, new_dah, old_unmined, new_unmined)?;
+
+        // Dual-write (Task 9): mirror the same mined-state transition into
+        // the authoritative MinedIndex so it stays in sync with the device.
+        // Covers both the slow-path ADD (unset_mined == false: has existing
+        // entries or overflow) and the slow-path UNSET branches above.
+        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            if req.unset_mined {
+                self.mined_index().apply_unset(
+                    tx_key,
+                    entry.mined_slot,
+                    req.block_id,
+                    req.current_block_height,
+                );
+            } else {
+                self.mined_index().apply_set_mined(
+                    tx_key,
+                    entry.mined_slot,
+                    req.block_id,
+                    req.block_height,
+                    req.subtree_idx,
+                    req.on_longest_chain,
+                );
+            }
+        }
 
         let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
             collect_block_ids(&metadata).to_vec()
@@ -20342,6 +20381,160 @@ mod tests {
             750,
             "unmined_since should equal current_block_height after unmining last block"
         );
+    }
+
+    /// Task 9: `set_mined_inner` dual-writes mined-state to the authoritative
+    /// `MinedIndex`, keeping it in sync with the device (the pre-existing
+    /// device RMW is left untouched — only readers, not writers, migrate off
+    /// the device in later tasks). Proves the MinedIndex mirrors the device
+    /// across all three transitions: first setMined (fast path), a second
+    /// setMined (slow-path add, spills to MinedIndex overflow since a
+    /// `MinedEntry` has only one inline block tuple vs. the device's three),
+    /// and an unsetMined (slow-path remove).
+    #[test]
+    fn setmined_dual_writes_mined_index_matches_device() {
+        use crate::index::mined_index::{MINED_HAS_OVERFLOW, NO_MINED_SLOT};
+
+        let engine = create_engine();
+        let (_, req) = make_create_req(230, 3);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot, NO_MINED_SLOT,
+            "create must allocate a mined-index slot"
+        );
+        let slot = entry.mined_slot;
+
+        const B1: u32 = 111;
+        const B2: u32 = 222;
+
+        // -- setMined B1 (fast path: first-ever block entry) --
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: B1,
+                block_height: 1000,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("setMined B1 succeeds");
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            meta.block_entry_count, 1,
+            "device: one block entry after B1"
+        );
+        assert_eq!(
+            { meta.block_entries_inline[0].block_id },
+            B1,
+            "device: inline[0] is B1"
+        );
+        assert_eq!(
+            { meta.unmined_since },
+            0,
+            "device: on-chain -> unmined_since 0"
+        );
+
+        engine
+            .mined_index()
+            .with_entry(&key, slot, |e| {
+                assert_eq!(e.block_id, B1, "MinedIndex: inline block_id is B1");
+                assert_eq!(
+                    e.unmined_since, 0,
+                    "MinedIndex: on-chain -> unmined_since 0"
+                );
+            })
+            .expect("mined-index slot must still be live after B1");
+
+        // -- setMined B2 (slow path: a 2nd distinct block, competing chain) --
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: B2,
+                block_height: 1001,
+                subtree_idx: 1,
+                current_block_height: 1001,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("setMined B2 succeeds");
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            meta.block_entry_count, 2,
+            "device: two block entries after B2"
+        );
+        assert_eq!({ meta.block_entries_inline[0].block_id }, B1);
+        assert_eq!(
+            { meta.block_entries_inline[1].block_id },
+            B2,
+            "device: inline[1] is B2"
+        );
+
+        // The MinedEntry only has room for one inline block tuple, so B2
+        // must have spilled into the shard's overflow map — assert both the
+        // inline value (still B1, unchanged) and the overflow flag (proving
+        // a 2nd block is tracked, matching the device's count of 2). The
+        // overflow map itself is private to the mined_index module; its
+        // content (must be exactly B2) is confirmed below when unsetting B1
+        // promotes it back into the inline slot.
+        engine
+            .mined_index()
+            .with_entry(&key, slot, |e| {
+                assert_eq!(e.block_id, B1, "MinedIndex: inline block_id still B1");
+                assert_ne!(
+                    e.flags & MINED_HAS_OVERFLOW,
+                    0,
+                    "MinedIndex: 2nd block must be tracked via overflow"
+                );
+            })
+            .expect("mined-index slot must still be live after B2");
+
+        // -- unsetMined B1 (slow path: remove; B2 must remain) --
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: B1,
+                block_height: 1000,
+                subtree_idx: 0,
+                current_block_height: 1002,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: true,
+            })
+            .expect("unsetMined B1 succeeds");
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!(
+            meta.block_entry_count, 1,
+            "device: one block entry remains after unsetting B1"
+        );
+        assert_eq!(
+            { meta.block_entries_inline[0].block_id },
+            B2,
+            "device: B2 remains after removing B1"
+        );
+
+        engine
+            .mined_index()
+            .with_entry(&key, slot, |e| {
+                assert_eq!(
+                    e.block_id, B2,
+                    "MinedIndex: B1 gone, B2 promoted from overflow into inline"
+                );
+                assert_eq!(
+                    e.flags & MINED_HAS_OVERFLOW,
+                    0,
+                    "MinedIndex: overflow now empty after B2's promotion"
+                );
+            })
+            .expect("mined-index slot must still be live after unsetting B1");
     }
 
     #[test]
