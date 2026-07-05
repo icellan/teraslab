@@ -3112,6 +3112,7 @@ impl Engine {
             metadata: p.metadata,
             current_block_height: p.current_block_height,
             block_height_retention: p.block_height_retention,
+            mined_slot: p.mined_slot,
         })
     }
 
@@ -3161,6 +3162,7 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let record_offset = entry.record_offset;
         let device_id = entry.device_id;
+        let mined_slot = entry.mined_slot;
 
         // 2. Read metadata (zero-alloc when device supports direct access)
         let metadata = self.read_metadata_fast(device_id, record_offset)?;
@@ -3201,6 +3203,7 @@ impl Engine {
                 metadata,
                 current_block_height: req.current_block_height,
                 block_height_retention: req.block_height_retention,
+                mined_slot,
             });
         }
 
@@ -3382,6 +3385,7 @@ impl Engine {
             metadata,
             current_block_height: req.current_block_height,
             block_height_retention: req.block_height_retention,
+            mined_slot,
         })
     }
 
@@ -3556,6 +3560,18 @@ impl Engine {
         metadata.generation = { metadata.generation }.wrapping_add(1);
         metadata.updated_at = self.now_millis();
 
+        // This is the sole production entry point for the replica apply path
+        // (`receiver.rs::apply_op` → `ReplicaOp::Spend`), which fully mutates
+        // `spent_utxos` without going through `PreparedSpend::apply_locked` —
+        // so it must independently maintain the same `MINED_ALL_SPENT`
+        // invariant. RAM-only; no-op if the entry has no live mined-index slot.
+        if { metadata.spent_utxos } == utxo_count
+            && entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT
+        {
+            self.mined_index()
+                .set_all_spent(&req.tx_key, entry.mined_slot, true);
+        }
+
         // 7. Evaluate deleteAtHeight
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
@@ -3724,6 +3740,16 @@ impl Engine {
             metadata.spent_utxos = current - 1;
             metadata.generation = { metadata.generation }.wrapping_add(1);
             metadata.updated_at = self.now_millis();
+
+            // This slot just went SPENT → UNSPENT, so the record cannot be
+            // all-spent anymore. Clearing unconditionally (rather than only
+            // when it WAS all-spent) is correct and simplest: a record with
+            // any unspent UTXO is never all-spent. RAM-only; no-op if the
+            // entry has no live mined-index slot.
+            if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+                self.mined_index()
+                    .set_all_spent(&req.tx_key, entry.mined_slot, false);
+            }
         }
         // else: silent no-op. The slot, counter, and generation are left
         // untouched; we still fall through to DAH housekeeping exactly as the
@@ -8524,6 +8550,7 @@ impl<'a> ValidatedSpend<'a> {
             metadata,
             current_block_height,
             block_height_retention,
+            mined_slot,
         } = self;
         PreparedSpend {
             tx_key,
@@ -8538,6 +8565,7 @@ impl<'a> ValidatedSpend<'a> {
             metadata,
             current_block_height,
             block_height_retention,
+            mined_slot,
         }
         // Single-spend path: commit the DAH inline (defer_dah = false); the
         // returned transition is always None here.
@@ -8590,6 +8618,7 @@ impl PreparedSpend {
             mut metadata,
             current_block_height,
             block_height_retention,
+            mined_slot,
         } = self;
 
         // Fault-injection: simulate a crash AFTER redo fsync but BEFORE
@@ -8664,6 +8693,18 @@ impl PreparedSpend {
         metadata.spent_utxos = new_spent;
         metadata.generation = { metadata.generation }.wrapping_add(1);
         metadata.updated_at = engine.now_millis();
+
+        // This spend consumed the record's last unspent UTXO: mark it
+        // all-spent in the MinedIndex slot (RAM-only; a later setMined DAH
+        // evaluation reads this instead of the device). No-op if the entry
+        // has no live mined-index slot.
+        if new_spent == { metadata.utxo_count }
+            && mined_slot != crate::index::mined_index::NO_MINED_SLOT
+        {
+            engine
+                .mined_index()
+                .set_all_spent(&tx_key, mined_slot, true);
+        }
 
         // 8. Evaluate deleteAtHeight. A DAH-overflow error here indicates
         // misconfiguration (current_height + retention > u32::MAX) and
@@ -16348,6 +16389,186 @@ mod tests {
             !unmined_after_delete.contains(&pair),
             "deleted tx's mined-index slot must be freed: no longer in the \
              unmined range query"
+        );
+    }
+
+    /// Task 8: the spend path maintains the `MINED_ALL_SPENT` bit in the
+    /// tx's `MinedIndex` slot. A partial spend (one of two UTXOs) must NOT
+    /// set the bit; the spend that consumes the LAST unspent UTXO must set
+    /// it. Exercises the batched `spend_multi` → `PreparedSpend::apply_locked`
+    /// path — the primary production spend entry point.
+    #[test]
+    fn last_spend_sets_all_spent() {
+        let engine = create_engine_inner();
+        let (hashes, req) = make_create_req(70, 2);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "create must allocate a mined-index slot"
+        );
+
+        let is_all_spent = || {
+            engine
+                .mined_index()
+                .with_entry(&key, entry.mined_slot, |e| {
+                    e.flags & crate::index::mined_index::MINED_ALL_SPENT != 0
+                })
+                .expect("mined-index slot must still be live")
+        };
+
+        assert!(!is_all_spent(), "freshly created tx must not be all-spent");
+
+        // Spend UTXO 0 — one of two. Partial spend must NOT set the bit.
+        let mut spending_data_0 = [0u8; 36];
+        spending_data_0[0] = 0xA0;
+        spending_data_0[32..36].copy_from_slice(&1u32.to_le_bytes());
+        engine
+            .spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: hashes[0],
+                    spending_data: spending_data_0,
+                    idx: 0,
+                }],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend of utxo 0 succeeds");
+
+        assert!(
+            !is_all_spent(),
+            "partial spend (1 of 2 utxos) must not set all_spent"
+        );
+
+        // Spend UTXO 1 — the last remaining one. Must set the bit.
+        let mut spending_data_1 = [0u8; 36];
+        spending_data_1[0] = 0xA1;
+        spending_data_1[32..36].copy_from_slice(&1u32.to_le_bytes());
+        engine
+            .spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends: vec![SpendItem {
+                    offset: 1,
+                    utxo_hash: hashes[1],
+                    spending_data: spending_data_1,
+                    idx: 0,
+                }],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend of the last utxo succeeds");
+
+        assert!(
+            is_all_spent(),
+            "spending the last remaining utxo must set all_spent"
+        );
+    }
+
+    /// Task 8: the single-spend fast path (`Engine::spend`) — the sole
+    /// production entry point used by the replica apply path
+    /// (`receiver.rs::apply_op` → `ReplicaOp::Spend`) — must maintain the
+    /// same `all_spent` invariant as the batched path, since it fully
+    /// mutates `spent_utxos` without going through `PreparedSpend::apply_locked`.
+    #[test]
+    fn single_spend_path_sets_all_spent_on_last_utxo() {
+        let engine = create_engine_inner();
+        let (hashes, req) = make_create_req(71, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+        let entry = engine.lookup(&key).expect("entry must be registered");
+
+        let mut spending_data = [0u8; 36];
+        spending_data[0] = 0xB0;
+        spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hashes[0],
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("single spend succeeds");
+
+        let is_all_spent = engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                e.flags & crate::index::mined_index::MINED_ALL_SPENT != 0
+            })
+            .expect("mined-index slot must still be live");
+        assert!(
+            is_all_spent,
+            "single-spend path must set all_spent when it spends the last utxo"
+        );
+    }
+
+    /// Task 8: unspending a fully-spent record must clear `MINED_ALL_SPENT`
+    /// again — a reorg that reverses the spend that made a record all-spent
+    /// must un-flag it so a later setMined DAH evaluation doesn't treat it
+    /// as eligible for deletion while a UTXO is live again.
+    #[test]
+    fn unspend_clears_all_spent() {
+        let engine = create_engine_inner();
+        let (hashes, req) = make_create_req(72, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+        let entry = engine.lookup(&key).expect("entry must be registered");
+
+        let mut spending_data = [0u8; 36];
+        spending_data[0] = 0xC0;
+        spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hashes[0],
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend of the only utxo succeeds");
+
+        let is_all_spent = || {
+            engine
+                .mined_index()
+                .with_entry(&key, entry.mined_slot, |e| {
+                    e.flags & crate::index::mined_index::MINED_ALL_SPENT != 0
+                })
+                .expect("mined-index slot must still be live")
+        };
+        assert!(
+            is_all_spent(),
+            "fully spending the only utxo must set all_spent"
+        );
+
+        engine
+            .unspend(&crate::ops::unspend::UnspendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hashes[0],
+                spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("unspend succeeds");
+
+        assert!(
+            !is_all_spent(),
+            "unspend must clear all_spent once the utxo is unspent again"
         );
     }
 

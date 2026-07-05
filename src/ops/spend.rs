@@ -169,6 +169,10 @@ pub struct ValidatedSpend<'a> {
     pub(crate) current_block_height: u32,
     /// Block height retention for DAH.
     pub(crate) block_height_retention: u32,
+    /// The tx's `MinedIndex` slot, from the index entry's `mined_slot`
+    /// (`NO_MINED_SLOT` if none). `apply` uses this to set `MINED_ALL_SPENT`
+    /// when this spend consumes the record's last unspent UTXO.
+    pub(crate) mined_slot: u32,
 }
 
 impl<'a> ValidatedSpend<'a> {
@@ -252,6 +256,11 @@ pub struct PreparedSpend {
     pub(crate) current_block_height: u32,
     /// Request param: block height retention (DAH evaluation).
     pub(crate) block_height_retention: u32,
+    /// The tx's `MinedIndex` slot, from the index entry's `mined_slot`
+    /// (`NO_MINED_SLOT` if none). `apply_locked` uses this to set
+    /// `MINED_ALL_SPENT` when this spend consumes the record's last unspent
+    /// UTXO.
+    pub(crate) mined_slot: u32,
 }
 
 impl PreparedSpend {
