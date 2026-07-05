@@ -5925,6 +5925,26 @@ fn create_repl_cold_data(
     }
 }
 
+/// Force the create path to build replica ops even on a standalone node.
+///
+/// Production build: always `false` (compiles away — zero hot-path cost), so
+/// standalone creates skip the discarded replica-op construction. The
+/// `#[cfg(test)]` sibling lets the perf A/B test measure both configurations in
+/// one binary back-to-back, cancelling machine noise.
+#[cfg(not(test))]
+#[inline(always)]
+fn force_build_repl_ops_for_test() -> bool {
+    false
+}
+
+#[cfg(test)]
+static PERF_FORCE_REPL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn force_build_repl_ops_for_test() -> bool {
+    PERF_FORCE_REPL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn handle_create_batch(
     req: &RequestFrame,
     engine: &Engine,
@@ -6504,10 +6524,25 @@ fn handle_create_batch(
         Err(BatchItemError),
         Skip,
     }
+    // Standalone node (no cluster): `replicate_all_ops_with_barrier` returns
+    // NotApplicable when `cluster` is None, so every `ReplicaOp::Create` built
+    // below is discarded unread. Building one is expensive on the create hot
+    // path — a full metadata read-back (`engine.read_metadata`), a full metadata
+    // re-serialization, a `utxo_hashes` clone, and (for external records) a blob
+    // read-back — which profiling puts at ~2x the create's own engine cost. Skip
+    // all of it when replication cannot consume it. Correctness is preserved:
+    // per-item success is counted as `items.len() - errors.len()` (never from
+    // repl ops), and a no-repl `Skip` is already a success outcome (see the
+    // degraded-blob path below). Durability is untouched — repl ops are
+    // replication intent, not local WAL. Clustered nodes are unchanged.
+    let build_repl_ops = cluster.is_some() || force_build_repl_ops_for_test();
     let register_one = |v: &ValidCreate| -> RegisterOutcome {
         let item = &items[v.idx];
         match engine.register_create_at_offset(v.device_id, &v.create_req, v.record_offset) {
             Ok(_) => {
+                if !build_repl_ops {
+                    return RegisterOutcome::Skip;
+                }
                 let key = TxKey { txid: item.txid };
                 // Serialize full metadata for the replica so a promoted replica
                 // has the authoritative record state.
@@ -21201,6 +21236,110 @@ mod tests {
         );
         assert_eq!(after_succ - before_succ, 1, "creates_succeeded += 1");
         assert_eq!(after_fail - before_fail, 1, "creates_failed += 1");
+    }
+
+    /// A standalone create that SKIPS the discarded replica-op construction
+    /// (`build_repl_ops == false`, the new default when `cluster` is None) must
+    /// produce a byte-for-byte identical on-device record and identical client
+    /// response as the OLD path that built and then discarded the replica op.
+    /// The `PERF_FORCE_REPL` toggle forces the OLD path on a standalone engine
+    /// so both can be exercised without a cluster. Guards the create hot-path
+    /// optimization on `perf/hotpath-cpu`.
+    #[test]
+    fn standalone_create_skip_repl_matches_build_repl() {
+        use std::sync::atomic::Ordering;
+        let _m = test_metrics();
+        let _ = test_histograms();
+
+        // Cover a few record shapes: 1 utxo, many utxos, coinbase, frozen-ish.
+        let shapes: &[(u8, u32, bool)] = &[(10, 1, false), (11, 8, false), (12, 3, true)];
+
+        let build = |txid: [u8; 32], utxos: u32, coinbase: bool| -> Vec<u8> {
+            let hashes: Vec<[u8; 32]> = (0..utxos)
+                .map(|i| {
+                    let mut hh = [0u8; 32];
+                    hh[0] = i as u8;
+                    hh
+                })
+                .collect();
+            let item = WireCreateItem {
+                txid,
+                tx_version: 2,
+                locktime: 7,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 260,
+                is_coinbase: coinbase,
+                spending_height: if coinbase { 100 } else { 0 },
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: hashes,
+                cold_data: vec![],
+                block_height: 42,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            encode_create_batch(&[item])
+        };
+
+        // Read back the deterministic metadata fields the optimization must not
+        // perturb (record content is written in Phase 2b, BEFORE register_one,
+        // so it cannot depend on `build_repl_ops`). Excludes wall-clock
+        // `updated_at`/`created_at`.
+        let snapshot = |h: &DispatchTestHarness, txid: [u8; 32]| -> Vec<u64> {
+            let meta = h
+                .engine
+                .read_metadata(&TxKey { txid })
+                .expect("record present");
+            vec![
+                u64::from(u32::from({ meta.tx_version })),
+                u64::from({ meta.locktime }),
+                { meta.fee },
+                u64::from({ meta.size_in_bytes }),
+                u64::from({ meta.extended_size }),
+                u64::from({ meta.spending_height }),
+                u64::from({ meta.utxo_count }),
+                u64::from({ meta.record_size }),
+                u64::from({ meta.flags }.bits()),
+                u64::from({ meta.generation }),
+                u64::from({ meta.unmined_since }),
+                u64::from({ meta.delete_at_height }),
+                u64::from({ meta.preserve_until }),
+            ]
+        };
+
+        // Create the record on a fresh standalone engine and snapshot it. Only
+        // ONE harness may live at a time — each holds the global metrics test
+        // lock, so two concurrent harnesses would deadlock — hence the harness
+        // is dropped at the end of this closure before the next call.
+        let create_and_snapshot =
+            |force_repl: bool, txid: [u8; 32], utxos: u32, coinbase: bool| -> Vec<u64> {
+                PERF_FORCE_REPL.store(force_repl, Ordering::Relaxed);
+                let h = DispatchTestHarness::new();
+                assert_eq!(
+                    h.request(OP_CREATE_BATCH, build(txid, utxos, coinbase))
+                        .status,
+                    STATUS_OK,
+                    "standalone create should succeed (force_repl={force_repl})"
+                );
+                snapshot(&h, txid)
+            };
+
+        for &(seed, utxos, coinbase) in shapes {
+            let txid = DispatchTestHarness::make_txid(seed);
+            // OLD path: force the replica-op build on a standalone engine.
+            let old_snap = create_and_snapshot(true, txid, utxos, coinbase);
+            // NEW path: skip it (the shipped standalone default).
+            let new_snap = create_and_snapshot(false, txid, utxos, coinbase);
+            assert_eq!(
+                old_snap, new_snap,
+                "skipping the discarded replica-op build must not change the created \
+                 record (seed={seed}, utxos={utxos}, coinbase={coinbase})"
+            );
+        }
+        PERF_FORCE_REPL.store(false, Ordering::Relaxed);
     }
 
     /// Freeze items should tick freezes_succeeded / freezes_failed per item.
