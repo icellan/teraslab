@@ -52,7 +52,8 @@ teraslab/
 │   ├── 10_wire_protocol.md
 │   ├── 11_tiered_storage.md
 │   ├── 12_integration.md
-│   └── 13_admin_tooling.md
+│   ├── 13_admin_tooling.md
+│   └── 14_backup.md
 └── src/                               ← Rust source (you build this)
 ```
 
