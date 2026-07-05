@@ -23,6 +23,48 @@ pub struct MinedEntry {
 /// A `u32::MAX` slot means "no mined slot assigned" (stored in the primary entry).
 pub const NO_MINED_SLOT: u32 = u32::MAX;
 
+/// Version byte for the [`ShardedMinedIndex::serialize`] snapshot format.
+const MINED_SNAPSHOT_VERSION: u8 = 1;
+
+/// Errors from [`ShardedMinedIndex::deserialize`].
+#[derive(Debug, thiserror::Error)]
+pub enum MinedIndexError {
+    /// The snapshot's version byte doesn't match [`MINED_SNAPSHOT_VERSION`].
+    #[error("mined-index snapshot version mismatch: got {0}, want {1}")]
+    VersionMismatch(u8, u8),
+    /// The snapshot bytes are truncated or otherwise malformed.
+    #[error("mined-index snapshot truncated/corrupt")]
+    Corrupt,
+}
+
+/// Minimal fail-closed byte cursor for the mined-index snapshot format.
+///
+/// Every read returns `None` (never panics or indexes out of bounds) when
+/// the requested bytes aren't available, so a truncated or corrupt buffer
+/// fails the read instead of panicking.
+struct SnapshotCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SnapshotCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn read_u8(&mut self) -> Option<u8> {
+        let b = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn read_u32(&mut self) -> Option<u32> {
+        let bytes: [u8; 4] = self.data.get(self.pos..self.pos + 4)?.try_into().ok()?;
+        self.pos += 4;
+        Some(u32::from_le_bytes(bytes))
+    }
+}
+
 #[derive(Default)]
 #[allow(dead_code)]
 struct MinedShard {
@@ -107,6 +149,127 @@ impl MinedShard {
             }
         }
         out.sort_unstable(); // deterministic order for tests + downstream batching
+    }
+
+    /// Append this shard's full state (entries + live flags, free list,
+    /// overflow map, unmined buckets) to `out` in plain little-endian
+    /// length-prefixed form. See [`ShardedMinedIndex::serialize`] for the
+    /// overall snapshot layout this is embedded in.
+    fn serialize(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for (i, e) in self.entries.iter().enumerate() {
+            let live = self.live.get(i).copied().unwrap_or(false);
+            out.push(live as u8);
+            out.extend_from_slice(&e.block_id.to_le_bytes());
+            out.extend_from_slice(&e.block_height.to_le_bytes());
+            out.extend_from_slice(&e.subtree_idx.to_le_bytes());
+            out.extend_from_slice(&e.unmined_since.to_le_bytes());
+            out.push(e.flags);
+        }
+
+        out.extend_from_slice(&(self.free.len() as u32).to_le_bytes());
+        for &slot in &self.free {
+            out.extend_from_slice(&slot.to_le_bytes());
+        }
+
+        out.extend_from_slice(&(self.overflow.len() as u32).to_le_bytes());
+        for (&slot, blocks) in &self.overflow {
+            out.extend_from_slice(&slot.to_le_bytes());
+            out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+            for be in blocks {
+                // `BlockEntry` is `#[repr(C, packed)]`; copy fields out to
+                // locals before referencing them to avoid unaligned
+                // references (E0793).
+                let block_id = be.block_id;
+                let block_height = be.block_height;
+                let subtree_idx = be.subtree_idx;
+                out.extend_from_slice(&block_id.to_le_bytes());
+                out.extend_from_slice(&block_height.to_le_bytes());
+                out.extend_from_slice(&subtree_idx.to_le_bytes());
+            }
+        }
+
+        out.extend_from_slice(&(self.unmined.len() as u32).to_le_bytes());
+        for (&height, set) in &self.unmined {
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&(set.len() as u32).to_le_bytes());
+            for &slot in set {
+                out.extend_from_slice(&slot.to_le_bytes());
+            }
+        }
+    }
+
+    /// Parse one shard's state from `cur`, in the format written by
+    /// [`Self::serialize`]. Fails closed with [`MinedIndexError::Corrupt`] on
+    /// any truncated or out-of-bounds read; never panics.
+    fn deserialize(cur: &mut SnapshotCursor) -> Result<Self, MinedIndexError> {
+        let entry_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
+        // Grow via `push` rather than `Vec::with_capacity(entry_count)` so a
+        // poisoned/huge declared count fails fast on the first truncated
+        // read instead of driving a large upfront allocation.
+        let mut entries = Vec::new();
+        let mut live = Vec::new();
+        for _ in 0..entry_count {
+            let l = cur.read_u8().ok_or(MinedIndexError::Corrupt)?;
+            let block_id = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            let block_height = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            let subtree_idx = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            let unmined_since = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            let flags = cur.read_u8().ok_or(MinedIndexError::Corrupt)?;
+            entries.push(MinedEntry {
+                block_id,
+                block_height,
+                subtree_idx,
+                unmined_since,
+                flags,
+            });
+            live.push(l != 0);
+        }
+
+        let free_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
+        let mut free = Vec::new();
+        for _ in 0..free_count {
+            free.push(cur.read_u32().ok_or(MinedIndexError::Corrupt)?);
+        }
+
+        let overflow_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
+        let mut overflow = HashMap::new();
+        for _ in 0..overflow_count {
+            let slot = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            let vec_len = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
+            let mut v = Vec::new();
+            for _ in 0..vec_len {
+                let block_id = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+                let block_height = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+                let subtree_idx = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+                v.push(BlockEntry {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                });
+            }
+            overflow.insert(slot, v);
+        }
+
+        let unmined_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
+        let mut unmined = HashMap::new();
+        for _ in 0..unmined_count {
+            let height = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            let set_len = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
+            let mut set = HashSet::new();
+            for _ in 0..set_len {
+                set.insert(cur.read_u32().ok_or(MinedIndexError::Corrupt)?);
+            }
+            unmined.insert(height, set);
+        }
+
+        Ok(MinedShard {
+            entries,
+            live,
+            free,
+            overflow,
+            unmined,
+        })
     }
 }
 
@@ -351,6 +514,55 @@ impl ShardedMinedIndex {
             }
         }
     }
+
+    /// Serialize the entire index (every shard's entries, free list,
+    /// overflow map, and unmined buckets) into a versioned snapshot, appended
+    /// to `out`.
+    ///
+    /// Format: a 1-byte version ([`MINED_SNAPSHOT_VERSION`]) followed by each
+    /// shard's state in order, in plain little-endian length-prefixed form.
+    /// Round-trips through [`Self::deserialize`] given the same `shard_count`
+    /// this index was created with.
+    pub fn serialize(&self, out: &mut Vec<u8>) {
+        out.push(MINED_SNAPSHOT_VERSION);
+        for shard in self.shards.iter() {
+            shard.lock().serialize(out);
+        }
+    }
+
+    /// Reconstruct a [`ShardedMinedIndex`] from a snapshot produced by
+    /// [`Self::serialize`].
+    ///
+    /// `shard_count` must be the same value the original index was
+    /// constructed with ([`Self::new`]) — it re-derives the identical `mask`
+    /// and reuses the process-wide `seed`, so `shard_for` routes every key to
+    /// the same shard index it did before the snapshot, and the parsed shard
+    /// sections line up positionally.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed (never panics) with:
+    /// - [`MinedIndexError::VersionMismatch`] if the version byte doesn't
+    ///   match [`MINED_SNAPSHOT_VERSION`].
+    /// - [`MinedIndexError::Corrupt`] if the bytes are truncated or otherwise
+    ///   malformed at any point during parsing.
+    pub fn deserialize(bytes: &[u8], shard_count: usize) -> Result<Self, MinedIndexError> {
+        let mut cur = SnapshotCursor::new(bytes);
+        let version = cur.read_u8().ok_or(MinedIndexError::Corrupt)?;
+        if version != MINED_SNAPSHOT_VERSION {
+            return Err(MinedIndexError::VersionMismatch(
+                version,
+                MINED_SNAPSHOT_VERSION,
+            ));
+        }
+
+        let restored = Self::new(shard_count);
+        for shard_mutex in restored.shards.iter() {
+            let parsed = MinedShard::deserialize(&mut cur)?;
+            *shard_mutex.lock() = parsed;
+        }
+        Ok(restored)
+    }
 }
 
 /// Result of [`ShardedMinedIndex::apply_set_mined`].
@@ -365,6 +577,159 @@ pub struct MinedApplyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_roundtrip_reproduces_state() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+
+        // 1. A created/unmined slot.
+        let k_unmined = TxKey { txid: [10u8; 32] };
+        let slot_unmined = idx.alloc_created(&k_unmined, 42);
+
+        // 2. A mined slot on the longest chain.
+        let k_mined = TxKey { txid: [11u8; 32] };
+        let slot_mined = idx.alloc_created(&k_mined, 5);
+        idx.apply_set_mined(&k_mined, slot_mined, 500, 20, 3, true);
+
+        // 3. A slot with an overflow block (mined in two competing blocks).
+        let k_overflow = TxKey { txid: [12u8; 32] };
+        let slot_overflow = idx.alloc_created(&k_overflow, 5);
+        idx.apply_set_mined(&k_overflow, slot_overflow, 600, 30, 1, true);
+        idx.apply_set_mined(&k_overflow, slot_overflow, 601, 31, 2, true);
+
+        // 4. A freed slot (must restore as absent).
+        let k_freed = TxKey { txid: [13u8; 32] };
+        let slot_freed = idx.alloc_created(&k_freed, 5);
+        {
+            let mut sh = idx.shards[idx.shard_for(&k_freed)].lock();
+            sh.free_slot(slot_freed);
+        }
+
+        let mut buf = Vec::new();
+        idx.serialize(&mut buf);
+
+        let restored = ShardedMinedIndex::deserialize(&buf, 16)
+            .expect("roundtrip of a well-formed snapshot must succeed");
+
+        restored.with_entry(&k_unmined, slot_unmined, |e| {
+            assert_eq!(e.block_id, 0, "unmined slot has no block tuple");
+            assert_eq!(e.unmined_since, 42, "unmined_since must survive roundtrip");
+        });
+
+        restored.with_entry(&k_mined, slot_mined, |e| {
+            assert_eq!(e.block_id, 500, "inline block tuple must survive roundtrip");
+            assert_eq!(e.block_height, 20);
+            assert_eq!(e.subtree_idx, 3);
+            assert_eq!(
+                e.unmined_since, 0,
+                "mined-on-longest-chain clears unmined_since"
+            );
+        });
+
+        restored.with_entry(&k_overflow, slot_overflow, |e| {
+            assert_eq!(e.block_id, 600, "inline tuple keeps the first block");
+            assert_ne!(
+                e.flags & MINED_HAS_OVERFLOW,
+                0,
+                "overflow flag must survive roundtrip"
+            );
+        });
+        {
+            let sh = restored.shards[restored.shard_for(&k_overflow)].lock();
+            let overflow = sh
+                .overflow
+                .get(&slot_overflow)
+                .expect("overflow entry must survive roundtrip");
+            assert_eq!(overflow.len(), 1);
+            let be = overflow[0];
+            assert_eq!({ be.block_id }, 601);
+            assert_eq!({ be.block_height }, 31);
+            assert_eq!({ be.subtree_idx }, 2);
+        }
+
+        assert!(
+            restored
+                .with_entry(&k_freed, slot_freed, |e| e.block_id)
+                .is_none(),
+            "freed slot must restore as absent"
+        );
+
+        // Pair each slot with its OWN shard index — different keys can land
+        // in different shards yet still get the same raw (shard-local) slot
+        // number, so comparing bare slot numbers across shards would produce
+        // false collisions.
+        let unmined_pair = (restored.shard_for(&k_unmined), slot_unmined);
+        let mined_pair = (restored.shard_for(&k_mined), slot_mined);
+        let overflow_pair = (restored.shard_for(&k_overflow), slot_overflow);
+        let freed_pair = (restored.shard_for(&k_freed), slot_freed);
+
+        let mut out = Vec::new();
+        restored.collect_unmined_below(1_000, &mut out);
+        assert!(
+            out.contains(&unmined_pair),
+            "unmined slot must still appear in the unmined range query"
+        );
+        assert!(
+            !out.contains(&mined_pair),
+            "mined slot must not appear as unmined"
+        );
+        assert!(
+            !out.contains(&overflow_pair),
+            "overflow slot is mined on the longest chain, must not appear as unmined"
+        );
+        assert!(
+            !out.contains(&freed_pair),
+            "freed slot must not appear as unmined"
+        );
+    }
+
+    #[test]
+    fn deserialize_wrong_version_fails_closed() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [1u8; 32] };
+        idx.alloc_created(&k, 10);
+
+        let mut buf = Vec::new();
+        idx.serialize(&mut buf);
+        let original_version = buf[0];
+        buf[0] = original_version.wrapping_add(1);
+
+        let err = ShardedMinedIndex::deserialize(&buf, 16)
+            .err()
+            .expect("a flipped version byte must fail closed");
+        match err {
+            MinedIndexError::VersionMismatch(got, want) => {
+                assert_eq!(got, original_version.wrapping_add(1));
+                assert_eq!(want, MINED_SNAPSHOT_VERSION);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deserialize_truncated_fails_closed() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [1u8; 32] };
+        idx.alloc_created(&k, 10);
+
+        let mut buf = Vec::new();
+        idx.serialize(&mut buf);
+        let truncated = &buf[..buf.len() / 2];
+
+        let err = ShardedMinedIndex::deserialize(truncated, 16)
+            .err()
+            .expect("truncated snapshot bytes must fail closed");
+        assert!(
+            matches!(err, MinedIndexError::Corrupt),
+            "expected Corrupt, got {err:?}"
+        );
+    }
 
     fn entry(block_id: u32) -> MinedEntry {
         MinedEntry {
