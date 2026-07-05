@@ -129,6 +129,10 @@ sources (device record + MinedIndex); the merge is a RAM lookup with no extra ha
   current_block_height, block_height_retention, unset: bool, txids: Vec<TxKey> }`.
   Shared fields once + `[count][txids]`.
 - The current per-tx `RedoOp::SetMined` is **removed** (greenfield).
+- **Per-store split (device_split):** the redo is per-store, so a batch whose owned
+  txids span multiple stores is split into one `SetMinedBatch` per store's redo log
+  (shared fields repeated per store — cheap). The client-supplied batch is already
+  per-node (the client routes per shard); this splits it per store *within* the node.
 - **Replay:** iterate `txids`, apply into the MinedIndex. Idempotent — re-applying an
   already-mined tx is a no-op (matches today's SetMined replay idempotency).
 - **Recovery order:** MinedIndex snapshot (checkpoint baseline) + replay of
@@ -153,11 +157,42 @@ costs the spend path one RAM bit-write on its last-spend. **Flagged for review:*
 coupling spend → MinedIndex is unwanted, the fallback is one device read per
 setMined (spent_utxos) — still eliminates the write, but not the read.
 
-## 11. Batch replication
+## 11. Cluster — replication, sharding & re-sharding
 
-- New `ReplicaOp::SetMinedBatch { shared, txids }` — one op per replica per RPC.
+### 11.1 Batch replication
+- New `ReplicaOp::SetMinedBatch { shared, txids }`.
+- **Split per target node.** `build_replication_targets` groups ops into
+  `by_addr: HashMap<SocketAddr, Vec<ReplicaOp>>`. A setMined batch's txids are routed
+  to their replica targets and each target receives **one** `SetMinedBatch` carrying
+  only *its* owned subset (shared block fields repeated per target — cheap), instead of
+  N per-key `SetMined` ops. The per-tx `ReplicaOp::SetMined` path is **removed**.
 - Replica apply: iterate `txids` into its MinedIndex. Idempotent.
-- The per-tx `ReplicaOp::SetMined` path is **removed**.
+
+### 11.2 A batch that spans shards / arrives at a stale owner
+Unchanged from today, and **batching does not coarsen it**:
+- The client splits a setMined batch per shard by its shard-table view and sends each
+  owning node its sub-batch (all txs still share the block fields — the batch-native
+  path fits this exactly).
+- The server checks ownership **per item** (`check_shard_ownership`). Items this node no
+  longer owns (node-down / re-shard raced the client's view) → **per-item REDIRECT**
+  with the shard-table version; the client retries just those to the new owner. The
+  `SetMinedBatch` redo/replica ops are built from `valid_items` (owned) **only**, so a
+  partially-mis-routed batch is partially applied + partially redirected — same
+  granularity as per-tx today.
+- During a shard's migration cutover it is **fenced**; per-txid stripe locks + the fence
+  prevent a setMined applying to a txid mid-transfer. Batching holds the same per-txid
+  locks, so this is unaffected.
+
+### 11.3 Migrating mined-state (the design addition)
+Migration currently reconstructs mined-state by reading `meta.block_entries_inline`
+**from the device record** (coordinator.rs:5811) and shipping `ReplicaOp::SetMined` per
+entry. Under pure store-auth (D1) the device no longer holds it, so the migration source
+**changes to the MinedIndex**: for each migrating txid, read its MinedIndex slot
+(block-entries + `unmined_since` + `all_spent`) and ship it in a `SetMinedBatch` (grouped
+with the shard's `Create`/`Spend` baseline ops). The receiving node applies it into its
+own MinedIndex, so the migrated shard's mined-state is reconstructed store-to-store,
+never via the device. This mirrors the replay-target change in §9 and must be covered by
+the master↔replica convergence tests (§14).
 
 ## 12. Durability & recovery
 
@@ -192,7 +227,11 @@ setMined (spent_utxos) — still eliminates the write, but not the read.
   batch recovery.
 - **Snapshot:** MinedIndex snapshot/restore round-trip; recovery (snapshot + redo
   replay) reproduces live state exactly (the whole durability contract under D1).
-- **Cluster:** `SetMinedBatch` replication apply; master/replica MinedIndex convergence.
+- **Cluster:** `SetMinedBatch` replication apply; master/replica MinedIndex convergence;
+  a partially-mis-routed batch applies its owned subset + redirects the rest per-item
+  (batching preserves per-tx redirect granularity); **migration reconstructs a shard's
+  mined-state store-to-store** (source = MinedIndex, not the device record) and the
+  receiver converges.
 - **DAH:** mined(store) + spent(device/`all_spent` bit) merge produces the same
   delete-eligibility as today, incl. both trigger orders (spend-then-mine, mine-then-spend).
 - **Perf:** dispatch-level setMined burst before/after (target ~6–10× ns/tx; assert
@@ -218,7 +257,8 @@ setMined (spent_utxos) — still eliminates the write, but not the read.
 2. Primary entry `mined_slot` + slot lifecycle (create/delete).
 3. setMined rewrite onto the MinedIndex (hot path, §7) + `all_spent` on spend (§10).
 4. Batch WAL (`SetMinedBatch`) + replay + snapshot/recovery.
-5. Batch replication (`SetMinedBatch`).
+5. Batch replication (`SetMinedBatch`) — per-target split, partial-redirect, and
+   **migration shipping mined-state from the MinedIndex** (§11).
 6. Reroute readers (GET, delete_eval, unmined range queries); remove the unmined
    secondary index and the on-device block-entry region.
 7. Perf validation + adversarial recovery/consensus review.
