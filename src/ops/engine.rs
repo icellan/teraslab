@@ -5530,6 +5530,17 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
 
+        // This slot just went SPENT -> PRUNED, decrementing `spent_utxos`
+        // above. A pruned utxo is not a spent one, so a record that was
+        // all-spent (spent_utxos == utxo_count) can no longer be — mirrors
+        // `unspend`'s idiom of clearing unconditionally on any move away
+        // from all-spent, rather than only when it previously WAS all-spent.
+        // RAM-only; no-op if the entry has no live mined-index slot.
+        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            self.mined_index()
+                .set_all_spent(parent_key, entry.mined_slot, false);
+        }
+
         // BUG-3: re-evaluate `deleteAtHeight` after the prune. Pruning a
         // slot decrements `spent_utxos`, so a record that was previously
         // all-spent (and therefore had a DAH set and a DAH-index entry) is
@@ -16569,6 +16580,135 @@ mod tests {
         assert!(
             !is_all_spent(),
             "unspend must clear all_spent once the utxo is unspent again"
+        );
+    }
+
+    /// Task 8 (review fix): `prune_slot_if_spent_by_child` moves a slot from
+    /// SPENT to PRUNED and decrements `spent_utxos` — the same direction of
+    /// travel away from all-spent as `unspend`. Before this fix the prune
+    /// path decremented `spent_utxos` without touching the mined-index bit,
+    /// leaving a record flagged all-spent even though it no longer has every
+    /// utxo spent (one is pruned instead). This is a live production path:
+    /// called from the delete parent-prune fan-out and the replica
+    /// `PruneSlotIfSpentBy` apply path.
+    #[test]
+    fn prune_last_spent_slot_clears_all_spent() {
+        let engine = create_engine_inner();
+        let (hashes, req) = make_create_req(73, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "create must allocate a mined-index slot"
+        );
+
+        let mut spending_data = [0u8; 36];
+        spending_data[0] = 0xD0;
+        spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hashes[0],
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend of the only utxo succeeds");
+
+        let is_all_spent = || {
+            engine
+                .mined_index()
+                .with_entry(&key, entry.mined_slot, |e| {
+                    e.flags & crate::index::mined_index::MINED_ALL_SPENT != 0
+                })
+                .expect("mined-index slot must still be live")
+        };
+        assert!(
+            is_all_spent(),
+            "fully spending the only utxo must set all_spent"
+        );
+
+        let mut child_txid = [0u8; 32];
+        child_txid.copy_from_slice(&spending_data[..32]);
+        let applied = engine
+            .prune_slot_if_spent_by_child(&key, 0, child_txid)
+            .expect("prune succeeds");
+        assert!(applied, "prune of the matching spent slot must apply");
+
+        assert!(
+            !is_all_spent(),
+            "pruning the only spent slot must clear all_spent: the record \
+             no longer has every utxo spent (one is pruned instead)"
+        );
+    }
+
+    /// Task 8 (review fix): the no-op branch of `unspend` — caller's
+    /// `spending_data` doesn't match what's stored, so `caller_owns_spend`
+    /// is false and the slot/counter/generation are all left untouched —
+    /// must also leave `MINED_ALL_SPENT` untouched. Guards the
+    /// `if caller_owns_spend { set_all_spent(false) }` gate against a
+    /// regression that clears the bit unconditionally on every unspend call.
+    #[test]
+    fn idempotent_unspend_leaves_all_spent_untouched() {
+        let engine = create_engine_inner();
+        let (hashes, req) = make_create_req(74, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+        let entry = engine.lookup(&key).expect("entry must be registered");
+
+        let mut spending_data = [0u8; 36];
+        spending_data[0] = 0xE0;
+        spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hashes[0],
+                spending_data,
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend of the only utxo succeeds");
+
+        let is_all_spent = || {
+            engine
+                .mined_index()
+                .with_entry(&key, entry.mined_slot, |e| {
+                    e.flags & crate::index::mined_index::MINED_ALL_SPENT != 0
+                })
+                .expect("mined-index slot must still be live")
+        };
+        assert!(
+            is_all_spent(),
+            "fully spending the only utxo must set all_spent"
+        );
+
+        // Wrong spending_data: `caller_owns_spend` is false, so this is the
+        // no-op branch — the slot, counter, and generation are all left
+        // untouched by design.
+        let mut wrong_spending_data = spending_data;
+        wrong_spending_data[0] = 0xFF;
+        engine
+            .unspend(&crate::ops::unspend::UnspendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hashes[0],
+                spending_data: wrong_spending_data,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("no-op unspend still returns Ok");
+
+        assert!(
+            is_all_spent(),
+            "a no-op unspend (wrong spending_data) must not clear all_spent"
         );
     }
 
