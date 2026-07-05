@@ -21303,20 +21303,23 @@ mod tests {
                 .engine
                 .read_metadata(&TxKey { txid })
                 .expect("record present");
+            // Copy `flags` out of the packed struct before calling `.bits()`
+            // (a method call would take a reference to the packed field).
+            let flags = meta.flags;
             vec![
-                u64::from(u32::from({ meta.tx_version })),
-                u64::from({ meta.locktime }),
-                { meta.fee },
-                u64::from({ meta.size_in_bytes }),
-                u64::from({ meta.extended_size }),
-                u64::from({ meta.spending_height }),
-                u64::from({ meta.utxo_count }),
-                u64::from({ meta.record_size }),
-                u64::from({ meta.flags }.bits()),
-                u64::from({ meta.generation }),
-                u64::from({ meta.unmined_since }),
-                u64::from({ meta.delete_at_height }),
-                u64::from({ meta.preserve_until }),
+                u64::from(meta.tx_version),
+                u64::from(meta.locktime),
+                meta.fee,
+                meta.size_in_bytes,
+                meta.extended_size,
+                u64::from(meta.spending_height),
+                u64::from(meta.utxo_count),
+                u64::from(meta.record_size),
+                u64::from(flags.bits()),
+                u64::from(meta.generation),
+                u64::from(meta.unmined_since),
+                u64::from(meta.delete_at_height),
+                u64::from(meta.preserve_until),
             ]
         };
 
