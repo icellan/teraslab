@@ -2,25 +2,69 @@
 
 ## Commit Model
 
-TeraSlab uses a **WAL-first** commit model with a **mandatory redo log**.
+TeraSlab uses a **WAL-first** commit model with a **mandatory redo log**. The
+redo log is the authoritative source of truth for the post-checkpoint window;
+the store is always internally consistent — an acknowledged mutation either
+appears in the redo log (and will survive recovery) or does not. What varies
+between deployment modes is *when* that redo entry reaches durable storage.
 
-> **History note:** an earlier draft of this document (and a comment block in
-> `src/server/dispatch.rs`) described an "engine-first" model where O_DIRECT
-> engine writes were the durability point and the redo log was a metadata
-> consistency journal that ran *after* the engine write. That ordering does
-> not match the implemented code and is unsafe under crashes that hit
-> mid-engine-write: the engine can have a partial / torn write on the device
-> while the redo log has no record of the operation, so recovery cannot
-> reconstruct the intended post-state. This document supersedes that earlier
-> drift and is the authoritative description of the durability contract.
->
-> The current document describes the actual implementation. Operators
-> integrating with TeraSlab MUST treat WAL-first ordering as part of the
-> release contract.
+### Default: Buffered Redo Durability
+
+**The shipped default is `redo_buffered = true`** (`src/config.rs`). In this
+mode, a mutation is acknowledged after its redo entry is appended to the
+in-memory redo buffer. A background flusher calls `fsync` on the redo log
+every `redo_flush_interval_ms` (default **5 ms**). This means:
+
+- On an **unclean shutdown**, acknowledged mutations written in the last flush
+  interval (up to 5 ms by default) may be lost. The store will never expose
+  a partially-applied mutation — the redo log is the source of truth, and a
+  lost tail entry's mutation simply vanishes atomically. There is no
+  corruption: recovered state is consistent but may lag acknowledged state by
+  at most one flush window.
+- The store **remains internally consistent** after any crash. The B2 fix
+  ensures lost tail entries never cause silent freelist reuse — the mutation
+  is absent, not corrupted.
+- Operators who need to reduce the loss window can lower
+  `redo_flush_interval_ms` at the cost of more frequent fsyncs.
+
+This is the appropriate default for BSV Teranode deployments where replication
+provides the cluster-level durability guarantee: the replica holds a copy of
+every acked mutation, so a single-node crash within the flush window does not
+lose data from the cluster's perspective.
+
+### Strict Mode: fsync-Before-Ack
+
+Set `redo_buffered = false` to enable **strict durability**: the redo entry is
+fsynced to disk before the mutation is applied to the engine and before the
+client receives a success response. An acknowledged mutation is durable on the
+local device at the moment the ack is sent.
+
+**Tradeoff:** strict mode disables the log-structured `segment` engine (which
+requires buffered durability — see `src/config.rs` for the validation check).
+You must also set `storage.engine = "in_place"` for strict mode. Throughput
+drops significantly because every mutation blocks on an `fsync`.
+
+```toml
+redo_buffered = false
+
+[storage]
+engine = "in_place"
+```
+
+> **History note:** an earlier draft of this document described an
+> "engine-first" model where O_DIRECT engine writes were the durability point
+> and the redo log was a metadata consistency journal that ran *after* the
+> engine write. That ordering does not match the implemented code and is unsafe
+> under crashes that hit mid-engine-write. This document is the authoritative
+> description. Operators integrating with TeraSlab MUST treat the WAL-first
+> ordering (redo append before engine write) as part of the release contract.
+> The durability *window* for the redo append (buffered vs. strict) is a
+> configuration choice described above.
 
 ### Write Path Ordering
 
-For every acknowledged mutation:
+The WAL-first ordering is invariant across both modes — what differs is only
+whether the redo append is fsynced before or after the ack:
 
 1. **Validate under lock** — parse the request, check shard ownership,
    acquire the per-transaction stripe lock. Multi-spend additionally
@@ -30,9 +74,11 @@ For every acknowledged mutation:
 2. **Pre-allocate** (creates only) — reserve device space via the
    allocator. The allocator is itself WAL-journalled
    (`RedoOp::AllocateRegion`), so allocations survive crashes.
-3. **Append + fsync the redo entry** — `RedoLog::append` + `RedoLog::flush`
-   together produce a durable WAL record carrying every byte recovery needs
-   to reconstruct the post-mutation state. Concretely:
+3. **Append the redo entry** — `RedoLog::append` appends the redo record to
+   the in-memory buffer. In strict mode (`redo_buffered = false`),
+   `RedoLog::flush` is called immediately and blocks until the entry is on
+   durable storage. In buffered mode (default), flush is deferred to the
+   background flusher. Concretely:
    * `RedoOp::CreateV2` carries the full record bytes (metadata header +
      UTXO slots + cold data) plus the `is_conflicting` flag and
      `parent_txids` list.
@@ -42,14 +88,14 @@ For every acknowledged mutation:
      metadata mutation.
    This step is **mandatory**: if the redo log open / create fails at
    startup the binary refuses to serve (no in-memory fallback). If the
-   redo flush fails mid-request, the client request fails with an
-   internal error and no engine mutation runs.
+   redo flush fails mid-request (strict mode), the client request fails with
+   an internal error and no engine mutation runs.
 4. **Apply to the engine** — write UTXO slots and/or metadata to the
    block device via `pwrite_all_at`. On `DirectDevice` (production), the
    write is durable on return because the device is opened with
    `O_DIRECT`, bypassing the OS page cache. The internal `pwrite_all_at`
-   loop treats short writes as fatal corruption (gap #4) so a partial
-   apply cannot silently land between the WAL fsync and the engine write.
+   loop treats short writes as fatal corruption so a partial apply cannot
+   silently land.
 5. **Replicate** — fan out the mutation to replicas with the durable
    sequence numbers assigned in step 3. The current ack policy is
    best-effort: replication failures may degrade durability for the
@@ -62,12 +108,20 @@ For every acknowledged mutation:
 
 A client success response guarantees:
 
-- The mutation is recorded in the redo log and fsynced to disk.
-- The mutation is durable on the local block device (engine writes via
-  `O_DIRECT`).
+- The mutation is recorded in the redo log. In **buffered mode** (default),
+  the redo entry will reach durable storage within one flush interval (default
+  ≤ 5 ms). In **strict mode** (`redo_buffered = false`), the entry is fsynced
+  before the ack is sent.
+- The mutation is applied to the engine (O_DIRECT write, durable if the redo
+  entry is durable).
 - The mutation was sent to all configured replicas. Replica failures may
   surface as a degraded-durability status byte but do not roll back the
   local commit.
+
+In buffered mode, an acknowledged mutation may be lost on unclean shutdown if
+the crash occurs within the last flush window. The store remains consistent —
+the lost mutation is absent, not corrupted. Replication provides the cluster
+durability guarantee for multi-node deployments.
 
 ### Crash Recovery
 
@@ -98,12 +152,13 @@ matches. Replay can therefore run multiple times without divergence
 
 | Failure point | Outcome |
 |---------------|---------|
-| Crash before redo fsync | No durable record. The mutation never happened from the perspective of every observer (client, replica, recovery). |
+| **Buffered mode** — crash before background fsync (within last flush window) | The redo entry is in the OS page cache but not yet on disk. The mutation is lost; the store recovers to consistent pre-mutation state. No corruption. Replication may still have a copy. |
+| **Strict mode** — crash before redo fsync | No durable record. The mutation never happened from the perspective of every observer (client, replica, recovery). |
 | Crash after redo fsync, before engine write | Recovery replays the entry. `CreateV2` reconstructs the record, spend/unspend write the correct counter, the slot transition is idempotently re-applied. |
 | Crash after engine write, before replication | Local state is fully consistent. The replica is behind by the unsent batch and catches up via `RedoLog::read_from_sequence` on reconnect. |
 | Crash after replication ACK, before intent clear | The persistent `ReplicationIntentTracker` carries the pending range across restart. The next startup `commit`s the range idempotently after reconciling with replicas. |
 | Crash after intent clear, before client response | Client sees timeout / disconnect. The mutation is durable everywhere; client retry is idempotent because all redo entries are idempotent. |
-| Redo log full | `RedoLog::append` returns `LogFull`, the dispatcher fails the client request with internal error, no engine mutation runs. The operator must enable / accelerate checkpoints (gap #3 — finite redo log is a separate readiness issue). |
+| Redo log full | `RedoLog::append` returns `LogFull`, the dispatcher fails the client request with internal error, no engine mutation runs. The operator must enable / accelerate checkpoints. |
 | Redo log open / create failure at startup | Fatal — startup exits with an operator-facing error message naming the path and underlying device error. There is **no** in-memory fallback in production code paths. |
 
 ### Design Decisions
@@ -117,10 +172,12 @@ matches. Replay can therefore run multiple times without divergence
    etc.). WAL-first ordering puts the durable record on disk before the
    torn-bytes window opens.
 
-2. **Mandatory redo.** Redo log open / create failure is fatal at startup
-   (gap #2 part 1). Redo flush failure mid-request fails the client. There
-   is no in-memory fallback because the resulting "ack" would be a lie —
-   bytes in volatile memory disappear at shutdown.
+2. **Mandatory redo.** Redo log open / create failure is fatal at startup.
+   In strict mode (`redo_buffered = false`), a redo flush failure mid-request
+   fails the client request before any engine mutation runs. In buffered mode
+   (default), the client request completes after the in-memory append; a
+   background flush error is surfaced via server health metrics. There is no
+   silent "skip redo" path — the redo log is always written before the engine.
 
 3. **Full-payload redo entries.** Gap #2 parts 2 / 4 introduced
    `RedoOp::CreateV2` which captures the full record bytes plus the

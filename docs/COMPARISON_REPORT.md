@@ -7,7 +7,7 @@
 | Storage model | General-purpose key-value | Purpose-built for UTXO workload |
 | Record layout | Variable-size bins | Fixed-size metadata + pre-allocated UTXO slots |
 | Index | In-memory hash (sprigs) | mmap'd hash table with hugepage support |
-| Write path | Log-structured (requires defrag) | Direct-placement with freelist (no defrag) |
+| Write path | Log-structured (requires defrag) | Log-structured segment with background compaction/defrag (default); best-fit freelist with in-place updates available via `engine = "in_place"` |
 | UTXO logic | Lua UDF on server | Native Rust implementation |
 | Spend I/O | Read full record → Lua → write full record | Read slot (73B incl. 4-byte CRC) → validate → write 73B slot + 320B metadata |
 | Replication | Built-in (complex) | Operation-based, purpose-built |
@@ -50,7 +50,13 @@ continuous defragmentation. Under sustained write load, defrag competes
 with application I/O:
 
 - **Original**: Defrag death spiral at high utilization (>60%)
-- **TeraSlab**: Freelist-based allocation, no defrag needed, stable performance at 80%+ utilization
+- **TeraSlab (segment engine, default)**: Log-structured with pressure-aware
+  background compaction. Defrag runs during checkpoint windows using a
+  configurable pressure threshold (`[storage.defrag]`), avoiding competition
+  with foreground I/O under normal load.
+- **TeraSlab (in_place engine)**: Freelist-based allocation with in-place
+  updates; no defrag required. Trade-off: requires strict redo durability
+  (`redo_buffered = false`) and lower throughput than segment.
 
 ## Running Comparison Benchmarks
 
