@@ -19,6 +19,8 @@
 //! simpler than a sparse writer. Restore pwrites each range back at its
 //! `device_offset`.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -123,10 +125,52 @@ impl TailCollector {
     }
 }
 
-/// A copied range plus its bytes, buffered for image assembly.
+/// A copied range plus its bytes, buffered in RAM for later image assembly.
+/// Used ONLY for the bounded final-stall residual (copied under the visibility
+/// guard, where no backup-dir I/O may happen); the bulk copy streams straight
+/// to the image file and never buffers.
 struct RangeBytes {
     entry: RangeEntry,
     bytes: Vec<u8>,
+}
+
+/// Where [`copy_segments`] deposits each copied segment. Two implementations:
+/// [`StreamingSink`] writes bytes straight to the store's image file (so the
+/// whole live-data set is never held in RAM — the OOM-safe bulk path), and
+/// [`BufferSink`] holds them in RAM (the bounded final-stall residual, which
+/// must not touch the backup dir while the visibility guard is held).
+trait SegmentSink {
+    fn accept(&mut self, entry: RangeEntry, bytes: Vec<u8>) -> Result<(), BackupError>;
+}
+
+/// Streams each copied segment to the image file, folds its bytes into the
+/// running whole-image hash, and records the range (in FILE order).
+struct StreamingSink<'a, W: Write> {
+    file: &'a mut W,
+    whole: &'a mut Sha256,
+    ranges: &'a mut Vec<RangeEntry>,
+}
+
+impl<W: Write> SegmentSink for StreamingSink<'_, W> {
+    fn accept(&mut self, entry: RangeEntry, bytes: Vec<u8>) -> Result<(), BackupError> {
+        self.file.write_all(&bytes).map_err(BackupError::Io)?;
+        self.whole.update(&bytes);
+        self.ranges.push(entry);
+        Ok(())
+    }
+}
+
+/// Buffers each copied segment in RAM for the caller to flush after the
+/// visibility guard is released. Bounded by `stall_copy_max_segments`.
+struct BufferSink<'a> {
+    out: &'a mut Vec<RangeBytes>,
+}
+
+impl SegmentSink for BufferSink<'_> {
+    fn accept(&mut self, entry: RangeEntry, bytes: Vec<u8>) -> Result<(), BackupError> {
+        self.out.push(RangeBytes { entry, bytes });
+        Ok(())
+    }
 }
 
 /// Run a full online backup into `target_dir`. See the module docs for the flow.
@@ -227,19 +271,40 @@ fn run_backup_impl(
         .snapshot_index(&target_dir.join("teraslab-index.snap"))
         .map_err(|e| BackupError::Index(e.to_string()))?;
 
-    // 5. Copy sealed + growing segments.
+    // 5. Copy sealed + growing segments — STREAMED straight to each store's
+    //    image file so the whole live-data set is never held in RAM (only one
+    //    128 KiB copy chunk is, inside `copy_range`). The image is laid out in
+    //    copy order: streamed segments (ascending), then the bounded final-stall
+    //    residual, then the header (device offset 0) last; the manifest range
+    //    list is kept in that same file order so restore reads it with a plain
+    //    cumulative cursor.
     set_state(progress, BackupState::Copying);
     let mut copied_through: Vec<Option<u32>> = vec![None; store_count];
-    let mut store_ranges: Vec<Vec<RangeBytes>> = (0..store_count).map(|_| Vec::new()).collect();
+    let mut store_ranges: Vec<Vec<RangeEntry>> = (0..store_count).map(|_| Vec::new()).collect();
     let mut throttles: Vec<TokenBucket> = (0..store_count)
         .map(|_| TokenBucket::new(params.throttle_bytes_per_sec))
         .collect();
     let mut bytes_copied = 0u64;
     let mut segments_copied = 0u32;
 
+    // Per-store: the open image file (buffered) and its running whole-image hash.
+    let mut image_files: Vec<BufWriter<File>> = Vec::with_capacity(store_count);
+    let mut whole_hashers: Vec<Sha256> = Vec::with_capacity(store_count);
+    for s in 0..store_count as u8 {
+        let path = target_dir.join(format!("store.{s}.img"));
+        let f = File::create(&path).map_err(BackupError::Io)?;
+        image_files.push(BufWriter::new(f));
+        whole_hashers.push(Sha256::new());
+    }
+
     for s in 0..store_count as u8 {
         let view = engine.backup_view_for(s).ok_or_else(|| not_segment(s))?;
         let end = view.open_segment;
+        let mut sink = StreamingSink {
+            file: &mut image_files[s as usize],
+            whole: &mut whole_hashers[s as usize],
+            ranges: &mut store_ranges[s as usize],
+        };
         copy_segments(
             engine,
             s,
@@ -249,7 +314,7 @@ fn run_backup_impl(
             align,
             params.abort_headroom_segments,
             &mut throttles[s as usize],
-            &mut store_ranges[s as usize],
+            &mut sink,
             cancel,
             progress,
             &mut bytes_copied,
@@ -272,6 +337,11 @@ fn run_backup_impl(
             if round >= params.max_catchup_rounds {
                 return Err(BackupError::CatchupExceeded { rounds: round });
             }
+            let mut sink = StreamingSink {
+                file: &mut image_files[s as usize],
+                whole: &mut whole_hashers[s as usize],
+                ranges: &mut store_ranges[s as usize],
+            };
             copy_segments(
                 engine,
                 s,
@@ -281,7 +351,7 @@ fn run_backup_impl(
                 align,
                 params.abort_headroom_segments,
                 &mut throttles[s as usize],
-                &mut store_ranges[s as usize],
+                &mut sink,
                 cancel,
                 progress,
                 &mut bytes_copied,
@@ -302,9 +372,13 @@ fn run_backup_impl(
     }
 
     // 7. Final stall: sample T, copy the last segments, capture headers, drain
-    //    the tail — all under the visibility guard, no backup-dir I/O.
+    //    the tail — all under the visibility guard, no backup-dir I/O. The
+    //    residual segments are buffered in RAM here (bounded by
+    //    `stall_copy_max_segments`) and flushed to the image file AFTER the guard
+    //    releases; nothing writes to the backup dir while the guard is held.
     set_state(progress, BackupState::Finalizing);
     let mut headers: Vec<Vec<u8>> = Vec::with_capacity(store_count);
+    let mut residuals: Vec<Vec<RangeBytes>> = (0..store_count).map(|_| Vec::new()).collect();
     // The residual copy runs UNDER the visibility guard (all mutations blocked),
     // so it must never throttle-sleep and stall the engine. It is bounded by
     // `stall_copy_max_segments`, so an unthrottled read here is brief by design.
@@ -319,6 +393,9 @@ fn run_backup_impl(
             let view = engine.backup_view_for(s).ok_or_else(|| not_segment(s))?;
             let base = copied_through[s as usize].unwrap_or(0);
             if view.open_segment > base {
+                let mut sink = BufferSink {
+                    out: &mut residuals[s as usize],
+                };
                 copy_segments(
                     engine,
                     s,
@@ -328,7 +405,7 @@ fn run_backup_impl(
                     align,
                     params.abort_headroom_segments,
                     &mut unthrottled,
-                    &mut store_ranges[s as usize],
+                    &mut sink,
                     cancel,
                     progress,
                     &mut bytes_copied,
@@ -353,35 +430,43 @@ fn run_backup_impl(
         p.tail_end = Some(tail_end);
     }
 
-    // 8. Assemble per-store images + fabricated redo files (outside the guard).
+    // 8. Finish per-store images + fabricated redo files (outside the guard).
+    //    The streamed segments are already on disk; append the bounded residual
+    //    and the header (device offset 0, written LAST in the file), then flush
+    //    and fsync. The manifest range list stays in file order so restore reads
+    //    it with a plain cumulative cursor.
     let mut stores: Vec<StoreManifest> = Vec::with_capacity(store_count);
     for s in 0..store_count as u8 {
         let view = engine.backup_view_for(s).ok_or_else(|| not_segment(s))?;
+        let file = &mut image_files[s as usize];
+        let whole = &mut whole_hashers[s as usize];
+        let ranges = &mut store_ranges[s as usize];
 
-        // Header range at offset 0, then the copied segments; sort by offset so
-        // the image is [header, segments ascending].
-        let mut slots = std::mem::take(&mut store_ranges[s as usize]);
+        // Append the (bounded) final-stall residual segments buffered under the
+        // guard.
+        for rb in std::mem::take(&mut residuals[s as usize]) {
+            file.write_all(&rb.bytes).map_err(BackupError::Io)?;
+            whole.update(&rb.bytes);
+            ranges.push(rb.entry);
+        }
+        // Append the in-memory allocator header last; restore pwrites it to
+        // device offset 0 regardless of its position in the image.
         let header_bytes = std::mem::take(&mut headers[s as usize]);
-        let header_entry = RangeEntry {
+        file.write_all(&header_bytes).map_err(BackupError::Io)?;
+        whole.update(&header_bytes);
+        ranges.push(RangeEntry {
             device_offset: 0,
             len: header_bytes.len() as u64,
             sha256: sha256_hex(&header_bytes),
-        };
-        slots.push(RangeBytes {
-            entry: header_entry,
-            bytes: header_bytes,
         });
-        slots.sort_by_key(|r| r.entry.device_offset);
 
-        let mut image: Vec<u8> = Vec::new();
-        let mut ranges: Vec<RangeEntry> = Vec::with_capacity(slots.len());
-        for slot in &slots {
-            image.extend_from_slice(&slot.bytes);
-            ranges.push(slot.entry.clone());
-        }
+        // Flush the buffered writer to the file and fsync it durable.
+        file.flush().map_err(BackupError::Io)?;
+        file.get_ref().sync_all().map_err(BackupError::Io)?;
+
         let image_file = format!("store.{s}.img");
-        std::fs::write(target_dir.join(&image_file), &image).map_err(BackupError::Io)?;
-        let image_sha256 = sha256_hex(&image);
+        let image_sha256 = copier::hex_digest(whole.clone());
+        let ranges = std::mem::take(ranges);
 
         let region =
             RedoLog::build_backup_redo_region(align, fence, tail_end, &tail_frames[s as usize]);
@@ -459,7 +544,7 @@ fn copy_segments(
     align: usize,
     abort_headroom: u32,
     throttle: &mut TokenBucket,
-    out: &mut Vec<RangeBytes>,
+    sink: &mut impl SegmentSink,
     cancel: &AtomicBool,
     progress: &Mutex<BackupProgress>,
     bytes_copied: &mut u64,
@@ -507,7 +592,7 @@ fn copy_segments(
             p.bytes_copied = *bytes_copied;
             p.segments_copied = *segments_copied;
         }
-        out.push(RangeBytes { entry, bytes });
+        sink.accept(entry, bytes)?;
     }
     Ok(())
 }
@@ -760,14 +845,43 @@ mod tests {
             "expected at least header + one segment range, got {}",
             read.stores[0].ranges.len()
         );
-        // First range is the header at device offset 0.
-        assert_eq!(read.stores[0].ranges[0].device_offset, 0);
         assert_eq!(progress.lock().state, BackupState::Done);
-        // Every segment referenced in the image must be present in the image
-        // file: image length equals the sum of range lengths.
-        let image = std::fs::read(target.join(&read.stores[0].image_file)).unwrap();
-        let total: u64 = read.stores[0].ranges.iter().map(|r| r.len).sum();
-        assert_eq!(image.len() as u64, total);
+
+        let st = &read.stores[0];
+        // Streaming layout: the header (device offset 0) is written LAST; every
+        // earlier range is a segment (device offset > 0).
+        assert_eq!(
+            st.ranges.last().unwrap().device_offset,
+            0,
+            "the allocator header is the final range (streamed segments first)"
+        );
+        assert!(
+            st.ranges[..st.ranges.len() - 1]
+                .iter()
+                .all(|r| r.device_offset > 0),
+            "all non-final ranges are segments at non-zero device offsets"
+        );
+
+        // The image file equals the concatenation of the ranges IN LIST ORDER —
+        // the invariant restore relies on (it reads the image with a plain
+        // cumulative cursor). Verify by slicing the file at cumulative offsets
+        // and matching each slice's SHA-256 to its manifest range.
+        let image = std::fs::read(target.join(&st.image_file)).unwrap();
+        let total: u64 = st.ranges.iter().map(|r| r.len).sum();
+        assert_eq!(image.len() as u64, total, "image length == sum of ranges");
+        let mut cursor = 0usize;
+        for r in &st.ranges {
+            let slice = &image[cursor..cursor + r.len as usize];
+            assert_eq!(
+                sha256_hex(slice),
+                r.sha256,
+                "range at file offset {cursor} (device {}) must match its manifest sha",
+                r.device_offset
+            );
+            cursor += r.len as usize;
+        }
+        // The whole-image hash covers the file in that same order.
+        assert_eq!(st.image_sha256, sha256_hex(&image));
         // The estimated total was populated at pre-flight.
         assert!(progress.lock().segments_total >= 1);
     }
