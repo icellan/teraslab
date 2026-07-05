@@ -1614,6 +1614,7 @@ mod tests {
     /// - `i % 2 == 0` → delete_at_height set (no preserve)
     /// - `i % 2 == 1` → preserve_until set (must set HAS_PRESERVE_UNTIL,
     ///   and the wire DAH must read back as 0)
+    ///
     /// Every record has a non-zero unmined_since and generation.
     fn setup_device_with_lifecycle_records(
         record_count: usize,
