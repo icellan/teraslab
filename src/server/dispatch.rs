@@ -8293,6 +8293,41 @@ fn decorate_get_item(
     match engine.read_metadata(&key) {
         Ok(meta) => {
             let mut data = Vec::new();
+            // R-045 (Codex F4): track whether any inner sub-read
+            // (slot / cold-data / conflicting-children / mined-state) failed.
+            // Pre-fix the failures were silently filled with
+            // zeros / length-0 / count-0, so storage corruption
+            // was indistinguishable from a clean read of an
+            // empty record. Now we surface inner failures as
+            // ERR_STORAGE_IO on the result item — clients can
+            // retry instead of trusting the synthesized bytes.
+            // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
+            //
+            // Declared up here (rather than after the per-field block below)
+            // because UNMINED_SINCE/BLOCK_ENTRY_COUNT now read the
+            // MinedIndex via `mined_state` and need to report a sub-read
+            // failure too.
+            let mut inner_read_failed = false;
+            // Read the authoritative mined-state (block entries +
+            // `unmined_since`) from the MinedIndex — not the device — ONCE,
+            // shared across every field below that needs it. Mirrors the
+            // `cold_result`-once pattern further down so a request asking
+            // for more than one of UNMINED_SINCE/BLOCK_ENTRY_COUNT/
+            // BLOCK_ENTRIES/BLOCK_ENTRIES_ALL doesn't re-lock the MinedIndex
+            // shard repeatedly. `None` when none of the four fields are
+            // requested. The MinedIndex is dual-written in lockstep with the
+            // device's block-entry region and `unmined_since` (see
+            // `apply_set_mined`/`apply_unset`), so this is byte-identical to
+            // the former device-backed reads for any live record.
+            let mined_state = if field_mask.has(FieldMask::UNMINED_SINCE)
+                || field_mask.has(FieldMask::BLOCK_ENTRY_COUNT)
+                || field_mask.has(FieldMask::BLOCK_ENTRIES)
+                || field_mask.has(FieldMask::BLOCK_ENTRIES_ALL)
+            {
+                Some(engine.mined_block_entries(&key))
+            } else {
+                None
+            };
             if field_mask.has(FieldMask::RAW_METADATA) {
                 // Raw debug mode: dump the full on-disk struct as-is.
                 let mut buf = vec![0u8; METADATA_SIZE];
@@ -8340,7 +8375,15 @@ fn decorate_get_item(
                     data.extend_from_slice(&{ meta.updated_at }.to_le_bytes());
                 }
                 if field_mask.has(FieldMask::UNMINED_SINCE) {
-                    data.extend_from_slice(&{ meta.unmined_since }.to_le_bytes());
+                    match mined_state.as_ref() {
+                        Some(Ok((_, unmined_since))) => {
+                            data.extend_from_slice(&unmined_since.to_le_bytes());
+                        }
+                        _ => {
+                            inner_read_failed = true;
+                            data.extend_from_slice(&0u32.to_le_bytes());
+                        }
+                    }
                 }
                 if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
                     data.extend_from_slice(&{ meta.delete_at_height }.to_le_bytes());
@@ -8362,19 +8405,15 @@ fn decorate_get_item(
                     data.push(meta.reassignment_count);
                 }
                 if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
-                    data.push(meta.block_entry_count);
+                    match mined_state.as_ref() {
+                        Some(Ok((entries, _))) => data.push(entries.len() as u8),
+                        _ => {
+                            inner_read_failed = true;
+                            data.push(0u8);
+                        }
+                    }
                 }
             }
-            // R-045 (Codex F4): track whether any inner sub-read
-            // (slot / cold-data / conflicting-children) failed.
-            // Pre-fix the failures were silently filled with
-            // zeros / length-0 / count-0, so storage corruption
-            // was indistinguishable from a clean read of an
-            // empty record. Now we surface inner failures as
-            // ERR_STORAGE_IO on the result item — clients can
-            // retry instead of trusting the synthesized bytes.
-            // (P3.10 / F-G5-017; pre-P3.10 the code was ERR_INTERNAL.)
-            let mut inner_read_failed = false;
             // F-IJ-001: track a missing external cold-data blob distinctly
             // from generic sub-read corruption. A record that exists but
             // whose blob is gone must surface ERR_BLOB_NOT_FOUND (17), not
@@ -8474,38 +8513,46 @@ fn decorate_get_item(
                 }
             }
             if field_mask.has(FieldMask::BLOCK_ENTRIES) {
-                let count = { meta.block_entry_count };
-                data.push(count);
-                let inline_count = count.min(3);
-                for i in 0..inline_count as usize {
-                    let be = { meta.block_entries_inline[i] };
-                    data.extend_from_slice(&{ be.block_id }.to_le_bytes());
-                    data.extend_from_slice(&{ be.block_height }.to_le_bytes());
-                    data.extend_from_slice(&{ be.subtree_idx }.to_le_bytes());
+                // The declared count is the record's TRUE block-entry count
+                // (inline + overflow) — only the entries actually shipped on
+                // the wire are capped at 3 (backward-compat with the pre-#30
+                // wire shape). See `BLOCK_ENTRIES_ALL` below for the uncapped
+                // form.
+                match mined_state.as_ref() {
+                    Some(Ok((entries, _))) => {
+                        data.push(entries.len() as u8);
+                        let inline_count = entries.len().min(3);
+                        for be in &entries[..inline_count] {
+                            data.extend_from_slice(&be.block_id.to_le_bytes());
+                            data.extend_from_slice(&be.block_height.to_le_bytes());
+                            data.extend_from_slice(&be.subtree_idx.to_le_bytes());
+                        }
+                    }
+                    _ => {
+                        inner_read_failed = true;
+                        data.push(0u8);
+                    }
                 }
             }
             if field_mask.has(FieldMask::BLOCK_ENTRIES_ALL) {
                 // Issue #30: emit the COMPLETE block-entry set (inline +
                 // overflow), uncapped. Wire shape matches BLOCK_ENTRIES —
                 // [count:u8] then `count` × 12-byte entries — but every entry
-                // is present. On an overflow-read failure, surface
+                // is present. On a mined-state read failure, surface
                 // ERR_STORAGE_IO (like the other sub-read branches) rather
                 // than silently truncating the block-membership set.
-                match engine.read_all_block_entries(&key) {
-                    Ok(entries) => {
+                match mined_state.as_ref() {
+                    Some(Ok((entries, _))) => {
                         // Frame the count from the entries actually emitted so
-                        // the wire count always matches the payload (self-
-                        // consistent even under a count/overflow divergence).
-                        // `entries.len()` is bounded by `block_entry_count`
-                        // (u8, <= 255), so the cast cannot truncate.
+                        // the wire count always matches the payload.
                         data.push(entries.len() as u8);
-                        for be in &entries {
+                        for be in entries {
                             data.extend_from_slice(&be.block_id.to_le_bytes());
                             data.extend_from_slice(&be.block_height.to_le_bytes());
                             data.extend_from_slice(&be.subtree_idx.to_le_bytes());
                         }
                     }
-                    Err(_) => {
+                    _ => {
                         inner_read_failed = true;
                         data.push(0u8);
                     }
@@ -13405,6 +13452,124 @@ mod tests {
             entries,
             expected[..3].to_vec(),
             "the 3 inline entries must be the first three"
+        );
+    }
+
+    /// Task 10: GET's BLOCK_ENTRIES / BLOCK_ENTRIES_ALL / BLOCK_ENTRY_COUNT /
+    /// UNMINED_SINCE fields now read the authoritative `ShardedMinedIndex`
+    /// slot instead of the device record. Since setMined dual-writes both
+    /// (Task 9), this must be byte-identical to the device metadata for the
+    /// same record — pin that equivalence, including the overflow case
+    /// (mining into more than `INLINE_BLOCK_ENTRIES` == 3 distinct blocks).
+    #[test]
+    fn get_block_fields_read_from_mined_index_match_device() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(85);
+        let key = TxKey { txid };
+        assert_eq!(h.create_tx(txid, 2).status, STATUS_OK);
+
+        // Mine into 5 distinct blocks (> INLINE_BLOCK_ENTRIES == 3) on the
+        // longest chain, so the record has 2 overflow entries in addition to
+        // the 3 inline ones.
+        let block_ids = [110u32, 220, 330, 440, 550];
+        set_mined_into_blocks(&h, txid, &block_ids);
+
+        // Authoritative on-device record — the pre-reroute source of truth
+        // these GET fields must still match byte-identically now that they
+        // read the (dual-written, in-sync) MinedIndex instead.
+        let meta = h.engine.read_metadata(&key).expect("record must exist");
+        assert_eq!(
+            { meta.unmined_since },
+            0,
+            "mined on the longest chain must clear unmined_since on the device"
+        );
+        assert!(
+            meta.block_entry_count as usize > crate::record::INLINE_BLOCK_ENTRIES,
+            "test setup must actually produce an overflow entry"
+        );
+
+        // BLOCK_ENTRY_COUNT
+        let bec = decode_get_response(
+            &h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::BLOCK_ENTRY_COUNT, &[txid]),
+            )
+            .payload,
+        )
+        .unwrap();
+        assert_eq!(bec[0].status, 0);
+        assert_eq!(
+            bec[0].data[0], meta.block_entry_count,
+            "BLOCK_ENTRY_COUNT from the MinedIndex must match the device record"
+        );
+
+        // UNMINED_SINCE
+        let unmined = decode_get_response(
+            &h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::UNMINED_SINCE, &[txid]),
+            )
+            .payload,
+        )
+        .unwrap();
+        assert_eq!(unmined[0].status, 0);
+        assert_eq!(
+            u32::from_le_bytes(unmined[0].data[0..4].try_into().unwrap()),
+            { meta.unmined_since },
+            "UNMINED_SINCE from the MinedIndex must match the device record"
+        );
+
+        let expected: Vec<(u32, u32, u32)> = block_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &bid)| (bid, 1000 + i as u32, i as u32))
+            .collect();
+
+        // BLOCK_ENTRIES: declares the true count, ships only the first 3.
+        let be = decode_get_response(
+            &h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::BLOCK_ENTRIES, &[txid]),
+            )
+            .payload,
+        )
+        .unwrap();
+        assert_eq!(be[0].status, 0);
+        let (count, entries) = decode_block_entries_section(&be[0].data);
+        assert_eq!(
+            count, meta.block_entry_count,
+            "BLOCK_ENTRIES declared count must match the device record"
+        );
+        assert_eq!(entries, expected[..3].to_vec());
+
+        // BLOCK_ENTRIES_ALL: uncapped, must match the device's full block set.
+        let all = decode_get_response(
+            &h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::BLOCK_ENTRIES_ALL, &[txid]),
+            )
+            .payload,
+        )
+        .unwrap();
+        assert_eq!(all[0].status, 0);
+        let (all_count, all_entries) = decode_block_entries_section(&all[0].data);
+        assert_eq!(all_count, meta.block_entry_count);
+        assert_eq!(all_entries, expected);
+
+        // Cross-check against the device-backed engine accessor directly, to
+        // pin that the MinedIndex-backed GET path and the (still present,
+        // still device-backed) `read_all_block_entries` agree exactly.
+        let device_entries: Vec<(u32, u32, u32)> = h
+            .engine
+            .read_all_block_entries(&key)
+            .expect("device read_all_block_entries should succeed")
+            .iter()
+            .map(|e| (e.block_id, e.block_height, e.subtree_idx))
+            .collect();
+        assert_eq!(
+            all_entries, device_entries,
+            "MinedIndex-backed BLOCK_ENTRIES_ALL must match the device-backed \
+             read_all_block_entries"
         );
     }
 

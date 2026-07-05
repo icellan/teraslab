@@ -388,6 +388,33 @@ impl ShardedMinedIndex {
         sh.get(slot).map(f)
     }
 
+    /// Read the complete block-entry set for a slot — the inline tuple
+    /// first (if occupied, i.e. `block_id != 0`), then the overflow entries
+    /// in their stored (insertion) order — plus the slot's `unmined_since`.
+    ///
+    /// Reads the entry and its overflow list under a single shard-lock
+    /// acquisition so the two can't be torn against a concurrent
+    /// `apply_set_mined`/`apply_unset` on the same slot.
+    ///
+    /// Returns `None` if the slot is not live (mirrors [`Self::with_entry`]).
+    pub fn read_block_entries(&self, key: &TxKey, slot: u32) -> Option<(Vec<BlockEntry>, u32)> {
+        let sh = self.shards[self.shard_for(key)].lock();
+        let entry = sh.get(slot)?;
+        let mut entries = Vec::new();
+        if entry.block_id != 0 {
+            entries.push(BlockEntry {
+                block_id: entry.block_id,
+                block_height: entry.block_height,
+                subtree_idx: entry.subtree_idx,
+            });
+        }
+        let unmined_since = entry.unmined_since;
+        if let Some(overflow) = sh.overflow.get(&slot) {
+            entries.extend_from_slice(overflow);
+        }
+        Some((entries, unmined_since))
+    }
+
     /// Collect all unmined entries below a given height.
     ///
     /// Iterates through all shards and returns `(shard_index, shard_local_slot)`

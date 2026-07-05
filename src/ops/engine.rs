@@ -6504,6 +6504,47 @@ impl Engine {
         Ok(entries)
     }
 
+    /// Read a key's authoritative mined-state — block entries plus
+    /// `unmined_since` — from the [`ShardedMinedIndex`], not the device.
+    ///
+    /// The MinedIndex is dual-written in lockstep with the device's
+    /// block-entry region and `unmined_since` field (see
+    /// `apply_set_mined`/`apply_unset`), so for any live record this returns
+    /// values byte-identical to [`Self::read_all_block_entries`] / the
+    /// on-device `unmined_since`. Entries are in insertion order: the inline
+    /// tuple first (if the record has been mined at least once), then
+    /// overflow entries in their stored order — the same order
+    /// `read_all_block_entries` returns.
+    ///
+    /// Returns `(vec![], 0)` for a transaction with no mined slot assigned
+    /// (i.e. never mined) — that is the normal "unmined" state, not a
+    /// failure.
+    ///
+    /// # Errors
+    ///
+    /// - [`SpendError::TxNotFound`] if the transaction is not in the index.
+    /// - [`SpendError::StorageError`] if the index lookup fails, or if the
+    ///   entry's `mined_slot` is live but the MinedIndex reports the slot as
+    ///   absent (an index/MinedIndex desync, not a normal miss).
+    pub fn mined_block_entries(&self, key: &TxKey) -> Result<(Vec<BlockEntry>, u32), SpendError> {
+        let entry = self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        if entry.mined_slot == crate::index::mined_index::NO_MINED_SLOT {
+            return Ok((vec![], 0));
+        }
+        self.mined_index
+            .read_block_entries(key, entry.mined_slot)
+            .ok_or_else(|| SpendError::StorageError {
+                detail: "mined_slot present in primary index but absent from MinedIndex"
+                    .to_string(),
+            })
+    }
+
     fn append_conflicting_child_best_effort(
         &self,
         parent_key: &TxKey,
