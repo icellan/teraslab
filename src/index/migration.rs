@@ -47,9 +47,9 @@ const IMPORT_SENTINEL_SUFFIX: &str = ".import-in-progress";
 
 /// Streaming migration-file magic (`TeraSlab Migration Index`).
 const PORTABLE_MAGIC: [u8; 4] = *b"TSMI";
-const PORTABLE_VERSION: u32 = 1;
+const PORTABLE_VERSION: u32 = 2;
 const PORTABLE_MAX_COUNT: u64 = 1 << 30;
-const PORTABLE_PRIMARY_ENTRY_SIZE: usize = 41;
+const PORTABLE_PRIMARY_ENTRY_SIZE: usize = 45;
 const PORTABLE_SECONDARY_ENTRY_SIZE: usize = 36;
 const IMPORT_BATCH_SIZE: usize = 4096;
 
@@ -748,6 +748,7 @@ fn encode_primary_entry(key: TxKey, entry: TxIndexEntry) -> [u8; PORTABLE_PRIMAR
     buf[0..32].copy_from_slice(&key.txid);
     buf[32] = entry.device_id;
     buf[33..41].copy_from_slice(&entry.record_offset.to_le_bytes());
+    buf[41..45].copy_from_slice(&entry.mined_slot.to_le_bytes());
     buf
 }
 
@@ -762,17 +763,10 @@ fn read_primary_entry<R: Read>(
     txid.copy_from_slice(&buf[0..32]);
     Ok((
         TxKey { txid },
-        // KNOWN GAP (flagged in Task 6's report, not fixed here): the
-        // portable format does not carry `mined_slot` on the wire, so a
-        // round trip through `export_index`/`import_index` always comes
-        // back as `NO_MINED_SLOT`. Harmless today (no construction site
-        // assigns a real slot yet), but once Task 7+ populates real slots
-        // this will need `PORTABLE_PRIMARY_ENTRY_SIZE` + `PORTABLE_VERSION`
-        // bumped to actually persist it.
         TxIndexEntry {
             device_id: buf[32],
             record_offset: u64::from_le_bytes(buf[33..41].try_into().unwrap()),
-            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+            mined_slot: u32::from_le_bytes(buf[41..45].try_into().unwrap()),
         },
     ))
 }
@@ -812,18 +806,22 @@ mod tests {
         TxKey { txid }
     }
 
-    /// REL-017: populate BOTH slim locator fields with a distinct value derived
-    /// from `offset` so an offset-swap, width-truncation, or field-zeroing
-    /// regression on the portable export/import serialization path is caught by
-    /// full-entry equality assertions (rather than passing against an entry that
-    /// only checks `record_offset`). `record_offset` is scaled by 8 so it is
-    /// 8-aligned — the restore path inserts into an in-memory HashTable whose
-    /// bucket codec debug-asserts alignment.
+    /// REL-017 / Task 6 Fix B: populate ALL THREE primary-entry fields with a
+    /// distinct, non-sentinel value derived from `offset` so an offset-swap,
+    /// width-truncation, or field-zeroing regression on the portable
+    /// export/import serialization path is caught by full-entry equality
+    /// assertions (rather than passing against an entry that only checks
+    /// `record_offset`). `mined_slot` in particular must be non-sentinel here
+    /// — before Fix B, `read_primary_entry` hardcoded `NO_MINED_SLOT`
+    /// regardless of what was encoded, and comparing against a sentinel on
+    /// both sides would have hidden that. `record_offset` is scaled by 8 so
+    /// it is 8-aligned — the restore path inserts into an in-memory
+    /// HashTable whose bucket codec debug-asserts alignment.
     fn make_entry(offset: u64) -> TxIndexEntry {
         TxIndexEntry {
             device_id: (offset & 0xFF) as u8,
             record_offset: offset * 8,
-            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+            mined_slot: offset as u32 + 1,
         }
     }
 

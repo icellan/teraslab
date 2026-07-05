@@ -11215,6 +11215,22 @@ mod tests {
     fn relocate_record_moves_record_verbatim() {
         let (engine, dev, key, meta, slots, old_offset) = seg_engine_with_record();
 
+        // Give the entry a non-sentinel mined_slot before relocating: every
+        // other relocate test registers `NO_MINED_SLOT`, so a regression that
+        // reset the pointer on relocate would produce byte-identical output
+        // there. This proves `relocate_record` carries the pre-relocate
+        // `mined_slot` forward rather than resetting it.
+        engine
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: 0,
+                    record_offset: old_offset,
+                    mined_slot: 777,
+                },
+            )
+            .unwrap();
+
         // Pure move: no baked-in mutation.
         let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
         assert_ne!(
@@ -11227,6 +11243,10 @@ mod tests {
             .lookup(&key)
             .expect("key still indexed after relocate");
         assert_eq!(entry.record_offset, new_offset);
+        assert_eq!(
+            entry.mined_slot, 777,
+            "relocate must carry the pre-relocate mined_slot forward"
+        );
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.utxo_count }, 4);
 

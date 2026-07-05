@@ -5064,6 +5064,10 @@ mod tests {
         };
 
         // Pre-relocation record at off1 (registered in the index, generation 1).
+        // Register with a non-sentinel mined_slot: every other relocate-replay
+        // test uses `NO_MINED_SLOT`, so a regression that reset the pointer on
+        // replay would produce byte-identical output there. This proves
+        // `replay_relocate` carries the pre-relocate `mined_slot` forward.
         let off1 = write_rec(&mut h, 1, 0);
         h.index
             .register(
@@ -5071,7 +5075,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: off1,
-                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    mined_slot: 777,
                 },
             )
             .unwrap();
@@ -5101,6 +5105,10 @@ mod tests {
             "metadata comes from the relocated record"
         );
         assert_eq!({ m.spent_utxos }, 1);
+        assert_eq!(
+            ie.mined_slot, 777,
+            "replay must carry the pre-relocate mined_slot forward"
+        );
     }
 
     /// The CLUSTERED-segment spend recovery path (SEGMENT_CLUSTERING_DESIGN): a

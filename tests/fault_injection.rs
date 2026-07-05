@@ -31,7 +31,7 @@ use teraslab::index::hashtable::HashTable;
 use teraslab::index::redb_dah::RedbDahIndex;
 use teraslab::index::redb_unmined::RedbUnminedIndex;
 use teraslab::index::{
-    DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
+    DahBackend, NO_MINED_SLOT, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
 };
 use teraslab::redo::{RedoLog, RedoOp};
 
@@ -63,17 +63,16 @@ fn make_key(n: u8) -> TxKey {
     TxKey { txid }
 }
 
-fn make_entry(offset: u64, unmined_since: u32, delete_at_height: u32) -> TxIndexEntry {
+/// `mined_slot` lets callers give each entry a distinct, non-sentinel value
+/// (mirroring the old `unmined_since` differentiator) so a hashtable-resize
+/// or recovery-replay bug that corrupts/drops the field is caught by a
+/// per-entry equality check rather than passing vacuously. Pass
+/// [`NO_MINED_SLOT`] when the test doesn't care about the value.
+fn make_entry(offset: u64, mined_slot: u32) -> TxIndexEntry {
     TxIndexEntry {
         device_id: 0,
         record_offset: offset,
-        utxo_count: 5,
-        block_entry_count: 0,
-        tx_flags: 0,
-        spent_utxos: 0,
-        dah_or_preserve: delete_at_height,
-        unmined_since,
-        generation: 0,
+        mined_slot,
     }
 }
 
@@ -108,7 +107,7 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
     teraslab::io::write_full_record(&*data_dev, record_offset, &meta, &[slot]).unwrap();
 
     primary
-        .register(key, make_entry(record_offset, 0, 0))
+        .register(key, make_entry(record_offset, NO_MINED_SLOT))
         .unwrap();
 
     // Redo log on its own device.
@@ -224,7 +223,7 @@ fn kill_between_rename_and_dir_fsync_recovers_hashtable() {
     ));
 
     let entries: Vec<(TxKey, TxIndexEntry)> = (1u8..=8u8)
-        .map(|i| (make_key(i), make_entry((i as u64) * 4096, i as u32 * 10, 0)))
+        .map(|i| (make_key(i), make_entry((i as u64) * 4096, i as u32 * 10)))
         .collect();
 
     {
@@ -306,8 +305,8 @@ fn kill_between_rename_and_dir_fsync_recovers_hashtable() {
             k.txid[0]
         );
         assert_eq!(
-            actual.unmined_since, expected.unmined_since,
-            "unmined_since mismatch for key {}",
+            actual.mined_slot, expected.mined_slot,
+            "mined_slot mismatch for key {}",
             k.txid[0]
         );
     }
@@ -442,7 +441,7 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     let slot = teraslab::record::UtxoSlot::new_unspent([0x33u8; 32]);
     teraslab::io::write_full_record(&data_dev, record_offset, &meta, &[slot]).unwrap();
     primary
-        .register(key, make_entry(record_offset, 500, 0))
+        .register(key, make_entry(record_offset, 500))
         .unwrap();
 
     // Arm the panic at BeforeSecondaryRedbCommit, then call insert on
