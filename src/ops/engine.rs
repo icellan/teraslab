@@ -7411,10 +7411,24 @@ impl Engine {
         //
         // Ordering invariants preserved: this still precedes the allocator free
         // (F-G2-001 — a freed+reused offset must never be reachable via a live
-        // index entry), and it now also precedes the tombstone. Recovery is
-        // unaffected: the delete is journaled (redo `Delete`), so redo-replay
-        // removes the record regardless of tombstone timing; the tombstone remains
-        // only the device-scan-rebuild fallback's guard.
+        // index entry), and it now also precedes the tombstone.
+        //
+        // Crash recovery of a buffered delete: production journals NO
+        // `RedoOp::Delete` (deletes are local prune GC), so redo-replay does NOT
+        // remove the record. What IS durable at the allocator `free` below is a
+        // fsynced `FreeRegion` redo record; the tombstone header write and this
+        // index removal are buffered (write-back cache) and become durable only
+        // at the next checkpoint. A crash after the `FreeRegion` fsync but before
+        // that checkpoint reverts the unsynced tombstone, so the device-scan
+        // rebuild re-indexes the still-intact record as LIVE while replay puts
+        // its offset on the freelist. Recovery reconciles this index-wins: it
+        // carves any live record's offset back out of the freelist
+        // (`recovery::reconcile_freelist_against_live_index` →
+        // `SlotAllocator::reserve_recovered_live_region`), restoring the
+        // consistent "delete never happened" lost-tail state (buffered mode's
+        // contract) so a future allocation cannot overwrite the live record. The
+        // tombstone remains the device-scan-rebuild guard for a CHECKPOINTED
+        // delete (durable tombstone ⇒ the record is not re-indexed at all).
         //
         // `unregister_with_shard_count` only decrements when an entry was actually
         // removed (H2: no underflow if the key was concurrently removed). G-4: if

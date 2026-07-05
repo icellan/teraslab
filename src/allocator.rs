@@ -1845,6 +1845,60 @@ impl SlotAllocator {
         }
     }
 
+    /// Recovery reconciliation: carve a still-LIVE record's region back OUT of
+    /// the freelist so it can never be handed to a future allocation.
+    ///
+    /// Under buffered durability a `delete` fsyncs its `FreeRegion` redo record
+    /// (pushing the record's offset onto the freelist on replay) while the
+    /// tombstone header write and the primary-index removal stay in the volatile
+    /// write-back cache and are journaled by NO redo op. A crash after the
+    /// `FreeRegion` fsync but before the next checkpoint therefore leaves the
+    /// record's header intact on the device — so the device-scan rebuild
+    /// re-indexes it as LIVE — while replay puts its offset on the freelist. That
+    /// is a lost-tail delete: the consistent recovered state is "the delete never
+    /// happened", i.e. the record is alive and its offset is NOT reusable. This
+    /// removes `[offset, offset + align_reservation(size))` from the freelist,
+    /// re-inserting any non-overlapping head/tail remnant of the containing free
+    /// region (a coalesced region may span several such lost records plus genuine
+    /// holes). Idempotent: a no-op if the range is not currently free. `size` is
+    /// the record's on-device `record_size`; it is aligned with the SAME
+    /// granularity `free` used, so the carved extent matches exactly what was
+    /// freed.
+    ///
+    /// Returns `true` if it removed the range from the freelist. Recovery-only —
+    /// runs after redo replay, before writes are accepted; not on any hot path.
+    pub fn reserve_recovered_live_region(&mut self, offset: u64, size: u64) -> bool {
+        let aligned_size = self.align_reservation(size);
+        let Some(end) = offset.checked_add(aligned_size) else {
+            return false;
+        };
+        // Must sit fully inside one containing free region to carve.
+        let Some((free_offset, free_size)) = self.free_region_containing(offset) else {
+            return false;
+        };
+        let free_end = free_offset.saturating_add(free_size);
+        if aligned_size == 0 || end > free_end {
+            // A partial/over-run overlap is not the buffered-delete shape this
+            // reconciles (a freed record is fully contained in its region); leave
+            // it untouched rather than risk splitting a region incorrectly.
+            return false;
+        }
+        // Remove the whole containing region, then re-insert the parts that do
+        // NOT belong to the live record.
+        self.freelist.remove(free_offset);
+        if offset > free_offset {
+            self.freelist.insert(free_offset, offset - free_offset);
+        }
+        if end < free_end {
+            self.freelist.insert(end, free_end - end);
+        }
+        self.freelist.maybe_demote();
+        if let Some(m) = allocator_metrics() {
+            self.refresh_freelist_gauges(m);
+        }
+        true
+    }
+
     /// Return true if `[offset, offset + size)` is inside the allocator's
     /// high-water mark and does not overlap any free region.
     ///
@@ -2079,6 +2133,20 @@ pub trait RecordAllocator: Send {
         let _ = live_offsets;
     }
 
+    /// Recovery reconciliation for the in-place [`SlotAllocator`]: carve a still-
+    /// LIVE record's region back OUT of the freelist so a future allocation can
+    /// never overwrite it. `size` is the record's on-device `record_size`. See
+    /// [`SlotAllocator::reserve_recovered_live_region`] for the buffered-delete
+    /// lost-tail window this closes. Returns `true` if the range was removed.
+    /// Default no-op (returns `false`): the log-structured segment allocator has
+    /// no fsynced-`FreeRegion` delete window — its deletes only bump per-segment
+    /// dead-byte counters and its layout is re-derived by
+    /// [`Self::reconcile_recovered_free_list`] from the live set.
+    fn reserve_recovered_live_region(&mut self, offset: u64, size: u64) -> bool {
+        let _ = (offset, size);
+        false
+    }
+
     /// Defrag fast path (log-structured engine): reclaim every fully-dead segment
     /// (all its records relocated out or deleted) for reuse, bounding device
     /// growth. Returns the number of segments reclaimed. Default 0: the in-place
@@ -2211,6 +2279,9 @@ impl RecordAllocator for BoxedAllocator {
     fn reconcile_recovered_free_list(&mut self, live_offsets: &[u64]) {
         (**self).reconcile_recovered_free_list(live_offsets)
     }
+    fn reserve_recovered_live_region(&mut self, offset: u64, size: u64) -> bool {
+        (**self).reserve_recovered_live_region(offset, size)
+    }
     fn reclaim_fully_dead_segments(&mut self) -> usize {
         (**self).reclaim_fully_dead_segments()
     }
@@ -2256,6 +2327,9 @@ impl RecordAllocator for SlotAllocator {
     }
     fn free_region_containing(&self, offset: u64) -> Option<(u64, u64)> {
         SlotAllocator::free_region_containing(self, offset)
+    }
+    fn reserve_recovered_live_region(&mut self, offset: u64, size: u64) -> bool {
+        SlotAllocator::reserve_recovered_live_region(self, offset, size)
     }
     fn free_region_count(&self) -> usize {
         SlotAllocator::free_region_count(self)

@@ -731,6 +731,18 @@ pub fn recover_all_multi_store(
         }
     }
 
+    // Index-wins freelist reconciliation across every store (buffered-delete
+    // lost-tail window; see `reconcile_freelist_against_live_index`). Each live
+    // entry is routed to its owning store via `entry.device_id`. Runs after the
+    // global-order replay applied every store's `FreeRegion`, and BEFORE the
+    // per-store snapshots are persisted below.
+    {
+        let dev_refs: Vec<&dyn BlockDevice> = devices.iter().map(|d| d.as_ref()).collect();
+        let mut alloc_refs: Vec<&mut crate::allocator::BoxedAllocator> =
+            allocators.iter_mut().collect();
+        reconcile_freelist_against_live_index(&dev_refs, &mut alloc_refs, index)?;
+    }
+
     // Persist EVERY store's allocator snapshot so the next boot can skip
     // allocator redo replay. Non-fatal per store (idempotent next boot).
     for alloc in allocators.iter_mut() {
@@ -1176,6 +1188,19 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
                 );
             }
         }
+    }
+
+    // Index-wins freelist reconciliation (buffered-delete lost-tail window):
+    // remove from the allocator's freelist any offset a live index entry still
+    // owns, so a replayed `FreeRegion` whose matching tombstone/index-removal was
+    // lost cannot let a future allocation overwrite the still-live record. Runs
+    // AFTER the replay loop has applied every `FreeRegion`, and BEFORE the
+    // allocator snapshot is persisted below, so the reconciled freelist is what
+    // gets checkpointed. Single-store: every entry is on store 0 / `device`.
+    if let Some(alloc) = allocator.as_deref_mut() {
+        let devices: [&dyn BlockDevice; 1] = [device];
+        let mut allocs: [&mut crate::allocator::BoxedAllocator; 1] = [alloc];
+        reconcile_freelist_against_live_index(&devices, &mut allocs, index)?;
     }
 
     // Persist the allocator snapshot so next startup can skip replay of the
@@ -3579,6 +3604,91 @@ fn replay_compensate_set_locked(
         return ReplayResult::Failed(ReplayCause::IoError);
     }
     ReplayResult::Applied
+}
+
+/// Index-wins freelist reconciliation: after redo replay, remove from each
+/// in-place allocator's freelist any offset a LIVE index entry still owns.
+///
+/// # Why this is required (buffered-delete lost-tail window)
+///
+/// Under the default buffered redo mode, `delete` fsyncs its `FreeRegion` redo
+/// record (via `SlotAllocator::free`) but leaves the tombstone header write and
+/// the primary-index removal in the volatile write-back cache — and NO
+/// production path journals a `RedoOp::Delete` (deletes are treated as local
+/// prune GC). A crash after the `FreeRegion` fsync but before the next
+/// checkpoint therefore reverts the unsynced tombstone — so the record's header
+/// is still intact on the device and the device-scan rebuild re-indexes it as
+/// LIVE — while redo replay pushes its offset onto the freelist. The record is
+/// then live in the index AND its offset is allocatable, so a later `create` can
+/// silently overwrite acked, durable data.
+///
+/// Buffered mode's contract is that a crash may lose the tail of un-checkpointed
+/// mutations. A delete whose `FreeRegion` was fsynced but whose tombstone /
+/// index removal was NOT is exactly such a lost-tail delete, so the consistent
+/// recovered state is "the delete never happened": the record is ALIVE and its
+/// offset must NOT be reusable. This pass restores that by carving each live
+/// record's region back out of the freelist (index wins over the replayed free).
+///
+/// Zero hot-path cost: runs once at boot, after replay, before writes are
+/// accepted. Only offsets actually on the freelist trigger a metadata read, so a
+/// clean store (empty/small freelist) does near-zero device I/O. No-op for the
+/// log-structured segment allocator (its `reserve_recovered_live_region` default
+/// returns `false`) — its deletes bump per-segment dead-byte counters rather than
+/// fsyncing a `FreeRegion`, so it has no such window; its layout is re-derived by
+/// [`crate::allocator::RecordAllocator::reconcile_recovered_free_list`].
+///
+/// `devices[i]` backs `allocators[i]` (store `i`); each live index entry is
+/// routed to its owning store via `entry.device_id`.
+///
+/// # Errors
+/// Propagates a device error if a live record whose offset is on the freelist
+/// cannot have its `record_size` read — recovery fails closed rather than leave
+/// a live-and-free offset that a future allocation could overwrite.
+fn reconcile_freelist_against_live_index(
+    devices: &[&dyn BlockDevice],
+    allocators: &mut [&mut BoxedAllocator],
+    index: &ShardedIndex,
+) -> Result<(), RecoveryError> {
+    // Collect (store, offset) for every live entry in one index pass, so the
+    // reconcile does not hold the index lock across device reads.
+    let mut live: Vec<(usize, u64)> = Vec::new();
+    index.for_each(|_key, e| {
+        live.push((e.device_id as usize, e.record_offset));
+    });
+    for (store, offset) in live {
+        let Some(alloc) = allocators.get_mut(store) else {
+            // An entry referencing a store that does not exist is a corrupt
+            // index; skip rather than panic — the frontier/secondary passes
+            // surface store-count mismatches with their own errors.
+            continue;
+        };
+        // Only a currently-free offset can be a lost-tail delete. A clean store
+        // hits this for none of its live records, so no metadata is read.
+        if alloc.free_region_containing(offset).is_none() {
+            continue;
+        }
+        let Some(dev) = devices.get(store) else {
+            continue;
+        };
+        let meta = io::read_metadata(*dev, offset).map_err(|_| {
+            RecoveryError::Index(crate::index::IndexError::FormatError {
+                detail: format!(
+                    "freelist reconcile could not read record_size for live offset {offset} on store {store}"
+                ),
+            })
+        })?;
+        let record_size = { meta.record_size } as u64;
+        if alloc.reserve_recovered_live_region(offset, record_size) {
+            tracing::warn!(
+                target: "teraslab::recovery::allocator",
+                store,
+                offset,
+                record_size,
+                "recovery: reconciled a buffered-delete lost-tail — record is live in the index but its offset was on the freelist; reserved the offset so it cannot be reused (the delete is treated as un-checkpointed and reverted)",
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Recompute each store's append frontier from the rebuilt index so a segment
