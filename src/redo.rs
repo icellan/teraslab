@@ -2764,6 +2764,29 @@ pub struct RedoLog {
     /// atomics; the engine replaces it with one shared across all per-store
     /// logs via [`RedoLog::set_backpressure`]. See [`RedoBackpressure`].
     backpressure: Arc<RedoBackpressure>,
+    /// Online-backup tee. When set (via [`RedoLog::attach_tee`]), every durable
+    /// frame is handed to this callback at commit time — the on-disk frame
+    /// bytes `[len][seq][op][data][crc]`, the sequence, and the op-type byte —
+    /// under the redo mutex, in commit order. The backup captures the tail
+    /// `(F, T]` this way rather than reading it back later (a concurrent
+    /// checkpoint may reclaim the live log's prefix). `None` in normal
+    /// operation; the callback owns all filtering (it drops `RecoveryProgress`
+    /// / `Checkpoint` markers) and back-pressure (bounded buffer), so the append
+    /// path stays oblivious. Not persisted.
+    tee: Option<RedoTee>,
+}
+
+/// A redo tee callback: `(frame_bytes, sequence, op_type)`, invoked under the
+/// redo mutex for every durable frame in commit order. See [`RedoLog::attach_tee`].
+pub type RedoTee = Box<dyn Fn(&[u8], u64, u8) + Send>;
+
+/// Whether an op-type byte is a recovery MARKER (`RecoveryProgress` or
+/// `Checkpoint`) that an online-backup tee must drop before writing the tail.
+/// A mid-window marker copied into the fabricated file would falsely fence the
+/// backup replay against a `.snap` taken at a different point. See
+/// [`RedoLog::write_backup_redo_file`].
+pub fn redo_op_type_is_marker(op_type: u8) -> bool {
+    op_type == OP_RECOVERY_PROGRESS || op_type == OP_CHECKPOINT
 }
 
 impl RedoLog {
@@ -2846,6 +2869,7 @@ impl RedoLog {
             // Default single-store coordinator; the engine swaps in a shared
             // multi-store one at boot via `set_backpressure`.
             backpressure: RedoBackpressure::new(Vec::new()),
+            tee: None,
         };
         // Build the default coordinator over this log's own atomics now that
         // `atomics` exists.
@@ -3094,6 +3118,100 @@ impl RedoLog {
         self.shared_seq = Some(shared);
     }
 
+    /// Attach an online-backup tee. Every durable frame committed after this
+    /// call is handed to `tee(frame_bytes, sequence, op_type)` in commit order,
+    /// under the redo mutex (the caller holds `Arc<Mutex<RedoLog>>`). The
+    /// callback captures the redo tail for a running backup; it owns all
+    /// filtering and back-pressure. Replaces any previously-attached tee.
+    pub fn attach_tee(&mut self, tee: RedoTee) {
+        self.tee = Some(tee);
+    }
+
+    /// Detach the online-backup tee installed by [`Self::attach_tee`]. Idempotent
+    /// (a no-op if none is attached). The backup calls this at finalize under the
+    /// visibility guard so no frame past `T` is teed.
+    pub fn detach_tee(&mut self) {
+        self.tee = None;
+    }
+
+    /// Whether a backup tee is currently attached (diagnostics/tests).
+    pub fn has_tee(&self) -> bool {
+        self.tee.is_some()
+    }
+
+    /// Write a self-contained linear-v2 redo file for an online-backup restore.
+    ///
+    /// The produced file, opened at boot by [`RedoLog::open`] and replayed by
+    /// [`RedoLog::recover`], yields exactly the entries in `(fence, tail_end]` —
+    /// the redo tail the backup teed. Layout at `device` offset 0:
+    /// * a linear-v2 header with `next_sequence = tail_end + 1`,
+    ///   `checkpoint_seq = fence`;
+    /// * a `RecoveryProgress { through_sequence: fence }` marker at sequence
+    ///   `fence` (so `recover` fences replay at `fence` against a `.snap` taken
+    ///   at the same point);
+    /// * then `frames` — the teed tail frames in commit order, each a complete
+    ///   on-disk frame `[len][seq][op][data][crc]`.
+    ///
+    /// `frames` MUST already exclude `RecoveryProgress`/`Checkpoint` markers
+    /// (the tee filters them via [`redo_op_type_is_marker`]) and carry
+    /// sequences in `(fence, tail_end]`. The remainder of the region is left
+    /// zero, which the linear scanner treats as end-of-log. Even under
+    /// `redo_segment_ring`, a non-empty linear file stays linear (ring adoption
+    /// only happens on a fresh region), so this file is portable across that
+    /// config.
+    pub fn write_backup_redo_file(
+        device: &dyn BlockDevice,
+        fence: u64,
+        tail_end: u64,
+        frames: &[Vec<u8>],
+    ) -> Result<()> {
+        let align = device.alignment();
+        let region = Self::build_backup_redo_region(align, fence, tail_end, frames);
+        // O_DIRECT needs an alignment-multiple, alignment-backed buffer.
+        let mut buf = AlignedBuf::new(region.len(), align);
+        buf[..region.len()].copy_from_slice(&region);
+        // Trailing bytes are already zero (AlignedBuf zero-fills) → end-of-log.
+        device.pwrite_all_at(&buf, 0)?;
+        device.sync()?;
+        Ok(())
+    }
+
+    /// Build the raw bytes of a backup redo file (see
+    /// [`Self::write_backup_redo_file`]): a linear-v2 header block padded to
+    /// `align`, a `RecoveryProgress { fence }` marker at sequence `fence`, then
+    /// the teed tail `frames`, with the whole region padded up to an `align`
+    /// multiple (trailing zeros = end-of-log). Returned as an owned `Vec` so the
+    /// backup can write it to a plain file in the backup directory; restore
+    /// installs it at the target redo path.
+    pub fn build_backup_redo_region(
+        align: usize,
+        fence: u64,
+        tail_end: u64,
+        frames: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut region: Vec<u8> = Vec::new();
+        // Header block, padded to one alignment block.
+        let header = RedoHeader::linear(tail_end + 1, fence, 0).serialize();
+        region.extend_from_slice(&header);
+        region.resize(align, 0);
+        // Fence marker at sequence `fence`, then the tail frames in order.
+        let marker = RedoEntry {
+            sequence: fence,
+            op: RedoOp::RecoveryProgress {
+                through_sequence: fence,
+            },
+        }
+        .serialize();
+        region.extend_from_slice(&marker);
+        for frame in frames {
+            region.extend_from_slice(frame);
+        }
+        // Pad to an alignment multiple.
+        let padded_len = region.len().div_ceil(align) * align;
+        region.resize(padded_len, 0);
+        region
+    }
+
     /// This log's own next-sequence high-water mark (the value persisted in
     /// the on-disk header), independent of any attached shared counter.
     ///
@@ -3313,6 +3431,11 @@ impl RedoLog {
     fn buffer_entry(&mut self, op: RedoOp, seq: u64) {
         let entry = RedoEntry { sequence: seq, op };
         let bytes = entry.serialize();
+        if let Some(tee) = self.tee.as_ref() {
+            // Frame layout: [length:4][seq:8][op_type:1][data][crc:4].
+            let op_type = bytes[ENTRY_HEADER_SIZE + ENTRY_SEQ_SIZE];
+            tee(&bytes, seq, op_type);
+        }
         self.buffer.extend_from_slice(&bytes);
         self.pending_entries.push(entry);
         if let Some(m) = redo_metrics() {
@@ -3333,9 +3456,15 @@ impl RedoLog {
         e.body[..ENTRY_SEQ_SIZE].copy_from_slice(&seq.to_le_bytes());
         let crc = crc32fast::hash(&e.body);
         let length = (e.body.len() + ENTRY_CHECKSUM_SIZE) as u32;
+        let frame_start = self.buffer.len();
         self.buffer.extend_from_slice(&length.to_le_bytes());
         self.buffer.extend_from_slice(&e.body);
         self.buffer.extend_from_slice(&crc.to_le_bytes());
+        if let Some(tee) = self.tee.as_ref() {
+            // Frame layout: [length:4][seq:8][op_type:1][data][crc:4].
+            let op_type = self.buffer[frame_start + ENTRY_HEADER_SIZE + ENTRY_SEQ_SIZE];
+            tee(&self.buffer[frame_start..], seq, op_type);
+        }
         self.pending_entries.push(RedoEntry {
             sequence: seq,
             op: e.op,
@@ -4794,6 +4923,217 @@ mod tests {
         let mut txid = [0u8; 32];
         txid[0] = n;
         TxKey { txid }
+    }
+
+    /// A representative mutation op for tee/backup tests (op_type == OP_SPEND).
+    fn backup_spend_op(n: u8) -> RedoOp {
+        RedoOp::Spend {
+            tx_key: test_key(n),
+            offset: u32::from(n),
+            spending_data: [n; 36],
+            new_spent_count: u32::from(n),
+        }
+    }
+
+    // -- backup-2: redo tee -------------------------------------------------
+
+    #[test]
+    fn tee_receives_every_committed_frame_in_commit_order() {
+        use std::sync::Mutex as StdMutex;
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(dev, 0, 1024 * 1024).unwrap(),
+        ));
+        let seen: Arc<StdMutex<Vec<(u64, u8)>>> = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let seen = seen.clone();
+            log.lock().attach_tee(Box::new(move |frame, seq, op_type| {
+                // The frame's own length prefix must match the byte slice.
+                let len = u32::from_le_bytes(frame[..4].try_into().unwrap()) as usize;
+                assert_eq!(len + ENTRY_HEADER_SIZE, frame.len(), "frame length prefix");
+                seen.lock().unwrap().push((seq, op_type));
+            }));
+        }
+        // Two concurrent appenders; the tee is invoked under the redo mutex so
+        // every frame is observed exactly once, in commit (sequence) order.
+        std::thread::scope(|s| {
+            for t in 0..2u8 {
+                let log = log.clone();
+                s.spawn(move || {
+                    for i in 0..25u8 {
+                        log.lock().append(backup_spend_op(t * 25 + i)).unwrap();
+                    }
+                });
+            }
+        });
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 50, "every committed frame teed exactly once");
+        // Sequences strictly increasing (commit order) and all Create ops.
+        for w in seen.windows(2) {
+            assert!(w[0].0 < w[1].0, "tee frames must be in ascending seq order");
+        }
+        assert!(seen.iter().all(|(_, op)| *op == super::OP_SPEND));
+    }
+
+    #[test]
+    fn tee_filters_recovery_progress_and_checkpoint() {
+        let (_dev, mut log) = make_log(1024 * 1024);
+        let kept: Arc<parking_lot::Mutex<Vec<u8>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let kept = kept.clone();
+            log.attach_tee(Box::new(move |_frame, _seq, op_type| {
+                // The backup's real closure drops markers.
+                if !redo_op_type_is_marker(op_type) {
+                    kept.lock().push(op_type);
+                }
+            }));
+        }
+        log.append(backup_spend_op(1)).unwrap();
+        log.mark_recovery_progress(1).unwrap(); // RecoveryProgress marker (29)
+        log.append(RedoOp::Checkpoint).unwrap(); // Checkpoint marker (11)
+        log.append(backup_spend_op(2)).unwrap();
+
+        let kept = kept.lock();
+        assert_eq!(
+            &*kept,
+            &[super::OP_SPEND, super::OP_SPEND],
+            "only the two Create frames survive; both markers are dropped"
+        );
+        assert!(redo_op_type_is_marker(OP_RECOVERY_PROGRESS));
+        assert!(redo_op_type_is_marker(OP_CHECKPOINT));
+        assert!(!redo_op_type_is_marker(super::OP_SPEND));
+    }
+
+    #[test]
+    fn tee_bounded_overflow_aborts_without_blocking_append() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_dev, mut log) = make_log(1024 * 1024);
+        let cap = 4usize;
+        let buffer: Arc<parking_lot::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let aborted = Arc::new(AtomicBool::new(false));
+        {
+            let buffer = buffer.clone();
+            let aborted = aborted.clone();
+            log.attach_tee(Box::new(move |frame, _seq, _op| {
+                let mut buf = buffer.lock();
+                if buf.len() >= cap {
+                    // Bounded: drop and signal abort, never block the appender.
+                    aborted.store(true, Ordering::Relaxed);
+                    return;
+                }
+                buf.push(frame.to_vec());
+            }));
+        }
+        // Append well past the cap — every append still succeeds.
+        for i in 0..20u8 {
+            log.append(backup_spend_op(i))
+                .expect("append must never block/fail on tee overflow");
+        }
+        assert!(
+            aborted.load(Ordering::Relaxed),
+            "overflow must set the abort flag"
+        );
+        assert_eq!(
+            buffer.lock().len(),
+            cap,
+            "bounded buffer holds at most `cap`"
+        );
+    }
+
+    // -- backup-2: fabricated redo file ------------------------------------
+
+    /// Collected tee frames: `(sequence, op_type, frame_bytes)`.
+    type CapturedFrames = Arc<parking_lot::Mutex<Vec<(u64, u8, Vec<u8>)>>>;
+
+    /// Tee a source log, capturing the non-marker frames whose sequence is in
+    /// `(fence, tail_end]` — exactly what the backup would ship.
+    fn capture_tail_frames(fence: u64, ops: &[RedoOp]) -> (Vec<Vec<u8>>, Vec<(u64, RedoOp)>) {
+        let (_dev, mut log) = make_log(1024 * 1024);
+        let frames: CapturedFrames = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        {
+            let frames = frames.clone();
+            log.attach_tee(Box::new(move |frame, seq, op_type| {
+                frames.lock().push((seq, op_type, frame.to_vec()));
+            }));
+        }
+        let mut expected = Vec::new();
+        for op in ops {
+            let seq = log.append(op.clone()).unwrap();
+            if seq > fence {
+                expected.push((seq, op.clone()));
+            }
+        }
+        let tail = frames
+            .lock()
+            .iter()
+            .filter(|(seq, op_type, _)| *seq > fence && !redo_op_type_is_marker(*op_type))
+            .map(|(_, _, f)| f.clone())
+            .collect();
+        (tail, expected)
+    }
+
+    #[test]
+    fn fabricated_linear_file_recovers_exactly_entries_above_fence() {
+        let ops: Vec<RedoOp> = (1..=6u8).map(backup_spend_op).collect();
+        let fence = 3u64;
+        let tail_end = 6u64;
+        let (frames, expected) = capture_tail_frames(fence, &ops);
+        assert_eq!(expected.len(), 3, "seqs 4,5,6 are above the fence");
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        RedoLog::write_backup_redo_file(dev.as_ref(), fence, tail_end, &frames).unwrap();
+
+        let log = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        let recovered: Vec<(u64, RedoOp)> = log
+            .recover()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.sequence, e.op))
+            .collect();
+        assert_eq!(
+            recovered, expected,
+            "recover yields exactly the (fence, tail_end] tail in order"
+        );
+        assert_eq!(log.current_sequence(), tail_end + 1);
+    }
+
+    #[test]
+    fn fabricated_file_opens_under_segment_ring_config() {
+        // A fabricated backup file is linear v2 (segment_count == 0), so it is
+        // never adopted as a ring: ring adoption only ever happens on a FRESH
+        // region, and this file is non-empty. Thus it stays linear and recovers
+        // regardless of the redo_segment_ring policy.
+        let ops: Vec<RedoOp> = (1..=4u8).map(backup_spend_op).collect();
+        let (frames, expected) = capture_tail_frames(0, &ops);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        RedoLog::write_backup_redo_file(dev.as_ref(), 0, 4, &frames).unwrap();
+        let log = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        assert!(
+            !log.is_segment_ring(),
+            "linear backup file must not open as a ring"
+        );
+        let recovered: Vec<(u64, RedoOp)> = log
+            .recover()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.sequence, e.op))
+            .collect();
+        assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn fabricated_empty_tail_replays_nothing() {
+        // A backup taken at a quiescent fence (no tail) replays nothing.
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        RedoLog::write_backup_redo_file(dev.as_ref(), 7, 7, &[]).unwrap();
+        let log = RedoLog::open(dev, 0, 1024 * 1024).unwrap();
+        assert!(
+            log.recover().unwrap().is_empty(),
+            "empty tail replays nothing"
+        );
+        assert_eq!(log.current_sequence(), 8);
     }
 
     /// N2: `serialized_data_len` (arithmetic, used by `would_fit`) must match
@@ -6741,7 +7081,7 @@ mod tests {
     /// `==` the original. Together they prove the Arc change did not perturb
     /// the format.
     #[test]
-    fn create_op_serialize_roundtrip_byte_identical() {
+    fn spend_op_serialize_roundtrip_byte_identical() {
         // Non-trivial record split across the two example sizes from the spec
         // (300 + 1100 bytes) so the 4-byte record_len field carries a real
         // value and the body is large enough to be a meaningful copy.
@@ -6823,7 +7163,7 @@ mod tests {
     /// (engine `append_redo_ops_routed`, `append_atomic`'s `op.clone()`,
     /// `pending_entries` retention) and that clone must be O(1).
     #[test]
-    fn create_op_clone_shares_record_arc() {
+    fn spend_op_clone_shares_record_arc() {
         let record: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let op = RedoOp::Create {
             tx_key: make_txid(0x77),
@@ -8455,7 +8795,7 @@ mod tests {
     /// `record_bytes` so a test can force the pre-encoded `body` well past the
     /// 64-byte head-room `pre_encode` reserves (exercising buffer growth that the
     /// old `with_capacity(.. + 64)` under-sized).
-    fn create_op(n: u8, data_len: usize) -> RedoOp {
+    fn spend_op(n: u8, data_len: usize) -> RedoOp {
         RedoOp::Create {
             tx_key: test_key(n),
             device_id: 0,
@@ -8477,8 +8817,8 @@ mod tests {
     fn ring_preencoded_append_byte_identical_to_op_append() {
         let ops: Vec<RedoOp> = vec![
             freeze(1),
-            create_op(2, 200),  // hot path, op_data > 64 bytes
-            create_op(3, 1024), // forces buffer growth past pre_encode's +64
+            spend_op(2, 200),  // hot path, op_data > 64 bytes
+            spend_op(3, 1024), // forces buffer growth past pre_encode's +64
             RedoOp::SetMined {
                 tx_key: test_key(4),
                 block_id: 7,

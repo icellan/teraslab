@@ -7,6 +7,7 @@
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::metrics::allocator_metrics;
 use crate::redo::{RedoLog, RedoOp};
+use crate::segment_allocator::SegmentBackupView;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -2171,6 +2172,32 @@ pub trait RecordAllocator: Send {
         Vec::new()
     }
 
+    /// Online backup: freeze/thaw segment REUSE. While pinned, the log-structured
+    /// allocator only advances into virgin segments and reclaim is a no-op, so
+    /// the used-segment set stays stable and the append frontier monotone for the
+    /// duration of a backup copy. Default no-op — the in-place [`SlotAllocator`]
+    /// has no segments to freeze. The segment allocator overrides it.
+    fn set_lifecycle_pinned(&mut self, pinned: bool) {
+        let _ = pinned;
+    }
+
+    /// Online backup: a snapshot of this allocator's segment layout, or `None`
+    /// for allocators that are not log-structured (the in-place [`SlotAllocator`],
+    /// which the backup refuses — design v1 scope). The segment allocator
+    /// overrides it to return `Some`.
+    fn backup_view(&self) -> Option<SegmentBackupView> {
+        None
+    }
+
+    /// Online backup: serialize the allocator header from memory into an aligned
+    /// buffer WITHOUT touching the device, so the backup captures an untorn
+    /// header even while a checkpoint rewrites the on-disk one. `None` for
+    /// allocators without a segment header (the in-place [`SlotAllocator`]). The
+    /// segment allocator overrides it.
+    fn serialize_backup_header(&self) -> Option<AlignedBuf> {
+        None
+    }
+
     /// Test/fault-injection only: arm the next persist to fail once. On the trait
     /// so checkpoint crash tests can trigger it through the engine's boxed
     /// allocator. Compiled out of production builds.
@@ -2287,6 +2314,15 @@ impl RecordAllocator for BoxedAllocator {
     }
     fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
         (**self).defrag_victim_ranges(min_dead_frac, max)
+    }
+    fn set_lifecycle_pinned(&mut self, pinned: bool) {
+        (**self).set_lifecycle_pinned(pinned)
+    }
+    fn backup_view(&self) -> Option<SegmentBackupView> {
+        (**self).backup_view()
+    }
+    fn serialize_backup_header(&self) -> Option<AlignedBuf> {
+        (**self).serialize_backup_header()
     }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {

@@ -171,6 +171,51 @@ enum Command {
         #[arg(long)]
         config: std::path::PathBuf,
     },
+    /// Online backup management (requires a running server + admin token).
+    Backup {
+        #[command(subcommand)]
+        action: BackupAction,
+    },
+    /// OFFLINE restore of a backup directory onto the devices/paths named by a
+    /// server config. The server MUST be stopped: `restore` takes the instance
+    /// flock and refuses if a live server holds it. The node then boots through
+    /// its normal recovery (index snapshot load + redo tail replay).
+    Restore {
+        /// Server TOML config naming the TARGET devices/paths to write onto.
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// The backup directory produced by `teraslab-cli backup run` (it must
+        /// contain a `MANIFEST.json`).
+        #[arg(long)]
+        from: std::path::PathBuf,
+        /// Acknowledge that restore OVERWRITES the target devices. Required —
+        /// without it the command refuses and exits non-zero, so a restore can
+        /// never clobber a device by accident (non-interactive: there is no
+        /// prompt).
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// `teraslab-cli backup <action>` — drive the online-backup coordinator over
+/// the bearer-gated `/admin/backup*` HTTP endpoints.
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Start an online backup (`POST /admin/backup`).
+    Run {
+        /// Target subdirectory under the server's configured backup root
+        /// (relative, no `..`). Omit to use the server default (`backup`).
+        #[arg(long)]
+        dir: Option<String>,
+        /// Poll `GET /admin/backup/status` until the backup reaches `Done` or
+        /// `Failed`, printing progress; exit non-zero if it `Failed`.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Show the current backup progress (`GET /admin/backup/status`).
+    Status,
+    /// Request cancellation of the in-flight backup (`DELETE /admin/backup`).
+    Abort,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +296,50 @@ impl HttpClient {
             });
         }
         Ok(resp.text()?)
+    }
+
+    /// POST a JSON body and parse the (possibly empty) JSON response. Routes
+    /// through [`Self::request`] so the bearer token is attached. A non-2xx
+    /// status becomes [`CliError::ServerError`]; an empty 2xx body yields
+    /// `Value::Null`.
+    fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, CliError> {
+        let resp = self
+            .request(reqwest::Method::POST, path)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_string(body)?)
+            .send()?;
+        if !resp.status().is_success() {
+            return Err(CliError::ServerError {
+                status: resp.status().as_u16(),
+                message: resp.text().unwrap_or_default(),
+            });
+        }
+        let text = resp.text()?;
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Issue a DELETE and parse the (possibly empty) JSON response, with bearer
+    /// auth attached via [`Self::request`].
+    fn delete(&self, path: &str) -> Result<serde_json::Value, CliError> {
+        let resp = self.request(reqwest::Method::DELETE, path).send()?;
+        if !resp.status().is_success() {
+            return Err(CliError::ServerError {
+                status: resp.status().as_u16(),
+                message: resp.text().unwrap_or_default(),
+            });
+        }
+        let text = resp.text()?;
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::Null))
     }
 
     fn is_ready(&self) -> bool {
@@ -1509,6 +1598,196 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Online backup (backup run/status/abort) + offline restore
+// ---------------------------------------------------------------------------
+
+/// Dispatch `teraslab-cli backup <action>`. Returns `Ok(true)` on success,
+/// `Ok(false)` when a `--wait` run observed a `Failed` backup (so the process
+/// exits non-zero without printing a generic error), and `Err` on transport /
+/// HTTP failures.
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout/stderr
+fn cmd_backup(http: &HttpClient, json: bool, action: BackupAction) -> Result<bool, CliError> {
+    match action {
+        BackupAction::Run { dir, wait } => cmd_backup_run(http, json, dir.as_deref(), wait),
+        BackupAction::Status => {
+            cmd_backup_status(http, json)?;
+            Ok(true)
+        }
+        BackupAction::Abort => {
+            let r = http.delete("/admin/backup")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("Abort requested");
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// `POST /admin/backup`, optionally polling to completion when `--wait`.
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout/stderr
+fn cmd_backup_run(
+    http: &HttpClient,
+    json: bool,
+    dir: Option<&str>,
+    wait: bool,
+) -> Result<bool, CliError> {
+    let body = match dir {
+        Some(d) => serde_json::json!({ "dir": d }),
+        None => serde_json::json!({}),
+    };
+    let started = http.post_json("/admin/backup", &body)?;
+    if !wait {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&started)?);
+        } else {
+            println!("Backup started");
+        }
+        return Ok(true);
+    }
+
+    // Poll the status endpoint until the job reaches a terminal state.
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let status = http.get_json("/admin/backup/status")?;
+        let state = status["state"].as_str().unwrap_or("").to_string();
+        if !json {
+            println!(
+                "state={state} segments={}/{} bytes={}",
+                as_u64(&status["segments_copied"]),
+                as_u64(&status["segments_total"]),
+                fmt_bytes(as_u64(&status["bytes_copied"])),
+            );
+        }
+        match state.as_str() {
+            "Done" => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!(
+                        "Backup complete: {}",
+                        status["manifest_path"]
+                            .as_str()
+                            .unwrap_or("(no manifest path)"),
+                    );
+                }
+                return Ok(true);
+            }
+            "Failed" => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    eprintln!(
+                        "Backup failed: {}",
+                        status["error"].as_str().unwrap_or("unknown error"),
+                    );
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `GET /admin/backup/status` — print the current progress.
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout
+fn cmd_backup_status(http: &HttpClient, json: bool) -> Result<(), CliError> {
+    let status = http.get_json("/admin/backup/status")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+    let mut table = Table::new();
+    table.set_header(vec!["Field", "Value"]);
+    table.add_row(vec!["State", status["state"].as_str().unwrap_or("-")]);
+    table.add_row(vec![
+        "Segments",
+        &format!(
+            "{} / {}",
+            as_u64(&status["segments_copied"]),
+            as_u64(&status["segments_total"]),
+        ),
+    ]);
+    table.add_row(vec![
+        "Bytes copied",
+        &fmt_bytes(as_u64(&status["bytes_copied"])),
+    ]);
+    table.add_row(vec!["Fence", &status["fence"].to_string()]);
+    table.add_row(vec!["Tail end", &status["tail_end"].to_string()]);
+    table.add_row(vec![
+        "Catch-up round",
+        &as_u64(&status["catchup_round"]).to_string(),
+    ]);
+    if let Some(err) = status["error"].as_str() {
+        table.add_row(vec!["Error", err]);
+    }
+    if let Some(mp) = status["manifest_path"].as_str() {
+        table.add_row(vec!["Manifest", mp]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+/// OFFLINE restore: place a backup directory's artifacts onto the target
+/// devices/paths named by `config`, then the node boots through normal
+/// recovery. Mirrors `cmd_repair`'s offline structure. Maps a
+/// [`teraslab::backup::BackupError`] onto a non-zero exit via
+/// [`CliError::Other`] carrying a clear message.
+#[allow(clippy::disallowed_macros)] // CLI user-facing stdout/stderr
+fn cmd_restore(
+    config_path: &std::path::Path,
+    from: &std::path::Path,
+    force: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    use teraslab::config::ServerConfig;
+
+    let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
+
+    // Restore OVERWRITES the target devices; require an explicit acknowledgement
+    // rather than prompting (this is a non-interactive tool).
+    if !force {
+        return Err(CliError::Other(format!(
+            "restore OVERWRITES the target device(s) named by {} — re-run with --force to \
+             proceed (and stop the server first)",
+            config_path.display(),
+        )));
+    }
+
+    teraslab::backup::restore::restore(from, &cfg)
+        .map_err(|e| CliError::Other(format!("restore failed: {e}")))?;
+
+    let redo = cfg.resolved_redo_log_path();
+    let snap = cfg.resolved_index_snapshot_path();
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "restored": true,
+                "from": from.display().to_string(),
+                "device_paths": cfg
+                    .device_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
+                "redo_log": redo.display().to_string(),
+                "index_snapshot": snap.display().to_string(),
+            })
+        );
+    } else {
+        println!("Restored backup {} onto:", from.display());
+        for p in &cfg.device_paths {
+            println!("  device: {}", p.display());
+        }
+        println!("  redo:   {}", redo.display());
+        println!("  index:  {}", snap.display());
+        println!("Start the server; it boots through normal recovery (snapshot + redo replay).");
+    }
+    Ok(())
+}
+
 /// Lowercase hex of a byte slice for operator-facing output.
 fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -1556,6 +1835,19 @@ fn main() -> ExitCode {
         Command::ExportIndex { config, output } => cmd_export_index(&config, &output, cli.json),
         Command::ImportIndex { config, input } => cmd_import_index(&config, &input, cli.json),
         Command::Repair { config } => cmd_repair(&config, cli.json),
+        Command::Backup { action } => match cmd_backup(&http, cli.json, action) {
+            Ok(true) => return ExitCode::SUCCESS,
+            Ok(false) => return ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Command::Restore {
+            config,
+            from,
+            force,
+        } => cmd_restore(&config, &from, force, cli.json),
     };
 
     match result {

@@ -1,8 +1,16 @@
 # Phase 14: Online backup and restore
 
-**Status:** planned — design in `docs/ONLINE_BACKUP_DESIGN.md` (read it first;
-this phase file is the build order and test list, the design doc is the
-correctness argument).
+**Status:** shipped — `src/backup/{mod,job,copier,manifest,restore}.rs`,
+`src/instance_lock.rs`, the redo tee (`src/redo.rs`), the `pread_nocache`
+device stack, and the `/admin/backup*` endpoints + `teraslab-cli
+backup`/`restore` are in `feat/online-backup` (stacked on
+`docs/online-backup-design`). Design + correctness argument:
+`docs/ONLINE_BACKUP_DESIGN.md`. Built in six PR-sized stages (backup-1 pins +
+flock → backup-2 redo tee + fabricated redo → backup-3 copier + job + restore →
+backup-4 HTTP + config + metrics → backup-5 CLI + headroom monitor + flagship
+I2/I8 → backup-6 docs). One tracked follow-up remains: the per-store image is
+assembled in RAM before it is written (fine for v1's bounded device sizes);
+stream it to a sparse image for very large devices.
 
 ## Goal
 

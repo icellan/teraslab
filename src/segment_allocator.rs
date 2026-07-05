@@ -218,6 +218,66 @@ pub struct SegmentAllocatorStats {
     pub live_bytes: u64,
 }
 
+/// A point-in-time snapshot of a segment allocator's layout for the online
+/// backup. Captured under the store's allocator lock at pin time (initial
+/// used-set + headroom) and at finalize (header serialization covers the same
+/// fields). All offsets are store-relative device offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentBackupView {
+    /// Start of the data region (bytes) — the first byte a segment can occupy.
+    pub data_region_start: u64,
+    /// Total device (or sub-device) size in bytes.
+    pub device_size: u64,
+    /// Absolute device offset of the append cursor.
+    pub cursor: u64,
+    /// Configured segment size in bytes.
+    pub segment_size: u64,
+    /// Total segments carved from the data region.
+    pub segment_count: u32,
+    /// The currently-open (appendable) segment index.
+    pub open_segment: u32,
+    /// The 128-bit device identity from the header.
+    pub device_id: [u8; 16],
+    /// Per-segment `(used, dead)` accounting, indexed by segment number
+    /// (`len == segment_count`). A segment with `used > 0` holds record bytes
+    /// and must be copied; the rest are virgin.
+    pub per_segment: Vec<(u64, u64)>,
+}
+
+impl SegmentBackupView {
+    /// Device byte offset of segment `idx`.
+    pub fn segment_offset(&self, idx: u32) -> u64 {
+        self.data_region_start + u64::from(idx) * self.segment_size
+    }
+
+    /// The segment indices that hold record bytes (`used > 0`) and must be
+    /// copied into the backup image.
+    pub fn used_segments(&self) -> Vec<u32> {
+        self.per_segment
+            .iter()
+            .enumerate()
+            .filter(|(_, (used, _))| *used > 0)
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    /// The highest segment index with `used > 0`, or `open_segment` if none.
+    pub fn highest_used(&self) -> u32 {
+        self.per_segment
+            .iter()
+            .rposition(|(used, _)| *used > 0)
+            .map(|i| i as u32)
+            .unwrap_or(self.open_segment)
+    }
+
+    /// Virgin segments remaining beyond the frontier — the headroom a backup can
+    /// consume before allocation hits the device end (reuse is pinned off).
+    pub fn virgin_headroom_segments(&self) -> u32 {
+        let frontier = self.open_segment.max(self.highest_used());
+        self.segment_count.saturating_sub(frontier + 1)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SegmentAllocator
 // ---------------------------------------------------------------------------
@@ -260,6 +320,14 @@ pub struct SegmentAllocator {
     redo_log: Option<Arc<Mutex<RedoLog>>>,
     /// Store tag stamped on this allocator's future redo entries (relocate).
     redo_device_id: u8,
+    /// Online-backup lifecycle pin. While set, segment REUSE is frozen so the
+    /// allocation frontier only advances into virgin segments: reclaimed
+    /// segments are not popped from [`Self::free_segments`] and
+    /// [`Self::reclaim_fully_dead_segments`] is a no-op. This keeps the
+    /// used-segment set stable and the append frontier monotone for the
+    /// duration of a backup copy (design: restore ≡ crash recovery). Not
+    /// persisted; RAM-only and released when the backup finishes or aborts.
+    pinned: bool,
 }
 
 impl std::fmt::Debug for SegmentAllocator {
@@ -316,6 +384,7 @@ impl SegmentAllocator {
             packed: false,
             redo_log: None,
             redo_device_id: 0,
+            pinned: false,
         })
     }
 
@@ -450,7 +519,12 @@ impl SegmentAllocator {
     /// no reclaimed segments this is exactly the Phase 1 pure append
     /// (`open_segment + 1`).
     fn advance_to_next_segment(&mut self) -> bool {
-        if let Some(reused) = self.free_segments.pop_front() {
+        // While a backup pins the lifecycle, do NOT reuse reclaimed segments —
+        // fall through to virgin-append so the frontier stays monotone and the
+        // backup's used-segment set is not overwritten mid-copy.
+        if !self.pinned
+            && let Some(reused) = self.free_segments.pop_front()
+        {
             debug_assert!(
                 self.segments[reused as usize].used == 0
                     && self.segments[reused as usize].dead == 0,
@@ -490,6 +564,14 @@ impl SegmentAllocator {
     /// selects them). The open segment is never reclaimed (the cursor is inside
     /// it). Already-free segments are skipped (idempotent).
     pub fn reclaim_fully_dead_segments(&mut self) -> Vec<u32> {
+        // A backup pin freezes reclaim entirely: leave every segment's
+        // accounting intact and the reuse free list untouched so the copy sees a
+        // stable used-segment set. (Checkpoints also skip the engine-level
+        // defrag entry points while pinned; this is the belt-and-braces guard on
+        // the allocator itself.)
+        if self.pinned {
+            return Vec::new();
+        }
         let mut reclaimed = Vec::new();
         for idx in 0..self.segment_count {
             if idx == self.open_segment {
@@ -817,6 +899,30 @@ impl SegmentAllocator {
         self.device_id
     }
 
+    /// Freeze/thaw segment REUSE for an online backup (see the `pinned` field).
+    /// While `true`, allocation only advances into virgin segments and reclaim
+    /// is a no-op, keeping the used-segment set stable for the copy.
+    pub fn set_lifecycle_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
+    }
+
+    /// Snapshot the fields the online backup needs to enumerate used segments,
+    /// place them at the right device offsets, and compute headroom. Cheap
+    /// (clones the per-segment `used`/`dead` table); taken under the store's
+    /// allocator lock.
+    pub fn backup_view(&self) -> SegmentBackupView {
+        SegmentBackupView {
+            data_region_start: self.data_region_start,
+            device_size: self.device_size,
+            cursor: self.cursor,
+            segment_size: self.segment_size,
+            segment_count: self.segment_count,
+            open_segment: self.open_segment,
+            device_id: self.device_id,
+            per_segment: self.segments.iter().map(|s| (s.used, s.dead)).collect(),
+        }
+    }
+
     /// Compute a statistics snapshot for observability.
     pub fn stats(&self) -> SegmentAllocatorStats {
         let mut used_bytes = 0u64;
@@ -858,6 +964,22 @@ impl SegmentAllocator {
     /// so the checkpoint can write every store's header under the lock and sync
     /// all devices once, outside the lock.
     pub(crate) fn persist_header_no_sync(&self) -> Result<()> {
+        let buf = self.serialize_header_bytes()?;
+        self.device.pwrite_all_at(&buf, 0)?;
+        Ok(())
+    }
+
+    /// Serialize the allocator header (scalar resume state + per-segment
+    /// `used`/`dead` table) into an aligned buffer WITHOUT touching the device.
+    ///
+    /// This is the pure build+CRC half of [`Self::persist_header_no_sync`]; the
+    /// online backup uses it to capture a store's header from memory at finalize
+    /// time (untorn by construction, covering every segment used through `T`)
+    /// rather than reading the on-disk header, which a concurrent checkpoint may
+    /// be rewriting in place. Fails with
+    /// [`SegmentAllocatorError::SegmentTableOverflow`] if the touched-segment
+    /// table does not fit the header.
+    pub(crate) fn serialize_header_bytes(&self) -> Result<AlignedBuf> {
         // Persist every segment up to and including the HIGHEST-USED one (v2).
         //
         // Under defrag reuse the layout is non-monotonic: a reclaimed low segment
@@ -918,8 +1040,7 @@ impl SegmentAllocator {
         };
         buf[OFF_CRC..OFF_CRC + 4].copy_from_slice(&crc.to_le_bytes());
 
-        self.device.pwrite_all_at(&buf, 0)?;
-        Ok(())
+        Ok(buf)
     }
 
     /// Recover allocator state from the device header.
@@ -1076,6 +1197,7 @@ impl SegmentAllocator {
             packed,
             redo_log: None,
             redo_device_id: 0,
+            pinned: false,
         })
     }
 
@@ -1238,6 +1360,15 @@ impl RecordAllocator for SegmentAllocator {
     }
     fn defrag_victim_ranges(&self, min_dead_frac: f64, max: usize) -> Vec<(u64, u64)> {
         SegmentAllocator::defrag_victim_ranges(self, min_dead_frac, max)
+    }
+    fn set_lifecycle_pinned(&mut self, pinned: bool) {
+        SegmentAllocator::set_lifecycle_pinned(self, pinned);
+    }
+    fn backup_view(&self) -> Option<SegmentBackupView> {
+        Some(SegmentAllocator::backup_view(self))
+    }
+    fn serialize_backup_header(&self) -> Option<crate::device::AlignedBuf> {
+        SegmentAllocator::serialize_header_bytes(self).ok()
     }
     #[cfg(any(test, feature = "fault-injection"))]
     fn arm_fail_next_persist(&self) {
@@ -1407,6 +1538,119 @@ mod tests {
         );
         assert_eq!(o4, DATA_REGION_OFFSET, "reused seg0 starts at its base");
         assert_eq!(a.free_segment_count(), 0);
+    }
+
+    #[test]
+    fn pinned_advance_skips_free_list_pop_and_advances_high_water() {
+        // Same setup as the reuse test, but pin the lifecycle before the second
+        // fill: the reclaimed seg0 must NOT be reused — allocation grows into
+        // seg2 instead, and the free list is left untouched.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let o0 = a.allocate(4096).unwrap(); // seg0 b0
+        let o1 = a.allocate(4096).unwrap(); // seg0 b1 (full)
+        let _o2 = a.allocate(4096).unwrap(); // -> seg1 b0
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap();
+        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.free_segment_count(), 1);
+
+        a.set_lifecycle_pinned(true);
+        let _o3 = a.allocate(4096).unwrap(); // seg1 b1 (fills seg1)
+        let o4 = a.allocate(4096).unwrap(); // pinned: must GROW, not reuse seg0
+        assert_eq!(
+            a.open_segment(),
+            2,
+            "pinned advance must grow into seg2, not reuse the reclaimed seg0"
+        );
+        assert_eq!(o4, DATA_REGION_OFFSET + 2 * seg, "grew into seg2's base");
+        assert_eq!(
+            a.free_segment_count(),
+            1,
+            "the reclaimed seg0 stays on the free list untouched while pinned"
+        );
+    }
+
+    #[test]
+    fn pinned_reclaim_does_not_requeue() {
+        // A fully-dead segment exists, but while pinned reclaim is a no-op: it
+        // returns nothing and does not reset accounting or grow the free list.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let o0 = a.allocate(4096).unwrap();
+        let o1 = a.allocate(4096).unwrap();
+        let _o2 = a.allocate(4096).unwrap(); // open seg1
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap(); // seg0 fully dead
+
+        a.set_lifecycle_pinned(true);
+        assert!(
+            a.reclaim_fully_dead_segments().is_empty(),
+            "pinned reclaim must return nothing"
+        );
+        assert_eq!(a.free_segment_count(), 0, "free list must stay empty");
+        // Accounting is untouched: seg0 still records its dead bytes.
+        assert_eq!(a.stats().dead_bytes, 2 * 4096);
+    }
+
+    #[test]
+    fn unpin_restores_reuse() {
+        // After unpinning, reclaim + reuse behave exactly as unpinned.
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg);
+        let o0 = a.allocate(4096).unwrap();
+        let o1 = a.allocate(4096).unwrap();
+        let _o2 = a.allocate(4096).unwrap(); // open seg1
+        a.free(o0, 4096).unwrap();
+        a.free(o1, 4096).unwrap();
+
+        a.set_lifecycle_pinned(true);
+        assert!(a.reclaim_fully_dead_segments().is_empty());
+        a.set_lifecycle_pinned(false);
+
+        assert_eq!(a.reclaim_fully_dead_segments(), vec![0]);
+        assert_eq!(a.free_segment_count(), 1);
+        let _o3 = a.allocate(4096).unwrap(); // fills seg1
+        let o4 = a.allocate(4096).unwrap();
+        assert_eq!(a.open_segment(), 0, "reuse restored after unpin");
+        assert_eq!(o4, DATA_REGION_OFFSET);
+    }
+
+    #[test]
+    fn serialize_header_bytes_matches_persisted_header() {
+        // The factored-out serializer must produce byte-identical output to what
+        // persist_header_no_sync writes to the device.
+        let mut a = alloc(64, 8 * 1024 * 1024);
+        a.allocate(4096).unwrap();
+        a.allocate(600).unwrap();
+        let _ = a.allocate(4096).unwrap();
+
+        let serialized = a.serialize_header_bytes().unwrap();
+        a.persist_header_no_sync().unwrap();
+        // Read back exactly what was written.
+        let mut on_disk = crate::device::AlignedBuf::new(serialized.len(), ALIGN);
+        a.device.pread_exact_at(&mut on_disk, 0).unwrap();
+        assert_eq!(
+            &serialized[..],
+            &on_disk[..],
+            "serialize_header_bytes must equal the persisted header bytes"
+        );
+    }
+
+    #[test]
+    fn backup_view_reports_used_segments_and_headroom() {
+        let seg = 2 * ALIGN as u64;
+        let mut a = alloc(64, seg); // 64 MiB -> (64-1)/segsize... 31 segments of 8 KiB
+        a.allocate(4096).unwrap();
+        a.allocate(4096).unwrap(); // seg0 full
+        a.allocate(4096).unwrap(); // seg1 open, 1 block used
+        let view = a.backup_view();
+        assert_eq!(view.open_segment, 1);
+        assert_eq!(view.used_segments(), vec![0, 1], "seg0 and seg1 hold bytes");
+        assert_eq!(view.highest_used(), 1);
+        assert_eq!(view.segment_offset(1), DATA_REGION_OFFSET + seg);
+        // Headroom = segment_count - (frontier+1); frontier = 1.
+        assert_eq!(view.virgin_headroom_segments(), view.segment_count - 2);
     }
 
     #[test]

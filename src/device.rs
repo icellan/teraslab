@@ -240,6 +240,21 @@ pub trait BlockDevice: Send + Sync {
     /// buffers with `EINVAL`; allocate buffers via [`AlignedBuf`].
     fn pread(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
 
+    /// Read like [`Self::pread`], but WITHOUT populating any write-back cache on
+    /// a miss.
+    ///
+    /// A cached read (`CachingDevice`) normally inserts every missed block into
+    /// the cache, evicting the hot working set. The online-backup copier streams
+    /// the entire device once and must not pollute the cache, so it uses this:
+    /// caching wrappers serve a hit from their in-memory image (including dirty
+    /// blocks — coherent with in-flight writes) but read a miss straight from
+    /// the inner device without inserting. Wrappers delegate through their inner
+    /// device's `pread_nocache` so the bypass propagates down the stack. The
+    /// default (leaf devices with no cache) is exactly [`Self::pread`].
+    fn pread_nocache(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.pread(buf, offset)
+    }
+
     /// Write `buf` starting at `offset`.
     ///
     /// `offset`, `buf.len()`, AND the buffer's memory address

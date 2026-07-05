@@ -374,6 +374,22 @@ On server restart (see also "Index Recovery on Startup" above):
 4. Pending replication intent ranges are reconciled and cleared.
 5. Replica connections are re-established; catch-up runs automatically.
 
+### Restore is Crash Recovery
+
+The online backup (`docs/ONLINE_BACKUP_DESIGN.md`) relies on exactly this
+contract. A backup is constructed to be a **crash-legal device image at an
+instant `T`** — each 4 KiB block captured atomically under the same striped
+block lock a writer holds across its RMW — **plus the complete redo tail
+`(F, T]`** teed live at commit time, written into a fabricated linear-v2 redo
+file with `checkpoint_seq = F`. Restore lays those artifacts down at their
+configured paths and boots the node normally: step 2 above replays the tail on
+top of the image with no special casing. Because replay is idempotent and
+self-contained for the in-place ops (spend/setMined/freeze/…​ recompute absolute
+state) and payload-carrying for creates, the restored state equals the source
+state at `T`. There is **no backup-specific recovery code** — restore ≡ this
+startup recovery path, which is why the WAL-first ordering and idempotent replay
+guaranteed here are load-bearing for backup correctness.
+
 ## Topology Epochs and Ownership Fencing
 
 ### Monotonic Epoch Counter

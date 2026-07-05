@@ -196,6 +196,11 @@ impl BlockDevice for SubDevice {
         self.barrier.device().pread(buf, phys)
     }
 
+    fn pread_nocache(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let phys = self.translate(offset, buf.len())?;
+        self.barrier.device().pread_nocache(buf, phys)
+    }
+
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
         let phys = self.translate(offset, buf.len())?;
         self.barrier.device().pwrite(buf, phys)

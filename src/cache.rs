@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::device::{AlignedBuf, BlockDevice, Result};
+use crate::device::{AlignedBuf, BlockDevice, DeviceError, Result};
 
 /// Upper bound on the size of a single coalesced write-back flush, in bytes.
 ///
@@ -465,6 +465,53 @@ impl CacheState {
         Ok(buf.len())
     }
 
+    /// Cache-bypassing read (see [`BlockDevice::pread_nocache`]): a resident
+    /// block (including a DIRTY one, the authoritative in-memory image) is served
+    /// from the cache, coherent with in-flight writes; a miss is read straight
+    /// from the inner device and NOT inserted, so a full device scan does not
+    /// evict the hot working set.
+    fn pread_nocache(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let bs = self.block_size as u64;
+        let first = offset / bs;
+        let last = (offset + buf.len() as u64 - 1) / bs;
+        for block_idx in first..=last {
+            let (in_block, in_buf, n) = self.block_span(block_idx, offset, buf.len());
+            // Hit (incl. dirty): serve from the in-memory image, no LRU bump.
+            {
+                let shard = self.shard_of(block_idx).lock();
+                if let Some(b) = shard.blocks.get(&block_idx) {
+                    buf[in_buf..in_buf + n].copy_from_slice(&b.data[in_block..in_block + n]);
+                    continue;
+                }
+            }
+            // Miss: read from the inner device WITHOUT inserting into the cache.
+            // Propagate the bypass (pread_nocache) so a stacked inner cache is
+            // not polluted either; loop until the full block is read.
+            let block_start = block_idx * bs;
+            let len = self.block_len(block_start);
+            let mut block = AlignedBuf::new(len, self.block_size);
+            let mut done = 0usize;
+            while done < len {
+                let got = self
+                    .inner
+                    .pread_nocache(&mut block[done..len], block_start + done as u64)?;
+                if got == 0 {
+                    return Err(DeviceError::ShortRead {
+                        expected: len,
+                        got: done,
+                        offset: block_start,
+                    });
+                }
+                done += got;
+            }
+            buf[in_buf..in_buf + n].copy_from_slice(&block[in_block..in_block + n]);
+        }
+        Ok(buf.len())
+    }
+
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -713,6 +760,10 @@ impl BlockDevice for CachingDevice {
         self.state.pread(buf, offset)
     }
 
+    fn pread_nocache(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.state.pread_nocache(buf, offset)
+    }
+
     fn pwrite(&self, buf: &[u8], offset: u64) -> Result<usize> {
         self.state.pwrite(buf, offset)
     }
@@ -819,6 +870,49 @@ mod tests {
         let mut b = AlignedBuf::new(len, BS);
         cache.pread(&mut b[..], off).unwrap();
         b[..].to_vec()
+    }
+
+    fn read_cache_nocache(cache: &CachingDevice, off: u64, len: usize) -> Vec<u8> {
+        let mut b = AlignedBuf::new(len, BS);
+        cache.pread_nocache(&mut b[..], off).unwrap();
+        b[..].to_vec()
+    }
+
+    #[test]
+    fn pread_nocache_serves_dirty_block_without_inserting_miss() {
+        let dev = CountingDev::new(64 * BS, BS);
+        // Seed inner block 2 directly (never touches the cache).
+        dev.inner.pwrite(&ab(0xCC, BS), 2 * BS as u64).unwrap();
+        // Write-back cache: a written block stays dirty in RAM.
+        let cache = CachingDevice::new(dev.clone(), 16 * BS, true, NEVER_MS);
+
+        // Dirty-write block 0 → resident + dirty in the cache.
+        cache.pwrite(&ab(0xAA, BS), 0).unwrap();
+
+        // (a) pread_nocache serves the DIRTY block from the in-memory image.
+        assert_eq!(
+            read_cache_nocache(&cache, 0, BS),
+            vec![0xAA; BS],
+            "dirty block must be served from the cache (coherent with the write)"
+        );
+
+        // (b) pread_nocache on an UNCACHED block reads inner but does NOT insert.
+        let reads_before = dev.reads.load(Ordering::Relaxed);
+        assert_eq!(
+            read_cache_nocache(&cache, 2 * BS as u64, BS),
+            vec![0xCC; BS],
+            "uncached block read straight from inner"
+        );
+        let reads_after_nocache = dev.reads.load(Ordering::Relaxed);
+        assert!(reads_after_nocache > reads_before, "the miss reached inner");
+
+        // A subsequent NORMAL read of the same block must ALSO hit inner — proof
+        // pread_nocache did not populate the cache.
+        assert_eq!(read_cache(&cache, 2 * BS as u64, BS), vec![0xCC; BS]);
+        assert!(
+            dev.reads.load(Ordering::Relaxed) > reads_after_nocache,
+            "pread_nocache must NOT cache the block (the normal read re-hits inner)"
+        );
     }
 
     /// Build a bare single-shard `CacheState` (no background flusher, no flush

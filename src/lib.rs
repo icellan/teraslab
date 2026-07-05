@@ -22,6 +22,7 @@
 // the trait + backends only when a real caller is ready to land
 // alongside.
 pub mod allocator;
+pub mod backup;
 pub mod cache;
 pub mod checkpoint;
 pub mod cluster;
@@ -30,6 +31,7 @@ pub mod device;
 pub mod fault_injection;
 pub(crate) mod fsutil;
 pub mod index;
+pub mod instance_lock;
 pub mod io;
 pub mod locks;
 pub mod metrics;

@@ -1398,6 +1398,41 @@ pub(crate) fn lock_span_blocks(
     stripes.iter().map(|&s| locks.write_index(s)).collect()
 }
 
+/// Read-side counterpart to [`lock_span_blocks`]: acquire SHARED guards for
+/// every 4 KiB block the span `[offset, offset + span_bytes)` touches, in the
+/// same sorted, deduplicated stripe order.
+///
+/// The online-backup copier holds these while it reads a device chunk, so the
+/// read sees a block only in a committed pre- or post-state — never torn
+/// mid-RMW against a writer holding the corresponding [`lock_span_blocks`]
+/// write guard. Returns an empty vec for a zero-length span.
+pub(crate) fn read_span_blocks(
+    offset: u64,
+    span_bytes: u64,
+) -> Vec<parking_lot::RwLockReadGuard<'static, ()>> {
+    let locks = io_locks();
+    const BLOCK: u64 = 4096;
+    if span_bytes == 0 {
+        return Vec::new();
+    }
+    let first_block = offset - (offset % BLOCK);
+    let last_byte = offset + span_bytes - 1;
+    let last_block = last_byte - (last_byte % BLOCK);
+
+    let mut stripes: Vec<usize> = Vec::new();
+    let mut block = first_block;
+    loop {
+        stripes.push(locks.stripe_index(block));
+        if block == last_block {
+            break;
+        }
+        block += BLOCK;
+    }
+    stripes.sort_unstable();
+    stripes.dedup();
+    stripes.iter().map(|&s| locks.read_index(s)).collect()
+}
+
 /// Write a single [`UtxoSlot`] at `slot_index` within the record at `record_offset`.
 ///
 /// Uses read-modify-write: reads the aligned block containing the slot,
@@ -1694,6 +1729,50 @@ mod tests {
     fn test_device() -> Arc<MemoryDevice> {
         // 16 MB, 4096-byte alignment
         Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap())
+    }
+
+    #[test]
+    fn read_span_blocks_counts_and_dedups() {
+        // One block.
+        assert_eq!(read_span_blocks(4096, 1).len(), 1);
+        // Last byte in the second block → two blocks.
+        assert_eq!(read_span_blocks(0, 4097).len(), 2);
+        // Exactly one block.
+        assert_eq!(read_span_blocks(0, 4096).len(), 1);
+        // Zero span → no guards.
+        assert_eq!(read_span_blocks(0, 0).len(), 0);
+        // Three contiguous blocks.
+        assert_eq!(read_span_blocks(0, 3 * 4096).len(), 3);
+    }
+
+    #[test]
+    fn read_span_blocks_shared_but_excludes_writer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // High offset so the stripe is unlikely to collide with other tests.
+        let off = 700 * 1024 * 1024;
+
+        // Two concurrent readers of the same span coexist (shared read side).
+        let g1 = read_span_blocks(off, 4096);
+        let g2 = read_span_blocks(off, 4096);
+        assert_eq!(g1.len(), 1);
+        assert_eq!(g2.len(), 1);
+
+        // A writer on the same block must WAIT until the read guards drop.
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _w = lock_span_blocks(off, 4096);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "writer must block while read guards are held"
+        );
+        drop(g1);
+        drop(g2);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("writer acquires once the read guards drop");
+        handle.join().unwrap();
     }
 
     /// Helper: create test metadata + slots and write them at `record_offset`.

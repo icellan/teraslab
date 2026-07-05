@@ -61,6 +61,13 @@ fn start_test_server() -> (u16, std::sync::MutexGuard<'static, ()>) {
     drop(listener);
 
     let state = Arc::new(HttpState {
+        backup: teraslab::backup::BackupManager::new(
+            engine.clone(),
+            Arc::new(AtomicBool::new(false)),
+            teraslab::backup::BackupParams::default(),
+            teraslab::config::ServerConfig::default(),
+            None,
+        ),
         engine,
         metrics: &CLI_METRICS,
         histograms: &CLI_HISTOGRAMS,
@@ -497,4 +504,212 @@ fn export_import_index_roundtrip() {
     assert_eq!(e.utxo_count, 3);
     assert_eq!(e.spent_utxos, 1);
     assert_eq!(e.generation, 7);
+}
+
+/// I13 (offline half): `teraslab-cli restore` round-trip WITHOUT a server.
+///
+/// Produce a real backup dir in-process (`run_backup` over a temp segment
+/// device), then invoke the built `teraslab-cli restore --config <fresh> --from
+/// <backupdir> --force` subprocess against a FRESH config and assert it exits 0
+/// and lays down the device / redo / index-snapshot files. Also asserts the
+/// `--force` safety gate refuses (non-zero, no files written) when omitted.
+///
+/// The online `backup run/status/abort` subcommands need a live server socket
+/// (denied in this sandbox), so [`cli_backup_and_restore_help_parses`] only
+/// proves they parse; CI covers their live behaviour.
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn cli_restore_roundtrip_offline() {
+    use std::sync::atomic::AtomicBool;
+
+    use parking_lot::Mutex as PlMutex;
+    use teraslab::backup::job::run_backup;
+    use teraslab::backup::{BackupParams, BackupProgress};
+    use teraslab::config::ServerConfig;
+    use teraslab::device::{BlockDevice, DirectDevice};
+    use teraslab::ops::create::CreateRequest;
+    use teraslab::segment_allocator::SegmentAllocator;
+
+    const ALIGN: usize = 4096;
+    const SEG: u64 = 1024 * 1024;
+    const DEVICE_SIZE: u64 = 16 * 1024 * 1024;
+
+    // --- Source segment engine + a few records, then a real online backup.
+    let src_dir = tempfile::TempDir::new().unwrap();
+    let data_path = src_dir.path().join("data.dat");
+    let dev: Arc<dyn BlockDevice> =
+        Arc::new(DirectDevice::open(&data_path, DEVICE_SIZE, ALIGN).unwrap());
+    let seg = SegmentAllocator::new(dev.clone(), SEG).unwrap();
+    let engine = Engine::new(
+        dev.clone(),
+        Index::new(256).unwrap(),
+        seg,
+        StripedLocks::new(256),
+        DahIndex::new(),
+        UnminedIndex::new(),
+    );
+    for i in 0..6u64 {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        txid[31] = 0xAA;
+        let hashes = [[0x22u8; 32]];
+        engine
+            .create(&CreateRequest {
+                tx_id: txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: i,
+                size_in_bytes: 250,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                utxo_hashes: &hashes,
+                inputs: None,
+                outputs: None,
+                inpoints: None,
+                is_external: false,
+                created_at: 0,
+                block_height: 1,
+                mined_block_infos: &[],
+                frozen: false,
+                conflicting: false,
+                locked: false,
+                external_ref: None,
+                parent_txids: &[],
+            })
+            .unwrap();
+    }
+    engine.persist_allocator().unwrap();
+    dev.sync().unwrap();
+
+    let mut src_cfg = ServerConfig::default();
+    src_cfg.device_paths = vec![data_path.clone()];
+    src_cfg.device_size = DEVICE_SIZE;
+    src_cfg.device_alignment = ALIGN;
+    src_cfg.device_split = 1;
+    src_cfg.redo_log_size = 4 * 1024 * 1024;
+    src_cfg.redo_log_path = Some(src_dir.path().join("data.dat.redo"));
+    src_cfg.index_snapshot_path = src_dir.path().join("data.dat.snap");
+    src_cfg.blobstore_path = src_dir.path().join("no-blobstore");
+
+    let backup_root = tempfile::TempDir::new().unwrap();
+    let target = backup_root.path().join("bk");
+    let params = BackupParams {
+        throttle_bytes_per_sec: 0,
+        min_headroom_segments: 1,
+        abort_headroom_segments: 0,
+        ..BackupParams::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let progress = PlMutex::new(BackupProgress::default());
+    let blob_pause = AtomicBool::new(false);
+    run_backup(
+        &engine,
+        &blob_pause,
+        &src_cfg,
+        &params,
+        &target,
+        &cancel,
+        &progress,
+    )
+    .expect("in-process backup should succeed");
+    drop(engine);
+    drop(dev);
+    assert!(
+        target.join("MANIFEST.json").exists(),
+        "backup dir must exist"
+    );
+
+    // --- Fresh restore target: a minimal TOML naming NEW files. Geometry
+    //     (alignment 4096, split 1, size 16 MiB) matches the source defaults.
+    let restore_dir = tempfile::TempDir::new().unwrap();
+    let r_data = restore_dir.path().join("data.dat");
+    let r_redo = restore_dir.path().join("data.dat.redo");
+    let r_snap = restore_dir.path().join("data.dat.snap");
+    let r_blob = restore_dir.path().join("blobstore");
+    let cfg_path = restore_dir.path().join("restore.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "device_paths = [{:?}]\n\
+             device_size = {DEVICE_SIZE}\n\
+             redo_log_path = {:?}\n\
+             redo_log_size = 4194304\n\
+             index_snapshot_path = {:?}\n\
+             blobstore_path = {:?}\n",
+            r_data.to_string_lossy(),
+            r_redo.to_string_lossy(),
+            r_snap.to_string_lossy(),
+            r_blob.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    // Without --force the restore refuses and writes nothing.
+    let refused = Command::new(cli_bin())
+        .arg("restore")
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--from")
+        .arg(&target)
+        .output()
+        .expect("failed to run teraslab-cli");
+    assert!(
+        !refused.status.success(),
+        "restore without --force must refuse: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !r_data.exists(),
+        "no target device may be written without --force"
+    );
+
+    // With --force it restores and exits 0.
+    let out = Command::new(cli_bin())
+        .arg("restore")
+        .arg("--config")
+        .arg(&cfg_path)
+        .arg("--from")
+        .arg(&target)
+        .arg("--force")
+        .output()
+        .expect("failed to run teraslab-cli");
+    assert!(
+        out.status.success(),
+        "restore --force failed (exit {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(r_data.exists(), "restored device file must exist");
+    assert!(r_redo.exists(), "restored redo file must exist");
+    assert!(r_snap.exists(), "restored index snapshot must exist");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Restored backup"),
+        "restore summary expected, stdout: {stdout}"
+    );
+}
+
+/// The `backup`/`restore` subcommand trees parse (no server needed): clap must
+/// accept `backup [run|status|abort]` and `restore` and print help with exit 0.
+#[test]
+fn cli_backup_and_restore_help_parses() {
+    let cases: &[&[&str]] = &[
+        &["backup", "--help"],
+        &["backup", "run", "--help"],
+        &["backup", "status", "--help"],
+        &["backup", "abort", "--help"],
+        &["restore", "--help"],
+    ];
+    for args in cases {
+        let out = Command::new(cli_bin())
+            .args(*args)
+            .output()
+            .expect("failed to run teraslab-cli");
+        assert!(
+            out.status.success(),
+            "{args:?} should exit 0: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
