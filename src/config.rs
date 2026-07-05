@@ -768,8 +768,7 @@ pub struct StorageConfig {
     /// extends the high-water mark (`false`, default, is the unchanged best-fit
     /// freelist behavior).
     ///
-    /// This is the Phase 1 log-structured write lever (see
-    /// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`): under the UTXO
+    /// This is the Phase 1 log-structured write lever: under the UTXO
     /// recipe the create-then-delete churn fills the freelist, and best-fit
     /// reuse then scatters new records into the freed holes — defeating the
     /// write-back cache's sequential-flush coalescing. With `append_only`, frees
@@ -786,10 +785,10 @@ pub struct StorageConfig {
     /// persisted, so a device can be reopened in either mode safely.
     pub append_only: bool,
 
-    /// Storage engine: `"in_place"` (default) uses the best-fit `SlotAllocator`;
-    /// `"segment"` uses the log-structured append-cursor `SegmentAllocator`
-    /// (creates append to a moving cursor; sequential writes; relocate + defrag in
-    /// later phases). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+    /// Storage engine: `"segment"` (default) uses the log-structured
+    /// append-cursor `SegmentAllocator` (creates append to a moving cursor;
+    /// sequential writes; relocate + defrag). `"in_place"` uses the best-fit
+    /// `SlotAllocator` (in-place RMW; no defrag).
     ///
     /// The engine determines the on-disk allocator header format (distinct
     /// magics), so a device formatted by one engine cannot be opened by the
@@ -808,7 +807,7 @@ pub struct StorageConfig {
     /// store's device. Buffers the sequential append tail and flushes it as large
     /// sequential pwrites (the reference datastore's streaming model), instead of
     /// letting the random-access write-back cache re-scatter the appends into ~6 KB
-    /// writes (measured in `bench/results/20260630-ec2-segment`).
+    /// writes.
     ///
     /// Only meaningful with `engine = "segment"` (it has no effect on
     /// `"in_place"`, whose writes are in-place RMW, not appends). When enabled the
