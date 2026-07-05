@@ -8032,15 +8032,21 @@ impl Engine {
         // metadata under a third guard — the offset-keyed-guard + ABA pattern
         // (a recreate-same-txid cycle could return another tx's block entries
         // under `key`), and the overflow read was torn-read-unsafe against the
-        // now-guarded `write_overflow_entries`. `io::read_metadata` and
+        // now-guarded `write_overflow_entries`. We MUST use
+        // `io::read_metadata_unguarded` (NOT `io::read_metadata`, which now
+        // self-acquires the SAME striped read guard — the F-G2 torn-read fix —
+        // and would deadlock re-entrantly behind a queued
+        // `write_overflow_entries` writer). `read_metadata_unguarded` and
         // `read_overflow_entries` are both UNGUARDED device reads, so they run
         // under the single held guard without re-entering the lock; the guard
-        // pairs (same key) with `write_overflow_entries`' write guard.
+        // pairs (same key) with `write_overflow_entries`' write guard, which
+        // supplies the torn-read exclusion the inner reads need.
         let _g = io::record_read_guard(record_offset);
-        let metadata =
-            io::read_metadata(dev, record_offset).map_err(|e| SpendError::StorageError {
+        let metadata = io::read_metadata_unguarded(dev, record_offset).map_err(|e| {
+            SpendError::StorageError {
                 detail: format!("{e}"),
-            })?;
+            }
+        })?;
         if metadata.tx_id != key.txid {
             return Err(SpendError::TxNotFound);
         }

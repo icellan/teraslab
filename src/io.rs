@@ -84,16 +84,21 @@ fn io_locks() -> &'static StripedRwLocks {
 
 /// Acquire the record-level READ guard for `record_offset` and return it, so a
 /// lock-free reader can hold ONE guard across several UNGUARDED record reads
-/// (e.g. `read_metadata` + an overflow-block `pread`) — making them a coherent
-/// single-instance snapshot. This is the F-G2-001 ABA fix applied to the
-/// multi-read `read_block_entry` path, where a combined primitive would drag
-/// engine-side `BlockEntry`/overflow logic into this module.
+/// (e.g. `read_metadata_unguarded` + an overflow-block `pread`) — making them a
+/// coherent single-instance snapshot. This is the F-G2-001 ABA fix applied to
+/// the multi-read `read_block_entry` path, where a combined primitive would
+/// drag engine-side `BlockEntry`/overflow logic into this module.
 ///
-/// MISUSE WARNING: while holding this guard, call ONLY unguarded reads
-/// (`read_metadata`, raw `device.pread_*`). Do NOT call a guarded io fn
-/// (`read_all_utxo_slots`, `read_record_identity_and_slots`, …) or a writer
-/// keyed by the same `record_offset` — re-entrant acquisition of the same
-/// striped `RwLock` can deadlock.
+/// MISUSE WARNING: while holding this guard, call ONLY reads that do NOT
+/// themselves acquire the striped `io_locks` stripe for the same
+/// `record_offset` — i.e. [`read_metadata_unguarded`] and raw
+/// `device.pread_*`. Do NOT call a SELF-GUARDING io fn ([`read_metadata`],
+/// `read_metadata_direct`, `read_all_utxo_slots`,
+/// `read_record_identity_and_slots`, …) or a writer keyed by the same
+/// `record_offset` — the striped `RwLock` is NOT reentrant and re-acquiring it
+/// (readers park behind any queued writer) deadlocks. Note in particular that
+/// `read_metadata` is now self-guarding (the F-G2 torn-read fix); use
+/// [`read_metadata_unguarded`] under this guard instead.
 pub fn record_read_guard(record_offset: u64) -> parking_lot::RwLockReadGuard<'static, ()> {
     io_locks().read(record_offset)
 }
@@ -1028,6 +1033,13 @@ pub unsafe fn write_utxo_slot_direct(
 ///
 /// Reads the first `METADATA_SIZE` bytes from the device at the given
 /// record offset. The read is rounded up to the device alignment.
+///
+/// SELF-GUARDING: this acquires the per-record striped read guard for
+/// `record_offset` internally (torn-read protection, see below). Callers that
+/// already hold [`record_read_guard`] / [`record_write_guard`] for the same
+/// offset must NOT call this — the striped `parking_lot::RwLock` is not
+/// reentrant and would deadlock behind a queued writer. Such callers use
+/// [`read_metadata_unguarded`] instead (the outer guard supplies the exclusion).
 pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxMetadata> {
     // F-G2 (torn-read fix): hold the per-offset read guard for the whole read.
     // The metadata header can straddle a device-block boundary (packed records
@@ -1039,7 +1051,29 @@ pub fn read_metadata(device: &dyn BlockDevice, record_offset: u64) -> Result<TxM
     // the trait/cache path did not. Excludes `write_metadata`/`write_utxo_slot`/
     // `write_record_bytes` (all take the write side) for the same offset.
     let _r = io_locks().read(record_offset);
+    read_metadata_unguarded(device, record_offset)
+}
 
+/// Read the [`TxMetadata`] header of a record at `record_offset` WITHOUT
+/// acquiring the per-record striped read guard.
+///
+/// This is the raw aligned `pread` + parse that backs [`read_metadata`]. It
+/// exists for callers that ALREADY hold [`record_read_guard`] (or
+/// [`record_write_guard`]) for `record_offset` and need a second, coherent
+/// device read under that same held guard — e.g. `read_block_entry`, which
+/// reads the metadata header and the overflow-block region as one snapshot
+/// (the F-G2-001 ABA fix). Because [`read_metadata`] self-acquires the same
+/// non-reentrant striped `RwLock`, calling it under an already-held guard would
+/// deadlock behind a queued writer; this variant takes no lock, relying on the
+/// outer guard for torn-read exclusion.
+///
+/// # Torn-read safety
+///
+/// The caller MUST hold the striped read (or write) guard for `record_offset`
+/// across the call. Called with no such guard held, this is only safe on a
+/// quiescent device (e.g. single-threaded boot recovery); a concurrent
+/// `write_metadata` could otherwise be observed torn.
+pub fn read_metadata_unguarded(device: &dyn BlockDevice, record_offset: u64) -> Result<TxMetadata> {
     let align = device.alignment();
 
     // Record offset must be aligned (allocator guarantees this).
