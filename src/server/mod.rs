@@ -2576,8 +2576,14 @@ mod tests {
     /// Build a 32-byte txid whose LAST 8 bytes are the little-endian `tail`.
     /// Placement (`StorePlacer::place` in Txid mode) and dispatch routing both
     /// key on these last 8 bytes, so `tail` directly selects the store/shard.
+    ///
+    /// The FIRST 8 bytes are also set to `tail` so each txid is a distinct key
+    /// in the slim primary index (which stores only txid[0..12]); store
+    /// placement and dispatch routing still key on the last 8 bytes, so this
+    /// does not change which store a txid lands on.
     fn txid_with_tail(tail: u64) -> [u8; 32] {
         let mut t = [0u8; 32];
+        t[0..8].copy_from_slice(&tail.to_le_bytes());
         t[24..32].copy_from_slice(&tail.to_le_bytes());
         t
     }

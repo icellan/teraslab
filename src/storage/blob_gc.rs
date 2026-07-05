@@ -122,9 +122,12 @@ impl BlobGcStats {
 pub enum LookupOutcome {
     /// No primary-index entry exists for this txid — orphan, delete.
     NoEntry,
-    /// Index entry exists; carries the cached `tx_flags` so the GC can check
-    /// for [`TxFlags::EXTERNAL`].
-    Found { tx_flags: u8 },
+    /// A primary-index entry exists. `external` is read from the record's
+    /// on-device [`TxFlags::EXTERNAL`] footer flag (the slim primary index no
+    /// longer caches flags); `true` means the record owns this blob and it is
+    /// KEPT, `false` means the entry does not reference a blob so the blob is
+    /// debris to be deleted.
+    Found { external: bool },
 }
 
 /// Walk every blob in `blob_store` and delete every blob whose primary-index
@@ -209,9 +212,8 @@ where
         // blob is debris from a prior failed create whose registration ended
         // up referring to the inline / separate-tier path instead.
         let classified_found = match lookup(&key) {
-            LookupOutcome::Found { tx_flags } => {
-                let flags = TxFlags::from_bits_truncate(tx_flags);
-                if flags.contains(TxFlags::EXTERNAL) {
+            LookupOutcome::Found { external } => {
+                if external {
                     stats.kept += 1;
                     continue;
                 }
@@ -233,13 +235,7 @@ where
         let outcome = match pins {
             Some(p) => p.delete_orphan_guarded(
                 &txid,
-                || {
-                    !matches!(
-                        lookup(&key),
-                        LookupOutcome::Found { tx_flags }
-                            if TxFlags::from_bits_truncate(tx_flags).contains(TxFlags::EXTERNAL)
-                    )
-                },
+                || !matches!(lookup(&key), LookupOutcome::Found { external: true }),
                 || blob_store.delete(&txid),
             ),
             None => blob_store.delete(&txid).map(|()| PinSweepOutcome::Deleted),
@@ -291,11 +287,23 @@ where
 pub fn reconcile_orphan_blobs_against_index(
     blob_store: &dyn BlobStore,
     index: &ShardedIndex,
+    devices: &[Arc<dyn crate::device::BlockDevice>],
 ) -> Result<BlobGcStats, BlobError> {
     reconcile_orphan_blobs_with(blob_store, |key| match index.lookup(key) {
-        Some(entry) => LookupOutcome::Found {
-            tx_flags: entry.tx_flags,
-        },
+        Some(entry) => {
+            // The slim primary index no longer caches `tx_flags`, so read the
+            // record's EXTERNAL flag from its on-device footer via the entry's
+            // locator. On ANY ambiguity (device out of range, unreadable /
+            // CRC-failed footer, or a footer whose `tx_id` does not match this
+            // key) keep the blob — never delete a possibly-referenced blob on
+            // an uncertain read; the periodic engine sweep re-examines it.
+            let external = devices
+                .get(entry.device_id as usize)
+                .and_then(|dev| crate::io::read_metadata(dev.as_ref(), entry.record_offset).ok())
+                .map(|meta| meta.tx_id != key.txid || meta.flags.contains(TxFlags::EXTERNAL))
+                .unwrap_or(true);
+            LookupOutcome::Found { external }
+        }
         None => LookupOutcome::NoEntry,
     })
 }
@@ -318,11 +326,19 @@ pub fn reconcile_orphan_blobs(
     blob_store: &dyn BlobStore,
     engine: &Engine,
 ) -> Result<BlobGcStats, BlobError> {
-    let mut lookup = |key: &TxKey| match engine.lookup(key) {
-        Some(entry) => LookupOutcome::Found {
-            tx_flags: entry.tx_flags,
+    // The slim primary index no longer caches `tx_flags`, so consult the
+    // record's on-device footer for the EXTERNAL flag. `engine.read_metadata`
+    // resolves the locator AND verifies `meta.tx_id == key.txid` (F-G2-001):
+    // a `TxNotFound` (absent or offset aliased to another record) means no
+    // live record owns this blob → treat as `NoEntry` (delete the orphan). A
+    // transient storage error keeps the blob (conservative — never delete a
+    // possibly-referenced blob on an uncertain read).
+    let mut lookup = |key: &TxKey| match engine.read_metadata(key) {
+        Ok(meta) => LookupOutcome::Found {
+            external: meta.flags.contains(TxFlags::EXTERNAL),
         },
-        None => LookupOutcome::NoEntry,
+        Err(crate::ops::error::SpendError::TxNotFound) => LookupOutcome::NoEntry,
+        Err(_) => LookupOutcome::Found { external: true },
     };
     reconcile_orphan_blobs_with_filter(
         blob_store,
@@ -466,21 +482,33 @@ mod tests {
         t
     }
 
-    /// Insert a primary-index entry whose `tx_flags` includes the given
-    /// flags. Used to simulate "blob-owning" or "non-blob-owning" records
-    /// without going through the full create pipeline (which is what the
-    /// crash window we are GC'ing tries to skip).
+    /// Write a real on-device record carrying `flags` and register its locator
+    /// in the primary index. The slim primary index no longer caches
+    /// `tx_flags`, so the blob-GC sweep reads the [`TxFlags::EXTERNAL`] bit from
+    /// the record's on-device footer via `engine.read_metadata`; the footer
+    /// must therefore actually exist (with a matching `tx_id`) for the sweep to
+    /// classify the blob as blob-owning vs. orphan debris.
     fn insert_index_entry(engine: &Engine, key: &[u8; 32], flags: TxFlags) {
+        use crate::record::{TxMetadata, UtxoSlot};
+
+        let utxo_count = 1u32;
+        let mut meta = TxMetadata::new(utxo_count);
+        meta.tx_id = *key;
+        meta.flags = flags;
+
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let offset = {
+            let mut alloc = engine.allocator().lock();
+            alloc.allocate(record_size).expect("allocate record")
+        };
+
+        let slots = vec![UtxoSlot::new_unspent([0u8; 32]); utxo_count as usize];
+        crate::io::write_full_record(engine.device(), offset, &meta, &slots)
+            .expect("write record footer");
+
         let entry = crate::index::TxIndexEntry {
             device_id: 0,
-            record_offset: 0,
-            utxo_count: 0,
-            block_entry_count: 0,
-            tx_flags: flags.bits(),
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
+            record_offset: offset,
         };
         engine
             .register(crate::index::TxKey { txid: *key }, entry)

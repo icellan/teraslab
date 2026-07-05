@@ -15,7 +15,7 @@
 //!
 //! Routing reuses the SAME hashing as the primary
 //! ([`crate::index::sharded::shard_for_key`]: SplitMix64 finaliser over txid
-//! bytes `[24..32]`, masked by `shard_count - 1`) under the SAME process seed
+//! bytes `[4..12]`, masked by `shard_count - 1`) under the SAME process seed
 //! ([`crate::index::sharded::index_shard_seed`]). A given key therefore maps to
 //! the same shard NUMBER in the primary and both secondaries — which keeps the
 //! cross-subsystem lock-order reasoning simple: the per-key secondary shard lock

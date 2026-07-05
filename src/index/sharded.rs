@@ -7,7 +7,7 @@
 //!
 //! # Shard selection
 //!
-//! The shard is derived from bytes `[24..32]` of the txid via a SplitMix64
+//! The shard is derived from bytes `[8..12]` of the txid via a SplitMix64
 //! finaliser XOR-ed with a per-process random seed. The byte range is disjoint
 //! from:
 //! - bucket hash in [`crate::index::hashtable`] which uses `[0..8]`, and
@@ -15,7 +15,7 @@
 //!
 //! # Construction
 //!
-//! ```rust,ignore
+//! ```text
 //! let idx = ShardedIndex::new_in_memory(1_000_000, 16)?;
 //! ```
 //!
@@ -30,11 +30,9 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::cluster::shards::ShardTable;
 use crate::device::BlockDevice;
 use crate::index::backend::PrimaryBackend;
-use crate::index::redb_primary::CachedFieldsUpdate;
 use crate::index::{
     DahIndex, Index, IndexError, IndexStats, RestoreFlags, TxIndexEntry, TxKey, UnminedIndex,
 };
-use crate::record::TxFlags;
 
 // ---------------------------------------------------------------------------
 // v2 N-shard snapshot format
@@ -89,7 +87,18 @@ pub(crate) fn index_shard_seed() -> u64 {
 }
 
 /// Map `key` to a shard in `[0, shard_count)` using the SplitMix64 finaliser
-/// over txid bytes `[24..32]` XOR-ed with `seed`.
+/// over txid bytes `[8..12]` XOR-ed with `seed`.
+///
+/// # Why bytes `[8..12]`
+///
+/// The slim primary index stores only `txid[0..12]`, so iteration yields a
+/// 12-byte-prefix key (bytes 12.. zeroed). The index router MUST hash bytes
+/// that survive that truncation, otherwise an enumerated key would route to a
+/// different shard than its full-key form — breaking every enumeration-based
+/// routing path (rebuild-reshard, `register_batch`/`unregister_batch`
+/// grouping, snapshot restore). Bytes `[8..12]` are within the stored prefix
+/// (so truncation is shard-invariant) AND disjoint from the bucket bytes
+/// `[0..8]`, so shard placement is independent of intra-shard bucket placement.
 ///
 /// `shard_count` MUST be a power of two ≥ 1 (every constructor in this crate
 /// routes through `clamp_shard_count`), so `shard_count - 1` is the correct
@@ -100,7 +109,7 @@ pub(crate) fn shard_for_key(seed: u64, key: &TxKey, shard_count: usize) -> usize
     // The `try_into` on a statically-32-byte array with a fixed slice range
     // cannot fail; `unwrap_or` maps the impossible error to 0 (panic-free
     // library code per project rules, mirroring `locks.rs`).
-    let raw = u64::from_le_bytes(key.txid[24..32].try_into().unwrap_or([0u8; 8]));
+    let raw = u32::from_le_bytes(key.txid[8..12].try_into().unwrap_or([0u8; 4])) as u64;
     // SplitMix64 finalizer over (raw XOR seed) — shared impl in
     // `crate::index::hashmix`.
     let x = crate::index::hashmix::splitmix64_finalize(raw ^ seed);
@@ -221,7 +230,7 @@ impl ShardedIndex {
 
     /// Compute which shard a key belongs to.
     ///
-    /// Uses bytes `[24..32]` of the txid (disjoint from bucket `[0..8]` and
+    /// Uses bytes `[8..12]` of the txid (disjoint from bucket `[0..8]` and
     /// stripe `[16..24]`) XOR-mixed with the per-process seed through a
     /// SplitMix64 finaliser.
     pub fn index_shard_for_key(&self, key: &TxKey) -> usize {
@@ -325,36 +334,6 @@ impl ShardedIndex {
         self.write_shard(key).unregister_checked(key)
     }
 
-    /// Update the cached fields in the index entry for `key`.
-    ///
-    /// Returns `Ok(true)` if the key was found and updated, `Ok(false)` if
-    /// absent. Acquires an exclusive write lock on the owning shard.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`IndexError`] from the redb backend on commit failure.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_cached_fields(
-        &self,
-        key: &TxKey,
-        tx_flags: u8,
-        block_entry_count: u8,
-        spent_utxos: u32,
-        dah_or_preserve: u32,
-        unmined_since: u32,
-        generation: u32,
-    ) -> Result<bool, IndexError> {
-        self.write_shard(key).update_cached_fields(
-            key,
-            tx_flags,
-            block_entry_count,
-            spent_utxos,
-            dah_or_preserve,
-            unmined_since,
-            generation,
-        )
-    }
-
     // -----------------------------------------------------------------------
     // Batch operations — group by shard, one lock acquisition per shard
     // -----------------------------------------------------------------------
@@ -413,9 +392,8 @@ impl ShardedIndex {
                 continue;
             }
             // Collect just the keys for this shard into a contiguous slice so
-            // we can call `unregister_batch` once per shard (mirrors how
-            // `update_cached_fields_batch` delegates in a single call per
-            // shard).
+            // we can call `unregister_batch` once per shard (one lock
+            // acquisition per shard).
             let shard_keys: Vec<TxKey> = items.iter().map(|&(_, k)| k).collect();
             let mut guard = self.shards[shard_idx].write();
             let shard_results = guard.unregister_batch(&shard_keys)?;
@@ -424,38 +402,6 @@ impl ShardedIndex {
             }
         }
         Ok(results)
-    }
-
-    /// Update cached fields for multiple entries.
-    ///
-    /// Updates are grouped by shard so each shard lock is acquired at most
-    /// once. Returns the total number of entries that were found and updated.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`IndexError`] from the redb backend on commit failure.
-    pub fn update_cached_fields_batch(
-        &self,
-        updates: &[CachedFieldsUpdate],
-    ) -> Result<usize, IndexError> {
-        let shard_count = self.shards.len();
-        // Group update indices by shard.
-        let mut by_shard: Vec<Vec<usize>> = vec![Vec::new(); shard_count];
-        for (i, u) in updates.iter().enumerate() {
-            by_shard[self.index_shard_for_key(&u.key)].push(i);
-        }
-
-        let mut total = 0usize;
-        for (shard_idx, indices) in by_shard.iter().enumerate() {
-            if indices.is_empty() {
-                continue;
-            }
-            let shard_updates: Vec<CachedFieldsUpdate> =
-                indices.iter().map(|&i| updates[i].clone()).collect();
-            let mut guard = self.shards[shard_idx].write();
-            total += guard.update_cached_fields_batch(&shard_updates)?;
-        }
-        Ok(total)
     }
 
     // -----------------------------------------------------------------------
@@ -662,18 +608,6 @@ impl ShardedIndex {
             }
         });
         result
-    }
-
-    /// Invoke `f` for every key whose `CONFLICTING` flag is set.
-    ///
-    /// Used to rebuild the in-memory conflicting index after recovery.
-    /// Iterates the primary index; never touches the device.
-    pub fn for_each_conflicting(&self, mut f: impl FnMut(TxKey)) {
-        self.for_each(|k, e| {
-            if TxFlags::from_bits_truncate(e.tx_flags).contains(TxFlags::CONFLICTING) {
-                f(k);
-            }
-        });
     }
 
     // -----------------------------------------------------------------------
@@ -1362,24 +1296,24 @@ mod tests {
 
     fn make_key(n: u64) -> TxKey {
         let mut txid = [0u8; 32];
+        // The slim primary index stores only txid[0..12], so iteration and
+        // snapshot round-trips yield that 12-byte prefix (zero-padded). Keep
+        // all identifying bytes within [0..12] so truncation is lossless and
+        // these tests can compare enumerated/round-tripped keys to the
+        // originals. Shard routing uses txid[0..2] (see `ShardTable`), so
+        // varying byte 0..8 still spreads keys across shards.
         txid[0..8].copy_from_slice(&n.to_le_bytes());
-        txid[8..16].copy_from_slice(&n.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
-        // Vary bytes [24..32] so keys spread across shards
-        txid[24..32].copy_from_slice(&n.wrapping_mul(0x517C_C1B7_2722_0A95).to_le_bytes());
+        txid[8..12].copy_from_slice(&(n.wrapping_mul(0x9E3779B9) as u32).to_le_bytes());
         TxKey { txid }
     }
 
     fn make_entry(offset: u64) -> TxIndexEntry {
+        // `record_offset` values get inserted into the in-memory hash table,
+        // whose bucket codec requires 8-aligned offsets; multiplying the
+        // caller-supplied offset by 8 keeps every literal aligned.
         TxIndexEntry {
             device_id: 0,
-            record_offset: offset,
-            utxo_count: 10,
-            block_entry_count: 2,
-            tx_flags: 0x05,
-            spent_utxos: 3,
-            dah_or_preserve: 100,
-            unmined_since: 500,
-            generation: 7,
+            record_offset: offset * 8,
         }
     }
 
@@ -1419,7 +1353,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("wrapped key {i} missing"));
             assert_eq!(
                 entry.record_offset,
-                i * 4,
+                i * 4 * 8,
                 "wrong offset for wrapped key {i}"
             );
         }
@@ -1479,7 +1413,11 @@ mod tests {
             let e = restored
                 .lookup(&make_key(i))
                 .unwrap_or_else(|| panic!("restored key {i} missing"));
-            assert_eq!(e.record_offset, i * 2, "restored offset wrong for key {i}");
+            assert_eq!(
+                e.record_offset,
+                i * 2 * 8,
+                "restored offset wrong for key {i}"
+            );
         }
 
         // Multi-shard snapshot now writes v2 and round-trips through the
@@ -1510,7 +1448,7 @@ mod tests {
 
     /// Verify that the SplitMix64 shard hash distributes uniformly (±20% of
     /// mean) and that shard assignment is deterministic and only depends on
-    /// bytes `[24..32]` of the txid.
+    /// bytes `[8..12]` of the txid.
     #[test]
     fn routing_distribution() {
         for &shard_count in &[1usize, 4, 16] {
@@ -1521,8 +1459,8 @@ mod tests {
             let n = 100_000usize;
             for i in 0..n {
                 let mut txid = [0u8; 32];
-                // Drive shard assignment via [24..32]
-                txid[24..32].copy_from_slice(&(i as u64).to_le_bytes());
+                // Drive shard assignment via [8..12]
+                txid[8..12].copy_from_slice(&(i as u32).to_le_bytes());
                 // Also vary other bytes to exercise realistic inputs
                 txid[0..8]
                     .copy_from_slice(&(i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
@@ -1542,7 +1480,7 @@ mod tests {
 
             // Deterministic: same key → same shard
             let mut txid = [0u8; 32];
-            txid[24..32].copy_from_slice(&42u64.to_le_bytes());
+            txid[8..12].copy_from_slice(&42u32.to_le_bytes());
             let key = TxKey { txid };
             let s1 = idx.index_shard_for_key(&key);
             let s2 = idx.index_shard_for_key(&key);
@@ -1636,7 +1574,7 @@ mod tests {
         let mut by_shard: std::collections::HashMap<usize, TxKey> = Default::default();
         for i in 0u64..100_000 {
             let mut txid = [0u8; 32];
-            txid[24..32].copy_from_slice(&i.to_le_bytes());
+            txid[8..12].copy_from_slice(&(i as u32).to_le_bytes());
             let key = TxKey { txid };
             let s = idx.index_shard_for_key(&key);
             by_shard.entry(s).or_insert(key);
@@ -1655,8 +1593,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Verify that ShardedIndex produces byte-identical results to a plain
-    /// PrimaryBackend oracle for register / lookup / update / unregister and
-    /// their batch variants.
+    /// PrimaryBackend oracle for register / lookup / unregister and their
+    /// batch variants.
     #[test]
     fn per_key_crud_parity() {
         let sharded = ShardedIndex::new_in_memory(2000, 16).unwrap();
@@ -1676,32 +1614,6 @@ mod tests {
             let sharded_result = sharded.lookup(&key);
             let oracle_result = oracle.lookup(&key);
             assert_eq!(sharded_result, oracle_result, "lookup mismatch for key {i}",);
-        }
-
-        // Update cached fields for the first half
-        for i in 0..500u64 {
-            let key = make_key(i);
-            let sharded_updated = sharded
-                .update_cached_fields(&key, 0xAA, 3, 7, 100, 200, 42)
-                .unwrap();
-            let oracle_updated = oracle
-                .update_cached_fields(&key, 0xAA, 3, 7, 100, 200, 42)
-                .unwrap();
-            assert_eq!(
-                sharded_updated, oracle_updated,
-                "update_cached_fields return mismatch for key {i}"
-            );
-        }
-
-        // Verify updated fields match
-        for i in 0..500u64 {
-            let key = make_key(i);
-            let sharded_entry = sharded.lookup(&key).unwrap();
-            let oracle_entry = oracle.lookup(&key).unwrap();
-            assert_eq!(
-                sharded_entry, oracle_entry,
-                "entry mismatch after update for key {i}",
-            );
         }
 
         // Unregister the second half
@@ -1995,41 +1907,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 10: conflicting_scan_returns_correct_keys
-    // -----------------------------------------------------------------------
-
-    /// `for_each_conflicting` must return exactly the keys with CONFLICTING set.
-    #[test]
-    fn conflicting_scan_returns_correct_keys() {
-        use crate::record::TxFlags;
-        use std::collections::HashSet;
-
-        let sharded = ShardedIndex::new_in_memory(500, 16).unwrap();
-
-        // Register 100 keys; mark every third one as CONFLICTING
-        let mut expected_conflicting: HashSet<[u8; 32]> = HashSet::new();
-        for i in 0..100u64 {
-            let key = make_key(i);
-            let mut entry = make_entry(i * 16);
-            if i % 3 == 0 {
-                entry.tx_flags |= TxFlags::CONFLICTING.bits();
-                expected_conflicting.insert(key.txid);
-            }
-            sharded.register(key, entry).unwrap();
-        }
-
-        let mut got: HashSet<[u8; 32]> = HashSet::new();
-        sharded.for_each_conflicting(|k| {
-            got.insert(k.txid);
-        });
-
-        assert_eq!(
-            got, expected_conflicting,
-            "for_each_conflicting returned wrong set of keys"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // Test 11: flush_durable_ok_on_memory_backend
     // -----------------------------------------------------------------------
 
@@ -2103,7 +1980,7 @@ mod tests {
             let entry = sharded
                 .lookup(&make_key(i))
                 .unwrap_or_else(|| panic!("key {i} not found after resize"));
-            assert_eq!(entry.record_offset, i * 8, "wrong offset for key {i}");
+            assert_eq!(entry.record_offset, i * 8 * 8, "wrong offset for key {i}");
         }
 
         // Out-of-range shard_idx must return an error
@@ -2119,7 +1996,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::index::{DahBackend, DahIndex, UnminedBackend, UnminedIndex};
-    use crate::record::TxFlags;
 
     /// Collect every `(key, entry)` from a `ShardedIndex` into a txid-keyed map
     /// for order-agnostic content comparison.
@@ -2146,8 +2022,8 @@ mod tests {
     }
 
     /// Test 1: a v2 N=16 snapshot round-trips — every key lands back in its own
-    /// shard, dah/unmined match, and per-entry flags (CONFLICTING /
-    /// HAS_PRESERVE_UNTIL) are preserved.
+    /// shard, its on-device locator (`device_id` / `record_offset`) is
+    /// preserved, and dah/unmined match.
     #[test]
     fn v2_roundtrip_n16() {
         let dir = tempfile::tempdir().unwrap();
@@ -2156,16 +2032,9 @@ mod tests {
         let sharded = ShardedIndex::new_in_memory(4000, 16).unwrap();
         assert_eq!(sharded.shard_count(), 16);
 
-        // Register a spread of keys; vary flags so the bits are non-trivial.
+        // Register a spread of keys with varying on-device locators.
         for i in 0..2000u64 {
-            let mut entry = make_entry(i * 7 + 1);
-            if i % 5 == 0 {
-                entry.tx_flags |= TxFlags::CONFLICTING.bits();
-            }
-            if i % 7 == 0 {
-                entry.tx_flags |= TxFlags::HAS_PRESERVE_UNTIL.bits();
-                entry.dah_or_preserve = 5_000 + i as u32;
-            }
+            let entry = make_entry(i * 7 + 1);
             sharded.register(make_key(i), entry).unwrap();
         }
 
@@ -2709,11 +2578,6 @@ mod tests {
             assert_eq!(
                 entry.record_offset, oracle_entry.record_offset,
                 "record_offset disagrees with oracle for key {:?}",
-                key.txid
-            );
-            assert_eq!(
-                entry.utxo_count, oracle_entry.utxo_count,
-                "utxo_count disagrees with oracle for key {:?}",
                 key.txid
             );
         }

@@ -431,13 +431,6 @@ fn main() {
         let entry = teraslab::index::TxIndexEntry {
             device_id: 0,
             record_offset: (i as u64) * 4096,
-            utxo_count: 5,
-            block_entry_count: 1,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
         };
         index.register(key, entry).unwrap();
     }
@@ -471,28 +464,9 @@ fn main() {
         let entry = teraslab::index::TxIndexEntry {
             device_id: 0,
             record_offset: (tx_i as u64) * 4096,
-            utxo_count: 5,
-            block_entry_count: 1,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
         };
         let _ = index.register(key, entry);
         tx_i += 1;
-    });
-
-    let mut tx_i = 0u32;
-    measure("index::update_cached_fields", n, || {
-        let key = TxKey {
-            txid: make_tx_id(tx_i),
-        };
-        index.update_cached_fields(&key, 0x01, 2, tx_i, 0, 0, tx_i + 1);
-        tx_i += 1;
-        if tx_i >= 100_000 {
-            tx_i = 0;
-        }
     });
 
     drop(index);

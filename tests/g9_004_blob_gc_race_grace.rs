@@ -41,6 +41,29 @@ fn build_engine() -> Engine {
     Engine::new(device, index, allocator, locks, dah, unmined)
 }
 
+/// Write a real EXTERNAL-flagged record for `key` on the engine's device via
+/// its allocator, returning the record offset. The slim primary index no
+/// longer caches `tx_flags`, so blob GC reads the EXTERNAL flag from this
+/// on-device footer.
+fn write_external_record(engine: &Engine, key: [u8; 32]) -> u64 {
+    use teraslab::record::{TxMetadata, UtxoSlot};
+
+    let utxo_count = 1u32;
+    let mut meta = TxMetadata::new(utxo_count);
+    meta.tx_id = key;
+    meta.flags = TxFlags::EXTERNAL;
+
+    let record_size = TxMetadata::record_size_for(utxo_count);
+    let offset = {
+        let mut alloc = engine.allocator().lock();
+        alloc.allocate(record_size).expect("allocate record")
+    };
+    let slots = vec![UtxoSlot::new_unspent([0u8; 32]); utxo_count as usize];
+    teraslab::io::write_full_record(engine.device(), offset, &meta, &slots)
+        .expect("write record footer");
+    offset
+}
+
 fn blob_path_for(
     base: &std::path::Path,
     prefix_depth: usize,
@@ -139,20 +162,19 @@ fn periodic_sweep_keeps_aged_blob_with_external_flagged_entry() {
     let aged_mtime = SystemTime::now() - PERIODIC_GC_MIN_BLOB_AGE - Duration::from_secs(10);
     set_file_mtime(&blob_path_for(&blob_dir, 2, &live), aged_mtime);
 
-    // Register the matching primary-index entry with EXTERNAL.
-    let entry = TxIndexEntry {
-        device_id: 0,
-        record_offset: 0,
-        utxo_count: 0,
-        block_entry_count: 0,
-        tx_flags: TxFlags::EXTERNAL.bits(),
-        spent_utxos: 0,
-        dah_or_preserve: 0,
-        unmined_since: 0,
-        generation: 0,
-    };
+    // The slim primary index no longer caches `tx_flags`, so the blob GC reads
+    // the EXTERNAL flag from the record's on-device footer. Write a real
+    // EXTERNAL record via the engine's allocator + device, then register its
+    // locator so `read_metadata` returns a genuine EXTERNAL flag.
+    let off = write_external_record(&engine, live);
     engine
-        .register(TxKey { txid: live }, entry)
+        .register(
+            TxKey { txid: live },
+            TxIndexEntry {
+                device_id: 0,
+                record_offset: off,
+            },
+        )
         .expect("register");
 
     let stats = reconcile_orphan_blobs(&store as &dyn BlobStore, &engine).unwrap();

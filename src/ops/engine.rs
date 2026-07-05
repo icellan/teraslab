@@ -1794,8 +1794,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Atomically update the primary in-memory cache AND both secondary
-    /// indexes under a single critical section.
+    /// Atomically update both secondary indexes under a single critical
+    /// section, holding the primary shard write lock across them.
     ///
     /// This is the reorg-safe mutation path used by `mark_on_longest_chain`
     /// (and any other op that moves both `unmined_since` and
@@ -1811,26 +1811,26 @@ impl Engine {
     ///    by `dispatch_visibility_barrier`: the write side acquires it before
     ///    any index/secondary lock, so a writer and the inverted-order
     ///    checkpoint can never hold one of these locks at the same time.
-    /// 3. Apply the primary in-memory cache update
-    ///    (`update_cached_fields`) while both secondary mutexes are also
-    ///    held, so any reader that consults a secondary index and then
+    /// 3. Hold the primary shard write lock while both secondary mutexes are
+    ///    mutated, so any reader that consults a secondary index and then
     ///    cross-checks the primary (which requires the index read lock,
     ///    forcing it to wait for the write lock to drop) observes a
-    ///    consistent pair (H1).
+    ///    consistent pair (H1). The slim primary has no cached metadata of
+    ///    its own to update — the authoritative metadata already lives in the
+    ///    on-device footer written before this call.
     /// 4. Apply the DAH redb mutation.
     /// 5. Apply the unmined redb mutation.
     /// 6. Release all locks.
     ///
     /// Because any reader that wants to consult a secondary index and
     /// then cross-check the primary MUST acquire the secondary mutex
-    /// first, holding both secondary mutexes across the primary update
-    /// closes the window where a reader could observe a primary whose
+    /// first, holding the primary write lock across the secondary mutations
+    /// closes the window where a reader could observe a secondary index whose
     /// `unmined_since` moved while the DAH still references the old
     /// height.
     fn sync_primary_and_both_secondary_atomic(
         &self,
         key: &TxKey,
-        metadata: &TxMetadata,
         old_dah: u32,
         new_dah: u32,
         old_unmined: u32,
@@ -1866,26 +1866,12 @@ impl Engine {
         // Phase 2: lock order = primary.write → dah → unmined (matches
         // Engine::snapshot_index and the set_mined fast path).
         //
-        // Inline the primary cache update here rather than calling
-        // `sync_index_cache` so the write guard is held across the
-        // secondary mutations — any secondary reader that tries to
-        // cross-check the primary will have to wait for our index write
-        // to drop, and by then the dah/unmined mutations are durable.
-        let preserve = { metadata.preserve_until };
-        let meta_dah = { metadata.delete_at_height };
-        let has_preserve = preserve != 0;
-        let dah_or_preserve = if has_preserve { preserve } else { meta_dah };
-        let mut tf = metadata.flags.bits();
-        if has_preserve {
-            tf |= TxFlags::HAS_PRESERVE_UNTIL.bits();
-        } else {
-            tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
-        }
-        // Hold a single shard write guard across the primary cache update AND
-        // the dah/unmined mutations below — preserving the original atomicity
-        // where a secondary reader cross-checking the primary must wait for
-        // this write to drop. At one shard this is the whole index, exactly as
-        // before; at N shards it is the shard owning `key`.
+        // The slim primary index carries no cached metadata to update here.
+        // We still take the shard WRITE guard and hold it across the
+        // dah/unmined mutations below so the H1 cross-check window stays
+        // closed: any secondary reader that consults a secondary index and
+        // then cross-checks the primary (gated by `read_shard(key)`) blocks
+        // on this guard until every secondary mutation here has landed.
         //
         // H1 under sharded secondaries: each `dah_index`/`unmined_index` call
         // below locks only the secondary shard owning `key` (dah and unmined
@@ -1893,24 +1879,8 @@ impl Engine {
         // wrappers → independent lock sets). Those shard locks are taken WHILE
         // `primary_guard` is held, so the lock order stays primary.write → dah →
         // unmined — never unmined-before-dah, never two secondary shards of one
-        // index at once. The H1 cross-check window is preserved because a
-        // secondary reader cross-checks the PRIMARY (gated by
-        // `read_shard(key)`), which still blocks on `primary_guard` until every
-        // secondary mutation here has landed.
-        let mut primary_guard = self.index.write_shard(key);
-        primary_guard
-            .update_cached_fields(
-                key,
-                tf,
-                metadata.block_entry_count,
-                metadata.spent_utxos,
-                dah_or_preserve,
-                metadata.unmined_since,
-                metadata.generation,
-            )
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("index update_cached_fields failed: {e}"),
-            })?;
+        // index at once.
+        let primary_guard = self.index.write_shard(key);
 
         if dah_changed {
             if old_dah != 0 {
@@ -2022,13 +1992,12 @@ impl Engine {
 
         self.sync_primary_and_both_secondary_atomic(
             key,
-            &meta,
             old_dah,
             delete_at_height,
             old_unmined,
             unmined_since,
         )?;
-        // The atomic helper handles primary cache + DAH + unmined; preserve is
+        // The atomic helper handles DAH + unmined; preserve is
         // not journaled (in-memory model) so it is updated separately here.
         // THE migration / replica-create choke point — without this a migrated
         // preserved record is invisible to this node's expiry sweep until the
@@ -2865,45 +2834,6 @@ impl Engine {
         }
     }
 
-    /// Update the cached fields in the primary index entry after a mutation.
-    /// Acquires a brief write lock on the index.
-    ///
-    /// Encodes `preserve_until` / `delete_at_height` into the shared
-    /// `dah_or_preserve` field with the `HAS_PRESERVE_UNTIL` discriminant bit.
-    ///
-    /// Returns an error if the index backend fails to persist the update
-    /// (only possible for the on-disk redb backend). Callers MUST propagate
-    /// the error: a silent failure here would leave the primary-index
-    /// durability-critical fields (DAH, `unmined_since`, `generation`) out of
-    /// sync with the on-device metadata footer.
-    #[inline]
-    fn sync_index_cache(&self, key: &TxKey, metadata: &TxMetadata) -> Result<(), SpendError> {
-        let preserve = { metadata.preserve_until };
-        let dah = { metadata.delete_at_height };
-        let has_preserve = preserve != 0;
-        let dah_or_preserve = if has_preserve { preserve } else { dah };
-        let mut tf = metadata.flags.bits();
-        if has_preserve {
-            tf |= TxFlags::HAS_PRESERVE_UNTIL.bits();
-        } else {
-            tf &= !TxFlags::HAS_PRESERVE_UNTIL.bits();
-        }
-        self.index
-            .update_cached_fields(
-                key,
-                tf,
-                metadata.block_entry_count,
-                metadata.spent_utxos,
-                dah_or_preserve,
-                metadata.unmined_since,
-                metadata.generation,
-            )
-            .map(|_| ())
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("index update_cached_fields failed: {e}"),
-            })
-    }
-
     /// Register a transaction in the index (for test setup).
     ///
     /// Also increments the matching shard count atomically with the
@@ -2953,33 +2883,84 @@ impl Engine {
         }
     }
 
+    /// Resolve a batch of record locators to their FULL 32-byte txids by
+    /// reading each record's on-device footer (`meta.tx_id`).
+    ///
+    /// The slim primary index stores only a 12-byte txid prefix, so iteration
+    /// cannot reconstruct the full txid. Consumers that ship, delete, or
+    /// tx_id-verify records (cluster migration) need the real 32 bytes, so the
+    /// engine-level key-enumeration helpers resolve them from the device here.
+    /// A record whose footer is unreadable (torn / relocated mid-scan) is
+    /// skipped with a warning rather than yielding a truncated key that would
+    /// fail every downstream `read_metadata` tx_id check.
+    fn resolve_full_keys(&self, locs: Vec<(u8, u64)>) -> Vec<TxKey> {
+        let mut out = Vec::with_capacity(locs.len());
+        for (device_id, offset) in locs {
+            match self.read_metadata_fast(device_id, offset) {
+                Ok(meta) => out.push(TxKey::from_bytes(meta.tx_id)),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "teraslab::engine",
+                        device_id,
+                        offset,
+                        err = %e,
+                        "key enumeration: record footer unreadable; skipping full-txid resolution",
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Iterate over all registered transaction keys (for migration scanning).
     ///
-    /// Returns a snapshot of all keys currently in the index. This acquires
-    /// a read lock briefly and collects all keys into a Vec.
+    /// Returns the FULL 32-byte txids currently registered, resolved from each
+    /// record's on-device footer (the slim index only stores a 12-byte
+    /// prefix). Locators are snapshotted under the index read lock, then the
+    /// device reads happen outside it.
     pub fn all_keys(&self) -> Vec<TxKey> {
-        self.index.all_keys()
+        let mut locs: Vec<(u8, u64)> = Vec::new();
+        self.index
+            .for_each(|_k, e| locs.push((e.device_id, e.record_offset)));
+        self.resolve_full_keys(locs)
     }
 
-    /// Return keys belonging to a specific shard.
+    /// Return the FULL txids of records belonging to a specific shard.
     ///
-    /// More efficient than `all_keys()` followed by filtering when only
-    /// a subset of shards is needed. Acquires the index read lock once
-    /// and filters inline, avoiding a full clone + filter pass.
+    /// Shard routing uses `txid[0..8]`, which the stored 12-byte prefix
+    /// preserves, so the shard filter is applied cheaply on the prefix key
+    /// first; only the survivors' full txids are resolved from the device.
     pub fn keys_for_shard(&self, shard: u16) -> Vec<TxKey> {
-        self.index.keys_for_shard(shard)
+        let mut locs: Vec<(u8, u64)> = Vec::new();
+        self.index.for_each(|k, e| {
+            if crate::cluster::shards::ShardTable::shard_for_key(&k) == shard {
+                locs.push((e.device_id, e.record_offset));
+            }
+        });
+        self.resolve_full_keys(locs)
     }
 
-    /// Group all keys by shard in a single index scan.
+    /// Group all keys by shard in a single index scan, resolving full txids.
     ///
-    /// Returns a HashMap from shard number to Vec of keys. This is O(N)
-    /// where N is the total number of index entries, compared to O(N * S)
-    /// if calling `keys_for_shard` for each shard S.
+    /// Returns a HashMap from shard number to Vec of FULL txids.
     pub fn keys_by_shard(&self) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        self.index.keys_by_shard()
+        let mut by_shard: std::collections::HashMap<u16, Vec<(u8, u64)>> =
+            std::collections::HashMap::new();
+        self.index.for_each(|k, e| {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+            by_shard
+                .entry(shard)
+                .or_default()
+                .push((e.device_id, e.record_offset));
+        });
+        by_shard
+            .into_iter()
+            .map(|(shard, locs)| (shard, self.resolve_full_keys(locs)))
+            .collect()
     }
 
-    /// Group keys by shard, but only for a specified set of shards.
+    /// Group keys by shard, but only for a specified set of shards, resolving
+    /// full txids from the device.
     ///
     /// More memory-efficient than `keys_by_shard()` when only a subset
     /// of shards need migration (common case: only outbound shards).
@@ -2988,7 +2969,21 @@ impl Engine {
         &self,
         shard_filter: &std::collections::HashSet<u16>,
     ) -> std::collections::HashMap<u16, Vec<TxKey>> {
-        self.index.keys_by_shard_filtered(shard_filter)
+        let mut by_shard: std::collections::HashMap<u16, Vec<(u8, u64)>> =
+            std::collections::HashMap::new();
+        self.index.for_each(|k, e| {
+            let shard = crate::cluster::shards::ShardTable::shard_for_key(&k);
+            if shard_filter.contains(&shard) {
+                by_shard
+                    .entry(shard)
+                    .or_default()
+                    .push((e.device_id, e.record_offset));
+            }
+        });
+        by_shard
+            .into_iter()
+            .map(|(shard, locs)| (shard, self.resolve_full_keys(locs)))
+            .collect()
     }
 
     /// Execute a batch of spends on a single transaction.
@@ -3536,7 +3531,6 @@ impl Engine {
             } else {
                 self.write_metadata_fast(device_id, record_offset, &metadata)?;
             }
-            self.sync_index_cache(&req.tx_key, &metadata)?;
         }
 
         // 9. Update DAH secondary index (two-phase durable) — both engines.
@@ -3703,8 +3697,6 @@ impl Engine {
                 self.write_metadata_fast(device_id, record_offset, &metadata)?;
             }
 
-            self.sync_index_cache(&req.tx_key, &metadata)?;
-
             // Update DAH secondary index (two-phase durable).
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
         }
@@ -3771,23 +3763,17 @@ impl Engine {
         // ---------------------------------------------------------------
         // FAST PATH: first-ever setMined (count == 0), write-only.
         //
-        // When no block entries exist yet, we can skip the metadata read
-        // entirely: no duplicates to check, no existing block_ids to
-        // return, DAH evaluation runs from cached index fields.
+        // When no block entries exist yet, we can skip the block-entry
+        // reconciliation: no duplicates to check, no existing block_ids to
+        // return. The slim primary no longer caches the block-entry count,
+        // so eligibility is decided from the authoritative on-device
+        // metadata read below (the RMW needs that read anyway).
         // ---------------------------------------------------------------
-        let cached_count = entry.block_entry_count;
-        if !req.unset_mined && cached_count == 0 && !self.device_ptr_for(device_id).is_null() {
-            // F-G2-011 / KO-11: read the authoritative on-device metadata
-            // up front and derive EVERY DAH/flag/counter input from it,
-            // never from the cached `entry`. The fast path already needs
-            // this read for the RMW (CRC must cover the full post-state),
-            // so it is free. The cached `entry` can be stale after a prior
-            // mutation that wrote metadata but failed at `sync_index_cache`
-            // (the device advanced while the cache did not). F-G2-011 fixed
-            // only `generation` from `meta`; KO-11 extends that to the DAH,
-            // preserve discriminant, flags, and the spent/unmined counters
-            // so a stale-cache scenario cannot write a wrong `old_dah`,
-            // mis-flagged `tf`, or wrong DAH-index delta.
+        if !req.unset_mined && !self.device_ptr_for(device_id).is_null() {
+            // Read the authoritative on-device metadata up front and derive
+            // EVERY DAH/flag/counter input from it. The fast path already
+            // needs this read for the RMW (CRC must cover the full
+            // post-state), so it is free.
             // SAFETY: `device_ptr` is non-null (the fast path is gated on
             // `!self.device_ptr_for(device_id).is_null()`) and live for the engine's
             // lifetime; `record_offset` is allocator-valid. The set_mined
@@ -3802,11 +3788,10 @@ impl Engine {
                 )?
             };
 
-            // Fast-path eligibility is the cache's `count == 0` signal; the
-            // fresh read must agree, otherwise the cache was stale about the
-            // block-entry count and writing into inline slot 0 would clobber
-            // an existing entry. Fall through to the slow path, which reads
-            // and reconciles the full entry list.
+            // Fast-path eligibility: the record must have no block entries
+            // yet. When it already does, writing into inline slot 0 would
+            // clobber an existing entry, so fall through to the slow path,
+            // which reads and reconciles the full entry list.
             if { meta.block_entry_count } != 0 {
                 // Re-read via the slow path below (it re-reads metadata).
             } else {
@@ -3876,26 +3861,6 @@ impl Engine {
                 unsafe {
                     io::write_metadata_direct(self.device_ptr_for(device_id), record_offset, &meta);
                 }
-
-                // Sync all cached fields to index from the post-state.
-                let dah_or_preserve = if has_preserve { preserve } else { new_dah };
-                let mut sync_tf = tf;
-                if has_preserve {
-                    sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
-                }
-                self.index
-                    .update_cached_fields(
-                        tx_key,
-                        sync_tf.bits(),
-                        new_count,
-                        meta_spent,
-                        dah_or_preserve,
-                        new_unmined,
-                        generation,
-                    )
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("index update_cached_fields failed: {e}"),
-                    })?;
 
                 // Update secondary indexes with two-phase durability.
                 // Batched into a single redo fsync when both change.
@@ -4103,7 +4068,6 @@ impl Engine {
 
         // Write full metadata (slow path)
         self.write_metadata_fast(device_id, record_offset, &metadata)?;
-        self.sync_index_cache(tx_key, &metadata)?;
 
         // Update secondary indexes with two-phase durability, batched.
         let new_dah = { metadata.delete_at_height };
@@ -4217,7 +4181,6 @@ impl Engine {
         let new_unmined = { metadata.unmined_since };
         self.sync_primary_and_both_secondary_atomic(
             &req.tx_key,
-            &metadata,
             old_dah,
             new_dah,
             old_unmined,
@@ -4388,13 +4351,6 @@ impl Engine {
         let index_entry = TxIndexEntry {
             device_id,
             record_offset,
-            utxo_count,
-            block_entry_count: meta.block_entry_count,
-            tx_flags: flags.bits(),
-            spent_utxos: { meta.spent_utxos },
-            dah_or_preserve: { meta.delete_at_height },
-            unmined_since: { meta.unmined_since },
-            generation: 0,
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
@@ -4749,13 +4705,6 @@ impl Engine {
         let index_entry = TxIndexEntry {
             device_id,
             record_offset,
-            utxo_count,
-            block_entry_count: meta.block_entry_count,
-            tx_flags: flags.bits(),
-            spent_utxos: { meta.spent_utxos },
-            dah_or_preserve: { meta.delete_at_height },
-            unmined_since: { meta.unmined_since },
-            generation: 0,
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
@@ -5188,13 +5137,6 @@ impl Engine {
         let new_entry = TxIndexEntry {
             device_id,
             record_offset: new_offset,
-            utxo_count,
-            block_entry_count: { metadata.block_entry_count },
-            tx_flags: { metadata.flags }.bits(),
-            spent_utxos: { metadata.spent_utxos },
-            dah_or_preserve: { metadata.delete_at_height },
-            unmined_since: { metadata.unmined_since },
-            generation: { metadata.generation },
         };
         self.index
             .register(*tx_key, new_entry)
@@ -5251,6 +5193,11 @@ impl Engine {
             })?
             .ok_or(SpendError::TxNotFound)?;
 
+        // Read the authoritative on-device metadata once: the slim primary no
+        // longer caches `tx_flags` / `utxo_count`, and both the EXTERNAL
+        // branch and the inline branch below need the footer anyway.
+        let meta = self.read_metadata_for_key(entry.device_id, key, entry.record_offset)?;
+
         // Check if cold data is in the external blobstore.
         //
         // F-IJ-005: branch on the EXTERNAL flag ALONE — not on the flag AND a
@@ -5261,12 +5208,11 @@ impl Engine {
         // empty" bug. There is no inline cold data for an EXTERNAL record, so
         // an unresolvable external blob is a typed integrity error, never
         // empty bytes.
-        if entry.tx_flags & TxFlags::EXTERNAL.bits() != 0 {
+        if meta.flags.contains(TxFlags::EXTERNAL) {
             let Some(ref blob_store) = self.blob_store else {
                 // F-IJ-005: no store configured to resolve the external blob.
                 return Err(SpendError::BlobNotFound { txid: key.txid });
             };
-            let meta = self.read_metadata_for_key(entry.device_id, key, entry.record_offset)?;
             match blob_store.get(&key.txid) {
                 Ok(Some(data)) => {
                     if data.len() as u64 != meta.external_ref.total_size {
@@ -5302,9 +5248,9 @@ impl Engine {
             }
         }
 
-        // Read metadata to determine record_size, then compute inline cold offset.
-        let meta = self.read_metadata_for_key(entry.device_id, key, entry.record_offset)?;
-        let cold_intra = crate::storage::tiers::inline_cold_offset(entry.utxo_count);
+        // Compute the inline cold offset from the record's utxo_count (read above).
+        let utxo_count = { meta.utxo_count };
+        let cold_intra = crate::storage::tiers::inline_cold_offset(utxo_count);
         let cold_size = (meta.record_size as u64).saturating_sub(cold_intra);
         if cold_size == 0 {
             return Ok(vec![]);
@@ -5484,7 +5430,6 @@ impl Engine {
         let new_dah = { meta.delete_at_height };
 
         self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
-        self.sync_index_cache(parent_key, &meta)?;
         // BUG-3: keep the DAH secondary index in lock-step with the cleared
         // on-record DAH so the now-prunable-by-other-means record stops
         // being re-scanned on every sweep.
@@ -5599,7 +5544,6 @@ impl Engine {
         let mut meta = self.read_metadata_fast(entry.device_id, entry.record_offset)?;
         meta.generation = generation;
         self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
-        self.sync_index_cache(key, &meta)?;
         Ok(true)
     }
 
@@ -5680,7 +5624,6 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(device_id, ro, &meta)?;
-        self.sync_index_cache(&req.tx_key, &meta)?;
         Ok(meta.generation)
     }
 
@@ -5734,7 +5677,6 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(device_id, ro, &meta)?;
-        self.sync_index_cache(&req.tx_key, &meta)?;
         Ok(meta.generation)
     }
 
@@ -5826,8 +5768,6 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(device_id, ro, &meta)?;
-
-        self.sync_index_cache(&req.tx_key, &meta)?;
 
         let generation = { meta.generation };
         Ok(generation)
@@ -6871,26 +6811,6 @@ impl Engine {
                 io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
             }
 
-            // Sync index cache from the post-state.
-            let dah_or_preserve = if has_preserve { preserve } else { new_dah };
-            let mut sync_tf = tf;
-            if has_preserve {
-                sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
-            }
-            self.index
-                .update_cached_fields(
-                    &req.tx_key,
-                    sync_tf.bits(),
-                    meta_block_count,
-                    meta_spent,
-                    dah_or_preserve,
-                    meta_unmined,
-                    generation,
-                )
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index update_cached_fields failed: {e}"),
-                })?;
-
             // Update DAH secondary index (two-phase durable)
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
@@ -6919,7 +6839,6 @@ impl Engine {
             }
 
             self.write_metadata_fast(device_id, ro, &meta)?;
-            self.sync_index_cache(&req.tx_key, &meta)?;
 
             let new_dah = { meta.delete_at_height };
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
@@ -7025,27 +6944,11 @@ impl Engine {
         let ro = entry.record_offset;
         let device_id = entry.device_id;
 
-        // Fast path: all needed state is in the index cache + 4-byte generation read.
+        // Fast path: direct-mapped device. Read the authoritative on-device
+        // metadata up front (the RMW needs it for the CRC anyway) and derive
+        // every flag/DAH/generation input from `meta` — the slim primary
+        // index no longer caches those fields.
         if !self.device_ptr_for(device_id).is_null() {
-            let mut tf = TxFlags::from_bits_truncate(entry.tx_flags);
-            let prior_locked = tf.contains(TxFlags::LOCKED);
-            let has_preserve = tf.contains(TxFlags::HAS_PRESERVE_UNTIL);
-            let old_dah = if has_preserve {
-                0
-            } else {
-                entry.dah_or_preserve
-            };
-
-            let new_dah = if req.value {
-                tf.insert(TxFlags::LOCKED);
-                0 // Locking clears deleteAtHeight
-            } else {
-                tf.remove(TxFlags::LOCKED);
-                old_dah // Unlocking doesn't change DAH
-            };
-
-            // Generation is cached in the index — zero device reads.
-            let generation = entry.generation.wrapping_add(1);
             let updated_at = self.now_millis();
 
             // Read-modify-write so CRC is computed over the complete
@@ -7058,41 +6961,29 @@ impl Engine {
             // `read_metadata_direct` and `write_metadata_direct` take the
             // per-offset `io_locks()` read/write side, so the RMW is
             // torn-read-safe against concurrent direct accessors.
-            unsafe {
+            let (generation, prior_locked, old_dah, new_dah) = unsafe {
                 let mut meta = io::read_metadata_direct(self.device_ptr_for(device_id), ro)
                     .map_err(|e| SpendError::StorageError {
                         detail: format!("{e}"),
                     })?;
-                meta.flags = tf;
+                // `old_dah` is what the DAH secondary index currently
+                // reflects: the on-device DAH (0 when preserved, since
+                // preservation clears it).
+                let old_dah = { meta.delete_at_height };
+                let prior_locked = meta.flags.contains(TxFlags::LOCKED);
+                if req.value {
+                    meta.flags.insert(TxFlags::LOCKED);
+                    meta.delete_at_height = 0; // Locking clears deleteAtHeight
+                } else {
+                    meta.flags.remove(TxFlags::LOCKED);
+                }
+                let generation = { meta.generation }.wrapping_add(1);
                 meta.generation = generation;
                 meta.updated_at = updated_at;
-                meta.delete_at_height = new_dah;
+                let new_dah = { meta.delete_at_height };
                 io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
-            }
-
-            // Sync index cache
-            let dah_or_preserve = if has_preserve {
-                entry.dah_or_preserve
-            } else {
-                new_dah
+                (generation, prior_locked, old_dah, new_dah)
             };
-            let mut sync_tf = tf;
-            if has_preserve {
-                sync_tf.insert(TxFlags::HAS_PRESERVE_UNTIL);
-            }
-            self.index
-                .update_cached_fields(
-                    &req.tx_key,
-                    sync_tf.bits(),
-                    entry.block_entry_count,
-                    entry.spent_utxos,
-                    dah_or_preserve,
-                    entry.unmined_since,
-                    generation,
-                )
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("index update_cached_fields failed: {e}"),
-                })?;
 
             // Update DAH secondary index (two-phase durable)
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
@@ -7122,7 +7013,6 @@ impl Engine {
         meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(device_id, ro, &meta)?;
-        self.sync_index_cache(&req.tx_key, &meta)?;
 
         let new_dah = { meta.delete_at_height };
         self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
@@ -7137,8 +7027,8 @@ impl Engine {
     /// Restore the exact pre-`set_locked` lock state and DAH during rollback.
     ///
     /// This is intentionally a rare-path helper: it uses metadata read/write
-    /// rather than the mmap fast path so compensation can update flags, primary
-    /// cache, and DAH secondary index in one place.
+    /// rather than the mmap fast path so compensation can update the flags and
+    /// DAH secondary index in one place.
     pub(crate) fn restore_set_locked_for_compensation(
         &self,
         key: &TxKey,
@@ -7166,7 +7056,6 @@ impl Engine {
         meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
-        self.sync_index_cache(key, &meta)?;
         self.update_dah_index(key, old_dah, delete_at_height)?;
 
         Ok(meta.generation)
@@ -7212,7 +7101,6 @@ impl Engine {
         // the discriminant bit; fast paths consulted the cache,
         // concluded `has_preserve = false`, and bypassed the
         // protection — premature pruning of preserved records.
-        self.sync_index_cache(&req.tx_key, &meta)?;
 
         if old_dah != 0 {
             self.update_dah_index(&req.tx_key, old_dah, 0)?;
@@ -7440,7 +7328,7 @@ impl Engine {
         // recheck reads metadata the unguarded path reads anyway, so the cost
         // is one extra `TxFlags` test. Direct client deletes
         // (`due_guard == None`) skip this and stay unconditional (spec §3.18).
-        let (record_size, device_preserve, device_dah, device_unmined) = {
+        let (record_size, device_preserve, device_dah, device_unmined, device_conflicting) = {
             let meta =
                 self.read_metadata_for_key(entry.device_id, &req.tx_key, entry.record_offset)?;
             if let Some(current_height) = req.due_guard
@@ -7463,6 +7351,7 @@ impl Engine {
                 { meta.preserve_until },
                 { meta.delete_at_height },
                 { meta.unmined_since },
+                meta.flags.contains(TxFlags::CONFLICTING),
             )
         };
 
@@ -7566,11 +7455,12 @@ impl Engine {
             self.update_preserve_index(&req.tx_key, device_preserve, 0)?;
         }
 
-        // Drop any conflicting-index entry for the deleted record. The cached
-        // entry's flags reflect the record's last-published CONFLICTING state;
+        // Drop any conflicting-index entry for the deleted record. The
+        // authoritative CONFLICTING flag was captured from the on-device
+        // footer above (the slim primary index no longer caches flags);
         // `remove` is a no-op if absent, so this covers all delete variants
         // (they route through `delete_inner`).
-        if TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::CONFLICTING) {
+        if device_conflicting {
             self.conflicting_index.lock().remove(&req.tx_key);
         }
 
@@ -7686,7 +7576,6 @@ impl Engine {
         meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(device_id, ro, &meta)?;
-        self.sync_index_cache(key, &meta)?;
         // Mutual-exclusion transition preserve -> DAH. Remove from the preserve
         // index BEFORE inserting into DAH so a concurrent reader range-querying
         // both indexes sees the key in NEITHER transiently (never BOTH),
@@ -7717,12 +7606,25 @@ impl Engine {
         let ro = entry.record_offset;
         let device_id = entry.device_id;
 
-        // Pre-slot bound from the cached index `utxo_count` (no device read).
-        // This only bounds the upcoming slot read into the offset's allocated
-        // extent; the *authoritative* bound is re-checked against the
-        // on-device identity below (which also closes the aliasing race).
-        if req.offset >= entry.utxo_count {
-            return Err(SpendError::UtxoNotFound { offset: req.offset });
+        // Bound the offset against the record's on-device `utxo_count` BEFORE
+        // the slot read. The slim primary no longer caches `utxo_count`, and an
+        // out-of-range offset would otherwise address unallocated space and
+        // surface a CRC error (`read_record_identity_and_slot`) instead of a
+        // clean `UtxoNotFound`. The identity block read is cheap and
+        // torn-read-safe; the AUTHORITATIVE snapshot check is still performed by
+        // the atomic identity+slot read below.
+        {
+            let id_pre = io::read_identity(&**self.device_for(device_id), ro).map_err(|e| {
+                SpendError::StorageError {
+                    detail: format!("{e}"),
+                }
+            })?;
+            if id_pre.tx_id != req.tx_key.txid {
+                return Err(SpendError::TxNotFound);
+            }
+            if req.offset >= id_pre.utxo_count {
+                return Err(SpendError::UtxoNotFound { offset: req.offset });
+            }
         }
 
         // F-G2-001: read the identity prefix AND the slot as ONE coherent
@@ -7819,33 +7721,31 @@ impl Engine {
     /// Returns [`SpendError::StorageError`] if a device metadata read or a
     /// backend insert/clear fails.
     pub fn rebuild_preserve_index_from_device(&self) -> Result<(), SpendError> {
-        // Snapshot the record locations under the index read lock (no I/O held
+        // Snapshot the record locators under the index read lock (no I/O held
         // under the lock), then read each footer and build the preserve set.
-        let mut locs: Vec<(u8, u64, TxKey)> = Vec::new();
-        self.index.for_each(|key, entry| {
-            locs.push((entry.device_id, entry.record_offset, key));
+        // The slim primary index yields only a 12-byte key prefix, so the
+        // authoritative full txid is taken from each record's on-device footer
+        // (`meta.tx_id`), not from the primary key.
+        let mut locs: Vec<(u8, u64)> = Vec::new();
+        self.index.for_each(|_key, entry| {
+            locs.push((entry.device_id, entry.record_offset));
         });
         let mut pairs: Vec<(u32, TxKey)> = Vec::with_capacity(locs.len());
-        for (device_id, offset, key) in locs {
-            // `read_metadata_for_key` validates `meta.tx_id == key.txid`
-            // (F-G2-001), so a delete+reuse race surfaces as TxNotFound rather
-            // than reading an unrelated record's preserve_until.
-            let meta = match self.read_metadata_for_key(device_id, &key, offset) {
+        for (device_id, offset) in locs {
+            let meta = match self.read_metadata_fast(device_id, offset) {
                 Ok(m) => m,
                 // P1-C: skip + warn on ANY read failure, never abort the boot.
-                // A record that vanished/aliased surfaces as TxNotFound; a torn
-                // / CRC-failed footer surfaces as StorageError. Either way the
+                // A torn / CRC-failed footer surfaces as StorageError; the
                 // record is unreadable, so it carries no indexable preservation
                 // this boot — skip it. Aborting (the previous behaviour) turned
-                // a single corrupt footer into a fatal boot loop, a brand-new
-                // failure mode the sibling `rebuild_conflicting_index`
-                // (cache-only, infallible) never had. A missing preserve entry
-                // only delays that record's expiry transition, which is
-                // harmless and self-heals once the record is read cleanly
-                // (recovery/scrub) or rewritten.
+                // a single corrupt footer into a fatal boot loop. A missing
+                // preserve entry only delays that record's expiry transition,
+                // which is harmless and self-heals once the record is read
+                // cleanly (recovery/scrub) or rewritten.
                 Err(e) => {
                     tracing::warn!(
-                        txid = ?key.txid,
+                        device_id,
+                        offset,
                         err = %e,
                         "rebuild_preserve_index: footer unreadable; skipping (preserve \
                          entry, if any, will be missing until the record is read cleanly)",
@@ -7855,7 +7755,7 @@ impl Engine {
             };
             let preserve = { meta.preserve_until };
             if preserve != 0 {
-                pairs.push((preserve, key));
+                pairs.push((preserve, TxKey::from_bytes(meta.tx_id)));
             }
         }
         let mut preserve = self.preserve_index.lock();
@@ -7877,19 +7777,46 @@ impl Engine {
         self.conflicting_index.lock()
     }
 
-    /// Rebuild the in-memory conflicting index by scanning the primary index.
+    /// Rebuild the in-memory conflicting index from authoritative device
+    /// metadata.
     ///
     /// Called once at startup after recovery has reconstructed the primary
-    /// index. Every record whose cached `tx_flags` carries
-    /// [`TxFlags::CONFLICTING`] (bit `0x02`) is inserted. Idempotent: clears
-    /// first, so re-running is safe. The conflicting index has no on-device
-    /// durability of its own; this is how it is re-derived after a crash.
+    /// index. The slim primary index no longer caches `tx_flags` and yields
+    /// only a 12-byte key prefix, so this mirrors
+    /// [`Self::rebuild_preserve_index_from_device`]: it snapshots the record
+    /// locators from the primary index, then reads each record's on-device
+    /// footer and inserts the full txid (`meta.tx_id`) when
+    /// [`TxFlags::CONFLICTING`] is set. Idempotent: clears first, so re-running
+    /// is safe. The conflicting index has no on-device durability of its own;
+    /// this is how it is re-derived after a crash. A footer that is unreadable
+    /// (torn / CRC-failed) is skipped with a warning rather than aborting boot.
     pub fn rebuild_conflicting_index(&self) {
+        // Snapshot locators under the index read lock; do device I/O outside it.
+        let mut locs: Vec<(u8, u64)> = Vec::new();
+        self.index.for_each(|_key, entry| {
+            locs.push((entry.device_id, entry.record_offset));
+        });
         let mut conflicting = self.conflicting_index.lock();
         conflicting.clear();
-        self.index.for_each_conflicting(|key| {
-            conflicting.insert(key);
-        });
+        for (device_id, offset) in locs {
+            match self.read_metadata_fast(device_id, offset) {
+                Ok(meta) => {
+                    if meta.flags.contains(TxFlags::CONFLICTING) {
+                        conflicting.insert(TxKey::from_bytes(meta.tx_id));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "teraslab::engine",
+                        device_id,
+                        offset,
+                        err = %e,
+                        "rebuild_conflicting_index: footer unreadable; skipping (a \
+                         conflicting record, if any, will be missing until read cleanly)",
+                    );
+                }
+            }
+        }
     }
 
     /// Read on-device metadata for a transaction.
@@ -7916,46 +7843,6 @@ impl Engine {
             })?
             .ok_or(SpendError::TxNotFound)?;
         self.read_metadata_for_key(entry.device_id, key, entry.record_offset)
-    }
-
-    /// Look up a transaction's cached index fields without reading device memory.
-    ///
-    /// Returns the `TxIndexEntry` directly from the primary index. Fields like
-    /// `tx_flags`, `spent_utxos`, `utxo_count`, `block_entry_count`,
-    /// `dah_or_preserve`, and `unmined_since` are cached and updated on every
-    /// mutation via `sync_index_cache`.
-    ///
-    /// Use this for GET requests where the field mask only covers cached fields
-    /// (see [`crate::protocol::codec::FieldMask::fully_cached`]).
-    ///
-    /// Propagates backend read errors (G-4): a transient redb failure
-    /// surfaces as an `IndexError` rather than collapsing to `None`,
-    /// which on a client GET path would falsely report the transaction as
-    /// absent.
-    pub fn lookup_cached_checked(
-        &self,
-        key: &TxKey,
-    ) -> Result<Option<TxIndexEntry>, crate::index::IndexError> {
-        self.index.lookup_checked(key)
-    }
-
-    /// Infallible convenience variant of [`Self::lookup_cached_checked`].
-    ///
-    /// G-4: collapses a backend read error into `None` after logging it.
-    /// For tests / internal diagnostics only; client-visible read paths
-    /// MUST use [`Self::lookup_cached_checked`].
-    pub fn lookup_cached(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        match self.index.lookup_checked(key) {
-            Ok(found) => found,
-            Err(e) => {
-                tracing::error!(
-                    target: "teraslab::engine",
-                    err = %e,
-                    "Engine::lookup_cached: index read failed; returning None (caller should use lookup_cached_checked)",
-                );
-                None
-            }
-        }
     }
 
     /// Read a single on-device UTXO slot.
@@ -8648,8 +8535,6 @@ impl PreparedSpend {
             } else {
                 engine.write_metadata_fast(device_id, record_offset, &metadata)?;
             }
-
-            engine.sync_index_cache(&tx_key, &metadata)?;
         }
 
         // 10. Update the DAH secondary index (two-phase durable). When the
@@ -9349,23 +9234,9 @@ mod tests {
 
             io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
 
-            let preserve = { meta.preserve_until };
-            let dah = { meta.delete_at_height };
-            let has_preserve = preserve != 0;
-            let mut ie_flags = meta.flags.bits();
-            if has_preserve {
-                ie_flags |= TxFlags::HAS_PRESERVE_UNTIL.bits();
-            }
             let ie = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
-                utxo_count,
-                block_entry_count: meta.block_entry_count,
-                tx_flags: ie_flags,
-                spent_utxos: { meta.spent_utxos },
-                dah_or_preserve: if has_preserve { preserve } else { dah },
-                unmined_since: { meta.unmined_since },
-                generation: 0,
             };
             index.register(key, ie).unwrap();
 
@@ -9440,17 +9311,9 @@ mod tests {
             .collect();
         io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
 
-        let ie_flags = meta.flags.bits();
         let ie = TxIndexEntry {
             device_id: 0,
             record_offset: offset,
-            utxo_count,
-            block_entry_count: meta.block_entry_count,
-            tx_flags: ie_flags,
-            spent_utxos: { meta.spent_utxos },
-            dah_or_preserve: { meta.delete_at_height },
-            unmined_since: { meta.unmined_since },
-            generation: 0,
         };
         index.register(key, ie).unwrap();
 
@@ -11107,13 +10970,6 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: offset,
-                    utxo_count,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 0,
                 },
             )
             .unwrap();
@@ -11260,7 +11116,8 @@ mod tests {
             .lookup(&key)
             .expect("key still indexed after relocate");
         assert_eq!(entry.record_offset, new_offset);
-        assert_eq!(entry.utxo_count, 4);
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.utxo_count }, 4);
 
         // The relocated image is byte-faithful: metadata identity + every slot.
         let m2 = io::read_metadata(&*dev, new_offset).unwrap();
@@ -11313,8 +11170,9 @@ mod tests {
         // what `replay_relocate` reconstructs from the device (live == recovered).
         let entry = engine.lookup(&key).unwrap();
         assert_eq!(entry.record_offset, new_offset);
-        assert_eq!(entry.spent_utxos, 1);
-        assert_eq!(entry.generation, 7);
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.spent_utxos }, 1);
+        assert_eq!({ meta.generation }, 7);
     }
 
     #[test]
@@ -11378,7 +11236,8 @@ mod tests {
         assert_eq!(s[1].spending_data, spending_data);
         let entry = engine.lookup(&key).unwrap();
         assert_eq!(entry.record_offset, new_offset);
-        assert_eq!(entry.generation, 9);
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.generation }, 9);
 
         // But it journaled NOTHING for this key — no relocate redo at all.
         engine.flush_all_redo().unwrap();
@@ -11427,9 +11286,11 @@ mod tests {
         assert_eq!(s[0].status, UTXO_UNSPENT);
         let m = io::read_metadata(&*dev, entry.record_offset).unwrap();
         assert_eq!({ m.spent_utxos }, 1);
+        let meta = engine.read_metadata(&key).unwrap();
         assert_eq!(
-            entry.spent_utxos, 1,
-            "index cache re-pointed to the new record"
+            { meta.spent_utxos },
+            1,
+            "index re-pointed to the new record"
         );
 
         // A second, different-vout spend relocates AGAIN and accumulates.
@@ -11694,13 +11555,6 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: o_live,
-                    utxo_count: 1,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 0,
                 },
             )
             .unwrap();
@@ -11784,7 +11638,7 @@ mod tests {
             "segment spend must relocate the record to a new offset"
         );
         let new_offset = entry.record_offset;
-        assert_eq!(entry.spent_utxos, 1);
+        assert_eq!({ engine.read_metadata(&key).unwrap().spent_utxos }, 1);
 
         // The spend landed at the NEW offset: slot 0 SPENT, others untouched.
         let s = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
@@ -11819,7 +11673,7 @@ mod tests {
             entry2.record_offset, new_offset,
             "second spend relocates again"
         );
-        assert_eq!(entry2.spent_utxos, 2);
+        assert_eq!({ engine.read_metadata(&key).unwrap().spent_utxos }, 2);
         // Both spends are visible at the latest offset.
         assert_eq!(engine.read_slot(&key, 0).unwrap().status, UTXO_SPENT);
         assert_eq!(engine.read_slot(&key, 1).unwrap().status, UTXO_SPENT);
@@ -11874,13 +11728,6 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
-                        utxo_count: 10,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -12438,48 +12285,18 @@ mod tests {
         assert!(at_new.contains(&h.key));
     }
 
-    /// KO-11 regression (set_conflicting fast path): when the cached index
-    /// entry is stale relative to the on-device metadata, the fast path must
-    /// derive `old_dah` / preserve / flags from the FRESH `meta`, never from
-    /// the stale cache.
-    ///
-    /// Repro: the on-device record is PRESERVED (`preserve_until` set, so its
-    /// DAH is necessarily 0), but the index cache lies — it shows a non-zero
-    /// `dah_or_preserve` interpreted as a DAH (no `HAS_PRESERVE_UNTIL`), as
-    /// would happen after a prior mutation wrote metadata but failed at
-    /// `sync_index_cache`. Pre-fix, set_conflicting read `has_preserve=false`
-    /// and `old_dah=1288` from the cache and re-synced the cache to a bogus
-    /// DAH of 1288 — resurrecting a deletable-looking record that is actually
-    /// preserved. Post-fix it reads `preserve_until` from `meta`, keeps the
-    /// DAH cleared, and re-syncs the cache to `dah_or_preserve=5000` with the
-    /// `HAS_PRESERVE_UNTIL` discriminant.
+    /// KO-11 regression (set_conflicting): setting a preserved record
+    /// conflicting must derive `old_dah` / preserve / flags from the on-device
+    /// metadata — the sole source of truth. A record with `preserve_until` set
+    /// (so its DAH is necessarily 0) must NOT gain a bogus DAH and must not
+    /// leak a DAH-index entry.
     #[test]
-    fn set_conflicting_fast_path_uses_fresh_meta_not_stale_cache() {
+    fn set_conflicting_preserved_record_keeps_dah_cleared() {
         // On-device record is preserved until height 5000 (DAH must be 0).
         let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
             m.preserve_until = 5000;
             m.delete_at_height = 0;
         });
-
-        // Poison the cache: pretend a prior failed `sync_index_cache` left a
-        // stale DAH (1288) with NO preserve discriminant, while the device
-        // sits at preserve_until=5000.
-        {
-            let updated = h
-                .engine
-                .index
-                .update_cached_fields(
-                    &h.key,
-                    TxFlags::empty().bits(), // no HAS_PRESERVE_UNTIL
-                    0,                       // block_entry_count
-                    0,                       // spent_utxos
-                    1288,                    // stale dah_or_preserve (as DAH)
-                    0,                       // unmined_since
-                    0,                       // generation
-                )
-                .unwrap();
-            assert!(updated, "cache poison must hit the entry");
-        }
 
         let req = SetConflictingRequest {
             tx_key: h.key,
@@ -12489,7 +12306,8 @@ mod tests {
         };
         h.engine.set_conflicting(&req).unwrap();
 
-        // Device DAH must remain 0 (record is preserved).
+        // Device DAH must remain 0 (record is preserved) and preserve_until must
+        // survive — set_conflicting reads preserve straight from the device.
         let meta = h.engine.read_metadata(&h.key).unwrap();
         assert_eq!(
             { meta.delete_at_height },
@@ -12497,18 +12315,6 @@ mod tests {
             "preserved record must not gain a DAH",
         );
         assert_eq!({ meta.preserve_until }, 5000, "preserve must survive");
-
-        // Cache must now reflect the device truth: preserve discriminant set,
-        // dah_or_preserve == preserve_until (5000) — NOT the stale 1288.
-        let entry = h.engine.index.lookup(&h.key).unwrap();
-        assert_eq!(
-            entry.dah_or_preserve, 5000,
-            "cache must resync to preserve_until from fresh meta, not the stale DAH",
-        );
-        assert!(
-            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL),
-            "cache must carry the HAS_PRESERVE_UNTIL discriminant from fresh meta",
-        );
 
         // The DAH secondary index must hold no entry for a preserved record.
         let dah = h.engine.dah_index();
@@ -12518,24 +12324,18 @@ mod tests {
         );
     }
 
-    /// KO-11 regression (set_mined fast path): identical stale-cache hazard.
-    /// The first-ever setMined fast path must take `old_dah` / preserve /
-    /// flags / counters from the fresh `meta`, not the cached entry. F-G2-011
-    /// had fixed only `generation`; this asserts the DAH/preserve fields too.
+    /// KO-11 regression (set_mined): the first-ever setMined on a preserved
+    /// record must take `old_dah` / preserve / flags / counters from the
+    /// on-device metadata (the sole source of truth) — a preserved record keeps
+    /// DAH == 0 and must not leak a DAH-index entry.
     #[test]
-    fn set_mined_fast_path_uses_fresh_meta_not_stale_cache() {
+    fn set_mined_preserved_record_keeps_dah_cleared() {
         // Preserved, unmined record (no block entries yet → fast path).
         let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
             m.preserve_until = 5000;
             m.delete_at_height = 0;
             m.block_entry_count = 0;
         });
-
-        // Poison cache: stale DAH 1288, no preserve discriminant.
-        h.engine
-            .index
-            .update_cached_fields(&h.key, TxFlags::empty().bits(), 0, 0, 1288, 0, 0)
-            .unwrap();
 
         let req = SetMinedRequest {
             tx_key: h.key,
@@ -12562,16 +12362,6 @@ mod tests {
             { meta.block_entry_count },
             1,
             "block entry must be recorded"
-        );
-
-        let entry = h.engine.index.lookup(&h.key).unwrap();
-        assert_eq!(
-            entry.dah_or_preserve, 5000,
-            "cache must resync to preserve_until from fresh meta, not the stale DAH",
-        );
-        assert!(
-            TxFlags::from_bits_truncate(entry.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL),
-            "cache must carry HAS_PRESERVE_UNTIL from fresh meta",
         );
 
         let dah = h.engine.dah_index();
@@ -13574,13 +13364,6 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
-                        utxo_count: 1,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -13699,13 +13482,6 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
-                        utxo_count: 1,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -16244,13 +16020,6 @@ mod tests {
         let entry = TxIndexEntry {
             device_id: 5,
             record_offset: 4096,
-            utxo_count: 1,
-            block_entry_count: 0,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
         };
         engine
             .register(key, entry)
@@ -16521,14 +16290,14 @@ mod tests {
         );
     }
 
-    /// Find a `tx_id` (varying only the index-shard bytes `[24..32]`) whose
+    /// Find a `tx_id` (varying only the index-shard bytes `[8..12]`) whose
     /// `index_shard_for_key` differs from `avoid_shard`. Returns the chosen
     /// txid. Panics only if no differing shard is found in a large search
     /// (impossible for shard_count > 1 given the SplitMix64 spread).
     fn txid_in_other_shard(engine: &Engine, avoid_shard: usize) -> [u8; 32] {
-        for nonce in 0u64..100_000 {
+        for nonce in 0u32..100_000 {
             let mut txid = [0u8; 32];
-            txid[24..32].copy_from_slice(&nonce.to_le_bytes());
+            txid[8..12].copy_from_slice(&nonce.to_le_bytes());
             let key = TxKey { txid };
             if engine.index.index_shard_for_key(&key) != avoid_shard {
                 return txid;
@@ -16865,7 +16634,8 @@ mod tests {
 
         let entry = engine.lookup(&key).unwrap();
         assert_eq!(entry.record_offset, resp.record_offset);
-        assert_eq!(entry.utxo_count, 10);
+        let meta = engine.read_metadata(&key).unwrap();
+        assert_eq!({ meta.utxo_count }, 10);
     }
 
     #[test]
@@ -16956,7 +16726,7 @@ mod tests {
         );
 
         let original = engine.lookup(&key).expect("created entry must exist");
-        assert_eq!(original.utxo_count, 5);
+        assert_eq!({ engine.read_metadata(&key).unwrap().utxo_count }, 5);
 
         // (b) A duplicate txid with a DIFFERENT utxo_count is rejected and must
         // not overwrite the original entry or change the shard count.
@@ -17458,19 +17228,17 @@ mod tests {
         assert_eq!(slot.spending_data, [0xFF; 36]);
     }
 
-    /// R-016 (A-08): freeze must bump generation, write metadata
-    /// back, and sync the index cache. Pre-fix the generation stayed
-    /// flat and the cached `tx_flags` diverged from on-device state,
-    /// causing fast-path ops (set_mined / set_conflicting / set_locked
-    /// / preserve_until) to miscompute DAH eligibility.
+    /// R-016 (A-08): freeze must bump the on-device generation and write
+    /// metadata back. Pre-fix the generation stayed flat, causing fast-path
+    /// ops (set_mined / set_conflicting / set_locked / preserve_until) to
+    /// miscompute DAH eligibility.
     #[test]
-    fn freeze_bumps_generation_and_syncs_cache() {
+    fn freeze_bumps_generation() {
         let engine = create_engine();
         let (_, req) = make_create_req(0xF1, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
         let pre_gen = engine.read_metadata(&key).unwrap().generation;
-        let pre_cache_gen = engine.lookup(&key).unwrap().generation;
 
         engine
             .freeze(&FreezeRequest {
@@ -17481,24 +17249,15 @@ mod tests {
             .unwrap();
 
         let post_meta_gen = engine.read_metadata(&key).unwrap().generation;
-        let post_cache_gen = engine.lookup(&key).unwrap().generation;
         assert!(
             post_meta_gen > pre_gen,
             "freeze must bump on-device generation"
         );
-        assert!(
-            post_cache_gen > pre_cache_gen,
-            "freeze must sync the cache so index entry matches on-device generation"
-        );
-        assert_eq!(
-            post_meta_gen, post_cache_gen,
-            "cache and on-device generation must match after sync"
-        );
     }
 
-    /// R-016 (A-08): unfreeze must also bump generation + sync cache.
+    /// R-016 (A-08): unfreeze must also bump the on-device generation.
     #[test]
-    fn unfreeze_bumps_generation_and_syncs_cache() {
+    fn unfreeze_bumps_generation() {
         let engine = create_engine();
         let (_, req) = make_create_req(0xF2, 5);
         let key = req.tx_key();
@@ -17521,12 +17280,7 @@ mod tests {
             .unwrap();
 
         let post_meta_gen = engine.read_metadata(&key).unwrap().generation;
-        let post_cache_gen = engine.lookup(&key).unwrap().generation;
         assert!(post_meta_gen > pre_gen, "unfreeze must bump generation");
-        assert_eq!(
-            post_meta_gen, post_cache_gen,
-            "unfreeze must sync the cache"
-        );
     }
 
     #[test]
@@ -18610,10 +18364,7 @@ mod tests {
                 })
                 .unwrap();
             let after_conflict = engine.read_metadata(&key).unwrap();
-            let conflict_entry = engine.index.lookup(&key).unwrap();
             assert_eq!(conflicting.generation, { after_conflict.generation });
-            assert_eq!(conflict_entry.generation, { after_conflict.generation });
-            assert_eq!(conflict_entry.tx_flags, after_conflict.flags.bits());
             assert_ne!({ after_conflict.delete_at_height }, 0);
 
             let locked_generation = engine
@@ -18623,10 +18374,7 @@ mod tests {
                 })
                 .unwrap();
             let after_locked = engine.read_metadata(&key).unwrap();
-            let locked_entry = engine.index.lookup(&key).unwrap();
             assert_eq!(locked_generation, { after_locked.generation });
-            assert_eq!(locked_entry.generation, { after_locked.generation });
-            assert_eq!(locked_entry.tx_flags, after_locked.flags.bits());
             assert_eq!({ after_locked.delete_at_height }, 0);
 
             (
@@ -19037,20 +18785,22 @@ mod tests {
         );
     }
 
-    /// P1-B: deleting a record that is preserved ON DEVICE but whose cache
-    /// discriminant is stale (the post-`PreserveUntil`-replay state) must still
-    /// remove its preserve-index entry. Pre-fix the removal was gated on the
-    /// cached HAS_PRESERVE_UNTIL flag, so this delete skipped it and leaked the
+    /// P1-B: deleting a record whose `preserve_until` lives only in the
+    /// on-device footer (the post-`PreserveUntil`-replay state, where the
+    /// preserve index was rebuilt from the device) must still remove its
+    /// preserve-index entry. Pre-fix the removal was gated on a now-removed
+    /// in-index discriminant, so this delete skipped it and leaked the
     /// `(preserve_until, txid)` entry forever.
     #[test]
-    fn delete_removes_preserve_entry_when_cache_is_stale() {
+    fn delete_removes_preserve_entry_from_device_footer() {
         let engine = create_engine();
         let (_, req) = make_create_req(141, 1);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        // Plant the stale-cache state: device footer preserved, cache clear
-        // (exactly as a PreserveUntil redo replay leaves it).
+        // Plant the device-only preserve state: footer preserved, preserve
+        // index rebuilt from it (exactly as a PreserveUntil redo replay leaves
+        // it).
         let entry = engine.lookup(&key).expect("record exists");
         let mut meta = engine
             .read_metadata_fast(entry.device_id, entry.record_offset)
@@ -19062,12 +18812,6 @@ mod tests {
             .unwrap();
         engine.rebuild_preserve_index_from_device().unwrap();
         assert_eq!(engine.preserve_index().range_query(7000), vec![key]);
-        // The cache still shows no preservation (the leak's precondition).
-        let cached = engine.lookup(&key).unwrap();
-        assert!(
-            !TxFlags::from_bits_truncate(cached.tx_flags).contains(TxFlags::HAS_PRESERVE_UNTIL),
-            "precondition: cache discriminant is stale (clear)",
-        );
 
         engine
             .delete(&DeleteRequest {
@@ -19083,25 +18827,24 @@ mod tests {
         );
     }
 
-    /// Blocker (the DAH twin of `delete_removes_preserve_entry_when_cache_is_stale`,
+    /// Blocker (the DAH twin of `delete_removes_preserve_entry_from_device_footer`,
     /// missed in the first round): deleting a record whose DAH lives in the
-    /// backend but whose primary-cache `dah_or_preserve` is stale-0 (the
-    /// post-crash state — SecondaryDahUpdate replay / reconcile rebuild the
-    /// backend but never refresh the cache) must still remove the DAH backend
-    /// entry. Pre-fix the removal was gated on the cached height, so it no-op'd
-    /// (update_dah_index(key,0,0)) and leaked the backend entry — orphans that
-    /// clog the per-call sweep cap (#25 stall, different cause).
+    /// backend and on-device footer (the post-crash state — SecondaryDahUpdate
+    /// replay / reconcile rebuild the backend from the device) must still remove
+    /// the DAH backend entry. Pre-fix the removal was gated on a now-removed
+    /// cached height, so it no-op'd (update_dah_index(key,0,0)) and leaked the
+    /// backend entry — orphans that clog the per-call sweep cap (#25 stall,
+    /// different cause).
     #[test]
-    fn delete_removes_dah_entry_when_cache_is_stale() {
+    fn delete_removes_dah_entry_from_device_footer() {
         let engine = create_engine();
         let (_, req) = make_create_req(142, 1);
         let key = req.tx_key();
         engine.create(&req).unwrap();
 
-        // Plant the stale state: device footer carries a DAH and the DAH
-        // backend holds (H, key), but the primary cache still shows
-        // dah_or_preserve == 0 (no sync_index_cache — exactly what a
-        // SecondaryDahUpdate replay + reconcile leave behind).
+        // Plant the device-only DAH state: footer carries a DAH and the DAH
+        // backend holds (H, key), exactly what a SecondaryDahUpdate replay +
+        // reconcile leave behind.
         let entry = engine.lookup(&key).expect("record exists");
         let mut meta = engine
             .read_metadata_fast(entry.device_id, entry.record_offset)
@@ -19115,12 +18858,6 @@ mod tests {
             .insert(9000, key, None)
             .expect("seed DAH backend");
         assert_eq!(engine.dah_index().range_query(u32::MAX), vec![key]);
-        let cached = engine.lookup(&key).unwrap();
-        assert_eq!(
-            { cached.dah_or_preserve },
-            0,
-            "precondition: primary cache is stale-0 for the DAH height",
-        );
 
         engine
             .delete(&DeleteRequest {
@@ -19616,7 +19353,7 @@ mod tests {
                 block_height_retention: 288,
             })
             .unwrap();
-        let off1 = engine.lookup_cached(&key1).unwrap().record_offset;
+        let off1 = engine.lookup(&key1).unwrap().record_offset;
 
         engine
             .delete(&DeleteRequest {
@@ -19631,7 +19368,7 @@ mod tests {
         req2.locktime = 222;
         let key2 = req2.tx_key();
         engine.create(&req2).unwrap();
-        let off2 = engine.lookup_cached(&key2).unwrap().record_offset;
+        let off2 = engine.lookup(&key2).unwrap().record_offset;
         assert_eq!(
             off1, off2,
             "test requires the allocator to reuse the freed offset"
@@ -20536,13 +20273,6 @@ mod tests {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: 0,
-                utxo_count: 1,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 0,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
             }
         }
 
@@ -20631,13 +20361,6 @@ mod tests {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: i * 4096,
-                utxo_count: 1,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 0,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
             }
         }
 

@@ -2356,7 +2356,7 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::{BlockDevice, MemoryDevice};
-    use crate::index::{DahIndex, Index, TxIndexEntry, TxKey, UnminedIndex};
+    use crate::index::{DahIndex, Index, TxKey, UnminedIndex};
     use crate::locks::StripedLocks;
 
     fn make_engine() -> Arc<Engine> {
@@ -3327,13 +3327,6 @@ mod tests {
             MASTER_GEN,
             "generation sync must set the replica's generation to the master's value",
         );
-        // The cached generation in the primary index must match too — proving
-        // set_record_generation refreshed the index cache (sync_index_cache).
-        let cached = engine.lookup_cached(&k).unwrap();
-        assert_eq!(
-            cached.generation, MASTER_GEN,
-            "primary-index cached generation must match the synced generation",
-        );
     }
 
     #[test]
@@ -4254,7 +4247,6 @@ mod tests {
 
     #[test]
     fn apply_preserve_until_op_and_idempotent_reapply() {
-        use crate::record::TxFlags;
         let engine = make_engine();
         let k = key(56);
         create_record(&engine, k, 1);
@@ -4268,16 +4260,6 @@ mod tests {
         let meta = engine.read_metadata(&k).unwrap();
         assert_eq!({ meta.preserve_until }, 900_000);
         assert_eq!({ meta.delete_at_height }, 0);
-        // HAS_PRESERVE_UNTIL is an index-only discriminant bit (it marks
-        // the cached dah_or_preserve as a preserve height, R-019); it is
-        // never written to on-device meta.flags.
-        let entry = engine.lookup(&k).unwrap();
-        assert_ne!(
-            entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits(),
-            0,
-            "index cache must carry the preserve discriminant so fast \
-             paths skip DAH eviction (R-019)"
-        );
 
         // Re-apply: same preserve height lands in the same state.
         apply_op(&engine, &preserve).unwrap();
@@ -6934,21 +6916,9 @@ mod tests {
         apply_op(engine, &op)
     }
 
-    /// Decode the cached `delete_at_height` / `preserve_until` from a primary
-    /// index entry exactly as the fully-cached GET fast path
-    /// (`handle_get_batch`) does, so the test asserts what a client would see.
-    fn cached_dah_preserve(entry: &TxIndexEntry) -> (u32, u32) {
-        let has_preserve = entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
-        if has_preserve {
-            (0, entry.dah_or_preserve)
-        } else {
-            (entry.dah_or_preserve, 0)
-        }
-    }
-
     /// F-2: a migrated unmined record must land in the unmined secondary index
-    /// (so `QUERY_OLD_UNMINED` finds it) AND have its primary cached
-    /// `unmined_since` populated — both WITHOUT restarting the target.
+    /// (so `QUERY_OLD_UNMINED` finds it) AND carry `unmined_since` in its
+    /// on-device footer — both WITHOUT restarting the target.
     #[test]
     fn migrated_unmined_record_visible_in_unmined_index_and_cache() {
         let engine = make_engine();
@@ -6974,20 +6944,16 @@ mod tests {
             "migrated unmined record must be in the unmined index without restart",
         );
 
-        // Primary cached field matches the slow path.
-        let entry = engine
-            .lookup(&k)
-            .expect("entry present after migrated create");
-        assert_eq!(
-            entry.unmined_since,
-            { meta.unmined_since },
-            "cached unmined_since must match the device footer",
+        // The migrated record is registered in the primary index.
+        assert!(
+            engine.lookup(&k).is_some(),
+            "migrated create must register the primary index entry",
         );
     }
 
     /// F-2: a migrated record with `delete_at_height` set must land in the DAH
     /// secondary index (so the DAH sweep picks it up via the same range query)
-    /// and have its primary cached field populated — without restart.
+    /// and carry `delete_at_height` in its on-device footer — without restart.
     #[test]
     fn migrated_dah_record_visible_in_dah_index_and_cache() {
         let engine = make_engine();
@@ -7013,16 +6979,15 @@ mod tests {
             "DAH record not due before its height"
         );
 
-        // Primary cached field reflects the DAH.
-        let entry = engine.lookup(&k).expect("entry present");
-        let (cached_dah, cached_preserve) = cached_dah_preserve(&entry);
-        assert_eq!(cached_dah, dah, "cached delete_at_height must match footer");
-        assert_eq!(cached_preserve, 0);
+        // The migrated record is registered in the primary index.
+        assert!(
+            engine.lookup(&k).is_some(),
+            "entry present after migrated create",
+        );
     }
 
-    /// F-2: a migrated preserved record must surface `preserve_until` through
-    /// the cached primary path (HAS_PRESERVE_UNTIL discriminant set) and must
-    /// NOT appear in the DAH index.
+    /// F-2: a migrated preserved record must carry `preserve_until` in its
+    /// on-device footer and must NOT appear in the DAH index.
     #[test]
     fn migrated_preserved_record_visible_through_cache() {
         let engine = make_engine();
@@ -7041,27 +7006,19 @@ mod tests {
         let due = engine.dah_index().range_query(u32::MAX);
         assert!(!due.contains(&k), "preserved record must not be DAH-swept",);
 
-        // Cached path surfaces preserve_until via the HAS_PRESERVE_UNTIL bit.
-        let entry = engine.lookup(&k).expect("entry present");
+        // The migrated record is registered in the primary index.
         assert!(
-            entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0,
-            "HAS_PRESERVE_UNTIL discriminant must be set in the cached flags",
+            engine.lookup(&k).is_some(),
+            "entry present after migrated create",
         );
-        let (cached_dah, cached_preserve) = cached_dah_preserve(&entry);
-        assert_eq!(
-            cached_preserve, preserve,
-            "cached preserve_until must match"
-        );
-        assert_eq!(cached_dah, 0);
     }
 
-    /// F-2 specific symptom: for a migrated record the fully-cached GET fast
-    /// path and the slow (device-metadata) path must agree on
-    /// `unmined_since` / `delete_at_height` / `preserve_until`. Before the fix
-    /// the cached entry held zeros while the device footer held the real
-    /// values, so the same key answered differently by field mask.
+    /// F-2 specific symptom: a migrated record with `unmined_since = 0` and a
+    /// `delete_at_height` set must surface those exact values from its on-device
+    /// footer and land in the DAH index. (The primary index no longer caches
+    /// lifecycle fields — the footer is the single source of truth.)
     #[test]
-    fn migrated_record_cached_matches_slow_path() {
+    fn migrated_record_footer_matches_dah_index() {
         let engine = make_engine();
         let k = key(4);
         let unmined_since = 0u32; // mined record that also has a DAH set
@@ -7074,32 +7031,21 @@ mod tests {
         )
         .unwrap();
 
-        // Slow path: device metadata.
+        // The on-device footer is the single source of truth for lifecycle
+        // metadata; it must hold exactly the migrated values.
         let meta = engine.read_metadata(&k).unwrap();
-        // Cached path: primary index entry decoded like the GET fast path.
-        let entry = engine.lookup(&k).expect("entry present");
-        let (cached_dah, cached_preserve) = cached_dah_preserve(&entry);
-
         assert_eq!(
-            entry.unmined_since,
             { meta.unmined_since },
-            "cached vs slow-path unmined_since must match",
+            unmined_since,
+            "footer unmined_since"
         );
-        assert_eq!(
-            cached_dah,
-            { meta.delete_at_height },
-            "cached vs slow-path delete_at_height must match",
-        );
-        assert_eq!(
-            cached_preserve,
-            { meta.preserve_until },
-            "cached vs slow-path preserve_until must match",
-        );
+        assert_eq!({ meta.delete_at_height }, dah, "footer delete_at_height");
+        assert_eq!({ meta.preserve_until }, 0, "footer preserve_until");
 
-        // And the DAH index agrees with both.
+        // And the DAH index agrees with the footer.
         assert!(
             engine.dah_index().range_query(dah).contains(&k),
-            "DAH index must agree with the cached + slow paths",
+            "DAH index must agree with the on-device footer",
         );
     }
 }

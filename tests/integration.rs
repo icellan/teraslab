@@ -1598,13 +1598,18 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
         spend_utxo(&engine, mined_key, MINED_N, 1);
         let frozen_key = create_frozen_tx(&engine, FROZEN_N, 2);
 
-        // Capture the live cached entries before shutdown — these are the
-        // ground truth the rebuilt index must reproduce.
+        // Capture the live locator + on-device footer before shutdown —
+        // these are the ground truth the rebuilt index + records must
+        // reproduce. The slim index carries only the locator; every former
+        // cached field now lives in the record footer (`read_metadata`).
         let expected_entries: Vec<_> = [unmined_key, mined_key, frozen_key]
             .into_iter()
             .map(|k| {
-                let entry = engine.lookup_cached(&k).expect("created tx must be cached");
-                (k, entry)
+                let entry = engine.lookup(&k).expect("created tx must be registered");
+                let meta = engine
+                    .read_metadata(&k)
+                    .expect("created tx must have a record");
+                (k, entry.record_offset, meta)
             })
             .collect();
 
@@ -1633,23 +1638,13 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
         "every device record must re-register after snapshot loss"
     );
 
-    // Cached fields that the device scan restores from record headers
-    // must match the pre-shutdown live entries exactly. (`dah_or_preserve`
-    // and `unmined_since` are intentionally NOT compared on the primary
-    // entry: the device rebuild leaves them 0 — that state lives in the
-    // secondary indexes, asserted below.)
-    for (key, exp) in &expected_entries {
+    // The rebuilt slim index must re-register every record at its original
+    // locator (the only per-entry state it carries now).
+    for (key, exp_offset, _exp_meta) in &expected_entries {
         let got = primary
             .lookup(key)
             .expect("record missing from rebuilt index");
-        assert_eq!(got.record_offset, exp.record_offset, "offset for {key:?}");
-        assert_eq!(got.utxo_count, exp.utxo_count, "utxo_count for {key:?}");
-        assert_eq!(got.spent_utxos, exp.spent_utxos, "spent_utxos for {key:?}");
-        assert_eq!(
-            got.block_entry_count, exp.block_entry_count,
-            "block_entry_count for {key:?}"
-        );
-        assert_eq!(got.tx_flags, exp.tx_flags, "tx_flags for {key:?}");
+        assert_eq!(got.record_offset, *exp_offset, "offset for {key:?}");
     }
 
     let secondaries = rebuild_in_memory_secondaries(&*dev, &alloc);
@@ -1669,6 +1664,35 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
         secondaries.dah,
         secondaries.unmined,
     );
+
+    // The record fields the device scan restores from record headers must
+    // match the pre-shutdown footers exactly, read back through the rebuilt
+    // index's locator. (`dah_or_preserve` / `unmined_since` live in the
+    // secondary indexes, asserted separately below.)
+    for (key, _off, exp_meta) in &expected_entries {
+        let got = engine
+            .read_metadata(key)
+            .expect("record readable via rebuilt index");
+        assert_eq!(
+            { got.utxo_count },
+            { exp_meta.utxo_count },
+            "utxo_count for {key:?}"
+        );
+        assert_eq!(
+            { got.spent_utxos },
+            { exp_meta.spent_utxos },
+            "spent_utxos for {key:?}"
+        );
+        assert_eq!(
+            got.block_entry_count, exp_meta.block_entry_count,
+            "block_entry_count for {key:?}"
+        );
+        assert_eq!(
+            { got.flags }.bits(),
+            { exp_meta.flags }.bits(),
+            "tx_flags for {key:?}"
+        );
+    }
 
     // Unmined tx: metadata, slot states, and unmined-index membership.
     let meta = engine.read_metadata(&unmined_key).unwrap();
@@ -1744,8 +1768,8 @@ fn snapshot_deletion_with_corrupt_header_primary_recovers_secondary_degrades() {
             txid: make_tx_id(0x7201),
         };
         let offset = engine
-            .lookup_cached(&victim)
-            .expect("victim must be cached")
+            .lookup(&victim)
+            .expect("victim must be registered")
             .record_offset;
         engine.snapshot_index(&snap_path).unwrap();
         engine.persist_allocator().unwrap();

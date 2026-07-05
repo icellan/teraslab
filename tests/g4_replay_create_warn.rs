@@ -46,13 +46,6 @@ fn replay_create_skips_when_already_indexed_with_different_offset() {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: other_offset,
-                utxo_count,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 0,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
             },
         )
         .unwrap();

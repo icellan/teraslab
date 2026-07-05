@@ -76,18 +76,34 @@ fn set_file_mtime(path: &std::path::Path, mtime: SystemTime) {
     mf.set_modified(mtime).expect("set sidecar mtime");
 }
 
-fn external_entry() -> TxIndexEntry {
-    TxIndexEntry {
-        device_id: 0,
-        record_offset: 0,
-        utxo_count: 0,
-        block_entry_count: 0,
-        tx_flags: TxFlags::EXTERNAL.bits(),
-        spent_utxos: 0,
-        dah_or_preserve: 0,
-        unmined_since: 0,
-        generation: 0,
-    }
+/// Write a real EXTERNAL-flagged record for `key` on the engine's device and
+/// register its locator. The slim primary index no longer caches `tx_flags`,
+/// so blob GC reads the EXTERNAL flag from this on-device footer.
+fn register_external_record(engine: &Engine, key: [u8; 32]) {
+    use teraslab::record::{TxMetadata, UtxoSlot};
+
+    let utxo_count = 1u32;
+    let mut meta = TxMetadata::new(utxo_count);
+    meta.tx_id = key;
+    meta.flags = TxFlags::EXTERNAL;
+
+    let record_size = TxMetadata::record_size_for(utxo_count);
+    let offset = {
+        let mut alloc = engine.allocator().lock();
+        alloc.allocate(record_size).expect("allocate record")
+    };
+    let slots = vec![UtxoSlot::new_unspent([0u8; 32]); utxo_count as usize];
+    teraslab::io::write_full_record(engine.device(), offset, &meta, &slots)
+        .expect("write record footer");
+    engine
+        .register(
+            TxKey { txid: key },
+            TxIndexEntry {
+                device_id: 0,
+                record_offset: offset,
+            },
+        )
+        .expect("register");
 }
 
 /// Backdate a freshly put blob past the grace window.
@@ -141,9 +157,7 @@ fn aged_blob_pinned_by_inflight_create_survives_sweep_between_digest_and_registe
     );
 
     // --- create dispatch, step 2: index registration, then pin release ---
-    engine
-        .register(TxKey { txid: key }, external_entry())
-        .expect("register");
+    register_external_record(&engine, key);
     drop(pin);
 
     // A later sweep keeps the blob via the live-set check.
@@ -241,9 +255,7 @@ fn registration_landing_mid_sweep_is_caught_by_under_lock_recheck() {
         if calls == 1 {
             LookupOutcome::NoEntry
         } else {
-            LookupOutcome::Found {
-                tx_flags: TxFlags::EXTERNAL.bits(),
-            }
+            LookupOutcome::Found { external: true }
         }
     })
     .unwrap();

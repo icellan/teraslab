@@ -1196,7 +1196,11 @@ fn main() {
         // (audit IJK-08). Errors during reconciliation are non-fatal — a
         // transient blob-store issue must not block the server from coming
         // up; the periodic background sweep retries on its next tick.
-        match teraslab::recovery::reconcile_blobs_after_recovery(blob_store.as_ref(), &index) {
+        match teraslab::recovery::reconcile_blobs_after_recovery(
+            blob_store.as_ref(),
+            &index,
+            &store_devices,
+        ) {
             Ok(stats) => {
                 tracing::info!(
                     total_blobs = stats.total_blobs,

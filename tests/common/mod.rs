@@ -240,14 +240,14 @@ pub fn ops_per_sec(acked: u64, elapsed: Duration) -> f64 {
 //
 // Mirrors teranode's parent-decoration access pattern: one connection issuing
 // fat `OP_GET_BATCH` requests with `FieldMask::COLD_DATA` set, which forces the
-// slow device-read path (`read_metadata` + `read_cold_data` per item) — the
-// exact loop that pegs a single core in `handle_get_batch`. COLD_DATA is not in
-// `FieldMask::INDEX_CACHED`, so `fully_cached()` is false and the request never
-// short-circuits to the zero-I/O fast path.
+// device-read path (`read_metadata` + `read_cold_data` per item) — the exact
+// loop that pegs a single core in `handle_get_batch`. Every GET now reads the
+// on-device footer (the slim primary index caches no fields), so COLD_DATA
+// additionally pulls the cold blob per item.
 // ============================================================================
 
-/// The decoration field mask: cold data only. Not index-cached, so it drives
-/// the per-item device-read path that the single-core bottleneck lives on.
+/// The decoration field mask: cold data only. Drives the per-item device-read
+/// path that the single-core bottleneck lives on.
 pub const DECORATION_FIELD_MASK: u32 = FieldMask::COLD_DATA;
 
 /// Build a parent-tx cold-data blob in the 3-section wire format

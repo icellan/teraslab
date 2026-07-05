@@ -182,9 +182,9 @@ fn boundary_after_redo_fsync_before_record_write_reconstructs_full_record() {
 
     let entry = index.lookup(&key).expect("Create replay registers index");
     assert_eq!(entry.record_offset, record_offset);
-    assert_eq!(entry.utxo_count, utxo_count);
 
-    // On-device bytes must match the original.
+    // On-device bytes must match the original (utxo_count is verified from the
+    // footer below — the slim index no longer caches it).
     let recovered_meta = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
     assert_eq!({ recovered_meta.tx_version }, 1);
     assert_eq!({ recovered_meta.fee }, 100);

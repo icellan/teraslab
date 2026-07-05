@@ -28,7 +28,6 @@ pub use dah_index::{DahIndex, DahRedoEntry};
 pub use hashtable::{TxIndexEntry, TxKey};
 pub use preserve_backend::PreserveBackend;
 pub use preserve_index::PreserveIndex;
-pub use redb_primary::CachedFieldsUpdate;
 pub use secondary_backend::{DahBackend, UnminedBackend};
 pub use sharded::ShardedIndex;
 pub use sharded_secondary::{ShardedDahIndex, ShardedSecondary, ShardedUnminedIndex};
@@ -90,7 +89,7 @@ const SECONDARY_VERSION: u32 = 1;
 const MAX_SNAPSHOT_COUNT: usize = 1 << 30;
 
 // Per-entry sizes in the snapshot file
-const PRIMARY_ENTRY_SIZE: usize = 32 + 1 + 8 + 4 + 1 + 1 + 4 + 4 + 4 + 4; // TxKey + TxIndexEntry = 63
+const PRIMARY_ENTRY_SIZE: usize = 32 + 1 + 8; // TxKey + slim TxIndexEntry = 41
 const SECONDARY_ENTRY_SIZE: usize = 4 + 32; // height + txid = 36
 
 #[cfg(test)]
@@ -468,30 +467,6 @@ impl Index {
         self.table.remove(key)
     }
 
-    /// Update the cached fields in the bucket for `key`.
-    /// Returns `true` if the key was found and updated.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_cached_fields(
-        &mut self,
-        key: &TxKey,
-        tx_flags: u8,
-        block_entry_count: u8,
-        spent_utxos: u32,
-        dah_or_preserve: u32,
-        unmined_since: u32,
-        generation: u32,
-    ) -> bool {
-        self.table.update_cached_fields(
-            key,
-            tx_flags,
-            block_entry_count,
-            spent_utxos,
-            dah_or_preserve,
-            unmined_since,
-            generation,
-        )
-    }
-
     /// Number of entries in the primary index.
     pub fn len(&self) -> usize {
         self.table.len()
@@ -667,7 +642,10 @@ impl Index {
                 };
 
             let key = TxKey { txid: meta.tx_id };
-            let entry = TxIndexEntry::from_scanned_meta(offset, &meta);
+            let entry = TxIndexEntry {
+                device_id: 0,
+                record_offset: offset,
+            };
             index.register(key, entry)?;
             offset += aligned_advance;
         }
@@ -817,13 +795,6 @@ impl Index {
             buf.extend_from_slice(&key.txid);
             buf.push(entry.device_id);
             buf.extend_from_slice(&entry.record_offset.to_le_bytes());
-            buf.extend_from_slice(&entry.utxo_count.to_le_bytes());
-            buf.push(entry.block_entry_count);
-            buf.push(entry.tx_flags);
-            buf.extend_from_slice(&entry.spent_utxos.to_le_bytes());
-            buf.extend_from_slice(&entry.dah_or_preserve.to_le_bytes());
-            buf.extend_from_slice(&entry.unmined_since.to_le_bytes());
-            buf.extend_from_slice(&entry.generation.to_le_bytes());
         }
 
         let checksum = crc32fast::hash(&buf);
@@ -941,13 +912,6 @@ impl Index {
             let entry = TxIndexEntry {
                 device_id: data[base + 32],
                 record_offset: u64::from_le_bytes(data[base + 33..base + 41].try_into().unwrap()),
-                utxo_count: u32::from_le_bytes(data[base + 41..base + 45].try_into().unwrap()),
-                block_entry_count: data[base + 45],
-                tx_flags: data[base + 46],
-                spent_utxos: u32::from_le_bytes(data[base + 47..base + 51].try_into().unwrap()),
-                dah_or_preserve: u32::from_le_bytes(data[base + 51..base + 55].try_into().unwrap()),
-                unmined_since: u32::from_le_bytes(data[base + 55..base + 59].try_into().unwrap()),
-                generation: u32::from_le_bytes(data[base + 59..base + 63].try_into().unwrap()),
             };
             index.register(key, entry)?;
         }
@@ -1255,23 +1219,16 @@ mod tests {
         TxKey { txid }
     }
 
-    /// REL-017: populate EVERY field with a distinct, non-zero value derived
+    /// REL-017: populate BOTH slim locator fields with a distinct value derived
     /// from `offset` so a field-offset swap, width truncation, or field-zeroing
     /// regression on the snapshot serialization path is caught by full-entry
-    /// equality assertions (rather than slipping past an all-zeros entry that
-    /// only checks `record_offset`). Each field uses a different arithmetic
-    /// shape and stays within its declared width.
+    /// equality assertions (rather than slipping past an entry that only checks
+    /// `record_offset`). `record_offset` is scaled by 8 to satisfy the bucket
+    /// codec's 8-alignment invariant.
     fn make_entry(offset: u64) -> TxIndexEntry {
         TxIndexEntry {
             device_id: (offset.wrapping_add(1) & 0xFF) as u8,
-            record_offset: offset,
-            utxo_count: (offset as u32).wrapping_mul(7).wrapping_add(3),
-            block_entry_count: ((offset.wrapping_add(17)) & 0xFF) as u8,
-            tx_flags: ((offset.wrapping_mul(3).wrapping_add(5)) & 0xFF) as u8,
-            spent_utxos: (offset as u32).wrapping_mul(11).wrapping_add(13),
-            dah_or_preserve: (offset as u32).wrapping_mul(101).wrapping_add(29),
-            unmined_since: (offset as u32).wrapping_add(0x4000_0001),
-            generation: (offset as u32).wrapping_mul(5).wrapping_add(1),
+            record_offset: offset * 8,
         }
     }
 
@@ -2048,7 +2005,7 @@ mod tests {
             rebuilt.lookup(&big_key).is_none(),
             "deleted multi-block record must be absent"
         );
-        for (i, (key, offset, utxo_count)) in records.iter().enumerate() {
+        for (i, (key, offset, _utxo_count)) in records.iter().enumerate() {
             if i == big {
                 continue;
             }
@@ -2056,7 +2013,6 @@ mod tests {
                 .lookup(key)
                 .unwrap_or_else(|| panic!("live record {i} must be indexed"));
             assert_eq!(e.record_offset, *offset, "record {i} offset");
-            assert_eq!(e.utxo_count, *utxo_count, "record {i} utxo_count");
         }
     }
 
@@ -2104,12 +2060,11 @@ mod tests {
 
         let rebuilt = Index::rebuild(&*dev, &alloc).unwrap();
         assert_eq!(rebuilt.len(), n, "no record skipped");
-        for (i, (key, offset, utxo_count)) in records.iter().enumerate() {
+        for (i, (key, offset, _utxo_count)) in records.iter().enumerate() {
             let e = rebuilt
                 .lookup(key)
                 .unwrap_or_else(|| panic!("record {i} must be indexed"));
             assert_eq!(e.record_offset, *offset);
-            assert_eq!(e.utxo_count, *utxo_count);
         }
     }
 
@@ -2385,7 +2340,7 @@ mod tests {
         }
         for i in 100..500u64 {
             let e = restored.lookup(&make_key(i)).expect("entry should exist");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 100 * 8);
         }
     }
 
@@ -2409,14 +2364,7 @@ mod tests {
                 });
                 let entry = TxIndexEntry {
                     device_id: 0,
-                    record_offset: i * 100,
-                    utxo_count: 10,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 0,
+                    record_offset: i * 104,
                 };
                 idx.register(key, entry).unwrap();
             }
@@ -2476,13 +2424,6 @@ mod tests {
                         let entry = TxIndexEntry {
                             device_id: 0,
                             record_offset: ((t * PER_THREAD + i) * 4096) as u64,
-                            utxo_count: 1,
-                            block_entry_count: 0,
-                            tx_flags: 0,
-                            spent_utxos: 0,
-                            dah_or_preserve: 0,
-                            unmined_since: 0,
-                            generation: 0,
                         };
                         idx.lock().unwrap().register(key, entry).unwrap();
                     }

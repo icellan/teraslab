@@ -418,13 +418,6 @@ fn export_import_index_roundtrip() {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: 4096 * n as u64,
-                        utxo_count: 3,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 1,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: n as u32,
                     },
                 )
                 .unwrap();
@@ -500,10 +493,10 @@ fn export_import_index_roundtrip() {
     let e = primary
         .lookup(&TxKey { txid })
         .expect("entry 7 survives roundtrip");
+    // The slim primary index round-trips only the locator (device_id +
+    // record_offset); the former cached metadata fields now live on device.
     assert_eq!(e.record_offset, 4096 * 7);
-    assert_eq!(e.utxo_count, 3);
-    assert_eq!(e.spent_utxos, 1);
-    assert_eq!(e.generation, 7);
+    assert_eq!(e.device_id, 0);
 }
 
 /// I13 (offline half): `teraslab-cli restore` round-trip WITHOUT a server.

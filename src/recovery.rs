@@ -1400,9 +1400,10 @@ fn reconcile_secondary_indexes_for_keys_multi(
 pub fn reconcile_blobs_after_recovery(
     blob_store: &dyn BlobStore,
     index: &ShardedIndex,
+    devices: &[std::sync::Arc<dyn BlockDevice>],
 ) -> Result<BlobGcStats, BlobError> {
     let started = std::time::Instant::now();
-    let stats = blob_gc::reconcile_orphan_blobs_against_index(blob_store, index)?;
+    let stats = blob_gc::reconcile_orphan_blobs_against_index(blob_store, index, devices)?;
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         total_blobs = stats.total_blobs,
@@ -2544,14 +2545,15 @@ fn replay_replica_create(
     // later replay of Delete + Create restamped the index entry), but
     // the reordering may indicate an upstream bug worth investigating.
     if let Some(existing) = index.lookup(tx_key) {
-        if existing.record_offset != record_offset || existing.utxo_count != utxo_count {
+        // The slim primary index no longer caches `utxo_count`; the record
+        // offset divergence is the load-bearing diagnostic (a delete+recreate
+        // that crossed the redo log restamps the offset).
+        if existing.record_offset != record_offset {
             tracing::warn!(
                 target: "teraslab::recovery",
                 txid_prefix = ?&tx_key.txid[..4],
                 expected_record_offset = record_offset,
                 actual_record_offset = existing.record_offset,
-                expected_utxo_count = utxo_count,
-                actual_utxo_count = existing.utxo_count,
                 "F-G4-014: replay_replica_create skipped — existing index entry diverges from redo entry; \
                  likely a delete+recreate that crossed the redo log",
             );
@@ -2600,13 +2602,6 @@ fn replay_replica_create(
     let entry = TxIndexEntry {
         device_id,
         record_offset,
-        utxo_count,
-        block_entry_count: meta.block_entry_count,
-        tx_flags: meta.flags.bits(),
-        spent_utxos: { meta.spent_utxos },
-        dah_or_preserve: { meta.delete_at_height },
-        unmined_since: { meta.unmined_since },
-        generation: { meta.generation },
     };
     match register_unique_offset(index, offset_owners, *tx_key, entry) {
         Ok(()) => ReplayResult::Applied,
@@ -2781,13 +2776,6 @@ fn replay_create(
     let entry = TxIndexEntry {
         device_id,
         record_offset,
-        utxo_count,
-        block_entry_count: meta.block_entry_count,
-        tx_flags: meta.flags.bits(),
-        spent_utxos: { meta.spent_utxos },
-        dah_or_preserve: { meta.delete_at_height },
-        unmined_since: { meta.unmined_since },
-        generation: { meta.generation },
     };
     if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
         return ReplayResult::Failed(ReplayCause::LogicError);
@@ -2857,13 +2845,6 @@ fn replay_create_v2(
     let entry = TxIndexEntry {
         device_id,
         record_offset,
-        utxo_count,
-        block_entry_count: meta.block_entry_count,
-        tx_flags: meta.flags.bits(),
-        spent_utxos: { meta.spent_utxos },
-        dah_or_preserve: { meta.delete_at_height },
-        unmined_since: { meta.unmined_since },
-        generation: { meta.generation },
     };
     if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
         return ReplayResult::Failed(ReplayCause::LogicError);
@@ -2913,13 +2894,6 @@ fn replay_relocate(
     let entry = TxIndexEntry {
         device_id,
         record_offset,
-        utxo_count,
-        block_entry_count: meta.block_entry_count,
-        tx_flags: meta.flags.bits(),
-        spent_utxos: { meta.spent_utxos },
-        dah_or_preserve: { meta.delete_at_height },
-        unmined_since: { meta.unmined_since },
-        generation: { meta.generation },
     };
     if let Err(_e) = register_unique_offset(index, offset_owners, *tx_key, entry) {
         return ReplayResult::Failed(ReplayCause::LogicError);
@@ -3813,13 +3787,6 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
-                        utxo_count,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -4599,9 +4566,6 @@ mod tests {
                 subtree_idx: 0,
             };
             io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-            h.index
-                .update_cached_fields(&key, 0, 1, 0, 0, 0, 0)
-                .unwrap();
             (h, key)
         };
 
@@ -4706,9 +4670,6 @@ mod tests {
         };
         meta.spent_utxos = 2; // over-counted: pretends all-spent
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-        h.index
-            .update_cached_fields(&key, 0, 1, 0, 0, 0, 0)
-            .unwrap();
 
         // Spend only slot 0 via replay. Recompute must yield 1 (not 2), so
         // the all-spent condition is NOT satisfied and no DAH is stamped.
@@ -5054,10 +5015,12 @@ mod tests {
             .lookup(&key)
             .expect("CreateV2 must register the entry read back from the device");
         assert_eq!(ie.record_offset, offset);
-        assert_eq!(ie.utxo_count, utxo_count);
+        let m = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ m.utxo_count }, utxo_count);
         assert_eq!(
-            ie.generation, 9,
-            "cached fields must come from the device read"
+            { m.generation },
+            9,
+            "metadata must come from the device read"
         );
     }
 
@@ -5099,13 +5062,6 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: off1,
-                    utxo_count,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 1,
                 },
             )
             .unwrap();
@@ -5128,11 +5084,13 @@ mod tests {
             ie.record_offset, off2,
             "index must re-point to the relocated offset"
         );
+        let m = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!(
-            ie.generation, 2,
-            "cached fields come from the relocated record"
+            { m.generation },
+            2,
+            "metadata comes from the relocated record"
         );
-        assert_eq!(ie.spent_utxos, 1);
+        assert_eq!({ m.spent_utxos }, 1);
     }
 
     /// The CLUSTERED-segment spend recovery path (SEGMENT_CLUSTERING_DESIGN): a
@@ -5172,13 +5130,6 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: off1,
-                    utxo_count,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 1,
                 },
             )
             .unwrap();
@@ -5380,13 +5331,6 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: off1,
-                    utxo_count,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 1,
                 },
             )
             .unwrap();
@@ -5489,13 +5433,6 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
-                        utxo_count,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -5776,7 +5713,8 @@ mod tests {
             "replica record lives on store 1 — recovery must stamp device_id 1, not 0",
         );
         assert_eq!(recovered.record_offset, record_offset);
-        assert_eq!(recovered.utxo_count, utxo_count);
+        let m = io::read_metadata(&*dev1, recovered.record_offset).unwrap();
+        assert_eq!({ m.utxo_count }, utxo_count);
     }
 
     /// Multi-store Delete recovery: replaying a `RedoOp::Delete` (with real
@@ -6099,13 +6037,6 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: off_a,
-                        utxo_count,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -6398,13 +6329,6 @@ mod tests {
                     TxIndexEntry {
                         device_id,
                         record_offset: offset,
-                        utxo_count,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -6588,13 +6512,6 @@ mod tests {
                     TxIndexEntry {
                         device_id,
                         record_offset: offset,
-                        utxo_count,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -6724,14 +6641,16 @@ mod tests {
             .lookup(&key)
             .expect("Create replay must register the index entry");
         assert_eq!(recovered.record_offset, record_offset);
-        assert_eq!(recovered.utxo_count, utxo_count);
+        let m = io::read_metadata(&*data_dev as &dyn BlockDevice, recovered.record_offset).unwrap();
+        assert_eq!({ m.utxo_count }, utxo_count);
         assert_eq!(
-            recovered.tx_flags,
+            m.flags.bits(),
             TxFlags::IS_COINBASE.bits(),
-            "tx_flags must come from reconstructed metadata, not zero"
+            "flags must come from reconstructed metadata, not zero"
         );
         assert_eq!(
-            recovered.unmined_since, 12345,
+            { m.unmined_since },
+            12345,
             "unmined_since must come from reconstructed metadata"
         );
 
@@ -7021,13 +6940,6 @@ mod tests {
         let stale_entry = TxIndexEntry {
             device_id: 0,
             record_offset: offset,
-            utxo_count,
-            block_entry_count: 0,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 5,
         };
         index.register(key_a, stale_entry).unwrap();
         assert!(
@@ -7215,18 +7127,21 @@ mod tests {
         let recovered = index
             .lookup(&key)
             .expect("legacy Create replay must register the index entry");
-        assert_eq!(recovered.utxo_count, utxo_count);
+        let m = io::read_metadata(&*data_dev as &dyn BlockDevice, recovered.record_offset).unwrap();
+        assert_eq!({ m.utxo_count }, utxo_count);
         assert_eq!(
-            recovered.tx_flags,
+            m.flags.bits(),
             TxFlags::IS_COINBASE.bits(),
-            "tx_flags must reflect on-device flags, not zero",
+            "flags must reflect on-device flags, not zero",
         );
         assert_eq!(
-            recovered.unmined_since, 99_999,
+            { m.unmined_since },
+            99_999,
             "unmined_since must reflect on-device value, not zero",
         );
         assert_eq!(
-            recovered.generation, 17,
+            { m.generation },
+            17,
             "generation must reflect on-device value, not zero",
         );
     }
@@ -8131,10 +8046,9 @@ mod tests {
         meta.unmined_since = 500;
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
 
-        // Deliberately keep the primary index cache stale. R-077 recovery
-        // must use the on-device metadata as the authority after a crash
-        // between the metadata write and the primary cache commit.
-        assert_eq!(ie.unmined_since, 0);
+        // R-077 recovery uses the on-device metadata (unmined_since = 500) as
+        // the authority after a crash between the metadata write and the
+        // secondary-index commit.
 
         // Redo log: the intent record (as if fsynced) but redb commit skipped.
         let mut redo = h.redo_log();
@@ -8174,9 +8088,10 @@ mod tests {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(31, 5);
 
-        // Primary: unmined_since = 0.
+        // On-device metadata: unmined_since = 0 (fresh record).
         let ie = h.index.lookup(&key).unwrap();
-        assert_eq!(ie.unmined_since, 0);
+        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!({ meta.unmined_since }, 0);
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
@@ -8212,17 +8127,6 @@ mod tests {
         let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         meta.unmined_since = 500;
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-        h.index
-            .update_cached_fields(
-                &key,
-                ie.tx_flags,
-                ie.block_entry_count,
-                ie.spent_utxos,
-                ie.dah_or_preserve,
-                500,
-                ie.generation,
-            )
-            .unwrap();
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
@@ -8258,28 +8162,11 @@ mod tests {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(33, 5);
 
-        // Set on-device DAH to 900. The device record is recovery's
-        // authoritative source; the primary cache update below only keeps
-        // this older test setup internally consistent.
+        // Set on-device DAH to 900 — the device record is recovery's
+        // authoritative source. preserve_until stays 0, so dah_or_preserve
+        // resolves to the DAH.
         let ie = h.index.lookup(&key).unwrap();
         let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.delete_at_height = 900;
-        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-        // Ensure HAS_PRESERVE_UNTIL is cleared so dah_or_preserve == DAH.
-        let tf = TxFlags::from_bits_truncate(ie.tx_flags) - TxFlags::HAS_PRESERVE_UNTIL;
-        h.index
-            .update_cached_fields(
-                &key,
-                tf.bits(),
-                ie.block_entry_count,
-                ie.spent_utxos,
-                900,
-                ie.unmined_since,
-                ie.generation,
-            )
-            .unwrap();
-        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.flags = tf;
         meta.delete_at_height = 900;
         meta.unmined_since = 500;
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
@@ -8569,22 +8456,9 @@ mod tests {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(34, 5);
 
-        // Primary's post-mutation state: both fields set.
+        // On-device post-mutation state: both fields set (recovery's authority).
         let ie = h.index.lookup(&key).unwrap();
-        let tf = TxFlags::from_bits_truncate(ie.tx_flags) - TxFlags::HAS_PRESERVE_UNTIL;
-        h.index
-            .update_cached_fields(
-                &key,
-                tf.bits(),
-                ie.block_entry_count,
-                ie.spent_utxos,
-                900,
-                500,
-                ie.generation,
-            )
-            .unwrap();
         let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.flags = tf;
         meta.delete_at_height = 900;
         meta.unmined_since = 500;
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
@@ -8635,9 +8509,6 @@ mod tests {
             subtree_idx: 0,
         };
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-        h.index
-            .update_cached_fields(&key, 0, 1, 0, 0, 0, 0)
-            .unwrap();
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SpendV2 {
@@ -8675,9 +8546,6 @@ mod tests {
         meta.delete_at_height = 900;
         meta.unmined_since = 500;
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-        h.index
-            .update_cached_fields(&key, 0, 0, 0, 900, 500, 0)
-            .unwrap();
 
         let redo = h.redo_log();
         let mut dah = DahBackend::new_in_memory();
@@ -8902,13 +8770,6 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
-                        utxo_count: 1,
-                        block_entry_count: 0,
-                        tx_flags: 0,
-                        spent_utxos: 0,
-                        dah_or_preserve: 0,
-                        unmined_since: 0,
-                        generation: 0,
                     },
                 )
                 .unwrap();
@@ -8984,7 +8845,8 @@ mod tests {
                 let mut txid_a = [0u8; 32];
                 txid_a[0] = 0xAA;
                 txid_a[1..9].copy_from_slice(&a.to_le_bytes());
-                txid_a[24..32].copy_from_slice(&a.to_le_bytes());
+                // Index-shard routing uses bytes [8..12]; drive it here.
+                txid_a[8..12].copy_from_slice(&(a as u32).to_le_bytes());
                 let ka = TxKey { txid: txid_a };
                 let shard_a = index.index_shard_for_key(&ka);
 
@@ -8992,7 +8854,7 @@ mod tests {
                     let mut txid_b = [0u8; 32];
                     txid_b[0] = 0xBB;
                     txid_b[1..9].copy_from_slice(&b.to_le_bytes());
-                    txid_b[24..32].copy_from_slice(&b.to_le_bytes());
+                    txid_b[8..12].copy_from_slice(&(b as u32).to_le_bytes());
                     let kb = TxKey { txid: txid_b };
                     if index.index_shard_for_key(&kb) != shard_a {
                         found = Some((ka, kb));
@@ -9029,13 +8891,6 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: offset_a,
-                    utxo_count,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 0,
                 },
             )
             .unwrap();

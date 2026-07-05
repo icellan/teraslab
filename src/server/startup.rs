@@ -1270,13 +1270,6 @@ mod tests {
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: 0xDEAD_0000,
-                utxo_count: 1,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 0,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
             };
             backend.register(bogus_key, entry).unwrap();
         }
@@ -1350,13 +1343,6 @@ mod tests {
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: 0xDEAD_0000,
-                utxo_count: 1,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 0,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
             };
             backend.register(TxKey { txid: [0xAB; 32] }, entry).unwrap();
         }
@@ -1733,14 +1719,16 @@ mod tests {
         let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
 
-        // Write 30 records with keys that spread across shards ([24..32] varied)
+        // Write 30 records with keys that spread across shards. Shard routing
+        // uses txid[0..2]; the slim index stores only txid[0..12], so keep all
+        // identifying bytes within [0..12] so iteration/rebuild round-trips are
+        // lossless.
         let mut expected: Vec<(TxKey, u64)> = Vec::new();
         for i in 0u64..30 {
             let mut meta = TxMetadata::new(5);
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
-            txid[8..16].copy_from_slice(&i.wrapping_mul(0x9E3779B97F4A7C15).to_le_bytes());
-            txid[24..32].copy_from_slice(&i.wrapping_mul(0x517C_C1B7_2722_0A95).to_le_bytes());
+            txid[8..12].copy_from_slice(&(i.wrapping_mul(0x9E3779B9) as u32).to_le_bytes());
             meta.tx_id = txid;
 
             let record_size = TxMetadata::record_size_for(5);

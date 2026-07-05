@@ -121,13 +121,6 @@ fn replay_stops_on_first_fatal_io_error() {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: *record_offset,
-                    utxo_count: 1,
-                    block_entry_count: 0,
-                    tx_flags: 0,
-                    spent_utxos: 0,
-                    dah_or_preserve: 0,
-                    unmined_since: 0,
-                    generation: 0,
                 },
             )
             .unwrap();

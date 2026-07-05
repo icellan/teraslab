@@ -1221,9 +1221,12 @@ fn segment_cluster_master_failover_preserves_replicated_record() {
         Duration::from_secs(10),
     )
     .expect("RF=2 must replicate the create to the replica's segment engine");
-    let replicated = replica.server.engine().lookup(&key).unwrap();
+    // The slim primary index carries only the locator; verify the replicated
+    // record shape from its on-device footer.
+    let replicated_meta = replica.server.engine().read_metadata(&key).unwrap();
     assert_eq!(
-        replicated.utxo_count, 1,
+        { replicated_meta.utxo_count },
+        1,
         "replicated record shape preserved"
     );
 

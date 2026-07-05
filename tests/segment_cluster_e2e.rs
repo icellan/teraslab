@@ -463,10 +463,12 @@ fn joining_segment_node_receives_record_via_migration_create_and_can_spend() {
 
     // The record landed and is fully readable, and its migrated generation was
     // preserved (the non-degenerate metadata payload path, not just index bytes).
-    let entry = joiner
+    joiner
         .lookup(&key)
         .expect("migrated record must be indexed");
-    assert_eq!(entry.utxo_count, 4);
+    // The slim primary index no longer caches utxo_count; read it from the
+    // migrated record's on-device footer.
+    assert_eq!({ joiner.read_metadata(&key).unwrap().utxo_count }, 4);
     assert_eq!(joiner.read_slot(&key, 0).unwrap().status, UTXO_UNSPENT);
     assert_eq!(
         { joiner.read_metadata(&key).unwrap().generation },

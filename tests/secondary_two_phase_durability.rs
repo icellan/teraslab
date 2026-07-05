@@ -18,7 +18,7 @@ use teraslab::index::redb_unmined::RedbUnminedIndex;
 use teraslab::index::{
     DahBackend, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
 };
-use teraslab::record::{TxFlags, TxMetadata};
+use teraslab::record::TxMetadata;
 use teraslab::redo::{RedoLog, RedoOp};
 
 fn make_key(n: u8) -> TxKey {
@@ -27,17 +27,14 @@ fn make_key(n: u8) -> TxKey {
     TxKey { txid }
 }
 
-fn make_entry(offset: u64, unmined_since: u32, delete_at_height: u32) -> TxIndexEntry {
+// The slim primary index carries only the locator; the authoritative
+// unmined_since / delete_at_height / preserve_until values that recovery's
+// secondary reconcile consults live in the on-device footer (written via
+// `write_device_metadata`), so this helper takes only the record offset.
+fn make_entry(offset: u64) -> TxIndexEntry {
     TxIndexEntry {
         device_id: 0,
         record_offset: offset,
-        utxo_count: 5,
-        block_entry_count: 0,
-        tx_flags: 0,
-        spent_utxos: 0,
-        dah_or_preserve: delete_at_height,
-        unmined_since,
-        generation: 0,
     }
 }
 
@@ -66,7 +63,7 @@ fn crash_after_unmined_redo_fsync_before_redb_commit() {
     // unmined_since is 500.
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(1);
-    primary.register(key, make_entry(4096, 500, 0)).unwrap();
+    primary.register(key, make_entry(4096)).unwrap();
 
     // Open on-disk DAH and unmined indexes.
     let dah_path = dir.path().join("dah.redb");
@@ -140,7 +137,7 @@ fn crash_after_dah_redo_fsync_before_redb_commit() {
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(2);
     // Primary's DAH = 900 (no preserve_until).
-    let entry = make_entry(8192, 0, 900);
+    let entry = make_entry(8192);
     primary.register(key, entry).unwrap();
 
     let dah_path = dir.path().join("dah.redb");
@@ -202,7 +199,7 @@ fn crash_after_batched_redo_fsync_before_both_redb_commits() {
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(3);
     // Primary: unmined_since = 500, DAH = 900.
-    primary.register(key, make_entry(16384, 500, 900)).unwrap();
+    primary.register(key, make_entry(16384)).unwrap();
 
     let dah_path = dir.path().join("dah.redb");
     let unmined_path = dir.path().join("unmined.redb");
@@ -270,7 +267,7 @@ fn recover_skips_stale_redo_relative_to_primary() {
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(4);
     // Primary's authoritative unmined_since is 0 (on-chain).
-    primary.register(key, make_entry(4096, 0, 0)).unwrap();
+    primary.register(key, make_entry(4096)).unwrap();
 
     let unmined_path = dir.path().join("unmined.redb");
     let mut unmined_backend =
@@ -323,11 +320,11 @@ fn recover_dah_respects_has_preserve_until_flag() {
 
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let key = make_key(5);
-    // HAS_PRESERVE_UNTIL flag set; dah_or_preserve = 12345 represents a
-    // preserve_until, NOT a DAH — so authoritative DAH = 0.
-    let mut entry = make_entry(4096, 0, 12345);
-    entry.tx_flags = TxFlags::HAS_PRESERVE_UNTIL.bits();
-    primary.register(key, entry).unwrap();
+    // The record is preserved on-device: preserve_until is set and the DAH
+    // is cleared, so the AUTHORITATIVE on-device `delete_at_height` is 0
+    // (written below). A redo DAH intent with new_height = 900 must therefore
+    // be treated as stale and skipped.
+    primary.register(key, make_entry(4096)).unwrap();
 
     let dah_path = dir.path().join("dah.redb");
     let mut dah_backend =
@@ -353,7 +350,16 @@ fn recover_dah_respects_has_preserve_until_flag() {
 
     let redo_log_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let data_dev = MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap();
-    write_device_metadata(&data_dev, key, 4096, 0, 0);
+    // Preserved record on device: preserve_until = 12345, DAH cleared to 0.
+    // The reconcile reads the authoritative on-device `delete_at_height` (0),
+    // so the redo DAH intent (900) is stale.
+    {
+        let mut meta = TxMetadata::new(5);
+        meta.tx_id = key.txid;
+        meta.preserve_until = 12345;
+        meta.delete_at_height = 0;
+        teraslab::io::write_metadata(&data_dev, 4096, &meta).unwrap();
+    }
 
     let stats = teraslab::recovery::recover_all(
         &data_dev,

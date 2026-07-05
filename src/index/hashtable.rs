@@ -97,65 +97,22 @@ impl std::fmt::Debug for TxKey {
 // TxIndexEntry
 // ---------------------------------------------------------------------------
 
-/// What the primary index stores for each transaction.
+/// What the primary index stores for each transaction: the on-device
+/// locator only.
+///
+/// The primary index is deliberately slim — it maps a `TxKey` to the
+/// `(device_id, record_offset)` pair needed to reach the authoritative
+/// [`crate::record::TxMetadata`] footer on device. Every lifecycle field
+/// (`utxo_count`, `tx_flags`, `spent_utxos`, `delete_at_height` /
+/// `preserve_until`, `unmined_since`, `generation`, `block_entry_count`) is
+/// read from that footer by the operation that needs it — the same read the
+/// op already performs — so the index carries no cached metadata.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TxIndexEntry {
     /// Which device this record lives on (for multi-device setups).
     pub device_id: u8,
     /// Byte offset on that device to the start of TxMetadata.
     pub record_offset: u64,
-    /// Number of UTXO slots in this record.
-    pub utxo_count: u32,
-    /// Number of entries in the block (cached from metadata).
-    pub block_entry_count: u8,
-    /// Transaction-level flags (cached from metadata).
-    pub tx_flags: u8,
-    /// Number of spent UTXOs (cached from TxMetadata).
-    pub spent_utxos: u32,
-    /// Delete-at-height or preserve-until value (discriminated by HAS_PRESERVE_UNTIL bit in tx_flags).
-    pub dah_or_preserve: u32,
-    /// Unmined-since timestamp (cached from TxMetadata).
-    pub unmined_since: u32,
-    /// Generation counter (cached from TxMetadata).
-    pub generation: u32,
-}
-
-impl TxIndexEntry {
-    /// Build an entry for a record recovered by a device scan, populating the
-    /// cached lifecycle fields (`dah_or_preserve`, `unmined_since`,
-    /// `generation`) and the `HAS_PRESERVE_UNTIL` discriminant from the parsed
-    /// metadata footer.
-    ///
-    /// This mirrors the live registration path (`Engine::sync_index_cache`):
-    /// `dah_or_preserve` holds `preserve_until` when it is non-zero (and the
-    /// index-only `HAS_PRESERVE_UNTIL` bit is set), otherwise `delete_at_height`.
-    /// Rebuild paths that hardcode these to `0` make a GET report an unmined tx
-    /// as mined and drop delete/preserve heights — a correctness bug — so every
-    /// device-scan construction site must use this instead of literal zeros.
-    #[must_use]
-    pub fn from_scanned_meta(record_offset: u64, meta: &crate::record::TxMetadata) -> Self {
-        let preserve = { meta.preserve_until };
-        let dah = { meta.delete_at_height };
-        let has_preserve = preserve != 0;
-        let dah_or_preserve = if has_preserve { preserve } else { dah };
-        let mut tx_flags = meta.flags.bits();
-        if has_preserve {
-            tx_flags |= crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits();
-        } else {
-            tx_flags &= !crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits();
-        }
-        Self {
-            device_id: 0,
-            record_offset,
-            utxo_count: { meta.utxo_count },
-            block_entry_count: meta.block_entry_count,
-            tx_flags,
-            spent_utxos: meta.spent_utxos,
-            dah_or_preserve,
-            unmined_since: { meta.unmined_since },
-            generation: { meta.generation },
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,49 +137,75 @@ fn cap_probe(dist: usize) -> u8 {
     dist.min(MAX_STORED_PROBE) as u8
 }
 
-/// One bucket in the Robin Hood hash table: exactly 64 bytes (one cache line).
+/// Number of txid prefix bytes stored in each bucket for collision-safe
+/// key comparison.
+///
+/// [`bucket_index`] hashes `txid[0..8]`, so an 8-byte stored key would let any
+/// txid sharing that 8-byte prefix land in the same probe chain and silently
+/// shadow the real entry. Storing 12 bytes (96 bits) makes the collision
+/// expectation ~2.5e-11 across 2e9 entries — effectively never — while keeping
+/// the bucket a compact 20 bytes.
+const STORED_TXID_LEN: usize = 12;
+
+/// One bucket in the Robin Hood hash table: exactly 20 bytes.
+///
+/// Layout: `probe_distance:u8` + `txid_lo:[u8;12]` + `device_id:u8` +
+/// `offset_div8:[u8;6]`. The bucket stores only the on-device locator plus a
+/// 12-byte txid prefix; all lifecycle metadata lives in the on-device
+/// [`crate::record::TxMetadata`] footer.
 ///
 /// The `probe_distance` field serves double duty: values 0–254 indicate an
 /// occupied bucket whose Robin Hood probe distance is that value; the value
 /// 0xFF ([`BUCKET_EMPTY_SENTINEL`]) means the bucket is empty.
+///
+/// `offset_div8` stores `record_offset >> 3` as a little-endian 48-bit
+/// integer. Records are always at least [`crate::record::RECORD_ALIGN`]
+/// (8-byte) aligned, so the shift is lossless and the 48-bit field addresses
+/// offsets up to `2^51` bytes (2 PiB) per device.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Bucket {
     probe_distance: u8,
-    txid: [u8; 32],
+    txid_lo: [u8; STORED_TXID_LEN],
     device_id: u8,
-    record_offset: u64,
-    utxo_count: u32,
-    block_entry_count: u8,
-    tx_flags: u8,
-    spent_utxos: u32,
-    dah_or_preserve: u32,
-    unmined_since: u32,
-    generation: u32,
+    offset_div8: [u8; 6],
 }
 
 /// Actual size of one bucket in bytes.
 pub const BUCKET_SIZE: usize = std::mem::size_of::<Bucket>();
 
-const _: () = assert!(
-    BUCKET_SIZE == 64,
-    "Bucket must be exactly 64 bytes (1 cache line)"
-);
+const _: () = assert!(BUCKET_SIZE == 20, "Bucket must be exactly 20 bytes");
+
+/// Encode a record offset into the packed 48-bit `offset_div8` field.
+///
+/// Records are always [`crate::record::RECORD_ALIGN`] (8-byte) aligned, so
+/// `off >> 3` is lossless. The low 6 bytes of `(off >> 3).to_le_bytes()` are
+/// stored. In debug builds the alignment and range invariants are asserted.
+#[inline(always)]
+fn encode_offset(off: u64) -> [u8; 6] {
+    debug_assert!(
+        off.is_multiple_of(8) && off < (1u64 << 51),
+        "record offset {off} must be 8-aligned and < 2^51"
+    );
+    let div8 = off >> 3;
+    let b = div8.to_le_bytes();
+    [b[0], b[1], b[2], b[3], b[4], b[5]]
+}
+
+/// Decode a packed 48-bit `offset_div8` field back to a byte offset.
+#[inline(always)]
+fn decode_offset(b: [u8; 6]) -> u64 {
+    let div8 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], 0, 0]);
+    div8 << 3
+}
 
 impl Bucket {
     fn empty() -> Self {
         Self {
             probe_distance: BUCKET_EMPTY_SENTINEL,
-            txid: [0; 32],
+            txid_lo: [0; STORED_TXID_LEN],
             device_id: 0,
-            record_offset: 0,
-            utxo_count: 0,
-            block_entry_count: 0,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
+            offset_div8: [0; 6],
         }
     }
 
@@ -234,32 +217,40 @@ impl Bucket {
         self.probe_distance != BUCKET_EMPTY_SENTINEL
     }
 
+    /// Whether this bucket's stored 12-byte txid prefix matches `key`.
+    #[inline]
+    fn key_matches(&self, key: &TxKey) -> bool {
+        self.txid_lo == key.txid[0..STORED_TXID_LEN]
+    }
+
+    /// Reconstruct a [`TxKey`] from the stored 12-byte prefix, zero-padding
+    /// bytes 12..32.
+    ///
+    /// This key is valid ONLY for in-table re-placement ([`bucket_index`]
+    /// reads `txid[0..8]`; [`Bucket::set_entry`] stores `txid[0..12]`) and for
+    /// look-ups (which compare only the 12-byte prefix). It is NOT the record's
+    /// true 32-byte txid — external consumers that need the full txid must read
+    /// it from the on-device record identity (see the enumeration caveat on
+    /// [`HashTableIter`]).
+    #[inline]
+    fn stored_key(&self) -> TxKey {
+        let mut txid = [0u8; 32];
+        txid[0..STORED_TXID_LEN].copy_from_slice(&self.txid_lo);
+        TxKey { txid }
+    }
+
     fn entry(&self) -> TxIndexEntry {
         TxIndexEntry {
             device_id: self.device_id,
-            record_offset: self.record_offset,
-            utxo_count: self.utxo_count,
-            block_entry_count: self.block_entry_count,
-            tx_flags: self.tx_flags,
-            spent_utxos: self.spent_utxos,
-            dah_or_preserve: self.dah_or_preserve,
-            unmined_since: self.unmined_since,
-            generation: self.generation,
+            record_offset: decode_offset(self.offset_div8),
         }
     }
 
     fn set_entry(&mut self, key: &TxKey, entry: &TxIndexEntry, probe_dist: u8) {
         self.probe_distance = probe_dist;
-        self.txid = key.txid;
+        self.txid_lo.copy_from_slice(&key.txid[0..STORED_TXID_LEN]);
         self.device_id = entry.device_id;
-        self.record_offset = entry.record_offset;
-        self.utxo_count = entry.utxo_count;
-        self.block_entry_count = entry.block_entry_count;
-        self.tx_flags = entry.tx_flags;
-        self.spent_utxos = entry.spent_utxos;
-        self.dah_or_preserve = entry.dah_or_preserve;
-        self.unmined_since = entry.unmined_since;
-        self.generation = entry.generation;
+        self.offset_div8 = encode_offset(entry.record_offset);
     }
 }
 
@@ -328,13 +319,6 @@ fn fresh_seed() -> u64 {
     let mut buf = [0u8; 8];
     getrandom::getrandom(&mut buf).expect("getrandom failed to produce a bucket seed");
     u64::from_le_bytes(buf)
-}
-
-/// Derive the fingerprint from a txid. Uses bytes 8–15 (same region that
-/// was previously stored redundantly in each bucket).
-#[inline(always)]
-fn txid_fingerprint(txid: &[u8; 32]) -> u64 {
-    u64::from_le_bytes(txid[8..16].try_into().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -987,7 +971,6 @@ impl HashTable {
 
     /// Look up a transaction by key, returning the entry by value. O(1) expected.
     pub fn get_entry(&self, key: &TxKey) -> Option<TxIndexEntry> {
-        let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(key, self.seed, self.mask);
         let mut dist: usize = 0;
 
@@ -1004,7 +987,7 @@ impl HashTable {
                 {
                     return None;
                 }
-                if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
+                if bucket.key_matches(key) {
                     return Some(bucket.entry());
                 }
             }
@@ -1019,7 +1002,6 @@ impl HashTable {
     /// Insert or update an entry. Returns the previous entry if the key existed.
     pub fn insert(&mut self, key: TxKey, entry: TxIndexEntry) -> Result<Option<TxIndexEntry>> {
         // Check for update of existing key first.
-        let fp = txid_fingerprint(&key.txid);
         {
             let mut idx = bucket_index(&key, self.seed, self.mask);
             let mut dist: usize = 0;
@@ -1034,7 +1016,7 @@ impl HashTable {
                     {
                         break;
                     }
-                    if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
+                    if bucket.key_matches(&key) {
                         let old = bucket.entry();
                         self.bucket_mut(idx)
                             .set_entry(&key, &entry, cap_probe(dist));
@@ -1071,7 +1053,7 @@ impl HashTable {
 
             // Robin Hood: if our displacement is greater, swap.
             if bucket.is_occupied() && dist > bucket.probe_distance as usize {
-                let displaced_key = TxKey { txid: bucket.txid };
+                let displaced_key = bucket.stored_key();
                 let displaced_entry = bucket.entry();
                 let displaced_dist: usize = bucket.probe_distance as usize;
 
@@ -1130,7 +1112,6 @@ impl HashTable {
     /// without finding a free slot (should not happen while the load factor is
     /// kept below 1.0 by the caller's resize policy).
     pub fn insert_if_absent(&mut self, key: TxKey, entry: TxIndexEntry) -> Result<bool> {
-        let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(&key, self.seed, self.mask);
         let mut dist: usize = 0;
         let mut cur_key = key;
@@ -1167,7 +1148,7 @@ impl HashTable {
                     && dist > bucket.probe_distance as usize
                 {
                     may_contain_original = false;
-                } else if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
+                } else if bucket.key_matches(&key) {
                     // Key already present — leave the table byte-identical.
                     return Ok(false);
                 }
@@ -1177,7 +1158,7 @@ impl HashTable {
             // this fires we begin carrying a displaced key, so the original key
             // can no longer be ahead of us.
             if bucket.is_occupied() && dist > bucket.probe_distance as usize {
-                let displaced_key = TxKey { txid: bucket.txid };
+                let displaced_key = bucket.stored_key();
                 let displaced_entry = bucket.entry();
                 let displaced_dist: usize = bucket.probe_distance as usize;
 
@@ -1206,8 +1187,7 @@ impl HashTable {
         for i in 0..self.capacity {
             let bucket = self.bucket(i);
             if bucket.is_occupied() {
-                let key = TxKey { txid: bucket.txid };
-                new_table.insert(key, bucket.entry())?;
+                new_table.insert(bucket.stored_key(), bucket.entry())?;
             }
         }
         Ok(())
@@ -1232,7 +1212,7 @@ impl HashTable {
         for i in 0..self.capacity {
             let bucket = self.bucket(i);
             if bucket.is_occupied() {
-                entries.push((TxKey { txid: bucket.txid }, bucket.entry()));
+                entries.push((bucket.stored_key(), bucket.entry()));
             }
         }
 
@@ -1259,7 +1239,6 @@ impl HashTable {
     ///
     /// Uses backward-shift deletion for better probe-chain performance.
     pub fn remove(&mut self, key: &TxKey) -> Option<TxIndexEntry> {
-        let fp = txid_fingerprint(&key.txid);
         let mut idx = bucket_index(key, self.seed, self.mask);
         let mut dist: usize = 0;
 
@@ -1275,7 +1254,7 @@ impl HashTable {
                 {
                     return None;
                 }
-                if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
+                if bucket.key_matches(key) {
                     break; // Found at idx
                 }
             }
@@ -1297,7 +1276,7 @@ impl HashTable {
         // non-zero probe distances) those conditions could never trigger
         // and the shift would walk forever, re-meeting itself after
         // wraparound. Cap iterations at `self.capacity` — matches the
-        // bounds used by `get_entry`, `insert`, and `update_cached_fields`.
+        // bounds used by `get_entry` and `insert`.
         let mut empty_idx = idx;
         let mut steps = 0usize;
         loop {
@@ -1395,56 +1374,6 @@ impl HashTable {
     /// Whether hugepages are backing this table.
     pub fn hugepage_enabled(&self) -> bool {
         self.hugepage
-    }
-
-    /// Update the cached fields for an existing entry.
-    ///
-    /// Returns `true` if the entry was found and updated, `false` if not found.
-    /// This is a targeted update — only the specified fields are written,
-    /// the rest of the bucket is untouched.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_cached_fields(
-        &mut self,
-        key: &TxKey,
-        tx_flags: u8,
-        block_entry_count: u8,
-        spent_utxos: u32,
-        dah_or_preserve: u32,
-        unmined_since: u32,
-        generation: u32,
-    ) -> bool {
-        let fp = txid_fingerprint(&key.txid);
-        let mut idx = bucket_index(key, self.seed, self.mask);
-        let mut dist: usize = 0;
-
-        loop {
-            let bucket = self.bucket(idx);
-            if bucket.is_empty() {
-                return false;
-            }
-            if bucket.is_occupied() {
-                if (bucket.probe_distance as usize) < MAX_STORED_PROBE
-                    && dist > bucket.probe_distance as usize
-                {
-                    return false;
-                }
-                if txid_fingerprint(&bucket.txid) == fp && bucket.txid == key.txid {
-                    let b = self.bucket_mut(idx);
-                    b.tx_flags = tx_flags;
-                    b.block_entry_count = block_entry_count;
-                    b.spent_utxos = spent_utxos;
-                    b.dah_or_preserve = dah_or_preserve;
-                    b.unmined_since = unmined_since;
-                    b.generation = generation;
-                    return true;
-                }
-            }
-            idx = (idx + 1) & self.mask;
-            dist += 1;
-            if dist >= self.capacity {
-                return false;
-            }
-        }
     }
 
     /// Flush dirty pages to the backing file asynchronously.
@@ -1734,6 +1663,14 @@ fn sentinel_path_for(path: &std::path::Path) -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Iterator over occupied hash table entries.
+///
+/// # Enumeration caveat
+///
+/// The slim bucket stores only `txid[0..12]`, so the [`TxKey`] yielded here is
+/// the 12-byte prefix zero-padded to 32 bytes — NOT the record's full txid. It
+/// is sufficient to look the entry back up (look-ups compare only the 12-byte
+/// prefix) but any consumer that needs the true 32-byte txid must read it from
+/// the on-device record identity during the scan.
 pub struct HashTableIter<'a> {
     table: &'a HashTable,
     pos: usize,
@@ -1747,7 +1684,7 @@ impl<'a> Iterator for HashTableIter<'a> {
             let bucket = self.table.bucket(self.pos);
             self.pos += 1;
             if bucket.is_occupied() {
-                return Some((TxKey { txid: bucket.txid }, bucket.entry()));
+                return Some((bucket.stored_key(), bucket.entry()));
             }
         }
         None
@@ -1771,17 +1708,14 @@ mod tests {
         TxKey { txid }
     }
 
-    fn make_entry(offset: u64) -> TxIndexEntry {
+    /// Build a slim entry whose `record_offset` is `n` scaled to an 8-byte
+    /// alignment (records are always [`crate::record::RECORD_ALIGN`]-aligned,
+    /// which the offset codec asserts). Callers that assert a specific
+    /// `record_offset` compare against `n * 8`.
+    fn make_entry(n: u64) -> TxIndexEntry {
         TxIndexEntry {
             device_id: 0,
-            record_offset: offset,
-            utxo_count: 10,
-            block_entry_count: 0,
-            tx_flags: 0,
-            spent_utxos: 0,
-            dah_or_preserve: 0,
-            unmined_since: 0,
-            generation: 0,
+            record_offset: n * 8,
         }
     }
 
@@ -2008,9 +1942,10 @@ mod tests {
     }
 
     #[test]
-    fn different_fingerprints_same_bucket() {
+    fn different_keys_same_bucket() {
         let mut t = HashTable::new(1024).unwrap();
-        // Two keys that map to the same bucket but have different fingerprints
+        // Two keys that map to the same bucket but differ within the stored
+        // 12-byte prefix (bytes 8..12 differ: sequence 1 vs 2).
         let k1 = make_colliding_key(42, 1, 1023);
         let k2 = make_colliding_key(42, 2, 1023);
 
@@ -2021,7 +1956,13 @@ mod tests {
             bucket_index(&k2, t.seed, 1023),
             "keys should collide"
         );
-        assert_ne!(txid_fingerprint(&k1.txid), txid_fingerprint(&k2.txid));
+        // The stored prefixes must differ so the 12-byte compare keeps them
+        // distinct (they share bytes 0..8 but differ in bytes 8..12).
+        assert_ne!(
+            k1.txid[0..STORED_TXID_LEN],
+            k2.txid[0..STORED_TXID_LEN],
+            "colliding keys must differ within the stored 12-byte prefix"
+        );
 
         let e1 = make_entry(1000);
         let e2 = make_entry(2000);
@@ -2031,6 +1972,76 @@ mod tests {
         assert_eq!(t.get_entry(&k1), Some(e1));
         assert_eq!(t.get_entry(&k2), Some(e2));
         assert_eq!(t.len(), 2);
+    }
+
+    /// The stored key is 12 bytes wide: two txids sharing an 8-byte prefix
+    /// (same home bucket) but differing ONLY in bytes 8..12 must be stored and
+    /// retrieved as distinct entries — an 8-byte stored key would silently
+    /// shadow one behind the other.
+    #[test]
+    fn twelve_byte_prefix_distinguishes_shared_8byte_prefix() {
+        let mut t = HashTable::new(256).unwrap();
+        let mut a = [0u8; 32];
+        a[0..8].copy_from_slice(&7u64.to_le_bytes());
+        a[8] = 0xAA; // byte 8 differs
+        let mut b = a; // shares bytes 0..8
+        b[8] = 0xBB;
+        // Bytes 12..32 differ too, but the table only ever inspects 0..12 —
+        // wipe them equal to prove the distinction comes from bytes 8..12.
+        for i in 12..32 {
+            a[i] = 0;
+            b[i] = 0;
+        }
+        let ka = TxKey { txid: a };
+        let kb = TxKey { txid: b };
+        assert_eq!(
+            bucket_index(&ka, t.seed, t.mask),
+            bucket_index(&kb, t.seed, t.mask),
+            "keys share txid[0..8] so must hash to the same home bucket"
+        );
+
+        t.insert(ka, make_entry(1)).unwrap();
+        t.insert(kb, make_entry(2)).unwrap();
+
+        assert_eq!(t.len(), 2, "distinct 12-byte prefixes must not collapse");
+        assert_eq!(t.get_entry(&ka).unwrap().record_offset, 8);
+        assert_eq!(t.get_entry(&kb).unwrap().record_offset, 2 * 8);
+    }
+
+    /// The offset codec (`encode_offset`/`decode_offset`) round-trips every
+    /// 8-aligned offset across the full 48-bit `offset_div8` range.
+    #[test]
+    fn offset_codec_round_trips_aligned_offsets() {
+        let cases = [
+            0u64,
+            8,
+            4096,
+            8 * 1_000_000,
+            (1u64 << 51) - 8, // largest representable 8-aligned offset
+        ];
+        for off in cases {
+            assert_eq!(decode_offset(encode_offset(off)), off, "offset {off}");
+        }
+    }
+
+    /// A record offset stored through a bucket must survive the round trip
+    /// through the packed 48-bit field.
+    #[test]
+    fn bucket_preserves_large_aligned_offset() {
+        let mut t = HashTable::new(16).unwrap();
+        let key = make_key(1);
+        let big = (1u64 << 40) + 4096; // 8-aligned, needs > 32 bits
+        t.insert(
+            key,
+            TxIndexEntry {
+                device_id: 3,
+                record_offset: big,
+            },
+        )
+        .unwrap();
+        let got = t.get_entry(&key).unwrap();
+        assert_eq!(got.record_offset, big);
+        assert_eq!(got.device_id, 3);
     }
 
     // -- Bucket-seed DoS-hardening tests (security fix) --
@@ -2151,7 +2162,7 @@ mod tests {
             let e = t
                 .get_entry(&make_key(i))
                 .expect("entry should survive resize");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 100 * 8);
         }
     }
 
@@ -2173,7 +2184,7 @@ mod tests {
         }
         t.resize(32).unwrap();
         t.insert(make_key(100), make_entry(100)).unwrap();
-        assert_eq!(t.get_entry(&make_key(100)).unwrap().record_offset, 100);
+        assert_eq!(t.get_entry(&make_key(100)).unwrap().record_offset, 100 * 8);
     }
 
     #[test]
@@ -2212,7 +2223,7 @@ mod tests {
 
         for (i, k) in keys.iter().enumerate() {
             let e = t.get_entry(k).expect("colliding key should be found");
-            assert_eq!(e.record_offset, i as u64 * 100);
+            assert_eq!(e.record_offset, i as u64 * 100 * 8);
         }
     }
 
@@ -2230,7 +2241,7 @@ mod tests {
             let e = t
                 .get_entry(k)
                 .unwrap_or_else(|| panic!("adversarial key {i} not found"));
-            assert_eq!(e.record_offset, i as u64);
+            assert_eq!(e.record_offset, i as u64 * 8);
         }
     }
 
@@ -2285,9 +2296,9 @@ mod tests {
 
         t.remove(&kb);
 
-        assert_eq!(t.get_entry(&ka).unwrap().record_offset, 1);
+        assert_eq!(t.get_entry(&ka).unwrap().record_offset, 8);
         assert!(t.get_entry(&kb).is_none());
-        assert_eq!(t.get_entry(&kc).unwrap().record_offset, 3);
+        assert_eq!(t.get_entry(&kc).unwrap().record_offset, 3 * 8);
     }
 
     #[test]
@@ -2305,8 +2316,8 @@ mod tests {
         t.remove(&ka);
 
         assert!(t.get_entry(&ka).is_none());
-        assert_eq!(t.get_entry(&kb).unwrap().record_offset, 2);
-        assert_eq!(t.get_entry(&kc).unwrap().record_offset, 3);
+        assert_eq!(t.get_entry(&kb).unwrap().record_offset, 2 * 8);
+        assert_eq!(t.get_entry(&kc).unwrap().record_offset, 3 * 8);
     }
 
     /// REL-122: removing an entry whose true probe distance was capped at
@@ -2344,7 +2355,7 @@ mod tests {
         let victim_seq = 600usize;
         let victim = keys[victim_seq];
         let removed = t.remove(&victim).expect("capped victim must be present");
-        assert_eq!(removed.record_offset, victim_seq as u64 + 1);
+        assert_eq!(removed.record_offset, (victim_seq as u64 + 1) * 8);
 
         assert_eq!(t.len() as u64, N - 1);
         // Removed key is gone.
@@ -2361,7 +2372,7 @@ mod tests {
             let e = t
                 .get_entry(k)
                 .unwrap_or_else(|| panic!("key {i} must survive capped remove"));
-            assert_eq!(e.record_offset, i as u64 + 1, "value for key {i}");
+            assert_eq!(e.record_offset, (i as u64 + 1) * 8, "value for key {i}");
         }
     }
 
@@ -2372,7 +2383,7 @@ mod tests {
         t.insert(key, make_entry(100)).unwrap();
         t.remove(&key);
         t.insert(key, make_entry(200)).unwrap();
-        assert_eq!(t.get_entry(&key).unwrap().record_offset, 200);
+        assert_eq!(t.get_entry(&key).unwrap().record_offset, 200 * 8);
     }
 
     #[test]
@@ -2391,7 +2402,7 @@ mod tests {
         // Table should still function correctly
         let key = make_key(999_999);
         t.insert(key, make_entry(42)).unwrap();
-        assert_eq!(t.get_entry(&key).unwrap().record_offset, 42);
+        assert_eq!(t.get_entry(&key).unwrap().record_offset, 42 * 8);
     }
 
     // -- Memory mapping tests --
@@ -2446,7 +2457,7 @@ mod tests {
             let e = t
                 .get_entry(&make_key(i))
                 .unwrap_or_else(|| panic!("key {i} not found at 1M scale"));
-            assert_eq!(e.record_offset, i * 8);
+            assert_eq!(e.record_offset, i * 8 * 8);
         }
     }
 
@@ -2473,7 +2484,7 @@ mod tests {
             let e = t
                 .get_entry(&make_key(i))
                 .unwrap_or_else(|| panic!("key {i} not found at 10M scale"));
-            assert_eq!(e.record_offset, i);
+            assert_eq!(e.record_offset, i * 8);
         }
     }
 
@@ -2529,7 +2540,7 @@ mod tests {
         collected.sort_by_key(|(_, e)| e.record_offset);
         assert_eq!(collected.len(), 20);
         for (i, (_, e)) in collected.iter().enumerate() {
-            assert_eq!(e.record_offset, i as u64);
+            assert_eq!(e.record_offset, i as u64 * 8);
         }
     }
 
@@ -2569,7 +2580,7 @@ mod tests {
         assert_eq!(t.len(), 20);
         for i in 0..20u64 {
             let e = t.get_entry(&make_key(i)).expect("should survive reopen");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 100 * 8);
         }
     }
 
@@ -2594,7 +2605,7 @@ mod tests {
         assert_eq!(t.len(), 10);
 
         let removed = t.remove(&make_key(5)).expect("should find entry");
-        assert_eq!(removed.record_offset, 500);
+        assert_eq!(removed.record_offset, 500 * 8);
         assert_eq!(t.len(), 9);
         assert!(t.get_entry(&make_key(5)).is_none());
     }
@@ -2618,7 +2629,7 @@ mod tests {
             let e = t
                 .get_entry(&make_key(i))
                 .expect("entry should survive resize");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 100 * 8);
         }
 
         assert!(!dir.path().join("test.tmp").exists());
@@ -2645,7 +2656,7 @@ mod tests {
             let e = t
                 .get_entry(&make_key(i))
                 .expect("should survive resize + reopen");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 100 * 8);
         }
     }
 
@@ -2681,7 +2692,7 @@ mod tests {
 
         // The live table is still usable.
         t.insert(make_key(99), make_entry(9900)).unwrap();
-        assert_eq!(t.get_entry(&make_key(99)).unwrap().record_offset, 9900);
+        assert_eq!(t.get_entry(&make_key(99)).unwrap().record_offset, 9900 * 8);
     }
 
     /// G-2: a crash (no clean Drop) AFTER a resize must be detected as an
@@ -2716,25 +2727,41 @@ mod tests {
         }
     }
 
+    /// Re-inserting an existing key on a file-backed table overwrites its
+    /// stored locator (device_id + record_offset) in place and the new value
+    /// survives a reopen. This is the slim-index equivalent of the former
+    /// cached-field update: the locator is now the ONLY mutable per-entry state.
     #[test]
-    fn file_backed_update_cached_fields() {
+    fn file_backed_reinsert_updates_locator() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.idx");
-        let mut t = HashTable::open_file_backed(&path, 32).unwrap();
-        let key = make_key(1);
-        t.insert(key, make_entry(4096)).unwrap();
+        {
+            let mut t = HashTable::open_file_backed(&path, 32).unwrap();
+            let key = make_key(1);
+            t.insert(key, make_entry(4096)).unwrap();
 
-        let updated = t.update_cached_fields(&key, 0xFF, 5, 8, 200, 600, 99);
-        assert!(updated);
+            let prev = t
+                .insert(
+                    key,
+                    TxIndexEntry {
+                        device_id: 2,
+                        record_offset: 9000 * 8,
+                    },
+                )
+                .unwrap();
+            assert_eq!(prev, Some(make_entry(4096)), "insert must return old entry");
 
-        let e = t.get_entry(&key).unwrap();
-        assert_eq!(e.tx_flags, 0xFF);
-        assert_eq!(e.block_entry_count, 5);
-        assert_eq!(e.spent_utxos, 8);
-        assert_eq!(e.dah_or_preserve, 200);
-        assert_eq!(e.unmined_since, 600);
-        assert_eq!(e.generation, 99);
-        assert_eq!(e.record_offset, 4096);
+            let e = t.get_entry(&key).unwrap();
+            assert_eq!(e.device_id, 2);
+            assert_eq!(e.record_offset, 9000 * 8);
+            assert_eq!(t.len(), 1, "re-insert must not grow the table");
+        }
+
+        // Reopen: the updated locator must be the durable value.
+        let t = HashTable::open_file_backed(&path, 32).unwrap();
+        let e = t.get_entry(&make_key(1)).expect("entry survives reopen");
+        assert_eq!(e.device_id, 2);
+        assert_eq!(e.record_offset, 9000 * 8);
     }
 
     #[test]
@@ -2936,7 +2963,7 @@ mod tests {
             // Sanity check all keys resolve before shutdown.
             for i in 0..14u64 {
                 let e = t.get_entry(&make_key(i)).unwrap();
-                assert_eq!(e.record_offset, i * 7 + 1);
+                assert_eq!(e.record_offset, (i * 7 + 1) * 8);
             }
         } // HashTable dropped — simulates clean shutdown
 
@@ -2954,7 +2981,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("key {i} lost after resize + reopen"));
             assert_eq!(
                 e.record_offset,
-                i * 7 + 1,
+                (i * 7 + 1) * 8,
                 "record_offset mismatch at key {i}"
             );
         }

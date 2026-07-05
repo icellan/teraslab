@@ -7,7 +7,7 @@ use crate::allocator::RecordAllocator;
 use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::hashtable::{TxIndexEntry, TxKey};
-use crate::index::redb_primary::{CachedFieldsUpdate, RedbPrimary, RedbPrimaryIter};
+use crate::index::redb_primary::{RedbPrimary, RedbPrimaryIter};
 use crate::index::secondary_backend::{DahBackend, UnminedBackend};
 use crate::index::{DahIndex, Index, IndexError, IndexStats, RestoreFlags, UnminedIndex};
 
@@ -304,86 +304,6 @@ impl PrimaryBackend {
         }
     }
 
-    /// Update the cached fields in the index entry for `key`.
-    ///
-    /// Returns `Ok(true)` if the key was found and updated, `Ok(false)` if the
-    /// key was not present, and an [`IndexError`] if the on-disk (redb) backend
-    /// fails to commit. Callers MUST propagate the error — silently dropping
-    /// it causes `dah_or_preserve`, `unmined_since`, and `generation` to drift
-    /// relative to the persisted state. The in-memory and file-backed variants
-    /// are infallible and always return `Ok(bool)`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_cached_fields(
-        &mut self,
-        key: &TxKey,
-        tx_flags: u8,
-        block_entry_count: u8,
-        spent_utxos: u32,
-        dah_or_preserve: u32,
-        unmined_since: u32,
-        generation: u32,
-    ) -> Result<bool, IndexError> {
-        match self {
-            Self::InMemory(idx) | Self::FileBacked(idx) => Ok(idx.update_cached_fields(
-                key,
-                tx_flags,
-                block_entry_count,
-                spent_utxos,
-                dah_or_preserve,
-                unmined_since,
-                generation,
-            )),
-            Self::OnDisk(redb) => redb.update_cached_fields(
-                key,
-                tx_flags,
-                block_entry_count,
-                spent_utxos,
-                dah_or_preserve,
-                unmined_since,
-                generation,
-            ),
-        }
-    }
-
-    /// Update cached fields for multiple entries in a single transaction.
-    ///
-    /// For the redb backend, all updates are performed within one write
-    /// transaction, amortizing the `begin_write()/commit()` overhead.
-    /// For the in-memory backend, updates are applied individually (no
-    /// batching benefit for direct memory writes).
-    ///
-    /// Returns `Ok(n)` where `n` is the number of entries successfully updated.
-    /// Returns an [`IndexError`] if the on-disk (redb) backend fails to commit.
-    /// Callers MUST propagate the error — silently returning `0` on commit
-    /// failure would cause durability-critical cached fields (DAH,
-    /// `unmined_since`, `generation`) to drift relative to the persisted state,
-    /// leading to incorrect pruning and replication decisions downstream.
-    pub fn update_cached_fields_batch(
-        &mut self,
-        updates: &[CachedFieldsUpdate],
-    ) -> Result<usize, IndexError> {
-        match self {
-            Self::InMemory(idx) | Self::FileBacked(idx) => {
-                let mut count = 0;
-                for u in updates {
-                    if idx.update_cached_fields(
-                        &u.key,
-                        u.tx_flags,
-                        u.block_entry_count,
-                        u.spent_utxos,
-                        u.dah_or_preserve,
-                        u.unmined_since,
-                        u.generation,
-                    ) {
-                        count += 1;
-                    }
-                }
-                Ok(count)
-            }
-            Self::OnDisk(redb) => redb.update_cached_fields_batch(updates),
-        }
-    }
-
     /// Remove multiple transactions in a single transaction.
     ///
     /// Returns a `Vec` parallel to the input: `Some(entry)` for keys that
@@ -677,7 +597,10 @@ impl PrimaryBackend {
             };
 
             let key = TxKey { txid: meta.tx_id };
-            let entry = TxIndexEntry::from_scanned_meta(offset, &meta);
+            let entry = TxIndexEntry {
+                device_id: 0,
+                record_offset: offset,
+            };
             batch.push((key, entry));
 
             if batch.len() >= BATCH_SIZE {
@@ -779,7 +702,10 @@ impl PrimaryBackend {
             };
 
             let key = TxKey { txid: meta.tx_id };
-            let entry = TxIndexEntry::from_scanned_meta(offset, &meta);
+            let entry = TxIndexEntry {
+                device_id: 0,
+                record_offset: offset,
+            };
             index.register(key, entry)?;
             offset += aligned_advance;
         }
@@ -875,8 +801,11 @@ mod tests {
 
     fn make_key(n: u64) -> TxKey {
         let mut txid = [0u8; 32];
+        // The slim primary index stores only txid[0..12]; keep all identifying
+        // bytes within [0..12] so iteration yields the same key (truncation is
+        // lossless).
         txid[0..8].copy_from_slice(&n.to_le_bytes());
-        txid[8..16].copy_from_slice(&(n.wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
+        txid[8..12].copy_from_slice(&(n.wrapping_mul(0x9E3779B9) as u32).to_le_bytes());
         TxKey { txid }
     }
 
@@ -884,13 +813,6 @@ mod tests {
         TxIndexEntry {
             device_id: 0,
             record_offset: offset,
-            utxo_count: 10,
-            block_entry_count: 2,
-            tx_flags: 0x05,
-            spent_utxos: 3,
-            dah_or_preserve: 100,
-            unmined_since: 500,
-            generation: 7,
         }
     }
 
@@ -943,9 +865,7 @@ mod tests {
 
             let e = backend.lookup(&make_key(1)).expect("should find entry");
             assert_eq!(e.record_offset, 4096);
-            assert_eq!(e.utxo_count, 10);
-            assert_eq!(e.tx_flags, 0x05);
-            assert_eq!(e.generation, 7);
+            assert_eq!(e.device_id, 0);
 
             // Missing key
             assert!(backend.lookup(&make_key(999)).is_none());
@@ -966,7 +886,7 @@ mod tests {
     fn both_backends_register_many_and_iterate() {
         with_all_backends(|backend| {
             for i in 0..100u64 {
-                backend.register(make_key(i), make_entry(i * 100)).unwrap();
+                backend.register(make_key(i), make_entry(i * 104)).unwrap();
             }
             assert_eq!(backend.len(), 100);
 
@@ -976,7 +896,7 @@ mod tests {
             for i in 0..100u64 {
                 let found = entries
                     .iter()
-                    .any(|(k, e)| *k == make_key(i) && e.record_offset == i * 100);
+                    .any(|(k, e)| *k == make_key(i) && e.record_offset == i * 104);
                 assert!(found, "entry {i} not found in iter");
             }
 
@@ -987,42 +907,13 @@ mod tests {
     }
 
     #[test]
-    fn both_backends_update_cached_fields() {
-        with_all_backends(|backend| {
-            backend.register(make_key(1), make_entry(4096)).unwrap();
-
-            let updated = backend
-                .update_cached_fields(&make_key(1), 0xFF, 5, 8, 200, 600, 99)
-                .unwrap();
-            assert!(updated);
-
-            let e = backend.lookup(&make_key(1)).unwrap();
-            assert_eq!(e.tx_flags, 0xFF);
-            assert_eq!(e.block_entry_count, 5);
-            assert_eq!(e.spent_utxos, 8);
-            assert_eq!(e.dah_or_preserve, 200);
-            assert_eq!(e.unmined_since, 600);
-            assert_eq!(e.generation, 99);
-            // Unchanged fields
-            assert_eq!(e.record_offset, 4096);
-            assert_eq!(e.utxo_count, 10);
-
-            // Update missing key
-            let missing = backend
-                .update_cached_fields(&make_key(999), 0, 0, 0, 0, 0, 0)
-                .unwrap();
-            assert!(!missing);
-        });
-    }
-
-    #[test]
     fn both_backends_stats() {
         with_all_backends(|backend| {
             let stats = backend.stats();
             assert_eq!(stats.entry_count, 0);
 
             for i in 0..10u64 {
-                backend.register(make_key(i), make_entry(i)).unwrap();
+                backend.register(make_key(i), make_entry(i * 8)).unwrap();
             }
             let stats = backend.stats();
             assert_eq!(stats.entry_count, 10);
@@ -1057,7 +948,7 @@ mod tests {
         {
             let mut backend = PrimaryBackend::new_on_disk(&config).unwrap();
             for i in 0..50u64 {
-                backend.register(make_key(i), make_entry(i * 100)).unwrap();
+                backend.register(make_key(i), make_entry(i * 104)).unwrap();
             }
         }
 
@@ -1069,7 +960,7 @@ mod tests {
             let e = restored
                 .lookup(&make_key(i))
                 .expect("entry should survive reopen");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 104);
         }
     }
 
@@ -1100,7 +991,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = redb_config(dir.path());
         let mut backend = PrimaryBackend::new_on_disk(&config).unwrap();
-        backend.register(make_key(1), make_entry(100)).unwrap();
+        backend.register(make_key(1), make_entry(104)).unwrap();
 
         // Snapshot should succeed (no-op)
         let snap_path = dir.path().join("noop.snap");
@@ -1114,7 +1005,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = redb_config(dir.path());
         let mut backend = PrimaryBackend::new_on_disk(&config).unwrap();
-        backend.register(make_key(1), make_entry(100)).unwrap();
+        backend.register(make_key(1), make_entry(104)).unwrap();
 
         let dah = DahBackend::InMemory(DahIndex::new());
         let unmined = UnminedBackend::InMemory(UnminedIndex::new());
@@ -1194,7 +1085,6 @@ mod tests {
         for (key, offset) in &records {
             let e = rebuilt.lookup(key).expect("record should be indexed");
             assert_eq!(e.record_offset, *offset);
-            assert_eq!(e.utxo_count, 5);
         }
     }
 
@@ -1263,7 +1153,6 @@ mod tests {
             let mem_entry = mem.lookup(key).expect("mem should have key");
             let redb_entry = redb.lookup(key).expect("redb should have key");
             assert_eq!(mem_entry.record_offset, redb_entry.record_offset);
-            assert_eq!(mem_entry.utxo_count, redb_entry.utxo_count);
             assert_eq!(mem_entry.record_offset, *offset);
         }
     }
@@ -1280,7 +1169,7 @@ mod tests {
         // Create and populate an in-memory backend
         let mut backend = PrimaryBackend::new_in_memory(1000).unwrap();
         for i in 0..50u64 {
-            backend.register(make_key(i), make_entry(i * 100)).unwrap();
+            backend.register(make_key(i), make_entry(i * 104)).unwrap();
         }
 
         // Snapshot to disk
@@ -1296,7 +1185,7 @@ mod tests {
             let e = restored
                 .lookup(&make_key(i))
                 .expect("entry should survive snapshot");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 104);
         }
     }
 
@@ -1308,7 +1197,7 @@ mod tests {
         // Create populated in-memory backend with secondary indexes
         let mut backend = PrimaryBackend::new_in_memory(1000).unwrap();
         for i in 0..20u64 {
-            backend.register(make_key(i), make_entry(i * 100)).unwrap();
+            backend.register(make_key(i), make_entry(i * 104)).unwrap();
         }
 
         let mut dah_inner = DahIndex::new();
@@ -1338,7 +1227,7 @@ mod tests {
             let e = restored
                 .lookup(&make_key(i))
                 .expect("entry should survive snapshot_all");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 104);
         }
 
         // Verify secondary data
@@ -1382,7 +1271,7 @@ mod tests {
     fn both_backends_overwrite_same_key() {
         with_all_backends(|backend| {
             let key = make_key(1);
-            backend.register(key, make_entry(100)).unwrap();
+            backend.register(key, make_entry(104)).unwrap();
             backend.register(key, make_entry(200)).unwrap();
 
             assert_eq!(backend.len(), 1);
@@ -1395,54 +1284,14 @@ mod tests {
     fn both_backends_unregister_then_reregister() {
         with_all_backends(|backend| {
             let key = make_key(1);
-            backend.register(key, make_entry(100)).unwrap();
+            backend.register(key, make_entry(104)).unwrap();
             backend.unregister(&key);
             assert!(backend.is_empty());
 
-            backend.register(key, make_entry(999)).unwrap();
+            backend.register(key, make_entry(1000)).unwrap();
             assert_eq!(backend.len(), 1);
             let e = backend.lookup(&key).unwrap();
-            assert_eq!(e.record_offset, 999);
-        });
-    }
-
-    #[test]
-    fn both_backends_update_cached_fields_batch() {
-        with_all_backends(|backend| {
-            for i in 0..5u64 {
-                backend.register(make_key(i), make_entry(i * 100)).unwrap();
-            }
-
-            let updates: Vec<crate::index::CachedFieldsUpdate> = (0..5u64)
-                .map(|i| crate::index::CachedFieldsUpdate {
-                    key: make_key(i),
-                    tx_flags: 0xAA,
-                    block_entry_count: 3,
-                    spent_utxos: (i as u32) * 10,
-                    dah_or_preserve: 500,
-                    unmined_since: 600,
-                    generation: 42,
-                })
-                .collect();
-
-            let updated = backend.update_cached_fields_batch(&updates).unwrap();
-            assert_eq!(updated, 5);
-
-            for i in 0..5u64 {
-                let e = backend.lookup(&make_key(i)).unwrap();
-                assert_eq!(e.tx_flags, 0xAA);
-                assert_eq!(e.generation, 42);
-                assert_eq!(e.record_offset, i * 100); // unchanged
-            }
-        });
-    }
-
-    #[test]
-    fn both_backends_update_cached_fields_batch_empty() {
-        with_all_backends(|backend| {
-            backend.register(make_key(1), make_entry(100)).unwrap();
-            let updated = backend.update_cached_fields_batch(&[]).unwrap();
-            assert_eq!(updated, 0);
+            assert_eq!(e.record_offset, 1000);
         });
     }
 
@@ -1450,7 +1299,7 @@ mod tests {
     fn both_backends_unregister_batch() {
         with_all_backends(|backend| {
             for i in 0..5u64 {
-                backend.register(make_key(i), make_entry(i * 100)).unwrap();
+                backend.register(make_key(i), make_entry(i * 104)).unwrap();
             }
 
             let keys: Vec<_> = vec![make_key(1), make_key(2), make_key(99)];
@@ -1467,7 +1316,7 @@ mod tests {
     #[test]
     fn both_backends_unregister_batch_empty() {
         with_all_backends(|backend| {
-            backend.register(make_key(1), make_entry(100)).unwrap();
+            backend.register(make_key(1), make_entry(104)).unwrap();
             let results = backend.unregister_batch(&[]).unwrap();
             assert!(results.is_empty());
             assert_eq!(backend.len(), 1);
@@ -1514,7 +1363,7 @@ mod tests {
         {
             let mut backend = PrimaryBackend::new_file_backed(&path, 1000).unwrap();
             for i in 0..50u64 {
-                backend.register(make_key(i), make_entry(i * 100)).unwrap();
+                backend.register(make_key(i), make_entry(i * 104)).unwrap();
             }
         }
 
@@ -1525,7 +1374,7 @@ mod tests {
             let e = restored
                 .lookup(&make_key(i))
                 .expect("should survive reopen");
-            assert_eq!(e.record_offset, i * 100);
+            assert_eq!(e.record_offset, i * 104);
         }
     }
 
@@ -1549,7 +1398,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("primary.idx");
         let mut backend = PrimaryBackend::new_file_backed(&path, 1000).unwrap();
-        backend.register(make_key(1), make_entry(100)).unwrap();
+        backend.register(make_key(1), make_entry(104)).unwrap();
         backend.snapshot(&dir.path().join("noop.snap")).unwrap();
     }
 
@@ -1558,7 +1407,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("primary.idx");
         let mut backend = PrimaryBackend::new_file_backed(&path, 1000).unwrap();
-        backend.register(make_key(1), make_entry(100)).unwrap();
+        backend.register(make_key(1), make_entry(104)).unwrap();
         backend.sync();
     }
 
@@ -1575,7 +1424,6 @@ mod tests {
         for (key, offset) in &records {
             let e = rebuilt.lookup(key).expect("record should be indexed");
             assert_eq!(e.record_offset, *offset);
-            assert_eq!(e.utxo_count, 5);
         }
     }
 
@@ -1593,7 +1441,6 @@ mod tests {
             let mem_entry = mem.lookup(key).expect("mem should have key");
             let fb_entry = fb.lookup(key).expect("fb should have key");
             assert_eq!(mem_entry.record_offset, fb_entry.record_offset);
-            assert_eq!(mem_entry.utxo_count, fb_entry.utxo_count);
             assert_eq!(mem_entry.record_offset, *offset);
         }
     }
@@ -1663,25 +1510,39 @@ mod tests {
     }
 
     /// Decode the (delete_at_height, preserve_until) a wire GET would return
-    /// for an index entry — the exact discriminant logic from
-    /// `server::dispatch`'s cached-entry fast path.
-    fn wire_dah_preserve(entry: &TxIndexEntry) -> (u32, u32) {
-        let has_preserve = entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
-        if has_preserve {
-            (0, entry.dah_or_preserve)
+    /// for a record — the exact discriminant logic from `server::dispatch`'s
+    /// GET path. The lifecycle fields now live only in the on-device
+    /// `TxMetadata` footer (the index no longer caches them), so this decodes
+    /// straight from the metadata read back at the record offset.
+    fn wire_dah_preserve(meta: &TxMetadata) -> (u32, u32) {
+        let preserve = { meta.preserve_until };
+        if preserve != 0 {
+            (0, preserve)
         } else {
-            (entry.dah_or_preserve, 0)
+            ({ meta.delete_at_height }, 0)
         }
     }
 
-    /// Assert a rebuilt backend carries the real lifecycle fields for every
-    /// record, and that a wire GET reads back the genuine non-zero values.
-    fn assert_lifecycle_preserved(rebuilt: &PrimaryBackend, records: &[(TxKey, u64, TxMetadata)]) {
+    /// Assert a rebuilt backend locates every record, and that following the
+    /// rebuilt offset to the on-device metadata reads back the genuine
+    /// non-zero lifecycle fields a wire GET would return. The index itself no
+    /// longer caches these fields (they live only in the `TxMetadata` footer),
+    /// so the "got" values are read back from the device at the rebuilt offset.
+    fn assert_lifecycle_preserved(
+        dev: &dyn BlockDevice,
+        rebuilt: &PrimaryBackend,
+        records: &[(TxKey, u64, TxMetadata)],
+    ) {
         for (key, offset, meta) in records {
             let entry = rebuilt
                 .lookup(key)
                 .expect("rebuilt index must contain the record");
             assert_eq!(entry.record_offset, *offset);
+
+            // Follow the rebuilt locator to the device — exactly what a wire
+            // GET does now that lifecycle fields are no longer index-cached.
+            let got = crate::io::read_metadata(dev, entry.record_offset)
+                .expect("record metadata must be readable at the rebuilt offset");
 
             let want_unmined = { meta.unmined_since };
             let want_gen = { meta.generation };
@@ -1689,36 +1550,42 @@ mod tests {
             let want_preserve = { meta.preserve_until };
             let want_has_preserve = want_preserve != 0;
 
-            // Primary cached fields must equal the on-device metadata.
             assert_eq!(
-                entry.unmined_since, want_unmined,
+                { got.unmined_since },
+                want_unmined,
                 "unmined_since must survive rebuild (regression: read as 0 = 'mined')"
             );
             assert_eq!(
-                entry.generation, want_gen,
+                { got.generation },
+                want_gen,
                 "generation must survive rebuild"
             );
             assert_eq!(
-                entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0,
+                { got.preserve_until } != 0,
                 want_has_preserve,
-                "HAS_PRESERVE_UNTIL discriminant must be restored from preserve_until"
+                "preserve_until discriminant must survive rebuild"
             );
             let want_dah_or_preserve = if want_has_preserve {
                 want_preserve
             } else {
                 want_dah
             };
+            let got_dah_or_preserve = if { got.preserve_until } != 0 {
+                got.preserve_until
+            } else {
+                got.delete_at_height
+            };
             assert_eq!(
-                entry.dah_or_preserve, want_dah_or_preserve,
+                got_dah_or_preserve, want_dah_or_preserve,
                 "dah_or_preserve must survive rebuild"
             );
 
             // Wire GET fast path: UNMINED_SINCE / DELETE_AT_HEIGHT /
             // PRESERVE_UNTIL must return the genuine non-zero values.
-            let (wire_dah, wire_preserve) = wire_dah_preserve(&entry);
+            let (wire_dah, wire_preserve) = wire_dah_preserve(&got);
             assert_eq!(wire_dah, want_dah, "wire DELETE_AT_HEIGHT");
             assert_eq!(wire_preserve, want_preserve, "wire PRESERVE_UNTIL");
-            assert_eq!(entry.unmined_since, want_unmined, "wire UNMINED_SINCE");
+            assert_eq!({ got.unmined_since }, want_unmined, "wire UNMINED_SINCE");
         }
     }
 
@@ -1727,7 +1594,7 @@ mod tests {
         let (dev, alloc, records) = setup_device_with_lifecycle_records(8);
         let rebuilt = PrimaryBackend::rebuild(&*dev, &alloc).unwrap();
         assert_eq!(rebuilt.len(), 8);
-        assert_lifecycle_preserved(&rebuilt, &records);
+        assert_lifecycle_preserved(&*dev, &rebuilt, &records);
     }
 
     #[test]
@@ -1737,9 +1604,9 @@ mod tests {
         let (dev, alloc, records) = setup_device_with_lifecycle_records(8);
         let rebuilt = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap();
         assert_eq!(rebuilt.len(), 8);
-        // The redb backend PERSISTS these fields durably via register_batch —
-        // this lookup reads them back from the on-disk B+ tree.
-        assert_lifecycle_preserved(&rebuilt, &records);
+        // The rebuilt index locates each record; the lifecycle fields are read
+        // back from the on-device footer at that offset.
+        assert_lifecycle_preserved(&*dev, &rebuilt, &records);
     }
 
     #[test]
@@ -1749,6 +1616,6 @@ mod tests {
         let path = dir.path().join("primary.idx");
         let rebuilt = PrimaryBackend::rebuild_file_backed(&path, &*dev, &alloc).unwrap();
         assert_eq!(rebuilt.len(), 8);
-        assert_lifecycle_preserved(&rebuilt, &records);
+        assert_lifecycle_preserved(&*dev, &rebuilt, &records);
     }
 }

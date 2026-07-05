@@ -51,13 +51,6 @@ fn legacy_freeze_replay_skips_already_spent_slot() {
             TxIndexEntry {
                 device_id: 0,
                 record_offset,
-                utxo_count,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 1,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
             },
         )
         .unwrap();
@@ -119,13 +112,6 @@ fn legacy_freeze_replay_applies_on_unspent_slot() {
             TxIndexEntry {
                 device_id: 0,
                 record_offset,
-                utxo_count,
-                block_entry_count: 0,
-                tx_flags: 0,
-                spent_utxos: 0,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
             },
         )
         .unwrap();

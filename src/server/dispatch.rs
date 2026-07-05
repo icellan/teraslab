@@ -21,7 +21,7 @@ use crate::ops::unspend::*;
 use crate::protocol::codec::*;
 use crate::protocol::frame::*;
 use crate::protocol::opcodes::*;
-use crate::record::{ExternalRef, METADATA_SIZE, TxFlags};
+use crate::record::{ExternalRef, METADATA_SIZE};
 use crate::redo::{RedoLog, RedoOp};
 use crate::replication::manager::ReplicaTransport;
 use crate::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
@@ -5343,12 +5343,14 @@ fn handle_unspend_batch(
             continue;
         }
         let key = TxKey { txid: item.txid };
-        // Snapshot the generation BEFORE unspend so we can classify the
-        // outcome as "real unspend" (gen bumped) vs "idempotent noop"
-        // (gen unchanged — slot was already UNSPENT).
-        let entry = engine.lookup(&key);
-        let pre_generation = entry.as_ref().map(|e| e.generation).unwrap_or(0);
-        let pre_spent = entry.as_ref().map(|e| e.spent_utxos).unwrap_or(0);
+        // Snapshot the generation + spent count BEFORE unspend so we can
+        // classify the outcome as "real unspend" (gen bumped) vs "idempotent
+        // noop" (gen unchanged — slot was already UNSPENT). The slim primary
+        // index no longer caches these, so read them from the on-device
+        // footer; the unspend apply below reads/writes the record anyway.
+        let meta = engine.read_metadata(&key).ok();
+        let pre_generation = meta.as_ref().map(|m| m.generation).unwrap_or(0);
+        let pre_spent = meta.as_ref().map(|m| m.spent_utxos).unwrap_or(0);
         // Initialize the running counter with the current spent count
         // (from index cache) the first time we see this txid in this
         // batch. Subsequent items in the same batch decrement from
@@ -8282,71 +8284,10 @@ fn decorate_get_item(
             };
         }
     }
-    // Fast path: if ALL requested fields are cached in the primary index,
-    // serve directly without reading device metadata (zero I/O).
-    if field_mask.fully_cached() {
-        // G-4: use the checked lookup so a transient backend read error
-        // is surfaced as ERR_STORAGE_IO rather than collapsing to
-        // ERR_TX_NOT_FOUND (which would tell the client a present
-        // transaction does not exist).
-        let cached = match engine.lookup_cached_checked(&key) {
-            Ok(found) => found,
-            Err(e) => {
-                return WireGetResult {
-                    status: ERR_STORAGE_IO as u8,
-                    data: format!("index lookup failed: {e}").into_bytes(),
-                };
-            }
-        };
-        if let Some(entry) = cached {
-            let mut data = Vec::new();
-            let has_preserve = entry.tx_flags & TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
-            // Strip the index-only HAS_PRESERVE_UNTIL bit before returning flags
-            let wire_flags = entry.tx_flags & !TxFlags::HAS_PRESERVE_UNTIL.bits();
-            if field_mask.has(FieldMask::FLAGS) {
-                data.push(wire_flags);
-            }
-            if field_mask.has(FieldMask::SPENT_UTXOS) {
-                data.extend_from_slice(&entry.spent_utxos.to_le_bytes());
-            }
-            if field_mask.has(FieldMask::UTXO_COUNT) {
-                data.extend_from_slice(&entry.utxo_count.to_le_bytes());
-            }
-            if field_mask.has(FieldMask::UNMINED_SINCE) {
-                data.extend_from_slice(&entry.unmined_since.to_le_bytes());
-            }
-            if field_mask.has(FieldMask::DELETE_AT_HEIGHT) {
-                let dah = if has_preserve {
-                    0u32
-                } else {
-                    entry.dah_or_preserve
-                };
-                data.extend_from_slice(&dah.to_le_bytes());
-            }
-            if field_mask.has(FieldMask::PRESERVE_UNTIL) {
-                let pu = if has_preserve {
-                    entry.dah_or_preserve
-                } else {
-                    0u32
-                };
-                data.extend_from_slice(&pu.to_le_bytes());
-            }
-            if field_mask.has(FieldMask::BLOCK_ENTRY_COUNT) {
-                data.push(entry.block_entry_count);
-            }
-            return WireGetResult {
-                status: STATUS_OK,
-                data,
-            };
-        }
-        // Not in index — fall through to TxNotFound below
-        return WireGetResult {
-            status: ERR_TX_NOT_FOUND as u8,
-            data: vec![],
-        };
-    }
-
-    // Slow path: read full metadata from device for non-cached fields. The
+    // Read full metadata from device for the requested fields. The slim
+    // primary index no longer caches any metadata, so EVERY GET reads the
+    // authoritative on-device footer (this path already served every field
+    // byte-identically; the former index fast path is removed). The
     // engine's read_metadata routes by the index entry's device_id, so this is
     // multi-store-correct without any per-store work in this function.
     match engine.read_metadata(&key) {
@@ -10038,7 +9979,7 @@ fn handle_admin_diagnose_key(
         };
 
         // Index lookup is in-memory and cheap; no async needed.
-        diag.has_local_data = engine.lookup_cached(&key).is_some();
+        diag.has_local_data = engine.lookup(&key).is_some();
 
         encode_key_diagnosis(&diag, &mut response);
     }
@@ -11308,8 +11249,8 @@ mod tests {
         // at 0 and the records would never qualify for the pruner.
         let make_eligible = |txid: [u8; 32]| {
             let key = TxKey { txid };
-            let entry = h.engine.lookup(&key).expect("seed lookup");
-            let utxo_count = entry.utxo_count;
+            let meta = h.engine.read_metadata(&key).expect("seed lookup");
+            let utxo_count = { meta.utxo_count };
             // Mine the record by calling engine.set_mined directly
             // (avoids encoding a full SET_MINED_BATCH wire frame for a
             // unit test).
@@ -11402,8 +11343,8 @@ mod tests {
     /// factory keyed on the harness.
     fn make_record_dah_eligible(h: &DispatchTestHarness, txid: [u8; 32], retention: u32) {
         let key = TxKey { txid };
-        let entry = h.engine.lookup(&key).expect("seed lookup");
-        let utxo_count = entry.utxo_count;
+        let meta = h.engine.read_metadata(&key).expect("seed lookup");
+        let utxo_count = { meta.utxo_count };
         h.engine
             .set_mined(&crate::ops::set_mined::SetMinedRequest {
                 tx_key: key,
@@ -13231,6 +13172,140 @@ mod tests {
         );
     }
 
+    /// Slim-index load-bearing invariant: after a full create→spend→setMined
+    /// cycle a GET returns field values byte-identical to a `read_metadata` of
+    /// the same record. The slim primary index caches NO metadata, so every GET
+    /// field is now served from the on-device footer — this pins that GET
+    /// responses are unchanged by the cache removal.
+    #[test]
+    fn create_spend_set_mined_get_matches_read_metadata() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(64);
+        let key = TxKey { txid };
+
+        assert_eq!(h.create_tx(txid, 3).status, STATUS_OK);
+
+        // Spend vout 0 (utxo_hash[0] == 0 matches create_tx's generated hash).
+        let mut utxo_hash = [0u8; 32];
+        utxo_hash[0] = 0;
+        let spend_params = SpendBatchParams {
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let spend_item = WireSpendItem {
+            txid,
+            vout: 0,
+            utxo_hash,
+            spending_data: {
+                let mut sd = [0u8; 36];
+                sd[0] = 0xAB;
+                sd[32..36].copy_from_slice(&1u32.to_le_bytes());
+                sd
+            },
+        };
+        assert_eq!(
+            h.request(
+                OP_SPEND_BATCH,
+                encode_spend_batch(&spend_params, &[spend_item])
+            )
+            .status,
+            STATUS_OK
+        );
+
+        // SetMined.
+        let set_mined_params = SetMinedBatchParams {
+            block_id: 42,
+            block_height: 1000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        assert_eq!(
+            h.request(
+                OP_SET_MINED_BATCH,
+                encode_set_mined_batch(&set_mined_params, &[txid])
+            )
+            .status,
+            STATUS_OK
+        );
+
+        // Authoritative on-device record.
+        let meta = h.engine.read_metadata(&key).expect("record must exist");
+
+        // RAW_METADATA GET returns the full footer byte-identically.
+        let raw = decode_get_response(
+            &h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::RAW_METADATA, &[txid]),
+            )
+            .payload,
+        )
+        .unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].status, STATUS_OK);
+        let mut buf = vec![0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+        assert_eq!(
+            raw[0].data, buf,
+            "RAW_METADATA GET must equal read_metadata().to_bytes()"
+        );
+
+        // Every former index-cached field, now served from the record, matches
+        // read_metadata exactly.
+        let get_u32 = |mask: u32| -> u32 {
+            let r = decode_get_response(
+                &h.request(OP_GET_BATCH, encode_get_batch(mask, &[txid]))
+                    .payload,
+            )
+            .unwrap();
+            assert_eq!(r[0].status, STATUS_OK);
+            u32::from_le_bytes(r[0].data[0..4].try_into().unwrap())
+        };
+        assert_eq!(get_u32(FieldMask::UTXO_COUNT), { meta.utxo_count });
+        assert_eq!(get_u32(FieldMask::SPENT_UTXOS), { meta.spent_utxos });
+        assert_eq!(get_u32(FieldMask::GENERATION), { meta.generation });
+        assert_eq!(get_u32(FieldMask::UNMINED_SINCE), { meta.unmined_since });
+        assert_eq!(get_u32(FieldMask::DELETE_AT_HEIGHT), {
+            meta.delete_at_height
+        });
+
+        let flags = decode_get_response(
+            &h.request(OP_GET_BATCH, encode_get_batch(FieldMask::FLAGS, &[txid]))
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(
+            flags[0].data[0],
+            { meta.flags }.bits(),
+            "FLAGS must match the record footer"
+        );
+
+        let bec = decode_get_response(
+            &h.request(
+                OP_GET_BATCH,
+                encode_get_batch(FieldMask::BLOCK_ENTRY_COUNT, &[txid]),
+            )
+            .payload,
+        )
+        .unwrap();
+        assert_eq!(
+            bec[0].data[0], meta.block_entry_count,
+            "BLOCK_ENTRY_COUNT must match the record footer"
+        );
+
+        // Sanity: the cycle actually mutated the record (non-tautological).
+        assert_eq!({ meta.spent_utxos }, 1, "one UTXO was spent");
+        assert!(meta.block_entry_count > 0, "record is mined after setMined");
+        assert!(
+            { meta.generation } >= 1,
+            "generation bumped by spend + setMined"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Issue #30: BLOCK_ENTRIES_ALL returns the complete inline+overflow set.
     // -----------------------------------------------------------------------
@@ -14218,6 +14293,10 @@ mod tests {
         fn mk_txid(w: usize, n: usize) -> [u8; 32] {
             let mut t = [0u8; 32];
             t[0] = w as u8;
+            // Vary bytes within the 12-byte index prefix so each (w, n) is a
+            // distinct key in the slim primary index (which stores txid[0..12]).
+            t[1] = n as u8;
+            t[2] = (n >> 8) as u8;
             t[16] = n as u8; // bytes 16..24 drive the stripe hash
             t[17] = (n >> 8) as u8;
             t

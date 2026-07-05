@@ -1,7 +1,7 @@
 //! Criterion benchmarks for standalone Index operations.
 //!
-//! Covers lookup, register, unregister, and update_cached_fields on the
-//! primary hash table index — the critical path for every engine operation.
+//! Covers lookup, register, and unregister on the primary hash table index —
+//! the critical path for every engine operation.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
@@ -19,13 +19,6 @@ fn make_entry(n: u32) -> TxIndexEntry {
     TxIndexEntry {
         device_id: 0,
         record_offset: (n as u64) * 4096,
-        utxo_count: 5,
-        block_entry_count: 1,
-        tx_flags: 0,
-        spent_utxos: 0,
-        dah_or_preserve: 0,
-        unmined_since: 0,
-        generation: 0,
     }
 }
 
@@ -123,32 +116,5 @@ fn bench_unregister(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_update_cached_fields(c: &mut Criterion) {
-    let mut group = c.benchmark_group("index_update_cached");
-    group.throughput(Throughput::Elements(1));
-
-    let mut index = populated_index(100_000);
-    let mut i = 0u32;
-
-    group.bench_function("update_100k", |b| {
-        b.iter(|| {
-            let key = make_tx_key(i);
-            index.update_cached_fields(&key, 0x01, 2, i, 0, 0, i + 1);
-            i += 1;
-            if i >= 100_000 {
-                i = 0;
-            }
-        })
-    });
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_lookup,
-    bench_register,
-    bench_unregister,
-    bench_update_cached_fields,
-);
+criterion_group!(benches, bench_lookup, bench_register, bench_unregister,);
 criterion_main!(benches);

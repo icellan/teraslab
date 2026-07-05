@@ -49,7 +49,7 @@ const IMPORT_SENTINEL_SUFFIX: &str = ".import-in-progress";
 const PORTABLE_MAGIC: [u8; 4] = *b"TSMI";
 const PORTABLE_VERSION: u32 = 1;
 const PORTABLE_MAX_COUNT: u64 = 1 << 30;
-const PORTABLE_PRIMARY_ENTRY_SIZE: usize = 63;
+const PORTABLE_PRIMARY_ENTRY_SIZE: usize = 41;
 const PORTABLE_SECONDARY_ENTRY_SIZE: usize = 36;
 const IMPORT_BATCH_SIZE: usize = 4096;
 
@@ -748,13 +748,6 @@ fn encode_primary_entry(key: TxKey, entry: TxIndexEntry) -> [u8; PORTABLE_PRIMAR
     buf[0..32].copy_from_slice(&key.txid);
     buf[32] = entry.device_id;
     buf[33..41].copy_from_slice(&entry.record_offset.to_le_bytes());
-    buf[41..45].copy_from_slice(&entry.utxo_count.to_le_bytes());
-    buf[45] = entry.block_entry_count;
-    buf[46] = entry.tx_flags;
-    buf[47..51].copy_from_slice(&entry.spent_utxos.to_le_bytes());
-    buf[51..55].copy_from_slice(&entry.dah_or_preserve.to_le_bytes());
-    buf[55..59].copy_from_slice(&entry.unmined_since.to_le_bytes());
-    buf[59..63].copy_from_slice(&entry.generation.to_le_bytes());
     buf
 }
 
@@ -772,13 +765,6 @@ fn read_primary_entry<R: Read>(
         TxIndexEntry {
             device_id: buf[32],
             record_offset: u64::from_le_bytes(buf[33..41].try_into().unwrap()),
-            utxo_count: u32::from_le_bytes(buf[41..45].try_into().unwrap()),
-            block_entry_count: buf[45],
-            tx_flags: buf[46],
-            spent_utxos: u32::from_le_bytes(buf[47..51].try_into().unwrap()),
-            dah_or_preserve: u32::from_le_bytes(buf[51..55].try_into().unwrap()),
-            unmined_since: u32::from_le_bytes(buf[55..59].try_into().unwrap()),
-            generation: u32::from_le_bytes(buf[59..63].try_into().unwrap()),
         },
     ))
 }
@@ -818,23 +804,17 @@ mod tests {
         TxKey { txid }
     }
 
-    /// REL-017: populate EVERY field with a distinct, non-zero value derived
+    /// REL-017: populate BOTH slim locator fields with a distinct value derived
     /// from `offset` so an offset-swap, width-truncation, or field-zeroing
     /// regression on the portable export/import serialization path is caught by
-    /// full-entry equality assertions (rather than passing against an all-zeros
-    /// entry that only checks `record_offset`). Each field uses a different
-    /// arithmetic shape and stays within its declared width.
+    /// full-entry equality assertions (rather than passing against an entry that
+    /// only checks `record_offset`). `record_offset` is scaled by 8 so it is
+    /// 8-aligned — the restore path inserts into an in-memory HashTable whose
+    /// bucket codec debug-asserts alignment.
     fn make_entry(offset: u64) -> TxIndexEntry {
         TxIndexEntry {
-            device_id: (offset.wrapping_add(1) & 0xFF) as u8,
-            record_offset: offset,
-            utxo_count: (offset as u32).wrapping_mul(7).wrapping_add(3),
-            block_entry_count: ((offset.wrapping_add(17)) & 0xFF) as u8,
-            tx_flags: ((offset.wrapping_mul(3).wrapping_add(5)) & 0xFF) as u8,
-            spent_utxos: (offset as u32).wrapping_mul(11).wrapping_add(13),
-            dah_or_preserve: (offset as u32).wrapping_mul(101).wrapping_add(29),
-            unmined_since: (offset as u32).wrapping_add(0x4000_0001),
-            generation: (offset as u32).wrapping_mul(5).wrapping_add(1),
+            device_id: (offset & 0xFF) as u8,
+            record_offset: offset * 8,
         }
     }
 
