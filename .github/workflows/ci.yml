@@ -85,6 +85,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # `clippy` is needed by the "Compile all fault-injection-gated targets"
+          # anti-bitrot step below. (`@stable` ships clippy by default, but pin it
+          # explicitly so the step can't silently lose its linter.)
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
@@ -99,6 +104,16 @@ jobs:
       - name: Run doctests
         run: cargo test --doc
 
+      - name: Compile all fault-injection-gated targets (anti-bitrot)
+        # The run step below names only a subset of fault-injection targets, so
+        # any OTHER `--features fault-injection`-gated suite (error_code_conformance,
+        # migration_crash, migration_fence, the simulation harness, ...) could
+        # silently stop compiling without failing CI — exactly the bitrot that hit
+        # migration_crash (fixed at 1ceafd8). Compiling + linting ALL targets under
+        # the feature makes any gated suite that stops building fail CI. `-D warnings`
+        # also holds the gated code to the same clippy bar as the default build.
+        run: cargo clippy --all-targets --features fault-injection -- -D warnings
+
       - name: Run fault-injection tests
         # Behind a feature flag so production builds stay zero-cost.
         # `cargo test --all` does not enable features; run these targets
@@ -107,7 +122,8 @@ jobs:
         # delayed-topology-activation masterless-shard deadlock.
         # crash_sweep_ops (AUDIT M2.10) runs the 9 WAL-boundary kill/restart
         # sweeps which are also gated behind `fault-injection`; without this
-        # they never ran in CI.
+        # they never ran in CI. The compile step above guarantees the remaining
+        # gated suites at least build even though they are not executed here.
         run: cargo test --features fault-injection --test fault_injection --test cluster_delayed_activation --test crash_sweep_ops
 
       - name: Block-device size ioctl on a real Linux loop device (AUDIT M3.15)

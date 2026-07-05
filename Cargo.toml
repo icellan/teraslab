@@ -86,19 +86,28 @@ parking_lot = "0.12"
 rayon = "1"
 # In-process CPU sampling profiler for the admin-gated `/debug/pprof/profile`
 # endpoint (src/server/http.rs). Samples the whole process via SIGPROF +
-# ITIMER_PROF and renders an inferno flamegraph SVG. Admin-gated and
-# single-flight, so it is inert unless an operator deliberately requests a
-# profile. The device pread/pwrite loops already retry EINTR (src/device.rs),
-# so SIGPROF sampling does not perturb live I/O.
+# ITIMER_PROF and renders a flamegraph SVG. Admin-gated and single-flight, so
+# it is inert unless an operator deliberately requests a profile. The device
+# pread/pwrite loops already retry EINTR (src/device.rs), so SIGPROF sampling
+# does not perturb live I/O.
 #
-# `flamegraph` only — deliberately NOT `protobuf-codec` / `prost-codec`.
-# `protobuf-codec` pulls the unmaintained rust-protobuf 2.x (RUSTSEC-2024-0437,
-# fails cargo-audit) and `prost-codec` pulls a second, older prost (0.12) +
-# prost-build alongside the tree's prost 0.14. The endpoint serves ONLY the SVG
-# flamegraph; a `go tool pprof` protobuf is obtained via samply / `cargo
-# flamegraph` instead (see PROFILING.md). `flamegraph` pulls `inferno`
-# (CDDL-1.0); see the scoped license exception in deny.toml.
-pprof = { version = "0.14", features = ["flamegraph"] }
+# Deliberately NOT the `flamegraph` / `protobuf-codec` / `prost-codec` features
+# (only pprof's default `cpp` symbol-demangler feature is kept):
+#   * `flamegraph` pulls `inferno`, whose only released line (0.11.x, and the
+#     0.12.x line) still depends on `quick-xml` <= 0.39. Both quick-xml
+#     advisories RUSTSEC-2026-0194 / -0195 are only patched in `quick-xml >=
+#     0.41`, and no inferno release (or its git `main`) has bumped past 0.39, so
+#     the `flamegraph` feature cannot resolve to an audit-clean quick-xml. We
+#     therefore render the flamegraph SVG in-tree from pprof's resolved `Report`
+#     (see `render_flamegraph_svg` in src/server/http.rs) — inferno/quick-xml
+#     leave the dependency graph entirely, and the endpoint keeps returning the
+#     same interactive SVG contract. pprof's `Symbol` Display already demangles
+#     via the default `cpp` feature, so no extra demangler dep is needed.
+#   * `protobuf-codec` pulls the unmaintained rust-protobuf 2.x
+#     (RUSTSEC-2024-0437) and `prost-codec` pulls a second, older prost (0.12) +
+#     prost-build alongside the tree's prost 0.14. A `go tool pprof` protobuf is
+#     obtained via samply / `cargo flamegraph` instead (see PROFILING.md).
+pprof = { version = "0.15" }
 redb = "2"
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
