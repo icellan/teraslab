@@ -1270,6 +1270,7 @@ mod tests {
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: 0xDEAD_0000,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             };
             backend.register(bogus_key, entry).unwrap();
         }
@@ -1343,6 +1344,7 @@ mod tests {
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: 0xDEAD_0000,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             };
             backend.register(TxKey { txid: [0xAB; 32] }, entry).unwrap();
         }

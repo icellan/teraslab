@@ -35,6 +35,7 @@ fn make_entry(offset: u64) -> TxIndexEntry {
     TxIndexEntry {
         device_id: 0,
         record_offset: offset,
+        mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
     }
 }
 

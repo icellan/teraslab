@@ -173,6 +173,7 @@ fn periodic_sweep_keeps_aged_blob_with_external_flagged_entry() {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: off,
+                mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
             },
         )
         .expect("register");

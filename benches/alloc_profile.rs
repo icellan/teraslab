@@ -431,6 +431,7 @@ fn main() {
         let entry = teraslab::index::TxIndexEntry {
             device_id: 0,
             record_offset: (i as u64) * 4096,
+            mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
         };
         index.register(key, entry).unwrap();
     }
@@ -464,6 +465,7 @@ fn main() {
         let entry = teraslab::index::TxIndexEntry {
             device_id: 0,
             record_offset: (tx_i as u64) * 4096,
+            mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
         };
         let _ = index.register(key, entry);
         tx_i += 1;

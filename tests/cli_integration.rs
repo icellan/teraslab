@@ -418,6 +418,7 @@ fn export_import_index_roundtrip() {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: 4096 * n as u64,
+                        mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();

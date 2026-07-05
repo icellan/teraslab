@@ -19,6 +19,7 @@ fn make_entry(n: u32) -> TxIndexEntry {
     TxIndexEntry {
         device_id: 0,
         record_offset: (n as u64) * 4096,
+        mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
     }
 }
 

@@ -51,6 +51,7 @@ fn legacy_freeze_replay_skips_already_spent_slot() {
             TxIndexEntry {
                 device_id: 0,
                 record_offset,
+                mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
             },
         )
         .unwrap();
@@ -112,6 +113,7 @@ fn legacy_freeze_replay_applies_on_unspent_slot() {
             TxIndexEntry {
                 device_id: 0,
                 record_offset,
+                mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
             },
         )
         .unwrap();

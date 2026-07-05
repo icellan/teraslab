@@ -10,10 +10,10 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::VecDeque;
 use std::path::Path;
 
-/// Entry value size: device_id(1) + record_offset(8) = 9 bytes.
-const ENTRY_VALUE_SIZE: usize = 9;
+/// Entry value size: device_id(1) + record_offset(8) + mined_slot(4) = 13 bytes.
+const ENTRY_VALUE_SIZE: usize = 13;
 
-/// ReDB table definition: txid(32 bytes) -> serialized TxIndexEntry(9 bytes).
+/// ReDB table definition: txid(32 bytes) -> serialized TxIndexEntry(13 bytes).
 const PRIMARY_TABLE: TableDefinition<[u8; 32], [u8; ENTRY_VALUE_SIZE]> =
     TableDefinition::new("primary_index");
 
@@ -539,19 +539,22 @@ impl Iterator for RedbPrimaryIter<'_> {
 // Serialization
 // ---------------------------------------------------------------------------
 
-/// Serialize a slim TxIndexEntry (locator only) into a fixed 9-byte array.
+/// Serialize a slim TxIndexEntry (locator + mined-slot pointer) into a fixed
+/// 13-byte array.
 fn serialize_entry(e: &TxIndexEntry) -> [u8; ENTRY_VALUE_SIZE] {
     let mut buf = [0u8; ENTRY_VALUE_SIZE];
     buf[0] = e.device_id;
     buf[1..9].copy_from_slice(&e.record_offset.to_le_bytes());
+    buf[9..13].copy_from_slice(&e.mined_slot.to_le_bytes());
     buf
 }
 
-/// Deserialize a slim TxIndexEntry from a 9-byte array.
+/// Deserialize a slim TxIndexEntry from a 13-byte array.
 fn deserialize_entry(buf: &[u8; ENTRY_VALUE_SIZE]) -> TxIndexEntry {
     TxIndexEntry {
         device_id: buf[0],
         record_offset: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
+        mined_slot: u32::from_le_bytes(buf[9..13].try_into().unwrap()),
     }
 }
 
@@ -613,6 +616,7 @@ mod tests {
         TxIndexEntry {
             device_id: 0,
             record_offset: offset,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         }
     }
 
@@ -806,11 +810,13 @@ mod tests {
         let entry = TxIndexEntry {
             device_id: 3,
             record_offset: 0xDEADBEEF_CAFEBABE,
+            mined_slot: 0x1234_5678,
         };
         let buf = serialize_entry(&entry);
         let restored = deserialize_entry(&buf);
         assert_eq!(restored.device_id, entry.device_id);
         assert_eq!(restored.record_offset, entry.record_offset);
+        assert_eq!(restored.mined_slot, entry.mined_slot);
     }
 
     #[test]
@@ -910,6 +916,7 @@ mod tests {
         let new_entry = TxIndexEntry {
             device_id: 2,
             record_offset: 10000,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         };
         primary.register(key, new_entry).unwrap();
         assert_eq!(primary.len(), 1);
@@ -1018,12 +1025,14 @@ mod tests {
         let entry = TxIndexEntry {
             device_id: 0,
             record_offset: 0,
+            mined_slot: 0,
         };
         let buf = serialize_entry(&entry);
         assert_eq!(buf, [0u8; ENTRY_VALUE_SIZE]);
         let restored = deserialize_entry(&buf);
         assert_eq!(restored.device_id, 0);
         assert_eq!(restored.record_offset, 0);
+        assert_eq!(restored.mined_slot, 0);
     }
 
     #[test]
@@ -1031,11 +1040,13 @@ mod tests {
         let entry = TxIndexEntry {
             device_id: u8::MAX,
             record_offset: u64::MAX,
+            mined_slot: u32::MAX,
         };
         let buf = serialize_entry(&entry);
         let restored = deserialize_entry(&buf);
         assert_eq!(restored.device_id, u8::MAX);
         assert_eq!(restored.record_offset, u64::MAX);
+        assert_eq!(restored.mined_slot, u32::MAX);
     }
 
     #[test]

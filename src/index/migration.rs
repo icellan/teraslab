@@ -762,9 +762,17 @@ fn read_primary_entry<R: Read>(
     txid.copy_from_slice(&buf[0..32]);
     Ok((
         TxKey { txid },
+        // KNOWN GAP (flagged in Task 6's report, not fixed here): the
+        // portable format does not carry `mined_slot` on the wire, so a
+        // round trip through `export_index`/`import_index` always comes
+        // back as `NO_MINED_SLOT`. Harmless today (no construction site
+        // assigns a real slot yet), but once Task 7+ populates real slots
+        // this will need `PORTABLE_PRIMARY_ENTRY_SIZE` + `PORTABLE_VERSION`
+        // bumped to actually persist it.
         TxIndexEntry {
             device_id: buf[32],
             record_offset: u64::from_le_bytes(buf[33..41].try_into().unwrap()),
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         },
     ))
 }
@@ -815,6 +823,7 @@ mod tests {
         TxIndexEntry {
             device_id: (offset & 0xFF) as u8,
             record_offset: offset * 8,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         }
     }
 

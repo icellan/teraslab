@@ -1314,6 +1314,7 @@ mod tests {
         TxIndexEntry {
             device_id: 0,
             record_offset: offset * 8,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         }
     }
 

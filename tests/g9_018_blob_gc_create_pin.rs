@@ -101,6 +101,7 @@ fn register_external_record(engine: &Engine, key: [u8; 32]) {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
+                mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
             },
         )
         .expect("register");

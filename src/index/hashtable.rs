@@ -98,7 +98,7 @@ impl std::fmt::Debug for TxKey {
 // ---------------------------------------------------------------------------
 
 /// What the primary index stores for each transaction: the on-device
-/// locator only.
+/// locator, plus a pointer into the [`crate::index::mined_index`] arena.
 ///
 /// The primary index is deliberately slim — it maps a `TxKey` to the
 /// `(device_id, record_offset)` pair needed to reach the authoritative
@@ -107,12 +107,21 @@ impl std::fmt::Debug for TxKey {
 /// `preserve_until`, `unmined_since`, `generation`, `block_entry_count`) is
 /// read from that footer by the operation that needs it — the same read the
 /// op already performs — so the index carries no cached metadata.
+///
+/// `mined_slot` is the one exception: it is a 4-byte pointer into the
+/// authoritative in-RAM [`crate::index::mined_index::ShardedMinedIndex`],
+/// letting a tx's mined-state be reached from its locator without a device
+/// read. [`crate::index::mined_index::NO_MINED_SLOT`] means "no slot
+/// assigned" (e.g. a tx that hasn't been created through the slot-allocating
+/// path yet).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TxIndexEntry {
     /// Which device this record lives on (for multi-device setups).
     pub device_id: u8,
     /// Byte offset on that device to the start of TxMetadata.
     pub record_offset: u64,
+    /// Pointer into the `ShardedMinedIndex` arena, or `NO_MINED_SLOT`.
+    pub mined_slot: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,11 +156,12 @@ fn cap_probe(dist: usize) -> u8 {
 /// the bucket a compact 20 bytes.
 const STORED_TXID_LEN: usize = 12;
 
-/// One bucket in the Robin Hood hash table: exactly 20 bytes.
+/// One bucket in the Robin Hood hash table: exactly 24 bytes.
 ///
 /// Layout: `probe_distance:u8` + `txid_lo:[u8;12]` + `device_id:u8` +
-/// `offset_div8:[u8;6]`. The bucket stores only the on-device locator plus a
-/// 12-byte txid prefix; all lifecycle metadata lives in the on-device
+/// `offset_div8:[u8;6]` + `mined_slot:u32`. The bucket stores the on-device
+/// locator, the mined-index slot pointer, and a 12-byte txid prefix; all
+/// other lifecycle metadata lives in the on-device
 /// [`crate::record::TxMetadata`] footer.
 ///
 /// The `probe_distance` field serves double duty: values 0–254 indicate an
@@ -162,6 +172,12 @@ const STORED_TXID_LEN: usize = 12;
 /// integer. Records are always at least [`crate::record::RECORD_ALIGN`]
 /// (8-byte) aligned, so the shift is lossless and the 48-bit field addresses
 /// offsets up to `2^51` bytes (2 PiB) per device.
+///
+/// `mined_slot` stores [`TxIndexEntry::mined_slot`] verbatim as a
+/// little-endian `u32`. It is read and written as a plain field — `Bucket`
+/// is `#[repr(C, packed)]`, so a by-value copy (never a reference) into or
+/// out of this field compiles to a safe unaligned load/store; no encode/decode
+/// helper is needed the way `offset_div8`'s compact 48-bit form needs one.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Bucket {
@@ -169,12 +185,13 @@ struct Bucket {
     txid_lo: [u8; STORED_TXID_LEN],
     device_id: u8,
     offset_div8: [u8; 6],
+    mined_slot: u32,
 }
 
 /// Actual size of one bucket in bytes.
 pub const BUCKET_SIZE: usize = std::mem::size_of::<Bucket>();
 
-const _: () = assert!(BUCKET_SIZE == 20, "Bucket must be exactly 20 bytes");
+const _: () = assert!(BUCKET_SIZE == 24, "Bucket must be exactly 24 bytes");
 
 /// Encode a record offset into the packed 48-bit `offset_div8` field.
 ///
@@ -206,6 +223,7 @@ impl Bucket {
             txid_lo: [0; STORED_TXID_LEN],
             device_id: 0,
             offset_div8: [0; 6],
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         }
     }
 
@@ -243,6 +261,7 @@ impl Bucket {
         TxIndexEntry {
             device_id: self.device_id,
             record_offset: decode_offset(self.offset_div8),
+            mined_slot: self.mined_slot,
         }
     }
 
@@ -251,6 +270,7 @@ impl Bucket {
         self.txid_lo.copy_from_slice(&key.txid[0..STORED_TXID_LEN]);
         self.device_id = entry.device_id;
         self.offset_div8 = encode_offset(entry.record_offset);
+        self.mined_slot = entry.mined_slot;
     }
 }
 
@@ -1716,6 +1736,7 @@ mod tests {
         TxIndexEntry {
             device_id: 0,
             record_offset: n * 8,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         }
     }
 
@@ -2036,6 +2057,7 @@ mod tests {
             TxIndexEntry {
                 device_id: 3,
                 record_offset: big,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             },
         )
         .unwrap();
@@ -2185,6 +2207,49 @@ mod tests {
         t.resize(32).unwrap();
         t.insert(make_key(100), make_entry(100)).unwrap();
         assert_eq!(t.get_entry(&make_key(100)).unwrap().record_offset, 100 * 8);
+    }
+
+    /// Task 6 regression: `mined_slot` must round-trip through
+    /// register→lookup byte-for-byte (it is stored directly in the packed
+    /// `Bucket`, unlike `record_offset`'s compact 48-bit encoding), and must
+    /// survive a table resize/rehash — `build_resized`'s `copy_entries_into`
+    /// re-inserts every occupied bucket's full `TxIndexEntry`, so a bug that
+    /// dropped `mined_slot` anywhere in the pack/unpack or copy path would
+    /// silently sever a tx's link to its `ShardedMinedIndex` slot the next
+    /// time the table grows.
+    #[test]
+    fn mined_slot_roundtrips_and_survives_resize() {
+        let mut t = HashTable::new(16).unwrap();
+        let key = make_key(1);
+        let entry = TxIndexEntry {
+            device_id: 7,
+            record_offset: 4096,
+            mined_slot: 12345,
+        };
+        t.insert(key, entry).unwrap();
+        assert_eq!(
+            t.get_entry(&key).unwrap().mined_slot,
+            12345,
+            "mined_slot must round-trip through register->lookup"
+        );
+
+        // Fill most of the table's capacity (mirrors `resize_preserves_entries`)
+        // then explicitly resize/rehash — `HashTable` does not auto-resize on
+        // insert, so bulk-inserting past capacity without an explicit
+        // `resize()` call would hit `HashTableError::Full` instead of
+        // exercising the rehash path this test targets.
+        for i in 2..12u64 {
+            t.insert(make_key(i), make_entry(i)).unwrap();
+        }
+        let old_cap = t.capacity();
+        t.resize(old_cap * 2).unwrap();
+        assert!(t.capacity() >= old_cap * 2);
+
+        assert_eq!(
+            t.get_entry(&key).unwrap().mined_slot,
+            12345,
+            "mined_slot must survive a table resize/rehash"
+        );
     }
 
     #[test]
@@ -2746,6 +2811,7 @@ mod tests {
                     TxIndexEntry {
                         device_id: 2,
                         record_offset: 9000 * 8,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();

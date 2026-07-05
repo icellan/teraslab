@@ -600,6 +600,7 @@ impl PrimaryBackend {
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             };
             batch.push((key, entry));
 
@@ -705,6 +706,7 @@ impl PrimaryBackend {
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             };
             index.register(key, entry)?;
             offset += aligned_advance;
@@ -813,6 +815,7 @@ mod tests {
         TxIndexEntry {
             device_id: 0,
             record_offset: offset,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         }
     }
 

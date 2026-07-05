@@ -4403,6 +4403,7 @@ impl Engine {
         let index_entry = TxIndexEntry {
             device_id,
             record_offset,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
@@ -4757,6 +4758,7 @@ impl Engine {
         let index_entry = TxIndexEntry {
             device_id,
             record_offset,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         };
         // Register in primary index AND increment shard_counts in the same
         // critical section so the two can never drift (H2 correctness fix).
@@ -5189,6 +5191,12 @@ impl Engine {
         let new_entry = TxIndexEntry {
             device_id,
             record_offset: new_offset,
+            // Preserve the pre-relocate mined_slot pointer: `tx_key` is
+            // unchanged (only the physical offset moves), so the tx's link
+            // into the ShardedMinedIndex arena must survive the re-point —
+            // resetting it to NO_MINED_SLOT here would sever it on every
+            // compaction/defrag relocate.
+            mined_slot: old_entry.mined_slot,
         };
         self.index
             .register(*tx_key, new_entry)
@@ -9337,6 +9345,7 @@ mod tests {
             let ie = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             };
             index.register(key, ie).unwrap();
 
@@ -9414,6 +9423,7 @@ mod tests {
         let ie = TxIndexEntry {
             device_id: 0,
             record_offset: offset,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         };
         index.register(key, ie).unwrap();
 
@@ -11070,6 +11080,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();
@@ -11655,6 +11666,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: o_live,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();
@@ -11828,6 +11840,7 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();
@@ -13464,6 +13477,7 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();
@@ -13582,6 +13596,7 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();
@@ -16120,6 +16135,7 @@ mod tests {
         let entry = TxIndexEntry {
             device_id: 5,
             record_offset: 4096,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         };
         engine
             .register(key, entry)
@@ -20323,6 +20339,7 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();
@@ -20515,6 +20532,7 @@ mod tests {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: 0,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             }
         }
 
@@ -20603,6 +20621,7 @@ mod tests {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: i * 4096,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             }
         }
 

@@ -1435,6 +1435,7 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: i as u64 * 256,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();
@@ -1795,6 +1796,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();
@@ -1974,6 +1976,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();
@@ -2137,6 +2140,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();
@@ -2232,6 +2236,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();
@@ -2414,6 +2419,7 @@ mod tests {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();
@@ -2836,6 +2842,7 @@ mod tests {
                     TxIndexEntry {
                         device_id: 0,
                         record_offset: i as u64 * 256,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                     },
                 )
                 .unwrap();

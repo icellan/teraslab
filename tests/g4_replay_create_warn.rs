@@ -46,6 +46,7 @@ fn replay_create_skips_when_already_indexed_with_different_offset() {
             TxIndexEntry {
                 device_id: 0,
                 record_offset: other_offset,
+                mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
             },
         )
         .unwrap();

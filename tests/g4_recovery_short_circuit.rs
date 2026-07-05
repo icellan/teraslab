@@ -121,6 +121,7 @@ fn replay_stops_on_first_fatal_io_error() {
                 TxIndexEntry {
                     device_id: 0,
                     record_offset: *record_offset,
+                    mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
                 },
             )
             .unwrap();

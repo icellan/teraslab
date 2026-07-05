@@ -76,6 +76,7 @@ fn register_entry(
             TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
+                mined_slot: teraslab::index::mined_index::NO_MINED_SLOT,
             },
         )
         .expect("register index entry");

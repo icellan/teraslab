@@ -79,7 +79,14 @@ pub type Result<T> = std::result::Result<T, IndexError>;
 // ---------------------------------------------------------------------------
 
 const SNAPSHOT_MAGIC: [u8; 4] = *b"TSIX"; // TeraSlab IndeX
-const SNAPSHOT_VERSION: u32 = 1;
+/// v2: the per-entry payload grew from 41 to 45 bytes to carry
+/// `TxIndexEntry::mined_slot` (Task 6, the primary index's pointer into the
+/// `ShardedMinedIndex` arena). A v1 snapshot is rejected by the version
+/// check below and falls back to a device-scan rebuild — see
+/// `snapshot_restore_rejects_unknown_version` and the `src/bin/server.rs`
+/// startup path, which already treats a version mismatch as a routine,
+/// safe "rebuild from device" event, not a fatal error.
+const SNAPSHOT_VERSION: u32 = 2;
 
 /// First four bytes of a v1 single-table primary snapshot. Re-exported to the
 /// crate so the sharded snapshot layer ([`crate::index::sharded`]) can
@@ -93,7 +100,7 @@ const SECONDARY_VERSION: u32 = 1;
 const MAX_SNAPSHOT_COUNT: usize = 1 << 30;
 
 // Per-entry sizes in the snapshot file
-const PRIMARY_ENTRY_SIZE: usize = 32 + 1 + 8; // TxKey + slim TxIndexEntry = 41
+const PRIMARY_ENTRY_SIZE: usize = 32 + 1 + 8 + 4; // TxKey + slim TxIndexEntry = 45
 const SECONDARY_ENTRY_SIZE: usize = 4 + 32; // height + txid = 36
 
 #[cfg(test)]
@@ -649,6 +656,7 @@ impl Index {
             let entry = TxIndexEntry {
                 device_id: 0,
                 record_offset: offset,
+                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
             };
             index.register(key, entry)?;
             offset += aligned_advance;
@@ -799,6 +807,7 @@ impl Index {
             buf.extend_from_slice(&key.txid);
             buf.push(entry.device_id);
             buf.extend_from_slice(&entry.record_offset.to_le_bytes());
+            buf.extend_from_slice(&entry.mined_slot.to_le_bytes());
         }
 
         let checksum = crc32fast::hash(&buf);
@@ -916,6 +925,7 @@ impl Index {
             let entry = TxIndexEntry {
                 device_id: data[base + 32],
                 record_offset: u64::from_le_bytes(data[base + 33..base + 41].try_into().unwrap()),
+                mined_slot: u32::from_le_bytes(data[base + 41..base + 45].try_into().unwrap()),
             };
             index.register(key, entry)?;
         }
@@ -1233,6 +1243,7 @@ mod tests {
         TxIndexEntry {
             device_id: (offset.wrapping_add(1) & 0xFF) as u8,
             record_offset: offset * 8,
+            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
         }
     }
 
@@ -1483,7 +1494,7 @@ mod tests {
         // `count` from offset 8.
         let mut data = Vec::new();
         data.extend_from_slice(&SNAPSHOT_MAGIC); // 4 bytes
-        data.extend_from_slice(&1u32.to_le_bytes()); // version
+        data.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes()); // version
         data.extend_from_slice(&u64::MAX.to_le_bytes()); // POISONED count
         data.extend_from_slice(&0u64.to_le_bytes()); // capacity
         // 4-byte trailing checksum so the header alone passes the
@@ -2369,6 +2380,7 @@ mod tests {
                 let entry = TxIndexEntry {
                     device_id: 0,
                     record_offset: i * 104,
+                    mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                 };
                 idx.register(key, entry).unwrap();
             }
@@ -2428,6 +2440,7 @@ mod tests {
                         let entry = TxIndexEntry {
                             device_id: 0,
                             record_offset: ((t * PER_THREAD + i) * 4096) as u64,
+                            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
                         };
                         idx.lock().unwrap().register(key, entry).unwrap();
                     }
