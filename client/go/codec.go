@@ -607,8 +607,14 @@ func decodeGetResponse(data []byte) ([]GetResult, error) {
 		if pos+dataLen > len(data) {
 			return nil, fmt.Errorf("get response: truncated data at item %d", i)
 		}
-		// Sub-slice the response payload.
-		results[i].Data = data[pos : pos+dataLen : pos+dataLen]
+		// Copy into a caller-owned buffer. The payload slice is recycled to
+		// payloadPool immediately after decoding (see decodeGetFrame) and then
+		// reused for the next frame, so a sub-slice into it would alias a
+		// buffer that gets overwritten — silently corrupting returned data.
+		if dataLen > 0 {
+			results[i].Data = make([]byte, dataLen)
+			copy(results[i].Data, data[pos:pos+dataLen])
+		}
 		pos += dataLen
 	}
 	return results, nil
