@@ -11,6 +11,7 @@ pub mod dah_index;
 pub mod hashmix;
 pub mod hashtable;
 pub mod migration;
+pub mod mined_index;
 pub mod preserve_backend;
 pub mod preserve_index;
 pub mod redb_dah;
