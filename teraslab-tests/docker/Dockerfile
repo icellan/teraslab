@@ -39,6 +39,9 @@ VOLUME ["/data", "/blobstore"]
 # 9100 = HTTP observability (metrics, health, status)
 EXPOSE 3300 3301 9100
 
+# /health/live returns 503 when the redo log is poisoned (issue #32 — the node
+# is write-dead and only a restart recovers it), so this probe fails the
+# container and drives an automatic restart in that case.
 HEALTHCHECK --interval=2s --timeout=2s --start-period=5s --retries=5 \
     CMD curl -sf http://localhost:9100/health/live || exit 1
 

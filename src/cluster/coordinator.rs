@@ -6659,9 +6659,10 @@ pub fn redo_entry_to_replica_op(
         | RedoOp::CompensateUnsetMined { .. }
         | RedoOp::CompensateReassign { .. }
         | RedoOp::CompensatePrune { .. }
-        // Relocate is a segment-engine physical move (recovery-only); the segment
-        // engine is non-clustered in v1, so a relocate is never shipped to a
-        // replica (the logical mutation would be, via its own op).
+        // `Relocate` is the standalone segment engine's physical move; it is
+        // recovery-only and never appears on a clustered node (a clustered segment
+        // spend's replication is carried by the convertible `SpendV2` handled
+        // above, and its relocate journals nothing). So it maps to None here.
         | RedoOp::Relocate { .. }
         | RedoOp::CompensateSetLocked { .. } => None,
     }

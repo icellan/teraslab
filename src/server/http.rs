@@ -1493,7 +1493,17 @@ fn prom_histogram_ns(out: &mut String, name: &str, hist: &LatencyHistogram) {
 // /health/live and /health/ready
 // ---------------------------------------------------------------------------
 
-async fn handle_health_live(State(_state): State<Arc<HttpState>>) -> impl IntoResponse {
+async fn handle_health_live(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    // Issue #32: a poisoned redo log makes the node write-dead — every mutation
+    // fails until a restart + recovery. Report NOT-live so the container /
+    // orchestrator liveness probe restarts the process (the only remedy),
+    // instead of leaving a green node that silently rejects all writes.
+    if !state.engine.write_healthy() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "redo log poisoned — writes are failing; restart required",
+        );
+    }
     (StatusCode::OK, "ok")
 }
 
@@ -1542,6 +1552,12 @@ enum ReadyState {
 fn compute_health_ready(state: &HttpState) -> ReadyState {
     if !state.ready.load(Ordering::Relaxed) {
         return ReadyState::NotReady("not ready (recovery in progress)");
+    }
+    // Issue #32: a poisoned redo log rejects every write until a restart, so the
+    // node must NOT receive traffic — drain it. Read is lock-free (does not block
+    // on the redo writer mutex).
+    if !state.engine.write_healthy() {
+        return ReadyState::NotReady("redo log poisoned — writes are failing; restart required");
     }
     // F-G6-001: dispatch flips the secondary readiness flags to `false`
     // at startup when the DAH or unmined index rebuild fails. The TCP
@@ -1673,6 +1689,18 @@ async fn wait_for_cluster_drain(cluster: &RunningCluster, wait_seconds: u64) -> 
 }
 
 async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let status = build_status_json(&state);
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        status.to_string(),
+    )
+}
+
+/// Build the `/status` JSON payload. Split out of the async handler so unit
+/// tests can assert the payload shape (records, storage/defrag health, cluster
+/// counts) without spinning up an HTTP listener.
+fn build_status_json(state: &HttpState) -> serde_json::Value {
     let m = state.metrics;
 
     let cluster_info = if let Some(ref cluster) = state.cluster {
@@ -1715,6 +1743,29 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
         })
     };
 
+    // On-device space + defrag health. `used_bytes` is the on-device footprint
+    // (live + dead); `dead_fraction` is the reclaimable share that the
+    // pressure-aware compaction (issue #33) targets. `compacted`/`reclaimed`
+    // are the LAST checkpoint's defrag pass outcomes (segments), so an operator
+    // can see the reclaimer keeping pace with dead-space growth. Non-blocking
+    // allocator read; falls back to a blocking read only when momentarily
+    // contended so the health endpoint stays cheap.
+    let alloc = state
+        .engine
+        .allocator_stats_try()
+        .unwrap_or_else(|| state.engine.allocator_stats());
+    let (compacted, reclaimed) = state.engine.last_checkpoint_defrag();
+    // For the segment engine the trait-level `used_bytes` is LIVE bytes and
+    // `total_free_bytes` is DEAD bytes; the on-device footprint is their sum.
+    let live_bytes = alloc.used_bytes;
+    let dead_bytes = alloc.total_free_bytes;
+    let used_bytes = live_bytes.saturating_add(dead_bytes);
+    let dead_fraction = if used_bytes > 0 {
+        dead_bytes as f64 / used_bytes as f64
+    } else {
+        0.0
+    };
+
     let status = serde_json::json!({
         "node_id": cluster_info["node_id"],
         "cluster_size": cluster_info["cluster_size"],
@@ -1731,6 +1782,15 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "unmined_index": state.engine.unmined_index().len(),
             "preserve_index": state.engine.preserve_index().len(),
         },
+        "storage": {
+            "used_bytes": used_bytes,
+            "dead_bytes": dead_bytes,
+            "live_bytes": live_bytes,
+            "dead_fraction": dead_fraction,
+            "total_bytes": alloc.device_size,
+            "compacted": compacted,
+            "reclaimed": reclaimed,
+        },
         "throughput": {
             "spends_attempted": m.spends_attempted.get(),
             "spends_succeeded": m.spends_succeeded.get(),
@@ -1739,13 +1799,14 @@ async fn handle_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse
             "spend_multi_batches": m.spend_multi_batches.get(),
         },
         "ready": state.ready.load(Ordering::Relaxed),
+        // Issue #32: surface redo write-health so it is scrapable. `write_healthy`
+        // is false (and `redo_poisoned` true) once any store's redo log is
+        // poisoned by a flush failure and the node is rejecting all writes.
+        "write_healthy": state.engine.write_healthy(),
+        "redo_poisoned": !state.engine.write_healthy(),
     });
 
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        status.to_string(),
-    )
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -2190,6 +2251,19 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
         })
     };
 
+    // Segment-engine defrag health (issue #33). For the segment engine the
+    // trait-level `used_bytes` is LIVE bytes and `total_free_bytes` is DEAD
+    // bytes; the on-device footprint is their sum.
+    let storage_dead_bytes = alloc_stats.total_free_bytes;
+    let storage_live_bytes = alloc_stats.used_bytes;
+    let storage_footprint = storage_live_bytes.saturating_add(storage_dead_bytes);
+    let storage_dead_fraction = if storage_footprint > 0 {
+        storage_dead_bytes as f64 / storage_footprint as f64
+    } else {
+        0.0
+    };
+    let (storage_compacted, storage_reclaimed) = state.engine.last_checkpoint_defrag();
+
     serde_json::json!({
         "node_id": node_id,
         "timestamp_ms": timestamp_ms,
@@ -2230,6 +2304,13 @@ fn build_local_top_snapshot(state: &HttpState) -> serde_json::Value {
             "total_bytes": alloc_stats.device_size,
             "utilization": alloc_stats.utilization,
             "free_regions": alloc_stats.free_region_count,
+            // Segment-engine defrag health (issue #33): dead/live split and the
+            // last checkpoint's compact/reclaim segment counts.
+            "dead_bytes": storage_dead_bytes,
+            "live_bytes": storage_live_bytes,
+            "dead_fraction": storage_dead_fraction,
+            "compacted": storage_compacted,
+            "reclaimed": storage_reclaimed,
         },
         "redo": redo,
         "connections": state.active_connections.load(Ordering::Relaxed),
@@ -2955,8 +3036,9 @@ impl Drop for PprofInFlightGuard {
 
 /// `GET /debug/pprof/profile?seconds=N&frequency=Hz`
 ///
-/// Samples the whole process for `seconds` and returns an inferno flamegraph
-/// SVG. Admin-gated and single-flight. The blocking sample runs on a dedicated
+/// Samples the whole process for `seconds` and returns a flamegraph SVG
+/// (rendered in-tree; see [`render_flamegraph_svg`]). Admin-gated and
+/// single-flight. The blocking sample runs on a dedicated
 /// `spawn_blocking` thread so it never parks an async worker, and the
 /// `ProfilerGuard` is created and reported entirely within that thread (never
 /// held across an `.await`).
@@ -3015,8 +3097,25 @@ async fn handle_debug_pprof_profile(Query(q): Query<PprofQuery>) -> axum::respon
     }
 }
 
-/// Run one blocking CPU sample and render it as an inferno flamegraph SVG.
+/// Run one blocking CPU sample and render it as a flamegraph SVG.
 /// Errors are returned as strings for the handler to surface as a 500.
+///
+/// pprof arms a process-global `ITIMER_PROF` timer that delivers `SIGPROF` to
+/// whichever thread is running (~`frequency` Hz), and its handler grabs the
+/// global `PROFILER` spin-lock. That is fine during the sample window, but the
+/// timer stays armed until the [`pprof::ProfilerGuard`] is *dropped* — which,
+/// with pprof's API, does not happen until after `report().build()` returns.
+/// `build()` symbolizes every captured frame, taking the process-wide
+/// dyld/libunwind lock; if a stray `SIGPROF` interrupts that same thread mid-
+/// symbolization, the signal handler re-enters that non-reentrant OS lock and
+/// wedges the profiling thread forever (the request never returns). A concurrent
+/// second `/debug/pprof/profile` (rejected with 409) makes the wedge reliable on
+/// macOS purely by adding scheduling pressure that widens the interrupt window.
+///
+/// Fix: explicitly disarm `ITIMER_PROF` the instant sampling ends — *before*
+/// symbolization — so no `SIGPROF` can fire while `report().build()` holds the
+/// symbolizer lock. The guard's own `Timer::drop` disarms again on scope exit;
+/// `setitimer` to zero is idempotent, so the double-disarm is harmless.
 fn run_cpu_profile(seconds: u64, frequency: i32) -> Result<Vec<u8>, String> {
     let guard = pprof::ProfilerGuardBuilder::default()
         .frequency(frequency)
@@ -3024,15 +3123,250 @@ fn run_cpu_profile(seconds: u64, frequency: i32) -> Result<Vec<u8>, String> {
         .build()
         .map_err(|e| format!("start profiler: {e}"))?;
     std::thread::sleep(Duration::from_secs(seconds));
+    // Stop the SIGPROF timer before symbolizing (see the doc comment above). The
+    // guard keeps its collected sample `data` intact for `report()`; only the
+    // periodic signal delivery is halted.
+    disarm_sigprof_timer();
     let report = guard
         .report()
         .build()
         .map_err(|e| format!("build report: {e}"))?;
-    let mut svg = Vec::new();
+    Ok(render_flamegraph_svg(&report))
+}
+
+/// Disarm the process-global `ITIMER_PROF` interval timer that pprof installs,
+/// stopping further `SIGPROF` delivery. Setting both the interval and the value
+/// to zero cancels the timer per POSIX `setitimer(2)`. Idempotent: calling it
+/// when the timer is already disarmed is a no-op.
+fn disarm_sigprof_timer() {
+    // SAFETY: `setitimer` reads a fully-initialized `itimerval` (all fields set
+    // to zero) and we pass a null `old_value`, so there is no aliasing or
+    // uninitialized-read hazard. `ITIMER_PROF` is a valid `which` on Linux and
+    // macOS.
+    unsafe {
+        let zero = libc::itimerval {
+            it_interval: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            it_value: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+        };
+        libc::setitimer(libc::ITIMER_PROF, &zero, std::ptr::null_mut());
+    }
+}
+
+/// Fold a pprof [`Report`](pprof::Report) into `(root-first stack,
+/// sample-count)` pairs.
+///
+/// pprof stores each `Frames` leaf-innermost; a flamegraph is drawn root-at-the-
+/// bottom, so both the frame list and each frame's inlined-symbol list are
+/// reversed to yield a root-first path. The thread name is prepended as the
+/// synthetic root so multi-thread profiles do not collapse unrelated stacks.
+/// This mirrors the fold that pprof's own (feature-gated) `flamegraph` used, so
+/// the rendered SVG is equivalent to the previous inferno output.
+fn fold_report(report: &pprof::Report) -> Vec<(Vec<String>, u64)> {
     report
-        .flamegraph(&mut svg)
-        .map_err(|e| format!("flamegraph render: {e}"))?;
-    Ok(svg)
+        .data
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(key, count)| {
+            let count = *count;
+            let mut stack = Vec::with_capacity(key.frames.len() + 1);
+            stack.push(key.thread_name_or_id());
+            for frame in key.frames.iter().rev() {
+                for symbol in frame.iter().rev() {
+                    stack.push(symbol.to_string());
+                }
+            }
+            (stack, count as u64)
+        })
+        .collect()
+}
+
+/// A node in the flamegraph prefix tree: a frame name, its total sample count,
+/// and its children keyed by child frame name (sorted for deterministic output).
+#[derive(Default)]
+struct FlameNode {
+    count: u64,
+    children: std::collections::BTreeMap<String, FlameNode>,
+}
+
+impl FlameNode {
+    /// Add `count` samples along the root-first `stack` path, creating nodes as
+    /// needed and accumulating the count at every level the path passes through.
+    fn insert(&mut self, stack: &[String], count: u64) {
+        self.count += count;
+        if let Some((head, rest)) = stack.split_first() {
+            self.children
+                .entry(head.clone())
+                .or_default()
+                .insert(rest, count);
+        }
+    }
+}
+
+/// Escape the five XML metacharacters for safe inclusion in element text and
+/// double-quoted attribute values.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Deterministic FNV-1a-based frame colour in the warm "flame" palette, so the
+/// same symbol always renders the same hue across profiles (aids visual diff).
+fn frame_color(name: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in name.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    // Warm palette: red 205-255, green 0-230, blue 0-55 — the classic flamegraph look.
+    let r = 205 + (hash % 50) as u16;
+    let g = ((hash >> 16) % 230) as u16;
+    let b = ((hash >> 32) % 55) as u16;
+    format!("rgb({r},{g},{b})")
+}
+
+/// Precomputed flamegraph geometry, shared across the recursive [`emit`] pass so
+/// the walk carries only the per-node `(node, name, x, level)` state (keeps the
+/// recursion signature small).
+///
+/// [`emit`]: FlameLayout::emit
+struct FlameLayout {
+    /// Total number of rows (flamegraph depth including the synthetic root).
+    rows: usize,
+    /// Horizontal pixels per sample; a rect's width is `count * px_per_sample`.
+    px_per_sample: f64,
+    /// Height of one frame row in pixels.
+    row_height: f64,
+    /// Canvas padding in pixels (also the root rect's left/bottom offset).
+    padding: f64,
+    /// Rects narrower than this (px) are pruned — invisible, only bloat the doc.
+    min_width: f64,
+    /// Label font size in pixels.
+    font_size: f64,
+}
+
+impl FlameLayout {
+    /// Emit rects for `node` (named `name`) and its subtree, depth-first. `x` is
+    /// the node's left edge in pixels; `level` 0 is the synthetic root, drawn on
+    /// the bottom row. Appends `<g>`/`<rect>`/`<text>` markup to `out`.
+    fn emit(&self, node: &FlameNode, name: &str, x: f64, level: usize, out: &mut String) {
+        let w = node.count as f64 * self.px_per_sample;
+        if w < self.min_width {
+            return;
+        }
+        // Bottom-up: the root sits on the lowest row.
+        let y = self.padding + (self.rows - 1 - level) as f64 * (self.row_height + 1.0);
+        let color = frame_color(name);
+        let title = format!("{} ({} samples)", xml_escape(name), node.count);
+        let row_height = self.row_height;
+        out.push_str(&format!(
+            "<g><title>{title}</title><rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{row_height:.2}\" fill=\"{color}\" rx=\"1\" ry=\"1\" />"
+        ));
+        // Only draw a label if the rect is wide enough to fit a few glyphs
+        // (~7px per char at this font size); clip the text to the rect width.
+        let max_chars = (w / 7.0) as usize;
+        if max_chars >= 3 {
+            let mut label = name.to_string();
+            if label.len() > max_chars {
+                label.truncate(max_chars.saturating_sub(2));
+                label.push('…');
+            }
+            out.push_str(&format!(
+                "<text x=\"{tx:.2}\" y=\"{ty:.2}\" font-family=\"Verdana, monospace\" font-size=\"{fs}\" fill=\"#000\">{label}</text>",
+                tx = x + 3.0,
+                ty = y + row_height - 4.0,
+                fs = self.font_size,
+                label = xml_escape(&label),
+            ));
+        }
+        out.push_str("</g>");
+
+        // Children are laid out left-to-right within the parent's span, ordered
+        // by the BTreeMap key for deterministic output.
+        let mut child_x = x;
+        for (child_name, child) in &node.children {
+            self.emit(child, child_name, child_x, level + 1, out);
+            child_x += child.count as f64 * self.px_per_sample;
+        }
+    }
+}
+
+/// Render a flamegraph as a self-contained SVG document from pprof's resolved
+/// [`Report`](pprof::Report).
+///
+/// Replaces the removed inferno-backed `Report::flamegraph`: inferno pulls a
+/// `quick-xml` version with unpatched DoS advisories (RUSTSEC-2026-0194 / -0195)
+/// that no release has fixed yet, so the flamegraph is drawn here instead. The
+/// output is a standard root-at-the-bottom flamegraph: one `<rect>` per frame,
+/// width proportional to its share of total samples, a `<title>` tooltip with
+/// the symbol and sample count, and a clipped label. Frames narrower than half a
+/// pixel are pruned (they would be invisible and only bloat the document).
+fn render_flamegraph_svg(report: &pprof::Report) -> Vec<u8> {
+    render_flamegraph_svg_from_folded(fold_report(report))
+}
+
+/// Pure flamegraph SVG renderer over `(root-first stack, sample-count)` pairs.
+/// Split out from [`render_flamegraph_svg`] so it is unit-testable without
+/// constructing a live pprof `Report`.
+fn render_flamegraph_svg_from_folded(stacks: Vec<(Vec<String>, u64)>) -> Vec<u8> {
+    const WIDTH: f64 = 1200.0;
+    const ROW_HEIGHT: f64 = 16.0;
+    const PADDING: f64 = 10.0;
+
+    let mut root = FlameNode::default();
+    for (stack, count) in stacks {
+        root.insert(&stack, count);
+    }
+
+    // Compute the flamegraph depth so the canvas height is exact.
+    fn depth(node: &FlameNode) -> usize {
+        1 + node.children.values().map(depth).max().unwrap_or(0)
+    }
+    let rows = if root.count == 0 { 1 } else { depth(&root) };
+    let height = PADDING * 2.0 + rows as f64 + ROW_HEIGHT * rows as f64;
+
+    let total = root.count.max(1) as f64;
+    let layout = FlameLayout {
+        rows,
+        px_per_sample: (WIDTH - PADDING * 2.0) / total,
+        row_height: ROW_HEIGHT,
+        padding: PADDING,
+        min_width: 0.5,
+        font_size: 12.0,
+    };
+
+    let mut rects = String::new();
+    if root.count > 0 {
+        layout.emit(&root, "root", PADDING, 0, &mut rects);
+    }
+
+    let svg = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n\
+         <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{WIDTH:.0}\" height=\"{height:.0}\" \
+         viewBox=\"0 0 {WIDTH:.0} {height:.0}\">\n\
+         <rect width=\"100%\" height=\"100%\" fill=\"#f8f8f8\" />\n\
+         <text x=\"{tx:.0}\" y=\"18\" font-family=\"Verdana, monospace\" font-size=\"14\" font-weight=\"bold\" fill=\"#333\">teraslab CPU flamegraph ({total_samples} samples)</text>\n\
+         {rects}\n\
+         </svg>\n",
+        tx = PADDING,
+        total_samples = root.count,
+    );
+    svg.into_bytes()
 }
 
 async fn handle_set_log_level(
@@ -3353,6 +3687,110 @@ pub(crate) fn attach_traceparent_response(headers: &mut HeaderMap, span: &tracin
 mod tests {
     use super::*;
     use crate::metrics::{ThreadHistograms, ThreadMetrics};
+
+    /// The in-tree flamegraph renderer must emit a well-formed SVG document with
+    /// one frame rect per distinct stack level and correct proportional widths.
+    #[test]
+    fn flamegraph_svg_is_well_formed_and_proportional() {
+        // Two stacks sharing a common root+`main` prefix, then diverging. `a`
+        // gets 3× the samples of `b`, so `a`'s rect must be ~3× wider than `b`'s.
+        let folded = vec![
+            (
+                vec!["main".to_string(), "work".to_string(), "a".to_string()],
+                75,
+            ),
+            (
+                vec!["main".to_string(), "work".to_string(), "b".to_string()],
+                25,
+            ),
+        ];
+        let svg = String::from_utf8(render_flamegraph_svg_from_folded(folded)).unwrap();
+
+        // Structural: a real SVG document, not a stub.
+        assert!(svg.starts_with("<?xml"), "must have an XML prolog");
+        assert!(svg.contains("<svg "), "must contain an <svg> element");
+        assert!(svg.trim_end().ends_with("</svg>"), "must close </svg>");
+        assert!(
+            svg.len() > 500,
+            "non-trivial document; got {} bytes",
+            svg.len()
+        );
+
+        // Every frame is present as a labelled group with a tooltip.
+        assert!(svg.contains(">main ("), "root frame `main` labelled");
+        assert!(svg.contains(">work ("), "shared frame `work` labelled");
+        assert!(svg.contains(">a ("), "leaf `a` labelled");
+        assert!(svg.contains(">b ("), "leaf `b` labelled");
+        assert!(svg.contains("(75 samples)"), "leaf `a` count in tooltip");
+        assert!(svg.contains("(25 samples)"), "leaf `b` count in tooltip");
+        // `work` accumulates both children.
+        assert!(svg.contains("(100 samples)"), "shared frame sums children");
+
+        // Proportional widths: parse the two leaf rects' widths and check a≈3×b.
+        let width_of = |title_prefix: &str| -> f64 {
+            let g = svg
+                .split("<g>")
+                .find(|g| g.contains(&format!(">{title_prefix} (")))
+                .unwrap_or_else(|| panic!("group for {title_prefix} not found"));
+            let w = g.split("width=\"").nth(1).unwrap();
+            w.split('"').next().unwrap().parse().unwrap()
+        };
+        let wa = width_of("a");
+        let wb = width_of("b");
+        assert!(
+            (wa / wb - 3.0).abs() < 0.05,
+            "`a` (75) must be ~3× the width of `b` (25); got {wa} vs {wb}"
+        );
+    }
+
+    /// XML metacharacters in symbol names must be escaped so a hostile or
+    /// generic-heavy Rust symbol (`Vec<T>`, `&mut`, etc.) can't break the SVG.
+    #[test]
+    fn flamegraph_svg_escapes_symbol_names() {
+        let folded = vec![(
+            vec!["main".to_string(), "Vec<T> & <b>\"x\"".to_string()],
+            10,
+        )];
+        let svg = String::from_utf8(render_flamegraph_svg_from_folded(folded)).unwrap();
+        assert!(svg.contains("Vec&lt;T&gt; &amp;"), "angle/amp escaped");
+        assert!(svg.contains("&quot;x&quot;"), "quotes escaped");
+        // No raw unescaped metacharacter from the symbol leaked into the doc
+        // (beyond the legitimate SVG structural markup).
+        assert!(
+            !svg.contains("Vec<T>"),
+            "raw `<` from symbol must not appear"
+        );
+    }
+
+    /// An empty report (no samples captured) still produces a valid SVG rather
+    /// than panicking or emitting an empty body.
+    #[test]
+    fn flamegraph_svg_handles_empty_report() {
+        let svg = String::from_utf8(render_flamegraph_svg_from_folded(vec![])).unwrap();
+        assert!(svg.starts_with("<?xml"));
+        assert!(svg.contains("<svg "));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains("(0 samples)"), "reports zero total samples");
+    }
+
+    /// Frame colours are deterministic per symbol name (aids visual diffing of
+    /// two profiles) and always fall inside the warm flame palette.
+    #[test]
+    fn frame_color_is_deterministic_and_in_palette() {
+        assert_eq!(frame_color("foo::bar"), frame_color("foo::bar"));
+        assert_ne!(frame_color("foo"), frame_color("bar"));
+        let c = frame_color("some::symbol");
+        let nums: Vec<u16> = c
+            .trim_start_matches("rgb(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        assert_eq!(nums.len(), 3);
+        assert!((205..=255).contains(&nums[0]), "red in warm range");
+        assert!(nums[1] <= 230, "green bounded");
+        assert!(nums[2] <= 55, "blue bounded");
+    }
 
     /// `/metrics` output for the spend histogram must contain a complete set
     /// of cumulative `_bucket{le="..."}` lines, one per bucket plus `+Inf`,
@@ -3750,6 +4188,104 @@ mod tests {
                 .unwrap(),
             0,
         );
+    }
+
+    /// Issue #33: `/status` exposes segment-defrag health — dead/live bytes,
+    /// dead_fraction, and the last checkpoint's compacted/reclaimed segment
+    /// counts — reflecting a known allocator state.
+    #[test]
+    fn status_reports_defrag_health_for_segment_engine() {
+        use crate::device::{BlockDevice, MemoryDevice};
+        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::locks::StripedLocks;
+        use crate::ops::engine::Engine;
+        use crate::record::TxMetadata;
+        use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg_size = 8 * 4096; // 8-block segments
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), seg_size).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            Index::new(256).unwrap(),
+            seg,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Allocate four one-block records, then free two → half the on-device
+        // footprint is dead. record_size is block-rounded, so live == dead here.
+        let record_size = TxMetadata::record_size_for(1);
+        let mut offsets = Vec::new();
+        for _ in 0..4 {
+            offsets.push(
+                engine
+                    .allocator_for(0)
+                    .lock()
+                    .allocate(record_size)
+                    .unwrap(),
+            );
+        }
+        for &off in &offsets[..2] {
+            engine
+                .allocator_for(0)
+                .lock()
+                .free(off, record_size)
+                .unwrap();
+        }
+
+        // Publish a known last-checkpoint defrag outcome.
+        engine.record_last_checkpoint_defrag(3, 7);
+
+        // Cross-check the expected numbers against the allocator's own view.
+        let seg_stats = engine.segment_allocator_stats().expect("segment engine");
+        let expected_dead = seg_stats.dead_bytes;
+        let expected_live = seg_stats.live_bytes;
+        let expected_used = seg_stats.used_bytes;
+        assert!(expected_dead > 0, "the two frees must create dead space");
+        assert_eq!(
+            expected_dead + expected_live,
+            expected_used,
+            "dead + live == on-device footprint"
+        );
+
+        let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
+        let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
+        let state = HttpState {
+            engine,
+            metrics,
+            histograms,
+            ready: Arc::new(AtomicBool::new(true)),
+            log_level: Arc::new(AtomicU8::new(LOG_LEVEL_INFO)),
+            cluster: None,
+            redo_log: None,
+            redo_atomics: None,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            http_port: 0,
+            replica_lag_warn_threshold_ops: 10_000,
+            replica_lag_cache: AtomicU64::new(0),
+        };
+
+        let status = build_status_json(&state);
+        let storage = status["storage"]
+            .as_object()
+            .expect("/status must include a storage object");
+
+        assert_eq!(storage["dead_bytes"].as_u64().unwrap(), expected_dead);
+        assert_eq!(storage["live_bytes"].as_u64().unwrap(), expected_live);
+        assert_eq!(storage["used_bytes"].as_u64().unwrap(), expected_used);
+
+        let dead_fraction = storage["dead_fraction"].as_f64().unwrap();
+        let want_fraction = expected_dead as f64 / expected_used as f64;
+        assert!(
+            (dead_fraction - want_fraction).abs() < 1e-9,
+            "dead_fraction {dead_fraction} must equal dead/used {want_fraction}"
+        );
+
+        assert_eq!(storage["compacted"].as_u64().unwrap(), 3);
+        assert_eq!(storage["reclaimed"].as_u64().unwrap(), 7);
     }
 
     /// Parse a labeled Prometheus counter line of the form
@@ -4197,6 +4733,114 @@ mod tests {
             replica_lag_warn_threshold_ops: 0,
             replica_lag_cache: AtomicU64::new(0),
         })
+    }
+
+    /// Build a `ready` test state with a real redo log attached to the engine.
+    /// When `poison` is true the log is poisoned up front, so the engine reports
+    /// `write_healthy() == false` — the issue #32 write-dead condition. Returns
+    /// the state plus the log handle so a test can flip the poison after the
+    /// fact if it wants.
+    fn build_ready_test_state_with_redo(
+        ready_flag: bool,
+        poison: bool,
+    ) -> (Arc<HttpState>, Arc<parking_lot::Mutex<RedoLog>>) {
+        let state = build_ready_test_state(ready_flag, None);
+        // A standalone in-memory device backing the redo log.
+        let redo_dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        if poison {
+            log.lock().poison();
+        }
+        state.engine.set_redo_log(log.clone());
+        (state, log)
+    }
+
+    #[test]
+    fn engine_write_healthy_reflects_redo_poison() {
+        // No redo attached → write-healthy by definition.
+        let (bare, _) = (build_ready_test_state(true, None), ());
+        assert!(
+            bare.engine.write_healthy(),
+            "engine with no redo logs attached must report write-healthy"
+        );
+
+        // Fresh redo attached, not poisoned → healthy.
+        let (state, log) = build_ready_test_state_with_redo(true, false);
+        assert!(
+            state.engine.write_healthy(),
+            "fresh redo log must report write-healthy"
+        );
+
+        // Poison the attached log → engine flips to unhealthy WITHOUT any lock
+        // held by the reader (write_healthy reads the lock-free mirror).
+        log.lock().poison();
+        assert!(
+            !state.engine.write_healthy(),
+            "engine must report write-UNhealthy once its redo log is poisoned"
+        );
+    }
+
+    #[test]
+    fn health_ready_rejects_when_redo_poisoned() {
+        let (state, _log) = build_ready_test_state_with_redo(true, true);
+        assert_eq!(
+            compute_health_ready(&state),
+            ReadyState::NotReady("redo log poisoned — writes are failing; restart required"),
+            "a poisoned redo must make the node NOT ready so it drains",
+        );
+    }
+
+    #[tokio::test]
+    async fn health_live_returns_503_when_redo_poisoned_200_when_healthy() {
+        use axum::extract::State;
+
+        // Healthy: 200 OK.
+        let (healthy, log) = build_ready_test_state_with_redo(true, false);
+        let resp = handle_health_live(State(healthy)).await.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a write-healthy node must report live (200)"
+        );
+
+        // Poison → 503 SERVICE_UNAVAILABLE, which fails the liveness probe and
+        // drives an automatic restart.
+        log.lock().poison();
+        let (poisoned, _) = build_ready_test_state_with_redo(true, true);
+        let resp = handle_health_live(State(poisoned)).await.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a poisoned redo must make /health/live report NOT-live (503)"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_payload_reports_redo_write_health() {
+        use axum::extract::State;
+
+        // Healthy node: write_healthy=true, redo_poisoned=false.
+        let (healthy, _log) = build_ready_test_state_with_redo(true, false);
+        let resp = handle_status(State(healthy)).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["write_healthy"], serde_json::json!(true));
+        assert_eq!(json["redo_poisoned"], serde_json::json!(false));
+
+        // Poisoned node: write_healthy=false, redo_poisoned=true.
+        let (poisoned, _log) = build_ready_test_state_with_redo(true, true);
+        let resp = handle_status(State(poisoned)).await.into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["write_healthy"], serde_json::json!(false));
+        assert_eq!(json["redo_poisoned"], serde_json::json!(true));
     }
 
     /// R-055 baseline: in single-node mode (no cluster) with the

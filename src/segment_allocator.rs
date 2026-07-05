@@ -1303,6 +1303,9 @@ impl RecordAllocator for SegmentAllocator {
             },
         }
     }
+    fn segment_stats(&self) -> Option<SegmentAllocatorStats> {
+        Some(SegmentAllocator::stats(self))
+    }
     fn next_offset(&self) -> u64 {
         self.cursor
     }
@@ -1691,11 +1694,11 @@ mod tests {
 
         // seg0: dead 1/4; seg1: dead 3/4; seg2: dead 2/4.
         a.free(seg_offsets[0][0], 4096).unwrap();
-        for i in 0..3 {
-            a.free(seg_offsets[1][i], 4096).unwrap();
+        for &off in &seg_offsets[1][..3] {
+            a.free(off, 4096).unwrap();
         }
-        for i in 0..2 {
-            a.free(seg_offsets[2][i], 4096).unwrap();
+        for &off in &seg_offsets[2][..2] {
+            a.free(off, 4096).unwrap();
         }
 
         // Most-dead-first: seg1 (0.75), seg2 (0.5), seg0 (0.25).
@@ -1704,8 +1707,8 @@ mod tests {
         assert_eq!(a.defrag_victims(0.5), vec![1, 2]);
         // Dead-mark seg0's remaining 3 blocks so it is now FULLY dead (4/4) ->
         // excluded from victims (it goes the free reclaim path, not compaction).
-        for i in 1..4 {
-            a.free(seg_offsets[0][i], 4096).unwrap();
+        for &off in &seg_offsets[0][1..4] {
+            a.free(off, 4096).unwrap();
         }
         assert!(!a.defrag_victims(0.0).contains(&0));
     }

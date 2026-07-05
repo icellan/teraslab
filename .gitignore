@@ -54,3 +54,6 @@ teraslab-tombstone*
 # Working-tree copies remain on the dev machine; not part of the codebase.
 bench/*.md
 bench/results/
+
+# Root-level benchmark/recipe notes (dev working files, not part of the codebase)
+utxo-db-benchmark-recipe.md

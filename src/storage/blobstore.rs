@@ -2,8 +2,9 @@
 //!
 //! Large transaction cold data is stored in an external blob store keyed by a
 //! caller-supplied 32-byte key (the txid). The advisory size guideline for
-//! choosing external placement is 8 KiB of serialized cold data (see
-//! [`crate::storage::tiers::INLINE_THRESHOLD`]); above that, clients are
+//! choosing external placement is 1 MiB of serialized cold data (see
+//! [`crate::storage::tiers::INLINE_THRESHOLD`], which matches the client
+//! default upload threshold); above that, clients are
 //! recommended to pre-upload a blob here. That threshold is *advisory only* —
 //! the server does not enforce it. Placement is client-driven via the
 //! `FLAG_EXTERNAL_BLOB` request flag, so a client may store any size external.

@@ -256,7 +256,8 @@ fn kill_between_rename_and_dir_fsync_recovers_hashtable() {
     // the tmp file is an orphan — recovery handles both.
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let data_dev = Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
-    let mut alloc_recov = SlotAllocator::new(data_dev.clone()).unwrap();
+    let mut alloc_recov: teraslab::allocator::BoxedAllocator =
+        Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let mut dah = DahBackend::new_in_memory();
     let mut unmined = UnminedBackend::new_in_memory();
@@ -352,7 +353,8 @@ fn kill_after_free_redo_fsync_before_freelist_mutation_reconstructs_freelist() {
     // Reconstruct: a fresh allocator derived from a freshly-persisted
     // snapshot would not yet reflect the free. Recovery with the redo
     // log replays the FreeRegion entry and rebuilds the freelist.
-    let mut recovered_alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+    let mut recovered_alloc: teraslab::allocator::BoxedAllocator =
+        Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
     // Re-allocate up to pre_free_next_offset so the allocator's
     // high-water mark aligns with the pre-crash state.
     let catchup = pre_free_next_offset - teraslab::allocator::DATA_REGION_OFFSET;

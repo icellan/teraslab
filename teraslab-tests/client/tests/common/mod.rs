@@ -1398,18 +1398,32 @@ pub async fn verify_consistency(
                 continue;
             }
 
-            if let Some((spent_count, is_mined, is_conflicting, is_locked)) =
-                parse_metadata_fields(result.data())
-            {
-                let mm = verifier.verify_record(
-                    txid,
-                    spent_count,
-                    is_mined,
-                    is_conflicting,
-                    is_locked,
-                    false,
-                );
-                all_mismatches.extend(mm);
+            match parse_metadata_fields(result.data()) {
+                Some((spent_count, is_mined, is_conflicting, is_locked)) => {
+                    let mm = verifier.verify_record(
+                        txid,
+                        spent_count,
+                        is_mined,
+                        is_conflicting,
+                        is_locked,
+                        false,
+                    );
+                    all_mismatches.extend(mm);
+                }
+                None => {
+                    // Status=0 (found) but metadata failed to parse — this is
+                    // a corrupt record, not a missing one. Count it as a
+                    // mismatch so verify_consistency fails rather than skipping.
+                    all_mismatches.push(Mismatch {
+                        txid: *txid,
+                        field: "metadata_parse".to_string(),
+                        expected: "parseable FIELD_ALL_METADATA response".to_string(),
+                        actual: format!(
+                            "status=0 but data too short or corrupt ({} bytes)",
+                            result.data().len()
+                        ),
+                    });
+                }
             }
         }
     }
@@ -1437,18 +1451,31 @@ pub async fn verify_consistency(
                     continue;
                 }
 
-                if let Some((spent_count, is_mined, is_conflicting, is_locked)) =
-                    parse_metadata_fields(result.data())
-                {
-                    let mm = verifier.verify_record(
-                        txid,
-                        spent_count,
-                        is_mined,
-                        is_conflicting,
-                        is_locked,
-                        false,
-                    );
-                    all_mismatches.extend(mm);
+                match parse_metadata_fields(result.data()) {
+                    Some((spent_count, is_mined, is_conflicting, is_locked)) => {
+                        let mm = verifier.verify_record(
+                            txid,
+                            spent_count,
+                            is_mined,
+                            is_conflicting,
+                            is_locked,
+                            false,
+                        );
+                        all_mismatches.extend(mm);
+                    }
+                    None => {
+                        // Status=0 (found) but metadata failed to parse — corrupt
+                        // record on retry pass; flag as mismatch.
+                        all_mismatches.push(Mismatch {
+                            txid: *txid,
+                            field: "metadata_parse".to_string(),
+                            expected: "parseable FIELD_ALL_METADATA response".to_string(),
+                            actual: format!(
+                                "status=0 but data too short or corrupt ({} bytes)",
+                                result.data().len()
+                            ),
+                        });
+                    }
                 }
             }
         }

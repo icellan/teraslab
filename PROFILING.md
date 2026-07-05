@@ -9,7 +9,8 @@ reproduce the serving bottleneck.
 
 The admin HTTP server exposes a CPU sampling profiler behind the bearer-token
 gate. It samples the **whole process** via `ITIMER_PROF` + `SIGPROF` and renders
-an [inferno](https://github.com/jonhoo/inferno) flamegraph SVG. It is
+a self-contained flamegraph SVG (drawn in-tree — see `render_flamegraph_svg` in
+`src/server/http.rs`). It is
 **single-flight** (one profile at a time → second request gets `409`) and runs
 the blocking sample on a dedicated thread, so it never parks the async HTTP
 runtime.

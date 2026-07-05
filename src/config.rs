@@ -723,8 +723,168 @@ impl BackupConfig {
     }
 }
 
+/// Pressure-aware segment-defrag compaction tuning (`[storage.defrag]` TOML
+/// subsection).
+///
+/// The segment (log-structured) engine reclaims on-device dead space in two
+/// phases per checkpoint: a cheap unbounded pass that reclaims FULLY-dead
+/// segments, and a rate-limited compaction pass that relocates the few live
+/// records OUT of partially-dead segments so they drain and become
+/// reclaimable. The compaction pass is deliberately conservative at steady
+/// state (few victims, high dead threshold) because short-lived UTXOs make
+/// segments go fully-dead fast, so the cheap pass carries the bulk.
+///
+/// Under a high-spend catchup, though, UTXOs have MIXED lifetimes: segments
+/// settle at 30–70% dead — too alive for the fast path, too alive for the
+/// conservative compaction threshold — and dead space accumulates until the
+/// device ENOSPCs (issue #33/#32). These knobs let compaction spend MORE copy
+/// budget and accept LESS-dead victims as free space runs low, converting the
+/// partially-dead tail into reclaimable segments before the device fills. At
+/// low occupancy the base values reproduce today's behavior byte-for-byte.
+///
+/// See [`crate::checkpoint::compaction_budget`] for the exact occupancy→budget
+/// curve these fields parameterize.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DefragConfig {
+    /// Compaction victim budget at LOW pressure (occupancy below
+    /// `pressure_low`). This is the steady-state cap on partially-dead
+    /// segments relocated per checkpoint; bounds live-record copy
+    /// amplification and checkpoint duration. Default `4`.
+    #[serde(default = "default_defrag_base_max_segments")]
+    pub base_max_segments: usize,
+
+    /// Minimum dead fraction (0.0..=1.0) a segment must reach to be a
+    /// compaction victim at LOW pressure. High so few live records are copied
+    /// per reclaimed segment (≤25% live at 0.75) and compaction is self-gating.
+    /// Default `0.75`.
+    #[serde(default = "default_defrag_base_min_dead_frac")]
+    pub base_min_dead_frac: f64,
+
+    /// Occupancy (used_bytes / device_size, 0.0..=1.0) below which the base
+    /// budget applies unchanged — steady state stays byte-identical to today.
+    /// Default `0.70`.
+    #[serde(default = "default_defrag_pressure_low")]
+    pub pressure_low: f64,
+
+    /// Occupancy (0.0..=1.0) at or above which compaction runs at its most
+    /// aggressive: `max_segments_ceiling` victims and the `min_dead_frac_floor`
+    /// threshold. Between `pressure_low` and this, the budget scales linearly.
+    /// Must be strictly greater than `pressure_low`. Default `0.85`.
+    #[serde(default = "default_defrag_pressure_high")]
+    pub pressure_high: f64,
+
+    /// Upper bound on compaction victims per checkpoint at HIGH pressure.
+    /// Caps the worst-case copy amplification / checkpoint duration even when
+    /// the device is nearly full. Must be `>= base_max_segments`. Default `64`.
+    #[serde(default = "default_defrag_max_segments_ceiling")]
+    pub max_segments_ceiling: usize,
+
+    /// Floor (0.0..=1.0) the min-dead-fraction threshold is never lowered
+    /// below, even at HIGH pressure. Below this, compaction would copy more
+    /// live bytes than it reclaims dead ones (net-negative churn). Must be
+    /// `<= base_min_dead_frac`. Default `0.25`.
+    #[serde(default = "default_defrag_min_dead_frac_floor")]
+    pub min_dead_frac_floor: f64,
+}
+
+/// Default LOW-pressure compaction victim budget (matches the historical
+/// `DEFRAG_COMPACT_MAX_SEGMENTS`).
+const fn default_defrag_base_max_segments() -> usize {
+    4
+}
+/// Default LOW-pressure minimum dead fraction (matches the historical
+/// `DEFRAG_COMPACT_MIN_DEAD_FRAC`).
+const fn default_defrag_base_min_dead_frac() -> f64 {
+    0.75
+}
+/// Default occupancy below which the base budget applies unchanged.
+const fn default_defrag_pressure_low() -> f64 {
+    0.70
+}
+/// Default occupancy at/above which compaction is fully aggressive.
+const fn default_defrag_pressure_high() -> f64 {
+    0.85
+}
+/// Default HIGH-pressure victim ceiling.
+const fn default_defrag_max_segments_ceiling() -> usize {
+    64
+}
+/// Default floor the min-dead-fraction threshold is never lowered below.
+const fn default_defrag_min_dead_frac_floor() -> f64 {
+    0.25
+}
+
+impl Default for DefragConfig {
+    fn default() -> Self {
+        // MUST match the per-field `#[serde(default = ...)]` fns: the
+        // struct-level `#[serde(default)]` uses THIS impl when the whole
+        // `[storage.defrag]` subsection is absent.
+        Self {
+            base_max_segments: default_defrag_base_max_segments(),
+            base_min_dead_frac: default_defrag_base_min_dead_frac(),
+            pressure_low: default_defrag_pressure_low(),
+            pressure_high: default_defrag_pressure_high(),
+            max_segments_ceiling: default_defrag_max_segments_ceiling(),
+            min_dead_frac_floor: default_defrag_min_dead_frac_floor(),
+        }
+    }
+}
+
+impl DefragConfig {
+    /// Validate the defrag tuning: fractions in `[0.0, 1.0]`, the pressure band
+    /// strictly ordered, the aggressive ceiling/floor consistent with the base
+    /// values. Returns a typed [`ConfigError::InvalidSizing`] describing the
+    /// first violation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidSizing`] if any fraction is outside
+    /// `[0.0, 1.0]`, `pressure_low >= pressure_high`,
+    /// `max_segments_ceiling < base_max_segments`,
+    /// `min_dead_frac_floor > base_min_dead_frac`, or `base_max_segments == 0`.
+    pub fn validate(&self) -> std::result::Result<(), ConfigError> {
+        let frac = |name: &str, v: f64| -> std::result::Result<(), ConfigError> {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(ConfigError::InvalidSizing(format!(
+                    "storage.defrag.{name} = {v} must be in [0.0, 1.0]"
+                )));
+            }
+            Ok(())
+        };
+        frac("base_min_dead_frac", self.base_min_dead_frac)?;
+        frac("pressure_low", self.pressure_low)?;
+        frac("pressure_high", self.pressure_high)?;
+        frac("min_dead_frac_floor", self.min_dead_frac_floor)?;
+        if self.base_max_segments == 0 {
+            return Err(ConfigError::InvalidSizing(
+                "storage.defrag.base_max_segments must be non-zero".to_string(),
+            ));
+        }
+        if self.pressure_low >= self.pressure_high {
+            return Err(ConfigError::InvalidSizing(format!(
+                "storage.defrag.pressure_low ({}) must be strictly less than pressure_high ({})",
+                self.pressure_low, self.pressure_high
+            )));
+        }
+        if self.max_segments_ceiling < self.base_max_segments {
+            return Err(ConfigError::InvalidSizing(format!(
+                "storage.defrag.max_segments_ceiling ({}) must be >= base_max_segments ({})",
+                self.max_segments_ceiling, self.base_max_segments
+            )));
+        }
+        if self.min_dead_frac_floor > self.base_min_dead_frac {
+            return Err(ConfigError::InvalidSizing(format!(
+                "storage.defrag.min_dead_frac_floor ({}) must be <= base_min_dead_frac ({})",
+                self.min_dead_frac_floor, self.base_min_dead_frac
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// On-device storage layout configuration (`[storage]` TOML section).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StorageConfig {
     /// Pack multiple sub-block records contiguously within a single device
@@ -767,8 +927,7 @@ pub struct StorageConfig {
     /// extends the high-water mark (`false`, default, is the unchanged best-fit
     /// freelist behavior).
     ///
-    /// This is the Phase 1 log-structured write lever (see
-    /// `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`): under the UTXO
+    /// This is the Phase 1 log-structured write lever: under the UTXO
     /// recipe the create-then-delete churn fills the freelist, and best-fit
     /// reuse then scatters new records into the freed holes — defeating the
     /// write-back cache's sequential-flush coalescing. With `append_only`, frees
@@ -785,10 +944,10 @@ pub struct StorageConfig {
     /// persisted, so a device can be reopened in either mode safely.
     pub append_only: bool,
 
-    /// Storage engine: `"in_place"` (default) uses the best-fit `SlotAllocator`;
-    /// `"segment"` uses the log-structured append-cursor `SegmentAllocator`
-    /// (creates append to a moving cursor; sequential writes; relocate + defrag in
-    /// later phases). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+    /// Storage engine: `"segment"` (default) uses the log-structured
+    /// append-cursor `SegmentAllocator` (creates append to a moving cursor;
+    /// sequential writes; relocate + defrag). `"in_place"` uses the best-fit
+    /// `SlotAllocator` (in-place RMW; no defrag).
     ///
     /// The engine determines the on-disk allocator header format (distinct
     /// magics), so a device formatted by one engine cannot be opened by the
@@ -807,7 +966,7 @@ pub struct StorageConfig {
     /// store's device. Buffers the sequential append tail and flushes it as large
     /// sequential pwrites (the reference datastore's streaming model), instead of
     /// letting the random-access write-back cache re-scatter the appends into ~6 KB
-    /// writes (measured in `bench/results/20260630-ec2-segment`).
+    /// writes.
     ///
     /// Only meaningful with `engine = "segment"` (it has no effect on
     /// `"in_place"`, whose writes are in-place RMW, not appends). When enabled the
@@ -817,6 +976,34 @@ pub struct StorageConfig {
     /// write pattern the EC2 A/B measured).
     #[serde(default)]
     pub streaming: bool,
+
+    /// Pressure-aware segment-defrag compaction tuning (`[storage.defrag]`).
+    /// Only meaningful with `engine = "segment"`. Defaults reproduce the
+    /// historical conservative behavior; see [`DefragConfig`].
+    #[serde(default)]
+    pub defrag: DefragConfig,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        // MUST match the per-field `#[serde(default = ...)]` attributes: when the
+        // whole `[storage]` section is absent from the config, serde uses THIS
+        // `Default` (via the struct-level `#[serde(default)]`) rather than the
+        // field-level defaults. In particular `segment_size` MUST be
+        // `default_segment_size()` (8 MiB), not 0 — a derived `Default` left it 0,
+        // which fails `SegmentAllocator::new` (InvalidSegmentSize) and, since
+        // `Segment` is the default engine, prevented a minimal-config node from
+        // starting at all.
+        Self {
+            packed: false,
+            placement: crate::subdevice::PlacementStrategy::default(),
+            append_only: false,
+            engine: StorageEngine::default(),
+            segment_size: default_segment_size(),
+            streaming: false,
+            defrag: DefragConfig::default(),
+        }
+    }
 }
 
 /// Default segment size (8 MiB) for the segment storage engine.
@@ -828,13 +1015,14 @@ const fn default_segment_size() -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StorageEngine {
     /// Best-fit freelist allocator (records placed at home offsets, updated in
-    /// place). Required for clustered/replicated nodes and for strict redo
-    /// durability (set `engine = "in_place"` explicitly for those).
+    /// place). Required for strict redo durability (set `engine = "in_place"`
+    /// explicitly for that).
     InPlace,
     /// Log-structured append-cursor allocator (creates append sequentially,
     /// spends relocate-on-write). The default: higher throughput and lower tail
-    /// latency on the standalone UTXO workload. Requires buffered redo
-    /// durability (now the default) and a non-clustered node.
+    /// latency on the UTXO workload. Requires buffered redo durability (now the
+    /// default). Clusters/replicates fine (a spend's replication is carried by the
+    /// convertible `SpendV2` — see `specs/SEGMENT_CLUSTERING_DESIGN.md`).
     #[default]
     Segment,
 }
@@ -1713,39 +1901,48 @@ impl ServerConfig {
     /// — the runtime signal emitted when RF > 1 best-effort is *not* in use
     /// but individual best-effort paths fall back because replicas ACK-failed.
     pub fn validate_cluster_safety(&self) -> std::result::Result<(), String> {
-        // The log-structured segment engine is NON-CLUSTERED in v1: its spends
-        // relocate the record (a physical move) rather than journaling a logical
-        // op, so the redo entries cannot be converted to replica ops. Refuse to
-        // start a clustered / replicated node on the segment engine rather than
-        // silently dropping replication. (See increment 4 / the design doc.)
+        // The log-structured segment engine is CLUSTERABLE as of the segment
+        // clustering work (specs/SEGMENT_CLUSTERING_DESIGN.md). Replication is
+        // LOGICAL — the master ships a vout-based `ReplicaOp::Spend` (no offset)
+        // that the replica applies through its own `engine.spend()`, relocating to
+        // its own offset. Crash safety AND replication recovery both key off the
+        // convertible per-vout `RedoOp::SpendV2`, emitted WAL-first exactly like the
+        // in-place engine: it is what the durable replication-intent tracker,
+        // startup/lag catch-up, and migration delta convert to `ReplicaOp`s, and on
+        // local recovery it replays the spend in place against the durable,
+        // append-only pre-spend record. Durability under the (required) buffered
+        // mode below is the SAME as the in-place clustered default: replication
+        // quorum before ack, plus failover + rejoin-resync healing a crashed
+        // master's un-flushed tail. The former blanket refusal is therefore removed.
+        //
+        // STANDALONE segment requires BUFFERED redo durability. Its spend journals
+        // a thin `Relocate` (a buffered append that reads the record back from the
+        // new, still-buffered offset on replay), so under strict durability an acked
+        // spend whose buffered data write is lost on crash would be silently
+        // reverted — refuse it.
+        //
+        // CLUSTERED segment MAY use strict durability — this is the "true Option A"
+        // (fsync-before-ack / commit-to-device). Its authoritative spend redo is the
+        // self-sufficient `SpendV2` (fsync'd before ack via the group-commit
+        // coordinator; on replay it re-applies the spend IN PLACE against the
+        // pre-spend record), and under strict the create emits the fat, image-
+        // carrying `RedoOp::Create` (`dispatch.rs`, keyed on `redo_buffered()`), so
+        // the master's whole redo chain reconstructs every acked write from the redo
+        // ALONE — no acked write can be lost (master fsync-durable + quorum). The
+        // default remains buffered (replication-quorum durability); strict is the
+        // stronger opt-in.
+        let clustered = self.is_clustered() || self.replication_factor > 1;
         if self.storage.engine == StorageEngine::Segment
-            && (self.is_clustered() || self.replication_factor > 1)
+            && !self.redo_buffered_effective()
+            && !clustered
         {
-            return Err(format!(
-                "storage.engine = \"segment\" is not supported with clustering \
-                 (node_id = {}, replication_factor = {}): the log-structured engine \
-                 is non-clustered in v1. Use storage.engine = \"in_place\" for clustered \
-                 nodes, or run this node standalone (node_id = 0, replication_factor = 1).",
-                self.node_id, self.replication_factor,
-            ));
-        }
-        // The segment engine's spend journals its `Relocate` intent AFTER writing
-        // the relocated record (not WAL-first): the new append-cursor offset is
-        // only known once allocated during apply. Crash safety therefore relies on
-        // BUFFERED durability — the checkpoint barrier fsyncs every store's data
-        // device before reclaiming any redo prefix, so the relocated image, its
-        // `Relocate` redo, and the old-extent dead-mark become durable together (a
-        // crash before the barrier loses all three and leaves the pre-relocation
-        // record intact). Under STRICT durability that ordering is not guaranteed,
-        // so refuse to start rather than silently weaken the crash contract.
-        if self.storage.engine == StorageEngine::Segment && !self.redo_buffered_effective() {
             return Err(
-                "storage.engine = \"segment\" requires buffered redo durability: set \
-                 redo_buffered = true (or redo_buffered_io = true). The log-structured \
-                 spend journals its Relocate intent after writing the relocated record, \
-                 so crash safety depends on the checkpoint barrier fsyncing the data \
-                 device before reclaiming the redo — a guarantee strict durability does \
-                 not provide."
+                "storage.engine = \"segment\" requires buffered redo durability on a \
+                 STANDALONE node: set redo_buffered = true (or redo_buffered_io = true). \
+                 The log-structured spend's thin Relocate reads the record back from a \
+                 buffered offset on replay, which strict durability does not make safe. \
+                 (A CLUSTERED segment node MAY use strict durability — its SpendV2 redo \
+                 is self-sufficient and fsync'd before ack.)"
                     .to_string(),
             );
         }
@@ -2244,6 +2441,10 @@ impl ServerConfig {
             self.checkpoint_poll_interval_ms,
         )?;
 
+        // Pressure-aware segment defrag tuning (fractions in range, pressure
+        // band ordered, ceiling/floor consistent with the base values).
+        self.storage.defrag.validate()?;
+
         // device_size must be large enough to hold at least one record's
         // worth of data; the runtime allocator otherwise hits a divide-by-
         // zero. Use UTXO_SLOT_SIZE+METADATA_SIZE as the lower bound here.
@@ -2492,7 +2693,8 @@ backend = ""
             replication_degraded_mode: "best_effort".to_string(),
             ..ServerConfig::default()
         };
-        // node_id>0 is clustered → in_place (segment is standalone-only).
+        // Pin in_place so this test isolates the ack_policy/degraded-mode rules
+        // from the engine-specific buffered-durability requirement.
         cfg.storage.engine = StorageEngine::InPlace;
 
         cfg.validate_cluster_safety()
@@ -2659,20 +2861,40 @@ backend = ""
     }
 
     #[test]
-    fn segment_engine_rejected_with_clustering() {
-        // node_id > 0 → clustered → segment engine must be refused.
+    fn segment_engine_allowed_with_clustering_when_buffered() {
+        // Phase 5 (specs/SEGMENT_CLUSTERING_DESIGN.md): the segment engine now
+        // clusters. node_id > 0 → clustered; with buffered durability (the
+        // default) the config validates — replication is logical and crash safety
+        // + replication recovery both key off the convertible per-vout SpendV2.
         let mut cfg = ServerConfig {
             node_id: 1,
+            replication_factor: 3,
             ..ServerConfig::default()
         };
         cfg.storage.engine = StorageEngine::Segment;
-        let err = cfg
-            .validate_cluster_safety()
-            .expect_err("segment engine on a clustered node must be refused");
-        assert!(
-            err.contains("segment") && err.contains("clustering"),
-            "error must explain the conflict: {err}",
-        );
+        cfg.redo_buffered = true;
+        assert!(cfg.is_clustered(), "node_id > 0 must be clustered");
+        cfg.validate_cluster_safety()
+            .expect("clustered segment engine must validate under buffered durability");
+    }
+
+    #[test]
+    fn segment_engine_clustered_allows_strict_durability() {
+        // "True Option A": a CLUSTERED segment node MAY run strict durability — its
+        // SpendV2 redo is self-sufficient and fsync'd before ack, and the fat Create
+        // (emitted under strict) makes the whole redo chain reconstruct every acked
+        // write from the redo alone. So strict + clustered segment validates.
+        let mut cfg = ServerConfig {
+            node_id: 1,
+            replication_factor: 3,
+            ..ServerConfig::default()
+        };
+        cfg.storage.engine = StorageEngine::Segment;
+        cfg.redo_buffered = false;
+        cfg.redo_buffered_io = false;
+        assert!(cfg.is_clustered());
+        cfg.validate_cluster_safety()
+            .expect("strict + clustered segment must be allowed (true Option A)");
     }
 
     #[test]
@@ -2695,6 +2917,138 @@ backend = ""
             toml::from_str("[storage]\nengine = \"segment\"\nstreaming = true\n").unwrap();
         assert!(on.storage.streaming, "streaming = true must parse");
         assert_eq!(on.storage.engine, StorageEngine::Segment);
+    }
+
+    #[test]
+    fn defrag_config_defaults_match_historical_behavior() {
+        // Absent [storage.defrag] → the documented conservative defaults, which
+        // reproduce the pre-#33 behavior byte-for-byte.
+        let d = DefragConfig::default();
+        assert_eq!(d.base_max_segments, 4);
+        assert_eq!(d.base_min_dead_frac, 0.75);
+        assert_eq!(d.pressure_low, 0.70);
+        assert_eq!(d.pressure_high, 0.85);
+        assert_eq!(d.max_segments_ceiling, 64);
+        assert_eq!(d.min_dead_frac_floor, 0.25);
+
+        // Same via a full config with no [storage.defrag] subsection.
+        let cfg: ServerConfig = toml::from_str("[storage]\nengine = \"segment\"\n").unwrap();
+        assert_eq!(cfg.storage.defrag, DefragConfig::default());
+    }
+
+    #[test]
+    fn defrag_config_parses_custom_keys() {
+        let cfg: ServerConfig = toml::from_str(
+            "[storage.defrag]\n\
+             base_max_segments = 8\n\
+             base_min_dead_frac = 0.6\n\
+             pressure_low = 0.5\n\
+             pressure_high = 0.9\n\
+             max_segments_ceiling = 128\n\
+             min_dead_frac_floor = 0.1\n",
+        )
+        .unwrap();
+        let d = &cfg.storage.defrag;
+        assert_eq!(d.base_max_segments, 8);
+        assert_eq!(d.base_min_dead_frac, 0.6);
+        assert_eq!(d.pressure_low, 0.5);
+        assert_eq!(d.pressure_high, 0.9);
+        assert_eq!(d.max_segments_ceiling, 128);
+        assert_eq!(d.min_dead_frac_floor, 0.1);
+        d.validate().expect("custom defrag config is valid");
+    }
+
+    #[test]
+    fn defrag_config_rejects_out_of_range_fraction() {
+        let d = DefragConfig {
+            base_min_dead_frac: 1.5,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("base_min_dead_frac") && msg.contains("[0.0, 1.0]"),
+                    "message must name the field and range: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defrag_config_rejects_unordered_pressure_band() {
+        let d = DefragConfig {
+            pressure_low: 0.9,
+            pressure_high: 0.8,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("pressure_low") && msg.contains("pressure_high"),
+                    "message must name both thresholds: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defrag_config_rejects_ceiling_below_base() {
+        let d = DefragConfig {
+            base_max_segments: 10,
+            max_segments_ceiling: 4,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("max_segments_ceiling") && msg.contains("base_max_segments"),
+                    "message must relate ceiling to base: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn defrag_config_rejects_floor_above_base_frac() {
+        let d = DefragConfig {
+            base_min_dead_frac: 0.5,
+            min_dead_frac_floor: 0.8,
+            ..DefragConfig::default()
+        };
+        match d.validate() {
+            Err(ConfigError::InvalidSizing(msg)) => {
+                assert!(
+                    msg.contains("min_dead_frac_floor") && msg.contains("base_min_dead_frac"),
+                    "message must relate floor to base: {msg}"
+                );
+            }
+            other => panic!("expected InvalidSizing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn storage_segment_size_defaults_to_8mib_when_section_absent() {
+        // Regression: a minimal config with NO [storage] section must still get a
+        // valid segment_size. `StorageConfig::default()` (used when the section is
+        // absent) once left segment_size = 0 (derived Default), which failed
+        // SegmentAllocator::new and — since Segment is the default engine —
+        // prevented a minimal-config node from starting at all.
+        assert_eq!(StorageConfig::default().segment_size, 8 * 1024 * 1024);
+        let cfg: ServerConfig =
+            toml::from_str("listen_addr = \"127.0.0.1:3300\"\nstrict_auth = false\n").unwrap();
+        assert_eq!(
+            cfg.storage.engine,
+            StorageEngine::Segment,
+            "segment is default"
+        );
+        assert_eq!(
+            cfg.storage.segment_size,
+            8 * 1024 * 1024,
+            "segment_size must default to 8 MiB even with no [storage] section"
+        );
     }
 
     #[test]

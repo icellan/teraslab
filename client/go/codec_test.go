@@ -607,6 +607,67 @@ func TestGetResponseMixedOKNotFound(t *testing.T) {
 	}
 }
 
+// TestGetResponseDataDoesNotAliasRecycledPayload verifies that GetResult.Data
+// returned by decodeGetResponse does not alias the pooled response payload.
+//
+// The GetBatch path (decodeGetFrame) recycles the payload buffer back to
+// payloadPool immediately after decoding, and readResponse then reuses that
+// same pooled buffer for the next frame — overwriting its bytes. If
+// decodeGetResponse sub-slices the payload without copying, the returned
+// .Data aliases the recycled buffer and gets silently corrupted when the
+// next response reuses it. This reproduces that recycle-then-reuse sequence.
+func TestGetResponseDataDoesNotAliasRecycledPayload(t *testing.T) {
+	// Build a GetBatch OK payload with two data-bearing items, using a
+	// pooled buffer exactly as readResponse would hand to the decoder.
+	var body []byte
+	body = appendU32(body, 2) // count
+	body = append(body, 0)    // item 0: status OK
+	body = appendU32(body, 5)
+	body = append(body, 0x11, 0x22, 0x33, 0x44, 0x55)
+	body = append(body, 0) // item 1: status OK
+	body = appendU32(body, 3)
+	body = append(body, 0xAA, 0xBB, 0xCC)
+
+	payload := payloadPool.Get().([]byte)
+	if cap(payload) < len(body) {
+		payload = make([]byte, len(body))
+	} else {
+		payload = payload[:len(body)]
+	}
+	copy(payload, body)
+
+	results, err := decodeGetResponse(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+
+	// Snapshot the returned data before any recycling happens.
+	want0 := append([]byte(nil), results[0].Data...)
+	want1 := append([]byte(nil), results[1].Data...)
+
+	// Recycle the payload (as decodeGetFrame does) and simulate the next
+	// frame reusing the same pooled buffer and overwriting its bytes (as
+	// readResponse does via copy()).
+	recyclePayload(payload)
+	reused := payloadPool.Get().([]byte)
+	reused = reused[:cap(reused)]
+	for i := range reused {
+		reused[i] = 0xEE
+	}
+
+	if !bytes.Equal(results[0].Data, want0) {
+		t.Errorf("result[0].Data corrupted after payload recycle: got %v, want %v",
+			results[0].Data, want0)
+	}
+	if !bytes.Equal(results[1].Data, want1) {
+		t.Errorf("result[1].Data corrupted after payload recycle: got %v, want %v",
+			results[1].Data, want1)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // GetSpend response decode
 // ---------------------------------------------------------------------------

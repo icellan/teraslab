@@ -134,10 +134,11 @@ impl Node {
         // or falls back to a fresh allocator when the header region is all
         // zeros (a node that crashed before its first checkpoint — exactly the
         // crash-mid-migration case, where no checkpoint had run yet).
-        let (mut alloc, _origin) = teraslab::server::startup::recover_or_create_allocator(
+        let (alloc, _origin) = teraslab::server::startup::recover_or_create_allocator(
             self.data_dev.clone() as Arc<dyn BlockDevice>,
         )
         .expect("allocator recover/create");
+        let mut alloc: teraslab::allocator::BoxedAllocator = Box::new(alloc);
         let primary = PrimaryBackend::rebuild(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         // Recovery now operates on a `ShardedIndex` (interior RwLocks, `&self`).
         // Wrap the rebuilt single backend as a one-shard index — identical

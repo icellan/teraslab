@@ -1314,6 +1314,46 @@ impl BlockEntry {
         }
         Ok(entries)
     }
+
+    /// Decode the COMPLETE block-entry set from a
+    /// [`FIELD_BLOCK_ENTRIES_ALL`](crate::FIELD_BLOCK_ENTRIES_ALL) section.
+    ///
+    /// Unlike [`Self::decode_entries`], this reads ALL `count` entries —
+    /// inline plus overflow — with no 3-entry cap, so the returned slice is
+    /// the full block-membership set the server declared. The count byte and
+    /// the number of entries always agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Protocol`] if the data is empty or fewer than
+    /// `count` × 12 bytes follow the count byte.
+    pub fn decode_all_entries(data: &[u8]) -> Result<Vec<Self>, ClientError> {
+        if data.is_empty() {
+            return Err(ClientError::Protocol(
+                "block entries (all): need 1 byte, have 0".to_string(),
+            ));
+        }
+        let count = data[0] as usize;
+        let needed = 1 + count * BLOCK_ENTRY_SIZE;
+        if data.len() < needed {
+            return Err(ClientError::Protocol(format!(
+                "block entries (all): truncated, need {count} entries ({} bytes), have {}",
+                count * BLOCK_ENTRY_SIZE,
+                data.len() - 1
+            )));
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut pos = 1;
+        for _ in 0..count {
+            entries.push(Self {
+                block_id: u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()),
+                block_height: u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()),
+                subtree_idx: u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap()),
+            });
+            pos += BLOCK_ENTRY_SIZE;
+        }
+        Ok(entries)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,6 +1414,18 @@ pub const FIELD_CONFLICTING_CHILDREN: u32 = 1 << 22;
 /// When set, the full struct is returned as-is including internal fields.
 /// Takes precedence over per-field metadata bits if both are set.
 pub const FIELD_RAW_METADATA: u32 = 1 << 23;
+/// Include the COMPLETE block-entry set — inline PLUS every on-device
+/// overflow entry — uncapped (issue #30).
+///
+/// The wire shape matches [`FIELD_BLOCK_ENTRIES`] (`[count:1]` then
+/// `count` × 12-byte entries) but every entry is present. Decode with
+/// [`BlockEntry::decode_all_entries`], which returns the full set with no
+/// 3-entry cap. Request this instead of [`FIELD_BLOCK_ENTRIES`] when a
+/// transaction may be mined into more than 3 blocks (deep-reorg
+/// block-membership queries). Heavier than [`FIELD_BLOCK_ENTRIES`] (an
+/// extra device read when overflow exists), hence opt-in and NOT part of
+/// [`FIELD_ALL`].
+pub const FIELD_BLOCK_ENTRIES_ALL: u32 = 1 << 25;
 
 /// Convenience alias: all per-field metadata bits (bits 0-18).
 pub const FIELD_ALL_METADATA: u32 = 0x0007_FFFF;
@@ -1416,3 +1468,58 @@ pub const SIGNAL_PRESERVE: u8 = 5;
 
 /// Number of shards in the cluster hash table.
 pub const NUM_SHARDS: usize = 4096;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `[count:1]` + `present` × 12-byte block-entry section, using
+    /// the same value scheme the server emits (id=100+i, height=200+i,
+    /// subtree=i). `count` may exceed `present` to model a truncated payload.
+    fn block_entries_payload(count: u8, present: usize) -> Vec<u8> {
+        let mut buf = vec![count];
+        for i in 0..present {
+            buf.extend_from_slice(&(100u32 + i as u32).to_le_bytes());
+            buf.extend_from_slice(&(200u32 + i as u32).to_le_bytes());
+            buf.extend_from_slice(&(i as u32).to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn decode_all_entries_returns_full_uncapped_set() {
+        // 5 entries all present (count == present): full set, no cap.
+        let payload = block_entries_payload(5, 5);
+        let entries = BlockEntry::decode_all_entries(&payload)
+            .expect("decode_all_entries should succeed for a complete payload");
+        assert_eq!(entries.len(), 5, "all 5 entries must decode");
+        for (i, e) in entries.iter().enumerate() {
+            assert_eq!(e.block_id, 100 + i as u32);
+            assert_eq!(e.block_height, 200 + i as u32);
+            assert_eq!(e.subtree_idx, i as u32);
+        }
+    }
+
+    #[test]
+    fn decode_all_entries_rejects_truncated_payload() {
+        // Declares 5 but only 3 present → error variant, not a silent cap.
+        let payload = block_entries_payload(5, 3);
+        let err = BlockEntry::decode_all_entries(&payload)
+            .expect_err("truncated payload must be rejected");
+        assert!(
+            matches!(err, ClientError::Protocol(_)),
+            "expected ClientError::Protocol, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_entries_still_caps_at_three() {
+        // The legacy inline decoder is unchanged: declares 5, caps at 3.
+        let payload = block_entries_payload(5, 3);
+        let entries = BlockEntry::decode_entries(&payload)
+            .expect("decode_entries should succeed on the inline (capped) payload");
+        assert_eq!(entries.len(), 3, "inline decode must remain capped at 3");
+        assert_eq!(entries[0].block_id, 100);
+        assert_eq!(entries[2].subtree_idx, 2);
+    }
+}

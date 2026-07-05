@@ -607,8 +607,14 @@ func decodeGetResponse(data []byte) ([]GetResult, error) {
 		if pos+dataLen > len(data) {
 			return nil, fmt.Errorf("get response: truncated data at item %d", i)
 		}
-		// Sub-slice the response payload.
-		results[i].Data = data[pos : pos+dataLen : pos+dataLen]
+		// Copy into a caller-owned buffer. The payload slice is recycled to
+		// payloadPool immediately after decoding (see decodeGetFrame) and then
+		// reused for the next frame, so a sub-slice into it would alias a
+		// buffer that gets overwritten — silently corrupting returned data.
+		if dataLen > 0 {
+			results[i].Data = make([]byte, dataLen)
+			copy(results[i].Data, data[pos:pos+dataLen])
+		}
 		pos += dataLen
 	}
 	return results, nil
@@ -970,4 +976,33 @@ func DecodeBlockEntriesWithCount(data []byte) (entries []BlockEntry, total int, 
 		pos += 12
 	}
 	return entries, count, nil
+}
+
+// DecodeAllBlockEntries parses a FieldBlockEntriesAll section from a
+// GetResult.Data field. Unlike DecodeBlockEntriesWithCount, it reads ALL
+// `count` entries — inline plus overflow — with no MaxInlineBlockEntries cap,
+// so the returned slice is the complete block-membership set the server
+// declared. The count byte and the number of entries always agree.
+//
+// Returns an error if the section is truncated (fewer than count × 12 bytes
+// follow the count byte).
+func DecodeAllBlockEntries(data []byte) (entries []BlockEntry, err error) {
+	if len(data) < 1 {
+		return nil, fmt.Errorf("block entries (all): need 1 byte, have %d", len(data))
+	}
+	count := int(data[0])
+	pos := 1
+	if pos+count*12 > len(data) {
+		return nil, fmt.Errorf("block entries (all): truncated, need %d entries (%d bytes), have %d", count, count*12, len(data)-pos)
+	}
+	entries = make([]BlockEntry, count)
+	for i := 0; i < count; i++ {
+		entries[i] = BlockEntry{
+			BlockID:     getU32(data[pos : pos+4]),
+			BlockHeight: getU32(data[pos+4 : pos+8]),
+			SubtreeIdx:  getU32(data[pos+8 : pos+12]),
+		}
+		pos += 12
+	}
+	return entries, nil
 }

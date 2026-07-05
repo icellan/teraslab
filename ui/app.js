@@ -593,7 +593,7 @@
 
         const tiers = [
             { label: 'HOT · NVMe',  y: 150, ops: fmtBytes(fl.used_bytes || 0),              color: '#c8ff5e', detail: 'metadata + UTXO slots' },
-            { label: 'COLD · blob', y: 290, ops: fmtBytes(ts.blobstore_bytes || 0),          color: '#8ab8ff', detail: 'tx bodies > 8 KiB' },
+            { label: 'COLD · blob', y: 290, ops: fmtBytes(ts.blobstore_bytes || 0),          color: '#8ab8ff', detail: 'tx bodies > 1 MiB' },
             { label: 'REDO log',    y: 420, ops: ((rd.utilization || 0) * 100).toFixed(1) + '%', color: '#7cf0b3', detail: 'seq ' + fmt(rd.current_sequence) },
         ];
 

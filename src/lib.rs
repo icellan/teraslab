@@ -1,4 +1,11 @@
 #![warn(clippy::disallowed_macros)]
+// The internal modules stay `pub` (see the note below), so rustdoc treats their
+// docs as "public" and warns when they link to genuinely private helpers — a
+// deliberate, pervasive style in this crate (public-item docs reference the
+// private fns that implement them for internal navigation). Allow it so the
+// `RUSTDOCFLAGS="-D warnings"` doc build does not fail on intentional links.
+// Genuinely BROKEN links (`rustdoc::broken_intra_doc_links`) still error.
+#![allow(rustdoc::private_intra_doc_links)]
 
 // F-G10-014: internal modules stay `pub` for now because they have
 // legitimate cross-crate consumers (bins, integration tests under

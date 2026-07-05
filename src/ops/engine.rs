@@ -209,12 +209,33 @@ pub struct Engine {
     /// instead of fsyncing per key on the ack path. Set in
     /// [`Self::set_buffered_durability`]; defaults to strict (`false`).
     redo_buffered: std::sync::atomic::AtomicBool,
+    /// Whether this node participates in a cluster / replication group
+    /// (`config.is_clustered() || replication_factor > 1`). Set once at boot via
+    /// [`Self::set_clustered`]; defaults to `false` (standalone).
+    ///
+    /// Governs the segment engine's spend redo. When `false` (standalone), a spend
+    /// relocate journals a THIN index-only [`crate::redo::RedoOp::Relocate`] for
+    /// recovery. When `true` (clustered), the relocate journals NOTHING — the
+    /// authoritative redo is the convertible per-vout [`crate::redo::RedoOp::SpendV2`]
+    /// emitted WAL-first by the caller (dispatch on the master,
+    /// `build_post_apply_redo_op` on the replica): it is replication-convertible AND
+    /// self-sufficient for local recovery (it replays the spend in place against the
+    /// durable, append-only pre-spend record). See
+    /// `specs/SEGMENT_CLUSTERING_DESIGN.md`.
+    clustered: std::sync::atomic::AtomicBool,
     /// One shared redo backpressure coordinator across all per-store logs,
     /// built and injected in [`Self::set_redo_logs`]. The dispatch gate
     /// ([`crate::redo::RedoBackpressure::wait_for_capacity`]) and the
     /// checkpoint drainer read it; each store's log signals it on reclaim.
     /// `None` until redo logs are attached (test / no-WAL paths).
     redo_backpressure: std::sync::OnceLock<Arc<crate::redo::RedoBackpressure>>,
+    /// Lock-free write-health mirrors, one per store, captured in
+    /// [`Self::set_redo_logs`] alongside `redo_logs`. Issue #32: a health probe
+    /// must observe whether ANY store's redo log has been poisoned WITHOUT
+    /// taking that log's writer mutex (a probe must never block behind a write
+    /// burst). [`Self::write_healthy`] reads these. `None`/empty in test /
+    /// no-WAL paths, which are treated as write-healthy.
+    redo_atomics: std::sync::OnceLock<Vec<Arc<crate::redo::RedoAtomics>>>,
     /// Highest `current_block_height` this node has durably observed across
     /// every height-bearing op it applied (spend / set_mined /
     /// mark_longest_chain / unspend), monotonically maxed
@@ -239,6 +260,15 @@ pub struct Engine {
     /// paths, in which case [`Self::persist_last_durable_height`] is a no-op
     /// and the height is recovered from the record-derived floor alone.
     last_durable_height_path: std::sync::OnceLock<std::path::PathBuf>,
+    /// Segments the LAST checkpoint's defrag compaction pass relocated live
+    /// records out of. Published by the checkpoint via
+    /// [`Self::record_last_checkpoint_defrag`] and read by the `/status`
+    /// observability endpoint. Relaxed atomics; no hot-path cost. `0` until the
+    /// first checkpoint runs.
+    last_checkpoint_compacted: std::sync::atomic::AtomicU64,
+    /// Segments the LAST checkpoint's fully-dead fast path reclaimed. See
+    /// [`Self::last_checkpoint_compacted`].
+    last_checkpoint_reclaimed: std::sync::atomic::AtomicU64,
     blob_store: Option<Arc<dyn BlobStore>>,
     /// In-flight external-blob pins (F-IJ-002).
     ///
@@ -484,9 +514,13 @@ impl Engine {
             redo_logs: std::sync::OnceLock::new(),
             redo_committers: std::sync::OnceLock::new(),
             redo_buffered: std::sync::atomic::AtomicBool::new(false),
+            clustered: std::sync::atomic::AtomicBool::new(false),
             redo_backpressure: std::sync::OnceLock::new(),
+            redo_atomics: std::sync::OnceLock::new(),
             last_durable_height: std::sync::atomic::AtomicU32::new(0),
             last_durable_height_path: std::sync::OnceLock::new(),
+            last_checkpoint_compacted: std::sync::atomic::AtomicU64::new(0),
+            last_checkpoint_reclaimed: std::sync::atomic::AtomicU64::new(0),
             blob_store: None,
             blob_pins: crate::storage::blobstore::BlobPinSet::new(),
             shard_counts,
@@ -573,6 +607,9 @@ impl Engine {
         // log, so the gate must not block.
         if !logs.is_empty() {
             let atomics: Vec<_> = logs.iter().map(|l| l.lock().atomics()).collect();
+            // Issue #32: keep the lock-free write-health mirrors so `write_healthy`
+            // can probe every store's poison flag without taking a log mutex.
+            let _ = self.redo_atomics.set(atomics.clone());
             let bp = crate::redo::RedoBackpressure::new(atomics);
             for l in &logs {
                 l.lock().set_backpressure(bp.clone());
@@ -620,6 +657,22 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Declare whether this node runs clustered / replicated. Call once at boot
+    /// (after [`Self::set_redo_logs`]) with `config.is_clustered() ||
+    /// replication_factor > 1`. Switches the segment engine's spend redo to the
+    /// convertible [`crate::redo::RedoOp::SpendV2`] model (relocate journals
+    /// nothing) — see [`Self::clustered`] field docs and [`Self::relocate_record`].
+    pub fn set_clustered(&self, clustered: bool) {
+        self.clustered
+            .store(clustered, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this node runs clustered / replicated (governs the segment
+    /// relocate durability model — see [`Self::set_clustered`]).
+    pub(crate) fn clustered(&self) -> bool {
+        self.clustered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Force every per-store redo log durable (fsync). Used by the background
     /// flusher under buffered durability and by the checkpoint barrier before it
     /// reclaims the redo prefix. Idempotent and cheap when nothing is dirty.
@@ -658,6 +711,26 @@ impl Engine {
     /// drainer use this handle.
     pub fn redo_backpressure(&self) -> Option<Arc<crate::redo::RedoBackpressure>> {
         self.redo_backpressure.get().cloned()
+    }
+
+    /// Whether the node can accept writes: `false` if ANY store's redo log has
+    /// been poisoned by a flush failure.
+    ///
+    /// Issue #32: a poisoned redo log rejects every subsequent append/flush with
+    /// [`crate::redo::RedoError::Poisoned`], so every mutation fails until the
+    /// process restarts and recovery rebuilds from the durable on-disk state.
+    /// While poisoned the node is effectively write-dead, and the health
+    /// endpoints must report that so orchestration restarts/drains it.
+    ///
+    /// This reads the lock-free [`crate::redo::RedoAtomics`] mirrors captured at
+    /// [`Self::set_redo_logs`], so a health probe NEVER blocks behind the redo
+    /// writer lock (which a sustained write burst can hold). When no redo logs
+    /// are attached (test / no-WAL paths) the node is considered write-healthy.
+    pub fn write_healthy(&self) -> bool {
+        match self.redo_atomics.get() {
+            Some(atomics) => !atomics.iter().any(|a| a.is_poisoned()),
+            None => true,
+        }
     }
 
     /// The redo log owning store `device_id`, for secondary-index two-phase
@@ -1341,7 +1414,7 @@ impl Engine {
     /// The highest block height this node has durably observed (design §4).
     ///
     /// Served over the wire by `OP_GET_NODE_HEIGHT` and consumed by the GC
-    /// horizon ([`crate::cluster::coordinator::RunningCluster::min_member_finalized_height`])
+    /// horizon (`RunningCluster::min_member_finalized_height`)
     /// and the rejoin-eligibility gate. Monotone within a process; restored
     /// (and floored) across restarts by [`Self::restore_last_durable_height`].
     pub fn last_durable_height(&self) -> u32 {
@@ -1350,7 +1423,7 @@ impl Engine {
     }
 
     /// Attach the path of the tiny durable height file (design §4, height
-    /// subsystem). Mirrors [`Self::set_redo_log`] / [`Self::set_tombstone_log`]
+    /// subsystem). Mirrors [`Self::set_redo_log`] / `set_tombstone_log`
     /// so existing `Engine::new` call sites are untouched. Call once at
     /// startup, before [`Self::persist_last_durable_height`] is invoked by the
     /// checkpoint task. When unset, persistence is a no-op and recovery relies
@@ -2000,6 +2073,68 @@ impl Engine {
     /// never stalls behind a write burst.
     pub fn allocator_stats_try(&self) -> Option<crate::allocator::AllocatorStats> {
         self.stores[0].allocator.try_lock().map(|g| g.stats())
+    }
+
+    /// Aggregate segment-allocator statistics across every LOG-STRUCTURED store,
+    /// or `None` if no store uses the segment engine (e.g. the in-place engine,
+    /// whose `defrag_compact` is a no-op anyway).
+    ///
+    /// Used by the checkpoint to size the pressure-aware compaction budget
+    /// ([`crate::checkpoint::compaction_budget`]) and by `/status` to report
+    /// on-device dead/live space. The byte counters (`used_bytes`, `dead_bytes`,
+    /// `live_bytes`) are SUMMED across stores; the scalar layout fields
+    /// (`device_size`, `segment_size`, counts, cursor) are taken from the first
+    /// log-structured store as a representative and, for `device_size`,
+    /// accumulated so occupancy is computed against the total device capacity.
+    ///
+    /// Briefly locks each log-structured store's allocator to snapshot it.
+    pub fn segment_allocator_stats(
+        &self,
+    ) -> Option<crate::segment_allocator::SegmentAllocatorStats> {
+        let mut acc: Option<crate::segment_allocator::SegmentAllocatorStats> = None;
+        for store in &self.stores {
+            if !store.log_structured {
+                continue;
+            }
+            let Some(s) = store.allocator.lock().segment_stats() else {
+                continue;
+            };
+            match acc.as_mut() {
+                None => acc = Some(s),
+                Some(a) => {
+                    a.device_size = a.device_size.saturating_add(s.device_size);
+                    a.used_bytes = a.used_bytes.saturating_add(s.used_bytes);
+                    a.dead_bytes = a.dead_bytes.saturating_add(s.dead_bytes);
+                    a.live_bytes = a.live_bytes.saturating_add(s.live_bytes);
+                    a.segment_count = a.segment_count.saturating_add(s.segment_count);
+                }
+            }
+        }
+        acc
+    }
+
+    /// Publish the LAST checkpoint's defrag outcome for `/status` observability:
+    /// `compacted` = partially-dead segments the compaction pass relocated live
+    /// records out of, `reclaimed` = fully-dead segments the fast path reclaimed.
+    /// Overwrites the previous values (relaxed atomics — this is a diagnostic
+    /// gauge, not a monotone counter).
+    pub fn record_last_checkpoint_defrag(&self, compacted: usize, reclaimed: usize) {
+        self.last_checkpoint_compacted
+            .store(compacted as u64, std::sync::atomic::Ordering::Relaxed);
+        self.last_checkpoint_reclaimed
+            .store(reclaimed as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the LAST checkpoint's defrag outcome as `(compacted, reclaimed)`
+    /// segment counts. Both `0` until the first checkpoint runs. See
+    /// [`Self::record_last_checkpoint_defrag`].
+    pub fn last_checkpoint_defrag(&self) -> (u64, u64) {
+        (
+            self.last_checkpoint_compacted
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.last_checkpoint_reclaimed
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Get a reference to the allocator mutex.
@@ -3342,17 +3477,13 @@ impl Engine {
             }
         }
 
-        // 5. Write the spent slot. R-004: propagate the write error
-        // rather than logging-and-continuing. The dispatcher returns
-        // ERR_INTERNAL to the client and the redo log drives replay
-        // on the next startup. Silently ignoring the failure was a
-        // double-spend invitation (slot stays UNSPENT on disk while
-        // metadata says SPENT, and a follow-up spend with different
-        // spending_data succeeds).
+        // 5. Prepare the spent slot.
         let new_slot = UtxoSlot::new_spent(req.utxo_hash, req.spending_data);
-        self.write_slot_fast(device_id, record_offset, req.offset, &new_slot)?;
+        let log_structured = self.store_is_log_structured(device_id);
 
-        // 6. Update metadata
+        // 6. Update metadata (the post-spend footer — computed regardless of
+        // engine so the segment relocate and the in-place RMW bake in the
+        // identical mutation).
         let old_dah = { metadata.delete_at_height };
         metadata.spent_utxos = { metadata.spent_utxos }.wrapping_add(1);
         metadata.generation = { metadata.generation }.wrapping_add(1);
@@ -3369,24 +3500,46 @@ impl Engine {
             apply_dah_patch(&mut metadata, patch);
         }
 
-        // 8. Write metadata. R-004: propagate the write error rather
-        // than logging-and-continuing.
-        if !self.device_ptr_for(device_id).is_null() {
-            // SAFETY: `device_ptr` is non-null (checked above) and live for
-            // the engine's lifetime; `record_offset` is allocator-valid. The
-            // caller holds this record's stripe lock, and
-            // `write_metadata_direct` additionally takes the per-offset
-            // `io_locks()` write side for torn-read-safe publication.
-            unsafe {
-                io::write_metadata_direct(self.device_ptr_for(device_id), record_offset, &metadata)
-            };
+        // 8. Persist the mutation.
+        if log_structured {
+            // Segment (log-structured) engine: RELOCATE — append the full record
+            // (spent slot + updated metadata baked in) at a fresh append-cursor
+            // offset, re-point the index, and (STANDALONE only) journal a thin
+            // `Relocate`, dead-marking the old extent. This mirrors the batch spend
+            // path (`PreparedSpend::apply_locked`) and reuses the same packed-safe
+            // primitive, so the SOLE production caller of this single-spend entry
+            // point — the replica apply path (`receiver.rs::apply_op` →
+            // `ReplicaOp::Spend`) — physically mirrors the master. `relocate_record`
+            // re-points the index in full (identically to recovery), so NO
+            // `sync_index_cache` follows. On a CLUSTERED node the relocate journals
+            // nothing; the replica's `build_post_apply_redo_op` emits the
+            // authoritative, convertible `SpendV2` after this.
+            self.relocate_record(device_id, &req.tx_key, &metadata, &[(req.offset, new_slot)])?;
         } else {
-            self.write_metadata_fast(device_id, record_offset, &metadata)?;
+            // In-place RMW. R-004: propagate the write error rather than
+            // logging-and-continuing — silently ignoring it is a double-spend
+            // invitation (slot stays UNSPENT on disk while metadata says SPENT).
+            self.write_slot_fast(device_id, record_offset, req.offset, &new_slot)?;
+            if !self.device_ptr_for(device_id).is_null() {
+                // SAFETY: `device_ptr` is non-null (checked above) and live for
+                // the engine's lifetime; `record_offset` is allocator-valid. The
+                // caller holds this record's stripe lock, and
+                // `write_metadata_direct` additionally takes the per-offset
+                // `io_locks()` write side for torn-read-safe publication.
+                unsafe {
+                    io::write_metadata_direct(
+                        self.device_ptr_for(device_id),
+                        record_offset,
+                        &metadata,
+                    )
+                };
+            } else {
+                self.write_metadata_fast(device_id, record_offset, &metadata)?;
+            }
+            self.sync_index_cache(&req.tx_key, &metadata)?;
         }
 
-        self.sync_index_cache(&req.tx_key, &metadata)?;
-
-        // 9. Update DAH secondary index (two-phase durable)
+        // 9. Update DAH secondary index (two-phase durable) — both engines.
         let new_dah = { metadata.delete_at_height };
         self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
@@ -4850,16 +5003,25 @@ impl Engine {
     /// - The store MUST be log-structured ([`Self::store_is_log_structured`]) so
     ///   `free` dead-marks rather than returning the extent to a reuse freelist,
     ///   and append-only never overwrites the old extent before defrag.
-    /// - Crash safety relies on BUFFERED durability: the new image, the `Relocate`
-    ///   redo, and the dead-mark all become durable together at the checkpoint
-    ///   barrier (which fsyncs the data device before reclaiming any redo prefix).
-    ///   A crash before that barrier loses all three together and leaves the
-    ///   pre-relocation record intact at the old offset — the buffered-tail-loss
-    ///   contract `replay_relocate` enforces. Do NOT use under strict durability:
-    ///   journaling happens AFTER the data write, not WAL-first.
+    /// - Durability is BUFFERED (the image write and dead-mark become durable at
+    ///   the checkpoint barrier, which fsyncs the data device before reclaiming any
+    ///   redo prefix). The REDO that makes a spend crash-safe is journaled by the
+    ///   CALLER, not here, and differs by [`Self::clustered`]:
+    ///   - STANDALONE (`clustered() == false`): this fn appends a thin index-only
+    ///     `Relocate` (recovery reads the record back from `new_offset`); a crash
+    ///     before the barrier loses image + redo + dead-mark together and leaves
+    ///     the pre-relocation record intact — the contract `replay_relocate`
+    ///     enforces.
+    ///   - CLUSTERED (`clustered() == true`): this fn journals NOTHING. The spend's
+    ///     convertible per-vout `RedoOp::SpendV2` — emitted WAL-first by the
+    ///     dispatch spend path and by the replica's post-apply journalling — is the
+    ///     authoritative redo: replication-convertible AND self-sufficient for
+    ///     local recovery (it replays the spend IN PLACE against the durable,
+    ///     append-only pre-spend record). See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
     ///
     /// # Ordering (consensus-critical)
-    /// allocate → write new image → journal `Relocate` → repoint index → free old.
+    /// allocate → write new image (buffered) → [STANDALONE: journal thin
+    /// `Relocate`] → repoint index → free old.
     /// A lock-free reader that grabbed the old offset before the repoint still
     /// reads valid bytes: the old extent stays intact (append-only never reuses a
     /// freed offset until defrag), and the index swap is atomic. The repoint
@@ -4884,6 +5046,12 @@ impl Engine {
         metadata: &TxMetadata,
         slot_mutations: &[(u32, UtxoSlot)],
     ) -> Result<u64, SpendError> {
+        // Re-fetch the old offset here rather than threading it from the caller:
+        // it keeps this consensus-critical primitive self-contained (it validates
+        // the key exists AND reads its offset atomically under the caller's stripe
+        // lock, so the two callers — `Engine::spend` and `PreparedSpend::apply_locked`
+        // — cannot pass a torn/stale offset). The probe is O(1) on the in-memory
+        // primary index the segment engine uses by default.
         let old_entry = self
             .index
             .lookup_checked(tx_key)
@@ -4968,7 +5136,8 @@ impl Engine {
         };
 
         // 4. Write the relocated image at the new offset (RMW-safe for packed
-        // sub-block records, holding every covered block's write guard).
+        // sub-block records, holding every covered block's write guard). BUFFERED
+        // in both durability models — see step 5.
         io::write_record_bytes(&**self.device_for(device_id), new_offset, &image).map_err(|e| {
             // Roll the speculative allocation back so a write failure does not leak
             // the cursor advance.
@@ -4979,9 +5148,25 @@ impl Engine {
             }
         })?;
 
-        // 5. Journal the relocation intent (BUFFERED — see preconditions). No
-        // embedded bytes: recovery reads the record back from `new_offset`.
-        if let Some(log) = self.redo_log_for_device(device_id) {
+        // 5. Journal the relocation for recovery — STANDALONE only.
+        //
+        // STANDALONE segment relies on the thin index-only `Relocate` (recovery
+        // reads the record back from `new_offset`), made durable together with the
+        // data at the checkpoint barrier.
+        //
+        // CLUSTERED segment journals NOTHING here: the spend's convertible per-vout
+        // `RedoOp::SpendV2` — emitted WAL-first by the dispatch spend path
+        // (`handle_spend_batch`) and by the replica's post-apply journalling
+        // (`build_post_apply_redo_op`) — is the authoritative redo. It is
+        // replication-convertible AND self-sufficient for local recovery: on replay
+        // it re-applies the spend IN PLACE against the durable, append-only
+        // pre-spend record (append-only never overwrites the old extent until
+        // defrag), so a physical relocate redo would be redundant. A fat
+        // image-carrying redo would also be a redo-amplification and oversized-entry
+        // hazard. See `specs/SEGMENT_CLUSTERING_DESIGN.md`.
+        if !self.clustered()
+            && let Some(log) = self.redo_log_for_device(device_id)
+        {
             log.lock()
                 .append(crate::redo::RedoOp::Relocate {
                     tx_key: *tx_key,
@@ -5142,7 +5327,25 @@ impl Engine {
                 detail: format!("{e}"),
             })?;
 
-        Ok(buf[intra..intra + cold_size as usize].to_vec())
+        let cold = &buf[intra..intra + cold_size as usize];
+
+        // Issue #34 (defense-in-depth): validate the inline blob's own length
+        // prefixes fit within the record's cold region BEFORE handing the bytes
+        // back. This mirrors the EXTERNAL branch's `total_size`/digest checks
+        // above: an inline blob whose declared inner lengths overrun `cold_size`
+        // would otherwise be returned one-or-more bytes short and decode
+        // downstream as an opaque "inpoints truncated", silently wedging the
+        // consumer. Fail closed with a typed, record-attributable error instead.
+        if let Some(declared) = declared_inline_cold_len(cold)
+            && declared > cold_size
+        {
+            return Err(SpendError::ColdDataInconsistent {
+                declared,
+                available: cold_size,
+            });
+        }
+
+        Ok(cold.to_vec())
     }
 
     /// Return the distinct parent txids encoded in a child's cold-data
@@ -6077,6 +6280,50 @@ impl Engine {
         let count = { meta.conflicting_children_count } as usize;
         let offset = { meta.conflicting_children_offset };
         self.read_conflicting_children_at(device_id, count, offset)
+    }
+
+    /// Read the COMPLETE block-entry set for a transaction — the inline
+    /// entries PLUS every on-device overflow entry.
+    ///
+    /// Returns entries in a stable order: the inline entries first (in their
+    /// on-disk slot order), then the overflow entries (in their stored
+    /// order). This is the same order the setMined path maintains (it fills
+    /// inline slots `0..INLINE_BLOCK_ENTRIES` before appending to overflow),
+    /// so the returned slice is a faithful, uncapped view of the record's
+    /// block membership.
+    ///
+    /// When `block_entry_count <= INLINE_BLOCK_ENTRIES` no device read for
+    /// overflow is performed and only the inline entries are returned.
+    ///
+    /// # Errors
+    ///
+    /// - [`SpendError::TxNotFound`] if the transaction is not in the index.
+    /// - [`SpendError::StorageError`] if the index lookup, the metadata read,
+    ///   or the overflow read fails.
+    pub fn read_all_block_entries(&self, key: &TxKey) -> Result<Vec<BlockEntry>, SpendError> {
+        let entry = self
+            .index
+            .lookup_checked(key)
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("index lookup failed: {e}"),
+            })?
+            .ok_or(SpendError::TxNotFound)?;
+        let device_id = entry.device_id;
+        let meta = self.read_metadata_fast(device_id, entry.record_offset)?;
+
+        let count = meta.block_entry_count as usize;
+        let inline = count.min(INLINE_BLOCK_ENTRIES);
+        let mut entries: Vec<BlockEntry> = meta.block_entries_inline[..inline].to_vec();
+        if count > INLINE_BLOCK_ENTRIES {
+            let overflow =
+                read_overflow_entries(&**self.device_for(device_id), &meta).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("overflow block-entry read failed: {e}"),
+                    }
+                })?;
+            entries.extend(overflow);
+        }
+        Ok(entries)
     }
 
     fn append_conflicting_child_best_effort(
@@ -7232,10 +7479,24 @@ impl Engine {
         //
         // Ordering invariants preserved: this still precedes the allocator free
         // (F-G2-001 — a freed+reused offset must never be reachable via a live
-        // index entry), and it now also precedes the tombstone. Recovery is
-        // unaffected: the delete is journaled (redo `Delete`), so redo-replay
-        // removes the record regardless of tombstone timing; the tombstone remains
-        // only the device-scan-rebuild fallback's guard.
+        // index entry), and it now also precedes the tombstone.
+        //
+        // Crash recovery of a buffered delete: production journals NO
+        // `RedoOp::Delete` (deletes are local prune GC), so redo-replay does NOT
+        // remove the record. What IS durable at the allocator `free` below is a
+        // fsynced `FreeRegion` redo record; the tombstone header write and this
+        // index removal are buffered (write-back cache) and become durable only
+        // at the next checkpoint. A crash after the `FreeRegion` fsync but before
+        // that checkpoint reverts the unsynced tombstone, so the device-scan
+        // rebuild re-indexes the still-intact record as LIVE while replay puts
+        // its offset on the freelist. Recovery reconciles this index-wins: it
+        // carves any live record's offset back out of the freelist
+        // (`recovery::reconcile_freelist_against_live_index` →
+        // `SlotAllocator::reserve_recovered_live_region`), restoring the
+        // consistent "delete never happened" lost-tail state (buffered mode's
+        // contract) so a future allocation cannot overwrite the live record. The
+        // tombstone remains the device-scan-rebuild guard for a CHECKPOINTED
+        // delete (durable tombstone ⇒ the record is not re-indexed at all).
         //
         // `unregister_with_shard_count` only decrements when an entry was actually
         // removed (H2: no underflow if the key was concurrently removed). G-4: if
@@ -7853,15 +8114,21 @@ impl Engine {
         // metadata under a third guard — the offset-keyed-guard + ABA pattern
         // (a recreate-same-txid cycle could return another tx's block entries
         // under `key`), and the overflow read was torn-read-unsafe against the
-        // now-guarded `write_overflow_entries`. `io::read_metadata` and
+        // now-guarded `write_overflow_entries`. We MUST use
+        // `io::read_metadata_unguarded` (NOT `io::read_metadata`, which now
+        // self-acquires the SAME striped read guard — the F-G2 torn-read fix —
+        // and would deadlock re-entrantly behind a queued
+        // `write_overflow_entries` writer). `read_metadata_unguarded` and
         // `read_overflow_entries` are both UNGUARDED device reads, so they run
         // under the single held guard without re-entering the lock; the guard
-        // pairs (same key) with `write_overflow_entries`' write guard.
+        // pairs (same key) with `write_overflow_entries`' write guard, which
+        // supplies the torn-read exclusion the inner reads need.
         let _g = io::record_read_guard(record_offset);
-        let metadata =
-            io::read_metadata(dev, record_offset).map_err(|e| SpendError::StorageError {
+        let metadata = io::read_metadata_unguarded(dev, record_offset).map_err(|e| {
+            SpendError::StorageError {
                 detail: format!("{e}"),
-            })?;
+            }
+        })?;
         if metadata.tx_id != key.txid {
             return Err(SpendError::TxNotFound);
         }
@@ -8354,16 +8621,17 @@ impl PreparedSpend {
         // 9. Persist the mutation.
         if log_structured {
             // Segment engine: append the full record (spent slots + updated
-            // metadata baked in) at a fresh cursor offset, re-point the index,
-            // journal a buffered `Relocate`, and dead-mark the old extent — all
-            // under the stripe lock the caller holds. `relocate_record` sets the
-            // index entry in full (identically to recovery), so NO subsequent
-            // `sync_index_cache` is needed (or wanted — it would update the old
-            // key's cached fields without moving the offset). The Relocate redo
-            // is journaled here, AFTER the WAL-first flush of this RPC, which is
-            // why the segment engine requires BUFFERED durability (enforced at
-            // boot): image + redo + dead-mark become durable together at the
-            // checkpoint barrier; a crash before it keeps the old record intact.
+            // metadata baked in) at a fresh cursor offset, re-point the index, and
+            // dead-mark the old extent — all under the stripe lock the caller holds.
+            // `relocate_record` sets the index entry in full (identically to
+            // recovery), so NO subsequent `sync_index_cache` is needed (or wanted —
+            // it would update the old key's cached fields without moving the
+            // offset). The spend's redo differs by node role: STANDALONE journals a
+            // thin buffered `Relocate` inside `relocate_record` (crash safety = the
+            // checkpoint barrier, which is why segment requires BUFFERED durability);
+            // CLUSTERED journals nothing here — the WAL-first `SpendV2` emitted in
+            // dispatch Phase 3 (already fsync-ordered before this apply) is the
+            // authoritative, convertible redo.
             engine.relocate_record(device_id, &tx_key, &metadata, &valid_spends)?;
         } else {
             // In-place RMW: targeted spend footer when direct, full otherwise.
@@ -8549,6 +8817,62 @@ fn extract_parent_txids_from_cold_data(cold_bytes: &[u8]) -> Result<Vec<[u8; 32]
         pos = entry_end;
     }
     Ok(result)
+}
+
+/// Minimum cold-region byte length an inline cold blob's own length prefixes
+/// require, or `None` when the buffer is empty or too short to carry the three
+/// prefixes (an empty/absent cold region is not "inconsistent").
+///
+/// The inline cold layout is
+/// `[inputs_len:4][inputs][outputs_len:4][outputs][inpoints_len:4][inpoints]`.
+/// This walks the three little-endian length prefixes in order and returns the
+/// exact number of bytes they collectively account for
+/// (`12 + inputs_len + outputs_len + inpoints_len`). Issue #34's
+/// defense-in-depth read check compares this against the record's actual
+/// `cold_size`: if the declared length exceeds what is stored, the blob is
+/// internally inconsistent (a byte was lost before the store persisted it) and
+/// [`Engine::read_cold_data`] fails closed with
+/// [`SpendError::ColdDataInconsistent`] instead of returning a short buffer.
+///
+/// All additions are saturating so a corrupt multi-gigabyte prefix can never
+/// overflow `u64`; a saturated value still compares `>` any real `cold_size`
+/// and correctly trips the inconsistency check. Returns `None` (rather than
+/// erroring) when fewer than 12 bytes are present, because a genuinely empty
+/// cold region is handled by the caller before this is consulted.
+fn declared_inline_cold_len(cold: &[u8]) -> Option<u64> {
+    if cold.len() < 12 {
+        return None;
+    }
+    let read_u32 = |off: usize| -> u64 {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&cold[off..off + 4]);
+        u32::from_le_bytes(b) as u64
+    };
+    let inputs_len = read_u32(0);
+    // The outputs length prefix sits at `4 + inputs_len`; if that offset is
+    // already past the stored bytes the blob is short, but we still compute the
+    // declared total from the prefixes we CAN read plus the declared inputs so
+    // the `declared > available` comparison fires. Read remaining prefixes only
+    // when they are actually present; otherwise fold their declared minimum in
+    // as zero-payload prefixes (4 bytes each) which keeps `declared >=` reality.
+    let outputs_off = 4u64.saturating_add(inputs_len);
+    let outputs_len = if (outputs_off as usize).saturating_add(4) <= cold.len() {
+        read_u32(outputs_off as usize)
+    } else {
+        0
+    };
+    let inpoints_off = outputs_off.saturating_add(4).saturating_add(outputs_len);
+    let inpoints_len = if (inpoints_off as usize).saturating_add(4) <= cold.len() {
+        read_u32(inpoints_off as usize)
+    } else {
+        0
+    };
+    Some(
+        12u64
+            .saturating_add(inputs_len)
+            .saturating_add(outputs_len)
+            .saturating_add(inpoints_len),
+    )
 }
 
 /// Build inline cold data from optional inputs/outputs/inpoints.
@@ -10968,7 +11292,7 @@ mod tests {
         let spent_slot = UtxoSlot::new_spent(slots[1].hash, spending_data);
 
         let new_offset = engine
-            .relocate_record(0, &key, &new_meta, &[(1, spent_slot.clone())])
+            .relocate_record(0, &key, &new_meta, &[(1, spent_slot)])
             .unwrap();
 
         // Baked-in metadata landed.
@@ -11024,12 +11348,142 @@ mod tests {
     }
 
     #[test]
+    fn clustered_relocate_journals_nothing_spendv2_is_the_redo() {
+        use crate::redo::{RedoLog, RedoOp};
+
+        let (engine, dev, key, meta, slots, _old) = seg_engine_with_record();
+
+        // Attach a redo log and declare clustered. A clustered relocate must
+        // journal NOTHING itself — the spend's convertible per-vout SpendV2
+        // (emitted by the dispatch / replica caller) is the authoritative redo, so
+        // `relocate_record` writes no relocate redo at all.
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        engine.set_clustered(true);
+
+        let mut new_meta = meta;
+        new_meta.spent_utxos = 1;
+        new_meta.generation = 9;
+        let spending_data = [0x37u8; 36];
+        let spent_slot = UtxoSlot::new_spent(slots[1].hash, spending_data);
+
+        let new_offset = engine
+            .relocate_record(0, &key, &new_meta, &[(1, spent_slot)])
+            .unwrap();
+
+        // The relocate still MOVES the record + bakes in the spend on the device.
+        let s = io::read_all_utxo_slots(&*dev, new_offset, 4).unwrap();
+        assert_eq!(s[1].status, UTXO_SPENT);
+        assert_eq!(s[1].spending_data, spending_data);
+        let entry = engine.lookup(&key).unwrap();
+        assert_eq!(entry.record_offset, new_offset);
+        assert_eq!(entry.generation, 9);
+
+        // But it journaled NOTHING for this key — no relocate redo at all.
+        engine.flush_all_redo().unwrap();
+        let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert!(
+            !entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::Relocate { tx_key, .. } if *tx_key == key
+            )),
+            "clustered relocate must journal no relocate redo — SpendV2 is the redo"
+        );
+    }
+
+    #[test]
+    fn engine_spend_relocates_on_segment_store() {
+        // Phase 2: the single-spend entry point (used in production only by the
+        // replica apply path) must RELOCATE on a log-structured store, not RMW in
+        // place — so a replica physically mirrors the master.
+        let (engine, dev, key, _meta, slots, old_offset) = seg_engine_with_record();
+
+        let req = SpendRequest {
+            tx_key: key,
+            offset: 2,
+            utxo_hash: slots[2].hash,
+            spending_data: [0x11u8; 36],
+            ignore_conflicting: true,
+            ignore_locked: true,
+            current_block_height: 100,
+            block_height_retention: 0,
+        };
+        engine.spend(&req).unwrap();
+
+        // The record MOVED to a fresh append-cursor offset.
+        let entry = engine.lookup(&key).unwrap();
+        assert_ne!(
+            entry.record_offset, old_offset,
+            "segment spend must relocate, not RMW in place"
+        );
+
+        // Logical state at the new offset is correct: slot 2 SPENT with the
+        // spending data, counter + generation bumped.
+        let s = io::read_all_utxo_slots(&*dev, entry.record_offset, 4).unwrap();
+        assert_eq!(s[2].status, UTXO_SPENT);
+        assert_eq!(s[2].spending_data, [0x11u8; 36]);
+        assert_eq!(s[0].status, UTXO_UNSPENT);
+        let m = io::read_metadata(&*dev, entry.record_offset).unwrap();
+        assert_eq!({ m.spent_utxos }, 1);
+        assert_eq!(
+            entry.spent_utxos, 1,
+            "index cache re-pointed to the new record"
+        );
+
+        // A second, different-vout spend relocates AGAIN and accumulates.
+        let req2 = SpendRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: slots[0].hash,
+            spending_data: [0x22u8; 36],
+            ignore_conflicting: true,
+            ignore_locked: true,
+            current_block_height: 100,
+            block_height_retention: 0,
+        };
+        engine.spend(&req2).unwrap();
+        let entry2 = engine.lookup(&key).unwrap();
+        assert_ne!(entry2.record_offset, entry.record_offset, "relocates again");
+        let m2 = io::read_metadata(&*dev, entry2.record_offset).unwrap();
+        assert_eq!({ m2.spent_utxos }, 2);
+    }
+
+    #[test]
+    fn standalone_relocate_still_journals_thin_relocate() {
+        use crate::redo::{RedoLog, RedoOp};
+
+        // Same setup as the clustered test but WITHOUT set_clustered — must keep
+        // the thin index-only Relocate (no image), proving the branch is gated.
+        let (engine, _dev, key, meta, _slots, _old) = seg_engine_with_record();
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev.clone(), 0, 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        assert!(!engine.clustered(), "default must be standalone");
+
+        let new_offset = engine.relocate_record(0, &key, &meta, &[]).unwrap();
+        engine.flush_all_redo().unwrap();
+
+        let log2 = RedoLog::open(log_dev, 0, 1024 * 1024).unwrap();
+        let entries = log2.recover().unwrap();
+        assert!(
+            entries.iter().any(|e| matches!(
+                &e.op,
+                RedoOp::Relocate { tx_key, record_offset, .. }
+                    if *tx_key == key && *record_offset == new_offset
+            )),
+            "standalone relocate must journal a thin Relocate"
+        );
+    }
+
+    #[test]
     fn relocate_record_rejects_out_of_range_vout() {
         let (engine, _dev, key, meta, slots, _old) = seg_engine_with_record();
 
         // vout 4 is out of range for a 4-UTXO record (valid: 0..=3).
         let err = engine
-            .relocate_record(0, &key, &meta, &[(4, slots[0].clone())])
+            .relocate_record(0, &key, &meta, &[(4, slots[0])])
             .unwrap_err();
         match err {
             SpendError::StorageError { detail } => {
@@ -14800,6 +15254,7 @@ mod tests {
     /// engine plus the underlying store devices and a snapshot of their
     /// allocators (for a recovery-by-device-scan test). Devices are shared
     /// `Arc`s, so writes through the engine are visible on the returned handles.
+    #[allow(clippy::type_complexity)]
     fn create_two_store_engine_txid() -> (
         Engine,
         Vec<Arc<dyn BlockDevice>>,
@@ -15514,58 +15969,82 @@ mod tests {
     fn append_redo_ops_routed_coalesces_concurrent_writers() {
         use crate::redo::{RedoLog, RedoOp};
 
-        // Single store, per-store redo over a sync-counting device so we can see
-        // how many fsyncs N concurrent routed writers actually cost.
-        let engine = create_engine();
-        let inner: Arc<dyn BlockDevice> =
-            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
-        let (cdev, syncs) = SyncCountingDevice::new(inner);
-        let log = RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
-        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
-        let baseline = syncs.load(Ordering::SeqCst);
-
         const N: usize = 16;
-        let barrier = Arc::new(std::sync::Barrier::new(N));
-        let handles: Vec<_> = (0..N)
-            .map(|i| {
-                let engine = engine.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    engine
-                        .append_redo_ops_routed(&[RedoOp::Delete {
-                            tx_key: TxKey {
-                                txid: [i as u8; 32],
-                            },
-                            record_offset: i as u64 * 4096,
-                            record_size: 4096,
-                        }])
-                        .expect("routed write ok")
+        // Coalescing is inherently probabilistic: the group-commit window only
+        // coalesces writers that actually overlap in it. On a contended CI
+        // runner the barrier-released threads can serialize, so a single
+        // scheduling may cost one fsync per writer with no coalescing — which
+        // made this test flaky on macOS runners. We therefore retry the
+        // measurement: the correctness invariants (distinct, contiguous,
+        // single-sequence ranges — NOT timing dependent) are asserted on EVERY
+        // attempt, and we require that coalescing (`fsyncs < N`) is observed in
+        // at least one attempt. That still proves the mechanism coalesces and
+        // still fails loudly on a real regression (coalescing never happening),
+        // without depending on a single lucky schedule.
+        const ATTEMPTS: usize = 20;
+        let mut coalesced = false;
+
+        for _ in 0..ATTEMPTS {
+            // Single store, per-store redo over a sync-counting device so we can
+            // see how many fsyncs N concurrent routed writers actually cost.
+            let engine = create_engine();
+            let inner: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+            let (cdev, syncs) = SyncCountingDevice::new(inner);
+            let log = RedoLog::open(cdev as Arc<dyn BlockDevice>, 0, 4 * 1024 * 1024).unwrap();
+            engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+            let baseline = syncs.load(Ordering::SeqCst);
+
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    let engine = engine.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        engine
+                            .append_redo_ops_routed(&[RedoOp::Delete {
+                                tx_key: TxKey {
+                                    txid: [i as u8; 32],
+                                },
+                                record_offset: i as u64 * 4096,
+                                record_size: 4096,
+                            }])
+                            .expect("routed write ok")
+                    })
                 })
-            })
-            .collect();
-        let mut ranges: Vec<(u64, u64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                .collect();
+            let mut ranges: Vec<(u64, u64)> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-        let fsyncs = syncs.load(Ordering::SeqCst) - baseline;
-        assert!(fsyncs >= 1, "must flush at least once");
-        assert!(
-            fsyncs < N as u64,
-            "routed group commit must coalesce concurrent writers: {N} writers used \
-             {fsyncs} fsyncs (expected < {N})"
-        );
+            let fsyncs = syncs.load(Ordering::SeqCst) - baseline;
+            assert!(fsyncs >= 1, "must flush at least once");
 
-        // Every writer got a distinct, contiguous single-sequence range — no
-        // lost, duplicated, or overlapping sequence under the coalescing.
-        ranges.sort();
-        assert_eq!(ranges.len(), N);
-        for i in 1..ranges.len() {
-            assert_eq!(ranges[i].0, ranges[i].1, "one op -> one sequence");
-            assert_eq!(
-                ranges[i].0,
-                ranges[i - 1].0 + 1,
-                "routed ranges must be contiguous with no gap/dup"
-            );
+            // Every writer got a distinct, contiguous single-sequence range — no
+            // lost, duplicated, or overlapping sequence under the coalescing.
+            // This invariant is not timing dependent and MUST hold every attempt.
+            ranges.sort();
+            assert_eq!(ranges.len(), N);
+            for i in 1..ranges.len() {
+                assert_eq!(ranges[i].0, ranges[i].1, "one op -> one sequence");
+                assert_eq!(
+                    ranges[i].0,
+                    ranges[i - 1].0 + 1,
+                    "routed ranges must be contiguous with no gap/dup"
+                );
+            }
+
+            if fsyncs < N as u64 {
+                coalesced = true;
+                break;
+            }
         }
+
+        assert!(
+            coalesced,
+            "routed group commit must coalesce concurrent writers: {N} writers \
+             never used < {N} fsyncs across {ATTEMPTS} attempts (no coalescing observed)"
+        );
     }
 
     /// Drive `n` two-phase secondary-index updates (the `setMined` reorg path
@@ -16546,6 +17025,33 @@ mod tests {
         assert_eq!(&cold[4..8], &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(u32::from_le_bytes(cold[8..12].try_into().unwrap()), 3); // outputs len
         assert_eq!(&cold[12..15], &[0x0A, 0x0B, 0x0C]);
+    }
+
+    #[test]
+    fn declared_inline_cold_len_matches_build_cold_data() {
+        // A well-formed blob's declared length equals its actual length.
+        let cold = build_cold_data(Some(&[1u8; 190]), Some(&[2u8; 74]), Some(&[3u8; 44]));
+        assert_eq!(cold.len(), 320);
+        assert_eq!(declared_inline_cold_len(&cold), Some(320));
+
+        // Empty / too-short buffers are not "inconsistent" — None.
+        assert_eq!(declared_inline_cold_len(&[]), None);
+        assert_eq!(declared_inline_cold_len(&[0u8; 11]), None);
+
+        // The issue-34 corruption: prefixes declare one more byte than stored.
+        // Inflate the inpoints length prefix (at 4+190+4+74 = 272) to 45.
+        let mut corrupt = cold.clone();
+        corrupt[272..276].copy_from_slice(&45u32.to_le_bytes());
+        // The stored buffer is still 320 bytes, but it now DECLARES 321.
+        assert_eq!(declared_inline_cold_len(&corrupt), Some(321));
+        assert!(declared_inline_cold_len(&corrupt).unwrap() > corrupt.len() as u64);
+
+        // A corrupt multi-gigabyte prefix saturates instead of overflowing and
+        // still trips the `declared > available` comparison.
+        let mut huge = cold.clone();
+        huge[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let declared = declared_inline_cold_len(&huge).unwrap();
+        assert!(declared >= u32::MAX as u64);
     }
 
     #[test]

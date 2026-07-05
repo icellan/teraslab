@@ -78,11 +78,17 @@ let items = vec![CreateItem {
     locktime: 0,
     fee: 500,
     size_in_bytes: 250,
+    extended_size: 250,
     is_coinbase: false,
-    block_height: 800000,
+    spending_height: 0,
+    created_at: 0,
+    flags: 0,
     utxo_hashes: vec![[0xAA; 32]],
     cold_data: serialized_tx_data,
-    ..Default::default()
+    mined_block_id: None,
+    mined_block_height: Some(800000),
+    mined_subtree_idx: None,
+    parent_txids: vec![],
 }];
 
 let result = client.create_batch(&items).await?;

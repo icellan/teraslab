@@ -946,6 +946,34 @@ pub fn handle_replica_batch_with_tracker(
     // journalling — they are normal replicated mutations.
     let journal = !is_migration;
     let start_seq = batch.first_sequence + skip_count as u64;
+
+    // Issue #29 — replica-side redo backpressure. The master mutation path
+    // stalls on this same gate before it fills the redo (see
+    // `handle_request`); the replica apply path is a separate TCP listener that
+    // never reached it, so a replica whose redo legitimately filled (checkpoint
+    // draining slower than sustained catch-up) hit `LogFull` on the first
+    // overflowing append → `poison_all_redo_logs` → the whole node FENCED until
+    // restart. Reuse the master's gate here so the batch STALLS until the drain
+    // frees space, then applies — a stalled replica is a better availability
+    // outcome than a fenced one.
+    //
+    // Placement is deliberate and MUST stay here: after every validation /
+    // stale-epoch / migration-key / dedup gate (the batch is accepted for
+    // application) but BEFORE the per-op apply loop and the post-loop device +
+    // redo fsync barrier. Nothing above holds a lock the checkpoint drain
+    // needs, and the gate itself holds NO barrier while waiting — mirroring the
+    // master's pre-barrier placement. The checkpoint drain that frees the space
+    // needs those same barriers, so gating under any of them would deadlock.
+    //
+    // Covers BOTH the tracked and migration/out-of-band paths: they share this
+    // one apply loop (the `journal` / `is_migration` flags only vary per-op
+    // journalling, not the route), so one gate before the loop backpressures a
+    // migration delta exactly like a normal replicated batch. Inherits the
+    // gate's safety: a no-op when no redo is attached or the coordinator is
+    // unarmed, so a replica with no drain armed degrades to the historical
+    // `LogFull` → poison path rather than hanging.
+    crate::server::dispatch::redo_backpressure_gate(engine);
+
     for (seq, op) in (start_seq..).zip(batch.ops.iter().skip(skip_count)) {
         if let Err(msg) = apply_op_journal(engine, op, journal, is_migration) {
             let ack = ReplicaAck::Error {
@@ -2066,6 +2094,14 @@ fn build_post_apply_redo_op(
             block_height_retention,
             ..
         } => {
+            // BOTH engines journal a post-apply `SpendV2`. In-place applied the
+            // spend with an in-place slot+metadata write; the SEGMENT replica
+            // RELOCATED the record but journals NOTHING inside `relocate_record`
+            // (clustered) — so `SpendV2` is its authoritative local redo, exactly
+            // as on the master's dispatch path. On recovery a segment `SpendV2`
+            // replays the spend IN PLACE against the durable append-only pre-spend
+            // record (idempotent; the spent counter is recomputed from the slots),
+            // reconstructing the spend without needing the record's new offset.
             let meta = match engine.read_metadata(tx_key) {
                 Ok(m) => m,
                 Err(_) => return Ok(None),
@@ -2336,6 +2372,33 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ))
+    }
+
+    /// A log-structured (segment) engine with an attached, clustered redo log —
+    /// the shape a replica node runs. Used to prove the replica spend relocates
+    /// and emits no post-apply `SpendV2` (Phase 2).
+    fn make_seg_engine_clustered() -> Arc<Engine> {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 256 * 4096).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            dev,
+            index,
+            seg,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        // Match the shape a clustered segment node actually boots (config forces
+        // buffered durability for segment).
+        engine.set_buffered_durability(true);
+        engine.set_clustered(true);
+        Arc::new(engine)
     }
 
     fn make_engine_with_blob_store(
@@ -2742,6 +2805,235 @@ mod tests {
     }
 
     #[test]
+    fn apply_multi_vout_same_txid_spends_all_get_applied() {
+        // A master spending N vouts of the SAME txid in one batch bumps the
+        // record generation ONCE (post_generation = pre+1) and ships N
+        // ReplicaOp::Spend, EVERY one carrying master_generation = pre+1. The
+        // replica must apply ALL N. If it locally increments generation per op
+        // (pre+1, pre+2, …), the staleness guard drops the 3rd+ op as "already
+        // superseded", diverging replica from master (a spent output stays
+        // UNSPENT on the replica → double-spend on failover).
+        let engine = make_engine();
+        let k = key(9);
+        create_record(&engine, k, 4); // fresh record, generation 0
+        let master_generation = 1; // what the master ships for all vouts
+
+        for vout in 0u32..3 {
+            let mut sd = [0u8; 36];
+            sd[0] = 0xE0 | vout as u8;
+            apply_op(
+                &engine,
+                &ReplicaOp::Spend {
+                    tx_key: k,
+                    offset: vout,
+                    spending_data: sd,
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
+                    master_generation,
+                },
+            )
+            .unwrap();
+        }
+
+        for vout in 0u32..3 {
+            let slot = engine.read_slot(&k, vout).unwrap();
+            assert_eq!(
+                slot.status, UTXO_SPENT,
+                "vout {vout} of a multi-vout same-txid batch must be spent on the replica"
+            );
+        }
+        // The replica's generation equals the master's (baked in, not per-op
+        // incremented).
+        let meta = engine.read_metadata(&k).unwrap();
+        assert_eq!(
+            { meta.generation },
+            master_generation,
+            "replica generation must match the master's (baked in)"
+        );
+    }
+
+    #[test]
+    fn apply_multi_vout_same_txid_spends_all_get_applied_on_segment() {
+        // Same as the in-place test but on a CLUSTERED SEGMENT replica — each op
+        // RELOCATES the record. All N vouts must still be applied and the
+        // generation baked to the master's value (not per-op incremented), or the
+        // staleness guard drops the 3rd+ relocated spend and the replica diverges.
+        let engine = make_seg_engine_clustered();
+        let k = key(19);
+        create_record(&engine, k, 4);
+        let master_generation = 1;
+
+        for vout in 0u32..3 {
+            let mut sd = [0u8; 36];
+            sd[0] = 0xF0 | vout as u8;
+            apply_op(
+                &engine,
+                &ReplicaOp::Spend {
+                    tx_key: k,
+                    offset: vout,
+                    spending_data: sd,
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
+                    master_generation,
+                },
+            )
+            .unwrap();
+        }
+
+        for vout in 0u32..3 {
+            assert_eq!(
+                engine.read_slot(&k, vout).unwrap().status,
+                UTXO_SPENT,
+                "segment replica: vout {vout} of a multi-vout same-txid batch must be spent"
+            );
+        }
+        assert_eq!(
+            { engine.read_metadata(&k).unwrap().generation },
+            master_generation,
+            "segment replica generation must match the master's (baked in)"
+        );
+    }
+
+    #[test]
+    fn segment_replica_journals_spendv2_with_baked_master_generation() {
+        // #3 regression: the replica bakes the master's generation AFTER apply
+        // (set_record_generation) and journals the post-apply SpendV2 AFTER that,
+        // so the journaled redo carries master_generation — NOT the per-op
+        // locally-incremented value. (The prior fat RelocateV2 was journaled
+        // mid-apply with the pre-bake generation, so crash-replay resurrected a
+        // generation ahead of the master and the staleness guard then dropped
+        // legitimately re-delivered ops. Retiring RelocateV2 closes that.)
+        use crate::redo::RedoOp;
+        let engine = make_seg_engine_clustered();
+        let k = key(29);
+        create_record(&engine, k, 4);
+        let master_generation = 1u32;
+
+        for vout in 0u32..3 {
+            let mut sd = [0u8; 36];
+            sd[0] = 0xC0 | vout as u8;
+            apply_op_journal(
+                &engine,
+                &ReplicaOp::Spend {
+                    tx_key: k,
+                    offset: vout,
+                    spending_data: sd,
+                    current_block_height: 700_000,
+                    block_height_retention: 288,
+                    master_generation,
+                },
+                true,
+                false,
+            )
+            .unwrap();
+        }
+
+        // Every journaled SpendV2 for this key carries the BAKED master generation
+        // (the relocate move journals nothing), so a crash-replay reconstructs
+        // generation == master's — no stale relocate op resurrecting a wrong gen.
+        engine.flush_all_redo().unwrap();
+        let entries = engine.redo_log().unwrap().lock().recover().unwrap();
+        let mut spendv2_count = 0;
+        for e in &entries {
+            match &e.op {
+                RedoOp::SpendV2 {
+                    tx_key,
+                    target_generation,
+                    ..
+                } if *tx_key == k => {
+                    assert_eq!(
+                        *target_generation, master_generation,
+                        "journaled SpendV2 must carry the baked master generation"
+                    );
+                    spendv2_count += 1;
+                }
+                RedoOp::Relocate { tx_key, .. } if *tx_key == k => {
+                    panic!("clustered segment replica must not journal a relocate redo");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            spendv2_count, 3,
+            "one SpendV2 per spent vout must be journaled"
+        );
+    }
+
+    #[test]
+    fn clustered_segment_spend_recovers_via_real_engine_and_redo() {
+        // #20: full composition — a REAL clustered segment engine journals a real
+        // spend (replica apply path → relocate + SpendV2), then recover() rebuilds
+        // the SPENT record from that engine's OWN device + redo. No hand-built redo
+        // and no pre-manufactured index state — the create and the spend both flow
+        // through the engine, and a fresh index is reconstructed from the journal.
+        use crate::index::{PrimaryBackend, ShardedIndex};
+
+        let engine = make_seg_engine_clustered();
+        let k = key(41);
+        // Both the create AND the spend flow through the replica apply path so both
+        // are journaled (a real replica receives a ReplicaOp::Create, which journals
+        // a ReplicaCreate; a direct engine.create does not journal).
+        let hashes: Vec<[u8; 32]> = (0..4u32)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = i as u8;
+                h[4..8].copy_from_slice(&k.txid[0..4]);
+                h
+            })
+            .collect();
+        apply_op_journal(
+            &engine,
+            &ReplicaOp::Create {
+                tx_key: k,
+                metadata_bytes: vec![],
+                utxo_hashes: hashes,
+                cold_data: None,
+                is_external: false,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        apply_op_journal(
+            &engine,
+            &ReplicaOp::Spend {
+                tx_key: k,
+                offset: 1,
+                spending_data: [0x77; 36],
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                master_generation: 1,
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        engine.flush_all_redo().unwrap();
+
+        // Crash + recover into a FRESH index from the engine's own device + redo.
+        let fresh = ShardedIndex::from_single(PrimaryBackend::new_in_memory(10_000).unwrap());
+        let redo = engine.redo_log().unwrap();
+        let stats = crate::recovery::recover(engine.device(), &redo.lock(), &fresh).unwrap();
+        assert!(
+            stats.entries_replayed >= 1,
+            "the create + spend redo must replay"
+        );
+
+        // The reconstructed record is SPENT at vout 1 with the master's baked
+        // generation — rebuilt purely from the journal.
+        let ie = fresh.lookup(&k).expect("recovered record must be indexed");
+        let m = crate::io::read_metadata(engine.device(), ie.record_offset).unwrap();
+        assert_eq!({ m.spent_utxos }, 1, "recovered record is spent");
+        assert_eq!(
+            { m.generation },
+            1,
+            "recovered generation == master's baked value"
+        );
+        let s = crate::io::read_utxo_slot(engine.device(), ie.record_offset, 1).unwrap();
+        assert_eq!(s.status, UTXO_SPENT);
+    }
+
+    #[test]
     fn apply_spend_op() {
         let engine = make_engine();
         let k = key(1);
@@ -2763,6 +3055,69 @@ mod tests {
         let slot = engine.read_slot(&k, 0).unwrap();
         assert_eq!(slot.status, UTXO_SPENT);
         assert_eq!(slot.spending_data[0], 0xAB);
+    }
+
+    #[test]
+    fn segment_replica_spend_relocates_and_emits_post_apply_spendv2() {
+        // On a log-structured replica, applying a logical `ReplicaOp::Spend`
+        // RELOCATES the record (mirroring the master) but journals NOTHING inside
+        // `relocate_record` — so the post-apply builder emits the convertible,
+        // self-sufficient `SpendV2`, exactly as the in-place engine does. That
+        // SpendV2 is the replica's authoritative local redo (on recovery it
+        // replays the spend in place against the durable pre-spend record).
+        let engine = make_seg_engine_clustered();
+        assert!(
+            engine.redo_log().is_some(),
+            "log attached (else None is trivial)"
+        );
+
+        let k = key(7);
+        create_record(&engine, k, 4);
+        let old = engine.lookup(&k).unwrap().record_offset;
+        assert!(engine.store_is_log_structured(engine.lookup(&k).unwrap().device_id));
+
+        let op = ReplicaOp::Spend {
+            tx_key: k,
+            offset: 1,
+            spending_data: [0x5A; 36],
+            current_block_height: 700_000,
+            block_height_retention: 288,
+            master_generation: 1,
+        };
+
+        apply_op(&engine, &op).unwrap();
+
+        // Apply relocated the record and flipped slot 1 SPENT.
+        let new = engine.lookup(&k).unwrap().record_offset;
+        assert_ne!(new, old, "replica spend must relocate on a segment store");
+        let slot = engine.read_slot(&k, 1).unwrap();
+        assert_eq!(slot.status, UTXO_SPENT);
+        assert_eq!(slot.spending_data[0], 0x5A);
+
+        // The post-apply redo is a SpendV2 for the spent vout (convertible +
+        // self-sufficient), NOT a physical relocate op.
+        let post = build_post_apply_redo_op(&engine, &op).unwrap();
+        match post {
+            Some(crate::redo::RedoOp::SpendV2 { tx_key, offset, .. }) => {
+                assert_eq!(tx_key, k);
+                assert_eq!(offset, 1);
+            }
+            other => panic!("segment replica Spend must emit a post-apply SpendV2, got {other:?}"),
+        }
+
+        // Same shape for an in-place replica — the engines are symmetric here.
+        let inplace = make_engine();
+        create_record(&inplace, k, 4);
+        apply_op(&inplace, &op).unwrap();
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
+        inplace.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        let post_inplace = build_post_apply_redo_op(&inplace, &op).unwrap();
+        assert!(
+            matches!(post_inplace, Some(crate::redo::RedoOp::SpendV2 { .. })),
+            "in-place replica Spend must emit a post-apply SpendV2, got {post_inplace:?}"
+        );
     }
 
     #[test]
@@ -4743,6 +5098,199 @@ mod tests {
 
         // Tracker still sits at the same high-water mark.
         assert_eq!(tracker.get(stream_key), 12);
+    }
+
+    /// Issue #29 — the replica apply path must honour redo backpressure.
+    ///
+    /// Pre-fix, `handle_replica_batch_with_tracker` never touched the master's
+    /// pre-barrier backpressure gate, so a replica whose redo legitimately
+    /// filled (checkpoint draining slower than sustained catch-up) hit
+    /// `LogFull` on the first overflowing append → `poison_all_redo_logs` → the
+    /// whole node FENCED until restart. This drives the replica apply path with
+    /// an armed backpressure whose redo is (near-)exhausted and a batch that
+    /// would overflow it, then reclaims from another thread once the appender
+    /// blocks. The contract: the call STALLS on the gate and then SUCCEEDS
+    /// (batch applied, ack OK) WITHOUT poisoning the redo — the exact contrast
+    /// with the pre-fix immediate `LogFull` → fence.
+    #[test]
+    fn replica_apply_stalls_on_redo_backpressure_then_applies_without_fencing() {
+        use crate::redo::{RedoError, RedoLog, RedoOp};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Duration;
+
+        // A replica-shaped engine with a SMALL attached redo log so we can
+        // exhaust it cheaply. Keep the log Arc so the reclaim thread can reset
+        // it (mirroring the checkpoint drain freeing space).
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+        let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+        let log = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(log_dev, 0, 256 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![log.clone()]);
+
+        let bp = engine
+            .redo_backpressure()
+            .expect("attached redo log must expose a backpressure coordinator");
+        // Arm the coordinator: a drain (our reclaim thread below) is present.
+        // Unarmed, the gate is a pure no-op and the append would just LogFull.
+        bp.arm();
+
+        let reserve = (bp.capacity() / 8).max(1);
+
+        // Exhaust the log so `available_space` is BELOW both the gate's reserve
+        // (so the gate blocks) and a single entry (so an append absent the gate
+        // would genuinely LogFull). Fill with fat Create entries direct on the
+        // log handle.
+        let mut filler_seed = 0u8;
+        loop {
+            let avail = bp.available_space();
+            if avail < 4096 {
+                break;
+            }
+            let op = RedoOp::Create {
+                tx_key: TxKey {
+                    txid: [filler_seed; 32],
+                },
+                device_id: 0,
+                record_offset: 4096,
+                utxo_count: 1,
+                is_conflicting: false,
+                record_bytes: vec![0xCD; 2048].into(),
+                parent_txids: Vec::new(),
+            };
+            match log.lock().append_and_flush(op) {
+                Ok(_) => {}
+                Err(RedoError::LogFull { .. }) => break,
+                Err(e) => panic!("unexpected error while pre-filling redo: {e}"),
+            }
+            filler_seed = filler_seed.wrapping_add(1);
+        }
+        assert!(
+            bp.available_space() < reserve,
+            "pre-fill must leave the log below the gate reserve so the gate blocks",
+        );
+
+        // Reclaim thread: reset (frees the whole region) ONLY once an appender
+        // is blocked on the gate — this is the real drain handshake. Without
+        // the gate raising `blocked_appenders`, this never fires.
+        let done = Arc::new(AtomicBool::new(false));
+        let blocked_seen = Arc::new(AtomicBool::new(false));
+        let reclaimer = {
+            let log = log.clone();
+            let bp = bp.clone();
+            let done = done.clone();
+            let blocked_seen = blocked_seen.clone();
+            std::thread::spawn(move || {
+                // Keep reclaiming as long as the apply is running: the gate can
+                // in principle re-block if the batch's own appends refill the
+                // log below the reserve, so a one-shot reset could race the
+                // apply loop under load. Reset whenever an appender is blocked
+                // until the main thread signals the batch is done.
+                while !done.load(Ordering::Relaxed) {
+                    if bp.blocked_appenders() > 0 {
+                        blocked_seen.store(true, Ordering::Relaxed);
+                        log.lock().reset().expect("reset reclaims the region");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+
+        // A tracked replica batch of Creates that, applied, journals several
+        // entries — more than the residual free space, so absent the gate the
+        // first append would LogFull and fence the node.
+        let ops: Vec<ReplicaOp> = (0..4)
+            .map(|i| ReplicaOp::Create {
+                tx_key: key(100 + i),
+                metadata_bytes: vec![0u8; 64],
+                utxo_hashes: vec![[0xAA; 32]; 2],
+                cold_data: None,
+                is_external: false,
+            })
+            .collect();
+        let batch = ReplicaBatch {
+            first_sequence: 10,
+            ops,
+            trace_ctx: None,
+            source_node_id: None,
+            cluster_key: 0,
+        };
+        let tracker = ReplicaAppliedTracker::in_memory();
+        let stream_key = "peer-bp:5000";
+        // Seed the watermark so first_sequence=10 is the next-expected position.
+        tracker.set(stream_key, 9);
+        let last_applied = Arc::new(AtomicU64::new(0));
+
+        let resp = handle_replica_batch_with_tracker(
+            &batch_request(&batch, 1),
+            &engine,
+            &last_applied,
+            Some(&tracker),
+            stream_key,
+            0,
+        );
+
+        done.store(true, Ordering::Relaxed);
+        reclaimer.join().unwrap();
+
+        // (a) The apply SUCCEEDED — batch applied, ack OK — rather than
+        // erroring / fencing.
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "replica batch under backpressure must apply, not error",
+        );
+        let ack = ReplicaAck::deserialize(&resp.payload).unwrap();
+        assert_eq!(
+            ack,
+            ReplicaAck::Ok {
+                through_sequence: 13
+            },
+            "the whole batch must be acked through its last sequence",
+        );
+        // Every op's record is actually present.
+        for i in 0..4 {
+            assert!(
+                engine.lookup(&key(100 + i)).is_some(),
+                "record {i} from the applied batch must exist",
+            );
+        }
+        // The gate genuinely engaged: an appender blocked and the reclaim ran.
+        assert!(
+            blocked_seen.load(Ordering::Relaxed),
+            "the apply must have stalled on the backpressure gate (appender blocked)",
+        );
+
+        // (b) The redo is NOT poisoned — the pre-fix path would have called
+        // `poison_all_redo_logs`, fencing the node. Post-reclaim the log is
+        // empty; a fresh append MUST succeed (a poisoned log returns
+        // `RedoError::Poisoned`).
+        let probe = RedoOp::Create {
+            tx_key: TxKey { txid: [0xEE; 32] },
+            device_id: 0,
+            record_offset: 4096,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: vec![0x11; 128].into(),
+            parent_txids: Vec::new(),
+        };
+        match log.lock().append_and_flush(probe) {
+            Ok(_) => {}
+            Err(RedoError::Poisoned) => {
+                panic!("redo was poisoned — the replica node was fenced (issue #29 regression)")
+            }
+            Err(e) => panic!("unexpected redo error after backpressure apply: {e}"),
+        }
     }
 
     /// `replica_restart_remembers_last_applied_seq`: after persisting

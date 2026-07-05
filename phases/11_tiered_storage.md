@@ -42,7 +42,7 @@ Key points for tiered storage:
 ### 11.1 Storage tier definitions — `src/storage/tiers.rs`
 
 ```rust
-pub const INLINE_THRESHOLD: usize = 8 * 1024;      // 8 KiB — same NVMe write as hot record
+pub const INLINE_THRESHOLD: usize = 1024 * 1024;   // 1 MiB — same NVMe write as hot record
 pub const SEPARATE_THRESHOLD: usize = 1024 * 1024;  // 1 MiB — separate NVMe write
 // Above SEPARATE_THRESHOLD → external blob store
 

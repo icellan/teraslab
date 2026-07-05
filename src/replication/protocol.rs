@@ -216,7 +216,7 @@ pub enum ReplicaOp {
     /// index is updated. The master emits this (instead of [`Self::Delete`])
     /// when `tombstones_enabled`, carrying the same `deletion_height` /
     /// `generation` / `cause` the master's own tombstone recorded. `cause` is
-    /// the [`crate::tombstone::TombstoneCause`] discriminant byte.
+    /// the `TombstoneCause` discriminant byte.
     ///
     /// Like [`Self::Delete`], this carries no `master_generation` idempotency
     /// token — it is an idempotent remove keyed on `tx_key`. The `generation`

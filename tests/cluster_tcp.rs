@@ -25,7 +25,9 @@ use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::{WireCreateItem, encode_create_batch};
 use teraslab::protocol::frame::*;
 use teraslab::protocol::opcodes::*;
+use teraslab::redo::RedoLog;
 use teraslab::replication::manager::AckPolicy;
+use teraslab::segment_allocator::SegmentAllocator;
 use teraslab::server::Server;
 
 #[allow(dead_code)]
@@ -63,6 +65,16 @@ const TEST_CLUSTER_ID: ClusterId = ClusterId([0xA5; 16]);
 /// that exercise a single-node cluster or that don't need replica handling.
 /// `rf=2` is the production default; pass it for tests that join multiple
 /// nodes and want to exercise the replication path.
+/// The default replication runtime every in-process test node uses.
+fn default_test_replication() -> ReplicationRuntimeConfig {
+    ReplicationRuntimeConfig {
+        ack_policy: None,
+        best_effort: true,
+        timeout: Duration::from_secs(3),
+        timeout_during_migration: Duration::from_secs(30),
+    }
+}
+
 fn create_node(
     node_id: u64,
     tcp_port: u16,
@@ -76,12 +88,7 @@ fn create_node(
         swim_port,
         seed_swim_ports,
         rf,
-        ReplicationRuntimeConfig {
-            ack_policy: None,
-            best_effort: true,
-            timeout: Duration::from_secs(3),
-            timeout_during_migration: Duration::from_secs(30),
-        },
+        default_test_replication(),
     )
 }
 
@@ -105,6 +112,27 @@ fn create_node_with_replication_runtime(
     )
 }
 
+/// A clustered node running the log-structured SEGMENT engine (Phase 5/6).
+fn create_segment_node(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+) -> TestNode {
+    create_node_full_engine(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        default_test_replication(),
+        TEST_CLUSTER_ID,
+        4,
+        true,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_node_full(
     node_id: u64,
@@ -115,6 +143,34 @@ fn create_node_full(
     replication: ReplicationRuntimeConfig,
     cluster_id: ClusterId,
     migration_pool_size: usize,
+) -> TestNode {
+    create_node_full_engine(
+        node_id,
+        tcp_port,
+        swim_port,
+        seed_swim_ports,
+        rf,
+        replication,
+        cluster_id,
+        migration_pool_size,
+        false,
+    )
+}
+
+/// Like [`create_node_full`] but selects the storage engine. `segment == true`
+/// builds a clustered log-structured node (redo log attached, buffered
+/// durability, `set_clustered`) — the shape a clustered segment node runs.
+#[allow(clippy::too_many_arguments)]
+fn create_node_full_engine(
+    node_id: u64,
+    tcp_port: u16,
+    swim_port: u16,
+    seed_swim_ports: &[u16],
+    rf: u8,
+    replication: ReplicationRuntimeConfig,
+    cluster_id: ClusterId,
+    migration_pool_size: usize,
+    segment: bool,
 ) -> TestNode {
     let tcp_port = if tcp_port == 0 {
         reserve_tcp_port()
@@ -132,16 +188,35 @@ fn create_node_full(
     };
 
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(32 * 1024 * 1024, 4096).unwrap());
-    let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1000).unwrap();
-    let engine = Arc::new(Engine::new(
-        dev,
-        index,
-        alloc,
-        StripedLocks::new(256),
-        DahIndex::new(),
-        UnminedIndex::new(),
-    ));
+    let engine = if segment {
+        let seg = SegmentAllocator::new(dev.clone(), 64 * 4096).unwrap();
+        let engine = Engine::new(
+            dev,
+            index,
+            seg,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+        let log_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let log = RedoLog::open(log_dev, 0, 16 * 1024 * 1024).unwrap();
+        engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
+        engine.set_buffered_durability(true);
+        engine.set_clustered(true);
+        Arc::new(engine)
+    } else {
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(256),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ))
+    };
 
     let seeds: Vec<std::net::SocketAddr> = seed_swim_ports
         .iter()
@@ -927,6 +1002,329 @@ fn migrate_shard_with_records_to_new_node() {
 
     shutdown_node(&node1);
     shutdown_node(&node2);
+}
+
+/// Phase 4/6 (specs/SEGMENT_CLUSTERING_DESIGN.md): a full multi-node cluster
+/// running the log-structured SEGMENT engine discovers peers over SWIM, commits
+/// a 2-node topology, and migrates shards (with records) to a joining segment
+/// node — the real coordinator + migration path, end to end, on segment.
+#[test]
+fn segment_cluster_migrates_shard_with_records_to_new_node() {
+    // Single segment node, RF=1 (writes land on node1 alone before node2 joins).
+    let node1 = create_segment_node(361, 13560, 13561, &[], 1);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", node1.tcp_port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Create 100 records on the segment node.
+    let records: Vec<_> = (0..100u32)
+        .map(|i| (make_txid(i + 30000), make_txid(i + 40000)))
+        .collect();
+    for chunk in records.chunks(10) {
+        let payload = encode_multi_create_payload(chunk);
+        let resp = send_request(
+            &mut stream,
+            &RequestFrame {
+                request_id: 1,
+                op_code: OP_CREATE_BATCH,
+                flags: 0,
+                payload: payload.into(),
+            },
+        );
+        assert!(
+            resp.status == STATUS_OK || resp.status == STATUS_PARTIAL_ERROR,
+            "segment create should succeed, got status {}",
+            resp.status
+        );
+    }
+
+    // A second SEGMENT node joins → SWIM discovery + rebalance + migration.
+    let node2 = create_segment_node(362, 13562, 13563, &[13561], 1);
+
+    wait_until(
+        || node2.cluster.committed_topology_members().len() == 2,
+        Duration::from_secs(5),
+    )
+    .expect("2-node segment topology should commit on node2 after it joins");
+
+    // The rebalance moves shards to node2. Wait for the shard table to reflect
+    // node2 ownership (the rebalance/migration runs async after the topology
+    // commits; a bare read races it under parallel-test CPU load).
+    wait_until(
+        || {
+            node2
+                .cluster
+                .shard_table()
+                .read()
+                .shard_counts()
+                .get(&NodeId(362))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        },
+        Duration::from_secs(10),
+    )
+    .expect("joining segment node must own shards after rebalance");
+
+    // node2 must SERVE its shards after the rebalance: a create for a key node2 now
+    // masters succeeds on node2's segment engine (the user-facing guarantee that
+    // the joined segment node is a full cluster participant). (Physical migration
+    // of the pre-existing records' bytes is validated at the apply level by
+    // tests/segment_cluster_e2e.rs::joining_segment_node_receives_record_via_migration_create_*.)
+    let node2_key = (0..2000u32)
+        .map(|i| make_txid(i + 50000))
+        .find(|txid| {
+            matches!(
+                node2.cluster.is_master(&TxKey { txid: *txid }),
+                MasterQueryResult::Yes
+            )
+        })
+        .expect("node2 must master at least one shard after rebalance");
+
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", node2.tcp_port)).unwrap();
+    stream2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let hash = make_txid(999);
+    let create_resp = send_request(
+        &mut stream2,
+        &RequestFrame {
+            request_id: 3,
+            op_code: OP_CREATE_BATCH,
+            flags: 0,
+            payload: encode_multi_create_payload(&[(node2_key, hash)]).into(),
+        },
+    );
+    assert_eq!(
+        create_resp.status, STATUS_OK,
+        "node2 must serve a create for a shard it masters after joining"
+    );
+    // The record it just wrote is present + readable on node2's own segment engine.
+    let entry = node2
+        .server
+        .engine()
+        .lookup(&TxKey { txid: node2_key })
+        .expect("record node2 just created must be on node2's segment engine");
+    assert_eq!(
+        node2
+            .server
+            .engine()
+            .read_slot(&TxKey { txid: node2_key }, 0)
+            .unwrap()
+            .status,
+        teraslab::record::UTXO_UNSPENT,
+        "node2's segment engine serves the record it created"
+    );
+    let _ = entry;
+
+    shutdown_node(&node1);
+    shutdown_node(&node2);
+}
+
+/// Phase 6 (specs/SEGMENT_CLUSTERING_DESIGN.md): MASTER FAILOVER on the segment
+/// engine. A record written on its master under RF=2 is replicated to its replica
+/// (proving segment write replication reaches the replica's engine); when the
+/// master is killed, the replica is promoted and the record SURVIVES on it — no
+/// lost data across a segment master failover.
+#[test]
+fn segment_cluster_master_failover_preserves_replicated_record() {
+    let node1 = create_segment_node(461, 0, 0, &[], 2);
+    let node2 = create_segment_node(462, 0, 0, &[node1.swim_port], 2);
+    let node3 = create_segment_node(463, 0, 0, &[node1.swim_port], 2);
+    let node_by_id = |id: u64| -> &TestNode {
+        match id {
+            461 => &node1,
+            462 => &node2,
+            463 => &node3,
+            other => panic!("unknown node id {other}"),
+        }
+    };
+
+    // 3-node topology committed on every node.
+    wait_until(
+        || {
+            [&node1, &node2, &node3]
+                .iter()
+                .all(|n| n.cluster.committed_topology_members().len() == 3)
+        },
+        Duration::from_secs(30),
+    )
+    .expect("3-node segment topology should commit");
+
+    // Wait until the chosen key has a SERVING master (a node answering
+    // is_master==Yes) — the real readiness signal, and no fence in flight.
+    let txid = make_txid(60001);
+    let key = TxKey { txid };
+    wait_until(
+        || {
+            [461u64, 462, 463].into_iter().any(|id| {
+                matches!(
+                    node_by_id(id).cluster.is_master(&key),
+                    MasterQueryResult::Yes
+                )
+            })
+        },
+        Duration::from_secs(30),
+    )
+    .expect("the key must have a serving master after the cluster forms");
+    let master_id = [461u64, 462, 463]
+        .into_iter()
+        .find(|id| {
+            matches!(
+                node_by_id(*id).cluster.is_master(&key),
+                MasterQueryResult::Yes
+            )
+        })
+        .expect("some node must master the key");
+    let master = node_by_id(master_id);
+    let replica_id = {
+        let shard = ShardTable::shard_for_key(&key);
+        let table = master.cluster.shard_table();
+        let a = table.read().assignment(shard).clone();
+        assert!(
+            !a.replicas.is_empty(),
+            "RF=2 shard must have a replica assigned"
+        );
+        a.replicas[0].0
+    };
+    let replica = node_by_id(replica_id);
+
+    // Create the record on its MASTER via the wire, retrying through a transient
+    // partial-error (a brief fence during cluster settle) until it lands.
+    let hash = make_txid(70001);
+    let mut master_stream = TcpStream::connect(format!("127.0.0.1:{}", master.tcp_port)).unwrap();
+    master_stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    wait_until(
+        || {
+            let resp = send_request(
+                &mut master_stream,
+                &RequestFrame {
+                    request_id: 1,
+                    op_code: OP_CREATE_BATCH,
+                    flags: 0,
+                    payload: encode_multi_create_payload(&[(txid, hash)]).into(),
+                },
+            );
+            resp.status == STATUS_OK && master.server.engine().lookup(&key).is_some()
+        },
+        Duration::from_secs(10),
+    )
+    .expect("create on the shard master must succeed and land on its engine");
+
+    // RF=2: the write must replicate to the REPLICA's segment engine.
+    wait_until(
+        || replica.server.engine().lookup(&key).is_some(),
+        Duration::from_secs(10),
+    )
+    .expect("RF=2 must replicate the create to the replica's segment engine");
+    let replicated = replica.server.engine().lookup(&key).unwrap();
+    assert_eq!(
+        replicated.utxo_count, 1,
+        "replicated record shape preserved"
+    );
+
+    // Kill the MASTER.
+    shutdown_node(node_by_id(master_id));
+
+    // A survivor observes the master leave, then the replica is promoted to master
+    // of the shard and STILL holds the record — the failover lost nothing.
+    wait_until(
+        || {
+            !replica
+                .cluster
+                .node_addresses()
+                .contains_key(&NodeId(master_id))
+        },
+        Duration::from_secs(10),
+    )
+    .expect("survivors should drop the killed master after suspicion");
+    wait_until(
+        || matches!(replica.cluster.is_master(&key), MasterQueryResult::Yes),
+        Duration::from_secs(15),
+    )
+    .expect("the replica must be promoted to master of the shard after failover");
+    assert!(
+        replica.server.engine().lookup(&key).is_some(),
+        "the replicated record must survive master failover on the promoted node"
+    );
+
+    // Clean up the survivors (the killed master is already down).
+    for id in [461u64, 462, 463] {
+        if id != master_id {
+            shutdown_node(node_by_id(id));
+        }
+    }
+}
+
+/// Phase 6: a segment node LEAVES the cluster and a fresh segment node REJOINS —
+/// it re-discovers peers, re-commits a 2-node topology, and takes shard ownership,
+/// proving a segment node re-participates after a membership change.
+#[test]
+fn segment_node_rejoins_and_takes_shard_ownership() {
+    let node1 = create_segment_node(471, 0, 0, &[], 2);
+    let node2 = create_segment_node(472, 0, 0, &[node1.swim_port], 2);
+    let seed = node1.swim_port;
+
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2.cluster.committed_topology_members().len() == 2
+        },
+        // Generous deadline: SWIM discovery + first topology commit can be slow
+        // on a contended CI runner. `wait_until` returns as soon as the topology
+        // commits, so this costs nothing on a healthy run — it only tolerates a
+        // slow one (macOS-runner flakiness fix).
+        Duration::from_secs(45),
+    )
+    .expect("initial 2-node segment topology should commit");
+
+    // node2 leaves.
+    shutdown_node(&node2);
+    wait_until(
+        || !node1.cluster.node_addresses().contains_key(&NodeId(472)),
+        // Failure detection is SWIM-timeout bound; give it generous headroom on
+        // a slow runner (short-circuits on success, so free on a healthy run).
+        Duration::from_secs(25),
+    )
+    .expect("node1 should drop node2 after it leaves");
+
+    // A FRESH segment node rejoins via the same seed.
+    let node2b = create_segment_node(473, 0, 0, &[seed], 2);
+    wait_until(
+        || {
+            node1.cluster.committed_topology_members().len() == 2
+                && node2b.cluster.committed_topology_members().len() == 2
+        },
+        Duration::from_secs(45),
+    )
+    .expect("rejoined segment node should re-commit a 2-node topology");
+    // The rejoined node takes ownership of shards.
+    wait_until(
+        || {
+            node2b
+                .cluster
+                .shard_table()
+                .read()
+                .shard_counts()
+                .get(&NodeId(473))
+                .copied()
+                .unwrap_or(0)
+                > 0
+        },
+        // Rebalance after a rejoin is the slowest step (topology commit →
+        // shard-table recompute → install); this deadline flaked at 15s on a
+        // contended macOS runner. `wait_until` returns the instant the rejoined
+        // node owns a shard, so the larger deadline only helps a slow runner.
+        Duration::from_secs(30),
+    )
+    .expect("rejoined segment node must own shards after rebalance");
+
+    shutdown_node(&node1);
+    shutdown_node(&node2b);
 }
 
 #[test]

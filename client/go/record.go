@@ -28,14 +28,19 @@ type TxRecord struct {
 	TxData *TxData
 
 	// BlockEntries lists the blocks this transaction has been mined into.
-	// Non-nil when FieldBlockEntries was requested and the record exists.
-	// Capped at MaxInlineBlockEntries; see BlockEntriesTruncated.
+	// Non-nil when FieldBlockEntries or FieldBlockEntriesAll was requested and
+	// the record exists.
+	//
+	// With FieldBlockEntries this is capped at MaxInlineBlockEntries (see
+	// BlockEntriesTruncated). With FieldBlockEntriesAll it holds the COMPLETE
+	// inline+overflow set, uncapped, and BlockEntriesTruncated is always false.
 	BlockEntries []BlockEntry
 
 	// BlockEntriesTruncated is true when the record declares more block entries
-	// than fit in the inline section (MaxInlineBlockEntries). The surplus is
-	// stored in on-disk overflow and is absent from BlockEntries; reading it
-	// requires repair tooling that follows block_overflow_offset.
+	// than were returned. This can only happen with FieldBlockEntries, which
+	// caps at MaxInlineBlockEntries and leaves the surplus in on-disk overflow.
+	// Request FieldBlockEntriesAll instead to receive the full set; that path
+	// always leaves this false.
 	BlockEntriesTruncated bool
 
 	// ConflictingChildren contains txids of transactions that were created
@@ -143,6 +148,23 @@ func decodeRecord(fieldMask uint32, data []byte) (TxRecord, error) {
 				inlineCount = MaxInlineBlockEntries
 			}
 			pos += 1 + inlineCount*12
+		}
+	}
+
+	// FieldBlockEntriesAll occupies the same wire position as FieldBlockEntries
+	// (a caller requests one or the other, never both). It carries the complete
+	// inline+overflow set, so BlockEntries holds every entry and
+	// BlockEntriesTruncated stays false.
+	if fieldMask&FieldBlockEntriesAll != 0 {
+		if pos < len(data) {
+			entries, err := DecodeAllBlockEntries(data[pos:])
+			if err != nil {
+				return rec, err
+			}
+			rec.BlockEntries = entries
+			rec.BlockEntriesTruncated = false
+			// Advance past: 1-byte count + count * 12 bytes.
+			pos += 1 + len(entries)*12
 		}
 	}
 

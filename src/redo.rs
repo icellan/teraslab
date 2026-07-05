@@ -178,6 +178,63 @@ pub enum RedoError {
 
 pub type Result<T> = std::result::Result<T, RedoError>;
 
+/// Classify a low-level I/O error as "the storage backing the redo log is
+/// full" — either the filesystem/device is out of space (`ENOSPC`) or the
+/// process/user has hit its disk quota (`EDQUOT`).
+///
+/// Issue #32: when a redo flush fails with one of these, the log is poisoned
+/// and only a restart after freeing space recovers it — a materially different
+/// operator action than a generic I/O fault (bad sector, device gone), so the
+/// flush-failure sites log a distinct, actionable message when this returns
+/// `true`.
+///
+/// Constants come from `libc` so each target OS gets the right raw value
+/// (`ENOSPC` is 28 everywhere; `EDQUOT` is 122 on Linux, 69 on macOS/BSD). We
+/// also honour [`std::io::ErrorKind::StorageFull`] where the stdlib has already
+/// mapped `ENOSPC` for us, so the classifier stays correct even if a caller
+/// constructed the error via `ErrorKind` rather than a raw OS code.
+pub fn is_storage_full(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::StorageFull {
+        return true;
+    }
+    match err.raw_os_error() {
+        Some(code) => code == libc::ENOSPC || code == libc::EDQUOT,
+        None => false,
+    }
+}
+
+/// Peel a [`RedoError`] down to the underlying [`std::io::Error`], if any, so a
+/// flush-failure site can run it through [`is_storage_full`]. Only the
+/// `Io(DeviceError::Io(_))` chain — the path a real device write/fsync failure
+/// takes — carries an OS error; every other variant is a logic/format error
+/// with no OS code and returns `None`.
+fn redo_error_io(err: &RedoError) -> Option<&std::io::Error> {
+    match err {
+        RedoError::Io(crate::device::DeviceError::Io(io)) => Some(io),
+        _ => None,
+    }
+}
+
+/// Emit a distinct, actionable log line for a redo flush failure. When the
+/// underlying error is `ENOSPC`/`EDQUOT` (see [`is_storage_full`]) the device /
+/// filesystem is full: the log is now poisoned and only a restart AFTER freeing
+/// space recovers it, so we log that explicitly at `ERROR` rather than letting
+/// it read as a generic transient I/O fault. Any other error keeps the plain
+/// I/O-error log. Issue #32.
+fn log_flush_failure(context: &str, err: &RedoError) {
+    if redo_error_io(err).is_some_and(is_storage_full) {
+        tracing::error!(
+            err = %err,
+            context,
+            "redo flush failed: data device / filesystem is FULL (ENOSPC/EDQUOT); \
+             the redo log is now poisoned and the node will reject writes — free \
+             space on the redo device and RESTART the process to recover"
+        );
+    } else {
+        tracing::error!(err = %err, context, "redo flush failed (I/O error); redo log poisoned");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RedoHeader (F-G4-001)
 // ---------------------------------------------------------------------------
@@ -524,10 +581,14 @@ const OP_CREATE_V2: u8 = 39;
 /// authoritative image back from the data device at the new `record_offset`
 /// (CRC/tx_id verified; a buffered-tail loss keeps the pre-relocation record,
 /// which is still intact because append-only never overwrites the old extent
-/// until defrag). Recovery-only: the segment engine is non-clustered in v1, so a
-/// relocate never needs op-based replication conversion (a logical spend op
-/// would; design §0.x). See `bench/results/LOG_STRUCTURED_DATA_LAYER_DESIGN.md`.
+/// until defrag). Recovery-only and STANDALONE-only: it is never emitted on a
+/// clustered node — there a segment spend's replication and recovery are both
+/// carried by the convertible `SpendV2` (the relocate move journals nothing), so
+/// a physical relocate never needs op-based replication conversion. See
+/// `specs/SEGMENT_CLUSTERING_DESIGN.md`.
 const OP_RELOCATE: u8 = 40;
+// Opcode 41 was `OP_RELOCATE_V2` (the retired fat clustered-segment relocate).
+// Superseded by the convertible `SpendV2`; do not reuse 41 without care.
 
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `Create` redo entry. Bitcoin transactions in practice rarely have
@@ -2271,12 +2332,37 @@ impl RedoEntry {
 pub struct RedoAtomics {
     write_pos: AtomicU64,
     entries_region_size: u64, // immutable after open
+    /// Lock-free mirror of `RedoLog::poisoned`. Set `true` the instant the log
+    /// is poisoned (a flush I/O failure — see `RedoLog::poison_drop_buffer` /
+    /// `RedoLog::poison`) so a health probe can observe write-health WITHOUT
+    /// taking the redo writer lock. Issue #32: a poisoned redo rejects every
+    /// mutation until a process restart, and the health endpoints must reflect
+    /// that so orchestration restarts/drains the node. It only ever goes
+    /// `false -> true` in normal operation (recovery on restart constructs a
+    /// fresh log); no path clears it in-process.
+    poisoned: AtomicBool,
 }
 
 impl RedoAtomics {
     /// Bytes written into the entries region (mirrors `RedoLog::write_position`).
     pub fn write_position(&self) -> u64 {
         self.write_pos.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Whether the mirrored log has been poisoned by a flush failure, read
+    /// WITHOUT taking the redo writer lock. `true` means the log rejects all
+    /// further appends/flushes (`RedoError::Poisoned`) and only a restart +
+    /// recovery can restore write acceptance. See the field docs for why this
+    /// mirror exists (issue #32).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Publish that the mirrored log is poisoned. Called from every path that
+    /// sets `RedoLog::poisoned` so the lock-free mirror never lags the true
+    /// state.
+    fn set_poisoned(&self) {
+        self.poisoned.store(true, AtomicOrdering::Relaxed);
     }
 
     /// Bytes available for a NEW forward append — `entries_region_size −
@@ -2583,7 +2669,7 @@ impl RingState {
 /// in-place wrap — see the module-level documentation for the full
 /// rationale (R-027 / BC-13).
 ///
-/// Lever 7: when [`Self::ring`] is `Some`, the log instead uses an in-device
+/// Lever 7: when `Self::ring` is `Some`, the log instead uses an in-device
 /// **segment ring** ([`RingState`], `docs/REDO_SEGMENT_RING_DESIGN.md`) — the
 /// `write_pos`/`logical_start` linear fields are unused and the append/flush
 /// paths key off the ring pointers.
@@ -2776,6 +2862,7 @@ impl RedoLog {
             atomics: Arc::new(RedoAtomics {
                 write_pos: AtomicU64::new(0),
                 entries_region_size: log_size - header_block_size,
+                poisoned: AtomicBool::new(false),
             }),
             shared_seq: None,
             ring: None,
@@ -3805,6 +3892,7 @@ impl RedoLog {
                     // durable prefix). `poison_drop_buffer` is idempotent on the
                     // now-empty buffer.
                     self.poison_drop_buffer();
+                    log_flush_failure("flush_pwrite_no_sync", &e);
                     return Err(e);
                 }
                 Ok(true)
@@ -3956,7 +4044,9 @@ impl RedoLog {
                 m.redo_flush_errors_total.inc();
             }
             self.poison_drop_buffer();
-            return Err(e.into());
+            let err: RedoError = e.into();
+            log_flush_failure("sync_device", &err);
+            return Err(err);
         }
         crate::fault_injection::check(crate::fault_injection::SyncPoint::AfterRedoFsync);
         Ok(())
@@ -3973,8 +4063,29 @@ impl RedoLog {
     /// F-G4-002: drop all in-flight buffer + pending state on flush
     /// failure. Other threads that contributed to `buffer` will see
     /// `Poisoned` on their next call.
+    ///
+    /// FOLLOW-UP (issue #32): the poison is sticky and only a restart + recovery
+    /// clears it — there is deliberately no in-process auto-recovery. By the time
+    /// a flush fails, `prepare_flush` (phase 1, under the lock) has ALREADY
+    /// advanced `write_pos`, moved the pending entries into the read cache, and
+    /// bumped the sequence high-water — all BEFORE `commit_flush`/`sync_device`
+    /// does the actual O_DIRECT pwrite/fsync that ENOSPC'd. So on failure the
+    /// in-memory state is ahead of what is durable with no rollback. Auto-clearing
+    /// the poison without a restart would require atomically rewinding `write_pos`,
+    /// the read cache, and the sequence high-water together on the hottest, most
+    /// correctness-critical path (a wrong rewind silently loses or duplicates
+    /// acked writes and diverges the replication sequence). That is out of scope
+    /// here; this fix instead makes the failure HONEST and OBSERVABLE (health
+    /// endpoints, `/status`, and a distinct ENOSPC/EDQUOT log) so orchestration
+    /// performs the existing safe recovery — restart — automatically.
     fn poison_drop_buffer(&mut self) {
         self.poisoned = true;
+        // Issue #32: publish to the lock-free mirror so a health probe observes
+        // the poison WITHOUT taking this log's writer lock. Every poison path
+        // funnels through here (`poison`, the `sync_device` / `flush_pwrite_no_sync`
+        // I/O-error branches, the multi-store fail-closed path), so this is the
+        // single site that keeps the mirror in lockstep with `self.poisoned`.
+        self.atomics.set_poisoned();
         self.buffer.clear();
         self.pending_entries.clear();
         self.buffered_entries = 0;
@@ -9195,5 +9306,154 @@ mod tests {
         // The atomic snapshot must agree with the locked accessors.
         assert_eq!(atomics.write_position(), log.write_position());
         assert_eq!(atomics.available_space(), log.available_space());
+    }
+
+    /// A device whose `sync` (and thus the default `sync_data`) fails with a
+    /// caller-chosen `io::Error`, so a `flush()` poisons the log via the real
+    /// `sync_device` fail-closed path — the exact failure issue #32 describes.
+    struct SyncFailingDevice {
+        inner: Arc<MemoryDevice>,
+        err_code: AtomicU64, // 0 = succeed, else raw OS errno to return from sync
+    }
+
+    impl SyncFailingDevice {
+        fn new(size: u64) -> Self {
+            Self {
+                inner: Arc::new(MemoryDevice::new(size, 4096).unwrap()),
+                err_code: AtomicU64::new(0),
+            }
+        }
+
+        fn fail_sync_with(&self, errno: i32) {
+            self.err_code.store(errno as u64, Ordering::SeqCst);
+        }
+    }
+
+    impl BlockDevice for SyncFailingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        fn sync(&self) -> crate::device::Result<()> {
+            let code = self.err_code.load(Ordering::SeqCst);
+            if code != 0 {
+                return Err(DeviceError::Io(std::io::Error::from_raw_os_error(
+                    code as i32,
+                )));
+            }
+            self.inner.sync()
+        }
+    }
+
+    #[test]
+    fn is_storage_full_classifies_enospc_edquot_and_rejects_others() {
+        // ENOSPC (28 on every target) — the filesystem/device-full case.
+        let enospc = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert!(
+            is_storage_full(&enospc),
+            "ENOSPC (os error {}) must classify as storage-full",
+            libc::ENOSPC
+        );
+        // EDQUOT — quota exhausted (122 on Linux, 69 on macOS/BSD).
+        let edquot = std::io::Error::from_raw_os_error(libc::EDQUOT);
+        assert!(
+            is_storage_full(&edquot),
+            "EDQUOT (os error {}) must classify as storage-full",
+            libc::EDQUOT
+        );
+        // The stdlib-mapped ErrorKind path, even with no raw OS code.
+        let kinded = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert!(
+            is_storage_full(&kinded),
+            "ErrorKind::StorageFull must classify as storage-full"
+        );
+        // A permission error is NOT storage-full.
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert!(
+            !is_storage_full(&denied),
+            "EACCES must NOT classify as storage-full"
+        );
+        // A generic, OS-code-less error is NOT storage-full.
+        let generic = std::io::Error::other("some other failure");
+        assert!(
+            !is_storage_full(&generic),
+            "a generic error must NOT classify as storage-full"
+        );
+    }
+
+    #[test]
+    fn redo_error_io_peels_only_the_io_chain() {
+        // The Io(DeviceError::Io(_)) chain carries the OS error and peels.
+        let io_err: RedoError =
+            DeviceError::Io(std::io::Error::from_raw_os_error(libc::ENOSPC)).into();
+        let peeled = redo_error_io(&io_err).expect("Io chain must peel to an io::Error");
+        assert_eq!(peeled.raw_os_error(), Some(libc::ENOSPC));
+        assert!(is_storage_full(peeled));
+        // A non-Io variant carries no OS error.
+        assert!(
+            redo_error_io(&RedoError::Poisoned).is_none(),
+            "Poisoned must not peel to an io::Error"
+        );
+    }
+
+    #[test]
+    fn atomics_poisoned_mirror_flips_on_flush_failure_without_lock() {
+        let dev = Arc::new(SyncFailingDevice::new(1 << 20));
+        let mut log = RedoLog::open(dev.clone(), 0, 1 << 20).unwrap();
+        // Grab the lock-free mirror up front — the health probe holds only this.
+        let atomics = log.atomics();
+        assert!(
+            !atomics.is_poisoned(),
+            "a freshly-opened log must be write-healthy"
+        );
+
+        // Buffer an op, then make the durability fsync fail with ENOSPC so the
+        // real fail-closed path poisons the log.
+        log.append(RedoOp::Checkpoint).unwrap();
+        dev.fail_sync_with(libc::ENOSPC);
+        let err = log
+            .flush()
+            .expect_err("flush must fail when sync returns ENOSPC");
+        // The error must be the OS-code-bearing Io chain, classified storage-full.
+        let io = redo_error_io(&err).expect("flush error must carry the io::Error");
+        assert_eq!(io.raw_os_error(), Some(libc::ENOSPC));
+        assert!(is_storage_full(io));
+
+        // The mirror must now read poisoned WITHOUT touching the log lock.
+        assert!(
+            atomics.is_poisoned(),
+            "the lock-free mirror must flip to poisoned after a flush failure"
+        );
+        // And the locked state agrees.
+        assert!(log.poisoned, "the log itself must be poisoned");
+        // A subsequent append fails closed with the Poisoned variant.
+        assert!(matches!(
+            log.append(RedoOp::Checkpoint),
+            Err(RedoError::Poisoned)
+        ));
+    }
+
+    #[test]
+    fn atomics_poisoned_mirror_flips_on_explicit_poison() {
+        let (_dev, mut log) = make_log(1 << 20);
+        let atomics = log.atomics();
+        assert!(!atomics.is_poisoned());
+        log.poison();
+        assert!(
+            atomics.is_poisoned(),
+            "an explicit poison() (multi-store fail-closed) must publish to the mirror"
+        );
     }
 }

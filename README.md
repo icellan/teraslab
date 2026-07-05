@@ -166,34 +166,23 @@ device_paths = ["teraslab-data.dat"]  # Raw device or file path(s)
 device_size = 1073741824              # Bytes per device (regular files only; block devices are auto-detected)
 device_alignment = 4096               # I/O alignment (4096 for NVMe/SSD)
 
-# --- Recovery ---
+# --- Recovery & redo durability ---
 redo_log_size = 67108864              # Redo log size in bytes (64 MiB)
 redo_log_path = "teraslab-data.dat.redo"  # Optional explicit redo log path
 recovery_missing_primary_tolerance = 65536  # Max MissingPrimary replay failures tolerated during
                                       # startup recovery before aborting (default 65536)
+redo_buffered = true                  # default TRUE: ack mutation after in-memory redo append;
+                                      # background flusher syncs to disk every redo_flush_interval_ms.
+                                      # Set false for strict fsync-before-ack durability (also requires
+                                      # storage.engine = "in_place"; see "Storage engine" section below).
+redo_flush_interval_ms = 5            # How often the background flusher fsyncs the redo log (ms).
+                                      # Only relevant when redo_buffered = true. Lower = narrower
+                                      # crash-loss window at the cost of more frequent fsyncs.
 
-# --- Deletion & tombstones (on by default; see "Deletion & tombstones" below) ---
-tombstones_enabled = true             # default TRUE: the engine writes a durable deletion tombstone on
-                                      # every physical record delete and recovery reconstructs the index.
-                                      # When true, startup provisions a `.tombstone` device file +
-                                      # the redb tombstone index ([index] redb_tombstone_path).
-tombstone_region_size = 67108864      # On-device tombstone log region size in bytes (default 64 MiB).
-                                      # Unlike the redo log it is NOT reset on checkpoint; bounded only
-                                      # by GC compaction (when gc is enabled).
-# tombstone_log_path = "..."          # Optional explicit tombstone log path
-                                      # (default: first device path + ".tombstone")
+# --- Durable node height ---
 # last_durable_height_path = "..."    # Optional path for the durable node-height file
-                                      # (default: index_snapshot_path + ".height"). ALWAYS maintained,
-                                      # independent of the tombstone flags.
-tombstone_reconciliation_enabled = false  # SOAK-GATED, default FALSE: tombstone-driven migration
-                                      # reconciliation. When false, migration behaves as the pre-Phase-8 path.
-tombstone_gc_enabled = false          # SOAK-GATED, default FALSE: bounded-retention tombstone GC + the
-                                      # coupled rejoin-eligibility gate. When false, tombstones are retained
-                                      # unboundedly and the rejoin gate is inert.
-rejoin_grace_blocks = 100000          # Max staleness (block heights) a rejoining node may carry before it
-                                      # is forced into a full resync. Only consulted when tombstone_gc_enabled.
-tombstone_gc_poll_interval_ms = 60000 # Cadence the background GC daemon evaluates the GC horizon
-                                      # (default 60000 = 1 min). Only active when tombstone_gc_enabled.
+                                      # (default: index_snapshot_path + ".height"). Always maintained;
+                                      # a missing or corrupt file falls back to a record-derived floor.
 
 # --- Index ---
 index_snapshot_path = "teraslab-index.snap"
@@ -205,7 +194,6 @@ backend = "memory"                        # "memory" (default), "redb", or "file
 redb_path = "teraslab-index.redb"         # Primary index redb file
 redb_dah_path = "teraslab-dah.redb"       # DAH secondary index redb file
 redb_unmined_path = "teraslab-unmined.redb" # Unmined secondary index redb file
-redb_tombstone_path = "teraslab-tombstone.redb" # Deletion-tombstone lookup index (used regardless of backend; see "Deletion & tombstones")
 redb_cache_size = 268435456               # redb page cache in bytes (256 MiB default)
 file_backed_path = "teraslab-index.dat"   # mmap primary index file (only used when backend = "file_backed")
 
@@ -256,6 +244,21 @@ replica_lag_warn_threshold_ops = 10000 # Replica lag (ops) that degrades /health
 # cluster_id   = "..."   # 32 hex chars (16 bytes); pins cluster membership
 # device_id    = "..."   # 32 hex chars; startup refuses if the device's stored id mismatches
 # advertise_addr = "..." # address peers should dial if different from listen_addr
+
+# --- Storage engine ---
+# The default engine is log-structured segment. Standalone nodes omit this
+# section entirely (segment + buffered redo is the zero-config default).
+[storage]
+engine = "segment"   # default; log-structured append-cursor with compaction/defrag.
+                     # Creates append to a moving write cursor (sequential I/O);
+                     # spends relocate-on-write into a fresh segment append.
+                     # Background defrag compacts sparse segments during checkpoints.
+                     # Requires buffered redo durability (redo_buffered = true, the default).
+                     #
+                     # Set engine = "in_place" to use the best-fit freelist allocator:
+                     # records are placed at home offsets and updated in place.
+                     # Required for strict redo durability (redo_buffered = false).
+                     # Clustered nodes always use "in_place" (segment is standalone-only).
 ```
 
 ### Security and access control
@@ -760,11 +763,20 @@ let client = Client::new(ClientConfig {
 client.create_batch(&[CreateItem {
     txid,
     tx_version: 1,
+    locktime: 0,
     fee: 500,
     size_in_bytes: 225,
+    extended_size: 225,
+    is_coinbase: false,
+    spending_height: 0,
+    created_at: 0,
+    flags: 0,
     utxo_hashes: vec![hash0, hash1, hash2],
-    block_height: 800000,
-    ..Default::default()
+    cold_data: vec![],
+    mined_block_id: None,
+    mined_block_height: Some(800000),
+    mined_subtree_idx: None,
+    parent_txids: vec![],
 }]).await?;
 ```
 
@@ -805,12 +817,12 @@ Each transaction occupies a contiguous region on the block device:
 
 **TxMetadata** (320 bytes, compile-asserted, 64-byte aligned) contains: txid, version, locktime, fee, size, extended size, flags (conflicting, locked, external, coinbase, last_spent_all), block entries (up to 3 inline, overflow stored separately), spending height, creation timestamp, generation counter, update timestamp, unmined_since, delete_at_height, preserve_until, reassignment tracking, external storage reference, conflicting children tracking, and a trailing CRC32 over the whole header.
 
-**UtxoSlot** (73 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout), 4-byte CRC32 (torn-write protection per slot — BC-02 / F-X-007). Slots are pre-allocated at full size during creation. A spend's *logical* mutation is the 41-byte status+spending+CRC region, but the production write path (`io.rs` `write_utxo_slot_direct`) rewrites the full 73-byte slot in place and (`io.rs` `write_metadata_direct`) rewrites the full 320-byte metadata header (generation, counters, timestamps) — not just a 41-byte footer. On `DirectDevice` (`O_DIRECT`), each write amplifies to the device's sector size (4096 bytes on most NVMe drives) regardless.
+**UtxoSlot** (73 bytes each): 32-byte hash, 1-byte status (unspent/spent/frozen/pruned), 36-byte spending data (spending txid + vout), 4-byte CRC32 (torn-write protection per slot — BC-02 / F-X-007). Slots are pre-allocated at full size during creation. A spend's *logical* mutation is the 41-byte status+spending+CRC region. In the default **segment engine**, a spend appends a full relocated record to a new segment position (log-structured, sequential I/O). In the **in-place engine** (`engine = "in_place"`), `io.rs` `write_utxo_slot_direct` rewrites the full 73-byte slot in place and `write_metadata_direct` rewrites the full 320-byte metadata header. On `DirectDevice` (`O_DIRECT`), each write amplifies to the device's sector size (4096 bytes on most NVMe drives) regardless of engine choice.
 
 ### Tiered storage
 
 - **Hot path** (NVMe): Metadata + UTXO slots. All spend/setMined/freeze operations touch only this tier.
-- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Placement is **client-driven**: the client sets the `FLAG_EXTERNAL_BLOB` request flag to route cold data to the external blob store (pre-uploaded via the streaming chunk protocol); without the flag, cold data is written inline in the same NVMe allocation as the hot record. The server does not second-guess this choice — by the time it receives the frame, the client has already decided whether to stream the payload externally or inline it on the wire (inline payloads are bounded by `MAX_COLD_DATA_PER_ITEM` at the wire decoder). The `tier_for_size` / `INLINE_THRESHOLD` (8 KiB) helpers in `src/storage/tiers.rs` are an **advisory size guideline** for clients, not a server-enforced threshold. The earlier separate-device middle tier is not enabled because current metadata has no durable offset/length fields for it.
+- **Cold data** (filesystem blob store): Transaction inputs, outputs, and inpoints. Placement is **client-driven**: the client sets the `FLAG_EXTERNAL_BLOB` request flag to route cold data to the external blob store (pre-uploaded via the streaming chunk protocol); without the flag, cold data is written inline in the same NVMe allocation as the hot record. The server does not second-guess this choice — by the time it receives the frame, the client has already decided whether to stream the payload externally or inline it on the wire (inline payloads are bounded by `MAX_COLD_DATA_PER_ITEM` at the wire decoder). The `tier_for_size` / `INLINE_THRESHOLD` (1 MiB) helpers in `src/storage/tiers.rs` are an **advisory size guideline** for clients (matching the client default upload threshold), not a server-enforced threshold. The earlier separate-device middle tier is not enabled because current metadata has no durable offset/length fields for it.
 
 ### Crash recovery
 
@@ -832,18 +844,12 @@ applied is a no-op via generation guards and slot-state checks.
 
 The redo log is a fixed-size **linear** log on a separate device file (not a circular buffer): `write_pos` advances monotonically and never wraps in place. When the log fills before the next checkpoint, appends return `RedoError::LogFull` and writers stall until the periodic checkpoint task snapshots engine state and resets `write_pos` back to the start. Size `redo_log_size` so the log holds the mutations produced between checkpoints under peak load.
 
-### Deletion & tombstones
+### Durable node height
 
-`tombstones_enabled` defaults to **`true`**. With it on, every physical record delete also appends a durable **deletion tombstone**, and startup provisions two extra artifacts: a `.tombstone` device file (sibling to the `.redo` log, default path = first device path + `.tombstone`, sized by `tombstone_region_size`, default 64 MiB) holding the append-only on-device tombstone log, and the redb **tombstone lookup index** at `[index] redb_tombstone_path` (default `teraslab-tombstone.redb`). The on-device log is the durable source of truth; the redb file is a derived index rebuilt from the log on recovery. On startup, recovery reconstructs the index from the log (R1) and self-purges any record this node resurrected for a key the cluster authoritatively deleted (R2). Unlike the redo log, the tombstone log is **not** reset on checkpoint — it is bounded only by GC compaction (see below).
-
-The node's `last_durable_height` is persisted to a tiny CRC-protected file (`last_durable_height_path`, default = index snapshot path + `.height`). This is **always maintained**, independent of the tombstone flags.
-
-Two related capabilities are **soak-gated and ship off by default**:
-
-- `tombstone_reconciliation_enabled` (default `false`) — tombstone-driven migration reconciliation (Phase 8). When off, migration completion behaves byte-identically to the pre-Phase-8 path.
-- `tombstone_gc_enabled` (default `false`) — bounded-retention tombstone GC plus its coupled rejoin-eligibility gate. When off, tombstones are retained unboundedly and a catching-up node is admitted as before. When on, a tombstone becomes GC-eligible once `min_member_finalized_height − deletion_height ≥ rejoin_grace_blocks` (default `100000`), and a node more than `rejoin_grace_blocks` behind the cluster tip is refused incremental rejoin and full-resynced. The GC daemon evaluates the horizon every `tombstone_gc_poll_interval_ms` (default 60000 ms).
-
-Enable the two soak-gated flags only after CI soak validates convergence, no-loss, and no-resurrection.
+The node's `last_durable_height` is persisted to a tiny CRC-protected file
+(`last_durable_height_path`, default = index snapshot path + `.height`).
+This is always maintained; a missing or corrupt file falls back to a
+record-derived floor — never a hard failure.
 
 ## Index backends
 

@@ -120,6 +120,44 @@ pub struct TxIndexEntry {
     pub generation: u32,
 }
 
+impl TxIndexEntry {
+    /// Build an entry for a record recovered by a device scan, populating the
+    /// cached lifecycle fields (`dah_or_preserve`, `unmined_since`,
+    /// `generation`) and the `HAS_PRESERVE_UNTIL` discriminant from the parsed
+    /// metadata footer.
+    ///
+    /// This mirrors the live registration path (`Engine::sync_index_cache`):
+    /// `dah_or_preserve` holds `preserve_until` when it is non-zero (and the
+    /// index-only `HAS_PRESERVE_UNTIL` bit is set), otherwise `delete_at_height`.
+    /// Rebuild paths that hardcode these to `0` make a GET report an unmined tx
+    /// as mined and drop delete/preserve heights — a correctness bug — so every
+    /// device-scan construction site must use this instead of literal zeros.
+    #[must_use]
+    pub fn from_scanned_meta(record_offset: u64, meta: &crate::record::TxMetadata) -> Self {
+        let preserve = { meta.preserve_until };
+        let dah = { meta.delete_at_height };
+        let has_preserve = preserve != 0;
+        let dah_or_preserve = if has_preserve { preserve } else { dah };
+        let mut tx_flags = meta.flags.bits();
+        if has_preserve {
+            tx_flags |= crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits();
+        } else {
+            tx_flags &= !crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits();
+        }
+        Self {
+            device_id: 0,
+            record_offset,
+            utxo_count: { meta.utxo_count },
+            block_entry_count: meta.block_entry_count,
+            tx_flags,
+            spent_utxos: meta.spent_utxos,
+            dah_or_preserve,
+            unmined_since: { meta.unmined_since },
+            generation: { meta.generation },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bucket
 // ---------------------------------------------------------------------------
