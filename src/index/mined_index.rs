@@ -63,6 +63,12 @@ impl<'a> SnapshotCursor<'a> {
         self.pos += 4;
         Some(u32::from_le_bytes(bytes))
     }
+
+    fn read_u64(&mut self) -> Option<u64> {
+        let bytes: [u8; 8] = self.data.get(self.pos..self.pos + 8)?.try_into().ok()?;
+        self.pos += 8;
+        Some(u64::from_le_bytes(bytes))
+    }
 }
 
 #[derive(Default)]
@@ -151,9 +157,12 @@ impl MinedShard {
         out.sort_unstable(); // deterministic order for tests + downstream batching
     }
 
-    /// Append this shard's full state (entries + live flags, free list,
-    /// overflow map, unmined buckets) to `out` in plain little-endian
-    /// length-prefixed form. See [`ShardedMinedIndex::serialize`] for the
+    /// Append this shard's full state (entries + live flags, free list, and
+    /// overflow map) to `out` in plain little-endian length-prefixed form.
+    /// The `unmined` height buckets are deliberately NOT serialized — they're
+    /// re-derived by [`Self::deserialize`] from the loaded entries'
+    /// `unmined_since` fields, which is self-correcting against corruption
+    /// and shrinks the snapshot. See [`ShardedMinedIndex::serialize`] for the
     /// overall snapshot layout this is embedded in.
     fn serialize(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
@@ -188,20 +197,15 @@ impl MinedShard {
                 out.extend_from_slice(&subtree_idx.to_le_bytes());
             }
         }
-
-        out.extend_from_slice(&(self.unmined.len() as u32).to_le_bytes());
-        for (&height, set) in &self.unmined {
-            out.extend_from_slice(&height.to_le_bytes());
-            out.extend_from_slice(&(set.len() as u32).to_le_bytes());
-            for &slot in set {
-                out.extend_from_slice(&slot.to_le_bytes());
-            }
-        }
     }
 
     /// Parse one shard's state from `cur`, in the format written by
     /// [`Self::serialize`]. Fails closed with [`MinedIndexError::Corrupt`] on
-    /// any truncated or out-of-bounds read; never panics.
+    /// any truncated read, or any `free`/`overflow` slot reference that is
+    /// out of bounds for the loaded `entries` (which would otherwise panic
+    /// later, deferred to the next `alloc`); never panics itself. The
+    /// `unmined` height buckets are re-derived from the loaded entries
+    /// rather than trusted from the wire.
     fn deserialize(cur: &mut SnapshotCursor) -> Result<Self, MinedIndexError> {
         let entry_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
         // Grow via `push` rather than `Vec::with_capacity(entry_count)` so a
@@ -229,13 +233,23 @@ impl MinedShard {
         let free_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
         let mut free = Vec::new();
         for _ in 0..free_count {
-            free.push(cur.read_u32().ok_or(MinedIndexError::Corrupt)?);
+            let slot = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            // A free-list entry that doesn't reference a real slot would
+            // panic later in `alloc` (`self.entries[slot] = e`), deferred
+            // and far from this parse — reject it here instead.
+            if slot as usize >= entries.len() {
+                return Err(MinedIndexError::Corrupt);
+            }
+            free.push(slot);
         }
 
         let overflow_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
         let mut overflow = HashMap::new();
         for _ in 0..overflow_count {
             let slot = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
+            if slot as usize >= entries.len() {
+                return Err(MinedIndexError::Corrupt);
+            }
             let vec_len = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
             let mut v = Vec::new();
             for _ in 0..vec_len {
@@ -251,16 +265,19 @@ impl MinedShard {
             overflow.insert(slot, v);
         }
 
-        let unmined_count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
-        let mut unmined = HashMap::new();
-        for _ in 0..unmined_count {
-            let height = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
-            let set_len = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
-            let mut set = HashSet::new();
-            for _ in 0..set_len {
-                set.insert(cur.read_u32().ok_or(MinedIndexError::Corrupt)?);
+        // `unmined` is deliberately not part of the wire format (see
+        // `serialize`): re-derive each live slot's height bucket from its own
+        // `unmined_since` field rather than trusting a separately-serialized
+        // (and therefore independently corruptible) bucket structure.
+        let mut unmined: HashMap<u32, HashSet<u32>> = HashMap::new();
+        for (slot, &is_live) in live.iter().enumerate() {
+            if !is_live {
+                continue;
             }
-            unmined.insert(height, set);
+            let since = entries[slot].unmined_since;
+            if since != 0 {
+                unmined.entry(since).or_default().insert(slot as u32);
+            }
         }
 
         Ok(MinedShard {
@@ -291,8 +308,24 @@ pub struct ShardedMinedIndex {
 impl ShardedMinedIndex {
     /// Create a new sharded index with at least `shard_count` shards.
     ///
-    /// The actual shard count is the next power of two at least 16.
+    /// The actual shard count is the next power of two at least 16. Routing
+    /// uses a fresh process-random seed ([`crate::locks::stripe_seed`]);
+    /// use [`Self::new_with_seed`] (or [`Self::deserialize`], which calls it
+    /// internally) when the seed must be a specific, previously-persisted
+    /// value instead.
     pub fn new(shard_count: usize) -> Self {
+        Self::new_with_seed(shard_count, crate::locks::stripe_seed())
+    }
+
+    /// Create a new sharded index with at least `shard_count` shards and an
+    /// explicit routing `seed`, bypassing the process-random default.
+    ///
+    /// Used by [`Self::deserialize`] to reinstall the exact seed a snapshot
+    /// was written with — routing (`shard_for`) is a function of `seed`, so
+    /// a restored index must reuse the original seed byte-for-byte or every
+    /// key silently routes to the wrong shard. Also useful in tests that need
+    /// deterministic (or deliberately mismatched) routing.
+    pub(crate) fn new_with_seed(shard_count: usize, seed: u64) -> Self {
         let count = shard_count.next_power_of_two().max(16);
         let shards = (0..count)
             .map(|_| parking_lot::Mutex::new(MinedShard::default()))
@@ -300,7 +333,7 @@ impl ShardedMinedIndex {
         Self {
             shards: shards.into_boxed_slice(),
             mask: count - 1,
-            seed: crate::locks::stripe_seed(),
+            seed,
         }
     }
 
@@ -515,16 +548,22 @@ impl ShardedMinedIndex {
         }
     }
 
-    /// Serialize the entire index (every shard's entries, free list,
-    /// overflow map, and unmined buckets) into a versioned snapshot, appended
-    /// to `out`.
+    /// Serialize the entire index (the routing seed, plus every shard's
+    /// entries, free list, and overflow map) into a versioned snapshot,
+    /// appended to `out`.
     ///
-    /// Format: a 1-byte version ([`MINED_SNAPSHOT_VERSION`]) followed by each
-    /// shard's state in order, in plain little-endian length-prefixed form.
-    /// Round-trips through [`Self::deserialize`] given the same `shard_count`
-    /// this index was created with.
+    /// Format: a 1-byte version ([`MINED_SNAPSHOT_VERSION`]), followed by the
+    /// 8-byte little-endian routing `seed`, followed by each shard's state in
+    /// order, in plain little-endian length-prefixed form. The seed MUST be
+    /// persisted: `shard_for` mixes it into every routing decision, and a
+    /// fresh process only ever picks a new random seed
+    /// ([`crate::locks::stripe_seed`]) — without the persisted value,
+    /// [`Self::deserialize`] after a real process restart would route every
+    /// key to the wrong shard. Round-trips through [`Self::deserialize`]
+    /// given the same `shard_count` this index was created with.
     pub fn serialize(&self, out: &mut Vec<u8>) {
         out.push(MINED_SNAPSHOT_VERSION);
+        out.extend_from_slice(&self.seed.to_le_bytes());
         for shard in self.shards.iter() {
             shard.lock().serialize(out);
         }
@@ -534,18 +573,22 @@ impl ShardedMinedIndex {
     /// [`Self::serialize`].
     ///
     /// `shard_count` must be the same value the original index was
-    /// constructed with ([`Self::new`]) — it re-derives the identical `mask`
-    /// and reuses the process-wide `seed`, so `shard_for` routes every key to
-    /// the same shard index it did before the snapshot, and the parsed shard
-    /// sections line up positionally.
+    /// constructed with — it re-derives the identical `mask` so the parsed
+    /// shard sections line up positionally. The routing `seed` is NOT
+    /// re-derived from the process; it is read verbatim from the snapshot
+    /// and installed via [`Self::new_with_seed`], so `shard_for` routes every
+    /// key to the same shard index it did before the snapshot even across a
+    /// process restart (a fresh [`crate::locks::stripe_seed`] would scatter
+    /// every key to a different, wrong shard).
     ///
     /// # Errors
     ///
     /// Fails closed (never panics) with:
     /// - [`MinedIndexError::VersionMismatch`] if the version byte doesn't
     ///   match [`MINED_SNAPSHOT_VERSION`].
-    /// - [`MinedIndexError::Corrupt`] if the bytes are truncated or otherwise
-    ///   malformed at any point during parsing.
+    /// - [`MinedIndexError::Corrupt`] if the bytes are truncated, reference
+    ///   out-of-bounds slots, or are otherwise malformed at any point during
+    ///   parsing.
     pub fn deserialize(bytes: &[u8], shard_count: usize) -> Result<Self, MinedIndexError> {
         let mut cur = SnapshotCursor::new(bytes);
         let version = cur.read_u8().ok_or(MinedIndexError::Corrupt)?;
@@ -555,8 +598,9 @@ impl ShardedMinedIndex {
                 MINED_SNAPSHOT_VERSION,
             ));
         }
+        let seed = cur.read_u64().ok_or(MinedIndexError::Corrupt)?;
 
-        let restored = Self::new(shard_count);
+        let restored = Self::new_with_seed(shard_count, seed);
         for shard_mutex in restored.shards.iter() {
             let parsed = MinedShard::deserialize(&mut cur)?;
             *shard_mutex.lock() = parsed;
@@ -952,5 +996,99 @@ mod tests {
                 "flag cleared after set_all_spent(false)"
             );
         });
+    }
+
+    #[test]
+    fn snapshot_survives_different_seed() {
+        use crate::index::TxKey;
+
+        // Stand in for "whatever random seed the process happened to pick
+        // before it crashed" with an explicit, known seed.
+        let original_seed = 0xDEAD_BEEF_CAFE_F00Du64;
+        let idx = ShardedMinedIndex::new_with_seed(16, original_seed);
+        let k = TxKey { txid: [42u8; 32] };
+        let slot = idx.alloc_created(&k, 7);
+
+        let mut buf = Vec::new();
+        idx.serialize(&mut buf);
+
+        // A real restart would call `Self::new`, which draws a fresh
+        // process-random seed via `stripe_seed()` — deserialize must ignore
+        // that entirely and install the persisted seed instead.
+        let restored = ShardedMinedIndex::deserialize(&buf, 16)
+            .expect("well-formed snapshot must deserialize");
+
+        assert_eq!(
+            restored.seed, original_seed,
+            "deserialize must install the persisted seed, not a fresh process seed"
+        );
+
+        // Behavioral proof: a DIFFERENT seed routes this key to a different
+        // shard selection function, so if `deserialize` had silently used a
+        // fresh/different seed, `shard_for` on the restored index would very
+        // likely disagree with the original's routing for this key.
+        let differently_seeded = ShardedMinedIndex::new_with_seed(16, original_seed ^ 0xFFFF_FFFF);
+        assert_ne!(
+            differently_seeded.shard_for(&k),
+            idx.shard_for(&k),
+            "test setup invariant: the alternate seed must actually route differently \
+             for this key, otherwise this test can't distinguish correct from buggy seeding"
+        );
+
+        assert_eq!(
+            restored.shard_for(&k),
+            idx.shard_for(&k),
+            "routing must match the original index's routing"
+        );
+        restored.with_entry(&k, slot, |e| {
+            assert_eq!(e.unmined_since, 7, "entry must be reachable after restore");
+        });
+    }
+
+    #[test]
+    fn deserialize_corrupt_free_list_fails_closed() {
+        // Hand-craft a snapshot (rather than mutating a real one) so the
+        // corrupt `free` slot's position is exact and independent of the
+        // rest of the format.
+        fn empty_shard_bytes() -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_le_bytes()); // entries_len
+            b.extend_from_slice(&0u32.to_le_bytes()); // free_len
+            b.extend_from_slice(&0u32.to_le_bytes()); // overflow_len
+            b
+        }
+
+        // One entry (so `entries.len() == 1`), and a free-list value of 99
+        // which is out of bounds for it.
+        let mut corrupt_shard = Vec::new();
+        corrupt_shard.extend_from_slice(&1u32.to_le_bytes()); // entries_len = 1
+        corrupt_shard.push(0); // live = false
+        corrupt_shard.extend_from_slice(&0u32.to_le_bytes()); // block_id
+        corrupt_shard.extend_from_slice(&0u32.to_le_bytes()); // block_height
+        corrupt_shard.extend_from_slice(&0u32.to_le_bytes()); // subtree_idx
+        corrupt_shard.extend_from_slice(&0u32.to_le_bytes()); // unmined_since
+        corrupt_shard.push(0); // flags
+        corrupt_shard.extend_from_slice(&1u32.to_le_bytes()); // free_len = 1
+        corrupt_shard.extend_from_slice(&99u32.to_le_bytes()); // free[0] = 99, OOB
+        corrupt_shard.extend_from_slice(&0u32.to_le_bytes()); // overflow_len
+
+        let mut buf = Vec::new();
+        buf.push(MINED_SNAPSHOT_VERSION);
+        buf.extend_from_slice(&0u64.to_le_bytes()); // seed
+        buf.extend_from_slice(&corrupt_shard);
+        // `ShardedMinedIndex::new_with_seed(16, ..)` allocates
+        // `16.next_power_of_two().max(16) == 16` shards; the corrupt one is
+        // first, the rest are trivially empty and well-formed.
+        for _ in 1..16 {
+            buf.extend_from_slice(&empty_shard_bytes());
+        }
+
+        let err = ShardedMinedIndex::deserialize(&buf, 16)
+            .err()
+            .expect("an out-of-bounds free-list slot must fail closed, not panic on next alloc");
+        assert!(
+            matches!(err, MinedIndexError::Corrupt),
+            "expected Corrupt, got {err:?}"
+        );
     }
 }
