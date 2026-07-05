@@ -676,19 +676,8 @@ impl PrimaryBackend {
                 }
             };
 
-            let utxo_count = { meta.utxo_count };
             let key = TxKey { txid: meta.tx_id };
-            let entry = TxIndexEntry {
-                device_id: 0,
-                record_offset: offset,
-                utxo_count,
-                block_entry_count: meta.block_entry_count,
-                tx_flags: meta.flags.bits(),
-                spent_utxos: meta.spent_utxos,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
-            };
+            let entry = TxIndexEntry::from_scanned_meta(offset, &meta);
             batch.push((key, entry));
 
             if batch.len() >= BATCH_SIZE {
@@ -789,19 +778,8 @@ impl PrimaryBackend {
                 }
             };
 
-            let utxo_count = { meta.utxo_count };
             let key = TxKey { txid: meta.tx_id };
-            let entry = TxIndexEntry {
-                device_id: 0,
-                record_offset: offset,
-                utxo_count,
-                block_entry_count: meta.block_entry_count,
-                tx_flags: meta.flags.bits(),
-                spent_utxos: meta.spent_utxos,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
-            };
+            let entry = TxIndexEntry::from_scanned_meta(offset, &meta);
             index.register(key, entry)?;
             offset += aligned_advance;
         }
@@ -1618,5 +1596,158 @@ mod tests {
             assert_eq!(mem_entry.utxo_count, fb_entry.utxo_count);
             assert_eq!(mem_entry.record_offset, *offset);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // B3: rebuild must preserve lifecycle fields (dah_or_preserve,
+    // unmined_since, generation, HAS_PRESERVE_UNTIL) — not hardcode them to 0.
+    //
+    // Regression: all three device-scan rebuild paths used to construct the
+    // TxIndexEntry with dah_or_preserve/unmined_since/generation = 0 even
+    // though the parsed TxMetadata carried the real values. A GET served from
+    // the rebuilt index then reported a genuinely-unmined tx as mined
+    // (unmined_since == 0) and dropped delete/preserve heights; the redb path
+    // even PERSISTED those zeros durably.
+    // -----------------------------------------------------------------------
+
+    /// Metadata whose lifecycle fields are all set. The i-th record varies:
+    /// - `i % 2 == 0` → delete_at_height set (no preserve)
+    /// - `i % 2 == 1` → preserve_until set (must set HAS_PRESERVE_UNTIL,
+    ///   and the wire DAH must read back as 0)
+    /// Every record has a non-zero unmined_since and generation.
+    fn setup_device_with_lifecycle_records(
+        record_count: usize,
+    ) -> (
+        Arc<MemoryDevice>,
+        SlotAllocator,
+        Vec<(TxKey, u64, TxMetadata)>,
+    ) {
+        let dev = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut records = Vec::new();
+
+        for i in 0..record_count {
+            let mut meta = TxMetadata::new(5);
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            txid[8..16]
+                .copy_from_slice(&((i as u64).wrapping_mul(0x9E3779B97F4A7C15)).to_le_bytes());
+            meta.tx_id = txid;
+
+            meta.unmined_since = (i as u32 + 1) * 50;
+            meta.generation = (i as u32 + 1) * 3;
+            if i % 2 == 0 {
+                meta.delete_at_height = (i as u32 + 1) * 100;
+                meta.preserve_until = 0;
+            } else {
+                meta.delete_at_height = 0;
+                meta.preserve_until = (i as u32 + 1) * 200;
+            }
+
+            let record_size = TxMetadata::record_size_for(5);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slots: Vec<UtxoSlot> = (0..5)
+                .map(|s| {
+                    let mut h = [0u8; 32];
+                    h[0] = s;
+                    UtxoSlot::new_unspent(h)
+                })
+                .collect();
+
+            write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            records.push((TxKey { txid }, offset, meta));
+        }
+
+        (dev, alloc, records)
+    }
+
+    /// Decode the (delete_at_height, preserve_until) a wire GET would return
+    /// for an index entry — the exact discriminant logic from
+    /// `server::dispatch`'s cached-entry fast path.
+    fn wire_dah_preserve(entry: &TxIndexEntry) -> (u32, u32) {
+        let has_preserve = entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0;
+        if has_preserve {
+            (0, entry.dah_or_preserve)
+        } else {
+            (entry.dah_or_preserve, 0)
+        }
+    }
+
+    /// Assert a rebuilt backend carries the real lifecycle fields for every
+    /// record, and that a wire GET reads back the genuine non-zero values.
+    fn assert_lifecycle_preserved(rebuilt: &PrimaryBackend, records: &[(TxKey, u64, TxMetadata)]) {
+        for (key, offset, meta) in records {
+            let entry = rebuilt
+                .lookup(key)
+                .expect("rebuilt index must contain the record");
+            assert_eq!(entry.record_offset, *offset);
+
+            let want_unmined = { meta.unmined_since };
+            let want_gen = { meta.generation };
+            let want_dah = { meta.delete_at_height };
+            let want_preserve = { meta.preserve_until };
+            let want_has_preserve = want_preserve != 0;
+
+            // Primary cached fields must equal the on-device metadata.
+            assert_eq!(
+                entry.unmined_since, want_unmined,
+                "unmined_since must survive rebuild (regression: read as 0 = 'mined')"
+            );
+            assert_eq!(
+                entry.generation, want_gen,
+                "generation must survive rebuild"
+            );
+            assert_eq!(
+                entry.tx_flags & crate::record::TxFlags::HAS_PRESERVE_UNTIL.bits() != 0,
+                want_has_preserve,
+                "HAS_PRESERVE_UNTIL discriminant must be restored from preserve_until"
+            );
+            let want_dah_or_preserve = if want_has_preserve {
+                want_preserve
+            } else {
+                want_dah
+            };
+            assert_eq!(
+                entry.dah_or_preserve, want_dah_or_preserve,
+                "dah_or_preserve must survive rebuild"
+            );
+
+            // Wire GET fast path: UNMINED_SINCE / DELETE_AT_HEIGHT /
+            // PRESERVE_UNTIL must return the genuine non-zero values.
+            let (wire_dah, wire_preserve) = wire_dah_preserve(&entry);
+            assert_eq!(wire_dah, want_dah, "wire DELETE_AT_HEIGHT");
+            assert_eq!(wire_preserve, want_preserve, "wire PRESERVE_UNTIL");
+            assert_eq!(entry.unmined_since, want_unmined, "wire UNMINED_SINCE");
+        }
+    }
+
+    #[test]
+    fn rebuild_preserves_lifecycle_fields_in_memory() {
+        let (dev, alloc, records) = setup_device_with_lifecycle_records(8);
+        let rebuilt = PrimaryBackend::rebuild(&*dev, &alloc).unwrap();
+        assert_eq!(rebuilt.len(), 8);
+        assert_lifecycle_preserved(&rebuilt, &records);
+    }
+
+    #[test]
+    fn rebuild_preserves_lifecycle_fields_redb() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = redb_config(dir.path());
+        let (dev, alloc, records) = setup_device_with_lifecycle_records(8);
+        let rebuilt = PrimaryBackend::rebuild_redb(&config, &*dev, &alloc).unwrap();
+        assert_eq!(rebuilt.len(), 8);
+        // The redb backend PERSISTS these fields durably via register_batch —
+        // this lookup reads them back from the on-disk B+ tree.
+        assert_lifecycle_preserved(&rebuilt, &records);
+    }
+
+    #[test]
+    fn rebuild_preserves_lifecycle_fields_file_backed() {
+        let (dev, alloc, records) = setup_device_with_lifecycle_records(8);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("primary.idx");
+        let rebuilt = PrimaryBackend::rebuild_file_backed(&path, &*dev, &alloc).unwrap();
+        assert_eq!(rebuilt.len(), 8);
+        assert_lifecycle_preserved(&rebuilt, &records);
     }
 }

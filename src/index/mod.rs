@@ -666,19 +666,8 @@ impl Index {
                     }
                 };
 
-            let utxo_count = { meta.utxo_count };
             let key = TxKey { txid: meta.tx_id };
-            let entry = TxIndexEntry {
-                device_id: 0,
-                record_offset: offset,
-                utxo_count,
-                block_entry_count: meta.block_entry_count,
-                tx_flags: meta.flags.bits(),
-                spent_utxos: meta.spent_utxos,
-                dah_or_preserve: 0,
-                unmined_since: 0,
-                generation: 0,
-            };
+            let entry = TxIndexEntry::from_scanned_meta(offset, &meta);
             index.register(key, entry)?;
             offset += aligned_advance;
         }
