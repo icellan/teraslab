@@ -4254,6 +4254,13 @@ mod tests {
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let state = HttpState {
+            backup: crate::backup::BackupManager::new(
+                engine.clone(),
+                Arc::new(AtomicBool::new(false)),
+                crate::backup::BackupParams::default(),
+                crate::config::ServerConfig::default(),
+                None,
+            ),
             engine,
             metrics,
             histograms,

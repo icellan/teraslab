@@ -668,14 +668,15 @@ mod tests {
     }
 
     fn test_config(dir: &Path, size: u64) -> ServerConfig {
-        let mut cfg = ServerConfig::default();
-        cfg.device_paths = vec![dir.join("data.dat")];
-        cfg.device_size = size;
-        cfg.device_alignment = ALIGN;
-        cfg.device_split = 1;
-        // A non-existent blob dir → empty blobs.
-        cfg.blobstore_path = dir.join("no-blobstore");
-        cfg
+        ServerConfig {
+            device_paths: vec![dir.join("data.dat")],
+            device_size: size,
+            device_alignment: ALIGN,
+            device_split: 1,
+            // A non-existent blob dir → empty blobs.
+            blobstore_path: dir.join("no-blobstore"),
+            ..Default::default()
+        }
     }
 
     fn low_headroom_params() -> BackupParams {

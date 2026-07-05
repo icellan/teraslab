@@ -5043,12 +5043,14 @@ mod tests {
 
     // -- backup-2: fabricated redo file ------------------------------------
 
+    /// Collected tee frames: `(sequence, op_type, frame_bytes)`.
+    type CapturedFrames = Arc<parking_lot::Mutex<Vec<(u64, u8, Vec<u8>)>>>;
+
     /// Tee a source log, capturing the non-marker frames whose sequence is in
     /// `(fence, tail_end]` — exactly what the backup would ship.
     fn capture_tail_frames(fence: u64, ops: &[RedoOp]) -> (Vec<Vec<u8>>, Vec<(u64, RedoOp)>) {
         let (_dev, mut log) = make_log(1024 * 1024);
-        let frames: Arc<parking_lot::Mutex<Vec<(u64, u8, Vec<u8>)>>> =
-            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let frames: CapturedFrames = Arc::new(parking_lot::Mutex::new(Vec::new()));
         {
             let frames = frames.clone();
             log.attach_tee(Box::new(move |frame, seq, op_type| {
