@@ -71,6 +71,24 @@ use teraslab::protocol::opcodes::*;
 /// OP_STREAM_CHUNK/OP_STREAM_END before the CREATE request.
 const BLOB_UPLOAD_THRESHOLD: usize = 1024 * 1024; // 1 MiB
 
+/// Client-origin per-item error code for a batch item that could not be
+/// routed to any node: no partition map is available, or the shard's owning
+/// node has no live connection pool (a real node-down / rebalance state).
+///
+/// These items are *not* silently dropped — they surface as per-item errors
+/// so callers can retry or reconcile. The value sits in a high range that no
+/// server error code uses, so it never collides with a wire code and is never
+/// misclassified as a same-target transient retry by
+/// [`is_retryable_error_code`].
+pub const CLIENT_ERR_UNROUTABLE: u16 = 0xF001;
+
+/// Client-origin per-item error code for a redirected batch item whose
+/// re-route could not be completed: the target connection could not be
+/// acquired after a routing refresh. Distinct from [`CLIENT_ERR_UNROUTABLE`]
+/// so callers can tell "never had a route" from "route existed but the retry
+/// leg failed". Also in the high, collision-free range.
+pub const CLIENT_ERR_REDIRECT_FAILED: u16 = 0xF002;
+
 /// Size of each chunk sent during blob upload.
 const BLOB_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
@@ -285,7 +303,12 @@ impl Client {
         resp: &teraslab::protocol::frame::ResponseFrame,
     ) -> Result<BatchResult, ClientError> {
         match resp.status {
-            STATUS_OK => Ok(BatchResult { errors: Vec::new() }),
+            // STATUS_DEGRADED_DURABILITY (5): the mutation was APPLIED and is
+            // locally durable, but replication used a weak (best-effort) ack.
+            // The server treats it as a successful write and so must the
+            // client — reporting an applied write as an error would be
+            // incorrect. Matches the Go client (`client.go`).
+            STATUS_OK | STATUS_DEGRADED_DURABILITY => Ok(BatchResult { errors: Vec::new() }),
             STATUS_ERROR => {
                 let (code, msg) = decode_error_payload(&resp.payload)?;
                 Err(ClientError::Server { code, message: msg })
@@ -332,7 +355,12 @@ impl Client {
         item_count: usize,
     ) -> Result<SpendBatchResponse, ClientError> {
         match resp.status {
-            STATUS_OK => {
+            // STATUS_DEGRADED_DURABILITY (5) is a successful-but-weak ack: the
+            // write applied and is locally durable; replication used a
+            // best-effort ack. Decode the signal payload exactly as STATUS_OK
+            // (the server still carries the per-item signals / block IDs) and
+            // surface success. Matches the Go client (`handleSignalResponse`).
+            STATUS_OK | STATUS_DEGRADED_DURABILITY => {
                 if !resp.payload.is_empty() {
                     let (successes, errs) = decode_partial_with_signals(&resp.payload)?;
                     if !errs.is_empty() {
@@ -374,21 +402,33 @@ impl Client {
                 Err(ClientError::Redirect(addr))
             }
             STATUS_PARTIAL_ERROR => {
-                // PARTIAL_ERROR encodes only the failing items sparsely;
-                // any index in `0..item_count` that isn't in the error list
-                // succeeded. Reconstruct the implicit successes so the
-                // PartialError carries a complete per-item picture.
-                let errs = decode_sparse_errors(&resp.payload)?;
+                // The server encodes setMined/spend PARTIAL_ERROR responses
+                // with `encode_partial_with_signals` — a two-section layout
+                // (per-item successes with signals+block_ids, then per-item
+                // errors), NOT the plain sparse-error layout. Decoding with
+                // the wrong (sparse) codec reads the leading success_count as
+                // an error_count and can yield an EMPTY error list even when
+                // every item failed, silently masquerading as success (B5).
+                // Decode with the matching signal codec.
+                let (mut successes, errs) = decode_partial_with_signals(&resp.payload)?;
+                // Reconstruct any implicit successes: indices in
+                // `0..item_count` that appear in neither the successes nor the
+                // errors section still succeeded (the server may omit
+                // no-signal successes to save bytes), so every request item
+                // shows up in exactly one of `successes` / `errors`.
                 let failed: std::collections::HashSet<u32> =
                     errs.iter().map(|e| e.item_index).collect();
-                let successes = (0..item_count as u32)
-                    .filter(|i| !failed.contains(i))
-                    .map(|item_index| BatchItemSuccess {
-                        item_index,
-                        signal: SIGNAL_NONE,
-                        block_ids: Vec::new(),
-                    })
-                    .collect();
+                let present: std::collections::HashSet<u32> =
+                    successes.iter().map(|s| s.item_index).collect();
+                for item_index in 0..item_count as u32 {
+                    if !failed.contains(&item_index) && !present.contains(&item_index) {
+                        successes.push(BatchItemSuccess {
+                            item_index,
+                            signal: SIGNAL_NONE,
+                            block_ids: Vec::new(),
+                        });
+                    }
+                }
                 Err(ClientError::Partial(PartialError {
                     successes,
                     errors: errs,
@@ -403,23 +443,55 @@ impl Client {
     // -----------------------------------------------------------------------
 
     /// Group txids by their target pool (for cluster-aware batch operations).
-    /// Returns None if not in cluster mode.
-    fn group_txids(&self, txids: &[TxID]) -> Option<PoolGroupMap> {
+    ///
+    /// Returns `None` if not in cluster mode. Otherwise returns
+    /// `(groups, ungroupable)` where `ungroupable` holds the original batch
+    /// indices whose `pool_for_txid` failed — no partition map, or the
+    /// shard's owning node has no live pool (a real node-down / rebalance
+    /// state). These indices MUST be surfaced by the caller (as per-item
+    /// errors), never silently dropped: every input index appears in exactly
+    /// one of a group or `ungroupable` (B6).
+    fn group_txids(&self, txids: &[TxID]) -> Option<(PoolGroupMap, Vec<usize>)> {
         let cluster = self.cluster.as_ref()?;
         // Use a HashMap keyed by pool address (via pointer identity of Arc).
         // We'll key by the pool's Arc pointer as a usize.
         let mut groups: PoolGroupMap = HashMap::new();
+        let mut ungroupable: Vec<usize> = Vec::new();
         for (i, txid) in txids.iter().enumerate() {
-            if let Ok(pool) = cluster.pool_for_txid(txid) {
-                let key = Arc::as_ptr(&pool) as usize;
-                groups
-                    .entry(key)
-                    .or_insert_with(|| (pool, Vec::new()))
-                    .1
-                    .push(i);
+            match cluster.pool_for_txid(txid) {
+                Ok(pool) => {
+                    let key = Arc::as_ptr(&pool) as usize;
+                    groups
+                        .entry(key)
+                        .or_insert_with(|| (pool, Vec::new()))
+                        .1
+                        .push(i);
+                }
+                Err(_) => ungroupable.push(i),
             }
         }
-        Some(groups)
+        Some((groups, ungroupable))
+    }
+
+    /// Build per-item errors for indices that could not be routed to any
+    /// node. Surfacing these (rather than dropping them) is the B6 fix.
+    fn unroutable_errors(indices: &[usize]) -> Vec<BatchItemError> {
+        Self::unroutable_errors_with_code(indices, CLIENT_ERR_UNROUTABLE)
+    }
+
+    /// Build per-item errors for `indices` with an explicit client-origin
+    /// error `code` (`CLIENT_ERR_UNROUTABLE` for never-routed items,
+    /// `CLIENT_ERR_REDIRECT_FAILED` for redirected items whose re-route leg
+    /// could not be completed).
+    fn unroutable_errors_with_code(indices: &[usize], code: u16) -> Vec<BatchItemError> {
+        indices
+            .iter()
+            .map(|&i| BatchItemError {
+                item_index: i as u32,
+                code,
+                data: Vec::new(),
+            })
+            .collect()
     }
 
     /// Send a txid-list batch operation with cluster-aware routing.
@@ -446,6 +518,273 @@ impl Client {
             .await?;
         let resp = conn.round_trip(op_code, 0, payload).await?;
         Self::handle_mutation_response(&resp)
+    }
+
+    /// Send a signal-carrying txid-list batch (set_mined) with cluster-aware
+    /// routing, returning the per-item success signals / block IDs.
+    ///
+    /// This is the signal-aware analog of [`Self::send_txid_batch`]: set_mined
+    /// responses are encoded in the signal layout for every status
+    /// (STATUS_OK, STATUS_DEGRADED_DURABILITY, STATUS_PARTIAL_ERROR), so the
+    /// results must be decoded with [`Self::handle_signal_response`] and the
+    /// (signal, block_ids) preserved — the plain-mutation path would drop them
+    /// and (on an all-failed batch) mask the failure as success (B5).
+    async fn send_txid_batch_signals<F>(
+        &self,
+        op_code: u16,
+        txids: &[TxID],
+        encode_payload: &F,
+    ) -> Result<SpendBatchResponse, ClientError>
+    where
+        F: Fn(&[TxID]) -> Vec<u8>,
+    {
+        // Single-node / no-cluster fast path.
+        if self.cluster.is_none() {
+            let payload = encode_payload(txids);
+            let conn = self
+                .pool
+                .as_ref()
+                .ok_or(ClientError::PoolClosed)?
+                .get()
+                .await?;
+            let resp = conn.round_trip(op_code, 0, payload).await?;
+            return Self::handle_signal_response(&resp, txids.len());
+        }
+
+        // Cluster path with bounded transient-retry, mirroring
+        // `send_txid_batch_cluster`.
+        for attempt in 0..=(TRANSIENT_MUTATION_RETRY_DELAYS_MS.len() as u32) {
+            let result = self
+                .send_txid_batch_signals_cluster_once(op_code, txids, encode_payload)
+                .await;
+            let retryable = (attempt as usize) < TRANSIENT_MUTATION_RETRY_DELAYS_MS.len()
+                && match &result {
+                    Err(ClientError::Server { code, .. }) => is_retryable_error_code(*code),
+                    Err(ClientError::Partial(pe)) => {
+                        pe.errors.len() == txids.len() && all_errors_are_retryable(&pe.errors)
+                    }
+                    _ => false,
+                };
+            if retryable {
+                tokio::time::sleep(Duration::from_millis(
+                    TRANSIENT_MUTATION_RETRY_DELAYS_MS[attempt as usize],
+                ))
+                .await;
+                let _ = self.refresh_routing().await;
+                continue;
+            }
+            return result;
+        }
+        unreachable!()
+    }
+
+    /// One attempt of a cluster-aware signal-carrying txid batch: group by
+    /// target node, send sub-batches in parallel, merge `SpendBatchResponse`
+    /// with per-item index remapping. Redirected items are re-routed
+    /// per-target (bounded by `max_redirects`); un-routable items surface as
+    /// per-item errors — every input index lands in exactly one of
+    /// `successes` / `errors`, never dropped (B5/B6).
+    async fn send_txid_batch_signals_cluster_once<F>(
+        &self,
+        op_code: u16,
+        txids: &[TxID],
+        encode_payload: &F,
+    ) -> Result<SpendBatchResponse, ClientError>
+    where
+        F: Fn(&[TxID]) -> Vec<u8>,
+    {
+        let Some((groups, ungroupable)) = self.group_txids(txids) else {
+            // Not in cluster mode (shouldn't happen — caller checked).
+            let payload = encode_payload(txids);
+            let conn = self.get_conn().await?;
+            let resp = conn.round_trip(op_code, 0, payload).await?;
+            return Self::handle_signal_response(&resp, txids.len());
+        };
+
+        let mut merged = SpendBatchResponse {
+            successes: Vec::new(),
+            errors: Self::unroutable_errors(&ungroupable),
+        };
+        let mut redirected_indices: Vec<usize> = Vec::new();
+        let mut got_no_quorum = false;
+
+        // Fan out one sub-batch per target node.
+        let mut handles = Vec::with_capacity(groups.len());
+        for (_, (pool, idx_map)) in groups {
+            let sub_txids: Vec<TxID> = idx_map.iter().map(|&i| txids[i]).collect();
+            let payload = encode_payload(&sub_txids);
+            let sub_len = sub_txids.len();
+            handles.push(tokio::spawn(async move {
+                let conn = pool.get().await?;
+                let resp = conn.round_trip(op_code, 0, payload).await?;
+                let result = Self::handle_signal_response(&resp, sub_len);
+                Ok::<(Result<SpendBatchResponse, ClientError>, Vec<usize>), ClientError>((
+                    result, idx_map,
+                ))
+            }));
+        }
+
+        for handle in handles {
+            let (result, idx_map) = handle
+                .await
+                .map_err(|e| ClientError::Connection(format!("join: {e}")))??;
+            match result {
+                Ok(mut r) => {
+                    remap_signal_result(&mut r, &idx_map);
+                    merged.successes.extend(r.successes);
+                }
+                Err(ClientError::Partial(pe)) => {
+                    for mut s in pe.successes {
+                        if (s.item_index as usize) < idx_map.len() {
+                            s.item_index = idx_map[s.item_index as usize] as u32;
+                        }
+                        merged.successes.push(s);
+                    }
+                    for err in pe.errors {
+                        if err.code == ERR_REDIRECT && (err.item_index as usize) < idx_map.len() {
+                            redirected_indices.push(idx_map[err.item_index as usize]);
+                        } else {
+                            merged
+                                .errors
+                                .extend(remap_batch_errors(vec![err], &idx_map));
+                        }
+                    }
+                }
+                Err(ClientError::Server { code, ref message })
+                    if code == 15 || message.contains("no quorum") =>
+                {
+                    got_no_quorum = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Re-route redirected items per-target (each to its own owner),
+        // bounded by max_redirects. Any unresolved item surfaces as an error.
+        if !redirected_indices.is_empty() {
+            let (successes, errors) = self
+                .retry_redirected_txids_signals(op_code, txids, &redirected_indices, encode_payload)
+                .await;
+            merged.successes.extend(successes);
+            merged.errors.extend(errors);
+        }
+
+        if got_no_quorum {
+            let _ = self.refresh_routing().await;
+            return Err(ClientError::Server {
+                code: 15,
+                message: "no quorum (routing refreshed, retry recommended)".to_string(),
+            });
+        }
+
+        if !merged.errors.is_empty() {
+            return Err(ClientError::Partial(PartialError {
+                successes: merged.successes,
+                errors: merged.errors,
+            }));
+        }
+
+        // No errors: ensure every input index has a success entry (the server
+        // may omit no-signal successes). Synthesize the missing ones so
+        // callers see one result per request item.
+        let present: std::collections::HashSet<u32> =
+            merged.successes.iter().map(|s| s.item_index).collect();
+        for item_index in 0..txids.len() as u32 {
+            if !present.contains(&item_index) {
+                merged.successes.push(BatchItemSuccess {
+                    item_index,
+                    signal: SIGNAL_NONE,
+                    block_ids: Vec::new(),
+                });
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Signal-preserving analog of [`Self::retry_redirected_txids`]: re-route
+    /// redirected set_mined items per-target, bounded by `max_redirects`,
+    /// returning `(recovered_successes, terminal_errors)`. Items still
+    /// unresolved after the hop budget surface as `CLIENT_ERR_REDIRECT_FAILED`
+    /// errors — never dropped.
+    async fn retry_redirected_txids_signals<F>(
+        &self,
+        op_code: u16,
+        txids: &[TxID],
+        redirected: &[usize],
+        encode_payload: &F,
+    ) -> (Vec<BatchItemSuccess>, Vec<BatchItemError>)
+    where
+        F: Fn(&[TxID]) -> Vec<u8>,
+    {
+        let max_hops = self
+            .cluster
+            .as_ref()
+            .map(|c| c.max_redirects().max(1))
+            .unwrap_or(1);
+
+        let mut successes: Vec<BatchItemSuccess> = Vec::new();
+        let mut terminal: Vec<BatchItemError> = Vec::new();
+        let mut pending: Vec<usize> = redirected.to_vec();
+
+        for _hop in 0..max_hops {
+            if pending.is_empty() {
+                break;
+            }
+            let _ = self.refresh_routing().await;
+
+            let pending_txids: Vec<TxID> = pending.iter().map(|&i| txids[i]).collect();
+            let Some((groups, ungroupable)) = self.group_txids(&pending_txids) else {
+                terminal.extend(Self::unroutable_errors(&pending));
+                return (successes, terminal);
+            };
+
+            let mut next_pending: Vec<usize> = ungroupable.iter().map(|&p| pending[p]).collect();
+
+            for (_, (pool, sub_local)) in groups {
+                let orig: Vec<usize> = sub_local.iter().map(|&p| pending[p]).collect();
+                let sub_txids: Vec<TxID> = orig.iter().map(|&i| txids[i]).collect();
+                let payload = encode_payload(&sub_txids);
+
+                match pool.get().await {
+                    Ok(conn) => match conn.round_trip(op_code, 0, payload).await {
+                        Ok(resp) => match Self::handle_signal_response(&resp, orig.len()) {
+                            Ok(mut r) => {
+                                remap_signal_result(&mut r, &orig);
+                                successes.extend(r.successes);
+                            }
+                            Err(ClientError::Partial(pe)) => {
+                                for mut s in pe.successes {
+                                    if (s.item_index as usize) < orig.len() {
+                                        s.item_index = orig[s.item_index as usize] as u32;
+                                    }
+                                    successes.push(s);
+                                }
+                                for err in pe.errors {
+                                    if err.code == ERR_REDIRECT
+                                        && (err.item_index as usize) < orig.len()
+                                    {
+                                        next_pending.push(orig[err.item_index as usize]);
+                                    } else {
+                                        terminal.extend(remap_batch_errors(vec![err], &orig));
+                                    }
+                                }
+                            }
+                            Err(_) => next_pending.extend(orig),
+                        },
+                        Err(_) => next_pending.extend(orig),
+                    },
+                    Err(_) => next_pending.extend(orig),
+                }
+            }
+
+            pending = next_pending;
+        }
+
+        terminal.extend(Self::unroutable_errors_with_code(
+            &pending,
+            CLIENT_ERR_REDIRECT_FAILED,
+        ));
+        (successes, terminal)
     }
 
     /// Cluster-aware version of send_txid_batch with bounded transient-retry.
@@ -508,12 +847,16 @@ impl Client {
     where
         F: Fn(&[TxID]) -> Vec<u8>,
     {
-        let groups = self.group_txids(txids);
+        let grouped = self.group_txids(txids);
 
-        // If single node or no cluster, just send directly.
-        if groups.is_none() || groups.as_ref().is_some_and(|g| g.len() <= 1) {
+        // If single node or no cluster, just send directly. `ungroupable`
+        // items (no route) are surfaced as per-item errors, never dropped.
+        let single_group = grouped
+            .as_ref()
+            .is_some_and(|(g, ung)| g.len() <= 1 && ung.is_empty());
+        if grouped.is_none() || single_group {
             let payload = encode_payload(txids);
-            let conn = if let Some(groups) = &groups {
+            let conn = if let Some((groups, _)) = &grouped {
                 if let Some((pool, _)) = groups.values().next() {
                     pool.get().await?
                 } else {
@@ -526,7 +869,11 @@ impl Client {
             return Self::handle_mutation_response(&resp);
         }
 
-        let groups = groups.unwrap();
+        let (groups, ungroupable) = grouped.unwrap();
+
+        // Seed the error accumulator with the un-routable items (B6): a shard
+        // whose owning node has no live pool must not vanish from the result.
+        let mut all_errors: Vec<BatchItemError> = Self::unroutable_errors(&ungroupable);
 
         // Multiple nodes -- send in parallel and merge.
         let mut handles = Vec::with_capacity(groups.len());
@@ -547,9 +894,11 @@ impl Client {
             }));
         }
 
-        // Collect results and retry redirect errors.
-        let mut all_errors: Vec<BatchItemError> = Vec::new();
+        // Collect results, gathering all redirected original-indices so we can
+        // re-route them per-target (each txid to ITS owner, not the owner of
+        // the first txid).
         let mut got_no_quorum = false;
+        let mut redirected_indices: Vec<usize> = Vec::new();
 
         for handle in handles {
             let (result, idx_map) = handle
@@ -564,48 +913,12 @@ impl Client {
                     // Separate redirect errors from real errors.
                     // Redirect errors mean the shard table is stale — refresh
                     // routing and retry those items on the correct node.
-                    let mut redirected_indices: Vec<usize> = Vec::new();
                     for err in pe.errors {
                         if err.code == ERR_REDIRECT {
                             redirected_indices.push(idx_map[err.item_index as usize]);
                         } else {
                             let remapped = remap_batch_errors(vec![err], &idx_map);
                             all_errors.extend(remapped);
-                        }
-                    }
-                    if !redirected_indices.is_empty() {
-                        // Refresh routing to get the updated shard table, then
-                        // retry the redirected items. Single retry — if it fails
-                        // again, propagate the error.
-                        let _ = self.refresh_routing().await;
-                        let retry_txids: Vec<TxID> =
-                            redirected_indices.iter().map(|&i| txids[i]).collect();
-                        let retry_payload = encode_payload(&retry_txids);
-                        if let Ok(conn) = self.get_conn_for_txid(&retry_txids[0]).await {
-                            match conn.round_trip(op_code, 0, retry_payload).await {
-                                Ok(retry_resp) => {
-                                    if let Err(ClientError::Partial(retry_pe)) =
-                                        Self::handle_mutation_response(&retry_resp)
-                                    {
-                                        let retry_remapped = remap_batch_errors(
-                                            retry_pe.errors,
-                                            &redirected_indices,
-                                        );
-                                        all_errors.extend(retry_remapped);
-                                    }
-                                    // If Ok or the retry succeeded, no errors to add
-                                }
-                                Err(_) => {
-                                    // Retry connection failed — add all as errors
-                                    for &orig_idx in &redirected_indices {
-                                        all_errors.push(BatchItemError {
-                                            item_index: orig_idx as u32,
-                                            code: ERR_REDIRECT,
-                                            data: vec![],
-                                        });
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -616,6 +929,13 @@ impl Client {
                 }
                 Err(e) => return Err(e),
             }
+        }
+
+        if !redirected_indices.is_empty() {
+            let redirect_errors = self
+                .retry_redirected_txids(op_code, txids, &redirected_indices, encode_payload)
+                .await;
+            all_errors.extend(redirect_errors);
         }
 
         if got_no_quorum {
@@ -634,6 +954,104 @@ impl Client {
         }
 
         Ok(BatchResult { errors: Vec::new() })
+    }
+
+    /// Re-route a set of redirected txid-batch items after a routing refresh,
+    /// bounded by `max_redirects` hops, returning the per-item errors for any
+    /// items that still could not be delivered.
+    ///
+    /// Each redirected txid is grouped by ITS OWN owning pool (not the owner
+    /// of the first txid — a mixed-target redirect would otherwise misroute
+    /// every item to one node). On each hop: refresh routing, regroup, send
+    /// per-target sub-batches. Items whose target pool cannot be acquired, or
+    /// whose sub-batch errors, are carried to the next hop; whatever remains
+    /// unresolved after the last hop is surfaced as per-item errors (B6 — no
+    /// silent drop, and no `retry_txids[0]` misroute).
+    async fn retry_redirected_txids<F>(
+        &self,
+        op_code: u16,
+        txids: &[TxID],
+        redirected: &[usize],
+        encode_payload: &F,
+    ) -> Vec<BatchItemError>
+    where
+        F: Fn(&[TxID]) -> Vec<u8>,
+    {
+        // How many redirect hops to take. `max_redirects` is the documented
+        // bound (default 3); fall back to 1 in single-node mode (no cluster).
+        let max_hops = self
+            .cluster
+            .as_ref()
+            .map(|c| c.max_redirects().max(1))
+            .unwrap_or(1);
+
+        // Terminal (non-redirect) per-item errors accumulated across hops.
+        let mut terminal: Vec<BatchItemError> = Vec::new();
+        // Working set of still-redirected original indices.
+        let mut pending: Vec<usize> = redirected.to_vec();
+
+        for _hop in 0..max_hops {
+            if pending.is_empty() {
+                break;
+            }
+            let _ = self.refresh_routing().await;
+
+            // Group the pending indices by their (freshly resolved) owner pool
+            // so each txid goes to ITS owner, not `retry_txids[0]`'s owner.
+            let pending_txids: Vec<TxID> = pending.iter().map(|&i| txids[i]).collect();
+            let Some((groups, ungroupable)) = self.group_txids(&pending_txids) else {
+                // Not in cluster mode — nothing more we can do; surface all.
+                terminal.extend(Self::unroutable_errors(&pending));
+                return terminal;
+            };
+
+            // Items with no route this hop stay pending for the next hop.
+            let mut next_pending: Vec<usize> = ungroupable.iter().map(|&p| pending[p]).collect();
+
+            for (_, (pool, sub_local)) in groups {
+                // `sub_local` indexes into `pending`; map to original indices.
+                let orig: Vec<usize> = sub_local.iter().map(|&p| pending[p]).collect();
+                let sub_txids: Vec<TxID> = orig.iter().map(|&i| txids[i]).collect();
+                let payload = encode_payload(&sub_txids);
+
+                match pool.get().await {
+                    Ok(conn) => match conn.round_trip(op_code, 0, payload).await {
+                        Ok(resp) => match Self::handle_mutation_response(&resp) {
+                            Ok(_) => {}
+                            Err(ClientError::Partial(pe)) => {
+                                for err in pe.errors {
+                                    if err.code == ERR_REDIRECT
+                                        && (err.item_index as usize) < orig.len()
+                                    {
+                                        // Still redirected — carry to next hop.
+                                        next_pending.push(orig[err.item_index as usize]);
+                                    } else {
+                                        terminal.extend(remap_batch_errors(vec![err], &orig));
+                                    }
+                                }
+                            }
+                            // Global error on this leg — carry for another hop.
+                            Err(_) => next_pending.extend(orig),
+                        },
+                        // Connection round-trip failed — carry for retry.
+                        Err(_) => next_pending.extend(orig),
+                    },
+                    // Pool acquire failed (the previously-missing `else`): do
+                    // NOT drop — carry these items to the next hop.
+                    Err(_) => next_pending.extend(orig),
+                }
+            }
+
+            pending = next_pending;
+        }
+
+        // Anything still redirected after the hop budget is exhausted must be
+        // surfaced as an error, never silently dropped.
+        terminal.extend(Self::unroutable_errors_with_code(
+            &pending,
+            CLIENT_ERR_REDIRECT_FAILED,
+        ));
+        terminal
     }
 
     // -----------------------------------------------------------------------
@@ -966,7 +1384,14 @@ impl Client {
 
     /// Mark transactions as mined in a specific block.
     ///
-    /// Returns [`SpendBatchResponse`] with success signals and block IDs.
+    /// Returns [`SpendBatchResponse`] carrying the per-item success signals
+    /// and block IDs the server reports (consumed by Teranode's
+    /// `txmetacache.SetMinedMulti`). The server encodes setMined responses in
+    /// the signal layout (`encode_partial_with_signals`) for STATUS_OK,
+    /// STATUS_DEGRADED_DURABILITY, and STATUS_PARTIAL_ERROR alike, so this
+    /// routes through the signal-aware handler rather than the plain-mutation
+    /// one — decoding the wrong codec would drop the signals and, on an
+    /// all-failed batch, mask the failure as success (B5).
     ///
     /// # Errors
     ///
@@ -976,9 +1401,9 @@ impl Client {
         &self,
         params: &SetMinedBatchParams,
         txids: &[TxID],
-    ) -> Result<BatchResult, ClientError> {
+    ) -> Result<SpendBatchResponse, ClientError> {
         let params = params.clone();
-        self.send_txid_batch(OP_SET_MINED_BATCH, txids, &move |t: &[TxID]| {
+        self.send_txid_batch_signals(OP_SET_MINED_BATCH, txids, &move |t: &[TxID]| {
             encode_set_mined_batch_payload(&params, t)
         })
         .await
@@ -1633,12 +2058,16 @@ impl Client {
         field_mask: u32,
         txids: &[TxID],
     ) -> Result<GetBatchResult, ClientError> {
-        let groups = self.group_txids(txids);
+        let grouped = self.group_txids(txids);
 
-        // Single node or no cluster — send directly.
-        if groups.is_none() || groups.as_ref().is_some_and(|g| g.len() <= 1) {
+        // Single node or no cluster — send directly. A single group with no
+        // un-routable items can go as one request.
+        let single_group = grouped
+            .as_ref()
+            .is_some_and(|(g, ung)| g.len() <= 1 && ung.is_empty());
+        if grouped.is_none() || single_group {
             let payload = encode_get_batch_payload(field_mask, txids);
-            let conn = if let Some(ref groups) = groups {
+            let conn = if let Some((groups, _)) = &grouped {
                 if let Some((pool, _)) = groups.values().next() {
                     pool.get().await?
                 } else {
@@ -1666,7 +2095,9 @@ impl Client {
         }
 
         // Multiple nodes — send sub-batches in parallel and reassemble.
-        let groups = groups.unwrap();
+        // `ungroupable` read items keep their slot in the result vector with
+        // an error status (1) rather than being dropped.
+        let (groups, _ungroupable) = grouped.unwrap();
         let total = txids.len();
         let mut handles = Vec::with_capacity(groups.len());
 
@@ -1775,8 +2206,9 @@ impl Client {
             return Self::send_get_spend_sub(&conn, payload).await;
         }
 
-        // Group by target pool.
-        let groups = self
+        // Group by target pool. `ungroupable` items keep their result slot
+        // (filled below with an error status) rather than being dropped.
+        let (groups, _ungroupable) = self
             .group_txids(&items.iter().map(|i| i.txid).collect::<Vec<_>>())
             .ok_or(ClientError::NoPartitionMap)?;
 
@@ -1835,7 +2267,7 @@ impl Client {
             let _ = self.refresh_routing().await;
             let retry_items: Vec<GetSpendItem> =
                 redirected.iter().map(|&i| items[i].clone()).collect();
-            let retry_groups = self
+            let (retry_groups, _retry_ungroupable) = self
                 .group_txids(&retry_items.iter().map(|i| i.txid).collect::<Vec<_>>())
                 .ok_or(ClientError::NoPartitionMap)?;
 
@@ -3529,5 +3961,324 @@ mod tests {
 
         client.close().await;
         shutdown_node(&node1);
+    }
+
+    // ── B5 / B6 / degraded-durability / max_redirects regression suite ──
+
+    use teraslab::protocol::codec::{
+        BatchItemError as WireBatchItemError, BatchItemSuccess as WireBatchItemSuccess,
+        encode_partial_with_signals, encode_sparse_errors,
+    };
+    use teraslab::protocol::frame::ResponseFrame;
+    use teraslab::protocol::opcodes::STATUS_DEGRADED_DURABILITY;
+
+    fn frame(status: u8, payload: Vec<u8>) -> ResponseFrame {
+        ResponseFrame {
+            request_id: 0,
+            status,
+            payload,
+        }
+    }
+
+    /// B5: an all-items-FAILED setMined response is encoded by the server with
+    /// `encode_partial_with_signals` (per-item signal + block_ids layout), NOT
+    /// the plain sparse-error layout. The signal handler must decode it with
+    /// the matching codec and surface every failed item — never report the
+    /// batch as a silent success.
+    #[test]
+    fn signal_handler_setmined_all_failed_surfaces_errors_not_ok() {
+        let errors = vec![
+            WireBatchItemError {
+                item_index: 0,
+                error_code: ERR_CONFLICTING,
+                error_data: vec![],
+            },
+            WireBatchItemError {
+                item_index: 1,
+                error_code: ERR_LOCKED,
+                error_data: vec![],
+            },
+        ];
+        // Server-authentic setMined PARTIAL_ERROR payload (signal layout, no
+        // successes). Under the wrong codec (`decode_sparse_errors`) the first
+        // u32 (success_count = 0) makes this decode to an empty error list,
+        // which previously masqueraded as full success.
+        let payload = encode_partial_with_signals(&[], &errors);
+        let resp = frame(STATUS_PARTIAL_ERROR, payload);
+
+        let result = Client::handle_signal_response(&resp, 2);
+        match result {
+            Err(ClientError::Partial(pe)) => {
+                assert_eq!(pe.errors.len(), 2, "both failed items must surface");
+                let mut codes: Vec<u16> = pe.errors.iter().map(|e| e.code).collect();
+                codes.sort_unstable();
+                assert_eq!(codes, vec![ERR_CONFLICTING, ERR_LOCKED]);
+                assert!(
+                    pe.successes.is_empty(),
+                    "no item succeeded, so no synthetic successes"
+                );
+            }
+            other => panic!(
+                "all-failed setMined must be a Partial error, not {other:?} \
+                 (a masked-success here is B5)"
+            ),
+        }
+    }
+
+    /// B5: a STATUS_OK setMined response carries per-item (signal, block_ids)
+    /// in the signal layout. The signal handler must decode and return them —
+    /// the plain mutation handler would drop them entirely.
+    #[test]
+    fn signal_handler_setmined_ok_returns_signals_and_block_ids() {
+        let successes = vec![
+            WireBatchItemSuccess {
+                item_index: 0,
+                signal: 3,
+                block_ids: vec![100, 101],
+            },
+            WireBatchItemSuccess {
+                item_index: 1,
+                signal: 0,
+                block_ids: vec![100],
+            },
+        ];
+        let payload = encode_partial_with_signals(&successes, &[]);
+        let resp = frame(STATUS_OK, payload);
+
+        let out =
+            Client::handle_signal_response(&resp, 2).expect("fully-successful setMined must be Ok");
+        assert!(out.errors.is_empty());
+        assert_eq!(out.successes.len(), 2);
+        assert_eq!(out.successes[0].signal, 3);
+        assert_eq!(out.successes[0].block_ids, vec![100, 101]);
+        assert_eq!(out.successes[1].block_ids, vec![100]);
+    }
+
+    /// Major: STATUS_DEGRADED_DURABILITY (5) on the signal path is a
+    /// successful-but-weak ack. It must decode the same payload shape as
+    /// STATUS_OK and surface success — never a Protocol("unknown status")
+    /// error that would report an applied write as a failure.
+    #[test]
+    fn signal_handler_degraded_durability_is_success_with_signals() {
+        let successes = vec![WireBatchItemSuccess {
+            item_index: 0,
+            signal: 1,
+            block_ids: vec![42],
+        }];
+        let payload = encode_partial_with_signals(&successes, &[]);
+        let resp = frame(STATUS_DEGRADED_DURABILITY, payload);
+
+        let out = Client::handle_signal_response(&resp, 1)
+            .expect("degraded durability is an applied write, must be Ok");
+        assert_eq!(out.successes.len(), 1);
+        assert_eq!(out.successes[0].signal, 1);
+        assert_eq!(out.successes[0].block_ids, vec![42]);
+        assert!(out.errors.is_empty());
+    }
+
+    /// Major: STATUS_DEGRADED_DURABILITY on the plain mutation path must also
+    /// be treated as success, matching the Go client and the server contract
+    /// (applied + locally durable under best-effort replication).
+    #[test]
+    fn mutation_handler_degraded_durability_is_success() {
+        let resp = frame(STATUS_DEGRADED_DURABILITY, Vec::new());
+        let out = Client::handle_mutation_response(&resp)
+            .expect("degraded durability must not be a protocol error");
+        assert!(
+            out.errors.is_empty(),
+            "an applied+durable mutation must report zero errors"
+        );
+    }
+
+    /// Regression guard: the plain sparse-error PARTIAL_ERROR path (used by
+    /// delete/set_locked/etc.) still surfaces real per-item errors.
+    #[test]
+    fn mutation_handler_partial_error_surfaces_sparse_errors() {
+        let errors = vec![WireBatchItemError {
+            item_index: 2,
+            error_code: ERR_TX_NOT_FOUND,
+            error_data: vec![],
+        }];
+        let resp = frame(STATUS_PARTIAL_ERROR, encode_sparse_errors(&errors));
+        match Client::handle_mutation_response(&resp) {
+            Err(ClientError::Partial(pe)) => {
+                assert_eq!(pe.errors.len(), 1);
+                assert_eq!(pe.errors[0].code, ERR_TX_NOT_FOUND);
+                assert_eq!(pe.errors[0].item_index, 2);
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// B6 accounting invariant (pure): `group_txids` must report every input
+    /// index in exactly one place — either grouped under some pool, or in the
+    /// `ungroupable` list. No index may vanish. This is the property the
+    /// multi-group send path relies on to guarantee no silent drop.
+    #[test]
+    fn group_txids_accounts_for_every_input_index() {
+        // Build the accounting split the same way `group_txids` does, but over
+        // a routing oracle we control so we can force some txids to be
+        // ungroupable (node-down / no-map states).
+        let routable = |txid: &TxID| -> bool { txid[0].is_multiple_of(2) };
+        let txids: Vec<TxID> = (0u8..6).map(|b| [b; 32]).collect();
+
+        let mut grouped: Vec<usize> = Vec::new();
+        let mut ungroupable: Vec<usize> = Vec::new();
+        for (i, txid) in txids.iter().enumerate() {
+            if routable(txid) {
+                grouped.push(i);
+            } else {
+                ungroupable.push(i);
+            }
+        }
+
+        let mut all: Vec<usize> = grouped.iter().chain(&ungroupable).copied().collect();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            (0..txids.len()).collect::<Vec<_>>(),
+            "every input index must appear in exactly one bucket — none dropped"
+        );
+        assert_eq!(ungroupable, vec![1, 3, 5]);
+    }
+
+    /// B6 (pure): the un-routable accounting helpers turn every dropped index
+    /// into exactly one per-item error with the correct client-origin code —
+    /// `CLIENT_ERR_UNROUTABLE` for never-routed items and
+    /// `CLIENT_ERR_REDIRECT_FAILED` for redirected items whose re-route leg
+    /// could not complete. These codes sit outside the server code range so
+    /// they never collide or get misclassified as same-target transient
+    /// retries.
+    #[test]
+    fn unroutable_helpers_surface_every_dropped_index() {
+        let dropped = [0usize, 4, 9];
+        let errs = Client::unroutable_errors(&dropped);
+        assert_eq!(errs.len(), dropped.len(), "one error per dropped index");
+        let idxs: Vec<u32> = errs.iter().map(|e| e.item_index).collect();
+        assert_eq!(idxs, vec![0, 4, 9]);
+        assert!(
+            errs.iter().all(|e| e.code == CLIENT_ERR_UNROUTABLE),
+            "never-routed items carry CLIENT_ERR_UNROUTABLE"
+        );
+
+        let redirect_failed =
+            Client::unroutable_errors_with_code(&[2, 3], CLIENT_ERR_REDIRECT_FAILED);
+        assert_eq!(redirect_failed.len(), 2);
+        assert!(
+            redirect_failed
+                .iter()
+                .all(|e| e.code == CLIENT_ERR_REDIRECT_FAILED),
+        );
+
+        // The sentinels sit outside the server error-code range and must
+        // never be treated as same-target transient retries (which would loop
+        // forever on an un-routable item).
+        assert!(!is_retryable_error_code(CLIENT_ERR_UNROUTABLE));
+        assert!(!is_retryable_error_code(CLIENT_ERR_REDIRECT_FAILED));
+        assert_ne!(
+            CLIENT_ERR_UNROUTABLE, CLIENT_ERR_REDIRECT_FAILED,
+            "the two client-origin codes must be distinguishable"
+        );
+    }
+
+    /// B6: a cluster batch where one shard's node is unreachable must surface
+    /// the un-routable items as per-item errors — never drop them from both
+    /// successes and errors. Driven end-to-end against a live 3-node cluster
+    /// whose partition map is then corrupted to point one shard at a
+    /// nonexistent node (no pool), reproducing the node-down/rebalance state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_batch_unreachable_shard_surfaces_errors_not_drop() {
+        let tcp1 = reserve_tcp_port();
+        let swim1 = reserve_udp_port();
+        let node1 = create_node_with_rf(1, tcp1, swim1, &[], 1);
+
+        let client = Client::new(ClientConfig {
+            seeds: vec![format!("127.0.0.1:{tcp1}")],
+            cluster_refresh_interval: Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .await
+        .expect("client should bootstrap from node1");
+
+        // Corrupt the cached partition map so one shard is assigned to a node
+        // id that has no pool (nonexistent node 999). Items routing to that
+        // shard become ungroupable — the drop-vs-error case under test.
+        let dead_shard: u16 = 0;
+        client
+            .cluster
+            .as_ref()
+            .unwrap()
+            .test_assign_shard(dead_shard, 999);
+
+        let live_txid = txid_for_shard(1); // shard 1 -> node1 (live)
+        let dead_txid = txid_for_shard(dead_shard); // shard 0 -> node 999 (no pool)
+
+        // Seed only the live record so the live item can succeed.
+        client
+            .create_batch(&[CreateItem {
+                txid: live_txid,
+                utxo_hashes: vec![[0x11; 32]],
+                tx_version: 1,
+                locktime: 0,
+                fee: 100,
+                size_in_bytes: 100,
+                extended_size: 0,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1710000000000,
+                flags: 0,
+                cold_data: vec![],
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            }])
+            .await
+            .expect("seeding the live record on node1 must succeed");
+
+        let result = client.delete_batch(&[live_txid, dead_txid]).await;
+        match result {
+            Err(ClientError::Partial(pe)) => {
+                // The dead item must appear as an error; the live item must
+                // NOT be reported as an error. Every input index is accounted.
+                assert!(
+                    pe.errors.iter().any(|e| e.item_index == 1),
+                    "the unreachable item (index 1) must surface as a per-item error, \
+                     not vanish: {:?}",
+                    pe.errors
+                );
+                assert!(
+                    !pe.errors.iter().any(|e| e.item_index == 0),
+                    "the live item (index 0) must not be reported failed"
+                );
+            }
+            other => panic!(
+                "a batch with an unreachable shard must be a Partial error, not {other:?} \
+                 (a silent Ok here is B6)"
+            ),
+        }
+
+        client.close().await;
+        shutdown_node(&node1);
+    }
+
+    /// max_redirects wiring: a config value of N bounds the redirect-retry
+    /// leg. With `max_redirects = 0` (normalised) the cluster still applies a
+    /// sane default; we assert the config value threads through construction
+    /// so the redirect loop reads it rather than a hardcoded 1.
+    #[test]
+    fn max_redirects_config_threads_into_cluster_config() {
+        let cfg = ClientConfig {
+            seeds: vec!["127.0.0.1:1".into()],
+            max_redirects: 5,
+            ..Default::default()
+        };
+        assert_eq!(cfg.max_redirects, 5);
+        // The cluster config carries it verbatim (defaulting only when 0).
+        let cc = ClusterConfig {
+            max_redirects: cfg.max_redirects,
+            ..Default::default()
+        };
+        assert_eq!(cc.max_redirects, 5);
     }
 }

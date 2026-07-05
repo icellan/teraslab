@@ -328,6 +328,13 @@ impl Cluster {
         )))
     }
 
+    /// Maximum number of redirect-retry hops the client should take when a
+    /// mutation is redirected (stale shard table). Comes from
+    /// [`ClusterConfig::max_redirects`] (defaulted to 3 when unset).
+    pub fn max_redirects(&self) -> u32 {
+        self.config.max_redirects
+    }
+
     /// Return a clone of the cached partition map, or `None` if not yet bootstrapped.
     pub fn cached_partition_map(&self) -> Option<PartitionMap> {
         self.part_map.read().clone()
@@ -341,6 +348,16 @@ impl Cluster {
             .next()
             .cloned()
             .ok_or_else(|| ClientError::Connection("no pools available".to_string()))
+    }
+
+    /// Test-only: force the cached partition map to assign `shard` to
+    /// `node_id`. Used to reproduce a stale/rebalancing map where a shard
+    /// points at a node the client has no pool for (node-down state).
+    #[cfg(test)]
+    pub(crate) fn test_assign_shard(&self, shard: u16, node_id: u64) {
+        if let Some(pm) = self.part_map.write().as_mut() {
+            pm.assignments[shard as usize] = node_id;
+        }
     }
 
     /// Return the connection pool for the master of the given shard.
