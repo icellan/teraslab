@@ -216,6 +216,67 @@ fn fail_migration_task_current_epoch(
     true
 }
 
+/// Issue #46 — fail-safe gate for cluster key-enumeration.
+///
+/// After the slim-index change a reshard enumeration resolves each record's
+/// full 32-byte txid from its on-device footer and SKIPS any record whose
+/// footer is unreadable (torn / CRC-fail / concurrently relocating). A skip
+/// silently shrinks the shard-transfer key set, so shipping it would drop a
+/// UTXO from the handoff with no hard signal (the metric bump inside
+/// `Engine::resolve_full_keys` makes it observable, but that alone does not
+/// prevent the loss).
+///
+/// This gate treats ANY skip (`skipped > 0`) as "enumeration incomplete this
+/// round": the caller must NOT finalize / hand off the affected shards. Every
+/// outbound task in the round is FAILED and rolled back to `self`
+/// ([`FailedTaskTableAction::Rollback`] — the historical no-loss-safe outcome,
+/// never a relinquish, so a record we could not read is never handed to a peer
+/// that might not hold it). Rolling the shards back to `self` leaves the local
+/// table diverged from the committed topology, which the periodic reactivation
+/// loop (and the rejoin `take_failed_tasks` re-drive) re-runs next pass — when
+/// the record may read cleanly.
+///
+/// Returns `true` when the round is complete (`skipped == 0`) and the caller
+/// should proceed with the migration spawn; `false` when it was incomplete and
+/// the caller MUST abort the spawn. Tasks that are not currently tracked as
+/// active (e.g. a replica-resync backfill that was never `start_outbound`'d)
+/// make the per-task fail a no-op — for those non-handoff paths the ERROR log
+/// plus the metric bump plus the skipped spawn is the effective behaviour, and
+/// the natural resync re-request re-drives them.
+fn finalize_enumeration_round(
+    skipped: usize,
+    tasks: &[MigrationTask],
+    migration: &Arc<Mutex<MigrationManager>>,
+    shard_table: &Arc<ShardTableLock<ShardTable>>,
+    fenced_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    migrating_bm: &Arc<crate::cluster::migration::AtomicShardBitmap>,
+    topology_epoch: u64,
+) -> bool {
+    if skipped == 0 {
+        return true;
+    }
+    let shards: std::collections::BTreeSet<u16> = tasks.iter().map(|t| t.shard).collect();
+    tracing::error!(
+        skipped,
+        ?shards,
+        topology_epoch,
+        "cluster: key enumeration skipped {skipped} unreadable-footer record(s); refusing to \
+         finalize/hand off these shards this round — rolling back to self for retry (issue #46)",
+    );
+    for task in tasks {
+        fail_migration_task_current_epoch(
+            migration,
+            shard_table,
+            fenced_bm,
+            migrating_bm,
+            task,
+            topology_epoch,
+            FailedTaskTableAction::Rollback,
+        );
+    }
+    false
+}
+
 /// Context needed to decide, on an outbound master-handoff failure, whether to
 /// relinquish the shard to its committed master instead of rolling it back to
 /// `self` (Task #25). Built from the committed topology + live-member snapshot
@@ -2149,10 +2210,27 @@ impl ClusterCoordinator {
                         shard_count = tasks.len(),
                         "cluster: synthesizing full-shard resync tasks",
                     );
-                    let keys_map = engine.keys_by_shard_filtered(&target_shards);
+                    let (keys_map, skipped) = engine.keys_by_shard_filtered(&target_shards);
+                    let epoch = topology_epoch.load(Ordering::Relaxed);
+                    // Issue #46 fail-safe: an unreadable-footer skip means this
+                    // resync key set is incomplete — do not backfill a short set.
+                    // These resync tasks are not start_outbound-tracked, so the
+                    // fail is a no-op; the skipped spawn + the catchup loop's
+                    // next resync re-request re-drive it once the record reads
+                    // cleanly.
+                    if !finalize_enumeration_round(
+                        skipped,
+                        &tasks,
+                        &migration,
+                        &shard_table,
+                        &fenced_bm_event,
+                        &migrating_bm_event,
+                        epoch,
+                    ) {
+                        continue;
+                    }
                     let all_keys: Vec<TxKey> =
                         keys_map.values().flat_map(|v| v.iter().copied()).collect();
-                    let epoch = topology_epoch.load(Ordering::Relaxed);
                     let migration_ref = migration.clone();
                     let node_addrs_ref = node_addrs.clone();
                     let eng = engine.clone();
@@ -2247,64 +2325,80 @@ impl ClusterCoordinator {
                         migration
                             .lock()
                             .start_outbound(&resend_tasks, self_id, &populated);
-                        let keys_map = engine.keys_by_shard_filtered(&shard_set);
-                        let all_keys: Vec<TxKey> =
-                            keys_map.values().flat_map(|v| v.iter().copied()).collect();
-                        let migration_ref = migration.clone();
-                        let node_addrs_ref = node_addrs.clone();
-                        let eng = engine.clone();
-                        let redo = redo_for_events.clone();
-                        let st = shard_table.clone();
-                        let fb = fenced_bm_event.clone();
-                        let mb = migrating_bm_event.clone();
-                        let ib = inbound_bm_event.clone();
-                        let throttle_ref = migration_throttle_event.clone();
-                        let secret_ref = cluster_secret_event.clone();
-                        // Task #25 — relinquish context for the transfer-request
-                        // resend path: a peer is asking us to re-run an outbound
-                        // handoff. If the handoff hard-fails because that peer is
-                        // the committed master already serving the shard, drop
-                        // the phantom mastership instead of rolling back.
-                        let relinquish_ctx = {
-                            let committed_members = active_topology_members_event.read().clone();
-                            let (rf, placement_version) = {
-                                let t = st.read();
-                                (t.replication_factor(), t.placement_version())
+                        let (keys_map, skipped) = engine.keys_by_shard_filtered(&shard_set);
+                        // Issue #46 fail-safe: an incomplete enumeration must not
+                        // hand off. Fail the just-started outbound tasks (rollback
+                        // to self); the committed-term reactivation re-drives them.
+                        if !finalize_enumeration_round(
+                            skipped,
+                            &resend_tasks,
+                            &migration,
+                            &shard_table,
+                            &fenced_bm_event,
+                            &migrating_bm_event,
+                            committed_term,
+                        ) {
+                            // Rolled back for retry — skip the resend spawn.
+                        } else {
+                            let all_keys: Vec<TxKey> =
+                                keys_map.values().flat_map(|v| v.iter().copied()).collect();
+                            let migration_ref = migration.clone();
+                            let node_addrs_ref = node_addrs.clone();
+                            let eng = engine.clone();
+                            let redo = redo_for_events.clone();
+                            let st = shard_table.clone();
+                            let fb = fenced_bm_event.clone();
+                            let mb = migrating_bm_event.clone();
+                            let ib = inbound_bm_event.clone();
+                            let throttle_ref = migration_throttle_event.clone();
+                            let secret_ref = cluster_secret_event.clone();
+                            // Task #25 — relinquish context for the transfer-request
+                            // resend path: a peer is asking us to re-run an outbound
+                            // handoff. If the handoff hard-fails because that peer is
+                            // the committed master already serving the shard, drop
+                            // the phantom mastership instead of rolling back.
+                            let relinquish_ctx = {
+                                let committed_members =
+                                    active_topology_members_event.read().clone();
+                                let (rf, placement_version) = {
+                                    let t = st.read();
+                                    (t.replication_factor(), t.placement_version())
+                                };
+                                let mut live_members: std::collections::HashSet<NodeId> =
+                                    node_addrs.read().keys().copied().collect();
+                                live_members.insert(self_id);
+                                Arc::new(RelinquishContext {
+                                    committed_members,
+                                    rf,
+                                    placement_version,
+                                    self_id,
+                                    live_members,
+                                    engine: engine.clone(),
+                                })
                             };
-                            let mut live_members: std::collections::HashSet<NodeId> =
-                                node_addrs.read().keys().copied().collect();
-                            live_members.insert(self_id);
-                            Arc::new(RelinquishContext {
-                                committed_members,
-                                rf,
-                                placement_version,
-                                self_id,
-                                live_members,
-                                engine: engine.clone(),
-                            })
-                        };
-                        std::thread::spawn(move || {
-                            Self::run_migration_tasks_with_global_limit(
-                                resend_tasks,
-                                all_keys,
-                                node_addrs_ref,
-                                eng,
-                                migration_ref,
-                                st,
-                                redo,
-                                committed_term,
-                                max_migration_threads,
-                                migration_pool_size,
-                                migration_batch_size,
-                                fb,
-                                mb,
-                                ib,
-                                self_id,
-                                throttle_ref,
-                                secret_ref,
-                                Some(relinquish_ctx),
-                            );
-                        });
+                            std::thread::spawn(move || {
+                                Self::run_migration_tasks_with_global_limit(
+                                    resend_tasks,
+                                    all_keys,
+                                    node_addrs_ref,
+                                    eng,
+                                    migration_ref,
+                                    st,
+                                    redo,
+                                    committed_term,
+                                    max_migration_threads,
+                                    migration_pool_size,
+                                    migration_batch_size,
+                                    fb,
+                                    mb,
+                                    ib,
+                                    self_id,
+                                    throttle_ref,
+                                    secret_ref,
+                                    Some(relinquish_ctx),
+                                );
+                            });
+                        }
                     }
                     if diverged > 0 && !activation_held {
                         // Some requested shards were rolled back after a
@@ -2522,63 +2616,79 @@ impl ClusterCoordinator {
                     let epoch = topology_epoch.load(Ordering::Relaxed);
                     let retry_shards: std::collections::HashSet<u16> =
                         retry_tasks.iter().map(|t| t.shard).collect();
-                    let keys_map = engine.keys_by_shard_filtered(&retry_shards);
-                    let all_keys: Vec<TxKey> =
-                        keys_map.values().flat_map(|v| v.iter().copied()).collect();
-                    let migration_ref = migration.clone();
-                    let node_addrs_ref = node_addrs.clone();
-                    let eng = engine.clone();
-                    let redo = redo_for_events.clone();
-                    let st = shard_table.clone();
-                    let fb = fenced_bm.clone();
-                    let mb = migrating_bm.clone();
-                    let ib = inbound_bm.clone();
-                    let throttle_ref = migration_throttle.clone();
-                    let secret_ref = cluster_secret.clone();
-                    // Task #25 — relinquish context for the rejoin retry path,
-                    // built from the committed (active) topology members + RF
-                    // and the live-member snapshot (peers we have addresses for,
-                    // plus self).
-                    let relinquish_ctx = {
-                        let committed_members = active_topology_members.read().clone();
-                        let (rf, placement_version) = {
-                            let t = st.read();
-                            (t.replication_factor(), t.placement_version())
+                    let (keys_map, skipped) = engine.keys_by_shard_filtered(&retry_shards);
+                    // Issue #46 fail-safe: an incomplete enumeration must not
+                    // finalize the retried handoff. Re-fail the (Streaming,
+                    // tracked) retry tasks — rolling them back to self — so they
+                    // return to the failed set and are re-driven next pass.
+                    if !finalize_enumeration_round(
+                        skipped,
+                        &retry_tasks,
+                        migration,
+                        shard_table,
+                        fenced_bm,
+                        migrating_bm,
+                        epoch,
+                    ) {
+                        // Rolled back for retry — skip the spawn this round.
+                    } else {
+                        let all_keys: Vec<TxKey> =
+                            keys_map.values().flat_map(|v| v.iter().copied()).collect();
+                        let migration_ref = migration.clone();
+                        let node_addrs_ref = node_addrs.clone();
+                        let eng = engine.clone();
+                        let redo = redo_for_events.clone();
+                        let st = shard_table.clone();
+                        let fb = fenced_bm.clone();
+                        let mb = migrating_bm.clone();
+                        let ib = inbound_bm.clone();
+                        let throttle_ref = migration_throttle.clone();
+                        let secret_ref = cluster_secret.clone();
+                        // Task #25 — relinquish context for the rejoin retry path,
+                        // built from the committed (active) topology members + RF
+                        // and the live-member snapshot (peers we have addresses for,
+                        // plus self).
+                        let relinquish_ctx = {
+                            let committed_members = active_topology_members.read().clone();
+                            let (rf, placement_version) = {
+                                let t = st.read();
+                                (t.replication_factor(), t.placement_version())
+                            };
+                            let mut live_members: std::collections::HashSet<NodeId> =
+                                node_addrs.read().keys().copied().collect();
+                            live_members.insert(self_id);
+                            Arc::new(RelinquishContext {
+                                committed_members,
+                                rf,
+                                placement_version,
+                                self_id,
+                                live_members,
+                                engine: engine.clone(),
+                            })
                         };
-                        let mut live_members: std::collections::HashSet<NodeId> =
-                            node_addrs.read().keys().copied().collect();
-                        live_members.insert(self_id);
-                        Arc::new(RelinquishContext {
-                            committed_members,
-                            rf,
-                            placement_version,
-                            self_id,
-                            live_members,
-                            engine: engine.clone(),
-                        })
-                    };
-                    std::thread::spawn(move || {
-                        Self::run_migration_tasks_with_global_limit(
-                            retry_tasks,
-                            all_keys,
-                            node_addrs_ref,
-                            eng,
-                            migration_ref,
-                            st,
-                            redo,
-                            epoch,
-                            max_migration_threads,
-                            migration_pool_size,
-                            migration_batch_size,
-                            fb,
-                            mb,
-                            ib,
-                            self_id,
-                            throttle_ref,
-                            secret_ref,
-                            Some(relinquish_ctx),
-                        );
-                    });
+                        std::thread::spawn(move || {
+                            Self::run_migration_tasks_with_global_limit(
+                                retry_tasks,
+                                all_keys,
+                                node_addrs_ref,
+                                eng,
+                                migration_ref,
+                                st,
+                                redo,
+                                epoch,
+                                max_migration_threads,
+                                migration_pool_size,
+                                migration_batch_size,
+                                fb,
+                                mb,
+                                ib,
+                                self_id,
+                                throttle_ref,
+                                secret_ref,
+                                Some(relinquish_ctx),
+                            );
+                        });
+                    }
                 }
             }
             ClusterEvent::NodeLeft(node) => {
@@ -3382,7 +3492,25 @@ impl ClusterCoordinator {
             };
 
             std::thread::spawn(move || {
-                let pre_swap_keys_by_shard = engine_w.keys_by_shard_filtered(&outbound_shard_set);
+                let (pre_swap_keys_by_shard, skipped) =
+                    engine_w.keys_by_shard_filtered(&outbound_shard_set);
+                // Issue #46 fail-safe: this is the primary activation handoff.
+                // An unreadable-footer skip means the pre-swap key set is
+                // incomplete, so handing it off would silently drop that record's
+                // UTXO from the transfer. Fail every outbound task (rollback to
+                // self) so the periodic reactivation loop re-drives the handoff
+                // next pass, and do NOT run the migration this round.
+                if !finalize_enumeration_round(
+                    skipped,
+                    &outbound_tasks,
+                    &migration_w,
+                    &shard_table_w,
+                    &fenced_bm_w,
+                    &migrating_bm_w,
+                    epoch,
+                ) {
+                    return;
+                }
                 let pre_swap_keys: Vec<TxKey> = pre_swap_keys_by_shard
                     .values()
                     .flat_map(|v| v.iter().copied())
@@ -4646,30 +4774,66 @@ fn run_migration_batch(
         // in-flight straggler create (released between locks — see
         // `drain_in_flight_mutations` for the lock-order constraint).
         drain_in_flight_mutations(&engine);
+        let mut empty_recheck_incomplete = false;
         {
             let mut mgr = migration.lock();
-            let fenced_keys_by_shard = engine.keys_by_shard_filtered(&empty_shards);
+            let (fenced_keys_by_shard, fenced_skipped) =
+                engine.keys_by_shard_filtered(&empty_shards);
 
-            for task in &empty_tasks {
-                if !fenced_keys_by_shard.contains_key(&task.shard) {
-                    ready_empty_tasks.push(task.clone());
-                } else {
-                    if engine.shard_record_count(task.shard) == 0 {
-                        let key_count = fenced_keys_by_shard
-                            .get(&task.shard)
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-                        tracing::warn!(
-                            shard = task.shard,
-                            keys = key_count,
-                            "cluster: shard empty recheck found keys despite zero shard count",
-                        );
+            if fenced_skipped > 0 {
+                // Issue #46 fail-safe: an unreadable footer during the empty
+                // recheck means we CANNOT prove these shards are empty — a
+                // record exists but its full txid could not be resolved.
+                // Completing them as "empty" would silently drop that UTXO from
+                // the handoff. Refuse: leave every rechecked task out of both
+                // the ready-empty and promoted sets and fail it below (rolled
+                // back to self, never relinquished — the shard is NOT proven
+                // empty) so the retry path re-verifies next pass.
+                empty_recheck_incomplete = true;
+                tracing::error!(
+                    skipped = fenced_skipped,
+                    ?empty_shards,
+                    "cluster: empty-shard recheck enumeration skipped {fenced_skipped} \
+                     unreadable-footer record(s); refusing to finalize these shards as empty \
+                     this round — routing to retry (issue #46)",
+                );
+            } else {
+                for task in &empty_tasks {
+                    if !fenced_keys_by_shard.contains_key(&task.shard) {
+                        ready_empty_tasks.push(task.clone());
+                    } else {
+                        if engine.shard_record_count(task.shard) == 0 {
+                            let key_count = fenced_keys_by_shard
+                                .get(&task.shard)
+                                .map(|v| v.len())
+                                .unwrap_or(0);
+                            tracing::warn!(
+                                shard = task.shard,
+                                keys = key_count,
+                                "cluster: shard empty recheck found keys despite zero shard count",
+                            );
+                        }
+                        // Records appeared between snapshot and fence.
+                        // Must go through full migration path.
+                        mgr.unfence_shard(task.shard);
+                        fenced_bm.clear(task.shard);
+                        promoted.push(task.clone());
                     }
-                    // Records appeared between snapshot and fence.
-                    // Must go through full migration path.
-                    mgr.unfence_shard(task.shard);
-                    fenced_bm.clear(task.shard);
-                    promoted.push(task.clone());
+                }
+            }
+        }
+        if empty_recheck_incomplete {
+            for task in &empty_tasks {
+                if fail_migration_task_current_epoch(
+                    migration,
+                    shard_table,
+                    &fenced_bm,
+                    &migrating_bm,
+                    task,
+                    topology_epoch,
+                    FailedTaskTableAction::Rollback,
+                ) {
+                    failed.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -5006,8 +5170,8 @@ fn run_migration_batch(
                         })
                         .map(|(_, task)| task.shard)
                         .collect();
-                    let rescanned_keys_by_shard = if changed_shards.is_empty() {
-                        std::collections::HashMap::new()
+                    let (rescanned_keys_by_shard, rescan_skipped) = if changed_shards.is_empty() {
+                        (std::collections::HashMap::new(), 0usize)
                     } else {
                         engine.keys_by_shard_filtered(&changed_shards)
                     };
@@ -5067,6 +5231,34 @@ fn run_migration_batch(
                                 topology_epoch,
                                 relinquish_ctx,
                                 Some(&probe),
+                            ) {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                        // Issue #46 fail-safe: this shard's key set was rebuilt
+                        // by the manifest rescan, which SKIPPED an unreadable
+                        // footer. The rebuilt manifest / late-key set is therefore
+                        // incomplete; completing it would ship a manifest missing
+                        // that key and silently drop the UTXO from the transfer.
+                        // Abort the handoff for this shard and fail the task
+                        // (rollback to self) so the retry path re-runs it once the
+                        // record reads cleanly.
+                        if rescan_skipped > 0 && changed_shards.contains(&task.shard) {
+                            send_migration_abort_completion_best_effort(
+                                addr,
+                                task,
+                                "enumeration skipped unreadable footer (issue #46)",
+                                auth_secret,
+                            );
+                            if fail_migration_task_current_epoch(
+                                &migration,
+                                shard_table,
+                                &fenced_bm,
+                                &migrating_bm,
+                                task,
+                                topology_epoch,
+                                true,
                             ) {
                                 failed.fetch_add(1, Ordering::Relaxed);
                             }
@@ -9545,6 +9737,117 @@ mod tests {
         assert!(!mgr.is_shard_fenced(shard));
         assert!(!fenced_bm.test(shard));
         assert!(!migrating_bm.test(shard));
+    }
+
+    /// Issue #46: build two active outbound tasks and drive the fail-safe gate.
+    #[allow(clippy::type_complexity)]
+    fn setup_two_outbound_tasks() -> (
+        Arc<ShardTableLock<ShardTable>>,
+        Arc<Mutex<MigrationManager>>,
+        Arc<crate::cluster::migration::AtomicShardBitmap>,
+        Arc<crate::cluster::migration::AtomicShardBitmap>,
+        Vec<MigrationTask>,
+    ) {
+        // Epoch 3 table so `topology_epoch = 3` is current.
+        let shard_table = Arc::new(ShardTableLock::new(ShardTable::compute_with_epoch(
+            &[NodeId(1), NodeId(2)],
+            2,
+            3,
+            1,
+        )));
+        let migration = Arc::new(Mutex::new(MigrationManager::new()));
+        let fenced_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let migrating_bm = Arc::new(crate::cluster::migration::AtomicShardBitmap::new());
+        let tasks = vec![
+            MigrationTask {
+                shard: 5,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            },
+            MigrationTask {
+                shard: 9,
+                from_node: NodeId(1),
+                to_node: NodeId(2),
+                is_master: true,
+            },
+        ];
+        {
+            let mut mgr = migration.lock();
+            mgr.start_outbound(&tasks, NodeId(1), &std::collections::HashSet::new());
+        }
+        for t in &tasks {
+            migrating_bm.set(t.shard);
+        }
+        (shard_table, migration, fenced_bm, migrating_bm, tasks)
+    }
+
+    /// Issue #46: a reshard round whose enumeration skipped a key is treated as
+    /// INCOMPLETE — the gate returns `false` and fails every task in the round
+    /// (routing them to the retry path) instead of finalizing the handoff.
+    #[test]
+    fn finalize_enumeration_round_fails_safe_when_skipped() {
+        let (shard_table, migration, fenced_bm, migrating_bm, tasks) = setup_two_outbound_tasks();
+
+        let proceed = finalize_enumeration_round(
+            /* skipped = */ 1,
+            &tasks,
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            /* topology_epoch = */ 3,
+        );
+
+        assert!(
+            !proceed,
+            "skipped > 0 must be treated as incomplete — caller must NOT finalize"
+        );
+        let mgr = migration.lock();
+        assert_eq!(
+            mgr.failed_count(),
+            2,
+            "every task in a skipped round must be failed for retry"
+        );
+        for t in &tasks {
+            assert!(
+                !migrating_bm.test(t.shard),
+                "migrating bitmap must be cleared for a failed shard {}",
+                t.shard
+            );
+        }
+    }
+
+    /// Issue #46: a clean enumeration (`skipped == 0`) proceeds normally — the
+    /// gate returns `true` and leaves every task active (nothing failed).
+    #[test]
+    fn finalize_enumeration_round_proceeds_when_clean() {
+        let (shard_table, migration, fenced_bm, migrating_bm, tasks) = setup_two_outbound_tasks();
+
+        let proceed = finalize_enumeration_round(
+            /* skipped = */ 0,
+            &tasks,
+            &migration,
+            &shard_table,
+            &fenced_bm,
+            &migrating_bm,
+            /* topology_epoch = */ 3,
+        );
+
+        assert!(proceed, "a clean enumeration must let the caller proceed");
+        let mgr = migration.lock();
+        assert_eq!(
+            mgr.failed_count(),
+            0,
+            "no task may be failed when nothing was skipped"
+        );
+        for t in &tasks {
+            assert!(
+                migrating_bm.test(t.shard),
+                "migrating bitmap must be untouched for shard {} on a clean round",
+                t.shard
+            );
+        }
     }
 
     // ---- Task #25: no-loss-safe relinquish on failed outbound handoff ----

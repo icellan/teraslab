@@ -303,6 +303,19 @@ pub struct Engine {
     /// that a cascade was truncated rather than discovering it only in the
     /// ops log.
     conflicting_children_dropped: std::sync::atomic::AtomicU64,
+    /// Issue #46: count of records SKIPPED during full-txid key enumeration
+    /// because their on-device footer was unreadable (torn / CRC-fail /
+    /// concurrently relocating).
+    ///
+    /// The slim primary index stores only a 12-byte txid prefix, so migration
+    /// key-enumeration ([`Self::resolve_full_keys`] and the boot rebuild loops)
+    /// resolves each record's full 32-byte txid from its footer. A footer that
+    /// cannot be read is skipped rather than yielding a truncated key; without
+    /// an observable counter that skip could silently drop a UTXO from a shard
+    /// transfer. Read via [`Self::enumeration_unreadable`] and surfaced as the
+    /// Prometheus counter `teraslab_index_enumeration_unreadable_total`.
+    /// Monotonic for the lifetime of the engine.
+    enumeration_unreadable: std::sync::atomic::AtomicU64,
     /// Test-only fault injector: when set to `true`, the next call to
     /// [`Self::register_with_shard_count`] returns an error WITHOUT
     /// performing the backend `register` or incrementing `shard_counts`.
@@ -526,6 +539,7 @@ impl Engine {
             shard_counts,
             cached_millis: std::sync::atomic::AtomicU64::new(sys_millis()),
             conflicting_children_dropped: std::sync::atomic::AtomicU64::new(0),
+            enumeration_unreadable: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             fail_next_register: std::sync::atomic::AtomicBool::new(false),
             lifecycle_pinned: std::sync::atomic::AtomicBool::new(false),
@@ -2893,12 +2907,23 @@ impl Engine {
     /// A record whose footer is unreadable (torn / relocated mid-scan) is
     /// skipped with a warning rather than yielding a truncated key that would
     /// fail every downstream `read_metadata` tx_id check.
-    fn resolve_full_keys(&self, locs: Vec<(u8, u64)>) -> Vec<TxKey> {
+    ///
+    /// Returns `(resolved_keys, skipped)` where `skipped` is the number of
+    /// records whose footer could not be read (issue #46). Every skip also
+    /// bumps the observable [`Self::enumeration_unreadable`] counter. Callers
+    /// on the cluster reshard path MUST treat `skipped > 0` as an incomplete
+    /// enumeration and refuse to finalize a shard handoff built from it — a
+    /// silently short key set would drop a UTXO from the transfer.
+    fn resolve_full_keys(&self, locs: Vec<(u8, u64)>) -> (Vec<TxKey>, usize) {
         let mut out = Vec::with_capacity(locs.len());
+        let mut skipped = 0usize;
         for (device_id, offset) in locs {
             match self.read_metadata_fast(device_id, offset) {
                 Ok(meta) => out.push(TxKey::from_bytes(meta.tx_id)),
                 Err(e) => {
+                    skipped += 1;
+                    self.enumeration_unreadable
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         target: "teraslab::engine",
                         device_id,
@@ -2909,7 +2934,7 @@ impl Engine {
                 }
             }
         }
-        out
+        (out, skipped)
     }
 
     /// Iterate over all registered transaction keys (for migration scanning).
@@ -2922,7 +2947,11 @@ impl Engine {
         let mut locs: Vec<(u8, u64)> = Vec::new();
         self.index
             .for_each(|_k, e| locs.push((e.device_id, e.record_offset)));
-        self.resolve_full_keys(locs)
+        // Skipped-count dropped here: this admin/test enumerator keeps its
+        // Vec return. The skip is still observable via the
+        // `enumeration_unreadable` counter bumped inside `resolve_full_keys`.
+        let (keys, _skipped) = self.resolve_full_keys(locs);
+        keys
     }
 
     /// Return the FULL txids of records belonging to a specific shard.
@@ -2937,7 +2966,11 @@ impl Engine {
                 locs.push((e.device_id, e.record_offset));
             }
         });
-        self.resolve_full_keys(locs)
+        // Skipped-count dropped here (Vec return retained for the many
+        // admin/coordinator callers); the skip is still observable via the
+        // `enumeration_unreadable` counter bumped inside `resolve_full_keys`.
+        let (keys, _skipped) = self.resolve_full_keys(locs);
+        keys
     }
 
     /// Group all keys by shard in a single index scan, resolving full txids.
@@ -2953,9 +2986,14 @@ impl Engine {
                 .or_default()
                 .push((e.device_id, e.record_offset));
         });
+        // Skipped-count dropped here (HashMap return retained for admin/test
+        // callers); each skip is still observable via `enumeration_unreadable`.
         by_shard
             .into_iter()
-            .map(|(shard, locs)| (shard, self.resolve_full_keys(locs)))
+            .map(|(shard, locs)| {
+                let (keys, _skipped) = self.resolve_full_keys(locs);
+                (shard, keys)
+            })
             .collect()
     }
 
@@ -2965,10 +3003,18 @@ impl Engine {
     /// More memory-efficient than `keys_by_shard()` when only a subset
     /// of shards need migration (common case: only outbound shards).
     /// Keys belonging to shards NOT in the filter are skipped entirely.
+    ///
+    /// Returns `(map, total_skipped)` where `total_skipped` is the number of
+    /// records (across all filtered shards) whose footer was unreadable and
+    /// therefore OMITTED from `map` (issue #46). This is the cluster reshard
+    /// enumerator: a caller building a shard transfer from the result MUST
+    /// treat `total_skipped > 0` as an incomplete enumeration and refuse to
+    /// finalize/hand off the affected shards this round, retrying instead —
+    /// otherwise a skipped record's UTXO is silently dropped from the transfer.
     pub fn keys_by_shard_filtered(
         &self,
         shard_filter: &std::collections::HashSet<u16>,
-    ) -> std::collections::HashMap<u16, Vec<TxKey>> {
+    ) -> (std::collections::HashMap<u16, Vec<TxKey>>, usize) {
         let mut by_shard: std::collections::HashMap<u16, Vec<(u8, u64)>> =
             std::collections::HashMap::new();
         self.index.for_each(|k, e| {
@@ -2980,10 +3026,16 @@ impl Engine {
                     .push((e.device_id, e.record_offset));
             }
         });
-        by_shard
+        let mut total_skipped = 0usize;
+        let map = by_shard
             .into_iter()
-            .map(|(shard, locs)| (shard, self.resolve_full_keys(locs)))
-            .collect()
+            .map(|(shard, locs)| {
+                let (keys, skipped) = self.resolve_full_keys(locs);
+                total_skipped += skipped;
+                (shard, keys)
+            })
+            .collect();
+        (map, total_skipped)
     }
 
     /// Execute a batch of spends on a single transaction.
@@ -6316,6 +6368,22 @@ impl Engine {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Issue #46: number of records skipped during full-txid key enumeration
+    /// because their on-device footer was unreadable (torn / CRC-fail /
+    /// concurrently relocating).
+    ///
+    /// A non-zero (or increasing) value means at least one record could not be
+    /// resolved to its full 32-byte txid during a migration key scan or a boot
+    /// rebuild. On the reshard path a skip is treated as an incomplete
+    /// enumeration and the affected shard handoff is retried rather than
+    /// finalized (so no UTXO is silently dropped); on the boot rebuild paths it
+    /// is best-effort. Operators should alert on any increase. Monotonic for
+    /// the lifetime of the engine.
+    pub fn enumeration_unreadable(&self) -> u64 {
+        self.enumeration_unreadable
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     // -----------------------------------------------------------------------
     // F-X-022 — Deleted children list (the reference UDF `addDeletedChildren` parity)
     //
@@ -7731,6 +7799,7 @@ impl Engine {
             locs.push((entry.device_id, entry.record_offset));
         });
         let mut pairs: Vec<(u32, TxKey)> = Vec::with_capacity(locs.len());
+        let mut skipped = 0u64;
         for (device_id, offset) in locs {
             let meta = match self.read_metadata_fast(device_id, offset) {
                 Ok(m) => m,
@@ -7741,8 +7810,13 @@ impl Engine {
                 // a single corrupt footer into a fatal boot loop. A missing
                 // preserve entry only delays that record's expiry transition,
                 // which is harmless and self-heals once the record is read
-                // cleanly (recovery/scrub) or rewritten.
+                // cleanly (recovery/scrub) or rewritten. Issue #46: bump the
+                // observable enumeration-unreadable counter so a boot that
+                // silently drops a derived-index entry is not invisible.
                 Err(e) => {
+                    skipped += 1;
+                    self.enumeration_unreadable
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         device_id,
                         offset,
@@ -7757,6 +7831,15 @@ impl Engine {
             if preserve != 0 {
                 pairs.push((preserve, TxKey::from_bytes(meta.tx_id)));
             }
+        }
+        // Issue #46: one summary line per rebuild rather than only per-record
+        // noise, so an operator can see the aggregate loss at a glance.
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "rebuild_preserve_index: {skipped} record footer(s) unreadable; their \
+                 preserve entries (if any) are missing this boot until read cleanly",
+            );
         }
         let mut preserve = self.preserve_index.lock();
         preserve.clear().map_err(|e| SpendError::StorageError {
@@ -7798,6 +7881,7 @@ impl Engine {
         });
         let mut conflicting = self.conflicting_index.lock();
         conflicting.clear();
+        let mut skipped = 0u64;
         for (device_id, offset) in locs {
             match self.read_metadata_fast(device_id, offset) {
                 Ok(meta) => {
@@ -7806,6 +7890,12 @@ impl Engine {
                     }
                 }
                 Err(e) => {
+                    // Issue #46: best-effort (a corrupt record's authoritative
+                    // CONFLICTING flag is unreadable regardless), but bump the
+                    // observable counter so the skip is not invisible.
+                    skipped += 1;
+                    self.enumeration_unreadable
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(
                         target: "teraslab::engine",
                         device_id,
@@ -7816,6 +7906,16 @@ impl Engine {
                     );
                 }
             }
+        }
+        // Issue #46: one summary line per rebuild instead of only per-record
+        // noise, so the aggregate loss is visible at a glance.
+        if skipped > 0 {
+            tracing::warn!(
+                target: "teraslab::engine",
+                skipped,
+                "rebuild_conflicting_index: {skipped} record footer(s) unreadable; their \
+                 conflicting flags (if any) are missing until read cleanly",
+            );
         }
     }
 
@@ -20178,6 +20278,148 @@ mod tests {
 
         let shard = crate::cluster::shards::ShardTable::shard_for_key(&h.key);
         assert_eq!(by_shard.get(&shard).unwrap().len(), 1);
+    }
+
+    /// Issue #46: a record whose on-device footer is unreadable (corrupt CRC)
+    /// must be SKIPPED from full-txid key enumeration — omitted from the result,
+    /// counted in the returned `skipped`, and reflected in the observable
+    /// `enumeration_unreadable` counter — while the surviving records are still
+    /// returned. This is the invariant that stops a reshard from silently
+    /// dropping a UTXO from a shard transfer.
+    #[test]
+    fn key_enumeration_skips_unreadable_footer_and_bumps_metric() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(100).unwrap();
+
+        let mk = |a: u64, b: u64| -> TxKey {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&a.to_le_bytes());
+            txid[8..16].copy_from_slice(&b.to_le_bytes());
+            TxKey { txid }
+        };
+        let key_a = mk(0x1111, 0xAAAA);
+        let key_b = mk(0x2222, 0xBBBB); // the record we will corrupt
+        let key_c = mk(0x3333, 0xCCCC);
+
+        let utxo_count = 2u32;
+        let record_size = TxMetadata::record_size_for(utxo_count);
+        let mut b_offset = 0u64;
+        for key in [key_a, key_b, key_c] {
+            let offset = alloc.allocate(record_size).unwrap();
+            if key == key_b {
+                b_offset = offset;
+            }
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = key.txid;
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|_| UtxoSlot::new_unspent([0u8; 32]))
+                .collect();
+            io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                    },
+                )
+                .unwrap();
+        }
+
+        let engine = Arc::new(Engine::new(
+            dev,
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        ));
+
+        // Corrupt key_b's on-device metadata header so its CRC fails and the
+        // footer becomes unreadable (mirrors a torn / CRC-failed record).
+        let ptr = engine.device_ptr_for(0);
+        assert!(!ptr.is_null(), "MemoryDevice must expose a raw pointer");
+        // SAFETY: `ptr` is the live base of store 0's device buffer; `b_offset`
+        // is an allocator-issued in-bounds record offset and `METADATA_SIZE`
+        // stays within that record (records are >= METADATA_SIZE), so this
+        // overwrites only key_b's header bytes.
+        unsafe {
+            std::ptr::write_bytes(
+                ptr.add(b_offset as usize),
+                0xFF,
+                crate::record::METADATA_SIZE,
+            );
+        }
+
+        // The corruption took effect: key_b now reads as an error, while the
+        // two clean records still read back cleanly.
+        assert!(
+            engine.read_metadata(&key_b).is_err(),
+            "corrupted record must fail to read"
+        );
+        assert!(engine.read_metadata(&key_a).is_ok());
+        assert!(engine.read_metadata(&key_c).is_ok());
+
+        let before = engine.enumeration_unreadable();
+
+        // keys_by_shard_filtered over all three shards: skipped == 1, key_b out.
+        let sh = |k: &TxKey| crate::cluster::shards::ShardTable::shard_for_key(k);
+        let filter: std::collections::HashSet<u16> =
+            [sh(&key_a), sh(&key_b), sh(&key_c)].into_iter().collect();
+        let (map, skipped) = engine.keys_by_shard_filtered(&filter);
+        assert_eq!(
+            skipped, 1,
+            "the unreadable record must be counted as skipped"
+        );
+        let returned: std::collections::HashSet<TxKey> =
+            map.values().flat_map(|v| v.iter().copied()).collect();
+        assert!(returned.contains(&key_a), "clean key_a must survive");
+        assert!(returned.contains(&key_c), "clean key_c must survive");
+        assert!(
+            !returned.contains(&key_b),
+            "the unreadable key must be OMITTED, never returned truncated"
+        );
+        assert_eq!(
+            engine.enumeration_unreadable(),
+            before + 1,
+            "the enumeration_unreadable counter must bump by exactly one skip"
+        );
+
+        // all_keys keeps its Vec signature but still resolves + bumps the metric.
+        let all = engine.all_keys();
+        let all_set: std::collections::HashSet<TxKey> = all.iter().copied().collect();
+        assert_eq!(all.len(), 2, "all_keys must omit the unreadable record");
+        assert!(all_set.contains(&key_a) && all_set.contains(&key_c));
+        assert!(!all_set.contains(&key_b));
+        assert_eq!(
+            engine.enumeration_unreadable(),
+            before + 2,
+            "all_keys must bump the counter for its own skip too"
+        );
+    }
+
+    /// Issue #46: the boot rebuild loops stay best-effort on a corrupt footer,
+    /// but the skip must bump the observable `enumeration_unreadable` counter
+    /// (rather than vanishing into a per-record warning).
+    #[test]
+    fn rebuild_conflicting_index_bumps_metric_on_unreadable_footer() {
+        let h = TestHarness::new(2, TxFlags::CONFLICTING);
+        let offset = h.engine.lookup(&h.key).unwrap().record_offset;
+        let ptr = h.engine.device_ptr_for(0);
+        assert!(!ptr.is_null());
+        // SAFETY: as above — overwrite only this record's header bytes.
+        unsafe {
+            std::ptr::write_bytes(ptr.add(offset as usize), 0xFF, crate::record::METADATA_SIZE);
+        }
+        let before = h.engine.enumeration_unreadable();
+        h.engine.rebuild_conflicting_index();
+        assert_eq!(
+            h.engine.enumeration_unreadable(),
+            before + 1,
+            "rebuild_conflicting_index must bump the counter on an unreadable footer"
+        );
     }
 
     // -- Cached clock tests --

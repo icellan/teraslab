@@ -711,6 +711,7 @@ async fn handle_metrics(
         backup.segments_copied as u64,
         state.backup.throttle_bytes_per_sec(),
         u64::from(state.engine.is_segment_lifecycle_pinned()),
+        state.engine.enumeration_unreadable(),
     );
 
     let mut resp_headers = HeaderMap::new();
@@ -743,6 +744,7 @@ pub(crate) fn render_metrics_text(
     backup_segments_copied: u64,
     backup_throttle_bytes_per_sec: u64,
     backup_pinned: u64,
+    enumeration_unreadable: u64,
 ) -> String {
     let mut out = String::with_capacity(8192);
 
@@ -1167,6 +1169,16 @@ pub(crate) fn render_metrics_text(
         &mut out,
         "teraslab_preserve_index_entries",
         preserve_entries,
+    );
+
+    // Issue #46: records skipped during full-txid key enumeration because
+    // their on-device footer was unreadable. A rising value means a migration
+    // scan or boot rebuild could not resolve a record's full txid; on the
+    // reshard path this forces a handoff retry rather than a silent drop.
+    prom_counter(
+        &mut out,
+        "teraslab_index_enumeration_unreadable_total",
+        enumeration_unreadable,
     );
 
     // Connection gauge
@@ -3807,7 +3819,7 @@ mod tests {
         h.spend_latency.record_ns(1_000_000); // bucket 12 or nearby
         h.spend_latency.record_ns(1_000_000_000); // bucket 22 or nearby
 
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         // Every bucket boundary must appear exactly once.
         let num = LatencyHistogram::num_buckets();
@@ -3901,7 +3913,7 @@ mod tests {
         let h = ThreadHistograms::new();
 
         // Scrape 1: baseline.
-        let before = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let before = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let before_val = find_counter(&before, "teraslab_spend_multi_items_succeeded_total");
         assert_eq!(before_val, 0, "fresh ThreadMetrics must start at zero");
 
@@ -3909,7 +3921,7 @@ mod tests {
         m.spend_multi_items_succeeded.inc_by(10);
 
         // Scrape 2: observe the delta.
-        let after = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let after = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let after_val = find_counter(&after, "teraslab_spend_multi_items_succeeded_total");
         assert_eq!(
             after_val - before_val,
@@ -3951,7 +3963,7 @@ mod tests {
             .inc_by(OpCode::Spend, Outcome::ErrConflicting, 4);
         m.operations.inc_by(OpCode::Create, Outcome::ErrStorage, 7);
 
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         // The counter type declaration must be present.
         assert!(
@@ -4345,7 +4357,7 @@ mod tests {
 
         let m = ThreadMetrics::new();
         let h = ThreadHistograms::new();
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         // Scalar counter / gauge series.
         for name in [
@@ -5345,7 +5357,7 @@ mod tests {
         let m = ThreadMetrics::new();
         let h = ThreadHistograms::new();
         // state=Copying(4), bytes=1234, segments=7, throttle=256 MiB, pinned=1.
-        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 4, 1234, 7, 268_435_456, 1);
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 4, 1234, 7, 268_435_456, 1, 0);
         for (name, kind, value_line) in [
             ("teraslab_backup_state", "gauge", "teraslab_backup_state 4"),
             (
@@ -5378,5 +5390,25 @@ mod tests {
                 "missing value line `{value_line}`\n{text}"
             );
         }
+    }
+
+    /// Issue #46: `render_metrics_text` must emit the enumeration-unreadable
+    /// counter with a well-formed `# TYPE ... counter` line and the exact
+    /// value, so `prometheus_conformance` scrapers and operator alerts see it.
+    #[test]
+    fn metrics_emits_enumeration_unreadable_counter() {
+        let m = ThreadMetrics::new();
+        let h = ThreadHistograms::new();
+        // Last positional arg is the enumeration_unreadable count.
+        let text = render_metrics_text(&m, &h, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3);
+        assert!(
+            text.contains("# TYPE teraslab_index_enumeration_unreadable_total counter"),
+            "missing TYPE declaration for enumeration counter; output:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l == "teraslab_index_enumeration_unreadable_total 3"),
+            "missing value line for enumeration counter; output:\n{text}"
+        );
     }
 }
