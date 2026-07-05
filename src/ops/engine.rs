@@ -1962,14 +1962,17 @@ impl Engine {
     /// `block_height = 0`, then must replay the master's real lifecycle state
     /// (`generation`, `updated_at`, `unmined_since`, `delete_at_height`,
     /// `preserve_until`). Patching the device footer alone (raw
-    /// `io::write_metadata`) left three derived structures stale on the live
+    /// `io::write_metadata`) left four derived structures stale on the live
     /// migration target until its next restart:
     ///
     /// - the **unmined** secondary index (never inserted for unmined records),
     /// - the **DAH** secondary index (never inserted for records with a pending
     ///   delete-at-height),
     /// - the **primary-index cached fields** (`unmined_since`,
-    ///   `dah_or_preserve`, `generation`, `HAS_PRESERVE_UNTIL`).
+    ///   `dah_or_preserve`, `generation`, `HAS_PRESERVE_UNTIL`),
+    /// - the **MinedIndex** slot's `unmined_since` bucket (would otherwise stay
+    ///   at whatever `Self::create` seeded it to, diverging from the migrated
+    ///   footer this function just wrote).
     ///
     /// This entry point writes the lifecycle fields to the device footer and
     /// then routes the index updates through
@@ -1978,7 +1981,10 @@ impl Engine {
     /// cached fields all land for migrated records exactly as for locally
     /// created ones. Mined records (`unmined_since == 0`,
     /// `delete_at_height == 0`, `preserve_until == 0`) are handled correctly:
-    /// no secondary entries are created.
+    /// no secondary entries are created. The MinedIndex slot's `unmined_since`
+    /// is mirrored separately via `ShardedMinedIndex::set_longest_chain`
+    /// (bucket-only; block entries are untouched, matching what this function
+    /// itself does to the device footer).
     ///
     /// The "old" heights for the secondary transitions are read from the
     /// current on-device footer, so this is also correct when the create path
@@ -2031,6 +2037,22 @@ impl Engine {
             old_unmined,
             unmined_since,
         )?;
+
+        // Mirror the same unmined_since transition into the authoritative
+        // MinedIndex so a migration target's index doesn't go stale relative
+        // to the device footer this just wrote — the same gap Fix 1 closed
+        // for `mark_on_longest_chain`. `unmined_since == 0` is "mined on the
+        // longest chain"; otherwise the slot re-enters the unmined bucket at
+        // the migrated height.
+        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            self.mined_index().set_longest_chain(
+                key,
+                entry.mined_slot,
+                unmined_since == 0,
+                unmined_since,
+            );
+        }
+
         // The atomic helper handles DAH + unmined; preserve is
         // not journaled (in-memory model) so it is updated separately here.
         // THE migration / replica-create choke point — without this a migrated
@@ -4324,6 +4346,19 @@ impl Engine {
             new_unmined,
         )?;
 
+        // Mirror the same unmined_since transition into the authoritative
+        // MinedIndex so it stays in sync with the device — this RPC only
+        // ever writes `unmined_since` (block entries are untouched), so
+        // `set_longest_chain` (bucket-only) is the matching mutation.
+        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            self.mined_index().set_longest_chain(
+                &req.tx_key,
+                entry.mined_slot,
+                req.on_longest_chain,
+                req.current_block_height,
+            );
+        }
+
         Ok(MarkOnLongestChainResponse {
             signal,
             generation: { metadata.generation },
@@ -4494,6 +4529,18 @@ impl Engine {
         // (`mined_block_infos` non-empty). Freed below on any registration
         // failure so it never leaks.
         let mined_slot = self.mined_index.alloc_created(&key, meta.unmined_since);
+
+        // A create arriving already-mined must seed the slot's block-set to
+        // match the device's populated `block_entries_inline` — see
+        // `seed_mined_index_from_infos`.
+        if !req.mined_block_infos.is_empty() {
+            self.seed_mined_index_from_infos(
+                &key,
+                mined_slot,
+                meta.unmined_since,
+                req.mined_block_infos,
+            );
+        }
 
         // Register in index
         let index_entry = TxIndexEntry {
@@ -4857,6 +4904,18 @@ impl Engine {
         // see the matching comment in `create`. Freed below on any
         // registration failure so it never leaks.
         let mined_slot = self.mined_index.alloc_created(&key, meta.unmined_since);
+
+        // A create arriving already-mined must seed the slot's block-set to
+        // match the device's populated `block_entries_inline` — see
+        // `seed_mined_index_from_infos`.
+        if !req.mined_block_infos.is_empty() {
+            self.seed_mined_index_from_infos(
+                &key,
+                mined_slot,
+                meta.unmined_since,
+                req.mined_block_infos,
+            );
+        }
 
         let index_entry = TxIndexEntry {
             device_id,
@@ -7900,6 +7959,39 @@ impl Engine {
     /// of `specs/MINEDINDEX_SETMINED_DESIGN.md`).
     pub fn mined_index(&self) -> &ShardedMinedIndex {
         &self.mined_index
+    }
+
+    /// Seed a freshly-`alloc_created` MinedIndex slot with block tuples for
+    /// a create that arrived already mined (`req.mined_block_infos`
+    /// non-empty).
+    ///
+    /// `alloc_created` only ever sets `unmined_since` — without this, a
+    /// create of an already-mined tx left the MinedIndex slot with NO block
+    /// tuple at all, self-contradictory versus the device's populated
+    /// `block_entries_inline`. Both `create` and `create_at_offset_inner`
+    /// map `mined_block_infos` non-empty to `meta.unmined_since == 0`
+    /// (see `build_create_record_bytes`), so every info here is mined on
+    /// the longest chain; `on_longest_chain` is still derived from
+    /// `unmined_since` rather than hardcoded so this stays correct if that
+    /// mapping ever changes.
+    fn seed_mined_index_from_infos(
+        &self,
+        key: &TxKey,
+        slot: u32,
+        unmined_since: u32,
+        infos: &[MinedBlockInfo],
+    ) {
+        let on_longest_chain = unmined_since == 0;
+        for info in infos {
+            self.mined_index().apply_set_mined(
+                key,
+                slot,
+                info.block_id,
+                info.block_height,
+                info.subtree_idx,
+                on_longest_chain,
+            );
+        }
     }
 
     /// Get the preserve index (backs the expired-preservation sweep; also used
@@ -14514,6 +14606,182 @@ mod tests {
         assert_eq!({ meta.unmined_since }, 800);
     }
 
+    /// Fix 1: `mark_on_longest_chain` writes `unmined_since` to the device
+    /// but (pre-fix) never touched the authoritative `MinedIndex` slot,
+    /// leaving it stale relative to the device on every reorg that goes
+    /// through this RPC (as opposed to `set_mined`). Uses `create_engine()`
+    /// and `make_create_req` (not `TestHarness`, which registers with
+    /// `NO_MINED_SLOT`) so `create` allocates a real mined-index slot to
+    /// assert against.
+    #[test]
+    fn mark_on_longest_chain_dual_writes_mined_index() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(90, 2);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+
+        // Mine it on the longest chain first.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 100,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined succeeds");
+
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "create must allocate a mined-index slot"
+        );
+
+        // Reorg: this tx falls off the longest chain at height 250.
+        engine
+            .mark_on_longest_chain(&MarkOnLongestChainRequest {
+                tx_key: key,
+                on_longest_chain: false,
+                current_block_height: 250,
+                block_height_retention: 288,
+            })
+            .expect("mark_on_longest_chain succeeds");
+
+        let meta = engine
+            .read_metadata(&key)
+            .expect("metadata must be readable");
+        assert_eq!(
+            { meta.unmined_since },
+            250,
+            "device unmined_since must reflect the reorg"
+        );
+
+        // The MinedIndex slot must be kept in sync with the device, not left
+        // stale.
+        engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                assert_eq!(
+                    e.unmined_since, 250,
+                    "MinedIndex unmined_since must match the device after mark_on_longest_chain"
+                );
+                assert_eq!(
+                    e.block_id, 1,
+                    "mark_on_longest_chain must not touch the block tuple"
+                );
+            })
+            .expect("mined-index slot must still be live");
+
+        let mut out = Vec::new();
+        engine.mined_index().collect_unmined_below(1_000, &mut out);
+        let pair = (engine.mined_index().shard_for(&key), entry.mined_slot);
+        assert!(
+            out.contains(&pair),
+            "off-longest-chain slot must appear in the mined index's unmined range query"
+        );
+
+        // Reorg back onto the longest chain: MinedIndex must clear again.
+        engine
+            .mark_on_longest_chain(&MarkOnLongestChainRequest {
+                tx_key: key,
+                on_longest_chain: true,
+                current_block_height: 300,
+                block_height_retention: 288,
+            })
+            .expect("mark_on_longest_chain succeeds");
+
+        engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                assert_eq!(
+                    e.unmined_since, 0,
+                    "back on longest chain: MinedIndex must clear"
+                );
+            })
+            .expect("mined-index slot must still be live");
+        out.clear();
+        engine.mined_index().collect_unmined_below(1_000, &mut out);
+        assert!(
+            !out.contains(&pair),
+            "back-on-longest-chain slot must leave the unmined bucket"
+        );
+    }
+
+    /// Fix 3: `restore_migrated_lifecycle` writes `unmined_since` to the
+    /// device footer (and the DAH/unmined secondary indexes) but, like
+    /// `mark_on_longest_chain` before Fix 1, never mirrored it into the
+    /// authoritative `MinedIndex` slot — leaving a migration target's
+    /// MinedIndex stale relative to its own device the instant a lifecycle
+    /// replay lands.
+    #[test]
+    fn restore_migrated_lifecycle_dual_writes_mined_index() {
+        let engine = create_engine();
+        let (_, req) = make_create_req(91, 2);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "create must allocate a mined-index slot"
+        );
+
+        // Replay a MINED lifecycle state (unmined_since=0): the migrated
+        // master already mined this tx.
+        engine
+            .restore_migrated_lifecycle(&key, 5, 123_456, 0, 0, 0)
+            .expect("restore_migrated_lifecycle succeeds");
+
+        let meta = engine.read_metadata(&key).expect("metadata readable");
+        assert_eq!({ meta.unmined_since }, 0, "device must show mined");
+
+        engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                assert_eq!(
+                    e.unmined_since, 0,
+                    "MinedIndex must match the device after restore_migrated_lifecycle"
+                );
+            })
+            .expect("mined-index slot must still be live");
+
+        // Replay an UNMINED lifecycle state at height 777 (e.g. a later
+        // migration batch for a reorg the master observed).
+        engine
+            .restore_migrated_lifecycle(&key, 6, 123_457, 777, 0, 0)
+            .expect("restore_migrated_lifecycle succeeds");
+
+        let meta2 = engine.read_metadata(&key).expect("metadata readable");
+        assert_eq!(
+            { meta2.unmined_since },
+            777,
+            "device must show the migrated height"
+        );
+
+        engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                assert_eq!(
+                    e.unmined_since, 777,
+                    "MinedIndex must reflect the migrated unmined_since, not stay stale"
+                );
+            })
+            .expect("mined-index slot must still be live");
+
+        let mut out = Vec::new();
+        engine.mined_index().collect_unmined_below(1_000, &mut out);
+        let pair = (engine.mined_index().shard_for(&key), entry.mined_slot);
+        assert!(
+            out.contains(&pair),
+            "migrated-unmined slot must appear in the mined index's unmined range query"
+        );
+    }
+
     #[test]
     fn mark_on_longest_chain_nonexistent_tx() {
         let h = TestHarness::new(10, TxFlags::empty());
@@ -17725,6 +17993,139 @@ mod tests {
         assert_eq!({ meta.unmined_since }, 0);
         assert_eq!(meta.block_entry_count, 1);
         assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+
+        // Fix 2: a create arriving already-mined must seed the MinedIndex
+        // slot with the SAME block tuple + unmined_since the device carries
+        // — pre-fix, `alloc_created` only ever set `unmined_since` and left
+        // the slot's block-set empty, self-contradictory vs. the device's
+        // populated `block_entries_inline`.
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "create must allocate a mined-index slot"
+        );
+        engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                assert_eq!(
+                    e.block_id, 42,
+                    "MinedIndex must carry the pre-mined block_id"
+                );
+                assert_eq!(e.block_height, 900);
+                assert_eq!(e.subtree_idx, 7);
+                assert_eq!(
+                    e.unmined_since, 0,
+                    "MinedIndex unmined_since must match the device (mined)"
+                );
+            })
+            .expect("mined-index slot must be live");
+
+        let mut out = Vec::new();
+        engine.mined_index().collect_unmined_below(1_000, &mut out);
+        let pair = (engine.mined_index().shard_for(&key), entry.mined_slot);
+        assert!(
+            !out.contains(&pair),
+            "a create that arrived already-mined must NOT show up as unmined"
+        );
+    }
+
+    /// Fix 2, second block info: when a create arrives with MORE THAN ONE
+    /// pre-mined block (a competing-chain create), the first must land
+    /// inline and the rest in the MinedIndex slot's overflow — same
+    /// dual-write shape `set_mined` produces one call at a time. Proves
+    /// `create` doesn't just seed the first tuple and drop the rest.
+    #[test]
+    fn create_with_multiple_mined_block_infos_spills_to_mined_index_overflow() {
+        let engine = create_engine();
+        let (_, mut req) = make_create_req(56, 2);
+        let infos = vec![
+            MinedBlockInfo {
+                block_id: 100,
+                block_height: 900,
+                subtree_idx: 0,
+            },
+            MinedBlockInfo {
+                block_id: 101,
+                block_height: 901,
+                subtree_idx: 1,
+            },
+        ];
+        req.mined_block_infos = &infos;
+
+        let key = req.tx_key();
+        engine.create(&req).unwrap();
+
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                assert_eq!(e.block_id, 100, "first info lands inline");
+            })
+            .expect("mined-index slot must be live");
+
+        // The second info must have gone into the MinedIndex's overflow —
+        // there is no public accessor for the map's contents directly, so
+        // assert via the MINED_HAS_OVERFLOW flag, mirroring how the
+        // existing `setmined_dual_writes_mined_index_matches_device` test
+        // (Task 9) proves overflow spillover.
+        let has_overflow = engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                e.flags & crate::index::mined_index::MINED_HAS_OVERFLOW != 0
+            })
+            .expect("mined-index slot must be live");
+        assert!(
+            has_overflow,
+            "second pre-mined block info must spill into the MinedIndex's overflow"
+        );
+    }
+
+    /// Fix 2 (second funnel): `create_at_offset` routes through
+    /// `create_at_offset_inner`, the WAL-first dispatch path's create entry
+    /// point — a separate code path from `create()` that duplicates the
+    /// same mined-slot-allocation logic. Must seed the MinedIndex slot from
+    /// `mined_block_infos` exactly like `create()` does.
+    #[test]
+    fn create_at_offset_with_mined_block_info_seeds_mined_index() {
+        let engine = create_engine();
+        let (_, mut req) = make_create_req(57, 2);
+        let infos = vec![MinedBlockInfo {
+            block_id: 55,
+            block_height: 950,
+            subtree_idx: 2,
+        }];
+        req.mined_block_infos = &infos;
+
+        let key = req.tx_key();
+        let (offset, _, _) = engine
+            .pre_allocate_create(&req)
+            .expect("pre_allocate_create succeeds");
+        engine
+            .create_at_offset(&req, offset)
+            .expect("create_at_offset succeeds");
+
+        let meta = engine.read_metadata(&key).expect("metadata readable");
+        assert_eq!({ meta.unmined_since }, 0);
+        assert_eq!(meta.block_entry_count, 1);
+        assert_eq!({ meta.block_entries_inline[0].block_id }, 55);
+
+        let entry = engine.lookup(&key).expect("entry must be registered");
+        assert_ne!(
+            entry.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "create_at_offset must allocate a mined-index slot"
+        );
+        engine
+            .mined_index()
+            .with_entry(&key, entry.mined_slot, |e| {
+                assert_eq!(
+                    e.block_id, 55,
+                    "create_at_offset_inner must also seed the MinedIndex slot, not just create()"
+                );
+                assert_eq!(e.unmined_since, 0);
+            })
+            .expect("mined-index slot must be live");
     }
 
     // -- Phase 5 additional tests --

@@ -438,7 +438,21 @@ impl ShardedMinedIndex {
             .get(&slot)
             .is_some_and(|v| v.iter().any(|be| be.block_id == block_id));
         if already_inline || already_overflow {
-            let new_unmined_since = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+            // The block tuple itself is a no-op, but the on_longest_chain ->
+            // unmined_since/bucket transition must still apply — mirrors the
+            // device slow-path add (`set_mined_inner`'s "Update
+            // unmined_since" step runs unconditionally on
+            // `req.on_longest_chain`, not only when `!exists`), so a
+            // duplicate setMined with on_longest_chain=true still ensures
+            // unmined_since==0.
+            let old_unmined = sh.get(slot).map(|e| e.unmined_since).unwrap_or(0);
+            let new_unmined_since = if on_longest_chain { 0 } else { old_unmined };
+            if on_longest_chain && let Some(e) = sh.get_mut(slot) {
+                e.unmined_since = 0;
+            }
+            if old_unmined != new_unmined_since {
+                sh.set_unmined(slot, old_unmined, new_unmined_since);
+            }
             return MinedApplyResult {
                 changed: false,
                 new_unmined_since,
@@ -544,6 +558,34 @@ impl ShardedMinedIndex {
             }
             sh.set_unmined(slot, old_unmined, current_height);
         }
+    }
+
+    /// Move a slot into or out of the unmined height bucket without
+    /// touching its block tuple.
+    ///
+    /// Mirrors `Engine::mark_on_longest_chain`, which only ever writes
+    /// `unmined_since` on the device (block entries and UTXO slots are not
+    /// touched by that RPC). Sets `unmined_since` to 0 when
+    /// `on_longest_chain` is true, else to `current_height`, and moves the
+    /// shard's height-bucket membership to match.
+    ///
+    /// No-op if the slot is absent.
+    pub fn set_longest_chain(
+        &self,
+        key: &TxKey,
+        slot: u32,
+        on_longest_chain: bool,
+        current_height: u32,
+    ) {
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        let Some(old_unmined) = sh.get(slot).map(|e| e.unmined_since) else {
+            return;
+        };
+        let new_unmined = if on_longest_chain { 0 } else { current_height };
+        if let Some(e) = sh.get_mut(slot) {
+            e.unmined_since = new_unmined;
+        }
+        sh.set_unmined(slot, old_unmined, new_unmined);
     }
 
     /// Set or clear the `MINED_ALL_SPENT` flag on the slot's entry.
@@ -905,6 +947,62 @@ mod tests {
         });
     }
 
+    /// Fix 4: a duplicate `apply_set_mined` call for a `block_id` already
+    /// recorded on the slot (dedup no-op for the block tuple) must still
+    /// apply the `on_longest_chain` -> `unmined_since`/bucket transition —
+    /// mirroring the device slow-path ADD, whose "Update unmined_since"
+    /// step in `set_mined_inner` runs unconditionally on `req.on_longest_chain`,
+    /// not only when a genuinely new block_id was added (`exists` is not
+    /// consulted there).
+    #[test]
+    fn apply_set_mined_dedup_still_applies_longest_chain_transition() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [5u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        // First application: block recorded, but NOT yet on the longest
+        // chain (e.g. a competing-chain submission) — unmined_since stays
+        // at its pre-existing value.
+        let first = idx.apply_set_mined(&k, slot, 500, 20, 3, false);
+        assert!(
+            first.changed,
+            "first application of a new block is a real transition"
+        );
+        assert_eq!(
+            first.new_unmined_since, 10,
+            "off-longest-chain leaves unmined_since untouched"
+        );
+
+        // Re-apply the SAME block_id, now with on_longest_chain=true (this
+        // chain won the reorg). Dedup no-op for the block tuple, but the
+        // longest-chain transition must still land.
+        let second = idx.apply_set_mined(&k, slot, 500, 20, 3, true);
+        assert!(
+            !second.changed,
+            "same block_id is a dedup no-op for the tuple"
+        );
+        assert_eq!(
+            second.new_unmined_since, 0,
+            "dedup no-op must still clear unmined_since when on_longest_chain=true"
+        );
+
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(
+                e.unmined_since, 0,
+                "the entry's stored unmined_since must actually be updated, not just the \
+                 result's new_unmined_since field"
+            );
+        });
+
+        let mut out = Vec::new();
+        idx.collect_unmined_below(1_000, &mut out);
+        assert!(
+            !out.iter().any(|&(_s, sl)| sl == slot),
+            "slot must leave the unmined bucket even though the dedup path took the no-op branch"
+        );
+    }
+
     #[test]
     fn apply_set_mined_second_block_spills_to_overflow() {
         use crate::index::TxKey;
@@ -977,6 +1075,84 @@ mod tests {
         assert!(
             out.iter().any(|&(_s, sl)| sl == slot),
             "unset tx is visible again in the unmined range query"
+        );
+    }
+
+    /// Fix 0: `set_longest_chain` must move a slot into/out of the unmined
+    /// height bucket (visible via `collect_unmined_below`) purely from the
+    /// `on_longest_chain` flag, WITHOUT touching the slot's block tuple —
+    /// mirroring `mark_on_longest_chain`, which only ever writes
+    /// `unmined_since` on the device, never block entries.
+    #[test]
+    fn set_longest_chain_moves_bucket_without_touching_blocks() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [50u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        // Mine it on the longest chain — leaves the unmined bucket.
+        idx.apply_set_mined(&k, slot, 700, 40, 2, true);
+        let mut out = Vec::new();
+        idx.collect_unmined_below(1_000, &mut out);
+        assert!(
+            !out.iter().any(|&(_s, sl)| sl == slot),
+            "mined-on-longest-chain slot must not be in the unmined bucket"
+        );
+
+        // Reorg off the longest chain at height 55: must re-enter the bucket.
+        idx.set_longest_chain(&k, slot, false, 55);
+        out.clear();
+        idx.collect_unmined_below(1_000, &mut out);
+        assert!(
+            out.iter().any(|&(_s, sl)| sl == slot),
+            "off-longest-chain slot must reappear in the unmined bucket"
+        );
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(
+                e.unmined_since, 55,
+                "unmined_since must be the reorg height"
+            );
+            assert_eq!(
+                e.block_id, 700,
+                "set_longest_chain must not touch block entries"
+            );
+            assert_eq!(
+                e.block_height, 40,
+                "set_longest_chain must not touch block entries"
+            );
+        });
+
+        // Reorg back onto the longest chain: must leave the bucket again.
+        idx.set_longest_chain(&k, slot, true, 999);
+        out.clear();
+        idx.collect_unmined_below(1_000, &mut out);
+        assert!(
+            !out.iter().any(|&(_s, sl)| sl == slot),
+            "back-on-longest-chain slot must leave the unmined bucket"
+        );
+        idx.with_entry(&k, slot, |e| {
+            assert_eq!(e.unmined_since, 0);
+            assert_eq!(e.block_id, 700, "block entry must still be untouched");
+        });
+    }
+
+    /// Fix 0 (slot-absent guard): `set_longest_chain` on a freed/never-live
+    /// slot must be a safe no-op, matching every other mutation method here
+    /// (`apply_set_mined`, `apply_unset`, `set_all_spent`).
+    #[test]
+    fn set_longest_chain_on_absent_slot_is_noop() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [51u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+        idx.free(&k, slot);
+
+        // Must not panic on an absent slot.
+        idx.set_longest_chain(&k, slot, true, 100);
+
+        assert!(
+            idx.with_entry(&k, slot, |e| e.block_id).is_none(),
+            "freed slot must remain absent after set_longest_chain"
         );
     }
 
