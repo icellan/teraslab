@@ -809,20 +809,27 @@ where
     //     Lets recovery restore mined-state (block entries / unmined_since /
     //     all_spent) from this snapshot + the post-checkpoint redo tail
     //     instead of `Engine::rebuild_mined_index_from_device`'s full device
-    //     scan. Best-effort and NON-FATAL: unlike the primary/DAH/unmined
-    //     snapshot above, a failure here does not abort the checkpoint —
-    //     recovery falls back to the device scan (Task 12, never removed)
-    //     whenever this section is absent, stale, or corrupt, so the only
-    //     cost of a failure is a slower next recovery, never lost data.
-    if let Err(e) =
-        engine.snapshot_mined_index_by_key(&mined_index_snapshot_path(&config.snapshot_path))
-    {
-        tracing::warn!(
-            err = %e,
-            "checkpoint: mined-index snapshot failed (non-fatal; recovery falls back to the \
-             device scan)",
-        );
-    }
+    //     scan. FATAL like the primary/DAH/unmined snapshot above (a CRITICAL
+    //     fix — this was previously best-effort/non-fatal, which let a
+    //     transient write failure here leave a STALE `.mined` from the
+    //     PREVIOUS checkpoint on disk while the redo below still got fenced
+    //     and truncated through the CURRENT fence: recovery would then pair
+    //     that stale-but-well-formed snapshot with the now-shorter redo tail
+    //     and silently lose every mined mutation in between, returning
+    //     `Ok(true)` with no indication anything was wrong). Propagating the
+    //     error aborts the checkpoint HERE, before the redo fence/truncation
+    //     runs, so `.mined` and the redo can never disagree about which
+    //     checkpoint they belong to. `snapshot_fence_sequence` is stamped
+    //     into the snapshot so `Engine::recover_mined_index` can also verify
+    //     this independently at recovery time (defense-in-depth): recovery
+    //     falls back to the device scan (Task 12, never removed) whenever
+    //     this section is absent, stale (fence mismatch), or corrupt.
+    engine
+        .snapshot_mined_index_by_key(
+            &mined_index_snapshot_path(&config.snapshot_path),
+            snapshot_fence_sequence,
+        )
+        .map_err(|e| format!("mined-index snapshot: {e}"))?;
 
     // 1b. Defrag fast path: reclaim fully-dead segments (log-structured engine)
     //     so the header persisted next reflects the reclaimed, reused layout —
@@ -2405,6 +2412,171 @@ mod tests {
             .expect("mined-state must be present via the fallback");
         let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
         assert_eq!(block_ids, vec![700]);
+        assert_eq!(unmined_since, 0);
+    }
+
+    /// CRITICAL fix (Finding 1): a `.mined` snapshot whose stamped fence no
+    /// longer matches the redo logs' CURRENT persisted fence is STALE — it
+    /// belongs to an EARLIER checkpoint than the one that most recently
+    /// fenced/truncated the redo — and trusting it would silently drop
+    /// every mined mutation between the two fences. Reproduces exactly the
+    /// pre-fix hazard this closes: a well-formed `.mined` from checkpoint 1
+    /// (fence F1) is left in place (checkpoint 2's `.mined` write never
+    /// happens in this test, standing in for the write having FAILED), while
+    /// the redo log is independently fenced/truncated PAST F1 (as
+    /// checkpoint 2's primary/DAH/unmined snapshot + redo truncation would
+    /// have done regardless, since those steps are unconditionally fatal and
+    /// unrelated to the `.mined` write's own success). Asserts
+    /// `recover_mined_index` detects the fence mismatch, returns `Ok(false)`
+    /// (device-scan fallback, NOT the stale snapshot), and that the
+    /// recovered state matches the DEVICE's current truth — NOT what the
+    /// stale snapshot would have shown.
+    #[test]
+    fn mined_snapshot_stale_fence_falls_back_to_device_scan() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("stale-fence.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 256 * 1024).unwrap()));
+
+        let key = crate::index::TxKey { txid: [9u8; 32] };
+        let hash = [[0xEEu8; 32]];
+        engine
+            .create(&mined_test_create_req(key.txid, &hash))
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 100,
+                block_height: 20,
+                subtree_idx: 0,
+                current_block_height: 20,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        // Checkpoint 1: writes `.mined` stamped with fence F1, fences +
+        // truncates the redo through F1.
+        let cfg = CheckpointConfig::new(snap_path.clone());
+        perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint 1 must succeed");
+        assert!(mined_snap_path.exists());
+
+        // MORE mutations on the SAME live engine, past checkpoint 1's fence:
+        // a real device write (dual-write updates the on-device footer
+        // directly) plus the matching redo entry appended manually
+        // (mirrors dispatch building redo independently of the engine call).
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 200,
+                block_height: 30,
+                subtree_idx: 0,
+                current_block_height: 30,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: 200,
+                block_height: 30,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 30,
+                block_height_retention: 100_000,
+                unset: false,
+                txids: vec![key],
+            })
+            .unwrap();
+
+        // Simulate "checkpoint 2's primary/DAH/unmined snapshot + redo
+        // fence/truncation succeeded, but its `.mined` write did not happen"
+        // (standing in for the write having FAILED, which pre-fix was
+        // non-fatal and would leave exactly this state) — advance and
+        // reclaim the redo fence PAST F1, directly, without touching
+        // `.mined` at all.
+        let new_fence = redo.lock().current_sequence().saturating_sub(1);
+        redo.lock().checkpoint_fence(new_fence).unwrap();
+        redo.lock().checkpoint_reclaim(new_fence).unwrap();
+        assert!(
+            redo.lock().recover().unwrap().is_empty(),
+            "test setup invariant: the redo tail must now be fenced past the block-200 \
+             mutation, exactly like a real checkpoint 2 whose truncation succeeded"
+        );
+
+        // Recover a FRESH engine from checkpoint 1's primary snapshot + the
+        // NOW-advanced redo (which starts fenced past F1) + the STALE
+        // `.mined` (still stamped F1).
+        let mut alloc2: crate::allocator::BoxedAllocator = Box::new(
+            SlotAllocator::recover(dev.clone()).expect("allocator header must be durable"),
+        );
+        let (restored_index, dah2, unmined2, _flags) =
+            crate::index::ShardedIndex::restore_all(&snap_path, 1)
+                .expect("primary snapshot must restore");
+        let mut dah_b = crate::index::DahBackend::from(dah2);
+        let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
+        crate::recovery::recover_all_with_allocator(
+            &*dev,
+            &redo.lock(),
+            &restored_index,
+            &mut dah_b,
+            &mut unmined_b,
+            Some(&mut alloc2),
+        )
+        .expect("primary/device recovery must succeed");
+
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            restored_index,
+            alloc2,
+            StripedLocks::new(16),
+            dah_b,
+            unmined_b,
+        );
+
+        let used_snapshot = engine2
+            .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
+            .expect("mined-index recovery must succeed via the fallback");
+        assert!(
+            !used_snapshot,
+            "a stale snapshot (fence mismatch against the redo's current persisted fence) must \
+             fall back to the device scan, never be trusted"
+        );
+
+        // The recovered state must match the DEVICE's current truth — BOTH
+        // blocks (100 from before checkpoint 1, 200 from after) — NOT what
+        // the stale snapshot + gapped redo tail would have shown (block 100
+        // only), which would silently lose the block-200 mutation.
+        let e = engine2.lookup(&key).expect("tx must still be indexed");
+        let (blocks, unmined_since) = engine2
+            .mined_index()
+            .read_block_entries(&key, e.mined_slot)
+            .expect("mined-state must be present via the device-scan fallback");
+        let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
+        assert_eq!(
+            block_ids,
+            vec![100, 200],
+            "the device scan must reflect the LATEST device state (both blocks), not the stale \
+             snapshot's (block 100 only, silently losing the block-200 mutation)"
+        );
         assert_eq!(unmined_since, 0);
     }
 

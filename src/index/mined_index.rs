@@ -34,7 +34,10 @@ const MINED_SNAPSHOT_VERSION: u8 = 1;
 /// this is a different wire format (keyed by txid, not by shard-local slot),
 /// used by the checkpoint task, not [`ShardedMinedIndex::serialize`]'s
 /// slot-indexed round-trip.
-const MINED_BYKEY_SNAPSHOT_VERSION: u8 = 1;
+///
+/// Bumped 1 -> 2 (Task 13 CRITICAL fix) to add the leading `fence` field —
+/// see [`ShardedMinedIndex::serialize_by_key`]'s format doc.
+const MINED_BYKEY_SNAPSHOT_VERSION: u8 = 2;
 
 /// One transaction's mined-state as persisted in the checkpoint's TXID-keyed
 /// MinedIndex snapshot section (see [`ShardedMinedIndex::serialize_by_key`]).
@@ -774,14 +777,25 @@ impl ShardedMinedIndex {
     ///
     /// Unlike [`Self::serialize`] this format does NOT depend on `shard_count`
     /// or the routing `seed` to round-trip — [`Self::deserialize_by_key`]
-    /// hands back a plain `Vec<MinedByKeyEntry>` that recovery replays
+    /// hands back `(fence, Vec<MinedByKeyEntry>)` that recovery replays
     /// against a freshly constructed index (see
     /// `Engine::restore_mined_index_from_snapshot_entries`), allocating brand
     /// new slots. Format: a 1-byte version
-    /// ([`MINED_BYKEY_SNAPSHOT_VERSION`]), a 4-byte little-endian entry
+    /// ([`MINED_BYKEY_SNAPSHOT_VERSION`]), an 8-byte little-endian `fence`
+    /// (the checkpoint's `snapshot_fence_sequence`, the same value fencing
+    /// the redo log at the same checkpoint — see
+    /// `Engine::snapshot_mined_index_by_key`), a 4-byte little-endian entry
     /// count, then for each entry: `txid(32)`, `unmined_since(4 LE)`,
     /// `all_spent(1)`, `block_entries_len(4 LE)`, then that many
     /// `(block_id(4 LE), block_height(4 LE), subtree_idx(4 LE))` tuples.
+    ///
+    /// The `fence` field (added in version 2, Task 13 CRITICAL fix) is
+    /// defense-in-depth against a stale snapshot outliving a truncated redo
+    /// log: [`crate::ops::engine::Engine::recover_mined_index`] compares it
+    /// against the redo logs' CURRENT persisted recovery fence
+    /// ([`crate::redo::RedoLog::recover_with_fence`]) and falls back to the
+    /// device scan on any mismatch, exactly as it already does for an
+    /// absent/corrupt snapshot.
     ///
     /// A `(key, slot)` pair whose slot is no longer live (e.g. a delete
     /// racing a non-blocking checkpoint snapshot between when the caller
@@ -789,7 +803,7 @@ impl ShardedMinedIndex {
     /// redo-tail replay reconciles any such post-fence skew from the redo
     /// log, exactly as the primary/DAH/unmined snapshot sections already
     /// tolerate (see `crate::checkpoint`).
-    pub fn serialize_by_key(&self, pairs: &[(TxKey, u32)], out: &mut Vec<u8>) {
+    pub fn serialize_by_key(&self, fence: u64, pairs: &[(TxKey, u32)], out: &mut Vec<u8>) {
         let mut collected: Vec<MinedByKeyEntry> = Vec::with_capacity(pairs.len());
         for &(key, slot) in pairs {
             let Some((block_entries, unmined_since)) = self.read_block_entries(&key, slot) else {
@@ -807,6 +821,7 @@ impl ShardedMinedIndex {
         }
 
         out.push(MINED_BYKEY_SNAPSHOT_VERSION);
+        out.extend_from_slice(&fence.to_le_bytes());
         out.extend_from_slice(&(collected.len() as u32).to_le_bytes());
         for e in &collected {
             out.extend_from_slice(&e.txid);
@@ -828,12 +843,14 @@ impl ShardedMinedIndex {
     }
 
     /// Parse a TXID-keyed checkpoint snapshot section produced by
-    /// [`Self::serialize_by_key`] into a plain `Vec<MinedByKeyEntry>`.
+    /// [`Self::serialize_by_key`] into `(fence, Vec<MinedByKeyEntry>)`.
     ///
     /// Fails closed (never panics) with [`MinedIndexError::VersionMismatch`]
     /// on an unrecognized version byte, or [`MinedIndexError::Corrupt`] on
     /// any truncated/malformed read.
-    pub fn deserialize_by_key(bytes: &[u8]) -> Result<Vec<MinedByKeyEntry>, MinedIndexError> {
+    pub fn deserialize_by_key(
+        bytes: &[u8],
+    ) -> Result<(u64, Vec<MinedByKeyEntry>), MinedIndexError> {
         let mut cur = SnapshotCursor::new(bytes);
         let version = cur.read_u8().ok_or(MinedIndexError::Corrupt)?;
         if version != MINED_BYKEY_SNAPSHOT_VERSION {
@@ -842,6 +859,7 @@ impl ShardedMinedIndex {
                 MINED_BYKEY_SNAPSHOT_VERSION,
             ));
         }
+        let fence = cur.read_u64().ok_or(MinedIndexError::Corrupt)?;
         let count = cur.read_u32().ok_or(MinedIndexError::Corrupt)? as usize;
         // Grow via `push`, not `Vec::with_capacity(count)`, so a
         // poisoned/huge declared count fails fast on the first truncated
@@ -871,7 +889,7 @@ impl ShardedMinedIndex {
                 all_spent,
             });
         }
-        Ok(out)
+        Ok((fence, out))
     }
 }
 
@@ -1525,10 +1543,11 @@ mod tests {
         ];
 
         let mut buf = Vec::new();
-        idx.serialize_by_key(&pairs, &mut buf);
+        idx.serialize_by_key(777, &pairs, &mut buf);
 
-        let entries =
+        let (fence, entries) =
             ShardedMinedIndex::deserialize_by_key(&buf).expect("well-formed snapshot must decode");
+        assert_eq!(fence, 777, "the stamped fence must round-trip");
         assert_eq!(
             entries.len(),
             2,
@@ -1563,8 +1582,9 @@ mod tests {
     fn serialize_by_key_empty_pairs_roundtrips() {
         let idx = ShardedMinedIndex::new(16);
         let mut buf = Vec::new();
-        idx.serialize_by_key(&[], &mut buf);
-        let entries = ShardedMinedIndex::deserialize_by_key(&buf).expect("must decode");
+        idx.serialize_by_key(0, &[], &mut buf);
+        let (fence, entries) = ShardedMinedIndex::deserialize_by_key(&buf).expect("must decode");
+        assert_eq!(fence, 0);
         assert!(entries.is_empty(), "no pairs -> no snapshot entries");
     }
 
@@ -1575,7 +1595,7 @@ mod tests {
         let slot = idx.alloc_created(&k, 10);
 
         let mut buf = Vec::new();
-        idx.serialize_by_key(&[(k, slot)], &mut buf);
+        idx.serialize_by_key(42, &[(k, slot)], &mut buf);
         let original_version = buf[0];
         buf[0] = original_version.wrapping_add(1);
 
@@ -1598,7 +1618,7 @@ mod tests {
         idx.apply_set_mined(&k, slot, 500, 20, 3, true);
 
         let mut buf = Vec::new();
-        idx.serialize_by_key(&[(k, slot)], &mut buf);
+        idx.serialize_by_key(42, &[(k, slot)], &mut buf);
         // Cut mid-way through the single entry's block-tuple payload.
         let truncated = &buf[..buf.len() - 4];
 
@@ -1623,8 +1643,8 @@ mod tests {
         idx.free(&k, slot);
 
         let mut buf = Vec::new();
-        idx.serialize_by_key(&pairs, &mut buf);
-        let entries = ShardedMinedIndex::deserialize_by_key(&buf).expect("must decode");
+        idx.serialize_by_key(3, &pairs, &mut buf);
+        let (_fence, entries) = ShardedMinedIndex::deserialize_by_key(&buf).expect("must decode");
         assert!(
             entries.is_empty(),
             "a slot freed between resolving pairs and reading mined-state must be omitted, \

@@ -8436,7 +8436,11 @@ impl Engine {
     /// full device scan.
     ///
     /// Called by the checkpoint task (`crate::checkpoint::perform_checkpoint_inner`)
-    /// alongside [`Self::snapshot_index`].
+    /// alongside [`Self::snapshot_index`]. `fence` is the checkpoint's
+    /// `snapshot_fence_sequence` — the SAME sequence the redo log is fenced
+    /// at — and is stamped into the snapshot so
+    /// [`Self::recover_mined_index`] can detect a stale snapshot (Task 13
+    /// CRITICAL fix): see [`crate::index::mined_index::ShardedMinedIndex::serialize_by_key`].
     ///
     /// Enumerates every live primary entry with a live `mined_slot`,
     /// resolving the AUTHORITATIVE full txid from each record's on-device
@@ -8451,6 +8455,25 @@ impl Engine {
     /// with a warning — recovery's redo-tail replay, or failing that the
     /// device-scan fallback, still covers it.
     ///
+    /// TOCTOU re-resolve: `self.index.for_each`'s first pass captures
+    /// `(device_id, record_offset, mined_slot)` under each shard's own
+    /// short-lived read lock, which is released before the footer read
+    /// below runs. Under churn between those two steps, the ORIGINAL
+    /// `mined_slot` can be freed and handed by the LIFO free-list to a
+    /// THIRD transaction sharing this record's shard (a delete frees
+    /// offset+slot, a create reuses the offset for a different tx, and the
+    /// slot is separately reused for yet another tx) — pairing the FRESH
+    /// txid from the footer with that STALE, now-reassigned slot would
+    /// attribute the third tx's blocks/`all_spent` to this entry's key.
+    /// Closed the same way [`Self::read_metadata_for_key`] closes its
+    /// identity race: after resolving the authoritative key from the
+    /// footer, a FRESH `self.index.lookup` re-resolves `mined_slot`, and
+    /// the pair is trusted only if that fresh entry still points at the
+    /// SAME `(device_id, record_offset)` this iteration captured and
+    /// carries a live (non-sentinel) `mined_slot`. Otherwise the record has
+    /// moved or gone since pass one and is simply omitted — the same
+    /// fallback coverage as an unreadable footer.
+    ///
     /// Written as a SEPARATE file (tempfile + fsync + rename + parent-dir
     /// fsync, mirroring [`ShardedIndex::snapshot_all_concurrent`]) so a
     /// partial write of one section can never be paired with a stale or
@@ -8458,12 +8481,18 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns a [`std::io::Error`] on any filesystem failure. Callers
-    /// (the checkpoint task) treat a failure here as NON-FATAL — recovery
-    /// falls back to the device scan when this section is absent or
-    /// corrupt, so a transient write failure only costs a slower recovery,
-    /// never data loss.
-    pub fn snapshot_mined_index_by_key(&self, path: &std::path::Path) -> std::io::Result<()> {
+    /// Returns a [`std::io::Error`] on any filesystem failure. Unlike the
+    /// two paragraphs above (which are tolerated, best-effort omissions),
+    /// callers (the checkpoint task) treat a failure to write THIS FILE as
+    /// FATAL — it propagates via `?` and aborts the checkpoint before the
+    /// redo log is fenced/truncated, so a stale `.mined` snapshot can never
+    /// be left paired with an already-advanced redo (the CRITICAL bug this
+    /// fixes: see `crate::checkpoint::perform_checkpoint_inner`).
+    pub fn snapshot_mined_index_by_key(
+        &self,
+        path: &std::path::Path,
+        fence: u64,
+    ) -> std::io::Result<()> {
         let mut locs: Vec<(u8, u64, u32)> = Vec::new();
         self.index.for_each(|_key, entry| {
             if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
@@ -8471,11 +8500,51 @@ impl Engine {
             }
         });
 
+        let (pairs, skipped) = self.resolve_mined_index_pairs(locs);
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "snapshot_mined_index_by_key: {skipped} record(s) omitted (footer unreadable or \
+                 slot reassigned since the first pass)",
+            );
+        }
+
+        let mut buf = Vec::new();
+        self.mined_index.serialize_by_key(fence, &pairs, &mut buf);
+
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &buf)?;
+        let f = std::fs::File::open(&tmp_path)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, path)?;
+        crate::fsutil::fsync_parent_dir(path)?;
+        Ok(())
+    }
+
+    /// Pass 2 of [`Self::snapshot_mined_index_by_key`]: given `locs` —
+    /// `(device_id, record_offset, mined_slot)` tuples captured by pass 1's
+    /// `self.index.for_each` — resolve each record's AUTHORITATIVE txid from
+    /// its on-device footer and RE-RESOLVE its `mined_slot` from the
+    /// CURRENT primary index rather than trusting the slot `locs` captured
+    /// (see the TOCTOU doc on [`Self::snapshot_mined_index_by_key`]).
+    ///
+    /// Extracted into its own method (rather than inlined in the caller) so
+    /// tests can drive it directly with a hand-built `locs` that represents
+    /// "pass 1 already captured this, and churn happened before pass 2
+    /// runs" without needing genuine thread interleaving to reproduce the
+    /// race deterministically.
+    ///
+    /// Returns the resolved `(TxKey, mined_slot)` pairs and a count of
+    /// entries omitted (footer unreadable, or the key's current primary
+    /// entry no longer matches this `(device_id, offset)` / carries no live
+    /// `mined_slot`).
+    fn resolve_mined_index_pairs(&self, locs: Vec<(u8, u64, u32)>) -> (Vec<(TxKey, u32)>, u64) {
         let mut pairs: Vec<(TxKey, u32)> = Vec::with_capacity(locs.len());
         let mut skipped = 0u64;
-        for (device_id, offset, slot) in locs {
-            match self.read_metadata_fast(device_id, offset) {
-                Ok(meta) => pairs.push((TxKey::from_bytes(meta.tx_id), slot)),
+        for (device_id, offset, _slot) in locs {
+            let meta = match self.read_metadata_fast(device_id, offset) {
+                Ok(meta) => meta,
                 Err(e) => {
                     skipped += 1;
                     tracing::warn!(
@@ -8486,27 +8555,29 @@ impl Engine {
                          from the mined-index snapshot (recovery's redo-tail replay or the \
                          device-scan fallback still covers it)",
                     );
+                    continue;
+                }
+            };
+            let key = TxKey::from_bytes(meta.tx_id);
+            // Re-resolve against the CURRENT index instead of trusting the
+            // slot captured in the first pass (see the TOCTOU doc above).
+            match self.index.lookup(&key) {
+                Some(fresh)
+                    if fresh.device_id == device_id
+                        && fresh.record_offset == offset
+                        && fresh.mined_slot != crate::index::mined_index::NO_MINED_SLOT =>
+                {
+                    pairs.push((key, fresh.mined_slot));
+                }
+                _ => {
+                    // Moved (relocated/deleted+recreated) or freed since pass
+                    // one — expected under churn, not an error; omitted the
+                    // same as an unreadable footer.
+                    skipped += 1;
                 }
             }
         }
-        if skipped > 0 {
-            tracing::warn!(
-                skipped,
-                "snapshot_mined_index_by_key: {skipped} record(s) omitted (footer unreadable)",
-            );
-        }
-
-        let mut buf = Vec::new();
-        self.mined_index.serialize_by_key(&pairs, &mut buf);
-
-        let tmp_path = path.with_extension("tmp");
-        std::fs::write(&tmp_path, &buf)?;
-        let f = std::fs::File::open(&tmp_path)?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp_path, path)?;
-        crate::fsutil::fsync_parent_dir(path)?;
-        Ok(())
+        (pairs, skipped)
     }
 
     /// Rebuild the in-memory [`ShardedMinedIndex`] FRESH from a checkpoint's
@@ -8684,9 +8755,11 @@ impl Engine {
     /// create+delete+recreate cycle for the SAME txid within one tail
     /// leaves the FIRST create's slot allocated-and-abandoned once the
     /// second create overwrites `tail_slots`/`self.index`'s pointer — a
-    /// bounded, harmless leak that self-heals at the next checkpoint (whose
-    /// snapshot only walks the live final index) or a full restart
-    /// (`clear()`).
+    /// bounded, harmless leak (wasted RAM, unreachable, never aliased to
+    /// another txid). It does NOT self-heal at the next checkpoint —
+    /// `snapshot_mined_index_by_key` only READS the live final index via
+    /// `self.index.for_each`, it never scrubs the arena for orphaned slots —
+    /// only a full restart (`clear()`) reclaims it.
     ///
     /// Idempotent only in the sense that the CALLER always starts from a
     /// freshly-`clear()`ed arena (via
@@ -8810,13 +8883,45 @@ impl Engine {
         Ok(())
     }
 
+    /// The MINIMUM "persisted recovery fence" across every attached redo
+    /// log — the sequence through which each log's OWN tail replay is
+    /// already bounded (see [`crate::redo::RedoLog::recover_with_fence`]).
+    /// All per-store logs are fenced with the SAME global sequence by
+    /// `Engine::mark_recovery_progress_all`/`checkpoint_fence`, so in the
+    /// healthy case every log agrees; the minimum is the conservative choice
+    /// if any log lags (e.g. a partially-failed fencing round), since
+    /// trusting a HIGHER sibling's fence there would risk treating
+    /// not-yet-fenced entries as already covered.
+    ///
+    /// Returns `Ok(None)` when `redo_logs` is empty — there is nothing to
+    /// verify a snapshot's stamped fence against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] if scanning a log fails.
+    fn min_redo_recovery_fence(
+        redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
+    ) -> Result<Option<u64>, SpendError> {
+        let mut min_fence: Option<u64> = None;
+        for log in redo_logs {
+            let (_entries, fence) =
+                log.lock()
+                    .recover_with_fence()
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("mined-index recovery: reading redo log fence failed: {e}"),
+                    })?;
+            min_fence = Some(min_fence.map_or(fence, |m: u64| m.min(fence)));
+        }
+        Ok(min_fence)
+    }
+
     /// Recover the [`ShardedMinedIndex`] at startup: try the checkpoint
     /// snapshot + redo-tail replay path (Task 13) first, falling back to
     /// [`Self::rebuild_mined_index_from_device`]'s full device scan (Task 12)
-    /// when the snapshot section is absent, truncated, or otherwise fails to
-    /// decode. The device-scan fallback is NEVER removed by this method —
-    /// it is the same call [`Self::rebuild_mined_index_from_device`] always
-    /// was, just reached conditionally now.
+    /// when the snapshot section is absent, stale, truncated, or otherwise
+    /// fails to decode. The device-scan fallback is NEVER removed by this
+    /// method — it is the same call [`Self::rebuild_mined_index_from_device`]
+    /// always was, just reached conditionally now.
     ///
     /// Returns `Ok(true)` if the snapshot+redo-tail path was used, `Ok(false)`
     /// if it fell back to the device scan. Both outcomes leave the
@@ -8828,12 +8933,28 @@ impl Engine {
     /// corrupt bytes) is expected and non-fatal — it just means this
     /// checkpoint predates the mined-index snapshot feature, or the write
     /// was interrupted; the device scan reconstructs the same authoritative
-    /// state directly from the device instead. A STORAGE failure while
-    /// restoring or replaying (a primary-index register call erroring) is
-    /// NOT tolerated, matching [`Self::rebuild_mined_index_from_device`]'s
-    /// own severity: it indicates a systemic index-write fault the device
-    /// scan would hit identically, so it is propagated as fatal rather than
-    /// silently falling back.
+    /// state directly from the device instead.
+    ///
+    /// STALENESS CHECK (Task 13 CRITICAL fix, defense-in-depth on top of
+    /// [`Self::snapshot_mined_index_by_key`]'s write now being fatal to the
+    /// checkpoint): a well-formed snapshot's stamped `fence` is compared
+    /// against [`Self::min_redo_recovery_fence`]. These must have been
+    /// written by the SAME checkpoint (the primary/DAH/unmined snapshot and
+    /// the redo fence/truncation are fatal-on-failure and therefore always
+    /// consistent with each other; the `.mined` fence must match that same
+    /// value too). Any mismatch — including no redo logs to verify
+    /// against — means this `.mined` section is from an EARLIER checkpoint
+    /// than the currently-fenced redo (a stale snapshot that would silently
+    /// drop every mined mutation between the two fences), so it is treated
+    /// exactly like an absent/corrupt snapshot: fall back to the device
+    /// scan.
+    ///
+    /// A STORAGE failure while restoring or replaying (a primary-index
+    /// register call erroring) is NOT tolerated, matching
+    /// [`Self::rebuild_mined_index_from_device`]'s own severity: it
+    /// indicates a systemic index-write fault the device scan would hit
+    /// identically, so it is propagated as fatal rather than silently
+    /// falling back.
     ///
     /// # Errors
     ///
@@ -8858,8 +8979,8 @@ impl Engine {
             }
         };
         let decoded = crate::index::mined_index::ShardedMinedIndex::deserialize_by_key(&bytes);
-        let entries = match decoded {
-            Ok(e) => e,
+        let (snapshot_fence, entries) = match decoded {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
                     path = %mined_snapshot_path.display(),
@@ -8871,10 +8992,38 @@ impl Engine {
                 return Ok(false);
             }
         };
+
+        match Self::min_redo_recovery_fence(redo_logs)? {
+            Some(redo_fence) if redo_fence == snapshot_fence => {}
+            Some(redo_fence) => {
+                tracing::warn!(
+                    path = %mined_snapshot_path.display(),
+                    snapshot_fence,
+                    redo_fence,
+                    "mined-index recovery: snapshot fence does not match the redo logs' \
+                     current persisted fence (stale snapshot); falling back to the full \
+                     device scan",
+                );
+                self.rebuild_mined_index_from_device()?;
+                return Ok(false);
+            }
+            None => {
+                tracing::warn!(
+                    path = %mined_snapshot_path.display(),
+                    snapshot_fence,
+                    "mined-index recovery: no redo logs attached to verify the snapshot's \
+                     fence; falling back to the full device scan",
+                );
+                self.rebuild_mined_index_from_device()?;
+                return Ok(false);
+            }
+        }
+
         self.restore_mined_index_from_snapshot_entries(&entries)?;
         self.replay_mined_index_redo_tail(redo_logs)?;
         tracing::info!(
             entries = entries.len(),
+            fence = snapshot_fence,
             "mined-index recovery: restored from checkpoint snapshot + redo-tail replay",
         );
         Ok(true)
@@ -16705,6 +16854,124 @@ mod tests {
         );
     }
 
+    /// Mirrors
+    /// [`rebuild_mined_index_from_device_overwrites_stale_nonsentinel_mined_slot`]
+    /// for the OTHER recovery path (Task 13's checkpoint snapshot restore):
+    /// [`Engine::restore_mined_index_from_snapshot_entries`] must overwrite a
+    /// stale, non-sentinel `mined_slot` already present on the primary entry
+    /// it's re-pointing — never trust it as a hint for anything, since the
+    /// freshly-`clear()`ed arena has allocated nothing yet and any pre-existing
+    /// primary-entry `mined_slot` value is necessarily dangling.
+    #[test]
+    fn restore_from_snapshot_overwrites_stale_nonsentinel_mined_slot() {
+        use crate::index::mined_index::MinedByKeyEntry;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+        // Build the on-device record via a throwaway engine, then discard its
+        // index — only the device bytes and the locator matter.
+        let (device_id, offset, key) = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let temp_engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let (_, req) = make_create_req(243, 1);
+            let key = req.tx_key();
+            temp_engine.create(&req).expect("create succeeds");
+            let entry = temp_engine.lookup(&key).expect("entry registered");
+            temp_engine.allocator().lock().persist().unwrap();
+            (entry.device_id, entry.record_offset, key)
+        };
+
+        // Hand-build a primary index carrying a STALE, non-sentinel
+        // `mined_slot` (999) for this key — simulating a snapshot restored
+        // into a fresh engine whose `ShardedMinedIndex` has allocated nothing
+        // at all yet (exactly `restore_mined_index_from_snapshot_entries`'s
+        // precondition: it `clear()`s the arena before restoring).
+        let stale_index = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+        stale_index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id,
+                    record_offset: offset,
+                    mined_slot: 999,
+                },
+            )
+            .expect("register stale entry");
+
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            stale_index,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // Precondition: the fresh MinedIndex has allocated nothing, so slot
+        // 999 is absent — the stale pointer is already dangling.
+        assert!(
+            engine2
+                .mined_index()
+                .with_entry(&key, 999, |_| ())
+                .is_none(),
+            "precondition: the fresh arena must not have slot 999 live"
+        );
+
+        // The snapshot entry for this key carries its OWN, correct mined
+        // state (one block, all_spent), distinct from the stale slot 999.
+        let entries = vec![MinedByKeyEntry {
+            txid: key.txid,
+            block_entries: vec![crate::record::BlockEntry {
+                block_id: 55,
+                block_height: 44,
+                subtree_idx: 0,
+            }],
+            unmined_since: 0,
+            all_spent: true,
+        }];
+
+        engine2
+            .restore_mined_index_from_snapshot_entries(&entries)
+            .expect("snapshot restore succeeds");
+
+        let after = engine2.lookup(&key).expect("entry still present");
+        assert_ne!(
+            after.mined_slot, 999,
+            "restore must overwrite a stale non-sentinel mined_slot, not trust it"
+        );
+
+        let (blocks, unmined_since) = engine2
+            .mined_index()
+            .read_block_entries(&key, after.mined_slot)
+            .expect("restore must register a live slot under the freshly re-pointed mined_slot");
+        assert_eq!(unmined_since, 0);
+        assert_eq!(
+            blocks.iter().map(|b| b.block_id).collect::<Vec<_>>(),
+            vec![55],
+            "restore must reproduce the snapshot's own block entries under the new slot"
+        );
+        let all_spent = engine2
+            .mined_index()
+            .with_entry(&key, after.mined_slot, |e| {
+                e.flags & crate::index::mined_index::MINED_ALL_SPENT != 0
+            })
+            .expect("entry must be live");
+        assert!(
+            all_spent,
+            "restore must reproduce the snapshot's all_spent bit"
+        );
+    }
+
     /// CRITICAL fix: a record skipped for an unreadable footer must NOT leave
     /// its primary entry's stale `mined_slot` in place. Pre-fix, the skip left
     /// `mined_slot` untouched; since this pass allocates fresh slots
@@ -16847,6 +17114,424 @@ mod tests {
             entries_b.iter().map(|e| e.block_id).collect::<Vec<_>>(),
             vec![99],
             "B must keep its own block data"
+        );
+    }
+
+    /// IMPORTANT fix (Finding 2): `snapshot_mined_index_by_key`'s pass 1
+    /// (`self.index.for_each`, capturing `(device_id, offset, mined_slot)`
+    /// under each shard's own short-lived read lock) and pass 2 (the footer
+    /// read that resolves the authoritative txid) are not atomic together —
+    /// under churn between the two, a delete can free `(offset, slot)`, a
+    /// create can reuse the offset for an unrelated tx, and the FREED slot
+    /// can be handed by the shard's LIFO free-list to a THIRD tx. Naively
+    /// pairing pass 1's captured (now-stale) slot with pass 2's freshly
+    /// resolved txid would attribute the third tx's mined-state to the
+    /// wrong record — the same class of bug fixed for the device-scan path
+    /// in commit 5a2585f (Task 12 CRITICAL).
+    ///
+    /// Reproduces the race deterministically (no genuine thread
+    /// interleaving needed) by driving
+    /// [`Engine::resolve_mined_index_pairs`] — pass 2 in isolation — with a
+    /// hand-built `locs` representing "pass 1 already captured this, then
+    /// the churn below happened before pass 2 runs". `read_block_entries`
+    /// resolves a slot's SHARD from the txid being looked up (not from the
+    /// slot number itself — see [`ShardedMinedIndex::read_block_entries`]),
+    /// so for a stale slot to visibly resolve to a DIFFERENT tx's real data,
+    /// that tx must land in the SAME `ShardedMinedIndex` shard the stale
+    /// slot belongs to. Device-offset reuse and MinedIndex-shard-slot reuse
+    /// are independent free lists (record size class vs. txid hash), so two
+    /// DIFFERENT utxo counts are used to deterministically steer which freed
+    /// device region each subsequent create reuses (best-fit by exact size),
+    /// decoupling "who reoccupies the offset" from "who reclaims the slot":
+    ///
+    /// 1. tx A (shard X, 1 UTXO) is created — allocating device offset
+    ///    `off_a` and MinedIndex slot 0 in shard X.
+    ///    `(device_id, off_a, 0)` is captured — this stands in for pass 1's
+    ///    snapshot.
+    /// 2. tx H (1 UTXO) is created as a permanent SPACER (never deleted),
+    ///    so `off_a` and the region G occupies below end up non-adjacent —
+    ///    otherwise the allocator's freelist would coalesce their freed
+    ///    regions into one contiguous span once both are deleted, and a
+    ///    later best-fit search would be satisfied from ITS start (`off_a`)
+    ///    regardless of the requested size, defeating step 4 below.
+    /// 3. tx G (a DIFFERENT shard, 200 UTXOs — a different, larger size
+    ///    class spanning more device-alignment blocks) is created purely as
+    ///    a device-offset donor.
+    /// 4. A and G are both deleted, freeing `off_a` (1-UTXO-sized) and
+    ///    `off_g` (200-UTXO-sized, non-adjacent to `off_a` thanks to H)
+    ///    plus shard X's slot 0.
+    /// 5. tx D (shard X, 200 UTXOs, set-mined) is created: best-fit hands it
+    ///    the ONLY 200-UTXO-sized free region (`off_g`, NOT `off_a`, which
+    ///    is too small), and since D routes to shard X it reclaims the only
+    ///    free slot there (0 — A's).
+    /// 6. tx F (shard X, 1 UTXO, set-mined) is created: best-fit hands it
+    ///    the ONLY 1-UTXO-sized free region left (`off_a` — the SAME
+    ///    location pass 1 captured), and since shard X's free list is now
+    ///    empty (D took slot 0), F allocates a FRESH slot (1) — distinct
+    ///    from the stale captured 0, which now holds D's mined-state.
+    ///
+    /// A naive implementation that trusts pass 1's captured slot would
+    /// resolve pass 2's footer read at `off_a` to F's txid (F lives there
+    /// now) and pair it with the STALE slot 0 — which, because F is in the
+    /// SAME shard X, resolves to D's real block data — silently
+    /// attributing D's mined-state to F. The fix re-resolves `mined_slot`
+    /// via a fresh `self.index.lookup`, so it must instead pair F's txid
+    /// with F's OWN current slot (1), never D's.
+    #[test]
+    fn snapshot_by_key_reresolves_slot_no_cross_tx_aliasing() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // Bucket 256 single-byte txid seeds by `ShardedMinedIndex` shard;
+        // pick a shard X with at least 3 members (A, D, F) plus any seed
+        // from a DIFFERENT shard for G. With >=16 shards this always
+        // succeeds by pigeonhole (256 seeds, ~16 per shard on average).
+        let shard_for_seed = |n: u8| {
+            let mut txid = [0u8; 32];
+            txid[16] = n;
+            engine.mined_index().shard_for(&TxKey { txid })
+        };
+        let mut buckets: std::collections::HashMap<usize, Vec<u8>> =
+            std::collections::HashMap::new();
+        for n in 0u8..=255 {
+            buckets.entry(shard_for_seed(n)).or_default().push(n);
+        }
+        let (&shard_x, seeds_x) = buckets
+            .iter()
+            .find(|(_, v)| v.len() >= 3)
+            .expect("some shard must receive >=3 of 256 seeds by pigeonhole (>=16 shards)");
+        let (n_a, n_d, n_f) = (seeds_x[0], seeds_x[1], seeds_x[2]);
+        let n_g = *buckets
+            .iter()
+            .find(|&(&s, _)| s != shard_x)
+            .expect("at least 2 distinct shards must exist among 256 seeds")
+            .1
+            .first()
+            .unwrap();
+        // H: any seed distinct from the four above — a permanent spacer (see
+        // below), never deleted.
+        let taken = [n_a, n_d, n_f, n_g];
+        let n_h = (0u8..=255)
+            .find(|n| !taken.contains(n))
+            .expect("some seed distinct from the 4 already picked must exist");
+
+        // A: 1 UTXO, shard X. Allocates device offset `off_a` and shard-X
+        // slot 0 (the first-ever allocation in a fresh shard).
+        let (_, req_a) = make_create_req(n_a, 1);
+        let key_a = req_a.tx_key();
+        engine.create(&req_a).expect("create A succeeds");
+        let entry_a = engine.lookup(&key_a).expect("A registered");
+        assert_eq!(
+            entry_a.mined_slot, 0,
+            "test setup invariant: A gets shard X's first slot"
+        );
+
+        // H: a permanent spacer record, created between A and G and NEVER
+        // deleted, so A's and G's freed device regions end up non-adjacent —
+        // otherwise the allocator's freelist coalesces adjacent free regions
+        // into one contiguous span and a later best-fit search would be
+        // satisfied from ITS start (A's old offset) regardless of the
+        // requested size, defeating the size-class steering below.
+        let (_, req_h) = make_create_req(n_h, 1);
+        engine.create(&req_h).expect("create H succeeds");
+
+        // G: 200 UTXOs (a DIFFERENT, larger size class), a DIFFERENT shard — purely a
+        // device-offset donor; must not touch shard X's slot free list.
+        let (_, req_g) = make_create_req(n_g, 200);
+        let key_g = req_g.tx_key();
+        engine.create(&req_g).expect("create G succeeds");
+
+        // Simulate "pass 1 already captured A's location" BEFORE the churn
+        // below reassigns both the device offset and the shard-X slot.
+        let captured_locs = vec![(entry_a.device_id, entry_a.record_offset, entry_a.mined_slot)];
+
+        // Churn: delete both A and G, freeing a 1-UTXO-sized region
+        // (`off_a`) and a 200-UTXO-sized region (`off_g`), plus shard X's slot 0.
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key_a,
+                due_guard: None,
+            })
+            .expect("delete A succeeds");
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key_g,
+                due_guard: None,
+            })
+            .expect("delete G succeeds");
+
+        // D: 200 UTXOs, shard X. Best-fit hands it the ONLY 200-UTXO-sized free
+        // region (`off_g`) — NOT `off_a`, which is too small — and D's own
+        // shard-X allocation reclaims the only free slot there (0).
+        let (_, req_d) = make_create_req(n_d, 200);
+        let key_d = req_d.tx_key();
+        engine.create(&req_d).expect("create D succeeds");
+        let entry_d = engine.lookup(&key_d).expect("D registered");
+        assert_ne!(
+            entry_d.record_offset, entry_a.record_offset,
+            "test setup invariant: D (200 UTXOs) must NOT reuse A's smaller 1-UTXO region"
+        );
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key_d,
+                block_id: 99,
+                block_height: 900,
+                subtree_idx: 0,
+                current_block_height: 900,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("setMined D succeeds");
+        let entry_d = engine.lookup(&key_d).expect("D registered");
+        assert_eq!(
+            entry_d.mined_slot, entry_a.mined_slot,
+            "test setup invariant: D must reclaim A's freed shard-X slot (0), the only free one"
+        );
+
+        // F: 1 UTXO, shard X. Best-fit now hands it the ONLY 1-UTXO-sized
+        // free region left — `off_a`, the SAME location pass 1 captured.
+        // Shard X's slot free list is now empty (D took slot 0), so F
+        // allocates a FRESH slot.
+        let (_, req_f) = make_create_req(n_f, 1);
+        let key_f = req_f.tx_key();
+        engine.create(&req_f).expect("create F succeeds");
+        let entry_f = engine.lookup(&key_f).expect("F registered");
+        assert_eq!(
+            (entry_f.device_id, entry_f.record_offset),
+            (entry_a.device_id, entry_a.record_offset),
+            "test setup invariant: F must reuse A's freed device offset (the only 1-UTXO-sized \
+             free region left)"
+        );
+        assert_ne!(
+            entry_f.mined_slot, entry_a.mined_slot,
+            "test setup invariant: F's own shard-X slot must differ from the stale captured one \
+             (0 is already D's)"
+        );
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key_f,
+                block_id: 77,
+                block_height: 700,
+                subtree_idx: 0,
+                current_block_height: 700,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("setMined F succeeds");
+        let entry_f_after = engine.lookup(&key_f).expect("F still registered");
+
+        // Pass 2, driven with the STALE `locs` captured before the churn. F
+        // has its OWN live, still-current (device_id, offset) match plus a
+        // live mined_slot, so the fix must find and trust it — this is not
+        // the "moved/omit" case, it's the "slot silently swapped out from
+        // under an otherwise-still-valid location" case.
+        let (pairs, _skipped) = engine.resolve_mined_index_pairs(captured_locs);
+
+        let (_, slot) = pairs.iter().find(|(k, _)| *k == key_f).expect(
+            "F's current entry still matches the captured (device_id, offset) and \
+                     carries a live mined_slot, so it must be included, not omitted",
+        );
+        assert_eq!(
+            *slot, entry_f_after.mined_slot,
+            "F must be paired with its OWN current slot, never the stale captured one \
+             (which now holds D's mined-state) — the exact cross-tx aliasing this fix closes"
+        );
+        assert_ne!(
+            *slot, entry_a.mined_slot,
+            "must not resolve to the stale slot that now holds D's block data"
+        );
+
+        // Round-trip through the real snapshot format and decode: F's block
+        // data must be its OWN (block_id 77), never D's (block_id 99) —
+        // even though F and D share `ShardedMinedIndex` shard X, so a
+        // wrongly-paired slot WOULD resolve to real (wrong) data rather
+        // than an obviously-absent slot.
+        let mut buf = Vec::new();
+        engine.mined_index().serialize_by_key(1, &pairs, &mut buf);
+        let (_fence, decoded) =
+            crate::index::mined_index::ShardedMinedIndex::deserialize_by_key(&buf)
+                .expect("well-formed snapshot must decode");
+        let f_entry = decoded
+            .iter()
+            .find(|e| e.txid == key_f.txid)
+            .expect("F's entry must be present in the decoded snapshot");
+        let block_ids: Vec<u32> = f_entry.block_entries.iter().map(|b| b.block_id).collect();
+        assert_eq!(
+            block_ids,
+            vec![77],
+            "the snapshot must carry F's OWN block data, never D's (the aliasing bug)"
+        );
+    }
+
+    /// [`Engine::replay_mined_index_redo_tail`] must handle the index-only
+    /// create variants (`RedoOp::CreateV2` / `RedoOp::ReplicaCreate` — used
+    /// under buffered-redo durability / replication, which carry no embedded
+    /// `record_bytes`) by reading metadata back from the device via
+    /// `read_metadata_for_key`, not just the full-payload `RedoOp::Create`.
+    ///
+    /// Builds the two on-device records via a throwaway engine (a normal
+    /// `create()` dual-writes a live `mined_slot` immediately, which would
+    /// defeat this test — only the device bytes/footers matter here, not
+    /// that engine's own index), then hand-builds a FRESH engine sharing
+    /// the SAME device whose primary index carries `NO_MINED_SLOT`
+    /// sentinels for both keys — mirroring recovery's actual precondition:
+    /// the primary index has already been fully replayed, and the
+    /// MinedIndex is empty, when `replay_mined_index_redo_tail` runs (see
+    /// [`Engine::recover_mined_index`]). Replays a redo tail containing a
+    /// `CreateV2` entry for one and a `ReplicaCreate` entry for the other,
+    /// and asserts each ends up with a live `mined_slot` whose MinedIndex
+    /// state (no blocks yet, unmined at its creation height) matches the
+    /// record's own footer.
+    #[test]
+    fn create_v2_and_replica_create_redo_tail_populate_mined_index() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        use crate::redo::{RedoLog, RedoOp};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+        // Two real on-device records (footers only matter — this engine's
+        // own index/MinedIndex are discarded).
+        let (device_id, offset1, key1, offset2, key2) = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let temp_engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let (_, req1) = make_create_req(31, 1);
+            let key1 = req1.tx_key();
+            temp_engine.create(&req1).expect("create tx1 succeeds");
+            let entry1 = temp_engine.lookup(&key1).expect("tx1 registered");
+
+            let (_, req2) = make_create_req(32, 1);
+            let key2 = req2.tx_key();
+            temp_engine.create(&req2).expect("create tx2 succeeds");
+            let entry2 = temp_engine.lookup(&key2).expect("tx2 registered");
+
+            temp_engine.allocator().lock().persist().unwrap();
+            (
+                entry1.device_id,
+                entry1.record_offset,
+                key1,
+                entry2.record_offset,
+                key2,
+            )
+        };
+        assert_eq!(
+            device_id, 0,
+            "test setup invariant: single-store engine, store 0"
+        );
+
+        // A FRESH engine, sharing the same device, whose primary index
+        // already carries both keys with the NO_MINED_SLOT sentinel — the
+        // exact precondition `replay_mined_index_redo_tail` runs under at
+        // recovery (primary index fully replayed, MinedIndex still empty).
+        let fresh_index = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+        fresh_index
+            .register(
+                key1,
+                TxIndexEntry {
+                    device_id,
+                    record_offset: offset1,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register tx1");
+        fresh_index
+            .register(
+                key2,
+                TxIndexEntry {
+                    device_id,
+                    record_offset: offset2,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register tx2");
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            fresh_index,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // Build a redo tail with a CreateV2 entry for tx1 and a
+        // ReplicaCreate entry for tx2 — both index-only create variants
+        // that carry no embedded record bytes.
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 256 * 1024).unwrap(),
+        ));
+        redo.lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key1,
+                device_id,
+                record_offset: offset1,
+                utxo_count: 1,
+                is_conflicting: false,
+                parent_txids: vec![],
+            })
+            .expect("append CreateV2");
+        redo.lock()
+            .append_and_flush(RedoOp::ReplicaCreate {
+                tx_key: key2,
+                device_id,
+                record_offset: offset2,
+                utxo_count: 1,
+            })
+            .expect("append ReplicaCreate");
+
+        engine2
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo))
+            .expect("redo-tail replay succeeds");
+
+        let after1 = engine2.lookup(&key1).expect("tx1 still registered");
+        assert_ne!(
+            after1.mined_slot, NO_MINED_SLOT,
+            "CreateV2 replay must allocate + re-point a live mined_slot for tx1"
+        );
+        let (blocks1, unmined1) = engine2
+            .mined_index()
+            .read_block_entries(&key1, after1.mined_slot)
+            .expect("tx1's mined-state must be present after replay");
+        assert!(blocks1.is_empty(), "tx1 has no mined blocks yet");
+        assert_eq!(
+            unmined1, 1000,
+            "tx1 must be unmined at its creation height, matching its own device footer"
+        );
+
+        let after2 = engine2.lookup(&key2).expect("tx2 still registered");
+        assert_ne!(
+            after2.mined_slot, NO_MINED_SLOT,
+            "ReplicaCreate replay must allocate + re-point a live mined_slot for tx2"
+        );
+        let (blocks2, unmined2) = engine2
+            .mined_index()
+            .read_block_entries(&key2, after2.mined_slot)
+            .expect("tx2's mined-state must be present after replay");
+        assert!(blocks2.is_empty(), "tx2 has no mined blocks yet");
+        assert_eq!(
+            unmined2, 1000,
+            "tx2 must be unmined at its creation height, matching its own device footer"
         );
     }
 

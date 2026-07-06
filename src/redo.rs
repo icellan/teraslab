@@ -4348,11 +4348,33 @@ impl RedoLog {
     /// linear log appends a `RecoveryProgress` marker
     /// ([`Self::mark_recovery_progress`]). Lets the checkpoint treat both layouts
     /// uniformly (lever 7 phase 6).
+    ///
+    /// For a LINEAR log, ALSO durably records `through_sequence` in the
+    /// header's `checkpoint_seq` field (mirroring what [`Self::set_fence`]
+    /// always does for a ring). This is additional to, not a replacement
+    /// for, the `RecoveryProgress` marker `mark_recovery_progress` appends:
+    /// that marker can be discarded by a later full-drain
+    /// [`Self::compact_prefix_through`] (see its doc — once nothing else
+    /// needs retaining, the marker itself is redundant for REPLAY purposes
+    /// and is swept away with everything else), which would otherwise lose
+    /// every record of the fence ever having advanced past 0. Checkpoint
+    /// callers that need to durably ASSERT "the redo is fenced at least
+    /// this far" — not just "replay this tail" — read this back via
+    /// [`Self::recover_with_fence`] (Task 13 CRITICAL fix: verifying a
+    /// checkpoint's TXID-keyed MinedIndex snapshot's stamped fence is still
+    /// current). `mark_recovery_progress`'s OTHER callers (crash-recovery
+    /// bookkeeping, unrelated to checkpointing) are untouched — this method
+    /// is the checkpoint task's own entry point.
     pub fn checkpoint_fence(&mut self, through_sequence: u64) -> Result<()> {
         if self.is_ring() {
             self.set_fence(through_sequence)
         } else {
-            self.mark_recovery_progress(through_sequence)
+            self.mark_recovery_progress(through_sequence)?;
+            if through_sequence > self.checkpoint_seq {
+                self.checkpoint_seq = through_sequence;
+                self.write_header()?;
+            }
+            Ok(())
         }
     }
 
@@ -4370,18 +4392,34 @@ impl RedoLog {
 
     /// Read all entries after the last checkpoint (for crash recovery).
     pub fn recover(&self) -> Result<Vec<RedoEntry>> {
+        self.recover_with_fence().map(|(entries, _fence)| entries)
+    }
+
+    /// Same as [`Self::recover`], but also returns the fence sequence that
+    /// bounded the replay: every entry with `sequence <= fence` is covered by
+    /// an already-durable snapshot and excluded from the returned tail (ring:
+    /// the header's `checkpoint_seq`; linear: the last `Checkpoint`/
+    /// `RecoveryProgress` marker's `through_sequence`, or `0` if none).
+    ///
+    /// Used by [`crate::ops::engine::Engine::recover_mined_index`] to verify
+    /// a checkpoint's TXID-keyed MinedIndex snapshot's stamped fence still
+    /// matches this log's CURRENT persisted fence before trusting it — a
+    /// mismatch means the redo was truncated past what the snapshot covers
+    /// (Task 13 CRITICAL fix).
+    pub fn recover_with_fence(&self) -> Result<(Vec<RedoEntry>, u64)> {
         // Lever 7: a ring log's `entries_cache` already holds exactly the live
         // entries (rebuilt by `recover_ring_scan`); the replay set is those above
         // the header fence (`checkpoint_seq`) — the snapshot covers the rest.
         // There are no `Checkpoint` / `RecoveryProgress` log entries to consult.
         if self.is_ring() {
             let fence = self.checkpoint_seq;
-            return Ok(self
+            let entries = self
                 .entries_cache
                 .iter()
                 .filter(|e| e.sequence > fence)
                 .cloned()
-                .collect());
+                .collect();
+            return Ok((entries, fence));
         }
         let all = self.scan_all()?;
 
@@ -4407,14 +4445,27 @@ impl RedoLog {
             }
         }
 
-        Ok(all[start_idx..]
+        let entries = all[start_idx..]
             .iter()
             .filter(|entry| {
                 !matches!(entry.op, RedoOp::RecoveryProgress { .. })
                     && entry.sequence > progress_through
             })
             .cloned()
-            .collect())
+            .collect();
+        // `progress_through` alone can UNDER-report the true fence: a
+        // full-drain `compact_prefix_through` discards the RecoveryProgress
+        // marker itself once nothing else needs retaining (see its doc),
+        // so a later scan finds no marker even though `checkpoint_fence`
+        // durably recorded the fence in the header (`checkpoint_seq`) when
+        // it was set. Report whichever is higher; `entries` above is
+        // filtered by `progress_through` ONLY, never this merged value —
+        // that preserves `Self::recover`'s existing replay-tail contract
+        // byte-for-byte, this fence value is solely for callers (Task 13's
+        // stale-snapshot check) that need "how far is this log durably
+        // fenced," not "what should I replay."
+        let fence = progress_through.max(self.checkpoint_seq);
+        Ok((entries, fence))
     }
 
     /// Read all entries with sequence >= `from_seq` from the log.
