@@ -1948,8 +1948,17 @@ fn replay_spend(
     if let Some(ctx) = derived {
         meta.generation = ctx.target_generation;
         meta.updated_at = ctx.updated_at;
+        // Sourced from the on-device `meta` fields, not the MinedIndex: this
+        // redo replay runs against the bare device/primary-index (no `Engine`,
+        // no `ShardedMinedIndex`) during boot, strictly before
+        // `Engine::recover_mined_index` rebuilds it from the (now-replayed)
+        // device state — there is no MinedIndex to read here yet.
+        let has_blocks = { meta.block_entry_count } > 0;
+        let unmined_since = { meta.unmined_since };
         let dah_patch = match evaluate_delete_at_height(
             &meta,
+            has_blocks,
+            unmined_since,
             ctx.current_block_height,
             ctx.block_height_retention,
         ) {
@@ -2050,8 +2059,15 @@ fn replay_unspend(
     if let Some(ctx) = derived {
         meta.generation = ctx.target_generation;
         meta.updated_at = ctx.updated_at;
+        // See `replay_spend`: no `Engine`/`ShardedMinedIndex` exists yet at
+        // this point in boot recovery, so has_blocks/unmined_since must come
+        // from the on-device `meta` fields.
+        let has_blocks = { meta.block_entry_count } > 0;
+        let unmined_since = { meta.unmined_since };
         let dah_patch = match evaluate_delete_at_height(
             &meta,
+            has_blocks,
+            unmined_since,
             ctx.current_block_height,
             ctx.block_height_retention,
         ) {

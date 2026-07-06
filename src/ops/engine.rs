@@ -3620,9 +3620,15 @@ impl Engine {
                 .set_all_spent(&req.tx_key, entry.mined_slot, true);
         }
 
-        // 7. Evaluate deleteAtHeight
+        // 7. Evaluate deleteAtHeight. `spend` never touches block entries or
+        // `unmined_since`, so has_blocks/unmined_since are read fresh from
+        // the authoritative MinedIndex (Task 16a) rather than the device
+        // metadata's `block_entry_count`/`unmined_since` fields.
+        let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
+            !mined_entries.is_empty(),
+            mined_unmined_since,
             req.current_block_height,
             req.block_height_retention,
         )?;
@@ -3806,10 +3812,16 @@ impl Engine {
         // 6. Evaluate deleteAtHeight (runs on both the mutating and no-op paths,
         //    matching the Lua which calls setDeleteAtHeight before every OK
         //    return). On a pure no-op this may still forward-extend an
-        //    all-spent record's DAH.
+        //    all-spent record's DAH. `unspend` never touches block entries or
+        //    `unmined_since`, so has_blocks/unmined_since are read fresh from
+        //    the authoritative MinedIndex (Task 16a) rather than the device
+        //    metadata's `block_entry_count`/`unmined_since` fields.
         let old_dah = { metadata.delete_at_height };
+        let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
+            !mined_entries.is_empty(),
+            mined_unmined_since,
             req.current_block_height,
             req.block_height_retention,
         )?;
@@ -3968,7 +3980,10 @@ impl Engine {
                 let meta_spent = { meta.spent_utxos };
                 let meta_utxo_count = { meta.utxo_count };
 
-                // DAH evaluation from fresh-meta fields.
+                // DAH evaluation from fresh-meta fields. `new_count`/
+                // `new_unmined` are the post-mutation values about to be
+                // dual-written into the MinedIndex below (Task 16a: value
+                // already in hand, no extra MinedIndex read needed).
                 let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
                     tf,
                     meta_spent,
@@ -4217,9 +4232,15 @@ impl Engine {
         metadata.generation = { metadata.generation }.wrapping_add(1);
         metadata.updated_at = self.now_millis();
 
-        // Evaluate deleteAtHeight
+        // Evaluate deleteAtHeight. `metadata.block_entry_count`/`unmined_since`
+        // already hold the freshly-computed post-mutation values (set above)
+        // that are about to be dual-written into the MinedIndex below — this
+        // is the "value already in hand" case, so no extra MinedIndex read is
+        // needed.
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
+            { metadata.block_entry_count } > 0,
+            metadata.unmined_since,
             req.current_block_height,
             req.block_height_retention,
         )?;
@@ -4333,9 +4354,16 @@ impl Engine {
         metadata.generation = { metadata.generation }.wrapping_add(1);
         metadata.updated_at = self.now_millis();
 
-        // Evaluate deleteAtHeight (longest chain status affects DAH)
+        // Evaluate deleteAtHeight (longest chain status affects DAH). This op
+        // never touches block entries, so has_blocks is read fresh from the
+        // MinedIndex (Task 16a); `unmined_since` is the value already
+        // computed above (in hand — this op is the one mutating it), not a
+        // MinedIndex re-read of the pre-mutation state.
+        let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
+            !mined_entries.is_empty(),
+            metadata.unmined_since,
             req.current_block_height,
             req.block_height_retention,
         )?;
@@ -5684,8 +5712,17 @@ impl Engine {
         // guard `apply` to a strict DAH reduction so a CONFLICTING record
         // (whose DAH is driven by conflict state, not all-spent) can never
         // be handed a spurious sentinel-derived DAH.
+        // has_blocks/unmined_since are sourced from the MinedIndex (Task
+        // 16a) rather than `meta`, for consistency with every other
+        // `evaluate_delete_at_height` call site. They cannot actually affect
+        // the outcome here: `spent_utxos` was just decremented above, so
+        // `all_spent` is always false and only the "clear" / "all-spent
+        // transition" branches (neither of which reads has_blocks/
+        // on_longest_chain) are reachable.
+        let (mined_entries, mined_unmined_since) = self.mined_block_entries(parent_key)?;
         let old_dah = { meta.delete_at_height };
-        let (_signal, dah_patch) = evaluate_delete_at_height(&meta, 0, 1)?;
+        let (_signal, dah_patch) =
+            evaluate_delete_at_height(&meta, !mined_entries.is_empty(), mined_unmined_since, 0, 1)?;
         if let Some(patch) = dah_patch
             && patch.new_delete_at_height < old_dah
         {
@@ -7053,6 +7090,13 @@ impl Engine {
         let ro = entry.record_offset;
         let device_id = entry.device_id;
 
+        // `set_conflicting` never touches block entries or `unmined_since`,
+        // so has_blocks/unmined_since for both branches below are read fresh
+        // from the authoritative MinedIndex (Task 16a) rather than the
+        // device metadata's `block_entry_count`/`unmined_since` fields.
+        let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
+        let has_blocks = !mined_entries.is_empty();
+
         // Fast path: read the authoritative on-device metadata once and
         // derive every flag/DAH/counter/generation input from it. The RMW
         // already needs this read for the CRC, so it is free.
@@ -7087,8 +7131,6 @@ impl Engine {
             let old_dah = if has_preserve { 0 } else { meta_dah };
             let meta_spent = { meta.spent_utxos };
             let meta_utxo_count = { meta.utxo_count };
-            let meta_block_count = { meta.block_entry_count };
-            let meta_unmined = { meta.unmined_since };
 
             if req.value {
                 tf.insert(TxFlags::CONFLICTING);
@@ -7100,8 +7142,11 @@ impl Engine {
                 tf,
                 meta_spent,
                 meta_utxo_count,
-                meta_block_count,
-                meta_unmined,
+                // `evaluate_dah_cached` only tests `block_entry_count > 0`
+                // internally, so the MinedIndex-sourced `has_blocks` bool
+                // (Task 16a) maps onto its `u8` param as 0/1.
+                u8::from(has_blocks),
+                mined_unmined_since,
                 has_preserve,
                 if has_preserve { preserve } else { meta_dah },
                 req.current_block_height,
@@ -7152,6 +7197,8 @@ impl Engine {
 
             let (signal, dah_patch) = evaluate_delete_at_height(
                 &meta,
+                has_blocks,
+                mined_unmined_since,
                 req.current_block_height,
                 req.block_height_retention,
             )?;
@@ -9723,8 +9770,18 @@ impl PreparedSpend {
         // misconfiguration (current_height + retention > u32::MAX) and
         // surfaces to the caller as SpendError::DahOverflow — we never
         // silently clamp, which would pin UTXOs as unprunable forever.
-        let (signal, dah_patch) =
-            evaluate_delete_at_height(&metadata, current_block_height, block_height_retention)?;
+        // Batch spend never touches block entries or `unmined_since`, so
+        // has_blocks/unmined_since are read fresh from the authoritative
+        // MinedIndex (Task 16a) rather than the device metadata's
+        // `block_entry_count`/`unmined_since` fields.
+        let (mined_entries, mined_unmined_since) = engine.mined_block_entries(&tx_key)?;
+        let (signal, dah_patch) = evaluate_delete_at_height(
+            &metadata,
+            !mined_entries.is_empty(),
+            mined_unmined_since,
+            current_block_height,
+            block_height_retention,
+        )?;
 
         if let Some(ref patch) = dah_patch {
             apply_dah_patch(&mut metadata, patch);
@@ -10413,6 +10470,39 @@ mod tests {
         }
     }
 
+    /// Seed `engine`'s MinedIndex to match a hand-crafted `TxMetadata`'s
+    /// mined-state fields (`block_entry_count`/`block_entries_inline`/
+    /// `unmined_since`) and return the allocated slot.
+    ///
+    /// Test-only (Task 16a). Real production traffic keeps the device and
+    /// MinedIndex in sync via dual-write (`create` + `set_mined`); harnesses
+    /// that hand-write a record straight to the device (bypassing `create`)
+    /// must independently uphold that same invariant, or `delete_eval`'s
+    /// MinedIndex-sourced has_blocks/unmined_since would silently read back
+    /// "never mined" no matter what the device metadata says. Drives the
+    /// same `alloc_created`/`apply_set_mined` primitives the live setMined
+    /// path uses, so this reproduces exactly the state a real setMined
+    /// sequence would have left behind. Only inline block entries are
+    /// seeded (this harness never allocates on-device overflow).
+    fn seed_mined_index_for_test(engine: &Engine, key: &TxKey, meta: &TxMetadata) -> u32 {
+        let unmined_since = { meta.unmined_since };
+        let slot = engine.mined_index().alloc_created(key, unmined_since);
+        let on_longest_chain = unmined_since == 0;
+        let count = ({ meta.block_entry_count } as usize).min(INLINE_BLOCK_ENTRIES);
+        for be in &meta.block_entries_inline[..count] {
+            let be = *be;
+            engine.mined_index().apply_set_mined(
+                key,
+                slot,
+                be.block_id,
+                be.block_height,
+                be.subtree_idx,
+                on_longest_chain,
+            );
+        }
+        slot
+    }
+
     /// Build a test engine with a pre-created record.
     struct TestHarness {
         engine: Arc<Engine>,
@@ -10474,6 +10564,28 @@ mod tests {
                 DahIndex::new(),
                 UnminedIndex::new(),
             ));
+
+            // Task 16a: `delete_eval` callers now source has_blocks/
+            // unmined_since from the MinedIndex, not `meta.block_entry_count`/
+            // `meta.unmined_since`. This harness hand-writes `meta` straight
+            // to the device (bypassing `Engine::create`, which is what
+            // normally dual-writes the MinedIndex), so it must seed the
+            // MinedIndex itself to uphold the same device<->MinedIndex sync
+            // invariant real traffic maintains — otherwise every record here
+            // reads back as "never mined" (mined_slot == NO_MINED_SLOT)
+            // regardless of what `customize` set on `meta`.
+            let mined_slot = seed_mined_index_for_test(&engine, &key, &meta);
+            engine
+                .index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        mined_slot,
+                    },
+                )
+                .expect("re-register with the seeded mined_slot");
 
             Self { engine, key }
         }
@@ -14587,6 +14699,7 @@ mod tests {
 
         // Create two transactions
         let mut keys = Vec::new();
+        let mut metas = Vec::new();
         for i in 0..2u64 {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -14618,6 +14731,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            metas.push((key, offset, meta));
         }
 
         let engine = Arc::new(Engine::new(
@@ -14628,6 +14742,24 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ));
+
+        // Task 16a: seed the MinedIndex to match each hand-written record's
+        // block entries (see `seed_mined_index_for_test`) — `delete_eval`'s
+        // has_blocks now reads the MinedIndex, not `meta.block_entry_count`.
+        for (key, offset, meta) in &metas {
+            let mined_slot = seed_mined_index_for_test(&engine, key, meta);
+            engine
+                .index
+                .register(
+                    *key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: *offset,
+                        mined_slot,
+                    },
+                )
+                .unwrap();
+        }
 
         // Spend tx 0 at height 1000
         let req0 = SpendRequest {
@@ -14706,6 +14838,7 @@ mod tests {
 
         // Create 5 transactions, each with 1 UTXO
         let mut keys = Vec::new();
+        let mut metas = Vec::new();
         for i in 0..5u64 {
             let mut txid = [0u8; 32];
             txid[0..8].copy_from_slice(&i.to_le_bytes());
@@ -14737,6 +14870,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+            metas.push((key, offset, meta));
         }
 
         let engine = Arc::new(Engine::new(
@@ -14747,6 +14881,24 @@ mod tests {
             DahIndex::new(),
             UnminedIndex::new(),
         ));
+
+        // Task 16a: seed the MinedIndex to match each hand-written record's
+        // block entries (see `seed_mined_index_for_test`) — `delete_eval`'s
+        // has_blocks now reads the MinedIndex, not `meta.block_entry_count`.
+        for (key, offset, meta) in &metas {
+            let mined_slot = seed_mined_index_for_test(&engine, key, meta);
+            engine
+                .index
+                .register(
+                    *key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: *offset,
+                        mined_slot,
+                    },
+                )
+                .unwrap();
+        }
 
         // Spend each at different heights
         for (i, key) in keys.iter().enumerate() {
@@ -17114,6 +17266,113 @@ mod tests {
             entries_b.iter().map(|e| e.block_id).collect::<Vec<_>>(),
             vec![99],
             "B must keep its own block data"
+        );
+    }
+
+    /// Task 16a: `evaluate_delete_at_height`'s `has_blocks`/`unmined_since`
+    /// inputs are now sourced from the `ShardedMinedIndex`, not from
+    /// `metadata.block_entry_count`/`metadata.unmined_since`. Proves the
+    /// source actually moved by deliberately DESYNCING the two: mine the tx
+    /// (device and MinedIndex agree: 1 block, on longest chain, DAH set),
+    /// then hand-corrupt ONLY the on-device footer to look never-mined and
+    /// off the longest chain, leaving the MinedIndex (the real source of
+    /// truth) untouched — a state that only exists in this test, never in
+    /// production, but exercises exactly which side a `delete_eval` caller
+    /// reads. `set_conflicting(value: false)` is a flag no-op (CONFLICTING
+    /// was never set) but still re-runs the full DAH re-evaluation without
+    /// itself touching block entries or `unmined_since`. If the caller still
+    /// read the device fields, this corruption would spuriously clear the
+    /// DAH (has_blocks=false); reading the MinedIndex must leave it alone.
+    #[test]
+    fn delete_eval_uses_mined_index_for_has_blocks_and_longest_chain() {
+        let engine = create_engine();
+        let (hashes, req) = make_create_req(230, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+
+        // Spend the sole UTXO -> all_spent == true, but not yet mined, so no
+        // DAH is set (has_blocks == false).
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: hashes[0],
+                spending_data: [0x33u8; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend succeeds");
+
+        // Mine it on the longest chain: all_spent && has_blocks &&
+        // on_longest_chain -> DAH set, dual-written to device + MinedIndex.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 7,
+                block_height: 1000,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined succeeds");
+
+        assert_eq!(
+            { engine.read_metadata(&key).unwrap().delete_at_height },
+            1288,
+            "precondition: DAH set after mine (all-spent + has-blocks + on-chain)"
+        );
+        let (mined_entries, mined_unmined_since) = engine
+            .mined_block_entries(&key)
+            .expect("mined_block_entries reads the freshly-mined slot");
+        assert_eq!(
+            mined_entries.len(),
+            1,
+            "precondition: MinedIndex has 1 block"
+        );
+        assert_eq!(
+            mined_unmined_since, 0,
+            "precondition: MinedIndex says on longest chain"
+        );
+
+        // Hand-corrupt ONLY the on-device footer — make it look never-mined
+        // and off the longest chain — WITHOUT touching the MinedIndex. A
+        // real dual-write never does this; it simulates the desync that
+        // proves which side a caller actually reads.
+        let entry = engine.lookup(&key).expect("record exists");
+        let mut meta = engine
+            .read_metadata_fast(entry.device_id, entry.record_offset)
+            .unwrap();
+        meta.block_entry_count = 0;
+        meta.unmined_since = 555_000;
+        engine
+            .write_metadata_fast(entry.device_id, entry.record_offset, &meta)
+            .unwrap();
+
+        // Sanity: the device really is desynced now, DAH still (stale-ly) set.
+        let stale = engine.read_metadata(&key).unwrap();
+        assert_eq!({ stale.block_entry_count }, 0);
+        assert_eq!({ stale.unmined_since }, 555_000);
+        assert_eq!({ stale.delete_at_height }, 1288);
+
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("set_conflicting succeeds");
+
+        assert_eq!(
+            { engine.read_metadata(&key).unwrap().delete_at_height },
+            1288,
+            "delete_eval must follow the MinedIndex (has_blocks=true, on-chain), \
+             not the corrupted device fields (has_blocks=false, unmined) — the \
+             DAH must survive, not get spuriously cleared"
         );
     }
 
