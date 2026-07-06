@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
@@ -29,7 +29,6 @@ fn create_engine(size: u64) -> Arc<Engine> {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 

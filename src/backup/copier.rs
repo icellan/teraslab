@@ -154,8 +154,8 @@ mod tests {
     use super::*;
     use crate::backup::manifest::sha256_hex;
     use crate::device::{BlockDevice, MemoryDevice};
+    use crate::index::DahIndex;
     use crate::index::Index;
-    use crate::index::{DahIndex, UnminedIndex};
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
     use crate::segment_allocator::SegmentAllocator;
@@ -170,7 +170,6 @@ mod tests {
             seg,
             StripedLocks::new(256),
             DahIndex::new(),
-            UnminedIndex::new(),
         )
     }
 

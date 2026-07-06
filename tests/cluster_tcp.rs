@@ -19,7 +19,7 @@ use teraslab::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
 use teraslab::cluster::topology::{ClusterId, TopologyCommit, TopologyTerm};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::{WireCreateItem, encode_create_batch};
@@ -191,14 +191,7 @@ fn create_node_full_engine(
     let index = Index::new(1000).unwrap();
     let engine = if segment {
         let seg = SegmentAllocator::new(dev.clone(), 64 * 4096).unwrap();
-        let engine = Engine::new(
-            dev,
-            index,
-            seg,
-            StripedLocks::new(256),
-            DahIndex::new(),
-            UnminedIndex::new(),
-        );
+        let engine = Engine::new(dev, index, seg, StripedLocks::new(256), DahIndex::new());
         let log_dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
         let log = RedoLog::open(log_dev, 0, 16 * 1024 * 1024).unwrap();
@@ -214,7 +207,6 @@ fn create_node_full_engine(
             alloc,
             StripedLocks::new(256),
             DahIndex::new(),
-            UnminedIndex::new(),
         ))
     };
 

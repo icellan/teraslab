@@ -10544,8 +10544,7 @@ mod tests {
     use crate::config::{IndexBackendMode, IndexConfig};
     use crate::device::{BlockDevice, MemoryDevice, ReadFailingDevice};
     use crate::index::redb_dah::RedbDahIndex;
-    use crate::index::redb_unmined::RedbUnminedIndex;
-    use crate::index::{DahBackend, DahIndex, Index, PrimaryBackend, UnminedBackend, UnminedIndex};
+    use crate::index::{DahBackend, DahIndex, Index, PrimaryBackend};
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
     use std::sync::Arc;
@@ -10561,14 +10560,7 @@ mod tests {
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(10000).unwrap();
         let locks = StripedLocks::new(1024);
-        Engine::new(
-            dev,
-            index,
-            alloc,
-            locks,
-            DahIndex::new(),
-            UnminedIndex::new(),
-        )
+        Engine::new(dev, index, alloc, locks, DahIndex::new())
     }
 
     #[test]
@@ -10817,34 +10809,27 @@ mod tests {
                 backend: mode.clone(),
                 redb_path: dir.path().join("primary.redb"),
                 redb_dah_path: dir.path().join("dah.redb"),
-                redb_unmined_path: dir.path().join("unmined.redb"),
                 redb_cache_size: 16 * 1024 * 1024,
                 file_backed_path: dir.path().join("primary.index"),
                 index_shards: 16,
             };
-            let (primary, dah, unmined): (PrimaryBackend, DahBackend, UnminedBackend) = match mode {
+            let (primary, dah): (PrimaryBackend, DahBackend) = match mode {
                 IndexBackendMode::Memory => (
                     PrimaryBackend::new_in_memory(10000).unwrap(),
                     DahBackend::new_in_memory(),
-                    UnminedBackend::new_in_memory(),
                 ),
                 IndexBackendMode::Redb => (
                     PrimaryBackend::new_on_disk(&config).unwrap(),
                     DahBackend::OnDisk(
                         RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size).unwrap(),
                     ),
-                    UnminedBackend::OnDisk(
-                        RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size)
-                            .unwrap(),
-                    ),
                 ),
                 IndexBackendMode::FileBacked => (
                     PrimaryBackend::new_file_backed(&config.file_backed_path, 10000).unwrap(),
                     DahBackend::new_in_memory(),
-                    UnminedBackend::new_in_memory(),
                 ),
             };
-            let engine = Engine::new(dev, primary, alloc, locks, dah, unmined);
+            let engine = Engine::new(dev, primary, alloc, locks, dah);
             Self {
                 engine,
                 _metrics_guard: metrics_test_lock(),
@@ -10864,8 +10849,7 @@ mod tests {
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
             let dah = DahIndex::new();
-            let unmined = UnminedIndex::new();
-            let engine = Engine::new(dev, index, alloc, locks, dah, unmined);
+            let engine = Engine::new(dev, index, alloc, locks, dah);
             Self {
                 engine,
                 _metrics_guard: metrics_test_lock(),
@@ -10899,7 +10883,6 @@ mod tests {
                 index,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             Self {
                 engine,
@@ -11500,59 +11483,6 @@ mod tests {
         assert_eq!(
             count2, 1,
             "cutoff one past the unmined height must return it"
-        );
-    }
-
-    /// Task 16b: `OP_QUERY_OLD_UNMINED` must source its candidates from the
-    /// `ShardedMinedIndex`'s own height buckets, not the separate unmined
-    /// secondary index. Proven directly: a txid inserted ONLY into the old
-    /// secondary index (`engine.unmined_index()`), with no corresponding
-    /// MinedIndex bucket entry, must NOT come back from the handler — if it
-    /// did, the handler would still be reading the old index.
-    #[test]
-    fn dispatch_query_old_unmined_uses_mined_index() {
-        let h = DispatchTestHarness::new();
-        let txid_real = DispatchTestHarness::make_txid(21);
-        let txid_stale_secondary_only = DispatchTestHarness::make_txid(22);
-
-        // A genuine unmined tx as of height 50 — present in the MinedIndex's
-        // own height bucket via the ordinary create path.
-        assert_eq!(h.create_tx_at_height(txid_real, 1, 50).status, STATUS_OK);
-        assert!(
-            h.engine
-                .mined_index()
-                .collect_unmined_keys_below(1_000)
-                .contains(&TxKey { txid: txid_real }),
-            "precondition: create must have populated the MinedIndex bucket"
-        );
-
-        // A different tx created already-mined (block_height 0, no
-        // unmined_since) — its MinedIndex bucket never gets an entry — but
-        // manually seeded into the OLD secondary unmined index directly.
-        // Pre-Task-16b this would have been returned by the handler; now it
-        // must not be, since the handler no longer reads that index.
-        assert_eq!(h.create_tx(txid_stale_secondary_only, 1).status, STATUS_OK);
-        {
-            let ui = h.engine.unmined_index();
-            ui.insert(
-                50,
-                TxKey {
-                    txid: txid_stale_secondary_only,
-                },
-                None,
-            )
-            .unwrap();
-        }
-
-        let resp = h.request(OP_QUERY_OLD_UNMINED, 1_000u32.to_le_bytes().to_vec());
-        assert_eq!(resp.status, STATUS_OK);
-        let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
-        assert_eq!(count, 1, "only the MinedIndex-bucketed tx must be returned");
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&resp.payload[4..36]);
-        assert_eq!(
-            txid, txid_real,
-            "the tx seeded only in the old secondary index must be absent"
         );
     }
 
@@ -14508,7 +14438,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo_log = Arc::new(Mutex::new(
             RedoLog::open(
@@ -14623,7 +14552,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo_log = Arc::new(Mutex::new(
             RedoLog::open(
@@ -14786,7 +14714,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo_log = Arc::new(Mutex::new(
             RedoLog::open(
@@ -14913,7 +14840,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         let redo = Arc::new(Mutex::new(
             RedoLog::open(
@@ -15096,7 +15022,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo_log = Arc::new(Mutex::new(
             RedoLog::open(
@@ -15141,14 +15066,12 @@ mod tests {
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
             let dah = DahIndex::new();
-            let unmined = UnminedIndex::new();
             let engine = Engine::new(
                 data_dev.clone() as Arc<dyn BlockDevice>,
                 index,
                 alloc,
                 locks,
                 dah,
-                unmined,
             );
             let redo_log = crate::redo::RedoLog::open(
                 redo_dev.clone() as Arc<dyn BlockDevice>,
@@ -15191,7 +15114,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let redo_log = crate::redo::RedoLog::open(
                 redo_dev.clone() as Arc<dyn BlockDevice>,
@@ -15215,14 +15137,12 @@ mod tests {
             let index = Index::new(10000).unwrap();
             let locks = StripedLocks::new(1024);
             let dah = DahIndex::new();
-            let unmined = UnminedIndex::new();
             let engine = Engine::new(
                 data_dev.clone() as Arc<dyn BlockDevice>,
                 index,
                 alloc,
                 locks,
                 dah,
-                unmined,
             );
             let redo_log =
                 crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, log_size)
@@ -15327,7 +15247,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
 
             Self {
@@ -18949,8 +18868,7 @@ mod tests {
         let index = Index::new(10000).unwrap();
         let locks = StripedLocks::new(1024);
         let dah = DahIndex::new();
-        let unmined = UnminedIndex::new();
-        let engine = Arc::new(Engine::new(dev, index, alloc, locks, dah, unmined));
+        let engine = Arc::new(Engine::new(dev, index, alloc, locks, dah));
 
         let shard = 33u16;
         // Keys all hash to the migrating shard.
@@ -22833,7 +22751,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         // Small 132 KiB log (reserve = capacity/8 ≈ 16 KiB) so the burst's redo
         // (≈ one 4 KiB block per batch) fills it well past the reserve within
@@ -22882,7 +22799,6 @@ mod tests {
             index,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         assert_eq!(engine.store_count(), 2);
 
@@ -24151,7 +24067,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let redo_log =
                 crate::redo::RedoLog::open(redo_dev.clone() as Arc<dyn BlockDevice>, 0, redo_size)
@@ -24296,30 +24211,27 @@ mod tests {
             let primary: PrimaryBackend = Index::new(10000).unwrap().into();
             let index = crate::index::ShardedIndex::from_single(primary);
             let mut dah = DahBackend::new_in_memory();
-            let mut unmined = UnminedBackend::new_in_memory();
             crate::recovery::recover_all_with_allocator(
                 &*data_dev as &dyn BlockDevice,
                 &redo_log,
                 &index,
                 &mut dah,
-                &mut unmined,
                 Some(&mut alloc),
             )
             .expect("recovery must succeed");
-            // The recovered secondary backends (`dah`, `unmined`) reflect the
-            // replayed state, but this test only asserts on primary slot bytes
-            // read straight off the device via `engine.read_slot`, which is
-            // independent of the secondary indexes. Build the engine with
-            // fresh secondaries (the recovered ones already validated that
+            // The recovered secondary backend (`dah`) reflects the replayed
+            // state, but this test only asserts on primary slot bytes read
+            // straight off the device via `engine.read_slot`, which is
+            // independent of the secondary index. Build the engine with a
+            // fresh secondary (the recovered one already validated that
             // `recover_all_with_allocator` succeeded above).
-            let _ = (&dah, &unmined);
+            let _ = &dah;
             Engine::new_with_sharded_index(
                 data_dev as Arc<dyn BlockDevice>,
                 index,
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             )
         }
     }
@@ -25006,15 +24918,7 @@ mod tests {
         let index = Index::new(10000).unwrap();
         let locks = StripedLocks::new(1024);
         let dah = DahIndex::new();
-        let unmined = UnminedIndex::new();
-        let engine = Engine::new(
-            data_dev as Arc<dyn BlockDevice>,
-            index,
-            alloc,
-            locks,
-            dah,
-            unmined,
-        );
+        let engine = Engine::new(data_dev as Arc<dyn BlockDevice>, index, alloc, locks, dah);
         let redo_log = crate::redo::RedoLog::open(
             redo_dev.clone() as Arc<dyn BlockDevice>,
             0,
@@ -25719,7 +25623,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo_dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let redo_log = Arc::new(Mutex::new(

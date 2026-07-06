@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
@@ -39,7 +39,6 @@ fn create_engine() -> Arc<Engine> {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 

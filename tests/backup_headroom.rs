@@ -38,7 +38,7 @@ use teraslab::backup::job::{BackupPinGuard, run_backup};
 use teraslab::backup::{BackupError, BackupParams, BackupProgress, BackupState};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::segment_allocator::SegmentAllocator;
@@ -68,7 +68,6 @@ fn seg_engine(dev: &Arc<dyn BlockDevice>) -> Engine {
         seg,
         StripedLocks::new(64),
         DahIndex::new(),
-        UnminedIndex::new(),
     )
 }
 

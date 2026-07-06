@@ -7,7 +7,7 @@ use crate::allocator::{BoxedAllocator, RecordAllocator};
 use crate::device::{AlignedBuf, BlockDevice};
 use crate::index::{
     DahBackend, PreserveBackend, PrimaryBackend, ShardedDahIndex, ShardedIndex, ShardedMinedIndex,
-    ShardedUnminedIndex, TxIndexEntry, TxKey, UnminedBackend,
+    TxIndexEntry, TxKey,
 };
 use crate::io;
 use crate::locks::StripedLocks;
@@ -138,24 +138,19 @@ pub struct Engine {
     /// cycle. Sharded only for the in-memory backend; the redb variant stays
     /// single-shard (`from_single`).
     dah_index: ShardedDahIndex,
-    /// `unmined_since` secondary index, sharded by txkey. See [`Self::dah_index`]
-    /// for the routing + lock-ordering contract. An A/B test showed this index's
-    /// former single global mutex alone cost ~21 % of throughput under the
-    /// create-heavy workload.
-    unmined_index: ShardedUnminedIndex,
     /// Dedicated authoritative in-RAM mined-state store (Task 6/7 of
     /// `specs/MINEDINDEX_SETMINED_DESIGN.md`). Every create allocates a slot
     /// here (pointed to by the primary entry's `TxIndexEntry::mined_slot`)
     /// and delete frees it. Sharded at the same count as the primary `index`
     /// (see [`Self::new_inner`]), though routing uses its own independent
     /// seed — it does not need to share a shard NUMBER with the primary
-    /// index because, unlike `dah_index`/`unmined_index`, no lock-ordering
-    /// contract requires it (its lock is only ever taken standalone, keyed
-    /// by the already-resolved `mined_slot`, never nested under the primary
-    /// key's shard lock). Currently populated in parallel with the on-device
-    /// block entries but not yet authoritative for reads (Phase 2 of the
-    /// design) — later phases make setMined/spend update it and make it the
-    /// source of truth.
+    /// index because, unlike `dah_index`, no lock-ordering contract requires
+    /// it (its lock is only ever taken standalone, keyed by the
+    /// already-resolved `mined_slot`, never nested under the primary key's
+    /// shard lock). The sole authoritative mined/unmined-state store (Task
+    /// 16e removed the former sibling `unmined_index` secondary — this index
+    /// alone now serves both setMined/spend and the `unmined_since` pruner
+    /// queries).
     mined_index: ShardedMinedIndex,
     /// Secondary index mapping `preserve_until` → txids, serving the
     /// expired-preservation sweep (`OP_PROCESS_EXPIRED_PRESERVATIONS`) in
@@ -394,7 +389,6 @@ impl Engine {
         allocator: impl RecordAllocator + 'static,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
-        unmined_index: impl Into<UnminedBackend>,
     ) -> Self {
         // N=1 transparent pass-through over the recovered/rebuilt backend.
         // Behaviour is identical to the previous `RwLock<PrimaryBackend>`:
@@ -406,7 +400,6 @@ impl Engine {
             allocator,
             locks,
             dah_index,
-            unmined_index,
         )
     }
 
@@ -425,16 +418,8 @@ impl Engine {
         allocator: impl RecordAllocator + 'static,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
-        unmined_index: impl Into<UnminedBackend>,
     ) -> Self {
-        Self::new_inner(
-            device,
-            index,
-            Box::new(allocator),
-            locks,
-            dah_index.into(),
-            unmined_index.into(),
-        )
+        Self::new_inner(device, index, Box::new(allocator), locks, dah_index.into())
     }
 
     /// Construct a multi-store engine: store 0 (`primary_*`) plus one extra
@@ -449,7 +434,6 @@ impl Engine {
         index: ShardedIndex,
         locks: StripedLocks,
         dah_index: impl Into<DahBackend>,
-        unmined_index: impl Into<UnminedBackend>,
     ) -> Self {
         let mut engine = Self::new_inner(
             primary_device,
@@ -457,7 +441,6 @@ impl Engine {
             primary_allocator,
             locks,
             dah_index.into(),
-            unmined_index.into(),
         );
         let aux_stores: Vec<Store> = aux
             .into_iter()
@@ -493,7 +476,6 @@ impl Engine {
         allocator: BoxedAllocator,
         locks: StripedLocks,
         dah_index: DahBackend,
-        unmined_index: UnminedBackend,
     ) -> Self {
         let device_ptr = device.as_raw_ptr().unwrap_or(std::ptr::null_mut());
         // Single-device construction: store 0 only, no aux stores. The
@@ -508,7 +490,7 @@ impl Engine {
         let visibility = crate::visibility::VisibilityBarrier::new(locks.stripe_count());
         let store0_packed = allocator.is_packed();
         let store0_log_structured = allocator.is_log_structured();
-        // Shard both secondary indexes at the SAME count as the primary index so
+        // Shard the secondary index at the SAME count as the primary index so
         // a key routes to the same shard number everywhere. `shard_in_memory`
         // re-shards the (already recovered/reconciled) single in-memory backend
         // by draining its entries; the redb / on-disk variant stays single-shard
@@ -517,11 +499,10 @@ impl Engine {
         // the non-inserting single-shard pass-through.
         let secondary_shards = index.shard_count();
         let dah_index = ShardedDahIndex::shard_in_memory(dah_index, secondary_shards);
-        let unmined_index = ShardedUnminedIndex::shard_in_memory(unmined_index, secondary_shards);
         // Size the mined index to match the primary index's shard count so
-        // they scale together; unlike `dah_index`/`unmined_index` this is a
-        // fresh in-memory structure (not reconciled from an existing
-        // backend), so a plain `new` suffices.
+        // they scale together; unlike `dah_index` this is a fresh in-memory
+        // structure (not reconciled from an existing backend), so a plain
+        // `new` suffices.
         let mined_index = ShardedMinedIndex::new(secondary_shards);
         let engine = Self {
             stores: vec![Store {
@@ -535,7 +516,6 @@ impl Engine {
             index,
             locks,
             dah_index,
-            unmined_index,
             mined_index,
             // Preserve index is unconditionally in-memory (no constructor
             // param): recovery re-derives it from authoritative device metadata
@@ -1639,44 +1619,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Update the unmined secondary index with two-phase durability.
-    fn update_unmined_index(
-        &self,
-        key: &TxKey,
-        old_height: u32,
-        new_height: u32,
-    ) -> Result<(), SpendError> {
-        if old_height == new_height {
-            return Ok(());
-        }
-        // Per-store redo: route the secondary-index intent to the log owning
-        // the key's store.
-        let log_arc = self.redo_log_for_key(key);
-        let log_ref = log_arc.as_deref();
-        // The sharded wrapper locks ONLY the shard owning `key`; remove + insert
-        // route to the same shard, so this is the same single-shard critical
-        // section the global mutex used to be.
-        let _writer_gauge = crate::metrics::writer_enter();
-        if old_height != 0 {
-            self.unmined_index
-                .remove(key, log_ref)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("unmined secondary remove: {e}"),
-                })?;
-        }
-        if new_height != 0 {
-            self.unmined_index
-                .insert(new_height, *key, log_ref)
-                .map_err(|e| SpendError::StorageError {
-                    detail: format!("unmined secondary insert: {e}"),
-                })?;
-        }
-        Ok(())
-    }
-
-    /// Journal a batch of secondary-index intents (`SecondaryDahUpdate` /
-    /// `SecondaryUnminedUpdate`) to the store's redo log, honouring the active
-    /// durability mode. The intents are appended atomically (all-or-nothing).
+    /// Journal a batch of secondary-index intents (`SecondaryDahUpdate`) to the
+    /// store's redo log, honouring the active durability mode. The intents are
+    /// appended atomically (all-or-nothing).
     ///
     /// - **Strict** (`redo_buffered == false`): append + fsync in one call
     ///   ([`RedoLog::append_batch_and_flush`]) so the intent is durable BEFORE
@@ -1768,24 +1713,27 @@ impl Engine {
         Ok(())
     }
 
-    /// Apply a combined DAH + unmined update with a single redo fsync (strict)
-    /// or a single coalesced append (buffered).
+    /// Update the DAH secondary index through the batched
+    /// [`Self::journal_secondary_ops`] path — a single redo fsync (strict) or a
+    /// single coalesced append (buffered) — rather than the per-call journaling
+    /// [`Self::update_dah_index`] delegates to the backend.
     ///
-    /// When both secondary indexes change in the same operation (e.g.
-    /// `mark_on_longest_chain`), this batches both intent records into one
-    /// [`Self::journal_secondary_ops`] call so there is exactly one redo
-    /// append/fsync for the pair. Both redb commits then follow.
+    /// Task 16e: this used to also batch an `unmined_since` transition into the
+    /// same fsync/append (hence the name) when both secondary indexes changed
+    /// in one operation (e.g. `mark_on_longest_chain`). The former sibling
+    /// `unmined_index` secondary was removed — mined/unmined state now lives
+    /// solely in the `ShardedMinedIndex` — so this is DAH-only. Kept distinct
+    /// from [`Self::update_dah_index`] (not collapsed into it) because
+    /// `set_mined_inner`'s buffered-durability contract specifically needs the
+    /// `journal_secondary_ops` append-without-fsync behavior in buffered mode;
+    /// see that function's doc comment.
     fn update_both_secondary_indexes(
         &self,
         key: &TxKey,
         old_dah: u32,
         new_dah: u32,
-        old_unmined: u32,
-        new_unmined: u32,
     ) -> Result<(), SpendError> {
-        let dah_changed = old_dah != new_dah;
-        let unmined_changed = old_unmined != new_unmined;
-        if !dah_changed && !unmined_changed {
+        if old_dah == new_dah {
             return Ok(());
         }
 
@@ -1793,153 +1741,97 @@ impl Engine {
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
 
-        // Phase 1: journal both secondary intents (one fsync in strict mode, a
-        // coalesced append in buffered mode) before the redb mutations.
+        // Phase 1: journal the secondary intent (an fsync in strict mode, a
+        // coalesced append in buffered mode) before the redb mutation.
         if let Some(ref log) = log_arc {
-            let mut ops = Vec::with_capacity(2);
-            if dah_changed {
-                ops.push(crate::redo::RedoOp::SecondaryDahUpdate {
-                    tx_key: *key,
-                    old_height: old_dah,
-                    new_height: new_dah,
-                });
-            }
-            if unmined_changed {
-                ops.push(crate::redo::RedoOp::SecondaryUnminedUpdate {
-                    tx_key: *key,
-                    old_height: old_unmined,
-                    new_height: new_unmined,
-                });
-            }
+            let ops = [crate::redo::RedoOp::SecondaryDahUpdate {
+                tx_key: *key,
+                old_height: old_dah,
+                new_height: new_dah,
+            }];
             self.journal_secondary_ops(log, &ops)?;
         }
 
-        // Phase 2: commit both redb transactions. The redo log already has the
-        // durable record; recovery replay handles any redb commit failure. Each
-        // sharded call locks only `key`'s shard (dah and unmined are separate
-        // wrappers); the two were never held at once here, so routing each by
-        // key preserves the prior critical-section structure.
-        if dah_changed {
-            if old_dah != 0 {
-                self.dah_index
-                    .remove(key, None)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("dah secondary remove (post-fsync): {e}"),
-                    })?;
-            }
-            if new_dah != 0 {
-                self.dah_index.insert(new_dah, *key, None).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("dah secondary insert (post-fsync): {e}"),
-                    }
+        // Phase 2: commit the redb transaction. The redo log already has the
+        // durable record; recovery replay handles any redb commit failure.
+        if old_dah != 0 {
+            self.dah_index
+                .remove(key, None)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("dah secondary remove (post-fsync): {e}"),
                 })?;
-            }
         }
-        if unmined_changed {
-            if old_unmined != 0 {
-                self.unmined_index
-                    .remove(key, None)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("unmined secondary remove (post-fsync): {e}"),
-                    })?;
-            }
-            if new_unmined != 0 {
-                self.unmined_index
-                    .insert(new_unmined, *key, None)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("unmined secondary insert (post-fsync): {e}"),
-                    })?;
-            }
+        if new_dah != 0 {
+            self.dah_index
+                .insert(new_dah, *key, None)
+                .map_err(|e| SpendError::StorageError {
+                    detail: format!("dah secondary insert (post-fsync): {e}"),
+                })?;
         }
         Ok(())
     }
 
-    /// Atomically update both secondary indexes under a single critical
-    /// section, holding the primary shard write lock across them.
+    /// Atomically update the DAH secondary index under a single critical
+    /// section, holding the primary shard write lock across it.
     ///
     /// This is the reorg-safe mutation path used by `mark_on_longest_chain`
-    /// (and any other op that moves both `unmined_since` and
-    /// `delete_at_height` simultaneously). Ordering:
+    /// and `restore_migrated_lifecycle`. Both callers separately mirror the
+    /// `unmined_since` transition into the authoritative `ShardedMinedIndex`
+    /// (`set_longest_chain`) — Task 16e removed the former sibling
+    /// `unmined_index` secondary this function used to update in the same
+    /// critical section, so it is now DAH-only. Ordering:
     ///
-    /// 1. Redo log: append DAH + unmined intents in one batch, single fsync.
-    /// 2. Acquire the primary index (shard) write lock, then DAH, then unmined
-    ///    (shard.write → dah → unmined). NOTE: this order is INVERTED relative
-    ///    to [`Engine::snapshot_index`], which takes the shard lock LAST
-    ///    (dah → unmined → shard.read). The two paths are nonetheless
-    ///    deadlock-free because every write-path caller and the checkpoint
-    ///    (which is the sole caller of `snapshot_index`) are mutually excluded
-    ///    by `dispatch_visibility_barrier`: the write side acquires it before
+    /// 1. Redo log: append the DAH intent, fsync (strict) or coalesced append
+    ///    (buffered).
+    /// 2. Acquire the primary index (shard) write lock, then DAH (shard.write
+    ///    → dah). NOTE: this order is INVERTED relative to
+    ///    [`Engine::snapshot_index`], which takes the shard lock LAST
+    ///    (dah → shard.read). The two paths are nonetheless deadlock-free
+    ///    because every write-path caller and the checkpoint (which is the
+    ///    sole caller of `snapshot_index`) are mutually excluded by
+    ///    `dispatch_visibility_barrier`: the write side acquires it before
     ///    any index/secondary lock, so a writer and the inverted-order
     ///    checkpoint can never hold one of these locks at the same time.
-    /// 3. Hold the primary shard write lock while both secondary mutexes are
-    ///    mutated, so any reader that consults a secondary index and then
-    ///    cross-checks the primary (which requires the index read lock,
-    ///    forcing it to wait for the write lock to drop) observes a
-    ///    consistent pair (H1). The slim primary has no cached metadata of
-    ///    its own to update — the authoritative metadata already lives in the
-    ///    on-device footer written before this call.
+    /// 3. Hold the primary shard write lock while the DAH mutex is mutated, so
+    ///    any reader that consults the secondary index and then cross-checks
+    ///    the primary (which requires the index read lock, forcing it to wait
+    ///    for the write lock to drop) observes a consistent pair (H1). The
+    ///    slim primary has no cached metadata of its own to update — the
+    ///    authoritative metadata already lives in the on-device footer
+    ///    written before this call.
     /// 4. Apply the DAH redb mutation.
-    /// 5. Apply the unmined redb mutation.
-    /// 6. Release all locks.
-    ///
-    /// Because any reader that wants to consult a secondary index and
-    /// then cross-check the primary MUST acquire the secondary mutex
-    /// first, holding the primary write lock across the secondary mutations
-    /// closes the window where a reader could observe a secondary index whose
-    /// `unmined_since` moved while the DAH still references the old
-    /// height.
+    /// 5. Release all locks.
     fn sync_primary_and_both_secondary_atomic(
         &self,
         key: &TxKey,
         old_dah: u32,
         new_dah: u32,
-        old_unmined: u32,
-        new_unmined: u32,
     ) -> Result<(), SpendError> {
         let dah_changed = old_dah != new_dah;
-        let unmined_changed = old_unmined != new_unmined;
 
-        // Phase 1: journal both secondary intents (one fsync in strict mode, a
+        // Phase 1: journal the secondary intent (an fsync in strict mode, a
         // coalesced append in buffered mode) before the primary+redb mutations.
         // Per-store redo: route the secondary-index intent to the log owning
         // the key's store.
         let log_arc = self.redo_log_for_key(key);
-        if let Some(ref log) = log_arc {
-            let mut ops = Vec::with_capacity(2);
-            if dah_changed {
-                ops.push(crate::redo::RedoOp::SecondaryDahUpdate {
-                    tx_key: *key,
-                    old_height: old_dah,
-                    new_height: new_dah,
-                });
-            }
-            if unmined_changed {
-                ops.push(crate::redo::RedoOp::SecondaryUnminedUpdate {
-                    tx_key: *key,
-                    old_height: old_unmined,
-                    new_height: new_unmined,
-                });
-            }
+        if dah_changed && let Some(ref log) = log_arc {
+            let ops = [crate::redo::RedoOp::SecondaryDahUpdate {
+                tx_key: *key,
+                old_height: old_dah,
+                new_height: new_dah,
+            }];
             self.journal_secondary_ops(log, &ops)?;
         }
 
-        // Phase 2: lock order = primary.write → dah → unmined (matches
+        // Phase 2: lock order = primary.write → dah (matches
         // Engine::snapshot_index and the set_mined fast path).
         //
         // The slim primary index carries no cached metadata to update here.
-        // We still take the shard WRITE guard and hold it across the
-        // dah/unmined mutations below so the H1 cross-check window stays
-        // closed: any secondary reader that consults a secondary index and
-        // then cross-checks the primary (gated by `read_shard(key)`) blocks
-        // on this guard until every secondary mutation here has landed.
-        //
-        // H1 under sharded secondaries: each `dah_index`/`unmined_index` call
-        // below locks only the secondary shard owning `key` (dah and unmined
-        // route the same key to the same shard number, but they are independent
-        // wrappers → independent lock sets). Those shard locks are taken WHILE
-        // `primary_guard` is held, so the lock order stays primary.write → dah →
-        // unmined — never unmined-before-dah, never two secondary shards of one
-        // index at once.
+        // We still take the shard WRITE guard and hold it across the dah
+        // mutation below so the H1 cross-check window stays closed: any
+        // secondary reader that consults the secondary index and then
+        // cross-checks the primary (gated by `read_shard(key)`) blocks on
+        // this guard until the secondary mutation here has landed.
         let primary_guard = self.index.write_shard(key);
 
         if dah_changed {
@@ -1959,23 +1851,6 @@ impl Engine {
             }
         }
 
-        if unmined_changed {
-            if old_unmined != 0 {
-                self.unmined_index
-                    .remove(key, None)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("atomic unmined remove: {e}"),
-                    })?;
-            }
-            if new_unmined != 0 {
-                self.unmined_index
-                    .insert(new_unmined, *key, None)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("atomic unmined insert: {e}"),
-                    })?;
-            }
-        }
-
         drop(primary_guard);
 
         Ok(())
@@ -1988,10 +1863,9 @@ impl Engine {
     /// `block_height = 0`, then must replay the master's real lifecycle state
     /// (`generation`, `updated_at`, `unmined_since`, `delete_at_height`,
     /// `preserve_until`). Patching the device footer alone (raw
-    /// `io::write_metadata`) left four derived structures stale on the live
+    /// `io::write_metadata`) left three derived structures stale on the live
     /// migration target until its next restart:
     ///
-    /// - the **unmined** secondary index (never inserted for unmined records),
     /// - the **DAH** secondary index (never inserted for records with a pending
     ///   delete-at-height),
     /// - the **primary-index cached fields** (`unmined_since`,
@@ -2003,18 +1877,18 @@ impl Engine {
     /// This entry point writes the lifecycle fields to the device footer and
     /// then routes the index updates through
     /// `Self::sync_primary_and_both_secondary_atomic` — the same helper the
-    /// normal mutation path uses — so the DAH index, unmined index, and primary
-    /// cached fields all land for migrated records exactly as for locally
-    /// created ones. Mined records (`unmined_since == 0`,
-    /// `delete_at_height == 0`, `preserve_until == 0`) are handled correctly:
-    /// no secondary entries are created. The MinedIndex slot's `unmined_since`
-    /// is mirrored separately via `ShardedMinedIndex::set_longest_chain`
-    /// (bucket-only; block entries are untouched, matching what this function
-    /// itself does to the device footer).
+    /// normal mutation path uses — so the DAH index and primary cached fields
+    /// all land for migrated records exactly as for locally created ones.
+    /// Mined records (`unmined_since == 0`, `delete_at_height == 0`,
+    /// `preserve_until == 0`) are handled correctly: no secondary entry is
+    /// created. The MinedIndex slot's `unmined_since` is mirrored separately
+    /// via `ShardedMinedIndex::set_longest_chain` (bucket-only; block entries
+    /// are untouched, matching what this function itself does to the device
+    /// footer).
     ///
-    /// The "old" heights for the secondary transitions are read from the
-    /// current on-device footer, so this is also correct when the create path
-    /// replaced a pre-existing record that already carried DAH/unmined state.
+    /// The "old" height for the DAH transition is read from the current
+    /// on-device footer, so this is also correct when the create path
+    /// replaced a pre-existing record that already carried DAH state.
     ///
     /// # Errors
     ///
@@ -2041,10 +1915,9 @@ impl Engine {
             .ok_or(SpendError::TxNotFound)?;
         let mut meta = self.read_metadata_for_key(entry.device_id, key, entry.record_offset)?;
 
-        // Old secondary heights come from the current footer so a create that
-        // replaced an existing record (with prior DAH/unmined state) transitions
+        // Old DAH height comes from the current footer so a create that
+        // replaced an existing record (with prior DAH state) transitions
         // cleanly rather than leaking a stale index entry.
-        let old_unmined = { meta.unmined_since };
         let old_dah = { meta.delete_at_height };
         let old_preserve = { meta.preserve_until };
 
@@ -2056,15 +1929,9 @@ impl Engine {
 
         self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
 
-        self.sync_primary_and_both_secondary_atomic(
-            key,
-            old_dah,
-            delete_at_height,
-            old_unmined,
-            unmined_since,
-        )?;
+        self.sync_primary_and_both_secondary_atomic(key, old_dah, delete_at_height)?;
 
-        // Mirror the same unmined_since transition into the authoritative
+        // Mirror the unmined_since transition into the authoritative
         // MinedIndex so a migration target's index doesn't go stale relative
         // to the device footer this just wrote — the same gap Fix 1 closed
         // for `mark_on_longest_chain`. `unmined_since == 0` is "mined on the
@@ -2079,11 +1946,11 @@ impl Engine {
             );
         }
 
-        // The atomic helper handles DAH + unmined; preserve is
-        // not journaled (in-memory model) so it is updated separately here.
-        // THE migration / replica-create choke point — without this a migrated
-        // preserved record is invisible to this node's expiry sweep until the
-        // next restart's `rebuild_preserve_index_from_device`.
+        // The atomic helper handles DAH; preserve is not journaled (in-memory
+        // model) so it is updated separately here. THE migration /
+        // replica-create choke point — without this a migrated preserved
+        // record is invisible to this node's expiry sweep until the next
+        // restart's `rebuild_preserve_index_from_device`.
         self.update_preserve_index(key, old_preserve, preserve_until)
     }
 
@@ -4084,12 +3951,10 @@ impl Engine {
         //    write) — the sole remaining durable side effect besides the
         //    MinedIndex write. See the residual-staleness note above.
         //
-        //    Routed through `update_both_secondary_indexes` with the unmined
-        //    pair pinned to `(0, 0)` (a permanent no-op there, since
-        //    `unmined_changed` is false whenever old==new) rather than the
-        //    simpler `update_dah_index` alone: `update_dah_index` hands the
-        //    redo intent straight to the backend, which fsyncs it
-        //    unconditionally (see spend/unspend's own use of it), while
+        //    Routed through `update_both_secondary_indexes` rather than the
+        //    simpler `update_dah_index`: `update_dah_index` hands the redo
+        //    intent straight to the backend, which fsyncs it unconditionally
+        //    (see spend/unspend's own use of it), while
         //    `update_both_secondary_indexes` pre-journals through
         //    `journal_secondary_ops`, which HONORS buffered-durability mode
         //    (append-only, coalesced by the background flusher) instead of
@@ -4102,7 +3967,7 @@ impl Engine {
             .as_ref()
             .map(|patch| patch.new_delete_at_height)
             .unwrap_or(old_dah);
-        self.update_both_secondary_indexes(tx_key, old_dah, new_dah, 0, 0)?;
+        self.update_both_secondary_indexes(tx_key, old_dah, new_dah)?;
 
         Ok(SetMinedResponse {
             signal,
@@ -4158,7 +4023,6 @@ impl Engine {
 
         let mut metadata = self.read_metadata_fast(device_id, record_offset)?;
 
-        let old_unmined = { metadata.unmined_since };
         let old_dah = { metadata.delete_at_height };
 
         if req.on_longest_chain {
@@ -4203,19 +4067,12 @@ impl Engine {
             self.write_metadata_fast(device_id, record_offset, &metadata)?;
         }
 
-        // H1: atomic primary + DAH + unmined update under one critical
-        // section. Any reader that locks dah_index or unmined_index observes
-        // a consistent view with the primary in-memory cache — no window
-        // where DAH references a stale height while primary has moved on.
+        // H1: atomic primary + DAH update under one critical section. Any
+        // reader that locks dah_index observes a consistent view with the
+        // primary in-memory cache — no window where DAH references a stale
+        // height while primary has moved on.
         let new_dah = { metadata.delete_at_height };
-        let new_unmined = { metadata.unmined_since };
-        self.sync_primary_and_both_secondary_atomic(
-            &req.tx_key,
-            old_dah,
-            new_dah,
-            old_unmined,
-            new_unmined,
-        )?;
+        self.sync_primary_and_both_secondary_atomic(&req.tx_key, old_dah, new_dah)?;
 
         // Mirror the same unmined_since transition into the authoritative
         // MinedIndex so it stays in sync with the device — this RPC only
@@ -4442,14 +4299,6 @@ impl Engine {
             self.mined_index.free(&key, mined_slot);
             self.free_create_allocation_best_effort(device_id, record_offset, total_size);
             return Err(CreateError::DuplicateTxId);
-        }
-
-        // Update unmined secondary index if applicable (two-phase durable).
-        if meta.unmined_since != 0 {
-            self.update_unmined_index(&key, 0, meta.unmined_since)
-                .map_err(|e| CreateError::StorageError {
-                    detail: format!("{e}"),
-                })?;
         }
 
         // Conflicting secondary index: this record carries the CONFLICTING
@@ -4813,13 +4662,6 @@ impl Engine {
             // contract, so free it here to avoid leaking it.
             self.mined_index.free(&key, mined_slot);
             return Err(CreateError::DuplicateTxId);
-        }
-
-        if meta.unmined_since != 0 {
-            self.update_unmined_index(&key, 0, meta.unmined_since)
-                .map_err(|e| CreateError::StorageError {
-                    detail: format!("{e}"),
-                })?;
         }
 
         // Conflicting secondary index: this record carries the CONFLICTING
@@ -5832,7 +5674,15 @@ impl Engine {
             return Err(SpendError::Conflicting);
         }
         if meta.flags.contains(TxFlags::LOCKED) {
-            return Err(SpendError::Locked);
+            // Task 16e: see the identical reroute in `spend`/`prepare_spend_multi`
+            // (Task 16c) — LOCKED is now an immutable create-time marker, so a
+            // record is locked-for-reassign only while unmined per the
+            // MinedIndex. `reassign` has no `ignore_locked` escape hatch, so
+            // this is the sole gate.
+            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            if mined_entries.is_empty() {
+                return Err(SpendError::Locked);
+            }
         }
         let spending_height = { meta.spending_height };
         if meta.flags.contains(TxFlags::IS_COINBASE)
@@ -6343,14 +6193,10 @@ impl Engine {
     /// Read a key's authoritative mined-state — block entries plus
     /// `unmined_since` — from the [`ShardedMinedIndex`], not the device.
     ///
-    /// The MinedIndex is dual-written in lockstep with the device's
-    /// block-entry region and `unmined_since` field (see
-    /// `apply_set_mined`/`apply_unset`), so for any live record this returns
-    /// values byte-identical to [`Self::read_all_block_entries`] / the
-    /// on-device `unmined_since`. Entries are in insertion order: the inline
-    /// tuple first (if the record has been mined at least once), then
-    /// overflow entries in their stored order — the same order
-    /// `read_all_block_entries` returns.
+    /// The MinedIndex is the sole source of truth for mined/unmined state
+    /// (see `apply_set_mined`/`apply_unset`). Entries are in insertion
+    /// order: the inline tuple first (if the record has been mined at least
+    /// once), then overflow entries in their stored order.
     ///
     /// Returns `(vec![], 0)` for a transaction with no mined slot assigned
     /// (i.e. never mined) — that is the normal "unmined" state, not a
@@ -7502,7 +7348,7 @@ impl Engine {
         // recheck reads metadata the unguarded path reads anyway, so the cost
         // is one extra `TxFlags` test. Direct client deletes
         // (`due_guard == None`) skip this and stay unconditional (spec §3.18).
-        let (record_size, device_preserve, device_dah, device_unmined, device_conflicting) = {
+        let (record_size, device_preserve, device_dah, device_conflicting) = {
             let meta =
                 self.read_metadata_for_key(entry.device_id, &req.tx_key, entry.record_offset)?;
             if let Some(current_height) = req.due_guard
@@ -7524,7 +7370,6 @@ impl Engine {
                 ({ meta.record_size }) as u64,
                 { meta.preserve_until },
                 { meta.delete_at_height },
-                { meta.unmined_since },
                 meta.flags.contains(TxFlags::CONFLICTING),
             )
         };
@@ -7621,9 +7466,6 @@ impl Engine {
         // these performs a real removal.
         if device_dah != 0 {
             self.update_dah_index(&req.tx_key, device_dah, 0)?;
-        }
-        if device_unmined != 0 {
-            self.update_unmined_index(&req.tx_key, device_unmined, 0)?;
         }
         if device_preserve != 0 {
             self.update_preserve_index(&req.tx_key, device_preserve, 0)?;
@@ -7866,25 +7708,15 @@ impl Engine {
         })
     }
 
-    /// Borrow the sharded unmined secondary index.
-    ///
-    /// Returns the [`ShardedUnminedIndex`] wrapper, which exposes the same
-    /// `range_query` / `len` / `is_empty` / `insert` / `remove` surface the
-    /// callers used on the former `MutexGuard` — each call locks only the shard
-    /// owning the key (or fans out for the whole-index reads). Used by the
-    /// pruner read path (`dispatch::handle_query_old_unmined`), the metrics /
-    /// status endpoints, and tests.
-    pub fn unmined_index(&self) -> &ShardedUnminedIndex {
-        &self.unmined_index
-    }
-
     /// Borrow the sharded mined-state index.
     ///
     /// Returns the [`ShardedMinedIndex`] populated by
     /// [`Self::create`]/[`Self::create_at_offset`] (slot alloc) and
-    /// [`Self::delete`] (slot free) — currently maintained in parallel with
-    /// the on-device block entries, not yet authoritative for reads (Phase 2
-    /// of `specs/MINEDINDEX_SETMINED_DESIGN.md`).
+    /// [`Self::delete`] (slot free). The sole authoritative mined/unmined-state
+    /// store (Task 16e removed the former sibling `unmined_index` secondary —
+    /// its `unmined_len`/`collect_unmined_keys_below` now serve the metrics /
+    /// status endpoints and the pruner read path
+    /// (`dispatch::handle_query_old_unmined`) that used to read it).
     pub fn mined_index(&self) -> &ShardedMinedIndex {
         &self.mined_index
     }
@@ -8106,8 +7938,7 @@ impl Engine {
     /// [`crate::index::mined_index::NO_MINED_SLOT`]. Both cases are handled
     /// identically here — allocate a FRESH slot
     /// ([`ShardedMinedIndex::alloc_created`]), replay the record's on-device
-    /// block entries into it in the same inline-then-overflow order
-    /// [`Self::read_all_block_entries`] returns
+    /// block entries into it in inline-then-overflow order
     /// ([`ShardedMinedIndex::apply_set_mined`], mirroring
     /// [`Self::seed_mined_index_from_infos`]), re-derive the `all_spent` bit
     /// from `spent_utxos == utxo_count`
@@ -8944,8 +8775,8 @@ impl Engine {
         Ok(true)
     }
 
-    /// Rebuild the DAH and unmined secondary indexes store-authoritatively from
-    /// the recovered [`ShardedMinedIndex`] plus device `spent_utxos`/flags.
+    /// Rebuild the DAH secondary index store-authoritatively from the recovered
+    /// [`ShardedMinedIndex`] plus device `spent_utxos`/flags.
     ///
     /// Task 16d recovery reorder: this MUST run AFTER [`Self::recover_mined_index`]
     /// (the MinedIndex is the authoritative mined-state source) and REPLACES the
@@ -8968,12 +8799,17 @@ impl Engine {
     ///   when that field is non-zero (spend / setConflicting write it in
     ///   lockstep with the index), falling back to the re-derived value only
     ///   when the device field is stale-0 (a setMined-planted DAH).
-    /// - `unmined_index` membership is taken from the MinedIndex height buckets:
-    ///   a record whose MinedIndex `unmined_since` is non-zero is (re)inserted.
     ///
-    /// Both secondaries are CLEARED first, so entries for records deleted since
-    /// the last checkpoint (absent from the primary index, hence not visited)
-    /// are not left orphaned.
+    /// Task 16e: the former sibling `unmined_index` secondary this function
+    /// used to also rebuild was removed — `unmined_since` membership is now
+    /// read directly from the `ShardedMinedIndex`'s own height buckets
+    /// (`collect_unmined_keys_below`/`unmined_len`), which
+    /// [`Self::recover_mined_index`] already restored, so there is nothing
+    /// left here to reconcile for it.
+    ///
+    /// The DAH secondary is CLEARED first, so entries for records deleted
+    /// since the last checkpoint (absent from the primary index, hence not
+    /// visited) are not left orphaned.
     ///
     /// # Errors
     ///
@@ -8999,11 +8835,6 @@ impl Engine {
             .clear()
             .map_err(|e| SpendError::StorageError {
                 detail: format!("mined-index reconcile: clearing DAH index failed: {e}"),
-            })?;
-        self.unmined_index
-            .clear()
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("mined-index reconcile: clearing unmined index failed: {e}"),
             })?;
 
         for (key, device_id, record_offset, mined_slot) in records {
@@ -9052,13 +8883,6 @@ impl Engine {
                         detail: format!("mined-index reconcile: DAH insert failed: {e}"),
                     }
                 })?;
-            }
-            if unmined_since != 0 {
-                self.unmined_index
-                    .insert(unmined_since, key, None)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("mined-index reconcile: unmined insert failed: {e}"),
-                    })?;
             }
         }
         Ok(())
@@ -9237,8 +9061,10 @@ impl Engine {
 
     /// Borrow the sharded DAH secondary index.
     ///
-    /// Returns the [`ShardedDahIndex`] wrapper. See [`Self::unmined_index`] for
-    /// the surface and locking contract. Used by the pruner read path
+    /// Returns the [`ShardedDahIndex`] wrapper, which exposes the same
+    /// `range_query` / `len` / `is_empty` / `insert` / `remove` surface —
+    /// each call locks only the shard owning the key (or fans out for the
+    /// whole-index reads). Used by the pruner read path
     /// (`dispatch::handle_process_expired_preservations`), the metrics / status
     /// endpoints, and tests.
     pub fn dah_index(&self) -> &ShardedDahIndex {
@@ -9330,8 +9156,7 @@ impl Engine {
     /// Returns [`crate::index::IndexError`] on I/O failure or if the snapshot
     /// directory is not writable.
     pub fn snapshot_index(&self, path: &std::path::Path) -> crate::index::Result<()> {
-        self.index
-            .snapshot_all_concurrent(&self.dah_index, &self.unmined_index, path)
+        self.index.snapshot_all_concurrent(&self.dah_index, path)
     }
 
     /// Persist the allocator's freelist and high-water mark to the device header.
@@ -9476,8 +9301,8 @@ impl Engine {
         relocated
     }
 
-    /// Force the primary, DAH, and unmined index backends durable on
-    /// their own storage (G-1 audit fix).
+    /// Force the primary and DAH index backends durable on their own storage
+    /// (G-1 audit fix).
     ///
     /// On-disk (redb) backends commit with `Durability::Eventual` per op,
     /// relying on the redo log for crash recovery — that is only sound
@@ -9494,8 +9319,7 @@ impl Engine {
     pub fn flush_index_durable(&self) -> crate::index::Result<()> {
         self.index.flush_durable()?;
         self.dah_index.flush_durable()?;
-        self.preserve_index.lock().flush_durable()?;
-        self.unmined_index.flush_durable()
+        self.preserve_index.lock().flush_durable()
     }
 }
 
@@ -10150,7 +9974,7 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::{DeviceError, MemoryDevice};
-    use crate::index::{DahIndex, Index, UnminedIndex};
+    use crate::index::{DahIndex, Index};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10337,7 +10161,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             ));
 
             // Task 16a: `delete_eval` callers now source has_blocks/
@@ -10488,21 +10311,19 @@ mod tests {
             })
             .unwrap();
 
-        // Recovery: rebuild the primary index and rebuild the DAH/unmined
-        // secondaries FROM THE DEVICE — this is what RESURRECTS the stale DAH
-        // entry (device `delete_at_height` = D). Then recover the MinedIndex.
+        // Recovery: rebuild the primary index and rebuild the DAH secondary
+        // FROM THE DEVICE — this is what RESURRECTS the stale DAH entry
+        // (device `delete_at_height` = D). Then recover the MinedIndex.
         let recovered_alloc = SlotAllocator::recover(data_dev.clone()).unwrap();
         let primary = PrimaryBackend::rebuild(&*data_dev, &recovered_alloc).unwrap();
         let index = ShardedIndex::from_single(primary);
-        let (dah_idx, unmined_idx) =
-            PrimaryBackend::rebuild_secondary(&*data_dev, &recovered_alloc).unwrap();
+        let dah_idx = PrimaryBackend::rebuild_secondary(&*data_dev, &recovered_alloc).unwrap();
         let engine = Engine::new_with_sharded_index(
             data_dev.clone(),
             index,
             recovered_alloc,
             StripedLocks::new(64),
             DahBackend::from(dah_idx),
-            UnminedBackend::from(unmined_idx),
         );
 
         // Repro precondition: the device-based reconcile resurrected the stale
@@ -10618,7 +10439,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // Seed the MinedIndex to match the recovered (post-crash) mined-state:
@@ -10666,8 +10486,8 @@ mod tests {
             None,
             "reorg-unmined record must be excluded from dah_index (no orphan)",
         );
-        // The unmined secondary reflects the MinedIndex bucket: R2 present, R1 absent.
-        let unmined_keys = engine.unmined_index().range_query(u32::MAX);
+        // The MinedIndex's own unmined bucket reflects: R2 present, R1 absent.
+        let unmined_keys = engine.mined_index().collect_unmined_keys_below(u32::MAX);
         assert!(
             unmined_keys.contains(&r2),
             "R2 must be in the unmined index"
@@ -10764,7 +10584,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         (engine, key, fail)
     }
@@ -10795,7 +10614,6 @@ mod tests {
             ShardedIndex::from_single(Index::new(100).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         assert_eq!(engine.store_count(), 2);
@@ -12450,7 +12268,6 @@ mod tests {
             seg,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         assert!(seg_engine.store_is_log_structured(0));
 
@@ -12464,7 +12281,6 @@ mod tests {
             slot,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         assert!(!slot_engine.store_is_log_structured(0));
     }
@@ -12491,7 +12307,6 @@ mod tests {
             seg,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         assert!(engine.store_is_log_structured(0));
 
@@ -12610,7 +12425,6 @@ mod tests {
             seg,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         // The whole point: the cache device exposes no raw pointer, so the
         // tombstone takes the (previously unlocked) cache branch.
@@ -12944,7 +12758,6 @@ mod tests {
             seg,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         // Fill seg0, advance into seg1, then dead-mark all of seg0.
         {
@@ -12976,7 +12789,6 @@ mod tests {
             seg,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         // Drain seg0 so there IS something reclaimable.
         {
@@ -13022,7 +12834,6 @@ mod tests {
             seg,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         {
             let alloc = engine.allocator_for(0);
@@ -13047,7 +12858,6 @@ mod tests {
             slot,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         assert!(
             engine.backup_view_for(0).is_none(),
@@ -13068,7 +12878,6 @@ mod tests {
             slot,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         assert_eq!(engine.defrag_reclaim_fully_dead(), 0);
     }
@@ -13087,7 +12896,6 @@ mod tests {
             seg,
             StripedLocks::new(256),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let record_size = TxMetadata::record_size_for(1);
 
@@ -13316,7 +13124,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         let handles: Vec<_> = keys
@@ -14588,7 +14395,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         assert!(engine.store_is_packed(0), "test requires a packed store");
 
@@ -14949,7 +14755,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // Task 16a: seed the MinedIndex to match each hand-written record's
@@ -15088,7 +14893,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // Task 16a: seed the MinedIndex to match each hand-written record's
@@ -16757,7 +16561,6 @@ mod tests {
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ))
     }
 
@@ -16862,7 +16665,6 @@ mod tests {
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         engine.set_placement_strategy(crate::subdevice::PlacementStrategy::Txid);
         (engine, vec![dev0.clone(), dev1.clone()], dev0, dev1)
@@ -16968,7 +16770,6 @@ mod tests {
             rebuilt,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         for (key, expected_store) in &keys {
@@ -17011,7 +16812,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let (hashes, req) = make_create_req(240, 2);
             key = req.tx_key();
@@ -17087,7 +16887,6 @@ mod tests {
             recovered_alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let entry_before = engine2.lookup(&key).expect("record recovered from device");
@@ -17154,7 +16953,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let (_, req) = make_create_req(252, 1);
             key = req.tx_key();
@@ -17172,7 +16970,6 @@ mod tests {
             recovered_alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         engine2
@@ -17214,7 +17011,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let (_, req) = make_create_req(242, 1);
             let key = req.tx_key();
@@ -17263,7 +17059,6 @@ mod tests {
             alloc2,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // Precondition: the fresh MinedIndex has allocated nothing, so slot
@@ -17323,7 +17118,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let (_, req) = make_create_req(243, 1);
             let key = req.tx_key();
@@ -17357,7 +17151,6 @@ mod tests {
             alloc2,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // Precondition: the fresh MinedIndex has allocated nothing, so slot
@@ -17439,7 +17232,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let (_, req) = make_create_req(253, 1);
             let key = req.tx_key();
@@ -17468,7 +17260,6 @@ mod tests {
             alloc2,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // The snapshot entry is STILL unmined as of height 555 — never
@@ -17516,7 +17307,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // Find two distinct single-byte txid seeds (matching how
@@ -17825,7 +17615,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // Bucket 256 single-byte txid seeds by `ShardedMinedIndex` shard;
@@ -18049,7 +17838,6 @@ mod tests {
                 alloc,
                 StripedLocks::new(1024),
                 DahIndex::new(),
-                UnminedIndex::new(),
             );
             let (_, req1) = make_create_req(31, 1);
             let key1 = req1.tx_key();
@@ -18107,7 +17895,6 @@ mod tests {
             alloc2,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // Build a redo tail with a CreateV2 entry for tx1 and a
@@ -18196,7 +17983,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let (hashes, req) = make_create_req(251, 1);
@@ -18563,7 +18349,6 @@ mod tests {
             ShardedIndex::from_single(Index::new(1000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         assert_eq!(engine.store_count(), 2);
 
@@ -18959,7 +18744,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // Redo log on its OWN sync-counting device so the count is exactly the
@@ -19223,14 +19007,7 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
-        Engine::new(
-            dev,
-            index,
-            alloc,
-            StripedLocks::new(1024),
-            DahIndex::new(),
-            UnminedIndex::new(),
-        )
+        Engine::new(dev, index, alloc, StripedLocks::new(1024), DahIndex::new())
     }
 
     /// Task 7: `create` allocates a slot in the engine's `ShardedMinedIndex`
@@ -19611,7 +19388,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ))
     }
 
@@ -19725,8 +19501,8 @@ mod tests {
             .map(|k| k.txid)
             .collect();
         let ref_unmined: std::collections::HashSet<[u8; 32]> = reference
-            .unmined_index()
-            .range_query(u32::MAX)
+            .mined_index()
+            .collect_unmined_keys_below(u32::MAX)
             .into_iter()
             .map(|k| k.txid)
             .collect();
@@ -19758,8 +19534,8 @@ mod tests {
             .map(|k| k.txid)
             .collect();
         let cc_unmined: std::collections::HashSet<[u8; 32]> = concurrent
-            .unmined_index()
-            .range_query(u32::MAX)
+            .mined_index()
+            .collect_unmined_keys_below(u32::MAX)
             .into_iter()
             .map(|k| k.txid)
             .collect();
@@ -19780,8 +19556,8 @@ mod tests {
             "DAH lengths must match (no duplicates / drops)",
         );
         assert_eq!(
-            reference.unmined_index().len(),
-            concurrent.unmined_index().len(),
+            reference.mined_index().unmined_len(),
+            concurrent.mined_index().unmined_len(),
             "unmined lengths must match (no duplicates / drops)",
         );
     }
@@ -19943,7 +19719,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ))
     }
 
@@ -19965,7 +19740,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         (Arc::new(engine), dir)
     }
@@ -20545,9 +20319,8 @@ mod tests {
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.unmined_since }, 800);
 
-        // Should be in unmined index
-        let unmined = engine.unmined_index();
-        let results = unmined.range_query(800);
+        // Should be in the MinedIndex's unmined bucket.
+        let results = engine.mined_index().collect_unmined_keys_below(801);
         assert!(results.contains(&key));
     }
 
@@ -20782,7 +20555,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // Request more records than can fit in the data region
@@ -21188,6 +20960,58 @@ mod tests {
         assert!(
             matches!(result, Err(SpendError::Locked)),
             "reassign on LOCKED record must return Locked, got {result:?}"
+        );
+    }
+
+    /// Task 16e: reassign's LOCKED gate must be rerouted identically to
+    /// `spend`'s (Task 16c) — LOCKED is now an immutable create-time marker,
+    /// so a record already mined in the MinedIndex must be reassignable even
+    /// though the device `LOCKED` bit is still set (`set_mined` never clears
+    /// it, per Task 16d). Mirrors `spend_allows_locked_but_mined_record`.
+    #[test]
+    fn reassign_allows_locked_but_mined_record() {
+        let engine = create_engine();
+        let mut create = make_create_req(0xA2, 5).1;
+        create.locked = true;
+        let key = create.tx_key();
+        engine.create(&create).unwrap();
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 1,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 100,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let meta = engine.read_metadata(&key).unwrap();
+        assert!(
+            meta.flags.contains(TxFlags::LOCKED),
+            "device LOCKED is an immutable create-time marker; set_mined must not clear it"
+        );
+
+        let result = engine.reassign(&ReassignRequest {
+            tx_key: key,
+            offset: 0,
+            utxo_hash: create.utxo_hashes[0],
+            new_utxo_hash: [0xCC; 32],
+            block_height: 1000,
+            spendable_after: 100,
+        });
+        assert!(
+            result.is_ok(),
+            "a mined record must be reassignable even if device LOCKED is still set, got {result:?}"
         );
     }
 
@@ -22638,14 +22462,7 @@ mod tests {
         let dev: Arc<dyn BlockDevice> = dev;
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1000).unwrap();
-        let engine = Engine::new(
-            dev,
-            index,
-            alloc,
-            StripedLocks::new(1024),
-            DahIndex::new(),
-            UnminedIndex::new(),
-        );
+        let engine = Engine::new(dev, index, alloc, StripedLocks::new(1024), DahIndex::new());
         let (_, req) = make_create_req(126, 5);
         let key = req.tx_key();
         engine.create(&req).unwrap();
@@ -23741,7 +23558,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // All 10 threads try to create the same txid
@@ -23983,7 +23799,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // Corrupt key_b's on-device metadata header so its CRC fails and the
@@ -24192,7 +24007,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // PR#19 #1: counts are seeded EAGERLY in new_inner from the
@@ -24266,7 +24080,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let initial_capacity = engine.index.stats().capacity;
@@ -24897,7 +24710,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ))
     }
 

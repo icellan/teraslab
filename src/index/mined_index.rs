@@ -565,6 +565,28 @@ impl ShardedMinedIndex {
         out
     }
 
+    /// Total number of currently-unmined entries across every shard.
+    ///
+    /// Sums each shard's height-bucket membership (`unmined`'s inner maps),
+    /// which is exactly the set of live slots with a non-zero `unmined_since`
+    /// (see [`MinedShard::unmined`]). Supersedes the old on-disk/in-memory
+    /// `unmined_index`'s `.len()` for observability (metrics, cluster-info,
+    /// admin status) now that the MinedIndex is the sole mined/unmined
+    /// source of truth.
+    pub fn unmined_len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unmined
+                    .values()
+                    .map(HashMap::len)
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Record a tx as mined in `block_id`, adding the block tuple inline (if
     /// the slot has none yet) or into the shard's overflow list (if the tx is
     /// already mined in a different block — a competing-chain reorg case).
@@ -656,7 +678,7 @@ impl ShardedMinedIndex {
         }
     }
 
-    /// Remove a block tuple previously recorded by [`apply_set_mined`].
+    /// Remove a block tuple previously recorded by [`Self::apply_set_mined`].
     ///
     /// If `block_id` is the inline tuple, pulls one entry from overflow into
     /// its place (if any remain), else clears the inline slot. If `block_id`
@@ -1291,6 +1313,47 @@ mod tests {
         let below_15 = idx.collect_unmined_keys_below(15);
         assert!(below_15.contains(&k1));
         assert!(!below_15.contains(&k2));
+    }
+
+    /// Task 16e: `unmined_len` supersedes the now-removed `unmined_index`
+    /// secondary index for observability. It must count exactly the live
+    /// slots with a non-zero `unmined_since` — mined-on-longest-chain
+    /// records excluded, reorged-back-to-unmined records included — summed
+    /// across every shard.
+    #[test]
+    fn unmined_len_matches_unmined_records() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        assert_eq!(idx.unmined_len(), 0, "a fresh index has no unmined entries");
+
+        // Two freshly-created (unmined) txs.
+        let k1 = TxKey { txid: [71u8; 32] };
+        let slot1 = idx.alloc_created(&k1, 10);
+        let k2 = TxKey { txid: [72u8; 32] };
+        idx.alloc_created(&k2, 20);
+        assert_eq!(idx.unmined_len(), 2);
+
+        // Mined on the longest chain -> drops out of the unmined count.
+        let k3 = TxKey { txid: [73u8; 32] };
+        let slot3 = idx.alloc_created(&k3, 5);
+        idx.apply_set_mined(&k3, slot3, 700, 40, 0, true);
+        assert_eq!(
+            idx.unmined_len(),
+            2,
+            "a mined-on-longest-chain record must not count as unmined"
+        );
+
+        // Reorged back off the longest chain -> reappears as unmined.
+        idx.set_longest_chain(&k3, slot3, false, 25);
+        assert_eq!(
+            idx.unmined_len(),
+            3,
+            "a reorged-off-chain record must count as unmined again"
+        );
+
+        // Freeing a slot removes it from the unmined count too.
+        idx.free(&k1, slot1);
+        assert_eq!(idx.unmined_len(), 2);
     }
 
     #[test]

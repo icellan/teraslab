@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
@@ -41,7 +41,6 @@ fn start_test_http_server_with_admin(
         alloc,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

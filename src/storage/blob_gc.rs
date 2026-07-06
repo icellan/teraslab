@@ -468,9 +468,8 @@ mod tests {
         let allocator = SlotAllocator::new(device.clone()).unwrap();
         let index = PrimaryBackend::new_in_memory(1024).unwrap();
         let dah = crate::index::DahBackend::new_in_memory();
-        let unmined = crate::index::UnminedBackend::new_in_memory();
         let locks = StripedLocks::new(64);
-        let mut engine = Engine::new(device, index, allocator, locks, dah, unmined);
+        let mut engine = Engine::new(device, index, allocator, locks, dah);
         let blob_store = Arc::new(MemoryBlobStore::new());
         engine.set_blob_store(blob_store.clone() as Arc<dyn BlobStore>);
         (Arc::new(engine), blob_store)

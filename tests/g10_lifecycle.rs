@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use teraslab::allocator::SlotAllocator;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::server::Server;
@@ -33,7 +33,6 @@ fn build_test_server() -> Arc<Server> {
         alloc,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     // Bind to :0 so the OS picks an unused port. We snapshot the address

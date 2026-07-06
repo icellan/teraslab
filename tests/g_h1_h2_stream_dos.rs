@@ -27,7 +27,7 @@ use std::time::Duration;
 use teraslab::allocator::SlotAllocator;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::*;
@@ -52,7 +52,6 @@ fn start_server(
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

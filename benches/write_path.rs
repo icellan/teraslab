@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, ShardedIndex, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -52,7 +52,6 @@ fn create_engine() -> Arc<Engine> {
         alloc,
         StripedLocks::new(65536),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 
@@ -71,7 +70,6 @@ fn create_engine_sharded(shard_count: usize) -> Arc<Engine> {
         alloc,
         StripedLocks::new(65536),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 

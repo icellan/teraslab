@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -47,14 +47,7 @@ fn make_clustered_seg_engine_sized(seg_blocks: u64) -> Arc<Engine> {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let seg = SegmentAllocator::new(dev.clone(), seg_blocks * 4096).unwrap();
     let index = Index::new(10_000).unwrap();
-    let engine = Engine::new(
-        dev,
-        index,
-        seg,
-        StripedLocks::new(1024),
-        DahIndex::new(),
-        UnminedIndex::new(),
-    );
+    let engine = Engine::new(dev, index, seg, StripedLocks::new(1024), DahIndex::new());
     let log_dev: Arc<dyn BlockDevice> =
         Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
     let log = RedoLog::open(log_dev, 0, 16 * 1024 * 1024).unwrap();

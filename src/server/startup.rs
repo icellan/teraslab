@@ -35,9 +35,7 @@ use thiserror::Error;
 use crate::allocator::{AllocatorError, BoxedAllocator, RecordAllocator, SlotAllocator};
 use crate::config::{IndexConfig, StorageEngine};
 use crate::device::BlockDevice;
-use crate::index::{
-    DahBackend, DahIndex, IndexError, PrimaryBackend, ShardedIndex, UnminedBackend, UnminedIndex,
-};
+use crate::index::{DahBackend, DahIndex, IndexError, PrimaryBackend, ShardedIndex};
 use crate::recovery::{RecoveryStats, ReplayCause};
 
 use super::dispatch::SecondaryStatus;
@@ -122,10 +120,14 @@ pub enum RebuildError {
 
 /// Outcome of a secondary-index load attempt.
 ///
-/// On success both backends carry their populated state and `status`
-/// reports both flags as `true`. On failure the corresponding
-/// `dah_ok` / `unmined_ok` flag flips to `false` and an empty backend
-/// is returned in its slot. The caller is expected to call
+/// On success the backend carries its populated state and `status`
+/// reports `dah_ok` as `true`. On failure `dah_ok` flips to `false` and an
+/// empty backend is returned in its slot. `unmined_ok` is carried for wire
+/// compatibility with [`SecondaryStatus`] but is always `true` (Task 16e:
+/// the former sibling `unmined_index` secondary this outcome used to also
+/// report was removed — mined/unmined state now lives solely in the
+/// `ShardedMinedIndex`, recovered independently of this load path). The
+/// caller is expected to call
 /// [`crate::server::dispatch::set_secondary_status`] with `status` so
 /// the dispatch readiness gate can reject endpoints that depend on the
 /// missing index.
@@ -133,8 +135,6 @@ pub enum RebuildError {
 pub struct SecondaryLoadOutcome {
     /// DAH secondary index — populated on success, empty on failure.
     pub dah: DahBackend,
-    /// Unmined secondary index — populated on success, empty on failure.
-    pub unmined: UnminedBackend,
     /// Per-secondary readiness flags. Returned to the binary so it can
     /// install the global flags via
     /// [`crate::server::dispatch::set_secondary_status`].
@@ -609,20 +609,23 @@ pub fn load_sharded_index_in_memory_multi(
         })
 }
 
-/// Rebuild secondary indexes from the device, returning a
+/// Rebuild the DAH secondary index from the device, returning a
 /// [`SecondaryLoadOutcome`] that includes per-secondary readiness flags.
 ///
-/// On rebuild failure both secondaries fall through to empty in-memory
-/// backends and both flags flip to `false`. The dispatch readiness gate
-/// then rejects endpoints that depend on the missing data.
+/// On rebuild failure the DAH secondary falls through to an empty in-memory
+/// backend and `dah_ok` flips to `false`. The dispatch readiness gate then
+/// rejects endpoints that depend on the missing data. `unmined_ok` stays
+/// `true` unconditionally: the authoritative mined/unmined-state store (the
+/// `ShardedMinedIndex`) is recovered independently of this device-scan
+/// rebuild (Task 16e removed the former sibling `unmined_index` secondary
+/// this function used to also rebuild from the device).
 pub fn rebuild_in_memory_secondaries(
     device: &dyn BlockDevice,
     allocator: &dyn RecordAllocator,
 ) -> SecondaryLoadOutcome {
     match PrimaryBackend::rebuild_secondary(device, allocator) {
-        Ok((dah, unmined)) => SecondaryLoadOutcome {
+        Ok(dah) => SecondaryLoadOutcome {
             dah: DahBackend::from(dah),
-            unmined: UnminedBackend::from(unmined),
             status: SecondaryStatus {
                 dah_ok: true,
                 unmined_ok: true,
@@ -632,29 +635,27 @@ pub fn rebuild_in_memory_secondaries(
             tracing::error!(
                 err = %e,
                 "secondary index rebuild failed — node will start with degraded \
-                 readiness; pruner / unmined / DAH / conflict / mining endpoints \
-                 will reject requests with ERR_INDEX_DEGRADED until the operator \
+                 readiness; pruner / DAH / conflict / mining endpoints will \
+                 reject requests with ERR_INDEX_DEGRADED until the operator \
                  investigates and restarts (gap #5)",
             );
             SecondaryLoadOutcome {
                 dah: DahBackend::from(DahIndex::new()),
-                unmined: UnminedBackend::from(UnminedIndex::new()),
                 status: SecondaryStatus {
                     dah_ok: false,
-                    unmined_ok: false,
+                    unmined_ok: true,
                 },
             }
         }
     }
 }
 
-/// Wrap a successful pair of in-memory secondaries in a
-/// [`SecondaryLoadOutcome`] with both flags set to `true`. Used by the
-/// snapshot-restore path where the rebuild was unnecessary.
-pub fn secondaries_from_pair(dah: DahIndex, unmined: UnminedIndex) -> SecondaryLoadOutcome {
+/// Wrap a successful DAH secondary in a [`SecondaryLoadOutcome`] with both
+/// flags set to `true`. Used by the snapshot-restore path where the rebuild
+/// was unnecessary.
+pub fn secondaries_from_pair(dah: DahIndex) -> SecondaryLoadOutcome {
     SecondaryLoadOutcome {
         dah: DahBackend::from(dah),
-        unmined: UnminedBackend::from(unmined),
         status: SecondaryStatus {
             dah_ok: true,
             unmined_ok: true,
@@ -662,11 +663,11 @@ pub fn secondaries_from_pair(dah: DahIndex, unmined: UnminedIndex) -> SecondaryL
     }
 }
 
-/// Translate an [`IndexError`] from a one-shot DAH or unmined open
-/// attempt (redb backend) into the operator-facing degraded-readiness
-/// log line. Returns the empty in-memory fallback the caller should use.
+/// Translate an [`IndexError`] from a one-shot DAH open attempt (redb
+/// backend) into the operator-facing degraded-readiness log line. Returns
+/// the empty in-memory fallback the caller should use.
 ///
-/// `which` should be `"DAH"` or `"unmined"` for the log message.
+/// `which` should be `"DAH"` for the log message.
 pub fn fallback_dah_index(which: &str, err: IndexError) -> DahBackend {
     tracing::error!(
         index = which,
@@ -676,18 +677,6 @@ pub fn fallback_dah_index(which: &str, err: IndexError) -> DahBackend {
          until the operator investigates and restarts (gap #5)",
     );
     DahBackend::new_in_memory()
-}
-
-/// Sibling of [`fallback_dah_index`] for the unmined secondary index.
-pub fn fallback_unmined_index(which: &str, err: IndexError) -> UnminedBackend {
-    tracing::error!(
-        index = which,
-        err = %err,
-        "secondary {which} index unavailable — node will start with degraded \
-         readiness; dependent endpoints will reject with ERR_INDEX_DEGRADED \
-         until the operator investigates and restarts (gap #5)",
-    );
-    UnminedBackend::new_in_memory()
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,14 +1006,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let redb_path = tmp.path().join("primary.redb");
         let dah_path = tmp.path().join("dah.redb");
-        let unmined_path = tmp.path().join("unmined.redb");
         std::fs::write(&redb_path, b"this is not a redb file").unwrap();
         let original_bytes = std::fs::read(&redb_path).unwrap();
 
         let cfg = IndexConfig {
             redb_path: redb_path.clone(),
             redb_dah_path: dah_path,
-            redb_unmined_path: unmined_path,
             ..IndexConfig::default()
         };
 
@@ -1098,7 +1085,6 @@ mod tests {
         let cfg = IndexConfig {
             redb_path: redb_path.clone(),
             redb_dah_path: tmp.path().join("dah.redb"),
-            redb_unmined_path: tmp.path().join("unmined.redb"),
             ..IndexConfig::default()
         };
 
@@ -1139,7 +1125,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let redb_path = tmp.path().join("primary.redb");
         let dah_path = tmp.path().join("dah.redb");
-        let unmined_path = tmp.path().join("unmined.redb");
 
         // Pre-populate the redb file so restore_redb would otherwise
         // succeed; without the sentinel check the partial-state risk
@@ -1154,7 +1139,6 @@ mod tests {
         let cfg = IndexConfig {
             redb_path: redb_path.clone(),
             redb_dah_path: dah_path,
-            redb_unmined_path: unmined_path,
             ..IndexConfig::default()
         };
         let (dev, alloc) = fresh_dev_alloc();
@@ -1526,8 +1510,7 @@ mod tests {
     #[test]
     fn secondaries_from_pair_marks_both_ok() {
         let dah = DahIndex::new();
-        let unmined = UnminedIndex::new();
-        let outcome = secondaries_from_pair(dah, unmined);
+        let outcome = secondaries_from_pair(dah);
         assert!(outcome.status.dah_ok);
         assert!(outcome.status.unmined_ok);
         assert!(outcome.status.fully_ok());
@@ -1536,13 +1519,12 @@ mod tests {
     #[test]
     fn rebuild_in_memory_secondaries_succeeds_on_empty_device() {
         // An empty device has no records, so rebuild returns Ok(empty).
-        // Both flags must be true and indexes must be empty.
+        // Both flags must be true and the DAH index must be empty.
         let (dev, alloc) = fresh_dev_alloc();
         let outcome = rebuild_in_memory_secondaries(&*dev, &alloc);
         assert!(outcome.status.dah_ok);
         assert!(outcome.status.unmined_ok);
         assert_eq!(outcome.dah.len(), 0);
-        assert_eq!(outcome.unmined.len(), 0);
     }
 
     #[test]
@@ -1554,15 +1536,6 @@ mod tests {
         };
         let dah = fallback_dah_index("DAH", err);
         assert_eq!(dah.len(), 0);
-    }
-
-    #[test]
-    fn fallback_unmined_index_returns_empty_in_memory() {
-        let err = IndexError::FormatError {
-            detail: "synthetic test error".to_string(),
-        };
-        let unmined = fallback_unmined_index("unmined", err);
-        assert_eq!(unmined.len(), 0);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use crate::config::IndexConfig;
 use crate::device::BlockDevice;
 use crate::index::hashtable::{TxIndexEntry, TxKey};
 use crate::index::redb_primary::{RedbPrimary, RedbPrimaryIter};
-use crate::index::secondary_backend::{DahBackend, UnminedBackend};
-use crate::index::{DahIndex, Index, IndexError, IndexStats, RestoreFlags, UnminedIndex};
+use crate::index::secondary_backend::DahBackend;
+use crate::index::{DahIndex, Index, IndexError, IndexStats, RestoreFlags};
 
 /// Primary index backend selection.
 ///
@@ -472,27 +472,20 @@ impl PrimaryBackend {
         Self::new_on_disk(config)
     }
 
-    /// Snapshot primary index + both secondary indexes to a single file.
+    /// Snapshot primary index + the DAH secondary index to a single file.
     ///
-    /// Accepts the pluggable backend wrappers for the secondary indexes.
-    /// For the in-memory primary backend the secondary backends must be
-    /// `InMemory` variants; if they are `OnDisk` variants no secondary
-    /// data is written (redb is already durable so no snapshot is needed).
-    /// For the on-disk primary backend this is always a no-op.
-    pub fn snapshot_all(
-        &self,
-        dah: &DahBackend,
-        unmined: &UnminedBackend,
-        path: &std::path::Path,
-    ) -> Result<(), IndexError> {
+    /// Accepts the pluggable backend wrapper for the DAH secondary index.
+    /// For the in-memory primary backend the secondary backend must be an
+    /// `InMemory` variant; if it is an `OnDisk` variant no secondary data is
+    /// written (redb is already durable so no snapshot is needed). For the
+    /// on-disk primary backend this is always a no-op.
+    pub fn snapshot_all(&self, dah: &DahBackend, path: &std::path::Path) -> Result<(), IndexError> {
         match self {
             Self::InMemory(idx) => {
-                match (dah, unmined) {
-                    (DahBackend::InMemory(d), UnminedBackend::InMemory(u)) => {
-                        idx.snapshot_all(d, u, path)
-                    }
-                    // Secondary indexes are on-disk (redb already durable) — skip snapshot.
-                    _ => Ok(()),
+                match dah {
+                    DahBackend::InMemory(d) => idx.snapshot_all(d, path),
+                    // Secondary index is on-disk (redb already durable) — skip snapshot.
+                    DahBackend::OnDisk(_) => Ok(()),
                 }
             }
             Self::OnDisk(_) => Ok(()), // No-op: redb is already durable
@@ -503,9 +496,9 @@ impl PrimaryBackend {
     /// Restore all indexes from a snapshot file (in-memory backend).
     pub fn restore_all(
         path: &std::path::Path,
-    ) -> Result<(Self, DahIndex, UnminedIndex, RestoreFlags), IndexError> {
-        let (idx, dah, unmined, flags) = Index::restore_all(path)?;
-        Ok((Self::InMemory(idx), dah, unmined, flags))
+    ) -> Result<(Self, DahIndex, RestoreFlags), IndexError> {
+        let (idx, dah, flags) = Index::restore_all(path)?;
+        Ok((Self::InMemory(idx), dah, flags))
     }
 
     // -----------------------------------------------------------------------
@@ -725,11 +718,11 @@ impl PrimaryBackend {
         Ok(Self::FileBacked(index))
     }
 
-    /// Rebuild secondary indexes by scanning all records on the device.
+    /// Rebuild the DAH secondary index by scanning all records on the device.
     pub fn rebuild_secondary(
         device: &dyn BlockDevice,
         allocator: &dyn RecordAllocator,
-    ) -> Result<(DahIndex, UnminedIndex), IndexError> {
+    ) -> Result<DahIndex, IndexError> {
         Index::rebuild_secondary(device, allocator)
     }
 }
@@ -824,7 +817,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.join("primary.redb"),
             redb_dah_path: dir.join("dah.redb"),
-            redb_unmined_path: dir.join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         }
@@ -974,7 +966,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("nonexistent.redb"),
             redb_dah_path: dir.path().join("dah.redb"),
-            redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
@@ -1011,9 +1002,8 @@ mod tests {
         backend.register(make_key(1), make_entry(104)).unwrap();
 
         let dah = DahBackend::InMemory(DahIndex::new());
-        let unmined = UnminedBackend::InMemory(UnminedIndex::new());
         let snap_path = dir.path().join("all.snap");
-        backend.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+        backend.snapshot_all(&dah, &snap_path).unwrap();
         // No-op for OnDisk
         assert!(!snap_path.exists());
     }
@@ -1208,22 +1198,16 @@ mod tests {
         dah_inner.insert(200, make_key(2));
         let dah = DahBackend::InMemory(dah_inner);
 
-        let mut unmined_inner = UnminedIndex::new();
-        unmined_inner.insert(300, make_key(3));
-        let unmined = UnminedBackend::InMemory(unmined_inner);
-
         // Snapshot all
-        backend.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+        backend.snapshot_all(&dah, &snap_path).unwrap();
         assert!(snap_path.exists());
 
         // Restore all
-        let (restored, restored_dah, restored_unmined, _flags) =
-            PrimaryBackend::restore_all(&snap_path).unwrap();
+        let (restored, restored_dah, _flags) = PrimaryBackend::restore_all(&snap_path).unwrap();
 
         assert_eq!(restored.len(), 20);
         assert_eq!(restored.backend_name(), "memory");
         assert_eq!(restored_dah.len(), 2);
-        assert_eq!(restored_unmined.len(), 1);
 
         // Verify primary data
         for i in 0..20u64 {
@@ -1236,8 +1220,6 @@ mod tests {
         // Verify secondary data
         let dah_result = restored_dah.range_query(200);
         assert_eq!(dah_result.len(), 2);
-        let unmined_result = restored_unmined.range_query(300);
-        assert_eq!(unmined_result.len(), 1);
     }
 
     #[test]
@@ -1329,12 +1311,11 @@ mod tests {
     #[test]
     fn rebuild_secondary_from_device() {
         let (dev, alloc, _records) = setup_device_with_records(5);
-        let (dah, unmined) = PrimaryBackend::rebuild_secondary(&*dev, &alloc).unwrap();
+        let dah = PrimaryBackend::rebuild_secondary(&*dev, &alloc).unwrap();
 
-        // rebuild_secondary scans device for DAH/unmined metadata flags.
-        // Our test records have no DAH/unmined flags set, so both should be empty.
+        // rebuild_secondary scans device for DAH metadata flags. Our test
+        // records have no DAH flags set, so it should be empty.
         assert!(dah.is_empty());
-        assert!(unmined.is_empty());
     }
 
     // -----------------------------------------------------------------------

@@ -464,9 +464,10 @@ impl<'de> Deserialize<'de> for IndexBackendMode {
 /// (persistent across restarts, relying on the redo log for crash recovery);
 /// secondary indexes remain in-memory.
 ///
-/// The redb backend uses three separate database files: one for the primary
-/// index (`redb_path`), one for the DAH secondary index (`redb_dah_path`),
-/// and one for the unmined secondary index (`redb_unmined_path`).
+/// The redb backend uses two separate database files: one for the primary
+/// index (`redb_path`) and one for the DAH secondary index (`redb_dah_path`).
+/// The unmined secondary index was removed (Task 16e) — mined/unmined state
+/// is now sourced entirely from the in-RAM `ShardedMinedIndex`.
 ///
 /// # Example (TOML)
 ///
@@ -475,7 +476,6 @@ impl<'de> Deserialize<'de> for IndexBackendMode {
 /// backend = "redb"
 /// redb_path = "/data/teraslab-index.redb"
 /// redb_dah_path = "/data/teraslab-dah.redb"
-/// redb_unmined_path = "/data/teraslab-unmined.redb"
 /// redb_cache_size = 268435456
 /// ```
 #[derive(Debug, Clone, Deserialize)]
@@ -491,10 +491,6 @@ pub struct IndexConfig {
     /// Path for the redb DAH secondary index database.
     /// Only used when `backend = "redb"`.
     pub redb_dah_path: PathBuf,
-
-    /// Path for the redb unmined secondary index database.
-    /// Only used when `backend = "redb"`.
-    pub redb_unmined_path: PathBuf,
 
     /// redb page cache size in bytes. Default: 256 MiB.
     /// Only applies to the redb backend.
@@ -518,7 +514,6 @@ impl Default for IndexConfig {
             backend: IndexBackendMode::Memory,
             redb_path: PathBuf::from("teraslab-index.redb"),
             redb_dah_path: PathBuf::from("teraslab-dah.redb"),
-            redb_unmined_path: PathBuf::from("teraslab-unmined.redb"),
             redb_cache_size: 256 * 1024 * 1024, // 256 MiB
             file_backed_path: PathBuf::from("teraslab-index.dat"),
             index_shards: 256,
@@ -2571,17 +2566,12 @@ backend = "memory"
 backend = "redb"
 redb_path = "/data/primary.redb"
 redb_dah_path = "/data/dah.redb"
-redb_unmined_path = "/data/unmined.redb"
 redb_cache_size = 536870912
 "#;
         let cfg: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.index.is_redb());
         assert_eq!(cfg.index.redb_path, PathBuf::from("/data/primary.redb"));
         assert_eq!(cfg.index.redb_dah_path, PathBuf::from("/data/dah.redb"));
-        assert_eq!(
-            cfg.index.redb_unmined_path,
-            PathBuf::from("/data/unmined.redb")
-        );
         assert_eq!(cfg.index.redb_cache_size, 536870912);
     }
 

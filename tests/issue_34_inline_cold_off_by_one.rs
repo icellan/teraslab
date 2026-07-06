@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{AlignedBuf, BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::{Engine, build_cold_data};
@@ -61,7 +61,6 @@ fn slot_engine() -> Arc<Engine> {
         alloc,
         StripedLocks::new(64),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 
@@ -145,7 +144,6 @@ fn inline_cold_data_round_trips_byte_exact_after_spend_relocate() {
         seg,
         StripedLocks::new(64),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let (inputs, outputs, inpoints, cold) = issue_34_template();

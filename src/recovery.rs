@@ -37,9 +37,7 @@
 
 use crate::allocator::BoxedAllocator;
 use crate::device::{BlockDevice, DeviceError};
-use crate::index::{
-    DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
-};
+use crate::index::{DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey};
 use crate::io;
 use crate::record::*;
 use crate::redo::{RedoEntry, RedoLog, RedoOp};
@@ -464,12 +462,12 @@ pub fn repair_torn_slots(
 
 /// Replay redo log entries, reconciling secondary indexes as well.
 ///
-/// Like [`recover`], but also replays [`RedoOp::SecondaryUnminedUpdate`] and
-/// [`RedoOp::SecondaryDahUpdate`] entries against the provided secondary
-/// backends. The secondary replay is idempotent: the current primary-index
-/// value is checked, and the secondary update is only applied if the
-/// secondary index's current state is stale (i.e. does not match the
-/// primary's authoritative `unmined_since` / `delete_at_height`).
+/// Like [`recover`], but also replays [`RedoOp::SecondaryDahUpdate`] entries
+/// against the provided secondary backend. The secondary replay is
+/// idempotent: the current primary-index value is checked, and the
+/// secondary update is only applied if the secondary index's current state
+/// is stale (i.e. does not match the primary's authoritative
+/// `delete_at_height`).
 ///
 /// Call this instead of [`recover`] when the secondary indexes (particularly
 /// the on-disk redb-backed ones) need to be reconciled against the redo log
@@ -479,9 +477,8 @@ pub fn recover_all(
     redo_log: &RedoLog,
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
 ) -> Result<RecoveryStats, RecoveryError> {
-    recover_all_with_allocator(device, redo_log, index, dah, unmined, None)
+    recover_all_with_allocator(device, redo_log, index, dah, None)
 }
 
 /// Replay redo entries, reconciling secondary indexes and — if provided —
@@ -504,11 +501,10 @@ pub fn recover_all_with_allocator(
     redo_log: &RedoLog,
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
     allocator: Option<&mut crate::allocator::BoxedAllocator>,
 ) -> Result<RecoveryStats, RecoveryError> {
     let (stats, _, _) = recover_all_with_allocator_collecting_pending_conflicts(
-        device, redo_log, index, dah, unmined, allocator,
+        device, redo_log, index, dah, allocator,
     )?;
     Ok(stats)
 }
@@ -521,7 +517,6 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
     redo_log: &RedoLog,
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
     allocator: Option<&mut crate::allocator::BoxedAllocator>,
 ) -> Result<
     (
@@ -537,7 +532,6 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
         entries,
         index,
         dah,
-        unmined,
         allocator,
         None,
         // Conservative default: callers of this entry point do not signal
@@ -550,19 +544,18 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts(
 /// `RECOVERY_PROGRESS_INTERVAL_ENTRIES` safely processed entries and once
 /// at the end of the recovered range.
 ///
-/// `full_secondary_rebuild` (B-7): when `true` the DAH / unmined
-/// secondaries are re-derived by scanning the entire primary index
-/// (O(store size)); pass this when a secondary backend was not cleanly
-/// closed or its snapshot section is missing. When `false` — the common
-/// crash-of-a-clean-store case — only the keys the redo log touched are
-/// reconciled against the durable secondaries (O(redo size)), so boot
-/// time is bounded by the redo log, not the store.
+/// `full_secondary_rebuild` (B-7): when `true` the DAH secondary is
+/// re-derived by scanning the entire primary index (O(store size)); pass
+/// this when the secondary backend was not cleanly closed or its snapshot
+/// section is missing. When `false` — the common crash-of-a-clean-store
+/// case — only the keys the redo log touched are reconciled against the
+/// durable secondary (O(redo size)), so boot time is bounded by the redo
+/// log, not the store.
 pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
     device: &dyn BlockDevice,
     redo_log: &mut RedoLog,
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
     allocator: Option<&mut crate::allocator::BoxedAllocator>,
     full_secondary_rebuild: bool,
 ) -> Result<
@@ -584,7 +577,6 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
         entries,
         index,
         dah,
-        unmined,
         allocator,
         Some((redo_log, RECOVERY_PROGRESS_INTERVAL_ENTRIES)),
         secondary_reconcile,
@@ -597,13 +589,13 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
 /// so there is no shared log to partition — each log already contains exactly
 /// its store's entries (the dispatch write path routed each op to its store's
 /// log). Each store's log is replayed in parallel against that store's device +
-/// allocator, sharing the index / DAH / unmined backends. Per-store pending
+/// allocator, sharing the index / DAH backend. Per-store pending
 /// conflicting/deleted-child drains and stats are merged. The single-store path
 /// (`num_stores == 1`) is exactly the prior behaviour because the one store's
 /// log holds every entry.
 ///
-/// `defer_secondary_reconcile` (Task 16d): when `true` the trailing DAH/unmined
-/// reconcile is SKIPPED — the caller (server boot) rebuilds those secondaries
+/// `defer_secondary_reconcile` (Task 16d): when `true` the trailing DAH
+/// reconcile is SKIPPED — the caller (server boot) rebuilds that secondary
 /// store-authoritatively from the recovered MinedIndex afterwards
 /// (`Engine::reconcile_secondaries_from_mined_index`), because the device
 /// mined-state fields are no longer kept current by `set_mined`. When `false`
@@ -616,7 +608,6 @@ pub fn recover_all_multi_store(
     redo_logs: &mut [RedoLog],
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
     full_secondary_rebuild: bool,
     defer_secondary_reconcile: bool,
 ) -> Result<
@@ -694,10 +685,9 @@ pub fn recover_all_multi_store(
     let mut offset_owners = build_offset_owners(index);
     let mut pending_resizes: std::collections::HashMap<u64, Vec<u8>> =
         std::collections::HashMap::new();
-    // Secondary ops replay into throwaways; the authoritative DAH/unmined are
+    // Secondary ops replay into a throwaway; the authoritative DAH is
     // rebuilt store-routed by the reconcile below.
     let mut throwaway_dah = DahBackend::new_in_memory();
-    let mut throwaway_unmined = UnminedBackend::new_in_memory();
 
     for (store, entry) in &tagged {
         // Height subsystem: fold the max observed block height regardless of
@@ -711,7 +701,6 @@ pub fn recover_all_multi_store(
             allocators.get_mut(*store as usize),
             index,
             &mut throwaway_dah,
-            &mut throwaway_unmined,
             &mut offset_owners,
             &mut pending_cc,
             &mut pending_dc,
@@ -800,21 +789,15 @@ pub fn recover_all_multi_store(
     if !defer_secondary_reconcile {
         let dev_refs: Vec<&dyn BlockDevice> = devices.iter().map(|d| d.as_ref()).collect();
         if full_secondary_rebuild {
-            reconcile_secondary_indexes_from_metadata_multi(&dev_refs, index, dah, unmined)?;
+            reconcile_secondary_indexes_from_metadata_multi(&dev_refs, index, dah)?;
         } else {
-            reconcile_secondary_indexes_for_keys_multi(
-                &dev_refs,
-                index,
-                dah,
-                unmined,
-                &touched_keys,
-            )?;
+            reconcile_secondary_indexes_for_keys_multi(&dev_refs, index, dah, &touched_keys)?;
         }
     }
     Ok((total, pending_cc, pending_dc))
 }
 
-// Each argument is a distinct recovery input (device, the three index
+// Each argument is a distinct recovery input (device, the two index
 // backends, optional allocator, optional redo-progress fence, and the
 // secondary-reconcile mode); they have independent lifetimes/mutability and do
 // not form a natural cohesive struct, so the count is warranted here.
@@ -824,7 +807,6 @@ fn replay_one_recovery_entry(
     mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
     offset_owners: &mut OffsetOwners,
     pending_conflicting_children: &mut Vec<PendingAppendConflictingChild>,
     pending_deleted_children: &mut Vec<PendingAppendDeletedChild>,
@@ -832,11 +814,6 @@ fn replay_one_recovery_entry(
     entry: &RedoEntry,
 ) -> ReplayResult {
     match &entry.op {
-        RedoOp::SecondaryUnminedUpdate {
-            tx_key,
-            old_height,
-            new_height,
-        } => replay_secondary_unmined(device, index, unmined, tx_key, *old_height, *new_height),
         RedoOp::SecondaryDahUpdate {
             tx_key,
             old_height,
@@ -1063,7 +1040,6 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     entries: Vec<RedoEntry>,
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
     mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
     mut progress: Option<(&mut RedoLog, u64)>,
     secondary_reconcile: SecondaryReconcile,
@@ -1119,7 +1095,6 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
             allocator.as_deref_mut(),
             index,
             dah,
-            unmined,
             &mut offset_owners,
             &mut pending_conflicting_children,
             &mut pending_deleted_children,
@@ -1171,16 +1146,10 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
 
     match secondary_reconcile {
         SecondaryReconcile::FullScan => {
-            reconcile_secondary_indexes_from_metadata_multi(&[device], index, dah, unmined)?;
+            reconcile_secondary_indexes_from_metadata_multi(&[device], index, dah)?;
         }
         SecondaryReconcile::TouchedOnly => {
-            reconcile_secondary_indexes_for_keys_multi(
-                &[device],
-                index,
-                dah,
-                unmined,
-                &touched_keys,
-            )?;
+            reconcile_secondary_indexes_for_keys_multi(&[device], index, dah, &touched_keys)?;
         }
     }
 
@@ -1248,24 +1217,21 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     ))
 }
 
-/// Multi-store full reconcile: clear the DAH / unmined secondaries and
-/// re-derive them by scanning every primary index entry, reading each record's
-/// metadata from ITS OWN store's device (`devices[entry.device_id]`). Single
-/// store is the `devices.len() == 1` case (every `entry.device_id == 0`), so the
+/// Multi-store full reconcile: clear the DAH secondary and re-derive it by
+/// scanning every primary index entry, reading each record's metadata from
+/// ITS OWN store's device (`devices[entry.device_id]`). Single store is the
+/// `devices.len() == 1` case (every `entry.device_id == 0`), so the
 /// single-store recovery path calls this with a one-element slice. Called by
 /// `recover_all_multi_store` after every store's replay.
 fn reconcile_secondary_indexes_from_metadata_multi(
     devices: &[&dyn BlockDevice],
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
 ) -> Result<(), RecoveryError> {
     dah.clear().map_err(RecoveryError::Index)?;
-    unmined.clear().map_err(RecoveryError::Index)?;
 
     let mut first_error: Option<RecoveryError> = None;
     let mut dah_pairs: Vec<(u32, TxKey)> = Vec::new();
-    let mut unmined_pairs: Vec<(u32, TxKey)> = Vec::new();
 
     index.for_each(|key, entry| {
         if first_error.is_some() {
@@ -1298,10 +1264,6 @@ fn reconcile_secondary_indexes_from_metadata_multi(
                 if dah_height != 0 {
                     dah_pairs.push((dah_height, key));
                 }
-                let unmined_height = { meta.unmined_since };
-                if unmined_height != 0 {
-                    unmined_pairs.push((unmined_height, key));
-                }
             }
             Err(_) => {
                 first_error = Some(RecoveryError::Index(crate::index::IndexError::FormatError {
@@ -1320,9 +1282,6 @@ fn reconcile_secondary_indexes_from_metadata_multi(
     for (height, key) in dah_pairs {
         dah.insert(height, key, None)?;
     }
-    for (height, key) in unmined_pairs {
-        unmined.insert(height, key, None)?;
-    }
     Ok(())
 }
 
@@ -1335,24 +1294,22 @@ fn reconcile_secondary_indexes_from_metadata_multi(
 /// `recover_all_multi_store` when `full_secondary_rebuild == false`.
 ///
 /// For each touched key the primary index is authoritative: if the record is
-/// gone, any secondary entry for it is removed; otherwise the secondaries are
-/// set to exactly the record's `delete_at_height` / `unmined_since` read from
+/// gone, any secondary entry for it is removed; otherwise the secondary is
+/// set to exactly the record's `delete_at_height` read from
 /// `devices[entry.device_id]` (removing first so a height *change* does not
 /// leave a stale entry under the old bucket).
 fn reconcile_secondary_indexes_for_keys_multi(
     devices: &[&dyn BlockDevice],
     index: &ShardedIndex,
     dah: &mut DahBackend,
-    unmined: &mut UnminedBackend,
     keys: &std::collections::HashSet<TxKey>,
 ) -> Result<(), RecoveryError> {
     for key in keys {
         let entry = match index.lookup(key) {
             Some(e) => e,
             None => {
-                // Record no longer exists — drop any stale secondary entries.
+                // Record no longer exists — drop any stale secondary entry.
                 dah.remove(key, None).map_err(RecoveryError::Index)?;
-                unmined.remove(key, None).map_err(RecoveryError::Index)?;
                 continue;
             }
         };
@@ -1384,14 +1341,9 @@ fn reconcile_secondary_indexes_for_keys_multi(
         // Remove first so a changed height does not leave a stale entry under
         // the previous bucket, then re-insert the current value.
         dah.remove(key, None).map_err(RecoveryError::Index)?;
-        unmined.remove(key, None).map_err(RecoveryError::Index)?;
         let dah_height = { meta.delete_at_height };
         if dah_height != 0 {
             dah.insert(dah_height, *key, None)?;
-        }
-        let unmined_height = { meta.unmined_since };
-        if unmined_height != 0 {
-            unmined.insert(unmined_height, *key, None)?;
         }
     }
     Ok(())
@@ -1450,54 +1402,6 @@ fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
     }
 }
 
-/// Reconcile the unmined secondary index with a redo intent record.
-///
-/// Idempotency rule: the secondary update is applied only when the
-/// secondary's current state does not already match the redo's `new_height`.
-/// The primary index's authoritative `unmined_since` is used as the
-/// ground-truth reference — if the redo record's `new_height` does not
-/// match the primary, the redo entry is stale (primary moved on) and we
-/// skip the secondary update entirely.
-fn replay_secondary_unmined(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    unmined: &mut UnminedBackend,
-    tx_key: &TxKey,
-    _old_height: u32,
-    new_height: u32,
-) -> ReplayResult {
-    // The on-device record is authoritative here. R-077: after a crash
-    // between the primary metadata write and a primary-index/redb cache
-    // commit, the cached TxIndexEntry can be stale while the record already
-    // contains the redo target value.
-    let ie = match index.lookup(tx_key) {
-        Some(e) => e,
-        None => return ReplayResult::Skipped,
-    };
-    let primary_unmined = match io::read_metadata(device, ie.record_offset) {
-        Ok(meta) => meta.unmined_since,
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
-    };
-    if primary_unmined != new_height {
-        // Redo is stale relative to primary — a later redo has already
-        // superseded this one. Skip.
-        return ReplayResult::Skipped;
-    }
-    let entry = UnminedRedoEntry {
-        txid: tx_key.txid,
-        old_height: _old_height,
-        new_height,
-    };
-    match unmined.replay_redo(&entry) {
-        Ok(()) => ReplayResult::Applied,
-        // Secondary backend's `replay_redo` returned `Err`. The primary
-        // lookup already succeeded (so this isn't a missing-primary case),
-        // and the redo entry passed parsing — anything left is a
-        // logic-level inconsistency at the secondary backend.
-        Err(_) => ReplayResult::Failed(ReplayCause::LogicError),
-    }
-}
-
 fn replay_secondary_dah(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
@@ -1524,8 +1428,8 @@ fn replay_secondary_dah(
     };
     match dah.replay_redo(&entry) {
         Ok(()) => ReplayResult::Applied,
-        // Same reasoning as `replay_secondary_unmined`: a backend error
-        // after a successful primary lookup is a logic-level failure.
+        // A backend error after a successful primary lookup is a
+        // logic-level failure.
         Err(_) => ReplayResult::Failed(ReplayCause::LogicError),
     }
 }
@@ -1772,13 +1676,11 @@ fn replay_entry(
         // `AppendConflictingChild` is drained today.
         RedoOp::AppendDeletedChild { .. } => ReplayResult::Skipped,
         RedoOp::Checkpoint | RedoOp::RecoveryProgress { .. } => ReplayResult::Skipped,
-        // SecondaryUnminedUpdate / SecondaryDahUpdate are durability-intent
-        // records for redb secondary indexes — the primary index has no
-        // state to reconcile from them. `recover_all` handles them via the
-        // secondary backends; the single-backend `recover` path skips.
-        RedoOp::SecondaryUnminedUpdate { .. } | RedoOp::SecondaryDahUpdate { .. } => {
-            ReplayResult::Skipped
-        }
+        // SecondaryDahUpdate is a durability-intent record for the redb
+        // secondary index — the primary index has no state to reconcile
+        // from it. `recover_all` handles it via the secondary backend; the
+        // single-backend `recover` path skips.
+        RedoOp::SecondaryDahUpdate { .. } => ReplayResult::Skipped,
         // AllocateRegion / FreeRegion are allocator-scoped records. The
         // single-backend `recover` path has no allocator handle — skip
         // here and rely on `recover_all_with_allocator` to process them.
@@ -3401,10 +3303,9 @@ mod tests {
     fn touched_only_reconcile_matches_full_scan() {
         let mut h = RecoveryTestHarness::new();
         let a = h.create_record(0xA0, 1); // touched, has DAH
-        let b = h.create_record(0xA1, 1); // touched, has unmined
+        let b = h.create_record(0xA1, 1); // touched, no DAH
         let c = h.create_record(0xA2, 1); // NOT touched, has DAH
         h.set_record_heights(&a, 900, 0);
-        h.set_record_heights(&b, 0, 800);
         h.set_record_heights(&c, 950, 0);
 
         // Redo log touches only A and B.
@@ -3422,42 +3323,37 @@ mod tests {
         drop(redo);
         let entries = h.redo_log().recover().unwrap();
 
-        // Reference: a FULL scan over a fresh pair of secondaries. The
+        // Reference: a FULL scan over a fresh DAH secondary. The
         // Freeze replays do not mutate the primary index, so the same
         // `h.index` can drive both passes.
         let mut dah_full = DahBackend::new_in_memory();
-        let mut unmined_full = UnminedBackend::new_in_memory();
         recover_entries_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             entries.clone(),
             &h.index,
             &mut dah_full,
-            &mut unmined_full,
             None,
             None,
             SecondaryReconcile::FullScan,
         )
         .unwrap();
-        // Full scan derives all three: A(900)+C(950) in DAH, B(800) unmined.
+        // Full scan derives both: A(900)+C(950) in DAH.
         let sort_keys = |v: &mut Vec<TxKey>| v.sort_by_key(|k| k.txid);
         let mut dah_full_keys = dah_full.range_query(u32::MAX);
         sort_keys(&mut dah_full_keys);
         assert_eq!(dah_full_keys.len(), 2, "full scan finds A and C in DAH");
 
-        // Touched-only: start from durable secondaries that already hold
+        // Touched-only: start from a durable secondary that already holds
         // the correct entries for ALL keys (as a clean redb load would),
         // then reconcile only A and B.
         let mut dah_touch = DahBackend::new_in_memory();
-        let mut unmined_touch = UnminedBackend::new_in_memory();
         dah_touch.insert(900, a, None).unwrap();
         dah_touch.insert(950, c, None).unwrap();
-        unmined_touch.insert(800, b, None).unwrap();
         recover_entries_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             entries.clone(),
             &h.index,
             &mut dah_touch,
-            &mut unmined_touch,
             None,
             None,
             SecondaryReconcile::TouchedOnly,
@@ -3471,15 +3367,6 @@ mod tests {
             dah_touch_keys.iter().map(|k| k.txid).collect::<Vec<_>>(),
             dah_full_keys.iter().map(|k| k.txid).collect::<Vec<_>>(),
             "touched-only DAH must equal full-scan DAH",
-        );
-        let mut un_full = unmined_full.range_query(u32::MAX);
-        sort_keys(&mut un_full);
-        let mut un_touch = unmined_touch.range_query(u32::MAX);
-        sort_keys(&mut un_touch);
-        assert_eq!(
-            un_touch.iter().map(|k| k.txid).collect::<Vec<_>>(),
-            un_full.iter().map(|k| k.txid).collect::<Vec<_>>(),
-            "touched-only unmined must equal full-scan",
         );
         // C is still present in the touched-only DAH even though it was
         // never scanned — proving the reconcile is O(redo), not O(store).
@@ -3557,14 +3444,12 @@ mod tests {
         }
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         // Must NOT return Err(LogFull); recovery must finish.
         let result = recover_all_with_allocator_collecting_pending_conflicts_progress(
             &*h.data_dev,
             &mut log,
             &h.index,
             &mut dah,
-            &mut unmined,
             Some(&mut h.alloc),
             true,
         );
@@ -3740,13 +3625,11 @@ mod tests {
         .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let (stats, pending, _deleted) = recover_all_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             &redo,
             &h.index,
             &mut dah,
-            &mut unmined,
             Some(&mut h.alloc),
         )
         .unwrap();
@@ -3769,7 +3652,6 @@ mod tests {
             h.alloc,
             StripedLocks::new(1024),
             dah,
-            unmined,
         );
 
         for intent in &pending {
@@ -3812,13 +3694,11 @@ mod tests {
         .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let (stats, _pending, deleted) = recover_all_with_allocator_collecting_pending_conflicts(
             &*h.data_dev,
             &redo,
             &h.index,
             &mut dah,
-            &mut unmined,
             Some(&mut h.alloc),
         )
         .unwrap();
@@ -3842,7 +3722,6 @@ mod tests {
             h.alloc,
             StripedLocks::new(1024),
             dah,
-            unmined,
         );
 
         for intent in &deleted {
@@ -4098,16 +3977,14 @@ mod tests {
         let offset = ie.record_offset;
         let redo = make_log(&h, key);
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
+        recover_all(&*h.data_dev, &redo, &h.index, &mut dah).unwrap();
         let after_one = io::read_metadata(&*h.data_dev, offset).unwrap();
 
         // Pass 2: replay the same full log AGAIN on top of the post-pass-1
         // state (simulating a crash that forces a from-scratch re-replay).
         let redo2 = make_log(&h, key);
         let mut dah2 = DahBackend::new_in_memory();
-        let mut unmined2 = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo2, &h.index, &mut dah2, &mut unmined2).unwrap();
+        recover_all(&*h.data_dev, &redo2, &h.index, &mut dah2).unwrap();
         let after_two = io::read_metadata(&*h.data_dev, offset).unwrap();
 
         assert_eq!(
@@ -4170,8 +4047,7 @@ mod tests {
         .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
+        recover_all(&*h.data_dev, &redo, &h.index, &mut dah).unwrap();
 
         let post = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!(
@@ -5107,7 +4983,6 @@ mod tests {
             .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
@@ -5117,7 +4992,6 @@ mod tests {
             &mut redo_logs,
             &index,
             &mut dah,
-            &mut unmined,
             true,
             false,
         )
@@ -5220,7 +5094,6 @@ mod tests {
             .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
@@ -5230,7 +5103,6 @@ mod tests {
             &mut redo_logs,
             &index,
             &mut dah,
-            &mut unmined,
             true,
             false,
         )
@@ -5337,7 +5209,6 @@ mod tests {
             .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
@@ -5347,7 +5218,6 @@ mod tests {
             &mut redo_logs,
             &index,
             &mut dah,
-            &mut unmined,
             true,
             false,
         )
@@ -5475,7 +5345,6 @@ mod tests {
                 .unwrap();
 
             let mut dah = DahBackend::new_in_memory();
-            let mut unmined = UnminedBackend::new_in_memory();
             let devices = [dev0.clone(), dev1.clone()];
             let mut allocators = [alloc0, alloc1];
             let mut redo_logs = [redo0, redo1];
@@ -5485,7 +5354,6 @@ mod tests {
                 &mut redo_logs,
                 &index,
                 &mut dah,
-                &mut unmined,
                 true,
                 false,
             )
@@ -5638,7 +5506,6 @@ mod tests {
             .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut redo_logs = [redo0, redo1];
@@ -5648,7 +5515,6 @@ mod tests {
             &mut redo_logs,
             &index,
             &mut dah,
-            &mut unmined,
             true,
             false,
         )
@@ -5678,7 +5544,7 @@ mod tests {
     }
 
     /// Stress the PARALLEL multi-store recovery: 8 stores, many records each
-    /// (with DAH/unmined heights to exercise the store-routed secondary
+    /// (with DAH heights to exercise the store-routed secondary
     /// reconcile), one shared interleaved redo log. Verifies concurrent replay
     /// rebuilds the full index with correct per-store routing and secondaries —
     /// no index/allocator races, no cross-store contamination.
@@ -5764,14 +5630,12 @@ mod tests {
         }
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let (stats, _, _) = recover_all_multi_store(
             &devices,
             &mut allocators,
             &mut redo_logs,
             &index,
             &mut dah,
-            &mut unmined,
             true,
             false,
         )
@@ -5873,7 +5737,8 @@ mod tests {
         };
 
         // Store 0: A has DAH (touched), C has DAH (NOT touched).
-        // Store 1: B has unmined (touched), D has unmined (NOT touched).
+        // Store 1: B (touched) and D (NOT touched) have no DAH — they
+        // exercise cross-store touched-only preservation without a hit.
         let a = make(0xA0, 0, &dev0, &mut alloc0, 900, 0);
         let b = make(0xB0, 1, &dev1, &mut alloc1, 0, 800);
         let c = make(0xC0, 0, &dev0, &mut alloc0, 950, 0);
@@ -5912,7 +5777,6 @@ mod tests {
         // Reference: full rebuild (flag = true). Clears + re-derives every
         // primary entry across BOTH stores.
         let mut dah_full = DahBackend::new_in_memory();
-        let mut unmined_full = UnminedBackend::new_in_memory();
         {
             let devices = [dev0.clone(), dev1.clone()];
             let mut allocators: [crate::allocator::BoxedAllocator; 2] = [
@@ -5926,7 +5790,6 @@ mod tests {
                 &mut logs,
                 &index,
                 &mut dah_full,
-                &mut unmined_full,
                 true,
                 false,
             )
@@ -5934,21 +5797,15 @@ mod tests {
         }
         let mut dah_full_keys = dah_full.range_query(u32::MAX);
         sort_keys(&mut dah_full_keys);
-        let mut un_full = unmined_full.range_query(u32::MAX);
-        sort_keys(&mut un_full);
-        // Full scan finds A+C in DAH (both stores), B+D in unmined.
+        // Full scan finds A+C in DAH (both stores).
         assert_eq!(dah_full_keys.len(), 2, "full scan finds A and C in DAH");
-        assert_eq!(un_full.len(), 2, "full scan finds B and D in unmined");
 
-        // Fast path: flag = false, secondaries pre-seeded clean for ALL keys (as
+        // Fast path: flag = false, secondary pre-seeded clean for ALL keys (as
         // a clean redb load would present them). Only A and B are touched; C and
         // D must be preserved WITHOUT a re-scan.
         let mut dah_touch = DahBackend::new_in_memory();
-        let mut unmined_touch = UnminedBackend::new_in_memory();
         dah_touch.insert(900, a, None).unwrap();
         dah_touch.insert(950, c, None).unwrap();
-        unmined_touch.insert(800, b, None).unwrap();
-        unmined_touch.insert(850, d, None).unwrap();
         {
             let devices = [dev0.clone(), dev1.clone()];
             let mut allocators: [crate::allocator::BoxedAllocator; 2] = [
@@ -5962,7 +5819,6 @@ mod tests {
                 &mut logs,
                 &index,
                 &mut dah_touch,
-                &mut unmined_touch,
                 false,
                 false,
             )
@@ -5970,8 +5826,6 @@ mod tests {
         }
         let mut dah_touch_keys = dah_touch.range_query(u32::MAX);
         sort_keys(&mut dah_touch_keys);
-        let mut un_touch = unmined_touch.range_query(u32::MAX);
-        sort_keys(&mut un_touch);
 
         // Equivalence: touched-only result equals the full scan, across stores.
         assert_eq!(
@@ -5979,37 +5833,34 @@ mod tests {
             dah_full_keys.iter().map(|k| k.txid).collect::<Vec<_>>(),
             "multi-store touched-only DAH must equal full-scan DAH",
         );
-        assert_eq!(
-            un_touch.iter().map(|k| k.txid).collect::<Vec<_>>(),
-            un_full.iter().map(|k| k.txid).collect::<Vec<_>>(),
-            "multi-store touched-only unmined must equal full-scan unmined",
-        );
-        // Untouched C (store 0) and D (store 1) survive though never scanned —
-        // proving the fast path is O(redo), not O(store), and routes per store.
+        // Untouched C (store 0) survives though never scanned — proving the
+        // fast path is O(redo), not O(store), and routes per store. D (store
+        // 1, untouched, no DAH) is absent from both passes by construction.
         assert!(
             dah_touch_keys.iter().any(|k| k.txid == c.txid),
             "untouched C (store 0) preserved on fast path",
         );
         assert!(
-            un_touch.iter().any(|k| k.txid == d.txid),
-            "untouched D (store 1) preserved on fast path",
+            !dah_touch_keys.iter().any(|k| k.txid == d.txid),
+            "D (store 1, no DAH) must not appear in the DAH secondary",
         );
 
-        // And the fast path DID reconcile the touched keys from their OWN store:
-        // A's DAH (store 0) and B's unmined (store 1) are present.
+        // And the fast path DID reconcile the touched key from its OWN store:
+        // A's DAH (store 0) is present. B (store 1, touched, no DAH) confirms
+        // the touched-only path does not spuriously plant a DAH entry.
         assert!(
             dah_touch_keys.iter().any(|k| k.txid == a.txid),
             "touched A reconciled from store 0",
         );
         assert!(
-            un_touch.iter().any(|k| k.txid == b.txid),
-            "touched B reconciled from store 1",
+            !dah_touch_keys.iter().any(|k| k.txid == b.txid),
+            "touched B (store 1, no DAH) must not appear in the DAH secondary",
         );
     }
 
     /// P2 (multi-store B-7): with the fast path NOT seeded clean, the full
-    /// rebuild (flag = true) still derives correct DAH/unmined across stores
-    /// from a cold (empty) pair of secondaries — proving the full path remains
+    /// rebuild (flag = true) still derives correct DAH across stores
+    /// from a cold (empty) secondary — proving the full path remains
     /// correct and store-routed.
     #[test]
     fn multi_store_full_rebuild_from_cold_secondaries_across_stores() {
@@ -6059,7 +5910,7 @@ mod tests {
         };
 
         let a = make(0xA0, 0, &dev0, &mut alloc0, 900, 0); // store 0, DAH
-        let b = make(0xB0, 1, &dev1, &mut alloc1, 0, 800); // store 1, unmined
+        let b = make(0xB0, 1, &dev1, &mut alloc1, 0, 800); // store 1, no DAH
 
         let redo_dev0 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let redo_dev1 = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
@@ -6072,7 +5923,6 @@ mod tests {
         redo1.attach_shared_sequence(shared.clone());
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let devices = [dev0.clone(), dev1.clone()];
         let mut allocators = [alloc0, alloc1];
         let mut logs = [redo0, redo1];
@@ -6082,18 +5932,18 @@ mod tests {
             &mut logs,
             &index,
             &mut dah,
-            &mut unmined,
             true,
             false,
         )
         .unwrap();
 
         let dah_keys = dah.range_query(u32::MAX);
-        let un_keys = unmined.range_query(u32::MAX);
         assert_eq!(dah_keys.len(), 1, "exactly A in DAH");
-        assert_eq!(un_keys.len(), 1, "exactly B in unmined");
         assert_eq!(dah_keys[0].txid, a.txid, "A (store 0) derived into DAH");
-        assert_eq!(un_keys[0].txid, b.txid, "B (store 1) derived into unmined");
+        assert!(
+            !dah_keys.iter().any(|k| k.txid == b.txid),
+            "B (store 1, no DAH) must not appear in the DAH secondary",
+        );
     }
 
     /// bytes and registers the index with cached fields populated from
@@ -6227,7 +6077,6 @@ mod tests {
             Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
-        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
         let mut txid = [0u8; 32];
         txid[0] = 0xCD;
@@ -6259,15 +6108,9 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover_all_with_allocator(
-            &*data_dev,
-            &redo,
-            &index,
-            &mut dah,
-            &mut unmined,
-            Some(&mut alloc),
-        )
-        .unwrap();
+        let stats =
+            recover_all_with_allocator(&*data_dev, &redo, &index, &mut dah, Some(&mut alloc))
+                .unwrap();
         assert_eq!(stats.entries_failed, 1);
         assert_eq!(stats.failed_logic, 1);
         assert!(
@@ -6320,7 +6163,6 @@ mod tests {
             Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
-        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
         let utxo_count = 2;
         // Record B occupies the offset on device; the region is then freed
@@ -6344,15 +6186,9 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover_all_with_allocator(
-            &*data_dev,
-            &redo,
-            &index,
-            &mut dah,
-            &mut unmined,
-            Some(&mut alloc),
-        )
-        .unwrap();
+        let stats =
+            recover_all_with_allocator(&*data_dev, &redo, &index, &mut dah, Some(&mut alloc))
+                .unwrap();
 
         // The allocator gate fails the entry as a logic error.
         assert_eq!(stats.entries_failed, 1);
@@ -6378,7 +6214,6 @@ mod tests {
             Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
-        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
         let utxo_count = 2;
         // Record B at an offset that STAYS allocated (gate passes).
@@ -6413,15 +6248,9 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover_all_with_allocator(
-            &*data_dev,
-            &redo,
-            &index,
-            &mut dah,
-            &mut unmined,
-            Some(&mut alloc),
-        )
-        .unwrap();
+        let stats =
+            recover_all_with_allocator(&*data_dev, &redo, &index, &mut dah, Some(&mut alloc))
+                .unwrap();
 
         assert_eq!(
             stats.entries_failed, 1,
@@ -6448,7 +6277,6 @@ mod tests {
             Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
         let index = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
         let mut dah = DahBackend::from(crate::index::DahIndex::new());
-        let mut unmined = UnminedBackend::from(crate::index::UnminedIndex::new());
 
         let utxo_count = 2;
         // Offset X holds record B (on-device tx_id = B) and STAYS allocated,
@@ -6499,15 +6327,9 @@ mod tests {
         })
         .unwrap();
 
-        let stats = recover_all_with_allocator(
-            &*data_dev,
-            &redo,
-            &index,
-            &mut dah,
-            &mut unmined,
-            Some(&mut alloc),
-        )
-        .unwrap();
+        let stats =
+            recover_all_with_allocator(&*data_dev, &redo, &index, &mut dah, Some(&mut alloc))
+                .unwrap();
 
         // The rightful owner B registered successfully (the create applied).
         assert_eq!(
@@ -7064,13 +6886,11 @@ mod tests {
         .unwrap();
 
         let mut dah_backend = DahBackend::new_in_memory();
-        let mut unmined_backend = UnminedBackend::new_in_memory();
         let stats = recover_all_with_allocator(
             &*h.data_dev,
             &redo,
             &h.index,
             &mut dah_backend,
-            &mut unmined_backend,
             Some(&mut h.alloc),
         )
         .unwrap();
@@ -7588,131 +7408,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn recover_all_applies_unmined_secondary_when_stale() {
-        // Simulate the bug window: redo of unmined intent was fsynced but the
-        // redb commit never happened. Primary has `unmined_since = 500`
-        // (matches the redo entry's new_height), so recovery MUST apply the
-        // secondary update to reconcile the on-disk index.
-        let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(30, 5);
-
-        let ie = h.index.lookup(&key).unwrap();
-        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.unmined_since = 500;
-        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-
-        // R-077 recovery uses the on-device metadata (unmined_since = 500) as
-        // the authority after a crash between the metadata write and the
-        // secondary-index commit.
-
-        // Redo log: the intent record (as if fsynced) but redb commit skipped.
-        let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
-            tx_key: key,
-            old_height: 0,
-            new_height: 500,
-        })
-        .unwrap();
-
-        let mut dah_backend = DahBackend::new_in_memory();
-        let mut unmined_backend = UnminedBackend::new_in_memory();
-        // Secondary is currently EMPTY — stale relative to primary (500).
-
-        let stats = recover_all(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah_backend,
-            &mut unmined_backend,
-        )
-        .unwrap();
-        assert_eq!(stats.entries_replayed, 1);
-
-        // Secondary index should now contain the entry.
-        let result = unmined_backend.range_query(500);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], key);
-    }
-
-    #[test]
-    fn recover_all_skips_stale_unmined_redo_relative_to_primary() {
-        // Primary has unmined_since = 0 (record got MARK_ON_LONGEST_CHAIN
-        // after the secondary intent was fsynced). The redo's new_height
-        // (500) does not match the primary's current (0), so we must NOT
-        // replay — another redo entry later in the log supersedes this one.
-        let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(31, 5);
-
-        // On-device metadata: unmined_since = 0 (fresh record).
-        let ie = h.index.lookup(&key).unwrap();
-        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        assert_eq!({ meta.unmined_since }, 0);
-
-        let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
-            tx_key: key,
-            old_height: 0,
-            new_height: 500,
-        })
-        .unwrap();
-
-        let mut dah_backend = DahBackend::new_in_memory();
-        let mut unmined_backend = UnminedBackend::new_in_memory();
-
-        let stats = recover_all(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah_backend,
-            &mut unmined_backend,
-        )
-        .unwrap();
-        // The redo entry is stale — skipped.
-        assert_eq!(stats.entries_skipped, 1);
-        assert!(unmined_backend.is_empty());
-    }
-
-    #[test]
-    fn recover_all_skips_when_secondary_already_matches_primary() {
-        // Secondary already has the entry — replay must be a no-op (idempotent).
-        let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(32, 5);
-
-        let ie = h.index.lookup(&key).unwrap();
-        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.unmined_since = 500;
-        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-
-        let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
-            tx_key: key,
-            old_height: 0,
-            new_height: 500,
-        })
-        .unwrap();
-
-        let mut dah_backend = DahBackend::new_in_memory();
-        let mut unmined_backend = UnminedBackend::new_in_memory();
-        // Pre-populate secondary — matches primary already.
-        unmined_backend.insert(500, key, None).unwrap();
-
-        let stats = recover_all(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah_backend,
-            &mut unmined_backend,
-        )
-        .unwrap();
-        // Idempotent replay — backend reports it as Applied (no-op commit).
-        // Per our replay_redo contract, the redb backend no-ops on same-state
-        // so ReplayResult::Applied here means the replay path returned Ok
-        // without actually mutating. That's still correct behavior.
-        assert!(stats.entries_replayed + stats.entries_skipped == 1);
-        assert_eq!(unmined_backend.len(), 1);
-    }
-
-    #[test]
     fn recover_all_applies_dah_secondary_when_stale() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(33, 5);
@@ -7735,55 +7430,13 @@ mod tests {
         .unwrap();
 
         let mut dah_backend = DahBackend::new_in_memory();
-        let mut unmined_backend = UnminedBackend::new_in_memory();
 
-        let stats = recover_all(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah_backend,
-            &mut unmined_backend,
-        )
-        .unwrap();
+        let stats = recover_all(&*h.data_dev, &redo, &h.index, &mut dah_backend).unwrap();
         assert_eq!(stats.entries_replayed, 1);
 
         let result = dah_backend.range_query(900);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], key);
-    }
-
-    #[test]
-    fn recover_all_skips_missing_primary_record() {
-        let h = RecoveryTestHarness::new();
-
-        // Fabricate a key that is NOT in the primary index (as if the record
-        // was already deleted).
-        let mut txid = [0u8; 32];
-        txid[0] = 99;
-        let key = TxKey { txid };
-
-        let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SecondaryUnminedUpdate {
-            tx_key: key,
-            old_height: 0,
-            new_height: 500,
-        })
-        .unwrap();
-
-        let mut dah_backend = DahBackend::new_in_memory();
-        let mut unmined_backend = UnminedBackend::new_in_memory();
-
-        let stats = recover_all(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah_backend,
-            &mut unmined_backend,
-        )
-        .unwrap();
-        // Skipped — primary has no entry for this key.
-        assert_eq!(stats.entries_skipped, 1);
-        assert!(unmined_backend.is_empty());
     }
 
     /// Task 16d: `CompensateUnsetMined` is no longer replayed against the
@@ -7822,16 +7475,9 @@ mod tests {
         .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
-        let stats = recover_all_with_allocator(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah,
-            &mut unmined,
-            Some(&mut h.alloc),
-        )
-        .unwrap();
+        let stats =
+            recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut h.alloc))
+                .unwrap();
 
         assert_eq!(stats.entries_replayed, 0);
         assert_eq!(stats.entries_skipped, 1);
@@ -7886,13 +7532,11 @@ mod tests {
         assert_eq!(recovered.free_region_count(), 0, "snapshot lacks the free");
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let stats = recover_all_with_allocator(
             &*h.data_dev,
             &redo,
             &h.index,
             &mut dah,
-            &mut unmined,
             Some(&mut recovered),
         )
         .unwrap();
@@ -7928,13 +7572,11 @@ mod tests {
         let before_next = recovered.next_offset();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         recover_all_with_allocator(
             &*h.data_dev,
             &redo,
             &h.index,
             &mut dah,
-            &mut unmined,
             Some(&mut recovered),
         )
         .unwrap();
@@ -7975,32 +7617,17 @@ mod tests {
         .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
 
         let mut once: crate::allocator::BoxedAllocator =
             Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
-        recover_all_with_allocator(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah,
-            &mut unmined,
-            Some(&mut once),
-        )
-        .unwrap();
+        recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut once))
+            .unwrap();
 
         let mut twice: crate::allocator::BoxedAllocator =
             Box::new(SlotAllocator::recover(h.data_dev.clone()).unwrap());
         for _ in 0..2 {
-            recover_all_with_allocator(
-                &*h.data_dev,
-                &redo,
-                &h.index,
-                &mut dah,
-                &mut unmined,
-                Some(&mut twice),
-            )
-            .unwrap();
+            recover_all_with_allocator(&*h.data_dev, &redo, &h.index, &mut dah, Some(&mut twice))
+                .unwrap();
         }
 
         assert_eq!(
@@ -8013,55 +7640,6 @@ mod tests {
             twice.free_region_count(),
             "freelist size must be identical after any number of replays"
         );
-    }
-
-    #[test]
-    fn recover_all_batched_pair_reconciles_both_indexes() {
-        // End-to-end: a MarkOnLongestChain-style update produces TWO secondary
-        // intent records (DAH + unmined) in a single fsync batch. Both are
-        // fsynced but the redb commits never happened (crash scenario).
-        // `recover_all` should apply both.
-        let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(34, 5);
-
-        // On-device post-mutation state: both fields set (recovery's authority).
-        let ie = h.index.lookup(&key).unwrap();
-        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.delete_at_height = 900;
-        meta.unmined_since = 500;
-        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
-
-        let mut redo = h.redo_log();
-        // Batched fsync — both ops in one flush, as the engine would do.
-        let ops = vec![
-            RedoOp::SecondaryDahUpdate {
-                tx_key: key,
-                old_height: 0,
-                new_height: 900,
-            },
-            RedoOp::SecondaryUnminedUpdate {
-                tx_key: key,
-                old_height: 0,
-                new_height: 500,
-            },
-        ];
-        redo.append_batch_and_flush(&ops).unwrap();
-
-        let mut dah_backend = DahBackend::new_in_memory();
-        let mut unmined_backend = UnminedBackend::new_in_memory();
-
-        let stats = recover_all(
-            &*h.data_dev,
-            &redo,
-            &h.index,
-            &mut dah_backend,
-            &mut unmined_backend,
-        )
-        .unwrap();
-        assert_eq!(stats.entries_replayed, 2, "{stats:?}");
-
-        assert_eq!(dah_backend.range_query(900).len(), 1);
-        assert_eq!(unmined_backend.range_query(500).len(), 1);
     }
 
     /// Task 16d: spend replay recomputes `spent_utxos` / `generation` /
@@ -8102,8 +7680,7 @@ mod tests {
         .unwrap();
 
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
-        let stats = recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
+        let stats = recover_all(&*h.data_dev, &redo, &h.index, &mut dah).unwrap();
         assert_eq!(stats.entries_replayed, 1, "{stats:?}");
 
         let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
@@ -8136,11 +7713,9 @@ mod tests {
 
         let redo = h.redo_log();
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
-        recover_all(&*h.data_dev, &redo, &h.index, &mut dah, &mut unmined).unwrap();
+        recover_all(&*h.data_dev, &redo, &h.index, &mut dah).unwrap();
 
         assert_eq!(dah.range_query(900), vec![key]);
-        assert_eq!(unmined.range_query(500), vec![key]);
     }
 
     // -----------------------------------------------------------------------

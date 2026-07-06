@@ -35,7 +35,7 @@ use teraslab::cluster::shards::NodeId;
 use teraslab::cluster::topology::ClusterId;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::WireGetSpendItem;
@@ -107,7 +107,6 @@ fn create_proxied_node(
         alloc,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let cluster_config = ClusterConfig {

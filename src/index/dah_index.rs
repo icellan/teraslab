@@ -23,9 +23,10 @@ type HeightBucket = HashSet<TxKey, BuildHasherDefault<FastTxHasher>>;
 
 /// Redo log entry for DAH secondary index mutations.
 ///
-/// Parallel to [`crate::index::unmined_index::UnminedRedoEntry`]. Captures
-/// the before/after state so the mutation can be replayed idempotently
-/// on crash recovery.
+/// Captures the before/after state so the mutation can be replayed
+/// idempotently on crash recovery. (The former parallel `UnminedRedoEntry`
+/// for the unmined secondary index was removed in Task 16e — mined/unmined
+/// state is now sourced from the `ShardedMinedIndex`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DahRedoEntry {
     /// Transaction ID.

@@ -33,7 +33,7 @@ use teraslab::allocator::SlotAllocator;
 use teraslab::cluster::auth;
 use teraslab::config::{Secret, ServerConfig};
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::frame::ResponseFrame;
@@ -53,7 +53,6 @@ fn start_test_server_with_secret(secret: &str) -> (Arc<Server>, u16) {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

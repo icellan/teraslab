@@ -12,8 +12,7 @@ use teraslab::allocator::SlotAllocator;
 use teraslab::config::{IndexBackendMode, IndexConfig, ServerConfig};
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::redb_dah::RedbDahIndex;
-use teraslab::index::redb_unmined::RedbUnminedIndex;
-use teraslab::index::{DahBackend, DahIndex, Index, PrimaryBackend, UnminedBackend, UnminedIndex};
+use teraslab::index::{DahBackend, DahIndex, Index, PrimaryBackend};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::*;
@@ -47,31 +46,25 @@ fn build_engine_for_backend(mode: &IndexBackendMode, dir: &TempDir) -> Arc<Engin
         backend: mode.clone(),
         redb_path: dir.path().join("primary.redb"),
         redb_dah_path: dir.path().join("dah.redb"),
-        redb_unmined_path: dir.path().join("unmined.redb"),
         redb_cache_size: 16 * 1024 * 1024,
         file_backed_path: dir.path().join("primary.index"),
         index_shards: 16,
     };
 
-    let (primary, dah, unmined): (PrimaryBackend, DahBackend, UnminedBackend) = match mode {
+    let (primary, dah): (PrimaryBackend, DahBackend) = match mode {
         IndexBackendMode::Memory => (
             PrimaryBackend::new_in_memory(10_000).unwrap(),
             DahBackend::new_in_memory(),
-            UnminedBackend::new_in_memory(),
         ),
         IndexBackendMode::Redb => (
             PrimaryBackend::new_on_disk(&config).unwrap(),
             DahBackend::OnDisk(
                 RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size).unwrap(),
             ),
-            UnminedBackend::OnDisk(
-                RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size).unwrap(),
-            ),
         ),
         IndexBackendMode::FileBacked => (
             PrimaryBackend::new_file_backed(&config.file_backed_path, 10_000).unwrap(),
             DahBackend::new_in_memory(),
-            UnminedBackend::new_in_memory(),
         ),
     };
 
@@ -81,7 +74,6 @@ fn build_engine_for_backend(mode: &IndexBackendMode, dir: &TempDir) -> Arc<Engin
         alloc,
         StripedLocks::new(1024),
         dah,
-        unmined,
     ))
 }
 
@@ -137,7 +129,6 @@ fn start_test_server() -> (Arc<Server>, u16) {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     // Bind to port 0 to get a random available port
@@ -175,7 +166,6 @@ fn start_test_server_with_max_connections(max_connections: usize) -> (Arc<Server
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -211,7 +201,6 @@ fn start_test_server_with_blob_store() -> (Arc<Server>, u16) {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2517,7 +2506,6 @@ fn start_test_server_with_max_per_ip(max_per_ip: usize) -> (Arc<Server>, u16) {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

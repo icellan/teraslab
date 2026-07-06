@@ -11,10 +11,8 @@ use tempfile::TempDir;
 use teraslab::allocator::SlotAllocator;
 use teraslab::config::{IndexBackendMode, IndexConfig};
 use teraslab::device::{AlignedBuf, BlockDevice, MemoryDevice};
-use teraslab::index::{
-    DahBackend, DahIndex, Index, PrimaryBackend, TxKey, UnminedBackend, UnminedIndex,
-};
-use teraslab::index::{redb_dah::RedbDahIndex, redb_unmined::RedbUnminedIndex};
+use teraslab::index::redb_dah::RedbDahIndex;
+use teraslab::index::{DahBackend, DahIndex, Index, PrimaryBackend, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
@@ -41,7 +39,6 @@ fn create_engine() -> Arc<Engine> {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 
@@ -58,7 +55,6 @@ impl BackendCase {
             backend: mode.clone(),
             redb_path: dir.path().join("primary.redb"),
             redb_dah_path: dir.path().join("dah.redb"),
-            redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 16 * 1024 * 1024,
             file_backed_path: dir.path().join("primary.index"),
             index_shards: 16,
@@ -70,12 +66,11 @@ impl BackendCase {
         }
     }
 
-    fn fresh_indexes(&self) -> (PrimaryBackend, DahBackend, UnminedBackend) {
+    fn fresh_indexes(&self) -> (PrimaryBackend, DahBackend) {
         match self.mode {
             IndexBackendMode::Memory => (
                 PrimaryBackend::new_in_memory(10_000).unwrap(),
                 DahBackend::new_in_memory(),
-                UnminedBackend::new_in_memory(),
             ),
             IndexBackendMode::Redb => (
                 PrimaryBackend::new_on_disk(&self.config).unwrap(),
@@ -83,18 +78,10 @@ impl BackendCase {
                     RedbDahIndex::open(&self.config.redb_dah_path, self.config.redb_cache_size)
                         .unwrap(),
                 ),
-                UnminedBackend::OnDisk(
-                    RedbUnminedIndex::open(
-                        &self.config.redb_unmined_path,
-                        self.config.redb_cache_size,
-                    )
-                    .unwrap(),
-                ),
             ),
             IndexBackendMode::FileBacked => (
                 PrimaryBackend::new_file_backed(&self.config.file_backed_path, 10_000).unwrap(),
                 DahBackend::new_in_memory(),
-                UnminedBackend::new_in_memory(),
             ),
         }
     }
@@ -103,16 +90,12 @@ impl BackendCase {
         &self,
         dev: &dyn BlockDevice,
         alloc: &SlotAllocator,
-    ) -> (PrimaryBackend, DahBackend, UnminedBackend) {
+    ) -> (PrimaryBackend, DahBackend) {
         match self.mode {
             IndexBackendMode::Memory => {
                 let primary = PrimaryBackend::rebuild(dev, alloc).unwrap();
-                let (dah, unmined) = PrimaryBackend::rebuild_secondary(dev, alloc).unwrap();
-                (
-                    primary,
-                    DahBackend::from(dah),
-                    UnminedBackend::from(unmined),
-                )
+                let dah = PrimaryBackend::rebuild_secondary(dev, alloc).unwrap();
+                (primary, DahBackend::from(dah))
             }
             IndexBackendMode::Redb => (
                 PrimaryBackend::restore_redb(&self.config).unwrap(),
@@ -120,24 +103,13 @@ impl BackendCase {
                     RedbDahIndex::open(&self.config.redb_dah_path, self.config.redb_cache_size)
                         .unwrap(),
                 ),
-                UnminedBackend::OnDisk(
-                    RedbUnminedIndex::open(
-                        &self.config.redb_unmined_path,
-                        self.config.redb_cache_size,
-                    )
-                    .unwrap(),
-                ),
             ),
             IndexBackendMode::FileBacked => {
                 let primary =
                     PrimaryBackend::restore_file_backed(&self.config.file_backed_path, 10_000)
                         .unwrap();
-                let (dah, unmined) = PrimaryBackend::rebuild_secondary(dev, alloc).unwrap();
-                (
-                    primary,
-                    DahBackend::from(dah),
-                    UnminedBackend::from(unmined),
-                )
+                let dah = PrimaryBackend::rebuild_secondary(dev, alloc).unwrap();
+                (primary, DahBackend::from(dah))
             }
         }
     }
@@ -148,20 +120,27 @@ fn create_engine_with_backends(
     alloc: SlotAllocator,
     index: PrimaryBackend,
     dah: DahBackend,
-    unmined: UnminedBackend,
 ) -> Arc<Engine> {
-    Arc::new(Engine::new(
-        dev,
-        index,
-        alloc,
-        StripedLocks::new(1024),
-        dah,
-        unmined,
-    ))
+    let engine = Arc::new(Engine::new(dev, index, alloc, StripedLocks::new(1024), dah));
+    // `Engine::new`/`new_inner` always starts with a fresh, empty
+    // `ShardedMinedIndex` — unlike `dah_index` it is never reconciled from an
+    // existing backend (see `Engine::new_inner`'s doc comment). For a
+    // brand-new engine this is a no-op (the primary index has no entries
+    // yet); for the "reopen after restart" call sites in this file (a
+    // recovered/rebuilt primary index over a device with real records) this
+    // repopulates mined/unmined state from the device, mirroring what a real
+    // startup's device-scan fallback does.
+    engine.rebuild_mined_index_from_device().unwrap();
+    engine
 }
 
 fn assert_unmined_contains(engine: &Engine, key: TxKey, cutoff_height: u32, context: &str) {
-    let keys = engine.unmined_index().range_query(cutoff_height);
+    // `collect_unmined_keys_below` uses an exclusive upper bound (`1..height`);
+    // `+ 1` preserves the old `UnminedIndex::range_query`'s inclusive
+    // `[0, cutoff_height]` boundary.
+    let keys = engine
+        .mined_index()
+        .collect_unmined_keys_below(cutoff_height + 1);
     assert!(
         keys.contains(&key),
         "{context}: unmined index missing expected key"
@@ -445,8 +424,8 @@ fn backend_modes_create_spend_and_reopen() {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let key = {
             let alloc = SlotAllocator::new(dev.clone()).unwrap();
-            let (primary, dah, unmined) = case.fresh_indexes();
-            let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah, unmined);
+            let (primary, dah) = case.fresh_indexes();
+            let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah);
             let key = create_tx(&engine, 0x5900, 2);
 
             spend_utxo(&engine, key, 0x5900, 1);
@@ -463,9 +442,8 @@ fn backend_modes_create_spend_and_reopen() {
         };
 
         let recovered_alloc = SlotAllocator::recover(dev.clone()).unwrap();
-        let (primary, dah, unmined) = case.restart_indexes(&*dev, &recovered_alloc);
-        let restarted =
-            create_engine_with_backends(dev.clone(), recovered_alloc, primary, dah, unmined);
+        let (primary, dah) = case.restart_indexes(&*dev, &recovered_alloc);
+        let restarted = create_engine_with_backends(dev.clone(), recovered_alloc, primary, dah);
 
         assert_eq!(restarted.index_len(), 1, "restarted index len for {mode:?}");
         let meta = restarted.read_metadata(&key).unwrap();
@@ -499,8 +477,8 @@ fn backend_modes_secondary_indexes_survive_reopen() {
 
         let (unmined_key, dah_key) = {
             let alloc = SlotAllocator::new(dev.clone()).unwrap();
-            let (primary, dah, unmined) = case.fresh_indexes();
-            let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah, unmined);
+            let (primary, dah) = case.fresh_indexes();
+            let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah);
             let unmined_key = create_tx(&engine, UNMINED_TX_N, 2);
             let dah_key = create_mined_tx(&engine, MINED_TX_N, 2, MINED_TX_N, 2000);
 
@@ -530,8 +508,8 @@ fn backend_modes_secondary_indexes_survive_reopen() {
 
             assert!(
                 !engine
-                    .unmined_index()
-                    .range_query(u32::MAX)
+                    .mined_index()
+                    .collect_unmined_keys_below(u32::MAX)
                     .contains(&dah_key),
                 "mined tx should not be in unmined index for {mode:?}"
             );
@@ -541,8 +519,8 @@ fn backend_modes_secondary_indexes_survive_reopen() {
         };
 
         let alloc = SlotAllocator::recover(dev.clone()).unwrap();
-        let (primary, dah, unmined) = case.restart_indexes(&*dev, &alloc);
-        let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah, unmined);
+        let (primary, dah) = case.restart_indexes(&*dev, &alloc);
+        let engine = create_engine_with_backends(dev.clone(), alloc, primary, dah);
 
         assert_unmined_contains(
             &engine,
@@ -617,8 +595,8 @@ fn engine_lifecycle_for_backend(mode: IndexBackendMode) {
     let case = BackendCase::new(mode.clone());
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
-    let (primary, dah, unmined) = case.fresh_indexes();
-    let engine = create_engine_with_backends(dev, alloc, primary, dah, unmined);
+    let (primary, dah) = case.fresh_indexes();
+    let engine = create_engine_with_backends(dev, alloc, primary, dah);
 
     let key = create_tx(&engine, TX_N, UTXO_COUNT as usize);
     assert!(engine.lookup(&key).is_some(), "created on {mode:?}");
@@ -1411,7 +1389,12 @@ fn delete_cleans_secondary_indexes() {
     let key = create_tx(&engine, 1, 2);
 
     // Should be in unmined index (created without block info)
-    assert!(!engine.unmined_index().range_query(u32::MAX).is_empty());
+    assert!(
+        !engine
+            .mined_index()
+            .collect_unmined_keys_below(u32::MAX)
+            .is_empty()
+    );
 
     engine
         .delete(&DeleteRequest {
@@ -1421,7 +1404,12 @@ fn delete_cleans_secondary_indexes() {
         .unwrap();
 
     // Secondary indexes should be clean
-    assert!(engine.unmined_index().range_query(u32::MAX).is_empty());
+    assert!(
+        engine
+            .mined_index()
+            .collect_unmined_keys_below(u32::MAX)
+            .is_empty()
+    );
     assert!(engine.dah_index().range_query(u32::MAX).is_empty());
 }
 
@@ -1595,7 +1583,6 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
             alloc,
             PrimaryBackend::new_in_memory(10_000).unwrap(),
             DahBackend::new_in_memory(),
-            UnminedBackend::new_in_memory(),
         );
 
         // Mix of states: an unmined tx with one spent slot, a mined tx
@@ -1666,13 +1653,7 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
         "unmined rebuild must succeed on a healthy device"
     );
 
-    let engine = create_engine_with_backends(
-        dev.clone(),
-        alloc,
-        primary,
-        secondaries.dah,
-        secondaries.unmined,
-    );
+    let engine = create_engine_with_backends(dev.clone(), alloc, primary, secondaries.dah);
 
     // The record fields the device scan restores from record headers must
     // match the pre-shutdown footers exactly, read back through the rebuilt
@@ -1734,8 +1715,8 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
     assert_dah_contains(&engine, mined_key, EXPECTED_DAH, "rebuilt DAH index");
     assert!(
         !engine
-            .unmined_index()
-            .range_query(u32::MAX)
+            .mined_index()
+            .collect_unmined_keys_below(u32::MAX)
             .contains(&mined_key),
         "mined tx must not re-register as unmined"
     );
@@ -1754,9 +1735,9 @@ fn snapshot_deletion_with_corrupt_header_primary_recovers_secondary_degrades() {
     // Issue #14 / B-04 companion: when the snapshot is lost AND a record
     // header on the device is CRC-corrupt, the PRIMARY device-scan rebuild must
     // NOT crash-loop the store — it skips the corrupt record (loudly) and
-    // recovers every other record. The SECONDARY rebuild over the same device
-    // stays fail-closed and degrades explicitly (ERR_INDEX_DEGRADED) rather
-    // than silently serving an incomplete DAH/unmined view.
+    // recovers every other record. The SECONDARY (DAH) rebuild over the same
+    // device stays fail-closed and degrades explicitly (ERR_INDEX_DEGRADED)
+    // rather than silently serving an incomplete DAH view.
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let dir = TempDir::new().unwrap();
     let snap_path = dir.path().join("index.snap");
@@ -1768,7 +1749,6 @@ fn snapshot_deletion_with_corrupt_header_primary_recovers_secondary_degrades() {
             alloc,
             PrimaryBackend::new_in_memory(10_000).unwrap(),
             DahBackend::new_in_memory(),
-            UnminedBackend::new_in_memory(),
         );
         for n in 0..3u32 {
             create_tx(&engine, 0x7200 + n, 2);
@@ -1830,18 +1810,17 @@ fn snapshot_deletion_with_corrupt_header_primary_recovers_secondary_degrades() {
     }
 
     // The secondary rebuild over the same corrupt device must degrade
-    // explicitly (flags false, empty fallbacks gated by
-    // ERR_INDEX_DEGRADED) — not silently drop the corrupt record.
+    // explicitly (DAH flag false, empty fallback gated by
+    // ERR_INDEX_DEGRADED) — not silently drop the corrupt record. Task 16e
+    // removed the former sibling `unmined_index` secondary this rebuild used
+    // to also cover: `unmined_ok` is now unconditionally `true` (mined/unmined
+    // state is sourced from the independently-recovered `ShardedMinedIndex`,
+    // not this device-scan rebuild).
     let outcome = rebuild_in_memory_secondaries(&*dev, &alloc);
     assert!(!outcome.status.dah_ok, "DAH must be flagged degraded");
     assert!(
-        !outcome.status.unmined_ok,
-        "unmined must be flagged degraded"
+        outcome.status.unmined_ok,
+        "unmined_ok is unconditionally true post-16e"
     );
     assert_eq!(outcome.dah.len(), 0, "degraded DAH fallback must be empty");
-    assert_eq!(
-        outcome.unmined.len(),
-        0,
-        "degraded unmined fallback must be empty"
-    );
 }

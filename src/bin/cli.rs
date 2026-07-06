@@ -1360,7 +1360,7 @@ fn cmd_export_index(
     json: bool,
 ) -> Result<(), CliError> {
     use teraslab::config::{IndexBackendMode, ServerConfig};
-    use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, UnminedBackend, migration};
+    use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, migration};
 
     let cfg = ServerConfig::load(config_path).map_err(CliError::Other)?;
     let stats = match cfg.index.backend {
@@ -1378,17 +1378,12 @@ fn cmd_export_index(
                 &cfg.index.redb_dah_path,
                 cfg.index.redb_cache_size,
             )?);
-            let unmined =
-                UnminedBackend::OnDisk(teraslab::index::redb_unmined::RedbUnminedIndex::open(
-                    &cfg.index.redb_unmined_path,
-                    cfg.index.redb_cache_size,
-                )?);
-            migration::export_index(&primary, &dah, &unmined, output)?
+            migration::export_index(&primary, &dah, output)?
         }
         IndexBackendMode::Memory => {
-            let (sharded, dah, unmined, flags) =
+            let (sharded, dah, flags) =
                 ShardedIndex::restore_all(&cfg.index_snapshot_path, cfg.index.index_shards)?;
-            if flags.dah_needs_rebuild || flags.unmined_needs_rebuild {
+            if flags.dah_needs_rebuild {
                 return Err(CliError::Other(
                     "the snapshot's secondary index sections need a device-scan rebuild; \
                      start the server once and shut it down cleanly, then retry"
@@ -1401,12 +1396,7 @@ fn cmd_export_index(
                  before exporting",
                 cfg.index_snapshot_path.display()
             );
-            migration::export_index_sharded(
-                &sharded,
-                &DahBackend::from(dah),
-                &UnminedBackend::from(unmined),
-                output,
-            )?
+            migration::export_index_sharded(&sharded, &DahBackend::from(dah), output)?
         }
         IndexBackendMode::FileBacked => {
             return Err(CliError::Other(
@@ -1423,15 +1413,13 @@ fn cmd_export_index(
                 "output": output.display().to_string(),
                 "primary_entries": stats.primary_entries,
                 "dah_entries": stats.dah_entries,
-                "unmined_entries": stats.unmined_entries,
             })
         );
     } else {
         println!(
-            "exported {} primary, {} DAH, {} unmined entries to {}",
+            "exported {} primary, {} DAH entries to {}",
             stats.primary_entries,
             stats.dah_entries,
-            stats.unmined_entries,
             output.display()
         );
     }
@@ -1464,9 +1452,9 @@ fn cmd_import_index(
         ));
     }
 
-    let (primary, dah, unmined, stats) = migration::import_index(&cfg.index, input)?;
+    let (primary, dah, stats) = migration::import_index(&cfg.index, input)?;
     if matches!(cfg.index.backend, IndexBackendMode::Memory) {
-        primary.snapshot_all(&dah, &unmined, &cfg.index_snapshot_path)?;
+        primary.snapshot_all(&dah, &cfg.index_snapshot_path)?;
     }
 
     if json {
@@ -1476,15 +1464,13 @@ fn cmd_import_index(
                 "input": input.display().to_string(),
                 "primary_entries": stats.primary_entries,
                 "dah_entries": stats.dah_entries,
-                "unmined_entries": stats.unmined_entries,
             })
         );
     } else {
         println!(
-            "imported {} primary, {} DAH, {} unmined entries from {}",
+            "imported {} primary, {} DAH entries from {}",
             stats.primary_entries,
             stats.dah_entries,
-            stats.unmined_entries,
             input.display()
         );
         println!("verify the counts above before restarting the server");
@@ -1519,7 +1505,7 @@ fn cmd_repair(config_path: &std::path::Path, json: bool) -> Result<(), CliError>
             ShardedIndex::from_single(PrimaryBackend::restore_redb(&cfg.index)?)
         }
         IndexBackendMode::Memory => {
-            let (sharded, _dah, _unmined, _flags) =
+            let (sharded, _dah, _flags) =
                 ShardedIndex::restore_all(&cfg.index_snapshot_path, cfg.index.index_shards)?;
             sharded
         }

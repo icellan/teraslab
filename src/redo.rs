@@ -482,7 +482,10 @@ const OP_SET_CONFLICTING: u8 = 12;
 const OP_SET_LOCKED: u8 = 13;
 const OP_PRESERVE_UNTIL: u8 = 14;
 const OP_MARK_LONGEST_CHAIN: u8 = 15;
-const OP_SECONDARY_UNMINED_UPDATE: u8 = 16;
+// Opcode 16 was `OP_SECONDARY_UNMINED_UPDATE` (retired, Task 16e — the unmined
+// secondary index is gone; mined/unmined state is redo-durable via
+// `SetMinedBatch` on the `ShardedMinedIndex`. Greenfield — no back-compat
+// decoding). Do not reuse 16 without care.
 const OP_SECONDARY_DAH_UPDATE: u8 = 17;
 const OP_ALLOCATE_REGION: u8 = 18;
 const OP_FREE_REGION: u8 = 19;
@@ -942,17 +945,6 @@ pub enum RedoOp {
         /// entry are correctly observed as idempotent.
         generation: u32,
     },
-    /// Two-phase durability intent record for the unmined secondary index.
-    ///
-    /// Appended + fsynced BEFORE the redb secondary index transaction is
-    /// committed. On crash recovery, the replay path checks the primary
-    /// index's current `unmined_since` and only reapplies the secondary
-    /// update if it is stale, ensuring idempotency.
-    SecondaryUnminedUpdate {
-        tx_key: TxKey,
-        old_height: u32,
-        new_height: u32,
-    },
     /// Two-phase durability intent record for the DAH secondary index.
     ///
     /// Appended + fsynced BEFORE the redb secondary index transaction is
@@ -1160,7 +1152,6 @@ impl RedoOp {
             RedoOp::SetLocked { .. } => OP_SET_LOCKED,
             RedoOp::PreserveUntil { .. } => OP_PRESERVE_UNTIL,
             RedoOp::MarkOnLongestChain { .. } => OP_MARK_LONGEST_CHAIN,
-            RedoOp::SecondaryUnminedUpdate { .. } => OP_SECONDARY_UNMINED_UPDATE,
             RedoOp::SecondaryDahUpdate { .. } => OP_SECONDARY_DAH_UPDATE,
             RedoOp::AllocateRegion { .. } => OP_ALLOCATE_REGION,
             RedoOp::FreeRegion { .. } => OP_FREE_REGION,
@@ -1201,7 +1192,6 @@ impl RedoOp {
             | RedoOp::SetLocked { tx_key, .. }
             | RedoOp::PreserveUntil { tx_key, .. }
             | RedoOp::MarkOnLongestChain { tx_key, .. }
-            | RedoOp::SecondaryUnminedUpdate { tx_key, .. }
             | RedoOp::SecondaryDahUpdate { tx_key, .. }
             | RedoOp::CompensateUnsetMined { tx_key, .. }
             | RedoOp::CompensateReassign { tx_key, .. }
@@ -1296,7 +1286,6 @@ impl RedoOp {
             | RedoOp::RemoveConflictingChild { .. }
             | RedoOp::AppendDeletedChild { .. }
             | RedoOp::SetLocked { .. }
-            | RedoOp::SecondaryUnminedUpdate { .. }
             | RedoOp::SecondaryDahUpdate { .. }
             | RedoOp::CompensateReassign { .. }
             | RedoOp::CompensatePrune { .. }
@@ -1357,7 +1346,7 @@ impl RedoOp {
             RedoOp::SetLocked { .. } => 32 + 1,
             RedoOp::PreserveUntil { .. } => 32 + 4,
             RedoOp::MarkOnLongestChain { .. } => 32 + 1 + 4 + 4 + 4,
-            RedoOp::SecondaryUnminedUpdate { .. } | RedoOp::SecondaryDahUpdate { .. } => 32 + 4 + 4,
+            RedoOp::SecondaryDahUpdate { .. } => 32 + 4 + 4,
             RedoOp::AllocateRegion { .. } | RedoOp::FreeRegion { .. } => 8 + 8 + 1,
             RedoOp::HashtableResizeBegin { tmp_path_bytes, .. } => 8 + 4 + tmp_path_bytes.len(),
             RedoOp::HashtableResizeCommit { .. } => 8,
@@ -1663,12 +1652,7 @@ impl RedoOp {
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&generation.to_le_bytes());
             }
-            RedoOp::SecondaryUnminedUpdate {
-                tx_key,
-                old_height,
-                new_height,
-            }
-            | RedoOp::SecondaryDahUpdate {
+            RedoOp::SecondaryDahUpdate {
                 tx_key,
                 old_height,
                 new_height,
@@ -2193,15 +2177,6 @@ impl RedoOp {
                     current_block_height: u32::from_le_bytes(data[33..37].try_into().unwrap()),
                     block_height_retention: u32::from_le_bytes(data[37..41].try_into().unwrap()),
                     generation: u32::from_le_bytes(data[41..45].try_into().unwrap()),
-                })
-            }
-            OP_SECONDARY_UNMINED_UPDATE if data.len() >= 40 => {
-                let mut txid = [0u8; 32];
-                txid.copy_from_slice(&data[..32]);
-                Some(RedoOp::SecondaryUnminedUpdate {
-                    tx_key: TxKey { txid },
-                    old_height: u32::from_le_bytes(data[32..36].try_into().unwrap()),
-                    new_height: u32::from_le_bytes(data[36..40].try_into().unwrap()),
                 })
             }
             OP_SECONDARY_DAH_UPDATE if data.len() >= 40 => {
@@ -5485,11 +5460,6 @@ mod tests {
                 block_height_retention: 2,
                 generation: 3,
             },
-            RedoOp::SecondaryUnminedUpdate {
-                tx_key: k,
-                old_height: 1,
-                new_height: 2,
-            },
             RedoOp::SecondaryDahUpdate {
                 tx_key: k,
                 old_height: 1,
@@ -6188,11 +6158,6 @@ mod tests {
                 current_block_height: 600,
                 block_height_retention: 288,
                 generation: 1,
-            },
-            RedoOp::SecondaryUnminedUpdate {
-                tx_key: test_key(15),
-                old_height: 0,
-                new_height: 500,
             },
             RedoOp::SecondaryDahUpdate {
                 tx_key: test_key(16),
@@ -7578,25 +7543,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_secondary_unmined_update() {
-        assert_round_trip(RedoOp::SecondaryUnminedUpdate {
-            tx_key: make_txid(0x70),
-            old_height: 0,
-            new_height: 500,
-        });
-        assert_round_trip(RedoOp::SecondaryUnminedUpdate {
-            tx_key: make_txid(0x71),
-            old_height: 500,
-            new_height: 0,
-        });
-        assert_round_trip(RedoOp::SecondaryUnminedUpdate {
-            tx_key: make_txid(0x72),
-            old_height: 100,
-            new_height: 200,
-        });
-    }
-
-    #[test]
     fn round_trip_secondary_dah_update() {
         assert_round_trip(RedoOp::SecondaryDahUpdate {
             tx_key: make_txid(0x73),
@@ -7821,8 +7767,8 @@ mod tests {
                 old_height: 0,
                 new_height: 100,
             },
-            RedoOp::SecondaryUnminedUpdate {
-                tx_key: test_key(1),
+            RedoOp::SecondaryDahUpdate {
+                tx_key: test_key(2),
                 old_height: 0,
                 new_height: 500,
             },

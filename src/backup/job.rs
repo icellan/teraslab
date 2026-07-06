@@ -682,7 +682,7 @@ mod tests {
     use super::*;
     use crate::backup::manifest::Manifest;
     use crate::device::{BlockDevice, MemoryDevice};
-    use crate::index::{DahIndex, Index, UnminedIndex};
+    use crate::index::{DahIndex, Index};
     use crate::locks::StripedLocks;
     use crate::ops::create::CreateRequest;
     use crate::ops::engine::Engine;
@@ -702,7 +702,6 @@ mod tests {
             seg,
             StripedLocks::new(256),
             DahIndex::new(),
-            UnminedIndex::new(),
         )
     }
 
@@ -717,7 +716,6 @@ mod tests {
             slot,
             StripedLocks::new(256),
             DahIndex::new(),
-            UnminedIndex::new(),
         )
     }
 

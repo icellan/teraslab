@@ -6,18 +6,17 @@
 //!
 //! ## Import atomicity (R-047)
 //!
-//! The redb backend stores its three indexes (primary, DAH, unmined) in
-//! three independent files at [`IndexConfig::redb_path`],
-//! [`IndexConfig::redb_dah_path`], and [`IndexConfig::redb_unmined_path`].
+//! The redb backend stores its two indexes (primary, DAH) in two independent
+//! files at [`IndexConfig::redb_path`] and [`IndexConfig::redb_dah_path`].
 //! redb has no cross-file transaction support, so a crash midway through
 //! [`import_index`] could otherwise leave the on-disk state in a partial
-//! shape — primary fully populated, DAH empty, unmined empty (or any
-//! permutation). On the next startup the partial state would be opened
-//! as if it were complete, producing silent index inconsistency.
+//! shape — primary fully populated, DAH empty (or vice versa). On the next
+//! startup the partial state would be opened as if it were complete,
+//! producing silent index inconsistency.
 //!
 //! To prevent this, [`import_index`] writes a sentinel file at
 //! [`import_sentinel_path`] BEFORE opening the first redb backend and
-//! removes it ONLY after all three batch inserts have committed. Startup
+//! removes it ONLY after both batch inserts have committed. Startup
 //! consults [`import_in_progress`] before opening the redb files and
 //! refuses to start while the sentinel exists, so the operator must
 //! either re-run the import (which overwrites the partial state) or
@@ -34,20 +33,22 @@ use crate::index::hashtable::{TxIndexEntry, TxKey};
 
 use crate::index::redb_dah::RedbDahIndex;
 use crate::index::redb_primary::RedbPrimary;
-use crate::index::redb_unmined::RedbUnminedIndex;
-use crate::index::secondary_backend::{DahBackend, UnminedBackend};
-use crate::index::unmined_index::UnminedIndex;
+use crate::index::secondary_backend::DahBackend;
 use crate::index::{Index, IndexError};
 
 /// Suffix appended to [`IndexConfig::redb_path`] to derive the
 /// in-progress sentinel file. The sentinel is written by
 /// [`import_index`] before the first redb commit and removed only after
-/// all three commits succeed.
+/// both commits succeed.
 const IMPORT_SENTINEL_SUFFIX: &str = ".import-in-progress";
 
 /// Streaming migration-file magic (`TeraSlab Migration Index`).
 const PORTABLE_MAGIC: [u8; 4] = *b"TSMI";
-const PORTABLE_VERSION: u32 = 2;
+/// Bumped to 3 (Task 16e): the unmined secondary index — and its section of
+/// this format — was removed (mined/unmined state is now sourced from the
+/// authoritative `ShardedMinedIndex`, not a portable-migrated secondary
+/// index). Greenfield: no reader for version 2 files is kept.
+const PORTABLE_VERSION: u32 = 3;
 const PORTABLE_MAX_COUNT: u64 = 1 << 30;
 const PORTABLE_PRIMARY_ENTRY_SIZE: usize = 45;
 const PORTABLE_SECONDARY_ENTRY_SIZE: usize = 36;
@@ -141,8 +142,6 @@ pub struct ExportStats {
     pub primary_entries: usize,
     /// Number of DAH entries exported.
     pub dah_entries: usize,
-    /// Number of unmined entries exported.
-    pub unmined_entries: usize,
 }
 
 /// Statistics from an import operation.
@@ -152,8 +151,6 @@ pub struct ImportStats {
     pub primary_entries: usize,
     /// Number of DAH entries imported.
     pub dah_entries: usize,
-    /// Number of unmined entries imported.
-    pub unmined_entries: usize,
 }
 
 /// Export all index data to a portable migration file.
@@ -162,7 +159,7 @@ pub struct ImportStats {
 /// backend-agnostic format:
 ///
 /// `[magic "TSMI"][version u32][primary_count u64][dah_count u64]`
-/// `[unmined_count u64][primary entries][dah entries][unmined entries][crc32]`.
+/// `[primary entries][dah entries][crc32]`.
 ///
 /// The fixed-size entries intentionally mirror the existing snapshot payload
 /// layout, but this writer emits each entry directly from the backend iterator
@@ -170,11 +167,9 @@ pub struct ImportStats {
 pub fn export_index(
     primary: &PrimaryBackend,
     dah: &DahBackend,
-    unmined: &UnminedBackend,
     path: &std::path::Path,
 ) -> Result<ExportStats, IndexError> {
-    let declared =
-        PortableCounts::new(primary.len() as u64, dah.len() as u64, unmined.len() as u64)?;
+    let declared = PortableCounts::new(primary.len() as u64, dah.len() as u64)?;
     let tmp_path = path.with_extension("tmp");
     let file = File::create(&tmp_path)?;
     let mut writer = BufWriter::new(file);
@@ -200,17 +195,6 @@ pub fn export_index(
     }
     ensure_export_count("dah", declared.dah_usize()?, dah_entries)?;
 
-    let mut unmined_entries = 0usize;
-    for (height, key) in unmined.iter() {
-        write_tracked(
-            &mut writer,
-            &mut hasher,
-            &encode_secondary_entry(height, key),
-        )?;
-        unmined_entries += 1;
-    }
-    ensure_export_count("unmined", declared.unmined_usize()?, unmined_entries)?;
-
     writer.write_all(&hasher.finalize().to_le_bytes())?;
     writer.flush()?;
     let file = writer
@@ -224,7 +208,6 @@ pub fn export_index(
     Ok(ExportStats {
         primary_entries,
         dah_entries,
-        unmined_entries,
     })
 }
 
@@ -238,11 +221,10 @@ pub fn export_index(
 pub fn export_index_sharded(
     primary: &crate::index::ShardedIndex,
     dah: &DahBackend,
-    unmined: &UnminedBackend,
     path: &std::path::Path,
 ) -> Result<ExportStats, IndexError> {
     let primary_count = primary.len() as u64;
-    let declared = PortableCounts::new(primary_count, dah.len() as u64, unmined.len() as u64)?;
+    let declared = PortableCounts::new(primary_count, dah.len() as u64)?;
     let tmp_path = path.with_extension("tmp");
     let file = File::create(&tmp_path)?;
     let mut writer = BufWriter::new(file);
@@ -277,17 +259,6 @@ pub fn export_index_sharded(
     }
     ensure_export_count("dah", declared.dah_usize()?, dah_entries)?;
 
-    let mut unmined_entries = 0usize;
-    for (height, key) in unmined.iter() {
-        write_tracked(
-            &mut writer,
-            &mut hasher,
-            &encode_secondary_entry(height, key),
-        )?;
-        unmined_entries += 1;
-    }
-    ensure_export_count("unmined", declared.unmined_usize()?, unmined_entries)?;
-
     writer.write_all(&hasher.finalize().to_le_bytes())?;
     writer.flush()?;
     let file = writer
@@ -301,7 +272,6 @@ pub fn export_index_sharded(
     Ok(ExportStats {
         primary_entries,
         dah_entries,
-        unmined_entries,
     })
 }
 
@@ -311,15 +281,15 @@ pub fn export_index_sharded(
 ///
 /// # Atomicity (R-047)
 ///
-/// For the redb backend the three on-disk files (`redb_path`,
-/// `redb_dah_path`, `redb_unmined_path`) are written under separate
-/// transactions because redb has no cross-file commit. To prevent a
-/// crash mid-import from leaving a partially populated set of files
-/// that the next startup would silently treat as complete, this
-/// function writes a sentinel file via [`import_sentinel_path`] BEFORE
-/// opening the first redb backend and removes it ONLY after all three
-/// batch inserts have committed. Startup consults [`import_in_progress`]
-/// and refuses to open the redb backends while the sentinel exists.
+/// For the redb backend the two on-disk files (`redb_path`,
+/// `redb_dah_path`) are written under separate transactions because redb
+/// has no cross-file commit. To prevent a crash mid-import from leaving
+/// a partially populated set of files that the next startup would
+/// silently treat as complete, this function writes a sentinel file via
+/// [`import_sentinel_path`] BEFORE opening the first redb backend and
+/// removes it ONLY after both batch inserts have committed. Startup
+/// consults [`import_in_progress`] and refuses to open the redb backends
+/// while the sentinel exists.
 ///
 /// On any error during the redb branch the sentinel is intentionally
 /// left in place so the operator notices the partial state on the next
@@ -329,7 +299,7 @@ pub fn export_index_sharded(
 pub fn import_index(
     config: &IndexConfig,
     path: &std::path::Path,
-) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+) -> Result<(PrimaryBackend, DahBackend, ImportStats), IndexError> {
     if is_streaming_migration_file(path)? {
         import_streaming_index(config, path)
     } else {
@@ -340,14 +310,13 @@ pub fn import_index(
 fn import_legacy_snapshot(
     config: &IndexConfig,
     path: &std::path::Path,
-) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+) -> Result<(PrimaryBackend, DahBackend, ImportStats), IndexError> {
     // Compatibility path for pre-streaming `TSIX` snapshots. This still
     // materializes the legacy snapshot by design; new exports use `TSMI`.
-    let (mem_idx, mem_dah, mem_unmined, _flags) = Index::restore_all(path)?;
+    let (mem_idx, mem_dah, _flags) = Index::restore_all(path)?;
 
     let primary_count = mem_idx.len();
     let dah_count = mem_dah.len();
-    let unmined_count = mem_unmined.len();
 
     if config.is_redb() {
         // Write the in-progress sentinel BEFORE opening any redb file so
@@ -367,12 +336,7 @@ fn import_legacy_snapshot(
         let dah_entries: Vec<_> = mem_dah.iter().collect();
         redb_dah.insert_batch(&dah_entries)?;
 
-        let mut redb_unmined =
-            RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size)?;
-        let unmined_entries: Vec<_> = mem_unmined.iter().collect();
-        redb_unmined.insert_batch(&unmined_entries)?;
-
-        // All three backends committed successfully — clear the sentinel.
+        // Both backends committed successfully — clear the sentinel.
         // Each `*_batch` call above commits its own write transaction
         // synchronously, so the on-disk state is durable by the time we
         // reach this point.
@@ -381,11 +345,9 @@ fn import_legacy_snapshot(
         Ok((
             PrimaryBackend::OnDisk(redb_primary),
             DahBackend::OnDisk(redb_dah),
-            UnminedBackend::OnDisk(redb_unmined),
             ImportStats {
                 primary_entries: primary_count,
                 dah_entries: dah_count,
-                unmined_entries: unmined_count,
             },
         ))
     } else {
@@ -393,11 +355,9 @@ fn import_legacy_snapshot(
         Ok((
             PrimaryBackend::InMemory(mem_idx),
             DahBackend::InMemory(mem_dah),
-            UnminedBackend::InMemory(mem_unmined),
             ImportStats {
                 primary_entries: primary_count,
                 dah_entries: dah_count,
-                unmined_entries: unmined_count,
             },
         ))
     }
@@ -407,12 +367,11 @@ fn import_legacy_snapshot(
 struct PortableCounts {
     primary: u64,
     dah: u64,
-    unmined: u64,
 }
 
 impl PortableCounts {
-    fn new(primary: u64, dah: u64, unmined: u64) -> Result<Self, IndexError> {
-        for (name, count) in [("primary", primary), ("dah", dah), ("unmined", unmined)] {
+    fn new(primary: u64, dah: u64) -> Result<Self, IndexError> {
+        for (name, count) in [("primary", primary), ("dah", dah)] {
             if count > PORTABLE_MAX_COUNT {
                 return Err(IndexError::FormatError {
                     detail: format!(
@@ -421,11 +380,7 @@ impl PortableCounts {
                 });
             }
         }
-        Ok(Self {
-            primary,
-            dah,
-            unmined,
-        })
+        Ok(Self { primary, dah })
     }
 
     fn primary_usize(self) -> Result<usize, IndexError> {
@@ -434,10 +389,6 @@ impl PortableCounts {
 
     fn dah_usize(self) -> Result<usize, IndexError> {
         portable_count_to_usize(self.dah, "dah")
-    }
-
-    fn unmined_usize(self) -> Result<usize, IndexError> {
-        portable_count_to_usize(self.unmined, "unmined")
     }
 }
 
@@ -468,7 +419,7 @@ fn is_streaming_migration_file(path: &std::path::Path) -> Result<bool, IndexErro
 fn import_streaming_index(
     config: &IndexConfig,
     path: &std::path::Path,
-) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+) -> Result<(PrimaryBackend, DahBackend, ImportStats), IndexError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut hasher = crc32fast::Hasher::new();
@@ -485,7 +436,7 @@ fn import_streaming_memory<R: Read>(
     mut reader: R,
     mut hasher: crc32fast::Hasher,
     counts: PortableCounts,
-) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+) -> Result<(PrimaryBackend, DahBackend, ImportStats), IndexError> {
     let mut primary = Index::new(counts.primary_usize()?.max(16))?;
     for _ in 0..counts.primary {
         let (key, entry) = read_primary_entry(&mut reader, &mut hasher)?;
@@ -498,22 +449,14 @@ fn import_streaming_memory<R: Read>(
         dah.insert(height, key);
     }
 
-    let mut unmined = UnminedIndex::new();
-    for _ in 0..counts.unmined {
-        let (height, key) = read_secondary_entry(&mut reader, &mut hasher)?;
-        unmined.insert(height, key);
-    }
-
     verify_portable_checksum_and_eof(&mut reader, hasher)?;
 
     Ok((
         PrimaryBackend::InMemory(primary),
         DahBackend::InMemory(dah),
-        UnminedBackend::InMemory(unmined),
         ImportStats {
             primary_entries: counts.primary_usize()?,
             dah_entries: counts.dah_usize()?,
-            unmined_entries: counts.unmined_usize()?,
         },
     ))
 }
@@ -523,7 +466,7 @@ fn import_streaming_redb<R: Read>(
     mut reader: R,
     mut hasher: crc32fast::Hasher,
     counts: PortableCounts,
-) -> Result<(PrimaryBackend, DahBackend, UnminedBackend, ImportStats), IndexError> {
+) -> Result<(PrimaryBackend, DahBackend, ImportStats), IndexError> {
     write_import_sentinel(&config.redb_path).map_err(IndexError::Io)?;
 
     let mut redb_primary = RedbPrimary::open(&config.redb_path, config.redb_cache_size)?;
@@ -532,26 +475,15 @@ fn import_streaming_redb<R: Read>(
     let mut redb_dah = RedbDahIndex::open(&config.redb_dah_path, config.redb_cache_size)?;
     import_secondary_entries_to_dah(&mut reader, &mut hasher, counts.dah, &mut redb_dah)?;
 
-    let mut redb_unmined =
-        RedbUnminedIndex::open(&config.redb_unmined_path, config.redb_cache_size)?;
-    import_secondary_entries_to_unmined(
-        &mut reader,
-        &mut hasher,
-        counts.unmined,
-        &mut redb_unmined,
-    )?;
-
     verify_portable_checksum_and_eof(&mut reader, hasher)?;
     remove_import_sentinel(&config.redb_path).map_err(IndexError::Io)?;
 
     Ok((
         PrimaryBackend::OnDisk(redb_primary),
         DahBackend::OnDisk(redb_dah),
-        UnminedBackend::OnDisk(redb_unmined),
         ImportStats {
             primary_entries: counts.primary_usize()?,
             dah_entries: counts.dah_usize()?,
-            unmined_entries: counts.unmined_usize()?,
         },
     ))
 }
@@ -596,26 +528,6 @@ fn import_secondary_entries_to_dah<R: Read>(
     Ok(())
 }
 
-fn import_secondary_entries_to_unmined<R: Read>(
-    reader: &mut R,
-    hasher: &mut crc32fast::Hasher,
-    count: u64,
-    redb: &mut RedbUnminedIndex,
-) -> Result<(), IndexError> {
-    let mut batch = Vec::with_capacity(batch_capacity(count));
-    for _ in 0..count {
-        batch.push(read_secondary_entry(reader, hasher)?);
-        if batch.len() == IMPORT_BATCH_SIZE {
-            redb.insert_batch(&batch)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        redb.insert_batch(&batch)?;
-    }
-    Ok(())
-}
-
 fn batch_capacity(count: u64) -> usize {
     std::cmp::min(count, IMPORT_BATCH_SIZE as u64) as usize
 }
@@ -629,7 +541,6 @@ fn write_portable_header<W: Write>(
     write_tracked(writer, hasher, &PORTABLE_VERSION.to_le_bytes())?;
     write_tracked(writer, hasher, &counts.primary.to_le_bytes())?;
     write_tracked(writer, hasher, &counts.dah.to_le_bytes())?;
-    write_tracked(writer, hasher, &counts.unmined.to_le_bytes())?;
     Ok(())
 }
 
@@ -657,7 +568,6 @@ fn read_portable_header<R: Read>(
     PortableCounts::new(
         read_u64(reader, hasher, "portable primary count")?,
         read_u64(reader, hasher, "portable dah count")?,
-        read_u64(reader, hasher, "portable unmined count")?,
     )
 }
 
@@ -839,24 +749,19 @@ mod tests {
         dah.insert(100, make_key(1), None).unwrap();
         dah.insert(200, make_key(2), None).unwrap();
 
-        let mut unmined = UnminedBackend::new_in_memory();
-        unmined.insert(500, make_key(3), None).unwrap();
-
         // Export
-        let export_stats = export_index(&primary, &dah, &unmined, &snap_path).unwrap();
+        let export_stats = export_index(&primary, &dah, &snap_path).unwrap();
         assert_eq!(export_stats.primary_entries, 50);
         assert_eq!(export_stats.dah_entries, 2);
-        assert_eq!(export_stats.unmined_entries, 1);
 
         // Import into memory backend
         let config = IndexConfig::default();
-        let (restored_primary, restored_dah, restored_unmined, import_stats) =
+        let (restored_primary, restored_dah, import_stats) =
             import_index(&config, &snap_path).unwrap();
 
         assert_eq!(import_stats.primary_entries, 50);
         assert_eq!(restored_primary.len(), 50);
         assert_eq!(restored_dah.len(), 2);
-        assert_eq!(restored_unmined.len(), 1);
 
         // Verify data — REL-017: full entry equality across the
         // memory→memory round trip, not just `record_offset`.
@@ -881,28 +786,23 @@ mod tests {
         let mut dah = DahBackend::new_in_memory();
         dah.insert(100, make_key(1), None).unwrap();
 
-        let mut unmined = UnminedBackend::new_in_memory();
-        unmined.insert(500, make_key(3), None).unwrap();
-
         // Export
-        export_index(&primary, &dah, &unmined, &snap_path).unwrap();
+        export_index(&primary, &dah, &snap_path).unwrap();
 
         // Import into redb backend
         let config = IndexConfig {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("primary.redb"),
             redb_dah_path: dir.path().join("dah.redb"),
-            redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
-        let (restored_primary, restored_dah, restored_unmined, import_stats) =
+        let (restored_primary, restored_dah, import_stats) =
             import_index(&config, &snap_path).unwrap();
 
         assert_eq!(import_stats.primary_entries, 20);
         assert_eq!(restored_primary.len(), 20);
         assert_eq!(restored_dah.len(), 1);
-        assert_eq!(restored_unmined.len(), 1);
 
         // REL-017: full entry equality across the memory→redb round trip.
         for i in 0..20u64 {
@@ -920,16 +820,14 @@ mod tests {
 
         let primary = PrimaryBackend::new_in_memory(16).unwrap();
         let dah = DahBackend::new_in_memory();
-        let unmined = UnminedBackend::new_in_memory();
 
-        let stats = export_index(&primary, &dah, &unmined, &snap_path).unwrap();
+        let stats = export_index(&primary, &dah, &snap_path).unwrap();
         assert_eq!(stats.primary_entries, 0);
 
         let config = IndexConfig::default();
-        let (p, d, u, _) = import_index(&config, &snap_path).unwrap();
+        let (p, d, _) = import_index(&config, &snap_path).unwrap();
         assert!(p.is_empty());
         assert!(d.is_empty());
-        assert!(u.is_empty());
     }
 
     #[test]
@@ -942,7 +840,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("primary.redb"),
             redb_dah_path: dir.path().join("dah.redb"),
-            redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
@@ -951,14 +848,13 @@ mod tests {
             primary.register(make_key(i), make_entry(i * 100)).unwrap();
         }
         let dah = DahBackend::new_in_memory(); // Use in-memory for simplicity
-        let unmined = UnminedBackend::new_in_memory();
 
         // Export from redb
-        export_index(&primary, &dah, &unmined, &snap_path).unwrap();
+        export_index(&primary, &dah, &snap_path).unwrap();
 
         // Import into memory
         let mem_config = IndexConfig::default();
-        let (restored, _, _, stats) = import_index(&mem_config, &snap_path).unwrap();
+        let (restored, _, stats) = import_index(&mem_config, &snap_path).unwrap();
         assert_eq!(stats.primary_entries, 10);
         assert_eq!(restored.len(), 10);
     }
@@ -973,7 +869,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("src_primary.redb"),
             redb_dah_path: dir.path().join("src_dah.redb"),
-            redb_unmined_path: dir.path().join("src_unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
@@ -992,40 +887,27 @@ mod tests {
         dah.insert(100, make_key(1), None).unwrap();
         dah.insert(200, make_key(2), None).unwrap();
 
-        let mut unmined = UnminedBackend::OnDisk(
-            crate::index::redb_unmined::RedbUnminedIndex::open(
-                &src_config.redb_unmined_path,
-                src_config.redb_cache_size,
-            )
-            .unwrap(),
-        );
-        unmined.insert(500, make_key(3), None).unwrap();
-
         // Export from redb
-        let export_stats = export_index(&primary, &dah, &unmined, &snap_path).unwrap();
+        let export_stats = export_index(&primary, &dah, &snap_path).unwrap();
         assert_eq!(export_stats.primary_entries, 30);
         assert_eq!(export_stats.dah_entries, 2);
-        assert_eq!(export_stats.unmined_entries, 1);
 
         // Import into a different redb
         let dst_config = IndexConfig {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("dst_primary.redb"),
             redb_dah_path: dir.path().join("dst_dah.redb"),
-            redb_unmined_path: dir.path().join("dst_unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
-        let (restored_primary, restored_dah, restored_unmined, import_stats) =
+        let (restored_primary, restored_dah, import_stats) =
             import_index(&dst_config, &snap_path).unwrap();
 
         assert_eq!(import_stats.primary_entries, 30);
         assert_eq!(import_stats.dah_entries, 2);
-        assert_eq!(import_stats.unmined_entries, 1);
 
         assert_eq!(restored_primary.len(), 30);
         assert_eq!(restored_dah.len(), 2);
-        assert_eq!(restored_unmined.len(), 1);
 
         // REL-017: full entry equality across the redb→redb round trip.
         for i in 0..30u64 {
@@ -1045,7 +927,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("stream_src_primary.redb"),
             redb_dah_path: dir.path().join("stream_src_dah.redb"),
-            redb_unmined_path: dir.path().join("stream_src_unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
@@ -1062,19 +943,10 @@ mod tests {
             dah.insert(1_000 + i as u32, make_key(i), None).unwrap();
         }
 
-        let mut unmined = UnminedBackend::OnDisk(
-            RedbUnminedIndex::open(&src_config.redb_unmined_path, src_config.redb_cache_size)
-                .unwrap(),
-        );
-        for i in 9..14u64 {
-            unmined.insert(2_000 + i as u32, make_key(i), None).unwrap();
-        }
-
         crate::index::reset_index_new_call_count();
-        let export_stats = export_index(&primary, &dah, &unmined, &snap_path).unwrap();
+        let export_stats = export_index(&primary, &dah, &snap_path).unwrap();
         assert_eq!(export_stats.primary_entries, 25);
         assert_eq!(export_stats.dah_entries, 9);
-        assert_eq!(export_stats.unmined_entries, 5);
         assert_eq!(
             crate::index::index_new_call_count(),
             0,
@@ -1088,12 +960,11 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("stream_dst_primary.redb"),
             redb_dah_path: dir.path().join("stream_dst_dah.redb"),
-            redb_unmined_path: dir.path().join("stream_dst_unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
 
-        let (restored_primary, restored_dah, restored_unmined, import_stats) =
+        let (restored_primary, restored_dah, import_stats) =
             import_index(&dst_config, &snap_path).unwrap();
         assert_eq!(
             crate::index::index_new_call_count(),
@@ -1103,10 +974,8 @@ mod tests {
 
         assert_eq!(import_stats.primary_entries, 25);
         assert_eq!(import_stats.dah_entries, 9);
-        assert_eq!(import_stats.unmined_entries, 5);
         assert_eq!(restored_primary.len(), 25);
         assert_eq!(restored_dah.len(), 9);
-        assert_eq!(restored_unmined.len(), 5);
         // REL-017: full entry equality across the streaming redb→redb round
         // trip.
         for i in 0..25u64 {
@@ -1130,27 +999,21 @@ mod tests {
         }
         let mut dah = DahIndex::new();
         dah.insert(100, make_key(1));
-        let mut unmined = UnminedIndex::new();
-        unmined.insert(200, make_key(2));
-        primary.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+        primary.snapshot_all(&dah, &snap_path).unwrap();
 
         let config = IndexConfig {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("legacy_primary.redb"),
             redb_dah_path: dir.path().join("legacy_dah.redb"),
-            redb_unmined_path: dir.path().join("legacy_unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
 
-        let (restored_primary, restored_dah, restored_unmined, stats) =
-            import_index(&config, &snap_path).unwrap();
+        let (restored_primary, restored_dah, stats) = import_index(&config, &snap_path).unwrap();
         assert_eq!(stats.primary_entries, 6);
         assert_eq!(stats.dah_entries, 1);
-        assert_eq!(stats.unmined_entries, 1);
         assert_eq!(restored_primary.len(), 6);
         assert_eq!(restored_dah.len(), 1);
-        assert_eq!(restored_unmined.len(), 1);
     }
 
     #[test]
@@ -1187,7 +1050,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // R-047 — sentinel atomicity across the three redb files.
+    // R-047 — sentinel atomicity across the two redb files.
     // -----------------------------------------------------------------------
 
     fn write_minimal_snapshot(snap_path: &std::path::Path) {
@@ -1199,9 +1062,7 @@ mod tests {
         }
         let mut dah = DahBackend::new_in_memory();
         dah.insert(100, make_key(1), None).unwrap();
-        let mut unmined = UnminedBackend::new_in_memory();
-        unmined.insert(500, make_key(2), None).unwrap();
-        export_index(&primary, &dah, &unmined, snap_path).unwrap();
+        export_index(&primary, &dah, snap_path).unwrap();
     }
 
     #[test]
@@ -1218,7 +1079,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("primary.redb"),
             redb_dah_path: dir.path().join("dah.redb"),
-            redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
@@ -1227,10 +1087,9 @@ mod tests {
         assert!(!sentinel.exists(), "sentinel must not exist before import");
         assert!(!import_in_progress(&config));
 
-        let (_p, _d, _u, stats) = import_index(&config, &snap_path).unwrap();
+        let (_p, _d, stats) = import_index(&config, &snap_path).unwrap();
         assert_eq!(stats.primary_entries, 5);
         assert_eq!(stats.dah_entries, 1);
-        assert_eq!(stats.unmined_entries, 1);
 
         assert!(
             !sentinel.exists(),
@@ -1240,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn import_index_transactional_across_three_files() {
+    fn import_index_transactional_across_two_files() {
         // Simulate a crash mid-import by making the DAH path
         // un-openable: pre-create a *directory* at the dah path so
         // `RedbDahIndex::open` (which opens a file) fails. Pre-fix the
@@ -1259,7 +1118,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("primary.redb"),
             redb_dah_path: dah_path.clone(),
-            redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
@@ -1310,7 +1168,6 @@ mod tests {
             backend: IndexBackendMode::Redb,
             redb_path: dir.path().join("primary.redb"),
             redb_dah_path: dah_dir.clone(),
-            redb_unmined_path: dir.path().join("unmined.redb"),
             redb_cache_size: 64 * 1024 * 1024,
             ..IndexConfig::default()
         };
@@ -1327,7 +1184,7 @@ mod tests {
             redb_dah_path: dir.path().join("dah.redb"),
             ..bad_config
         };
-        let (_p, _d, _u, stats) = import_index(&good_config, &snap_path).unwrap();
+        let (_p, _d, stats) = import_index(&good_config, &snap_path).unwrap();
         assert_eq!(stats.primary_entries, 5);
         assert!(
             !import_in_progress(&good_config),

@@ -20,7 +20,7 @@ static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
@@ -53,7 +53,6 @@ fn start_test_server() -> (u16, std::sync::MutexGuard<'static, ()>) {
         alloc,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -400,7 +399,7 @@ fn cli_all_commands_json_valid() {
 #[test]
 fn export_import_index_roundtrip() {
     use teraslab::config::ServerConfig;
-    use teraslab::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey, UnminedBackend};
+    use teraslab::index::{DahBackend, PrimaryBackend, TxIndexEntry, TxKey};
 
     let tmp = tempfile::TempDir::new().unwrap();
 
@@ -424,8 +423,7 @@ fn export_import_index_roundtrip() {
                 .unwrap();
         }
         let dah = DahBackend::new_in_memory();
-        let unmined = UnminedBackend::new_in_memory();
-        primary.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+        primary.snapshot_all(&dah, &snap_path).unwrap();
     }
     let src_cfg_path = tmp.path().join("src.toml");
     std::fs::write(
@@ -463,10 +461,9 @@ fn export_import_index_roundtrip() {
     std::fs::write(
         &dst_cfg_path,
         format!(
-            "[index]\nbackend = \"redb\"\nredb_path = {:?}\nredb_dah_path = {:?}\nredb_unmined_path = {:?}\n",
+            "[index]\nbackend = \"redb\"\nredb_path = {:?}\nredb_dah_path = {:?}\n",
             dst_dir.join("primary.redb"),
             dst_dir.join("dah.redb"),
-            dst_dir.join("unmined.redb"),
         ),
     )
     .unwrap();
@@ -540,7 +537,6 @@ fn cli_restore_roundtrip_offline() {
         seg,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     );
     for i in 0..6u64 {
         let mut txid = [0u8; 32];

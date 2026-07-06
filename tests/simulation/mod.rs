@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::Mutex;
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, DeviceError, MemoryDevice};
-use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey, UnminedBackend};
+use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::*;
 use teraslab::ops::engine::Engine;
@@ -307,19 +307,12 @@ impl SimulatedNode {
         .unwrap();
         let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100_000).unwrap());
         let mut dah = DahBackend::new_in_memory();
-        let mut unmined = UnminedBackend::new_in_memory();
         let mut alloc: teraslab::allocator::BoxedAllocator =
             Box::new(SlotAllocator::new(self.device.clone()).unwrap());
 
-        let stats = recover_all_with_allocator(
-            &*self.device,
-            &redo,
-            &primary,
-            &mut dah,
-            &mut unmined,
-            Some(&mut alloc),
-        )
-        .expect("recovery must not error");
+        let stats =
+            recover_all_with_allocator(&*self.device, &redo, &primary, &mut dah, Some(&mut alloc))
+                .expect("recovery must not error");
         // Replaying the full log over whatever state survived the crash
         // must converge: every entry is Applied or Skipped, never Failed.
         // A Failed entry IS the recovery bug this harness exists to catch.
@@ -336,7 +329,6 @@ impl SimulatedNode {
             alloc,
             StripedLocks::new(1024),
             dah,
-            unmined,
         ));
         engine.set_redo_log(redo_arc.clone());
 

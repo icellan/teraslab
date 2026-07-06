@@ -1,7 +1,6 @@
 //! Preserve secondary index backend.
 //!
-//! Unlike [`DahBackend`](crate::index::secondary_backend::DahBackend) and
-//! [`UnminedBackend`](crate::index::secondary_backend::UnminedBackend), the
+//! Unlike [`DahBackend`](crate::index::secondary_backend::DahBackend), the
 //! preserve index has ONLY an in-memory variant: it is never journaled to the
 //! redo log and never persisted via redb. A crash re-derives it from each
 //! record's authoritative on-device `preserve_until` (see
@@ -14,8 +13,8 @@
 //! sites stay variant-agnostic. The `insert`/`remove` signatures intentionally
 //! mirror [`DahBackend`](crate::index::secondary_backend::DahBackend) —
 //! including the `Option<&Mutex<RedoLog>>` redo argument, which is **ignored**
-//! here — so the two-phase-durability call convention is identical across all
-//! three secondary backends.
+//! here — so the two-phase-durability call convention is identical across
+//! both secondary backends.
 
 use crate::index::IndexError;
 use crate::index::hashtable::TxKey;
@@ -48,8 +47,7 @@ impl Iterator for PreserveIter<'_> {
 /// Preserve (preserve-until) secondary index backend.
 ///
 /// In-memory only (see module docs). Modeled as an enum for parity with
-/// [`DahBackend`](crate::index::secondary_backend::DahBackend) /
-/// [`UnminedBackend`](crate::index::secondary_backend::UnminedBackend).
+/// [`DahBackend`](crate::index::secondary_backend::DahBackend).
 pub enum PreserveBackend {
     /// In-memory BTreeMap + HashMap (the only variant).
     InMemory(PreserveIndex),

@@ -6869,9 +6869,9 @@ pub fn redo_entry_to_replica_op(
                 master_generation: *generation,
             })
         }
-        // Checkpoint and RecoveryProgress are no-ops. SecondaryUnminedUpdate and
-        // SecondaryDahUpdate are local durability-intent records for the
-        // redb secondary indexes — replicas rebuild their secondaries from
+        // Checkpoint and RecoveryProgress are no-ops. SecondaryDahUpdate is a
+        // local durability-intent record for the redb secondary index —
+        // replicas rebuild their secondary from
         // their own metadata replay. AllocateRegion/FreeRegion are local
         // allocator-journal records with no replicated effect — replicas
         // allocate their own regions independently. AppendConflictingChild is
@@ -6890,7 +6890,6 @@ pub fn redo_entry_to_replica_op(
         // divergence. Drop them from the migration delta.
         RedoOp::Checkpoint
         | RedoOp::RecoveryProgress { .. }
-        | RedoOp::SecondaryUnminedUpdate { .. }
         | RedoOp::SecondaryDahUpdate { .. }
         | RedoOp::AppendConflictingChild { .. }
         | RedoOp::AppendDeletedChild { .. }
@@ -9470,7 +9469,6 @@ mod tests {
             alloc,
             crate::locks::StripedLocks::new(64),
             crate::index::DahIndex::new(),
-            crate::index::UnminedIndex::new(),
         )
     }
 
@@ -12158,7 +12156,6 @@ mod tests {
             alloc,
             crate::locks::StripedLocks::new(64),
             crate::index::DahIndex::new(),
-            crate::index::UnminedIndex::new(),
         ));
 
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
@@ -12243,7 +12240,6 @@ mod tests {
             alloc,
             crate::locks::StripedLocks::new(64),
             crate::index::DahIndex::new(),
-            crate::index::UnminedIndex::new(),
         ));
 
         let migration = Arc::new(Mutex::new(MigrationManager::new()));
@@ -12371,7 +12367,6 @@ mod tests {
             alloc,
             crate::locks::StripedLocks::new(64),
             crate::index::DahIndex::new(),
-            crate::index::UnminedIndex::new(),
         ));
 
         let tx_id = {
@@ -12587,7 +12582,6 @@ mod tests {
             alloc,
             crate::locks::StripedLocks::new(64),
             crate::index::DahIndex::new(),
-            crate::index::UnminedIndex::new(),
         ));
 
         // Seed one record on the migrating shard so the migration takes the
@@ -12772,7 +12766,6 @@ mod tests {
             alloc,
             crate::locks::StripedLocks::new(64),
             crate::index::DahIndex::new(),
-            crate::index::UnminedIndex::new(),
         ));
 
         let tx_id = {
@@ -12953,7 +12946,6 @@ mod tests {
             alloc,
             crate::locks::StripedLocks::new(64),
             crate::index::DahIndex::new(),
-            crate::index::UnminedIndex::new(),
         ));
 
         let migration = Arc::new(Mutex::new(MigrationManager::new()));

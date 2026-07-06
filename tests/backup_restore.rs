@@ -25,7 +25,7 @@ use teraslab::backup::restore::restore;
 use teraslab::backup::{BackupParams, BackupProgress, Manifest};
 use teraslab::config::ServerConfig;
 use teraslab::device::{AlignedBuf, BlockDevice, DirectDevice};
-use teraslab::index::{DahIndex, Index, ShardedIndex, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -99,7 +99,6 @@ fn backup_then_restore_round_trips_device_and_records() {
         seg,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     );
 
     let mut txids = Vec::new();
@@ -185,17 +184,11 @@ fn backup_then_restore_round_trips_device_and_records() {
 
     // (3) Record level: recover allocator + index, read every record back.
     let ralloc = SegmentAllocator::recover(rdev.clone()).expect("recover allocator from header");
-    let (rindex, rdah, runmined, _flags) =
+    let (rindex, rdah, _flags) =
         ShardedIndex::restore_all(&rconfig.resolved_index_snapshot_path(), 1)
             .expect("restore index snapshot");
-    let rengine = Engine::new_with_sharded_index(
-        rdev.clone(),
-        rindex,
-        ralloc,
-        StripedLocks::new(256),
-        rdah,
-        runmined,
-    );
+    let rengine =
+        Engine::new_with_sharded_index(rdev.clone(), rindex, ralloc, StripedLocks::new(256), rdah);
     for txid in &txids {
         let (meta, slots) = rengine
             .read_record_snapshot(&TxKey { txid: *txid })
@@ -242,7 +235,6 @@ fn restore_refuses_geometry_mismatch() {
         seg,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     );
     write_record(&engine, 1);
     dev.sync().unwrap();

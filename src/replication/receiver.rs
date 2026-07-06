@@ -2501,7 +2501,7 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::{BlockDevice, MemoryDevice};
-    use crate::index::{DahIndex, Index, TxKey, UnminedIndex};
+    use crate::index::{DahIndex, Index, TxKey};
     use crate::locks::StripedLocks;
 
     fn make_engine() -> Arc<Engine> {
@@ -2515,7 +2515,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ))
     }
 
@@ -2527,14 +2526,7 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let seg = crate::segment_allocator::SegmentAllocator::new(dev.clone(), 256 * 4096).unwrap();
         let index = Index::new(10_000).unwrap();
-        let engine = Engine::new(
-            dev,
-            index,
-            seg,
-            StripedLocks::new(1024),
-            DahIndex::new(),
-            UnminedIndex::new(),
-        );
+        let engine = Engine::new(dev, index, seg, StripedLocks::new(1024), DahIndex::new());
         let log_dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let log = crate::redo::RedoLog::open(log_dev, 0, 4 * 1024 * 1024).unwrap();
@@ -2553,14 +2545,7 @@ mod tests {
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(10_000).unwrap();
-        let mut engine = Engine::new(
-            dev,
-            index,
-            alloc,
-            StripedLocks::new(1024),
-            DahIndex::new(),
-            UnminedIndex::new(),
-        );
+        let mut engine = Engine::new(dev, index, alloc, StripedLocks::new(1024), DahIndex::new());
         engine.set_blob_store(store);
         Arc::new(engine)
     }
@@ -3680,7 +3665,6 @@ mod tests {
             crate::index::sharded::ShardedIndex::from_single(Index::new(10_000).unwrap().into()),
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         let rdev0: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
         let rdev1: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
@@ -5386,7 +5370,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         let log_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
         let log = Arc::new(parking_lot::Mutex::new(
@@ -6823,7 +6806,6 @@ mod tests {
             alloc,
             StripedLocks::new(1024),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         (engine, dev)
     }
@@ -7211,7 +7193,9 @@ mod tests {
         assert_eq!({ meta.generation }, 7);
 
         // Unmined secondary index contains it (QUERY_OLD_UNMINED-style lookup).
-        let unmined_keys = engine.unmined_index().range_query(unmined_since + 1);
+        let unmined_keys = engine
+            .mined_index()
+            .collect_unmined_keys_below(unmined_since + 1);
         assert!(
             unmined_keys.contains(&k),
             "migrated unmined record must be in the unmined index without restart",

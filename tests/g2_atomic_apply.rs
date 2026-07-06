@@ -49,7 +49,7 @@ use std::thread;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -74,7 +74,6 @@ fn build_engine() -> Arc<Engine> {
         // through one mutex. Using 64 stripes matches production sizing.
         StripedLocks::new(64),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 

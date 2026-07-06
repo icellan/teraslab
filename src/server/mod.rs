@@ -1716,7 +1716,7 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::{BlockDevice, MemoryDevice};
-    use crate::index::{DahIndex, Index, UnminedIndex};
+    use crate::index::{DahIndex, Index};
     use crate::locks::StripedLocks;
 
     #[test]
@@ -1780,7 +1780,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         )
     }
 
@@ -2605,7 +2604,6 @@ mod tests {
             ShardedIndex::from_single(Index::new(1024).unwrap().into()),
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         engine.set_placement_strategy(crate::subdevice::PlacementStrategy::Txid);
         engine

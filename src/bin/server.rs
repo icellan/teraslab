@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use teraslab::config::IndexBackendMode;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice};
-use teraslab::index::{DahBackend, ShardedIndex, UnminedBackend};
+use teraslab::index::{DahBackend, ShardedIndex};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
     AllocatorMetrics, ClusterAuthMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics,
@@ -32,10 +32,9 @@ use teraslab::server::dispatch::{SecondaryStatus, set_secondary_status};
 use teraslab::server::http::{HttpState, start_http_server};
 use teraslab::server::startup::{
     AllocatorOrigin, SecondaryLoadOutcome, apply_packed_mode, check_replay_tolerance_with_cap,
-    fallback_dah_index, fallback_unmined_index, load_primary_index_file_backed,
-    load_primary_index_redb, load_sharded_index_in_memory, load_sharded_index_in_memory_multi,
-    open_mandatory_redo_log, rebuild_in_memory_secondaries, recover_or_create_boxed_allocator,
-    secondaries_from_pair,
+    fallback_dah_index, load_primary_index_file_backed, load_primary_index_redb,
+    load_sharded_index_in_memory, load_sharded_index_in_memory_multi, open_mandatory_redo_log,
+    rebuild_in_memory_secondaries, recover_or_create_boxed_allocator, secondaries_from_pair,
 };
 use teraslab::storage::blobstore::{BlobStore, FileBlobStore};
 
@@ -843,194 +842,125 @@ fn main() {
             )
         }
     };
-    let load_outcome: (ShardedIndex, SecondaryLoadOutcome) = if config.index.backend
-        == IndexBackendMode::Redb
-    {
-        // ReDB on-disk backend
-        if index_shards > 1 {
-            tracing::warn!(
-                index_shards,
-                "index_shards={index_shards} not yet supported for the redb backend; \
+    let load_outcome: (ShardedIndex, SecondaryLoadOutcome) =
+        if config.index.backend == IndexBackendMode::Redb {
+            // ReDB on-disk backend
+            if index_shards > 1 {
+                tracing::warn!(
+                    index_shards,
+                    "index_shards={index_shards} not yet supported for the redb backend; \
                  using 1 shard (sharding is implemented for the in-memory backend)",
-            );
-        }
-        let primary = match load_primary_index_redb(&config.index, &*device, &*store_allocators[0])
-        {
-            Ok(idx) => {
-                tracing::info!(entries = idx.len(), "redb primary index opened");
-                idx
+                );
             }
-            Err(e) => {
-                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                std::process::exit(1);
-            }
-        };
-        // Open the redb DAH index. Failure is degraded readiness, NOT an
-        // empty start: the dispatch readiness gate rejects DAH-dependent
-        // endpoints with ERR_INDEX_DEGRADED.
-        let (dah, dah_ok) = match teraslab::index::redb_dah::RedbDahIndex::open(
-            &config.index.redb_dah_path,
-            config.index.redb_cache_size,
-        ) {
-            Ok(idx) => (DahBackend::OnDisk(idx), true),
-            Err(e) => (fallback_dah_index("DAH", e), false),
-        };
-        let (unmined, unmined_ok) = match teraslab::index::redb_unmined::RedbUnminedIndex::open(
-            &config.index.redb_unmined_path,
-            config.index.redb_cache_size,
-        ) {
-            Ok(idx) => (UnminedBackend::OnDisk(idx), true),
-            Err(e) => (fallback_unmined_index("unmined", e), false),
-        };
-        (
-            ShardedIndex::from_single(primary),
-            SecondaryLoadOutcome {
-                dah,
-                unmined,
-                status: SecondaryStatus { dah_ok, unmined_ok },
-            },
-        )
-    } else if config.index.backend == IndexBackendMode::FileBacked {
-        // File-backed mmap backend
-        if index_shards > 1 {
-            tracing::warn!(
-                index_shards,
-                "index_shards={index_shards} not yet supported for the file_backed backend; \
+            let primary =
+                match load_primary_index_redb(&config.index, &*device, &*store_allocators[0]) {
+                    Ok(idx) => {
+                        tracing::info!(entries = idx.len(), "redb primary index opened");
+                        idx
+                    }
+                    Err(e) => {
+                        tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                        std::process::exit(1);
+                    }
+                };
+            // Open the redb DAH index. Failure is degraded readiness, NOT an
+            // empty start: the dispatch readiness gate rejects DAH-dependent
+            // endpoints with ERR_INDEX_DEGRADED.
+            let (dah, dah_ok) = match teraslab::index::redb_dah::RedbDahIndex::open(
+                &config.index.redb_dah_path,
+                config.index.redb_cache_size,
+            ) {
+                Ok(idx) => (DahBackend::OnDisk(idx), true),
+                Err(e) => (fallback_dah_index("DAH", e), false),
+            };
+            (
+                ShardedIndex::from_single(primary),
+                SecondaryLoadOutcome {
+                    dah,
+                    status: SecondaryStatus {
+                        dah_ok,
+                        unmined_ok: true,
+                    },
+                },
+            )
+        } else if config.index.backend == IndexBackendMode::FileBacked {
+            // File-backed mmap backend
+            if index_shards > 1 {
+                tracing::warn!(
+                    index_shards,
+                    "index_shards={index_shards} not yet supported for the file_backed backend; \
                  using 1 shard (sharding is implemented for the in-memory backend)",
-            );
-        }
-        let fb_path = &config.index.file_backed_path;
-        let primary = match load_primary_index_file_backed(
-            fb_path,
-            config.expected_records,
-            &*device,
-            &*store_allocators[0],
-        ) {
-            Ok(idx) => {
-                tracing::info!(entries = idx.len(), "file-backed index opened");
-                idx
+                );
             }
-            Err(e) => {
-                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                std::process::exit(1);
-            }
-        };
-        // File-backed mode: secondary indexes stay in-memory.
-        let secondaries = rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
-        (ShardedIndex::from_single(primary), secondaries)
-    } else {
-        // In-memory backend (default). Builds a `ShardedIndex` at
-        // `index_shards` directly: the snapshot restore re-shards on a
-        // shard-count mismatch (and loads v1 single-table snapshots), and the
-        // device-scan rebuild routes every scanned entry into its target shard.
-        let snap_path = config.resolved_index_snapshot_path();
-        let snap_path = snap_path.as_path();
-        if snap_path.exists() {
-            match ShardedIndex::restore_all(snap_path, index_shards) {
-                Ok((idx, dah, unmined, flags)) => {
-                    tracing::info!(
-                        entries = idx.len(),
-                        shards = idx.shard_count(),
-                        "index restored from snapshot",
-                    );
-                    let secondaries = if flags.dah_needs_rebuild && flags.unmined_needs_rebuild {
-                        tracing::warn!("both secondary indexes need rebuild (snapshot corrupt)");
-                        rebuild_in_memory_secondaries(&*device, &*store_allocators[0])
-                    } else if flags.dah_needs_rebuild {
-                        tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
-                        // Preserve the intact unmined from the snapshot;
-                        // rebuild only DAH from the device scan. Failure
-                        // marks DAH as degraded but keeps unmined healthy.
-                        match teraslab::index::PrimaryBackend::rebuild_secondary(
-                            &*device,
-                            &*store_allocators[0],
-                        ) {
-                            Ok((rebuilt_dah, _)) => SecondaryLoadOutcome {
-                                dah: DahBackend::from(rebuilt_dah),
-                                unmined: UnminedBackend::from(unmined),
-                                status: SecondaryStatus {
-                                    dah_ok: true,
-                                    unmined_ok: true,
-                                },
-                            },
-                            Err(e) => {
-                                tracing::error!(
-                                    err = %e,
-                                    "DAH rebuild failed — degraded readiness",
-                                );
-                                SecondaryLoadOutcome {
-                                    dah: DahBackend::from(teraslab::index::DahIndex::new()),
-                                    unmined: UnminedBackend::from(unmined),
-                                    status: SecondaryStatus {
-                                        dah_ok: false,
-                                        unmined_ok: true,
-                                    },
-                                }
-                            }
-                        }
-                    } else if flags.unmined_needs_rebuild {
-                        tracing::warn!("unmined index needs rebuild (snapshot corrupt)");
-                        match teraslab::index::PrimaryBackend::rebuild_secondary(
-                            &*device,
-                            &*store_allocators[0],
-                        ) {
-                            Ok((_, rebuilt_unmined)) => SecondaryLoadOutcome {
-                                dah: DahBackend::from(dah),
-                                unmined: UnminedBackend::from(rebuilt_unmined),
-                                status: SecondaryStatus {
-                                    dah_ok: true,
-                                    unmined_ok: true,
-                                },
-                            },
-                            Err(e) => {
-                                tracing::error!(
-                                    err = %e,
-                                    "unmined rebuild failed — degraded readiness",
-                                );
-                                SecondaryLoadOutcome {
-                                    dah: DahBackend::from(dah),
-                                    unmined: UnminedBackend::from(
-                                        teraslab::index::UnminedIndex::new(),
-                                    ),
-                                    status: SecondaryStatus {
-                                        dah_ok: true,
-                                        unmined_ok: false,
-                                    },
-                                }
-                            }
-                        }
-                    } else {
-                        secondaries_from_pair(dah, unmined)
-                    };
-                    (idx, secondaries)
+            let fb_path = &config.index.file_backed_path;
+            let primary = match load_primary_index_file_backed(
+                fb_path,
+                config.expected_records,
+                &*device,
+                &*store_allocators[0],
+            ) {
+                Ok(idx) => {
+                    tracing::info!(entries = idx.len(), "file-backed index opened");
+                    idx
                 }
-                Err(e) => {
-                    tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
-                    let index = match rebuild_primary_from_scan(index_shards) {
-                        Ok(idx) => idx,
-                        Err(e) => {
-                            tracing::error!(err = %e, "FATAL: primary index rebuild failed");
-                            std::process::exit(1);
-                        }
-                    };
-                    let secondaries =
-                        rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
-                    (index, secondaries)
-                }
-            }
-        } else {
-            tracing::info!("no index snapshot found, rebuilding from device");
-            let index = match rebuild_primary_from_scan(index_shards) {
-                Ok(idx) => idx,
                 Err(e) => {
                     tracing::error!(err = %e, "FATAL: primary index rebuild failed");
                     std::process::exit(1);
                 }
             };
+            // File-backed mode: secondary indexes stay in-memory.
             let secondaries = rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
-            (index, secondaries)
-        }
-    };
+            (ShardedIndex::from_single(primary), secondaries)
+        } else {
+            // In-memory backend (default). Builds a `ShardedIndex` at
+            // `index_shards` directly: the snapshot restore re-shards on a
+            // shard-count mismatch (and loads v1 single-table snapshots), and the
+            // device-scan rebuild routes every scanned entry into its target shard.
+            let snap_path = config.resolved_index_snapshot_path();
+            let snap_path = snap_path.as_path();
+            if snap_path.exists() {
+                match ShardedIndex::restore_all(snap_path, index_shards) {
+                    Ok((idx, dah, flags)) => {
+                        tracing::info!(
+                            entries = idx.len(),
+                            shards = idx.shard_count(),
+                            "index restored from snapshot",
+                        );
+                        let secondaries = if flags.dah_needs_rebuild {
+                            tracing::warn!("DAH index needs rebuild (snapshot corrupt)");
+                            rebuild_in_memory_secondaries(&*device, &*store_allocators[0])
+                        } else {
+                            secondaries_from_pair(dah)
+                        };
+                        (idx, secondaries)
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, "index snapshot corrupt, rebuilding from device");
+                        let index = match rebuild_primary_from_scan(index_shards) {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                                std::process::exit(1);
+                            }
+                        };
+                        let secondaries =
+                            rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
+                        (index, secondaries)
+                    }
+                }
+            } else {
+                tracing::info!("no index snapshot found, rebuilding from device");
+                let index = match rebuild_primary_from_scan(index_shards) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        tracing::error!(err = %e, "FATAL: primary index rebuild failed");
+                        std::process::exit(1);
+                    }
+                };
+                let secondaries = rebuild_in_memory_secondaries(&*device, &*store_allocators[0]);
+                (index, secondaries)
+            }
+        };
     // The in-memory backend yields a `ShardedIndex` at the configured shard
     // count directly; the redb / file_backed backends yield a single-shard
     // `ShardedIndex` (sharding for those backends is a deferred follow-up). Both
@@ -1038,7 +968,6 @@ fn main() {
     let (index, secondary_outcome) = load_outcome;
     let SecondaryLoadOutcome {
         dah: mut dah_index,
-        unmined: mut unmined_index,
         status: secondary_status,
     } = secondary_outcome;
     // Install the global readiness flags BEFORE the server begins
@@ -1048,12 +977,6 @@ fn main() {
     if !secondary_status.dah_ok {
         tracing::warn!(
             "secondary readiness: DAH index unavailable — dependent endpoints \
-             will reject with ERR_INDEX_DEGRADED",
-        );
-    }
-    if !secondary_status.unmined_ok {
-        tracing::warn!(
-            "secondary readiness: unmined index unavailable — dependent endpoints \
              will reject with ERR_INDEX_DEGRADED",
         );
     }
@@ -1068,7 +991,6 @@ fn main() {
         "index loaded",
     );
     tracing::info!(entries = dah_index.len(), "DAH index loaded");
-    tracing::info!(entries = unmined_index.len(), "unmined index loaded");
 
     // 3b. Open redo log device (separate file) and run recovery.
     //
@@ -1169,16 +1091,14 @@ fn main() {
         // secondary that needed a device-scan rebuild) is treated as an
         // unclean secondary that requires the full rebuild — matching the
         // pre-B-7 behavior exactly, so no correctness regression.
-        let full_secondary_rebuild = !(config.index.backend == IndexBackendMode::Redb
-            && secondary_status.dah_ok
-            && secondary_status.unmined_ok);
+        let full_secondary_rebuild =
+            !(config.index.backend == IndexBackendMode::Redb && secondary_status.dah_ok);
         match teraslab::recovery::recover_all_multi_store(
             &store_devices,
             &mut store_allocators,
             redo.as_mut_slice(),
             &index,
             &mut dah_index,
-            &mut unmined_index,
             full_secondary_rebuild,
             // Task 16d: DEFER the device-metadata secondary reconcile. The
             // device `block_entry_count` / `unmined_since` / `delete_at_height`
@@ -1337,7 +1257,6 @@ fn main() {
         index,
         locks,
         dah_index,
-        unmined_index,
     );
 
     // Honor the configured create-time store placement strategy (round-robin by
@@ -1515,7 +1434,6 @@ fn main() {
     }
     tracing::info!(
         dah_entries = engine.dah_index().len(),
-        unmined_entries = engine.unmined_index().len(),
         "secondary indexes rebuilt store-authoritatively from the recovered mined index",
     );
 

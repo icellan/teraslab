@@ -26,7 +26,7 @@ use prometheus_parse::{Sample, Scrape, Value};
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{
     AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics,
@@ -137,7 +137,6 @@ fn start_test_http_server() -> (u16, Arc<HttpState>) {
         alloc,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

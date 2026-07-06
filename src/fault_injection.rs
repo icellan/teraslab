@@ -126,9 +126,9 @@ pub enum SyncPoint {
     BeforeCheckpointDataSync,
 
     /// Just before the secondary-index redb transaction commits in
-    /// [`crate::index::redb_dah`] or [`crate::index::redb_unmined`].
-    /// Alias of [`SyncPoint::BeforeIndexCommit`] for readability when
-    /// the test specifically targets the secondary (redb) path.
+    /// [`crate::index::redb_dah`]. Alias of [`SyncPoint::BeforeIndexCommit`]
+    /// for readability when the test specifically targets the secondary
+    /// (redb) path.
     BeforeSecondaryRedbCommit,
 
     /// Just after the redb secondary-index commit returns.

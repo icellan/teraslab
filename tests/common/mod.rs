@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use teraslab::allocator::SlotAllocator;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::metrics::{ThreadHistograms, ThreadMetrics};
 use teraslab::ops::engine::Engine;
@@ -60,7 +60,6 @@ pub fn spawn_write_server() -> WriteServer {
         alloc,
         StripedLocks::new(65536),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     // 512-byte alignment keeps per-entry padding small enough that 256 MiB

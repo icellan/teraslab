@@ -54,15 +54,7 @@ fn public_modules_remain_reachable() {
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let idx = Index::new(1024).unwrap();
     let dah = teraslab::index::DahIndex::new();
-    let unmined = teraslab::index::UnminedIndex::new();
-    let engine = std::sync::Arc::new(Engine::new(
-        dev,
-        idx,
-        alloc,
-        StripedLocks::new(256),
-        dah,
-        unmined,
-    ));
+    let engine = std::sync::Arc::new(Engine::new(dev, idx, alloc, StripedLocks::new(256), dah));
     let cfg = _ServerConfig::default();
     let _server = Server::new(engine, cfg);
     assert_eq!(UTXO_SLOT_SIZE, 73);

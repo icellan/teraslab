@@ -1,12 +1,14 @@
-//! Sharded secondary indexes (DAH and unmined).
+//! Sharded secondary index (DAH).
 //!
-//! The two secondary indexes — [`DahBackend`] (delete-at-height) and
-//! [`UnminedBackend`] (`unmined_since`) — were each guarded by a single global
-//! `parking_lot::Mutex` in the engine. Under high concurrency every `Create`
-//! (→ unmined), `Spend` (→ dah) and `SetMined` (→ both) serialised on those two
-//! mutexes; an A/B test showed the unmined mutex alone cost ~21 % of throughput.
+//! The DAH secondary index ([`DahBackend`], delete-at-height) was guarded by a
+//! single global `parking_lot::Mutex` in the engine. Under high concurrency
+//! every `Spend` (→ dah) and `SetMined` (→ dah) serialised on that mutex — the
+//! former sibling `unmined_since` secondary index carried an even larger cost
+//! (an A/B test showed its mutex alone cost ~21 % of throughput) before it was
+//! removed entirely (Task 16e): mined/unmined state is now sourced from the
+//! authoritative [`crate::index::mined_index::ShardedMinedIndex`] instead.
 //!
-//! [`ShardedSecondary`] removes that contention by spreading the key space
+//! [`ShardedSecondary`] removes the DAH contention by spreading the key space
 //! across `N` independent backends, each behind its own `parking_lot::Mutex`,
 //! mirroring the primary [`crate::index::ShardedIndex`]. Concurrent mutations on
 //! different keys hit independent shard locks.
@@ -39,17 +41,17 @@
 use parking_lot::Mutex;
 
 use crate::index::dah_index::DahRedoEntry;
-use crate::index::secondary_backend::{DahBackend, UnminedBackend};
-use crate::index::unmined_index::UnminedRedoEntry;
+use crate::index::secondary_backend::DahBackend;
 use crate::index::{IndexError, TxKey};
 use crate::redo::RedoLog;
 
-/// Behaviour shared by the two secondary backends so [`ShardedSecondary`] can
-/// drive them generically.
+/// Behaviour a secondary backend must expose so [`ShardedSecondary`] can drive
+/// it generically.
 ///
-/// Implemented for [`DahBackend`] and [`UnminedBackend`]; both expose identical
-/// `insert` / `remove` / `range_query` / `len` / `clear` / `flush_durable`
-/// signatures and differ only in their redo-entry type (routed by `txid`).
+/// Implemented for [`DahBackend`] (currently the sole secondary index — the
+/// former `UnminedBackend` sibling was removed in Task 16e). Kept as a trait
+/// rather than folded directly into `ShardedSecondary<DahBackend>` so a future
+/// secondary index can reuse the sharding wrapper without duplicating it.
 pub trait SecondaryBackend: Send + Sync + 'static {
     /// The redo-entry type replayed by [`Self::replay_redo`].
     type RedoEntry;
@@ -180,78 +182,6 @@ impl SecondaryBackend for DahBackend {
     }
 }
 
-impl SecondaryBackend for UnminedBackend {
-    type RedoEntry = UnminedRedoEntry;
-
-    fn insert(
-        &mut self,
-        height: u32,
-        key: TxKey,
-        redo_log: Option<&Mutex<RedoLog>>,
-    ) -> Result<(), IndexError> {
-        UnminedBackend::insert(self, height, key, redo_log)
-    }
-
-    fn remove(&mut self, key: &TxKey, redo_log: Option<&Mutex<RedoLog>>) -> Result<(), IndexError> {
-        UnminedBackend::remove(self, key, redo_log)
-    }
-
-    fn replay_redo(&mut self, entry: &Self::RedoEntry) -> Result<(), IndexError> {
-        UnminedBackend::replay_redo(self, entry)
-    }
-
-    fn redo_entry_key(entry: &Self::RedoEntry) -> TxKey {
-        TxKey { txid: entry.txid }
-    }
-
-    fn range_query(&self, cutoff: u32) -> Vec<TxKey> {
-        UnminedBackend::range_query(self, cutoff)
-    }
-
-    fn len(&self) -> usize {
-        UnminedBackend::len(self)
-    }
-
-    fn is_empty(&self) -> bool {
-        UnminedBackend::is_empty(self)
-    }
-
-    fn clear(&mut self) -> Result<(), IndexError> {
-        UnminedBackend::clear(self)
-    }
-
-    fn flush_durable(&self) -> Result<(), IndexError> {
-        UnminedBackend::flush_durable(self)
-    }
-
-    fn collect_pairs(&self) -> Vec<(u32, TxKey)> {
-        self.iter().collect()
-    }
-
-    fn is_in_memory(&self) -> bool {
-        matches!(self, UnminedBackend::InMemory(_))
-    }
-
-    fn new_in_memory() -> Self {
-        UnminedBackend::new_in_memory()
-    }
-
-    fn reshard_insert(&mut self, height: u32, key: TxKey) {
-        match self {
-            UnminedBackend::InMemory(idx) => {
-                idx.insert(height, key);
-            }
-            // Unreachable: `shard_in_memory` only builds in-memory shards.
-            UnminedBackend::OnDisk(_) => {
-                tracing::error!(
-                    target: "teraslab::index",
-                    "reshard_insert reached the redb unmined arm; this is unreachable and the entry was dropped",
-                );
-            }
-        }
-    }
-}
-
 /// A sharded secondary index.
 ///
 /// Spreads the key space across `shards.len()` independent backends, each behind
@@ -270,9 +200,6 @@ pub struct ShardedSecondary<B> {
 
 /// Sharded DAH (delete-at-height) secondary index.
 pub type ShardedDahIndex = ShardedSecondary<DahBackend>;
-
-/// Sharded `unmined_since` secondary index.
-pub type ShardedUnminedIndex = ShardedSecondary<UnminedBackend>;
 
 impl ShardedDahIndex {
     /// The current `delete_at_height` recorded for `key`, or `None` if absent.
@@ -558,36 +485,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn sharded_unmined_roundtrips_single_backend() {
-        const N: u64 = 2000;
-        let sharded: ShardedUnminedIndex =
-            ShardedSecondary::shard_in_memory(UnminedBackend::new_in_memory(), 16);
-        let mut reference = UnminedBackend::new_in_memory();
-
-        for i in 0..N {
-            let h = (i as u32 % 500) + 1; // varied heights, all non-zero
-            sharded.insert(h, key(i), None).unwrap();
-            reference.insert(h, key(i), None).unwrap();
-        }
-
-        assert!(sharded.shard_count() > 1, "must actually shard (N>1)");
-        assert_eq!(
-            sharded.len(),
-            reference.len(),
-            "sharded len must equal reference len",
-        );
-        assert_eq!(sharded.len(), N as usize);
-
-        // Every key present at u32::MAX cutoff in both.
-        let sharded_all: HashSet<TxKey> = sharded.range_query(u32::MAX).into_iter().collect();
-        let ref_all: HashSet<TxKey> = reference.range_query(u32::MAX).into_iter().collect();
-        assert_eq!(sharded_all, ref_all);
-        for i in 0..N {
-            assert!(sharded_all.contains(&key(i)), "missing key {i}");
-        }
-    }
-
-    #[test]
     fn sharded_dah_roundtrips_single_backend() {
         const N: u64 = 2000;
         let sharded: ShardedDahIndex =
@@ -666,8 +563,8 @@ mod tests {
     fn concurrent_inserts_lose_nothing() {
         const THREADS: u64 = 16;
         const PER_THREAD: u64 = 4096;
-        let sharded: Arc<ShardedUnminedIndex> = Arc::new(ShardedSecondary::shard_in_memory(
-            UnminedBackend::new_in_memory(),
+        let sharded: Arc<ShardedDahIndex> = Arc::new(ShardedSecondary::shard_in_memory(
+            DahBackend::new_in_memory(),
             16,
         ));
 
@@ -732,8 +629,8 @@ mod tests {
 
     #[test]
     fn clear_empties_all_shards() {
-        let sharded: ShardedUnminedIndex =
-            ShardedSecondary::shard_in_memory(UnminedBackend::new_in_memory(), 16);
+        let sharded: ShardedDahIndex =
+            ShardedSecondary::shard_in_memory(DahBackend::new_in_memory(), 16);
         for i in 0..300u64 {
             sharded.insert(50, key(i), None).unwrap();
         }
@@ -800,9 +697,9 @@ mod tests {
 
     #[test]
     fn replay_redo_routes_by_txid() {
-        let sharded: ShardedUnminedIndex =
-            ShardedSecondary::shard_in_memory(UnminedBackend::new_in_memory(), 16);
-        let entry = UnminedRedoEntry {
+        let sharded: ShardedDahIndex =
+            ShardedSecondary::shard_in_memory(DahBackend::new_in_memory(), 16);
+        let entry = DahRedoEntry {
             txid: key(42).txid,
             old_height: 0,
             new_height: 700,
@@ -812,7 +709,7 @@ mod tests {
         assert_eq!(sharded.range_query(700), vec![key(42)]);
 
         // Replaying the inverse removes it.
-        let undo = UnminedRedoEntry {
+        let undo = DahRedoEntry {
             txid: key(42).txid,
             old_height: 700,
             new_height: 0,

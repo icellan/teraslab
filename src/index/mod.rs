@@ -2,7 +2,8 @@
 //!
 //! - [`Index`]: primary hash index mapping `TxKey` → `TxIndexEntry` (device location)
 //! - [`DahIndex`]: secondary index for `delete_at_height` pruner queries
-//! - [`UnminedIndex`]: secondary index for `unmined_since` pruner queries
+//! - [`ShardedMinedIndex`]: authoritative mined/unmined-state store (also serves
+//!   the `unmined_since` pruner queries the removed `UnminedIndex` used to)
 //! - [`PreserveIndex`]: secondary index for `preserve_until` expiry sweeps
 
 pub mod backend;
@@ -16,11 +17,9 @@ pub mod preserve_backend;
 pub mod preserve_index;
 pub mod redb_dah;
 pub mod redb_primary;
-pub mod redb_unmined;
 pub mod secondary_backend;
 pub mod sharded;
 pub mod sharded_secondary;
-pub mod unmined_index;
 mod util;
 
 pub use backend::PrimaryBackend;
@@ -33,10 +32,9 @@ pub use mined_index::{
 };
 pub use preserve_backend::PreserveBackend;
 pub use preserve_index::PreserveIndex;
-pub use secondary_backend::{DahBackend, UnminedBackend};
+pub use secondary_backend::DahBackend;
 pub use sharded::ShardedIndex;
-pub use sharded_secondary::{ShardedDahIndex, ShardedSecondary, ShardedUnminedIndex};
-pub use unmined_index::{UnminedIndex, UnminedRedoEntry};
+pub use sharded_secondary::{ShardedDahIndex, ShardedSecondary};
 
 #[cfg(test)]
 use crate::allocator::SlotAllocator;
@@ -96,7 +94,6 @@ const SNAPSHOT_VERSION: u32 = 2;
 pub(crate) const PRIMARY_SNAPSHOT_MAGIC: [u8; 4] = SNAPSHOT_MAGIC;
 
 const DAH_SECTION_MAGIC: [u8; 4] = *b"DAHI";
-const UNMINED_SECTION_MAGIC: [u8; 4] = *b"UNMI";
 const SECONDARY_VERSION: u32 = 1;
 const MAX_SNAPSHOT_COUNT: usize = 1 << 30;
 
@@ -145,8 +142,6 @@ pub struct IndexStats {
 pub struct RestoreFlags {
     /// The DAH section was missing or corrupt — rebuild from device scan.
     pub dah_needs_rebuild: bool,
-    /// The unmined section was missing or corrupt — replay redo log or scan.
-    pub unmined_needs_rebuild: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -540,17 +535,11 @@ impl Index {
     // Snapshot all (primary + secondary indexes)
     // -----------------------------------------------------------------------
 
-    /// Snapshot primary index + both secondary indexes to a single file.
-    pub fn snapshot_all(
-        &self,
-        dah: &DahIndex,
-        unmined: &UnminedIndex,
-        path: &std::path::Path,
-    ) -> Result<()> {
+    /// Snapshot primary index + the DAH secondary index to a single file.
+    pub fn snapshot_all(&self, dah: &DahIndex, path: &std::path::Path) -> Result<()> {
         let tmp_path = path.with_extension("tmp");
         let mut data = self.serialize_primary();
         data.extend_from_slice(&serialize_secondary(&DAH_SECTION_MAGIC, dah.iter()));
-        data.extend_from_slice(&serialize_secondary(&UNMINED_SECTION_MAGIC, unmined.iter()));
         std::fs::write(&tmp_path, &data)?;
         let f = std::fs::File::open(&tmp_path)?;
         f.sync_all()?;
@@ -562,19 +551,13 @@ impl Index {
 
     /// Restore all indexes from a snapshot file.
     ///
-    /// Each secondary index section is parsed independently (H6): if the
-    /// DAH section is corrupt, only `dah_needs_rebuild` is set — the
-    /// unmined section is still searched for and parsed. Symmetrically, if
-    /// unmined is corrupt the DAH section is retained. Recovery then only
-    /// rebuilds the sections that actually failed, avoiding a full device
-    /// rescan that would throw away still-valid unmined data.
-    pub fn restore_all(
-        path: &std::path::Path,
-    ) -> Result<(Self, DahIndex, UnminedIndex, RestoreFlags)> {
+    /// If the DAH section is corrupt, `dah_needs_rebuild` is set so the
+    /// caller can rebuild it from a device scan instead of failing outright.
+    pub fn restore_all(path: &std::path::Path) -> Result<(Self, DahIndex, RestoreFlags)> {
         let data = std::fs::read(path)?;
         let (index, primary_end) = Self::deserialize_primary_with_offset(&data)?;
-        let (dah, unmined, flags) = parse_secondary_sections(&data[primary_end..]);
-        Ok((index, dah, unmined, flags))
+        let (dah, flags) = parse_secondary_sections(&data[primary_end..]);
+        Ok((index, dah, flags))
     }
 
     // -----------------------------------------------------------------------
@@ -675,15 +658,14 @@ impl Index {
         Ok(index)
     }
 
-    /// Rebuild secondary indexes by scanning all records on the device.
+    /// Rebuild the DAH secondary index by scanning all records on the device.
     ///
-    /// Returns `(DahIndex, UnminedIndex)` populated from record metadata.
+    /// Returns a [`DahIndex`] populated from record metadata.
     pub fn rebuild_secondary(
         device: &dyn BlockDevice,
         allocator: &dyn crate::allocator::RecordAllocator,
-    ) -> Result<(DahIndex, UnminedIndex)> {
+    ) -> Result<DahIndex> {
         let mut dah = DahIndex::new();
-        let mut unmined = UnminedIndex::new();
         let align = allocator.device_alignment();
         let start = allocator.data_region_start();
         let end = allocator.next_offset();
@@ -756,13 +738,9 @@ impl Index {
 
             let key = TxKey { txid: meta.tx_id };
             let dah_val = { meta.delete_at_height };
-            let unmined_val = { meta.unmined_since };
 
             if dah_val != 0 {
                 dah.insert(dah_val, key);
-            }
-            if unmined_val != 0 {
-                unmined.insert(unmined_val, key);
             }
 
             let record_aligned = (record_size as usize).div_ceil(align) * align;
@@ -776,7 +754,7 @@ impl Index {
             offset += record_aligned as u64;
         }
 
-        Ok((dah, unmined))
+        Ok(dah)
     }
 
     // -----------------------------------------------------------------------
@@ -973,139 +951,54 @@ fn serialize_secondary(magic: &[u8; 4], entries: impl Iterator<Item = (u32, TxKe
     buf
 }
 
-/// Serialize the DAH + unmined secondary sections into the exact byte layout
-/// that [`Index::snapshot_all`] appends after the primary payload (a `DAHI`
-/// section followed by a `UNMI` section). Exposed to the crate so the v2
-/// sharded manifest can write the (unsharded) secondaries once, identically to
-/// the single-table path, and have them round-trip through
-/// [`parse_secondary_sections`].
-pub(crate) fn serialize_secondary_sections(dah: &DahIndex, unmined: &UnminedIndex) -> Vec<u8> {
-    let mut buf = serialize_secondary(&DAH_SECTION_MAGIC, dah.iter());
-    buf.extend_from_slice(&serialize_secondary(&UNMINED_SECTION_MAGIC, unmined.iter()));
-    buf
+/// Serialize the DAH secondary section into the exact byte layout that
+/// [`Index::snapshot_all`] appends after the primary payload (a `DAHI`
+/// section). Exposed to the crate so the v2 sharded manifest can write the
+/// (unsharded) secondary once, identically to the single-table path, and have
+/// it round-trip through [`parse_secondary_sections`].
+pub(crate) fn serialize_secondary_sections(dah: &DahIndex) -> Vec<u8> {
+    serialize_secondary(&DAH_SECTION_MAGIC, dah.iter())
 }
 
-/// Serialize the DAH + unmined secondary sections from already-collected
-/// `(height, key)` pair lists, producing the SAME byte layout as
+/// Serialize the DAH secondary section from an already-collected `(height,
+/// key)` pair list, producing the SAME byte layout as
 /// [`serialize_secondary_sections`].
 ///
 /// Used by the sharded-secondary checkpoint path
 /// ([`crate::index::sharded::ShardedIndex::snapshot_all_concurrent`]): the
-/// sharded wrappers spread entries across `N` shards, so their full contents are
-/// gathered into two pair vectors (each shard locked and released in turn) and
-/// serialized here. Entry ORDER within a section is irrelevant — the format is a
-/// flat `(height, key)` list that [`parse_secondary_sections`] re-inserts
+/// sharded wrapper spreads entries across `N` shards, so its full contents are
+/// gathered into one pair vector (each shard locked and released in turn) and
+/// serialized here. Entry ORDER is irrelevant — the format is a flat
+/// `(height, key)` list that [`parse_secondary_sections`] re-inserts
 /// unordered — so a shard-then-bucket order round-trips identically to the
 /// single-backend bucket order.
-pub(crate) fn serialize_secondary_sections_from_pairs(
-    dah_pairs: &[(u32, TxKey)],
-    unmined_pairs: &[(u32, TxKey)],
-) -> Vec<u8> {
-    let mut buf = serialize_secondary(&DAH_SECTION_MAGIC, dah_pairs.iter().copied());
-    buf.extend_from_slice(&serialize_secondary(
-        &UNMINED_SECTION_MAGIC,
-        unmined_pairs.iter().copied(),
-    ));
-    buf
+pub(crate) fn serialize_secondary_sections_from_pairs(dah_pairs: &[(u32, TxKey)]) -> Vec<u8> {
+    serialize_secondary(&DAH_SECTION_MAGIC, dah_pairs.iter().copied())
 }
 
-/// Parse the DAH + unmined secondary sections from `data` (the bytes that
-/// follow the primary payload), reproducing the independent-section recovery
-/// of [`Index::restore_all`]:
-///
-/// - The DAH section is parsed at the front of `data`. If it is corrupt,
-///   `dah_needs_rebuild` is set and the unmined section is located by scanning
-///   for its magic (so a corrupt DAH section never hides an intact unmined
-///   one).
-/// - The unmined section is parsed from immediately after the DAH section (the
-///   happy path) or from the located offset. A corrupt/missing unmined section
-///   sets `unmined_needs_rebuild`.
+/// Parse the DAH secondary section from `data` (the bytes that follow the
+/// primary payload). If the section is corrupt or missing,
+/// `dah_needs_rebuild` is set and an empty [`DahIndex`] is returned so the
+/// caller can rebuild it from a device scan instead of failing outright.
 ///
 /// Shared by the v1 [`Index::restore_all`] path and the v2 sharded restore so
 /// the secondary-index recovery semantics stay identical across formats.
-pub(crate) fn parse_secondary_sections(data: &[u8]) -> (DahIndex, UnminedIndex, RestoreFlags) {
+pub(crate) fn parse_secondary_sections(data: &[u8]) -> (DahIndex, RestoreFlags) {
     let mut flags = RestoreFlags::default();
     let mut dah = DahIndex::new();
-    let mut unmined = UnminedIndex::new();
 
-    // Attempt DAH section parse at the expected offset (right after primary).
-    // On success we know where unmined begins. On failure we fall back to a
-    // targeted scan for the unmined section magic.
-    let unmined_slice: &[u8] = match deserialize_secondary(data, &DAH_SECTION_MAGIC) {
-        Ok((entries, consumed)) => {
+    match deserialize_secondary(data, &DAH_SECTION_MAGIC) {
+        Ok((entries, _consumed)) => {
             for (h, k) in entries {
                 dah.insert(h, k);
             }
-            &data[consumed..]
         }
         Err(_) => {
             flags.dah_needs_rebuild = true;
-            locate_unmined_section(data)
-        }
-    };
-
-    match deserialize_secondary(unmined_slice, &UNMINED_SECTION_MAGIC) {
-        Ok((entries, _)) => {
-            for (h, k) in entries {
-                unmined.insert(h, k);
-            }
-        }
-        Err(_) => {
-            flags.unmined_needs_rebuild = true;
         }
     }
 
-    (dah, unmined, flags)
-}
-
-/// Scan the provided slice for a byte window that begins with the unmined
-/// section magic (`UNMI`) AND whose declared `count` + body fits inside the
-/// remaining bytes AND whose stored CRC verifies. Returns the subslice
-/// starting at the first candidate that passes all three checks, or an
-/// empty slice if no candidate is found.
-///
-/// Used by [`Index::restore_all`] when the DAH section header is corrupt and
-/// the offset of the unmined section is unknown.
-///
-/// F-G3-012: the pre-fix scan accepted the first candidate that passed the
-/// size check, leaving `deserialize_secondary` to catch a forged section
-/// via the CRC. That worked, but an attacker who could plant `UNMI`
-/// followed by a benign `count` inside the corrupt DAH payload could
-/// divert the scan to a chosen offset before the genuine unmined section
-/// was even considered. Validating the CRC inline here removes that
-/// amplification: we now skip past any candidate whose stored CRC does
-/// not match, so a planted false-magic burst gets stepped over and the
-/// real section (if present) is still found.
-fn locate_unmined_section(data: &[u8]) -> &[u8] {
-    let header_size = 4 + 4 + 8;
-    let mut idx = 0usize;
-    while idx + header_size + 4 <= data.len() {
-        if data[idx..idx + 4] == UNMINED_SECTION_MAGIC {
-            // Check declared count fits in remaining bytes.
-            let count = u64::from_le_bytes(data[idx + 8..idx + 16].try_into().unwrap()) as usize;
-            // Reject ludicrous counts up front so a poisoned u64 cannot
-            // produce a `total` that is large but still within `data.len()`.
-            if count <= MAX_SNAPSHOT_COUNT {
-                let body_size = count.saturating_mul(SECONDARY_ENTRY_SIZE);
-                let total = header_size + body_size + 4;
-                if data.len() - idx >= total {
-                    // Verify the CRC before declaring the match. Pre-fix this
-                    // step happened inside `deserialize_secondary` AFTER the
-                    // scan had already accepted the candidate; doing it here
-                    // means a forged magic burst no longer hides the real
-                    // section behind it.
-                    let stored_checksum =
-                        u32::from_le_bytes(data[idx + total - 4..idx + total].try_into().unwrap());
-                    let computed_checksum = crc32fast::hash(&data[idx..idx + total - 4]);
-                    if stored_checksum == computed_checksum {
-                        return &data[idx..];
-                    }
-                }
-            }
-        }
-        idx += 1;
-    }
-    &[]
+    (dah, flags)
 }
 
 fn deserialize_secondary(
@@ -1431,22 +1324,14 @@ mod tests {
         dah.insert(100, make_key(1));
         dah.insert(200, make_key(2));
 
-        let mut unmined = UnminedIndex::new();
-        unmined.insert(500, make_key(3));
-        unmined.insert(600, make_key(4));
+        idx.snapshot_all(&dah, &snap_path).unwrap();
 
-        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
-
-        let (restored_idx, restored_dah, restored_unmined, flags) =
-            Index::restore_all(&snap_path).unwrap();
+        let (restored_idx, restored_dah, flags) = Index::restore_all(&snap_path).unwrap();
 
         assert!(!flags.dah_needs_rebuild);
-        assert!(!flags.unmined_needs_rebuild);
         assert_eq!(restored_idx.len(), 50);
         assert_eq!(restored_dah.len(), 2);
-        assert_eq!(restored_unmined.len(), 2);
         assert_eq!(restored_dah.range_query(200).len(), 2);
-        assert_eq!(restored_unmined.range_query(600).len(), 2);
     }
 
     #[test]
@@ -1460,9 +1345,7 @@ mod tests {
         let mut dah = DahIndex::new();
         dah.insert(100, make_key(1));
 
-        let unmined = UnminedIndex::new();
-
-        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+        idx.snapshot_all(&dah, &snap_path).unwrap();
 
         // Corrupt the DAH section (after primary index data)
         let mut data = std::fs::read(&snap_path).unwrap();
@@ -1472,8 +1355,7 @@ mod tests {
         }
         std::fs::write(&snap_path, &data).unwrap();
 
-        let (restored_idx, restored_dah, _restored_unmined, flags) =
-            Index::restore_all(&snap_path).unwrap();
+        let (restored_idx, restored_dah, flags) = Index::restore_all(&snap_path).unwrap();
 
         assert_eq!(restored_idx.len(), 1); // Primary should be fine
         assert!(flags.dah_needs_rebuild);
@@ -1542,201 +1424,19 @@ mod tests {
     }
 
     #[test]
-    fn restore_all_dah_corrupt_but_unmined_intact() {
-        // H6: DAH section is corrupted, but unmined is intact. Recovery
-        // must flag ONLY dah_needs_rebuild and retain the unmined entries.
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("all.snap");
-
-        let mut idx = Index::new(100).unwrap();
-        idx.register(make_key(1), make_entry(100)).unwrap();
-        idx.register(make_key(2), make_entry(200)).unwrap();
-        idx.register(make_key(3), make_entry(300)).unwrap();
-
-        let mut dah = DahIndex::new();
-        dah.insert(100, make_key(1));
-        dah.insert(200, make_key(2));
-
-        let mut unmined = UnminedIndex::new();
-        unmined.insert(500, make_key(1));
-        unmined.insert(600, make_key(2));
-        unmined.insert(700, make_key(3));
-
-        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
-
-        // Corrupt ONLY the DAH section header by flipping a byte inside its
-        // declared count field. Leave UNMI section untouched.
-        let mut data = std::fs::read(&snap_path).unwrap();
-        let dah_pos = data
-            .windows(4)
-            .position(|w| w == b"DAHI")
-            .expect("DAH magic should be present in snapshot");
-        // Flip a bit in the count word (offset 8 after magic+version)
-        data[dah_pos + 8] ^= 0xFF;
-        std::fs::write(&snap_path, &data).unwrap();
-
-        let (restored_idx, restored_dah, restored_unmined, flags) =
-            Index::restore_all(&snap_path).unwrap();
-
-        // Primary index is still good.
-        assert_eq!(restored_idx.len(), 3);
-        assert!(restored_idx.lookup(&make_key(1)).is_some());
-        assert!(restored_idx.lookup(&make_key(2)).is_some());
-        assert!(restored_idx.lookup(&make_key(3)).is_some());
-
-        // DAH is empty and flagged for rebuild.
-        assert!(flags.dah_needs_rebuild);
-        assert!(restored_dah.is_empty());
-
-        // Unmined is intact — NOT flagged for rebuild and entries preserved.
-        assert!(
-            !flags.unmined_needs_rebuild,
-            "unmined should not be flagged when only DAH is corrupt"
-        );
-        assert_eq!(restored_unmined.len(), 3);
-        let up_to_700 = restored_unmined.range_query(700);
-        assert_eq!(up_to_700.len(), 3);
-        let up_to_600 = restored_unmined.range_query(600);
-        assert_eq!(up_to_600.len(), 2);
-    }
-
-    // F-G3-012: `locate_unmined_section` must skip over a planted `UNMI`
-    // magic burst whose stored CRC does not verify, and continue scanning
-    // for the genuine unmined section that follows. Pre-fix, the first
-    // candidate that passed the size sanity-check was accepted and the
-    // CRC check happened inside `deserialize_secondary` — by then the
-    // scan had already locked onto the wrong offset.
-    #[test]
-    fn locate_unmined_section_skips_forged_magic_when_real_follows() {
-        // Build a valid serialized unmined section (the "real" one).
-        let real_entries = [(500u32, make_key(1)), (600u32, make_key(2))];
-        let real_bytes = serialize_secondary(&UNMINED_SECTION_MAGIC, real_entries.iter().copied());
-
-        // Build a poisoned prefix: `UNMI` magic + arbitrary version + count
-        // that fits in `data.len()` after the prefix, plus garbage CRC.
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&UNMINED_SECTION_MAGIC); // 4
-        blob.extend_from_slice(&SECONDARY_VERSION.to_le_bytes()); // 4
-        // count = 1 — small enough that the entire forged "section"
-        // (header + 1 entry + crc) fits inside the prefix block before
-        // the real section.
-        blob.extend_from_slice(&1u64.to_le_bytes()); // 8
-        // Fake entry (height + txid)
-        blob.extend_from_slice(&[0xAA; SECONDARY_ENTRY_SIZE]);
-        // Wrong CRC — deliberately not the real hash of the bytes above.
-        blob.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
-
-        // Now append the real section right after the forged one.
-        blob.extend_from_slice(&real_bytes);
-
-        // The scan must return the REAL section's start, not the forged
-        // prefix at offset 0.
-        let located = locate_unmined_section(&blob);
-        assert!(
-            !located.is_empty(),
-            "expected the real section to be located"
-        );
-
-        // Confirm by deserializing — if we got the forged prefix, the CRC
-        // check would fail; if we got the real one, it should succeed.
-        let (entries, _) = deserialize_secondary(located, &UNMINED_SECTION_MAGIC)
-            .expect("locate must hand back the real, CRC-valid section, not the forged prefix");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], (500, make_key(1)));
-        assert_eq!(entries[1], (600, make_key(2)));
-    }
-
-    #[test]
-    fn restore_all_unmined_corrupt_but_dah_intact() {
-        // H6 symmetric case: unmined corrupt, DAH intact.
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("all.snap");
-
-        let mut idx = Index::new(100).unwrap();
-        idx.register(make_key(1), make_entry(100)).unwrap();
-        idx.register(make_key(2), make_entry(200)).unwrap();
-
-        let mut dah = DahIndex::new();
-        dah.insert(111, make_key(1));
-        dah.insert(222, make_key(2));
-
-        let mut unmined = UnminedIndex::new();
-        unmined.insert(333, make_key(1));
-
-        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
-
-        // Corrupt the UNMI section's declared count.
-        let mut data = std::fs::read(&snap_path).unwrap();
-        let pos = data
-            .windows(4)
-            .position(|w| w == b"UNMI")
-            .expect("UNMI magic should be present");
-        data[pos + 8] ^= 0xFF;
-        std::fs::write(&snap_path, &data).unwrap();
-
-        let (restored_idx, restored_dah, restored_unmined, flags) =
-            Index::restore_all(&snap_path).unwrap();
-
-        assert_eq!(restored_idx.len(), 2);
-        assert!(
-            !flags.dah_needs_rebuild,
-            "DAH should not be flagged when only unmined is corrupt"
-        );
-        assert_eq!(restored_dah.len(), 2);
-        assert_eq!(restored_dah.range_query(222).len(), 2);
-
-        assert!(flags.unmined_needs_rebuild);
-        assert!(restored_unmined.is_empty());
-    }
-
-    #[test]
-    fn snapshot_all_corrupt_unmined_section() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("all.snap");
-
-        let mut idx = Index::new(100).unwrap();
-        idx.register(make_key(1), make_entry(100)).unwrap();
-
-        let dah = DahIndex::new();
-        let mut unmined = UnminedIndex::new();
-        unmined.insert(500, make_key(1));
-
-        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
-
-        // Corrupt the UNMI section
-        let mut data = std::fs::read(&snap_path).unwrap();
-        if let Some(pos) = data.windows(4).position(|w| w == b"UNMI") {
-            data[pos + 10] ^= 0xFF;
-        }
-        std::fs::write(&snap_path, &data).unwrap();
-
-        let (restored_idx, restored_dah, restored_unmined, flags) =
-            Index::restore_all(&snap_path).unwrap();
-
-        assert_eq!(restored_idx.len(), 1);
-        assert!(!flags.dah_needs_rebuild);
-        assert!(flags.unmined_needs_rebuild);
-        assert!(restored_dah.is_empty()); // empty, not corrupt
-        assert!(restored_unmined.is_empty());
-    }
-
-    #[test]
     fn snapshot_all_empty_secondary() {
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("all.snap");
 
         let idx = Index::new(16).unwrap();
         let dah = DahIndex::new();
-        let unmined = UnminedIndex::new();
 
-        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+        idx.snapshot_all(&dah, &snap_path).unwrap();
 
-        let (_, restored_dah, restored_unmined, flags) = Index::restore_all(&snap_path).unwrap();
+        let (_, restored_dah, flags) = Index::restore_all(&snap_path).unwrap();
 
         assert!(!flags.dah_needs_rebuild);
-        assert!(!flags.unmined_needs_rebuild);
         assert!(restored_dah.is_empty());
-        assert!(restored_unmined.is_empty());
     }
 
     #[test]
@@ -1750,16 +1450,14 @@ mod tests {
         let mut dah = DahIndex::new();
         dah.insert(100, make_key(1));
 
-        let unmined = UnminedIndex::new();
-
-        idx.snapshot_all(&dah, &unmined, &snap_path).unwrap();
+        idx.snapshot_all(&dah, &snap_path).unwrap();
 
         // Add more entries AFTER snapshot
         idx.register(make_key(2), make_entry(200)).unwrap();
         dah.insert(200, make_key(2));
 
         // Restore — should only have entries from snapshot time
-        let (restored_idx, restored_dah, _, _) = Index::restore_all(&snap_path).unwrap();
+        let (restored_idx, restored_dah, _) = Index::restore_all(&snap_path).unwrap();
 
         assert_eq!(restored_idx.len(), 1);
         assert!(restored_idx.lookup(&make_key(2)).is_none());
@@ -2208,12 +1906,10 @@ mod tests {
     fn rebuild_secondary_from_device() {
         let (dev, alloc, _) = setup_device_with_records(20);
 
-        let (dah, unmined) = Index::rebuild_secondary(&*dev, &alloc).unwrap();
+        let dah = Index::rebuild_secondary(&*dev, &alloc).unwrap();
 
         // 10 of 20 records have delete_at_height != 0 (even indices)
         assert_eq!(dah.len(), 10);
-        // 5 of 20 records have unmined_since != 0 (indices divisible by 4)
-        assert_eq!(unmined.len(), 5);
     }
 
     // Issue #14: unlike the PRIMARY rebuild (which skips-and-recovers to avoid a
@@ -2276,30 +1972,19 @@ mod tests {
     fn rebuild_secondary_empty_device() {
         let dev = Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
-        let (dah, unmined) = Index::rebuild_secondary(&*dev, &alloc).unwrap();
+        let dah = Index::rebuild_secondary(&*dev, &alloc).unwrap();
         assert!(dah.is_empty());
-        assert!(unmined.is_empty());
     }
 
     #[test]
     fn rebuild_secondary_dah_range_query_correct() {
         let (dev, alloc, _) = setup_device_with_records(20);
-        let (dah, _) = Index::rebuild_secondary(&*dev, &alloc).unwrap();
+        let dah = Index::rebuild_secondary(&*dev, &alloc).unwrap();
 
         // Record 0: dah = 100, record 2: dah = 300, record 4: dah = 500...
         let result = dah.range_query(300);
         // Heights 100, 300 — records 0 and 2
         assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn rebuild_secondary_unmined_range_query_correct() {
-        let (dev, alloc, _) = setup_device_with_records(20);
-        let (_, unmined) = Index::rebuild_secondary(&*dev, &alloc).unwrap();
-
-        // Record 0: unmined = 50, record 4: unmined = 250, record 8: unmined = 450...
-        let result = unmined.range_query(250);
-        assert_eq!(result.len(), 2); // Records 0 and 4
     }
 
     // -- Index manager integration test --

@@ -25,7 +25,7 @@ use std::sync::atomic::AtomicU64;
 use teraslab::allocator::SlotAllocator;
 use teraslab::cluster::auth;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -46,7 +46,6 @@ fn make_engine() -> Arc<Engine> {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 

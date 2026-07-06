@@ -21,7 +21,7 @@ use teraslab::allocator::SlotAllocator;
 use teraslab::backup::{BackupError, BackupManager, BackupParams, BackupState};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 
@@ -37,7 +37,6 @@ fn build_manager(backup_root: Option<std::path::PathBuf>) -> Arc<BackupManager> 
         alloc,
         StripedLocks::new(64),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
     BackupManager::new(
         engine,

@@ -71,7 +71,7 @@ use proptest::test_runner::Config as ProptestConfig;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::{CreateError, CreateRequest};
 use teraslab::ops::engine::Engine;
@@ -122,7 +122,6 @@ fn make_engine() -> Arc<Engine> {
         alloc,
         StripedLocks::new(64),
         DahIndex::new(),
-        UnminedIndex::new(),
     ))
 }
 
@@ -682,7 +681,12 @@ impl Model {
                 if rec.conflicting {
                     return Outcome::Conflicting;
                 }
-                if rec.locked {
+                // Task 16e: `LOCKED` only blocks a reassign while the record is
+                // unmined — `engine.reassign`'s reroute reads mined-state
+                // fresh from the MinedIndex, mirroring `spend`'s Task 16c
+                // reroute above (`reassign` has no `ignore_locked` escape
+                // hatch, so this is the sole gate).
+                if rec.locked && rec.mined.is_empty() {
                     return Outcome::Locked;
                 }
                 // Engine guard: `spending_height > 0 && spending_height >
@@ -1311,7 +1315,6 @@ fn make_volatile_harness() -> VolatileHarness {
         alloc,
         StripedLocks::new(64),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
     VolatileHarness { engine, device }
 }
@@ -1343,7 +1346,6 @@ fn rebuild_engine_from_device(device: Arc<MemoryDevice>) -> Result<Arc<Engine>, 
         alloc,
         StripedLocks::new(64),
         secondaries.dah,
-        secondaries.unmined,
     )))
 }
 

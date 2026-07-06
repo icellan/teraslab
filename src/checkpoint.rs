@@ -975,7 +975,7 @@ mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
     use crate::device::{BlockDevice, MemoryDevice};
-    use crate::index::{DahIndex, Index, UnminedIndex};
+    use crate::index::{DahIndex, Index};
     use crate::locks::StripedLocks;
     use crate::ops::create::CreateRequest;
     use crate::ops::engine::Engine;
@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     fn checkpoint_budget_from_engine_stats_escalates_under_high_occupancy() {
         use crate::device::MemoryDevice;
-        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::index::{DahIndex, Index};
         use crate::locks::StripedLocks;
         use crate::record::TxMetadata;
 
@@ -1095,7 +1095,6 @@ mod tests {
             seg,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let record_size = TxMetadata::record_size_for(1); // one block (4 KiB)
 
@@ -1246,7 +1245,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // Dedicated device region for the redo log so it does not collide
@@ -1275,7 +1273,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
         let total = 4096 + segment_size * count;
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(total, 4096).unwrap());
@@ -1321,7 +1318,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(264 * 1024, 4096).unwrap());
@@ -1492,7 +1488,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
@@ -1815,7 +1810,7 @@ mod tests {
     /// loss then silently reverted acked spends and creates.
     #[test]
     fn checkpoint_makes_acked_mutations_durable_before_redo_reclamation() {
-        use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, UnminedBackend};
+        use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry};
         use crate::recovery::recover_all_with_allocator;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1852,7 +1847,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo = Mutex::new(log);
 
@@ -1872,21 +1866,13 @@ mod tests {
             SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>)
                 .expect("allocator header must be durable after checkpoint"),
         );
-        let (primary2, dah2, unmined2, _flags) =
+        let (primary2, dah2, _flags) =
             PrimaryBackend::restore_all(&snap_path).expect("snapshot must restore");
         let index2 = crate::index::ShardedIndex::from_single(primary2);
         let mut dah_b = DahBackend::from(dah2);
-        let mut unmined_b = UnminedBackend::from(unmined2);
         let log2 = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
-        recover_all_with_allocator(
-            &*data_dev,
-            &log2,
-            &index2,
-            &mut dah_b,
-            &mut unmined_b,
-            Some(&mut alloc2),
-        )
-        .expect("recovery must succeed");
+        recover_all_with_allocator(&*data_dev, &log2, &index2, &mut dah_b, Some(&mut alloc2))
+            .expect("recovery must succeed");
 
         // Both acked mutations must be reproduced.
         let entry = index2.lookup(&key).expect("record must still be indexed");
@@ -1980,7 +1966,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
@@ -2055,17 +2040,15 @@ mod tests {
                 SlotAllocator::recover(dev.clone())
                     .expect("allocator header must be durable after checkpoint"),
             );
-            let (restored_index, dah2, unmined2, _flags) =
+            let (restored_index, dah2, _flags) =
                 crate::index::ShardedIndex::restore_all(&snap_path, 1)
                     .expect("primary snapshot must restore");
             let mut dah_b = crate::index::DahBackend::from(dah2);
-            let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
             crate::recovery::recover_all_with_allocator(
                 &*dev,
                 &redo.lock(),
                 &restored_index,
                 &mut dah_b,
-                &mut unmined_b,
                 Some(&mut alloc2),
             )
             .expect("primary/device recovery must succeed");
@@ -2076,7 +2059,6 @@ mod tests {
                 alloc2,
                 StripedLocks::new(16),
                 dah_b,
-                unmined_b,
             );
 
             let used_snapshot = engine2
@@ -2162,17 +2144,15 @@ mod tests {
         let mut alloc3: crate::allocator::BoxedAllocator = Box::new(
             SlotAllocator::recover(dev.clone()).expect("allocator header must still be durable"),
         );
-        let (restored_index3, dah3, unmined3, _flags3) =
+        let (restored_index3, dah3, _flags3) =
             crate::index::ShardedIndex::restore_all(&snap_path, 1)
                 .expect("primary snapshot must restore again");
         let mut dah_b3 = crate::index::DahBackend::from(dah3);
-        let mut unmined_b3 = crate::index::UnminedBackend::from(unmined3);
         crate::recovery::recover_all_with_allocator(
             &*dev,
             &redo.lock(),
             &restored_index3,
             &mut dah_b3,
-            &mut unmined_b3,
             Some(&mut alloc3),
         )
         .expect("primary/device recovery must succeed with the longer tail");
@@ -2183,7 +2163,6 @@ mod tests {
             alloc3,
             StripedLocks::new(16),
             dah_b3,
-            unmined_b3,
         );
         let used_snapshot3 = engine3
             .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
@@ -2229,7 +2208,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let key = crate::index::TxKey { txid: [7u8; 32] };
@@ -2275,17 +2253,14 @@ mod tests {
 
         let mut alloc2: crate::allocator::BoxedAllocator =
             Box::new(SlotAllocator::recover(dev.clone()).expect("allocator header durable"));
-        let (restored_index, dah2, unmined2, _flags) =
-            crate::index::ShardedIndex::restore_all(&snap_path, 1)
-                .expect("primary snapshot must restore");
+        let (restored_index, dah2, _flags) = crate::index::ShardedIndex::restore_all(&snap_path, 1)
+            .expect("primary snapshot must restore");
         let mut dah_b = crate::index::DahBackend::from(dah2);
-        let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
         crate::recovery::recover_all_with_allocator(
             &*dev,
             &redo,
             &restored_index,
             &mut dah_b,
-            &mut unmined_b,
             Some(&mut alloc2),
         )
         .expect("primary/device recovery must succeed");
@@ -2296,7 +2271,6 @@ mod tests {
             alloc2,
             StripedLocks::new(16),
             dah_b,
-            unmined_b,
         );
 
         let err = engine2
@@ -2336,7 +2310,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
@@ -2413,7 +2386,6 @@ mod tests {
             recovered_alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let used_snapshot = engine2
@@ -2460,7 +2432,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let key = crate::index::TxKey { txid: [8u8; 32] };
@@ -2497,17 +2468,14 @@ mod tests {
 
         let mut alloc2: crate::allocator::BoxedAllocator =
             Box::new(SlotAllocator::recover(dev.clone()).expect("allocator header durable"));
-        let (restored_index, dah2, unmined2, _flags) =
-            crate::index::ShardedIndex::restore_all(&snap_path, 1)
-                .expect("primary snapshot must restore");
+        let (restored_index, dah2, _flags) = crate::index::ShardedIndex::restore_all(&snap_path, 1)
+            .expect("primary snapshot must restore");
         let mut dah_b = crate::index::DahBackend::from(dah2);
-        let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
         crate::recovery::recover_all_with_allocator(
             &*dev,
             &redo.lock(),
             &restored_index,
             &mut dah_b,
-            &mut unmined_b,
             Some(&mut alloc2),
         )
         .expect("primary/device recovery must succeed");
@@ -2518,7 +2486,6 @@ mod tests {
             alloc2,
             StripedLocks::new(16),
             dah_b,
-            unmined_b,
         );
 
         let err = engine2
@@ -2563,7 +2530,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
@@ -2644,17 +2610,14 @@ mod tests {
         let mut alloc2: crate::allocator::BoxedAllocator = Box::new(
             SlotAllocator::recover(dev.clone()).expect("allocator header must be durable"),
         );
-        let (restored_index, dah2, unmined2, _flags) =
-            crate::index::ShardedIndex::restore_all(&snap_path, 1)
-                .expect("primary snapshot must restore");
+        let (restored_index, dah2, _flags) = crate::index::ShardedIndex::restore_all(&snap_path, 1)
+            .expect("primary snapshot must restore");
         let mut dah_b = crate::index::DahBackend::from(dah2);
-        let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
         crate::recovery::recover_all_with_allocator(
             &*dev,
             &redo.lock(),
             &restored_index,
             &mut dah_b,
-            &mut unmined_b,
             Some(&mut alloc2),
         )
         .expect("primary/device recovery must succeed");
@@ -2665,7 +2628,6 @@ mod tests {
             alloc2,
             StripedLocks::new(16),
             dah_b,
-            unmined_b,
         );
 
         let err = engine2
@@ -2704,7 +2666,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
@@ -2767,7 +2728,7 @@ mod tests {
     #[test]
     fn crash_before_checkpoint_data_sync_keeps_all_mutations_replayable() {
         use crate::fault_injection::{self, FaultMode, SyncPoint};
-        use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry, UnminedBackend};
+        use crate::index::{DahBackend, PrimaryBackend, TxIndexEntry};
         use crate::recovery::recover_all_with_allocator;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2799,7 +2760,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo = Mutex::new(log);
         let cfg = CheckpointConfig::new(snap_path);
@@ -2835,16 +2795,8 @@ mod tests {
         let index2 =
             crate::index::ShardedIndex::from_single(PrimaryBackend::new_in_memory(128).unwrap());
         let mut dah_b = DahBackend::new_in_memory();
-        let mut unmined_b = UnminedBackend::new_in_memory();
-        recover_all_with_allocator(
-            &*data_dev,
-            &log2,
-            &index2,
-            &mut dah_b,
-            &mut unmined_b,
-            Some(&mut alloc2),
-        )
-        .expect("recovery must succeed");
+        recover_all_with_allocator(&*data_dev, &log2, &index2, &mut dah_b, Some(&mut alloc2))
+            .expect("recovery must succeed");
 
         let entry = index2
             .lookup(&key)
@@ -2878,7 +2830,7 @@ mod tests {
         crate::allocator::BoxedAllocator,
         usize,
     ) {
-        use crate::index::{DahBackend, PrimaryBackend, ShardedIndex, UnminedBackend};
+        use crate::index::{DahBackend, PrimaryBackend, ShardedIndex};
         use crate::recovery::recover_all_with_allocator;
 
         let alloc = match SlotAllocator::recover(data_dev.clone() as Arc<dyn BlockDevice>) {
@@ -2890,32 +2842,23 @@ mod tests {
         };
         let mut alloc: crate::allocator::BoxedAllocator = Box::new(alloc);
 
-        let (primary, dah, unmined) = if snap_path.exists() {
-            let (idx, dah, unmined, _flags) =
+        let (primary, dah) = if snap_path.exists() {
+            let (idx, dah, _flags) =
                 PrimaryBackend::restore_all(snap_path).expect("snapshot must restore");
-            (idx, DahBackend::from(dah), UnminedBackend::from(unmined))
+            (idx, DahBackend::from(dah))
         } else {
             (
                 PrimaryBackend::new_in_memory(128).unwrap(),
                 DahBackend::new_in_memory(),
-                UnminedBackend::new_in_memory(),
             )
         };
         let index = ShardedIndex::from_single(primary);
         let mut dah_b = dah;
-        let mut unmined_b = unmined;
 
         let log = RedoLog::open(redo_dev.clone(), 0, redo_capacity).unwrap();
         let replayed = log.recover().unwrap().len();
-        recover_all_with_allocator(
-            &**data_dev,
-            &log,
-            &index,
-            &mut dah_b,
-            &mut unmined_b,
-            Some(&mut alloc),
-        )
-        .expect("recovery must succeed");
+        recover_all_with_allocator(&**data_dev, &log, &index, &mut dah_b, Some(&mut alloc))
+            .expect("recovery must succeed");
         (index, alloc, replayed)
     }
 
@@ -2963,7 +2906,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo = Mutex::new(log);
         let cfg = CheckpointConfig::new(snap_path.clone());
@@ -3059,7 +3001,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
         let redo = Mutex::new(log);
         let cfg = CheckpointConfig::new(snap_path.clone());
@@ -3242,7 +3183,6 @@ mod tests {
             alloc,
             StripedLocks::new(16),
             DahIndex::new(),
-            UnminedIndex::new(),
         );
 
         // Arm the allocator to fail its next persist. The checkpoint will
@@ -3666,7 +3606,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // 32 MiB redo so a single slow snapshot's worth of appends cannot fill
@@ -3952,7 +3891,6 @@ mod tests {
             alloc,
             StripedLocks::new(64),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         let redo_dev = CountingShadowDevice::new(256 * 1024, 4096);

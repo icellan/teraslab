@@ -2979,7 +2979,6 @@ mod tests {
             crate::index::PrimaryBackend::new_in_memory(1000).unwrap(),
         );
         let mut dah = crate::index::DahBackend::new_in_memory();
-        let mut unmined = crate::index::UnminedBackend::new_in_memory();
 
         let redo_log = crate::redo::RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap();
         let stats = crate::recovery::recover_all_with_allocator(
@@ -2987,7 +2986,6 @@ mod tests {
             &redo_log,
             &index,
             &mut dah,
-            &mut unmined,
             Some(&mut alloc),
         )
         .unwrap();

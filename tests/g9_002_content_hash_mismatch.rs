@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -28,14 +28,7 @@ fn build_engine_with_blob() -> (Engine, Arc<MemoryBlobStore>) {
     let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
     let alloc = SlotAllocator::new(dev.clone()).unwrap();
     let index = Index::new(1024).unwrap();
-    let mut engine = Engine::new(
-        dev,
-        index,
-        alloc,
-        StripedLocks::new(64),
-        DahIndex::new(),
-        UnminedIndex::new(),
-    );
+    let mut engine = Engine::new(dev, index, alloc, StripedLocks::new(64), DahIndex::new());
     let blob = Arc::new(MemoryBlobStore::new());
     engine.set_blob_store(blob.clone());
     (engine, blob)

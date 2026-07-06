@@ -388,13 +388,11 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
     .unwrap();
 
     let mut dah = teraslab::index::DahBackend::new_in_memory();
-    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
         &index,
         &mut dah,
-        &mut unmined,
         Some(&mut alloc),
     )
     .unwrap();
@@ -417,13 +415,11 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
     // device-level no-op / idempotent replay of create.
     let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
-    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats2 = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
         &index2,
         &mut dah2,
-        &mut unmined2,
         Some(&mut alloc),
     )
     .unwrap();
@@ -444,9 +440,8 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
 
 /// Crash after the MarkOnLongestChain(off) WAL fsync but before the
 /// metadata write (a reorg knocked the tx off the longest chain):
-/// replay must set `unmined_since` and the reconciled unmined secondary
-/// must track the record; the generation token (H7) makes a second
-/// pass a no-op.
+/// replay must set `unmined_since` on the device record; the generation
+/// token (H7) makes a second pass a no-op.
 #[test]
 fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
     let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
@@ -477,13 +472,11 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
     .unwrap();
 
     let mut dah = teraslab::index::DahBackend::new_in_memory();
-    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
         &index,
         &mut dah,
-        &mut unmined,
         Some(&mut alloc),
     )
     .unwrap();
@@ -492,23 +485,16 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
     let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
     assert_eq!({ m.unmined_since }, 850_000, "off-chain sets unmined_since");
     assert_eq!({ m.generation }, 1, "replay syncs the generation token");
-    assert_eq!(
-        unmined.len(),
-        1,
-        "reconciled unmined secondary must track the off-chain record"
-    );
 
     // Second pass: generation 1 is at-or-ahead of the token — replay
-    // must skip, leaving unmined_since/generation/secondary unchanged.
+    // must skip, leaving unmined_since/generation unchanged.
     let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
-    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats2 = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
         &index2,
         &mut dah2,
-        &mut unmined2,
         Some(&mut alloc),
     )
     .unwrap();
@@ -516,13 +502,12 @@ fn boundary_mark_longest_chain_off_after_wal_replays_and_is_idempotent() {
     let m2 = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
     assert_eq!({ m2.unmined_since }, 850_000);
     assert_eq!({ m2.generation }, 1);
-    assert_eq!(unmined2.len(), 1);
 }
 
 /// The inverse reorg direction: a record already off the longest chain
 /// (unmined_since set in its created bytes) is marked back ON the
-/// longest chain. Replay must clear `unmined_since`; the reconciled
-/// unmined secondary must drop the record; second pass is a no-op.
+/// longest chain. Replay must clear `unmined_since` on the device record;
+/// second pass is a no-op.
 #[test]
 fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
     let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
@@ -555,13 +540,11 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
     .unwrap();
 
     let mut dah = teraslab::index::DahBackend::new_in_memory();
-    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
         &index,
         &mut dah,
-        &mut unmined,
         Some(&mut alloc),
     )
     .unwrap();
@@ -570,20 +553,14 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
     let m = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
     assert_eq!({ m.unmined_since }, 0, "back-on-chain clears unmined_since");
     assert_eq!({ m.generation }, 1);
-    assert!(
-        unmined.is_empty(),
-        "reconciled unmined secondary must drop the on-chain record"
-    );
 
     let index2 = ShardedIndex::from_single(PrimaryBackend::new_in_memory(1000).unwrap());
     let mut dah2 = teraslab::index::DahBackend::new_in_memory();
-    let mut unmined2 = teraslab::index::UnminedBackend::new_in_memory();
     let stats2 = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
         &index2,
         &mut dah2,
-        &mut unmined2,
         Some(&mut alloc),
     )
     .unwrap();
@@ -591,7 +568,6 @@ fn boundary_mark_longest_chain_on_clears_unmined_and_is_idempotent() {
     let m2 = io::read_metadata(&*data_dev as &dyn BlockDevice, record_offset).unwrap();
     assert_eq!({ m2.unmined_since }, 0);
     assert_eq!({ m2.generation }, 1);
-    assert!(unmined2.is_empty());
 }
 
 /// A thin smoke test: drive a Create entry through
@@ -619,13 +595,11 @@ fn full_pipeline_recovery_reconstructs_create_v2() {
     .unwrap();
 
     let mut dah = teraslab::index::DahBackend::new_in_memory();
-    let mut unmined = teraslab::index::UnminedBackend::new_in_memory();
     let stats = recover_all_with_allocator(
         &*data_dev as &dyn BlockDevice,
         &redo,
         &index,
         &mut dah,
-        &mut unmined,
         Some(&mut alloc),
     )
     .unwrap();

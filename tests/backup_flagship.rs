@@ -62,9 +62,7 @@ use teraslab::backup::job::run_backup;
 use teraslab::backup::{BackupParams, BackupProgress, Manifest};
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, DirectDevice, MemoryDevice};
-use teraslab::index::{
-    DahBackend, DahIndex, Index, ShardedIndex, TxKey, UnminedBackend, UnminedIndex,
-};
+use teraslab::index::{DahBackend, DahIndex, Index, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::recovery::recover_all_with_allocator;
@@ -279,34 +277,19 @@ fn boot_restored_engine(cfg: &ServerConfig) -> Engine {
     let mut boxed_alloc: BoxedAllocator =
         Box::new(SegmentAllocator::recover(rdev.clone()).unwrap());
 
-    let (rindex, rdah_index, runmined_index, _flags) =
+    let (rindex, rdah_index, _flags) =
         ShardedIndex::restore_all(&cfg.resolved_index_snapshot_path(), 1).unwrap();
     let mut rdah = DahBackend::from(rdah_index);
-    let mut runmined = UnminedBackend::from(runmined_index);
 
     let redo_dev: Arc<dyn BlockDevice> = Arc::new(
         DirectDevice::open(&cfg.resolved_redo_log_path(), cfg.redo_log_size, ALIGN).unwrap(),
     );
     let rlog = RedoLog::open(redo_dev, 0, cfg.redo_log_size).unwrap();
 
-    recover_all_with_allocator(
-        &*rdev,
-        &rlog,
-        &rindex,
-        &mut rdah,
-        &mut runmined,
-        Some(&mut boxed_alloc),
-    )
-    .expect("restored redo tail must replay cleanly");
+    recover_all_with_allocator(&*rdev, &rlog, &rindex, &mut rdah, Some(&mut boxed_alloc))
+        .expect("restored redo tail must replay cleanly");
 
-    Engine::new_with_sharded_index(
-        rdev,
-        rindex,
-        boxed_alloc,
-        StripedLocks::new(256),
-        rdah,
-        runmined,
-    )
+    Engine::new_with_sharded_index(rdev, rindex, boxed_alloc, StripedLocks::new(256), rdah)
 }
 
 #[test]
@@ -326,7 +309,6 @@ fn backup_under_concurrent_journaled_load_restores_and_verifies() {
         seg,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     // --- Baseline: create records until the store spans a few segments (so the
@@ -482,7 +464,6 @@ fn backup_under_concurrent_journaled_load_restores_and_verifies() {
         teraslab::allocator::SlotAllocator::new(ref_dev).unwrap(),
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     );
     let mut reference = StateVerifier::new();
     for op in &baseline_ops {

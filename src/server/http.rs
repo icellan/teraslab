@@ -703,7 +703,7 @@ async fn handle_metrics(
         state.histograms,
         state.engine.index_len() as u64,
         state.engine.dah_index().len() as u64,
-        state.engine.unmined_index().len() as u64,
+        state.engine.mined_index().unmined_len() as u64,
         state.engine.preserve_index().len() as u64,
         state.active_connections.load(Ordering::Relaxed) as u64,
         backup_state_code(backup.state),
@@ -1791,7 +1791,7 @@ fn build_status_json(state: &HttpState) -> serde_json::Value {
         "records": {
             "total": state.engine.index_len(),
             "dah_index": state.engine.dah_index().len(),
-            "unmined_index": state.engine.unmined_index().len(),
+            "unmined_index": state.engine.mined_index().unmined_len(),
             "preserve_index": state.engine.preserve_index().len(),
         },
         "storage": {
@@ -2061,7 +2061,7 @@ async fn handle_admin_memory(State(state): State<Arc<HttpState>>) -> impl IntoRe
         "index_bytes": index_stats.memory_bytes,
         "index_entries": index_stats.entry_count,
         "dah_index_entries": state.engine.dah_index().len(),
-        "unmined_index_entries": state.engine.unmined_index().len(),
+        "unmined_index_entries": state.engine.mined_index().unmined_len(),
         "preserve_index_entries": state.engine.preserve_index().len(),
         "estimated_total_bytes": index_stats.memory_bytes,
     });
@@ -2073,7 +2073,7 @@ async fn handle_admin_records(State(state): State<Arc<HttpState>>) -> impl IntoR
     let body = serde_json::json!({
         "total_records": state.engine.index_len(),
         "dah_index_count": state.engine.dah_index().len(),
-        "unmined_count": state.engine.unmined_index().len(),
+        "unmined_count": state.engine.mined_index().unmined_len(),
         "preserve_count": state.engine.preserve_index().len(),
     });
     json_response(body)
@@ -4131,7 +4131,7 @@ mod tests {
     fn admin_top_ws_push_includes_operations_table() {
         use crate::allocator::SlotAllocator;
         use crate::device::{BlockDevice, MemoryDevice};
-        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::index::{DahIndex, Index};
         use crate::locks::StripedLocks;
         use crate::ops::engine::Engine;
         use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize};
@@ -4141,14 +4141,7 @@ mod tests {
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1024).unwrap();
         let locks = StripedLocks::new(64);
-        let engine = Arc::new(Engine::new(
-            dev,
-            index,
-            alloc,
-            locks,
-            DahIndex::new(),
-            UnminedIndex::new(),
-        ));
+        let engine = Arc::new(Engine::new(dev, index, alloc, locks, DahIndex::new()));
 
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         metrics.operations.inc_by(OpCode::Unspend, Outcome::Ok, 42);
@@ -4208,7 +4201,7 @@ mod tests {
     #[test]
     fn status_reports_defrag_health_for_segment_engine() {
         use crate::device::{BlockDevice, MemoryDevice};
-        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::index::{DahIndex, Index};
         use crate::locks::StripedLocks;
         use crate::ops::engine::Engine;
         use crate::record::TxMetadata;
@@ -4224,7 +4217,6 @@ mod tests {
             seg,
             StripedLocks::new(256),
             DahIndex::new(),
-            UnminedIndex::new(),
         ));
 
         // Allocate four one-block records, then free two → half the on-device
@@ -4407,7 +4399,7 @@ mod tests {
     fn admin_top_json_exposes_all_new_metric_shapes() {
         use crate::allocator::SlotAllocator;
         use crate::device::{BlockDevice, MemoryDevice};
-        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::index::{DahIndex, Index};
         use crate::locks::StripedLocks;
         use crate::metrics::{
             AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics,
@@ -4434,14 +4426,7 @@ mod tests {
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1024).unwrap();
         let locks = StripedLocks::new(64);
-        let engine = Arc::new(Engine::new(
-            dev,
-            index,
-            alloc,
-            locks,
-            DahIndex::new(),
-            UnminedIndex::new(),
-        ));
+        let engine = Arc::new(Engine::new(dev, index, alloc, locks, DahIndex::new()));
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let state = HttpState {
@@ -4501,7 +4486,7 @@ mod tests {
     fn ws_top_push_includes_new_metrics() {
         use crate::allocator::SlotAllocator;
         use crate::device::{BlockDevice, MemoryDevice};
-        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::index::{DahIndex, Index};
         use crate::locks::StripedLocks;
         use crate::metrics::{
             AllocatorMetrics, MigrationMetrics, RedoMetrics, ReplicationMetrics, SwimMetrics,
@@ -4528,14 +4513,7 @@ mod tests {
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1024).unwrap();
         let locks = StripedLocks::new(64);
-        let engine = Arc::new(Engine::new(
-            dev,
-            index,
-            alloc,
-            locks,
-            DahIndex::new(),
-            UnminedIndex::new(),
-        ));
+        let engine = Arc::new(Engine::new(dev, index, alloc, locks, DahIndex::new()));
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let state = HttpState {
@@ -4712,7 +4690,7 @@ mod tests {
     ) -> Arc<HttpState> {
         use crate::allocator::SlotAllocator;
         use crate::device::{BlockDevice, MemoryDevice};
-        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::index::{DahIndex, Index};
         use crate::locks::StripedLocks;
         use crate::ops::engine::Engine;
 
@@ -4721,14 +4699,7 @@ mod tests {
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1024).unwrap();
         let locks = StripedLocks::new(64);
-        let engine = Arc::new(Engine::new(
-            dev,
-            index,
-            alloc,
-            locks,
-            DahIndex::new(),
-            UnminedIndex::new(),
-        ));
+        let engine = Arc::new(Engine::new(dev, index, alloc, locks, DahIndex::new()));
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         Arc::new(HttpState {
@@ -5133,7 +5104,7 @@ mod tests {
     fn build_backup_test_state(backup_root: Option<std::path::PathBuf>) -> Arc<HttpState> {
         use crate::allocator::SlotAllocator;
         use crate::device::{BlockDevice, MemoryDevice};
-        use crate::index::{DahIndex, Index, UnminedIndex};
+        use crate::index::{DahIndex, Index};
         use crate::locks::StripedLocks;
         use crate::ops::engine::Engine;
 
@@ -5142,14 +5113,7 @@ mod tests {
         let alloc = SlotAllocator::new(dev.clone()).unwrap();
         let index = Index::new(1024).unwrap();
         let locks = StripedLocks::new(64);
-        let engine = Arc::new(Engine::new(
-            dev,
-            index,
-            alloc,
-            locks,
-            DahIndex::new(),
-            UnminedIndex::new(),
-        ));
+        let engine = Arc::new(Engine::new(dev, index, alloc, locks, DahIndex::new()));
         let metrics: &'static ThreadMetrics = Box::leak(Box::new(ThreadMetrics::new()));
         let histograms: &'static ThreadHistograms = Box::leak(Box::new(ThreadHistograms::new()));
         let backup = crate::backup::BackupManager::new(

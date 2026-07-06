@@ -29,9 +29,8 @@ use teraslab::device::MemoryDevice;
 use teraslab::fault_injection::{FaultMode, SyncPoint, arm, current, disarm};
 use teraslab::index::hashtable::HashTable;
 use teraslab::index::redb_dah::RedbDahIndex;
-use teraslab::index::redb_unmined::RedbUnminedIndex;
 use teraslab::index::{
-    DahBackend, NO_MINED_SLOT, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend,
+    DahBackend, NO_MINED_SLOT, PrimaryBackend, ShardedIndex, TxIndexEntry, TxKey,
 };
 use teraslab::redo::{RedoLog, RedoOp};
 
@@ -154,15 +153,8 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
     // slot to spent.
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let mut dah = DahBackend::new_in_memory();
-    let mut unmined = UnminedBackend::new_in_memory();
-    let stats = teraslab::recovery::recover_all(
-        &*data_dev,
-        &redo_reopened,
-        &primary,
-        &mut dah,
-        &mut unmined,
-    )
-    .unwrap();
+    let stats =
+        teraslab::recovery::recover_all(&*data_dev, &redo_reopened, &primary, &mut dah).unwrap();
     assert_eq!(
         stats.entries_replayed, 1,
         "exactly one Spend redo entry must be replayed"
@@ -179,14 +171,8 @@ fn kill_after_redo_fsync_before_data_pwrite_recovers_slot() {
         "spending_data must match the journaled intent"
     );
     // Idempotency: a second recovery run must be a no-op (entries_skipped > 0).
-    let stats2 = teraslab::recovery::recover_all(
-        &*data_dev,
-        &redo_reopened,
-        &primary,
-        &mut dah,
-        &mut unmined,
-    )
-    .unwrap();
+    let stats2 =
+        teraslab::recovery::recover_all(&*data_dev, &redo_reopened, &primary, &mut dah).unwrap();
     assert_eq!(
         stats2.entries_replayed, 0,
         "second recovery must not re-apply (idempotent)"
@@ -259,14 +245,12 @@ fn kill_between_rename_and_dir_fsync_recovers_hashtable() {
         Box::new(SlotAllocator::new(data_dev.clone()).unwrap());
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(100).unwrap());
     let mut dah = DahBackend::new_in_memory();
-    let mut unmined = UnminedBackend::new_in_memory();
 
     let stats = teraslab::recovery::recover_all_with_allocator(
         &*data_dev,
         &redo_reopened,
         &primary,
         &mut dah,
-        &mut unmined,
         Some(&mut alloc_recov),
     )
     .unwrap();
@@ -365,13 +349,11 @@ fn kill_after_free_redo_fsync_before_freelist_mutation_reconstructs_freelist() {
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let primary = ShardedIndex::from_single(PrimaryBackend::new_in_memory(16).unwrap());
     let mut dah = DahBackend::new_in_memory();
-    let mut unmined = UnminedBackend::new_in_memory();
     let stats = teraslab::recovery::recover_all_with_allocator(
         &*data_dev,
         &redo_reopened,
         &primary,
         &mut dah,
-        &mut unmined,
         Some(&mut recovered_alloc),
     )
     .unwrap();
@@ -412,20 +394,27 @@ fn kill_after_free_redo_fsync_before_freelist_mutation_reconstructs_freelist() {
 // Test 4: kill between secondary-redb commit phases (C4 contract)
 // ---------------------------------------------------------------------------
 
-/// Kill between `RedbUnminedIndex::insert`'s redo fsync and the redb
+/// Kill between `RedbDahIndex::insert`'s redo fsync and the redb
 /// transaction commit. Recovery must reconcile the secondary index
 /// from the durable redo intent.
+///
+/// Task 16e: this used to also cover `RedbUnminedIndex::insert` (the same
+/// `SyncPoint::BeforeSecondaryRedbCommit` boundary, hit from either
+/// secondary backend) — the unmined secondary index was removed
+/// (mined/unmined state is now sourced from the in-RAM `ShardedMinedIndex`,
+/// which has no on-disk redb backend and thus no per-key two-phase commit to
+/// crash mid-way through), so `RedbDahIndex` is now the sole backend that
+/// exercises this sync point.
 #[test]
 fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     let dir = tempfile::tempdir().unwrap();
-    let unmined_path = dir.path().join("unmined.redb");
     let dah_path = dir.path().join("dah.redb");
     let redo_dev = Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
     let redo_log = Arc::new(Mutex::new(
         RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap(),
     ));
 
-    // Primary with an authoritative unmined_since=500 entry, backed by a
+    // Primary with an authoritative delete_at_height=500 entry, backed by a
     // real on-device record: `recover_all` finishes by reconciling the
     // secondary indexes from on-device metadata
     // (`reconcile_secondary_indexes_from_metadata` reads every index
@@ -437,23 +426,23 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     let record_offset = 4096u64;
     let mut meta = teraslab::record::TxMetadata::new(1);
     meta.tx_id = key.txid;
-    meta.unmined_since = 500;
+    meta.delete_at_height = 500;
     let slot = teraslab::record::UtxoSlot::new_unspent([0x33u8; 32]);
     teraslab::io::write_full_record(&data_dev, record_offset, &meta, &[slot]).unwrap();
     primary
-        .register(key, make_entry(record_offset, 500))
+        .register(key, make_entry(record_offset, NO_MINED_SLOT))
         .unwrap();
 
     // Arm the panic at BeforeSecondaryRedbCommit, then call insert on
-    // the on-disk unmined backend. The redo flush completes, the
+    // the on-disk DAH backend. The redo flush completes, the
     // panic fires BEFORE `txn.commit()` runs.
     {
-        let mut unmined = RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap();
+        let mut dah = RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap();
         let redo_for_panic = redo_log.clone();
         let panicked = armed(
             FaultMode::PanicAt(SyncPoint::BeforeSecondaryRedbCommit),
             move || {
-                let _ = unmined.insert(500, key, Some(&*redo_for_panic));
+                let _ = dah.insert(500, key, Some(&*redo_for_panic));
             },
         );
         panicked.expect_err("insert must panic at BeforeSecondaryRedbCommit");
@@ -462,8 +451,8 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     // Post-panic: reopen the redb file. It must not contain the entry
     // (commit never ran).
     {
-        let unmined = RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap();
-        let result = unmined.range_query(500);
+        let dah = RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap();
+        let result = dah.range_query(500);
         assert!(
             result.is_empty(),
             "redb must be empty before recovery — commit did not run"
@@ -473,34 +462,27 @@ fn kill_before_secondary_redb_commit_reconciles_via_redo() {
     // Drop the live redo handle to mimic process restart.
     drop(redo_log);
 
-    // Reopen and run recovery with both secondary backends.
+    // Reopen and run recovery with the on-disk DAH backend.
     let redo_reopened = RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap();
     let mut dah_backend =
         DahBackend::OnDisk(RedbDahIndex::open(&dah_path, 16 * 1024 * 1024).unwrap());
-    let mut unmined_backend =
-        UnminedBackend::OnDisk(RedbUnminedIndex::open(&unmined_path, 16 * 1024 * 1024).unwrap());
 
-    let stats = teraslab::recovery::recover_all(
-        &data_dev,
-        &redo_reopened,
-        &primary,
-        &mut dah_backend,
-        &mut unmined_backend,
-    )
-    .unwrap();
+    let stats =
+        teraslab::recovery::recover_all(&data_dev, &redo_reopened, &primary, &mut dah_backend)
+            .unwrap();
     assert!(
         stats.entries_replayed >= 1,
-        "recovery must replay the SecondaryUnminedUpdate intent"
+        "recovery must replay the SecondaryDahUpdate intent"
     );
     assert_eq!(stats.entries_failed, 0);
 
-    // Secondary is reconciled: the txid now appears in the unmined
+    // Secondary is reconciled: the txid now appears in the DAH
     // range query at height 500.
-    let recovered = unmined_backend.range_query(500);
+    let recovered = dah_backend.range_query(500);
     assert_eq!(
         recovered.len(),
         1,
-        "recovered unmined index must contain the entry"
+        "recovered DAH index must contain the entry"
     );
     assert_eq!(
         recovered[0], key,

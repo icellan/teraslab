@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey, UnminedBackend};
+use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
@@ -71,7 +71,6 @@ impl Harness {
             alloc,
             StripedLocks::new(64),
             DahBackend::new_in_memory(),
-            UnminedBackend::new_in_memory(),
         ));
         engine.set_redo_log(redo_log.clone());
         // The default production mode, and the one the bug lives in.
@@ -143,10 +142,9 @@ impl Harness {
         );
         let primary = PrimaryBackend::rebuild(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         let index = ShardedIndex::from_single(primary);
-        let (dah_idx, unmined_idx) =
+        let dah_idx =
             PrimaryBackend::rebuild_secondary(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         let mut dah = DahBackend::from(dah_idx);
-        let mut unmined = UnminedBackend::from(unmined_idx);
 
         let redo = RedoLog::open(self.redo_dev.clone() as Arc<dyn BlockDevice>, 0, REDO_SIZE)
             .expect("reopen redo after crash");
@@ -155,7 +153,6 @@ impl Harness {
             &redo,
             &index,
             &mut dah,
-            &mut unmined,
             Some(&mut alloc),
         )
         .expect("recovery must not fail");
@@ -166,7 +163,6 @@ impl Harness {
             alloc,
             StripedLocks::new(64),
             dah,
-            unmined,
         ))
     }
 }

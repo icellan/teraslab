@@ -108,8 +108,10 @@ impl RedbDahIndex {
     ///      [`RedoOp::SecondaryDahUpdate`] record.
     ///   3. Commit the redb transaction.
     ///
-    /// See [`crate::index::redb_unmined::RedbUnminedIndex::insert`] for the
-    /// durability rationale.
+    /// The redo intent is fsynced BEFORE the redb commit so a crash between
+    /// the two leaves a durable, idempotently-replayable record of the
+    /// intended mutation — recovery replays it against the current primary
+    /// state and skips if already applied.
     pub fn insert(
         &mut self,
         height: u32,

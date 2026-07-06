@@ -49,7 +49,7 @@ use teraslab::cluster::shards::{NUM_SHARDS, NodeId, ShardTable};
 use teraslab::cluster::topology::ClusterId;
 use teraslab::config::ServerConfig;
 use teraslab::device::{BlockDevice, MemoryDevice};
-use teraslab::index::{DahIndex, Index, TxKey, UnminedIndex};
+use teraslab::index::{DahIndex, Index, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::server::Server;
@@ -98,7 +98,6 @@ fn create_node(node_id: u64, seed_swim_ports: &[u16], hold_activation: bool) -> 
         alloc,
         StripedLocks::new(256),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
 
     let seeds: Vec<std::net::SocketAddr> = seed_swim_ports

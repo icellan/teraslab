@@ -36,9 +36,8 @@ fn build_engine() -> Engine {
     let allocator = SlotAllocator::new(device.clone()).unwrap();
     let index = PrimaryBackend::new_in_memory(1024).unwrap();
     let dah = teraslab::index::DahBackend::new_in_memory();
-    let unmined = teraslab::index::UnminedBackend::new_in_memory();
     let locks = StripedLocks::new(64);
-    Engine::new(device, index, allocator, locks, dah, unmined)
+    Engine::new(device, index, allocator, locks, dah)
 }
 
 /// Write a real EXTERNAL-flagged record for `key` on the engine's device via

@@ -32,7 +32,7 @@ use tempfile::TempDir;
 use teraslab::allocator::SlotAllocator;
 use teraslab::device::{BlockDevice, MemoryDevice};
 use teraslab::index::redb_dah::RedbDahIndex;
-use teraslab::index::{DahIndex, Index, UnminedIndex};
+use teraslab::index::{DahIndex, Index};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::engine::Engine;
 use teraslab::protocol::codec::{decode_error_payload, encode_get_batch};
@@ -101,7 +101,6 @@ fn corrupt_secondary_redb_degrades_dah_ops_over_tcp_but_not_primary_reads() {
         alloc,
         StripedLocks::new(1024),
         DahIndex::new(),
-        UnminedIndex::new(),
     ));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
