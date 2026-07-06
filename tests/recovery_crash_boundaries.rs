@@ -367,12 +367,15 @@ fn boundary_set_mined_after_wal_replays_and_second_pass_is_idempotent() {
         parent_txids: Vec::new(),
     })
     .unwrap();
-    redo.append_and_flush(RedoOp::SetMined {
-        tx_key: key,
+    redo.append_and_flush(RedoOp::SetMinedBatch {
         block_id: 42,
         block_height: 800_000,
         subtree_idx: 7,
+        on_longest_chain: true,
+        current_block_height: 800_000,
+        block_height_retention: 288,
         unset: false,
+        txids: vec![key],
     })
     .unwrap();
 
@@ -689,12 +692,19 @@ fn wal_create_plus_set_mined(
     })
     .unwrap();
     for id in 1..=n {
-        redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key,
+        // Each mining event is its own redo entry (a batch-of-one — this
+        // helper mines the SAME tx into N DIFFERENT blocks, so the entries
+        // don't share fields the way a `SetMinedBatch` for N DIFFERENT
+        // txids in the SAME block would).
+        redo.append_and_flush(RedoOp::SetMinedBatch {
             block_id: id,
             block_height: 800_000 + id,
             subtree_idx: 10 + id,
+            on_longest_chain: true,
+            current_block_height: 800_000 + id,
+            block_height_retention: 288,
             unset: false,
+            txids: vec![key],
         })
         .unwrap();
     }
@@ -784,12 +794,15 @@ fn boundary_unset_mined_removes_overflow_resident_entry() {
     assert_eq!({ m.block_entry_count }, 4, "precondition: overflow built");
 
     // Crash after the unset's WAL fsync, before the metadata write.
-    redo.append_and_flush(RedoOp::SetMined {
-        tx_key: key,
+    redo.append_and_flush(RedoOp::SetMinedBatch {
         block_id: 4,
         block_height: 800_004,
         subtree_idx: 14,
+        on_longest_chain: true,
+        current_block_height: 800_004,
+        block_height_retention: 288,
         unset: true,
+        txids: vec![key],
     })
     .unwrap();
 
@@ -828,12 +841,15 @@ fn boundary_unset_mined_removes_overflow_resident_entry() {
 fn boundary_unset_mined_inline_entry_pulls_overflow_into_inline() {
     let (data_dev, _redo_dev, mut alloc, index, mut redo) = fresh_state();
     let (key, record_offset) = wal_create_plus_set_mined(&mut alloc, &mut redo, 0xE2, 4);
-    redo.append_and_flush(RedoOp::SetMined {
-        tx_key: key,
+    redo.append_and_flush(RedoOp::SetMinedBatch {
         block_id: 2,
         block_height: 800_002,
         subtree_idx: 12,
+        on_longest_chain: true,
+        current_block_height: 800_002,
+        block_height_retention: 288,
         unset: true,
+        txids: vec![key],
     })
     .unwrap();
 
@@ -942,12 +958,15 @@ fn boundary_set_mined_overflow_realloc_does_not_clobber_neighbor() {
 
     // The 46th entry for A: overflow grows 42 -> 43 entries, 516 bytes,
     // crossing the 512-byte boundary.
-    redo.append_and_flush(RedoOp::SetMined {
-        tx_key: key_a,
+    redo.append_and_flush(RedoOp::SetMinedBatch {
         block_id: 46,
         block_height: 800_046,
         subtree_idx: 56,
+        on_longest_chain: true,
+        current_block_height: 800_046,
+        block_height_retention: 288,
         unset: false,
+        txids: vec![key_a],
     })
     .unwrap();
 

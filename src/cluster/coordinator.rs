@@ -6547,13 +6547,34 @@ pub fn redo_entry_to_replica_op(
                 master_generation: *target_generation,
             })
         }
-        RedoOp::SetMined {
-            tx_key,
+        RedoOp::SetMinedBatch {
             block_id,
             block_height,
             subtree_idx,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
             unset,
+            txids,
         } => {
+            // A batch of exactly one key is reconstructable as the same
+            // single `ReplicaOp` the retired per-tx `SetMined`/`UnsetMined`
+            // redo entries produced — the common shape for Gap #8
+            // compensation entries (`server/dispatch.rs`'s `comp_redo`) and
+            // the replica's own echoed-back local redo
+            // (`replication/receiver.rs`'s `replica_op_to_redo_op`). A
+            // genuine multi-key batch (the primary WAL entry
+            // `handle_set_mined_batch` writes for a live setMined RPC) has
+            // no single key to hang one `ReplicaOp` off of; its post-crash
+            // catch-up reconstruction arrives with Task 14's
+            // `ReplicaOp::SetMinedBatch`. Until then such an entry is not
+            // reshipped by the pending-replication-intent catch-up path —
+            // live replication (dispatch Phase 4) is unaffected, since it
+            // ships the per-key `ReplicaOp::SetMined`/`UnsetMined`
+            // independently of this redo-entry reconstruction.
+            let [tx_key] = txids.as_slice() else {
+                return None;
+            };
             if ShardTable::shard_for_key(tx_key) != shard {
                 return None;
             }
@@ -6561,8 +6582,8 @@ pub fn redo_entry_to_replica_op(
                 Some(ReplicaOp::UnsetMined {
                     tx_key: *tx_key,
                     block_id: *block_id,
-                    current_block_height: 0,
-                    block_height_retention: 0,
+                    current_block_height: *current_block_height,
+                    block_height_retention: *block_height_retention,
                     master_generation: gen_for(tx_key),
                 })
             } else {
@@ -6571,9 +6592,9 @@ pub fn redo_entry_to_replica_op(
                     block_id: *block_id,
                     block_height: *block_height,
                     subtree_idx: *subtree_idx,
-                    on_longest_chain: true,
-                    current_block_height: 0,
-                    block_height_retention: 0,
+                    on_longest_chain: *on_longest_chain,
+                    current_block_height: *current_block_height,
+                    block_height_retention: *block_height_retention,
                     master_generation: gen_for(tx_key),
                 })
             }

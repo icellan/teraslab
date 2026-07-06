@@ -243,12 +243,15 @@ fn journal_primary(op: &WorkloadOp, engine: &Engine, redo: &Mutex<RedoLog>) -> u
             block_id,
             block_height,
             ..
-        } => RedoOp::SetMined {
-            tx_key: *tx_key,
+        } => RedoOp::SetMinedBatch {
             block_id: *block_id,
             block_height: *block_height,
             subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: *block_height,
+            block_height_retention: RETENTION,
             unset: false,
+            txids: vec![*tx_key],
         },
         WorkloadOp::Delete { tx_key } => {
             let entry = engine.lookup(tx_key).expect("record exists for delete");

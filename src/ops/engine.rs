@@ -879,6 +879,18 @@ impl Engine {
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
+            // `SetMinedBatch::tx_key()` only represents a batch of exactly
+            // one key (see its doc comment), so the generic `other.tx_key()`
+            // fallback below would misroute a genuine multi-key batch to
+            // store 0. Route by the batch's first txid directly instead —
+            // every txid in one `SetMinedBatch` instance is guaranteed (by
+            // the caller's per-store grouping in
+            // `server::dispatch::handle_set_mined_batch`) to belong to the
+            // SAME store, so any one of them resolves the right store.
+            RedoOp::SetMinedBatch { txids, .. } => match txids.first() {
+                Some(k) => self.index.lookup(k).map(|e| e.device_id).unwrap_or(0),
+                None => 0,
+            },
             other => match other.tx_key() {
                 Some(k) => self.index.lookup(k).map(|e| e.device_id).unwrap_or(0),
                 None => 0,
@@ -906,6 +918,20 @@ impl Engine {
             | RedoOp::ReplicaCreate { device_id, .. }
             | RedoOp::AllocateRegion { device_id, .. }
             | RedoOp::FreeRegion { device_id, .. } => *device_id,
+            // See `redo_store_for_op`'s `SetMinedBatch` arm: route by the
+            // batch's first txid — the batch-local `batch_keys` map is
+            // consulted first for parity with every other keyed op, though
+            // in practice `handle_set_mined_batch` never journals a
+            // `SetMinedBatch` in the same call as a `Create`/`AllocateRegion`
+            // for one of its own txids.
+            RedoOp::SetMinedBatch { txids, .. } => match txids.first() {
+                Some(k) => batch_keys
+                    .get(k)
+                    .copied()
+                    .or_else(|| self.index.lookup(k).map(|e| e.device_id))
+                    .unwrap_or(0),
+                None => 0,
+            },
             other => match other.tx_key() {
                 Some(k) => batch_keys
                     .get(k)

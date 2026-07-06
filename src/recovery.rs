@@ -642,7 +642,13 @@ pub fn recover_all_multi_store(
     if !full_secondary_rebuild {
         for part in &partitions {
             for entry in part {
-                if let Some(key) = entry.op.tx_key() {
+                // `SetMinedBatch` carries many keys — `tx_key()` only
+                // represents a batch of exactly one, so a genuine multi-key
+                // batch must be unpacked here directly instead of going
+                // through that accessor.
+                if let RedoOp::SetMinedBatch { txids, .. } = &entry.op {
+                    touched_keys.extend(txids.iter().copied());
+                } else if let Some(key) = entry.op.tx_key() {
                     touched_keys.insert(*key);
                 }
             }
@@ -1024,17 +1030,22 @@ fn replay_one_recovery_entry(
         // SetMined may need the overflow region (4th+ block entry,
         // or unset of an overflow-resident entry) — route through
         // the allocator-aware replay so it can allocate/free it.
-        RedoOp::SetMined {
-            tx_key,
+        RedoOp::SetMinedBatch {
             block_id,
             block_height,
             subtree_idx,
             unset,
-        } => replay_set_mined_with_allocator(
+            txids,
+            // `on_longest_chain` / `current_block_height` /
+            // `block_height_retention` are carried for a later
+            // store-authoritative replay target (Task 12+); today's
+            // device replay does not consume them.
+            ..
+        } => replay_set_mined_batch_with_allocator(
             device,
             index,
             allocator,
-            tx_key,
+            txids,
             *block_id,
             *block_height,
             *subtree_idx,
@@ -1088,7 +1099,11 @@ fn recover_entries_with_allocator_collecting_pending_conflicts(
     for entry in &entries {
         // B-7: record every key the redo log touches so a clean recovery
         // can reconcile just these against the durable secondaries.
-        if let Some(key) = entry.op.tx_key() {
+        // `SetMinedBatch` carries many keys — `tx_key()` only represents a
+        // batch of exactly one, so unpack a genuine multi-key batch directly.
+        if let RedoOp::SetMinedBatch { txids, .. } = &entry.op {
+            touched_keys.extend(txids.iter().copied());
+        } else if let Some(key) = entry.op.tx_key() {
             touched_keys.insert(*key);
         }
         // Height subsystem (design §4; BUG3): fold the max block height across
@@ -1659,16 +1674,17 @@ fn replay_entry(
             }),
             utxo_hash.as_ref(),
         ),
-        RedoOp::SetMined {
-            tx_key,
+        RedoOp::SetMinedBatch {
             block_id,
             block_height,
             subtree_idx,
             unset,
-        } => replay_set_mined(
+            txids,
+            ..
+        } => replay_set_mined_batch(
             device,
             index,
-            tx_key,
+            txids,
             *block_id,
             *block_height,
             *subtree_idx,
@@ -2053,27 +2069,6 @@ fn replay_unspend(
     ReplayResult::Applied
 }
 
-fn replay_set_mined(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    tx_key: &TxKey,
-    block_id: u32,
-    block_height: u32,
-    subtree_idx: u32,
-    unset: bool,
-) -> ReplayResult {
-    replay_set_mined_with_allocator(
-        device,
-        index,
-        None,
-        tx_key,
-        block_id,
-        block_height,
-        subtree_idx,
-        unset,
-    )
-}
-
 /// Allocator-aware `SetMined` replay, mirroring the live `set_mined`
 /// path's overflow handling: the 4th+ block entry spills to the
 /// separately-allocated overflow region, dedup checks scan inline AND
@@ -2264,6 +2259,111 @@ fn replay_set_mined_with_allocator(
         return ReplayResult::Failed(ReplayCause::IoError);
     }
     ReplayResult::Applied
+}
+
+/// D5/§9: replay a batch-native `SetMinedBatch` entry (no allocator — the
+/// legacy single-backend `recover` path). See
+/// [`replay_set_mined_batch_with_allocator`].
+fn replay_set_mined_batch(
+    device: &dyn BlockDevice,
+    index: &ShardedIndex,
+    txids: &[TxKey],
+    block_id: u32,
+    block_height: u32,
+    subtree_idx: u32,
+    unset: bool,
+) -> ReplayResult {
+    replay_set_mined_batch_with_allocator(
+        device,
+        index,
+        None,
+        txids,
+        block_id,
+        block_height,
+        subtree_idx,
+        unset,
+    )
+}
+
+/// D5/§9: replay a batch-native `SetMinedBatch` redo entry against the
+/// device — all txs in the batch share every field but the txid, so this
+/// applies the SAME per-key device mutation
+/// [`replay_set_mined_with_allocator`] performs for a single-tx `SetMined`,
+/// once per txid (Task 12 will retarget this to the MinedIndex; today's
+/// dual-write era still authors the device record).
+///
+/// Every txid is attempted regardless of an earlier one's outcome in this
+/// same batch — the device mutations are independent (different record
+/// offsets), so one missing/failed key must not shadow the rest of the
+/// block from being replayed. The aggregate `ReplayResult` reported to the
+/// caller is the worst-observed outcome:
+/// - a fatal failure (`IoError`/`LogicError`/`CorruptEntry`) anywhere in the
+///   batch is surfaced (after every txid has still been given a chance to
+///   apply), so the caller's F-G4-007 "stop on first non-tolerable failure"
+///   contract still halts subsequent redo entries;
+/// - otherwise, `Applied` if at least one txid actually mutated the device
+///   (this is a minor stats-granularity simplification versus the retired
+///   per-tx-entry model: a rare non-fatal `MissingPrimary` for one txid
+///   inside an otherwise-successful batch is not separately counted in
+///   `RecoveryStats` — the device mutations themselves are still complete
+///   and correct for every key regardless);
+/// - otherwise a non-fatal failure if every txid failed non-fatally;
+/// - otherwise `Skipped` (every txid already applied — the idempotent
+///   double-replay case — or the batch is empty).
+#[allow(clippy::too_many_arguments)]
+fn replay_set_mined_batch_with_allocator(
+    device: &dyn BlockDevice,
+    index: &ShardedIndex,
+    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
+    txids: &[TxKey],
+    block_id: u32,
+    block_height: u32,
+    subtree_idx: u32,
+    unset: bool,
+) -> ReplayResult {
+    let mut any_applied = false;
+    let mut any_skipped = false;
+    let mut worst_fatal: Option<ReplayCause> = None;
+    let mut worst_non_fatal: Option<ReplayCause> = None;
+
+    for tx_key in txids {
+        let outcome = replay_set_mined_with_allocator(
+            device,
+            index,
+            allocator.as_deref_mut(),
+            tx_key,
+            block_id,
+            block_height,
+            subtree_idx,
+            unset,
+        );
+        match outcome {
+            ReplayResult::Applied => any_applied = true,
+            ReplayResult::Skipped => any_skipped = true,
+            ReplayResult::Failed(cause) if is_fatal_replay_cause(cause) => {
+                worst_fatal.get_or_insert(cause);
+            }
+            ReplayResult::Failed(cause) => {
+                worst_non_fatal.get_or_insert(cause);
+            }
+        }
+    }
+
+    if let Some(cause) = worst_fatal {
+        return ReplayResult::Failed(cause);
+    }
+    if any_applied {
+        return ReplayResult::Applied;
+    }
+    if let Some(cause) = worst_non_fatal {
+        return ReplayResult::Failed(cause);
+    }
+    if any_skipped {
+        return ReplayResult::Skipped;
+    }
+    // Empty batch (txids.is_empty()): nothing to apply — treat as a no-op,
+    // mirroring how a Checkpoint/no-op entry is handled.
+    ReplayResult::Skipped
 }
 
 fn replay_freeze(
@@ -4841,12 +4941,15 @@ mod tests {
         let ie = h.index.lookup(&key).unwrap();
 
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key,
+        redo.append_and_flush(RedoOp::SetMinedBatch {
             block_id: 42,
             block_height: 1000,
             subtree_idx: 7,
+            on_longest_chain: true,
+            current_block_height: 1000,
+            block_height_retention: 288,
             unset: false,
+            txids: vec![key],
         })
         .unwrap();
 
@@ -4922,36 +5025,51 @@ mod tests {
         assert_eq!({ meta.spent_utxos }, 1);
     }
 
+    /// D5/§9 + Task 11: a `SetMinedBatch` covering several txids reproduces
+    /// the device block-entries for ALL of them from a single redo entry,
+    /// and replaying the SAME batch entry a second time is a no-op for
+    /// every txid (idempotent), exactly as the retired per-tx `SetMined`
+    /// replay was.
     #[test]
-    fn idempotent_set_mined() {
+    fn set_mined_batch_replays_all_txids_and_is_idempotent() {
         let mut h = RecoveryTestHarness::new();
-        let key = h.create_record(5, 5);
+        let key_a = h.create_record(5, 5);
+        let key_b = h.create_record(6, 5);
+        let key_c = h.create_record(7, 5);
 
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key,
+        let batch = RedoOp::SetMinedBatch {
             block_id: 10,
             block_height: 100,
             subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 100,
+            block_height_retention: 288,
             unset: false,
-        })
-        .unwrap();
-        redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key,
-            block_id: 10,
-            block_height: 100,
-            subtree_idx: 0,
-            unset: false,
-        })
-        .unwrap();
+            txids: vec![key_a, key_b, key_c],
+        };
+        redo.append_and_flush(batch.clone()).unwrap();
+        redo.append_and_flush(batch).unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
+        // First entry applies (mutates all 3 device records); the identical
+        // second entry is a full no-op re-replay.
         assert_eq!(stats.entries_replayed, 1);
         assert_eq!(stats.entries_skipped, 1);
 
-        let ie = h.index.lookup(&key).unwrap();
-        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        assert_eq!(meta.block_entry_count, 1);
+        for key in [key_a, key_b, key_c] {
+            let ie = h.index.lookup(&key).unwrap();
+            let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+            assert_eq!(
+                meta.block_entry_count, 1,
+                "each txid in the batch must have exactly one block entry"
+            );
+            assert_eq!(
+                { meta.block_entries_inline[0].block_id },
+                10,
+                "block entry must carry the batch's shared block_id"
+            );
+        }
     }
 
     #[test]
@@ -7302,12 +7420,15 @@ mod tests {
         );
 
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key,
+        redo.append_and_flush(RedoOp::SetMinedBatch {
             block_id: 42,
             block_height: 800_000,
             subtree_idx: 7,
+            on_longest_chain: true,
+            current_block_height: 800_000,
+            block_height_retention: 288,
             unset: false,
+            txids: vec![key],
         })
         .unwrap();
 
@@ -8689,15 +8810,19 @@ mod tests {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(0x70, 2);
 
-        // A height-bearing op (SetMined at height 800_123) and a NON-height op
-        // (Freeze) — only the former should contribute to the floor.
+        // A height-bearing op (SetMinedBatch at height 800_123) and a
+        // NON-height op (Freeze) — only the former should contribute to the
+        // floor.
         let mut redo = h.redo_log();
-        redo.append_and_flush(RedoOp::SetMined {
-            tx_key: key,
+        redo.append_and_flush(RedoOp::SetMinedBatch {
             block_id: 5,
             block_height: 800_123,
             subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 800_123,
+            block_height_retention: 288,
             unset: false,
+            txids: vec![key],
         })
         .unwrap();
         redo.append_and_flush(RedoOp::Freeze {

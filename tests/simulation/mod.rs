@@ -645,12 +645,15 @@ impl Simulation {
 
                 if redo
                     .lock()
-                    .append_and_flush(RedoOp::SetMined {
-                        tx_key: TxKey { txid },
+                    .append_and_flush(RedoOp::SetMinedBatch {
                         block_id,
                         block_height: current_block_height,
                         subtree_idx: 0,
+                        on_longest_chain: true,
+                        current_block_height,
+                        block_height_retention: 288,
                         unset: false,
+                        txids: vec![TxKey { txid }],
                     })
                     .is_err()
                 {

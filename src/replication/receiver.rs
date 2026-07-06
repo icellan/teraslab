@@ -2150,27 +2150,49 @@ fn build_post_apply_redo_op(
                 utxo_hash,
             }))
         }
+        // D5/§9: the replica's local redo is now the batch-native
+        // `SetMinedBatch` shape too — a batch-of-one, since the wire
+        // `ReplicaOp::SetMined`/`UnsetMined` are still per-key (batch
+        // replication arrives with Task 14's `ReplicaOp::SetMinedBatch`).
+        // `RedoOp::SetMinedBatch::tx_key()` treats a batch of exactly one
+        // key as a single-key op, so per-store routing
+        // (`Engine::append_replica_redo_entry`) and recovery's
+        // touched-keys tracking both work exactly as they did for the
+        // retired per-tx `RedoOp::SetMined`.
         ReplicaOp::SetMined {
             tx_key,
             block_id,
             block_height,
             subtree_idx,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
             ..
-        } => Ok(Some(RedoOp::SetMined {
-            tx_key: *tx_key,
+        } => Ok(Some(RedoOp::SetMinedBatch {
             block_id: *block_id,
             block_height: *block_height,
             subtree_idx: *subtree_idx,
+            on_longest_chain: *on_longest_chain,
+            current_block_height: *current_block_height,
+            block_height_retention: *block_height_retention,
             unset: false,
+            txids: vec![*tx_key],
         })),
         ReplicaOp::UnsetMined {
-            tx_key, block_id, ..
-        } => Ok(Some(RedoOp::SetMined {
-            tx_key: *tx_key,
+            tx_key,
+            block_id,
+            current_block_height,
+            block_height_retention,
+            ..
+        } => Ok(Some(RedoOp::SetMinedBatch {
             block_id: *block_id,
             block_height: 0,
             subtree_idx: 0,
+            on_longest_chain: false,
+            current_block_height: *current_block_height,
+            block_height_retention: *block_height_retention,
             unset: true,
+            txids: vec![*tx_key],
         })),
         ReplicaOp::Freeze { tx_key, offset, .. } => {
             let slot = match engine.read_slot(tx_key, *offset) {

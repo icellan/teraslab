@@ -467,7 +467,10 @@ impl RedoHeader {
 /// Type tags for serialized redo operations.
 const OP_SPEND: u8 = 1;
 const OP_UNSPEND: u8 = 2;
-const OP_SET_MINED: u8 = 3;
+// Opcode 3 was `OP_SET_MINED` (retired, greenfield — no back-compat decoding).
+// Replaced by the batch-native `OP_SET_MINED_BATCH` = 42 (see [`RedoOp::SetMinedBatch`]).
+// Not reused here to avoid confusing archived redo dumps / docs that still
+// reference "opcode 3" with the old per-tx shape.
 const OP_FREEZE: u8 = 4;
 const OP_UNFREEZE: u8 = 5;
 const OP_REASSIGN: u8 = 6;
@@ -590,6 +593,20 @@ const OP_RELOCATE: u8 = 40;
 // Opcode 41 was `OP_RELOCATE_V2` (the retired fat clustered-segment relocate).
 // Superseded by the convertible `SpendV2`; do not reuse 41 without care.
 
+/// D5/§9 (MinedIndex / MAX setMined design): batch-native setMined redo entry.
+/// One entry per setMined RPC per store instead of one per txid — all txs in
+/// a batch share every field but the txid. Replaces the retired per-tx
+/// `OP_SET_MINED` (was opcode 3; see [`RedoOp::SetMinedBatch`]).
+const OP_SET_MINED_BATCH: u8 = 42;
+
+/// F-G4-006-style cap: bound the allocation a corrupt-but-CRC-valid
+/// `SetMinedBatch` entry can force. A single client RPC is already capped by
+/// `Config::max_batch_size` (default 8192) before it ever reaches the redo
+/// layer, so any legitimate per-store batch is far below this; 1,000,000
+/// entries (~32 MiB) is a generous ceiling that still protects against a
+/// corrupted `count` field in a large redo log region.
+const MAX_SET_MINED_BATCH_TXIDS: usize = 1_000_000;
+
 /// F-G4-006: hard cap on the number of parent_txids decoded from a single
 /// `Create` redo entry. Bitcoin transactions in practice rarely have
 /// more than a handful of conflicting parents; a wire-controlled
@@ -651,12 +668,25 @@ pub enum RedoOp {
         /// correct hash instead of fail-closed-bricking.
         utxo_hash: Option<[u8; 32]>,
     },
-    SetMined {
-        tx_key: TxKey,
+    /// D5/§9: batch-native setMined redo entry — one entry per setMined RPC
+    /// per store (a batch whose owned txids span device-split stores is
+    /// split into one `SetMinedBatch` per store, shared fields repeated per
+    /// store). All txs in a batch share every field but the txid. Replaces
+    /// the retired per-tx `SetMined` (greenfield, no back-compat decoding).
+    ///
+    /// `on_longest_chain` / `current_block_height` / `block_height_retention`
+    /// are carried for a later store-authoritative replay target (the
+    /// MinedIndex) even though today's device replay (`replay_set_mined_*`)
+    /// does not consume them yet.
+    SetMinedBatch {
         block_id: u32,
         block_height: u32,
         subtree_idx: u32,
+        on_longest_chain: bool,
+        current_block_height: u32,
+        block_height_retention: u32,
         unset: bool,
+        txids: Vec<TxKey>,
     },
     Freeze {
         tx_key: TxKey,
@@ -1109,7 +1139,7 @@ impl RedoOp {
                 utxo_hash: Some(_), ..
             } => OP_UNSPEND_V3,
             RedoOp::UnspendV2 { .. } => OP_UNSPEND_V2,
-            RedoOp::SetMined { .. } => OP_SET_MINED,
+            RedoOp::SetMinedBatch { .. } => OP_SET_MINED_BATCH,
             RedoOp::Freeze { .. } => OP_FREEZE,
             RedoOp::FreezeV2 { .. } => OP_FREEZE_V2,
             RedoOp::Unfreeze { .. } => OP_UNFREEZE,
@@ -1154,7 +1184,6 @@ impl RedoOp {
             | RedoOp::SpendV2 { tx_key, .. }
             | RedoOp::Unspend { tx_key, .. }
             | RedoOp::UnspendV2 { tx_key, .. }
-            | RedoOp::SetMined { tx_key, .. }
             | RedoOp::Freeze { tx_key, .. }
             | RedoOp::FreezeV2 { tx_key, .. }
             | RedoOp::Unfreeze { tx_key, .. }
@@ -1181,6 +1210,24 @@ impl RedoOp {
             RedoOp::AppendConflictingChild { parent_key, .. }
             | RedoOp::RemoveConflictingChild { parent_key, .. }
             | RedoOp::AppendDeletedChild { parent_key, .. } => Some(parent_key),
+            // A batch of exactly one key acts like a single-key op for every
+            // consumer of this accessor (secondary-index touched-keys
+            // tracking, per-store redo routing, replication-intent key
+            // tracking, redo-entry-to-replica-op catch-up reconstruction) —
+            // this is the common shape for Gap #8 compensation entries and
+            // the replica's own echoed-back local redo (batch-of-one). A
+            // batch of 0 or >1 keys has no single representative key; those
+            // consumers special-case `SetMinedBatch` directly instead of
+            // going through this accessor (see `recovery::recover_all_multi_store`
+            // / `recover_entries_with_allocator_collecting_pending_conflicts`'s
+            // `touched_keys`, and `ops::engine::Engine::redo_store_for_op[_batch]`).
+            RedoOp::SetMinedBatch { txids, .. } => {
+                if txids.len() == 1 {
+                    txids.first()
+                } else {
+                    None
+                }
+            }
             RedoOp::AllocateRegion { .. }
             | RedoOp::FreeRegion { .. }
             | RedoOp::HashtableResizeBegin { .. }
@@ -1194,7 +1241,7 @@ impl RedoOp {
     /// subsystem, deletion-tombstone design §4).
     ///
     /// Returns `Some(h)` for the height-bearing ops that carry the chain height
-    /// (or, for [`RedoOp::SetMined`], the mined block height) at the time the
+    /// (or, for [`RedoOp::SetMinedBatch`], the mined block height) at the time the
     /// engine applied them: spend / unspend (V2 — V1 predates the field),
     /// set-mined, reassign, set-conflicting, preserve-until,
     /// mark-on-longest-chain, and the unset-mined compensation. Returns `None`
@@ -1225,7 +1272,7 @@ impl RedoOp {
                 current_block_height,
                 ..
             } => Some(*current_block_height),
-            RedoOp::SetMined { block_height, .. }
+            RedoOp::SetMinedBatch { block_height, .. }
             | RedoOp::Reassign { block_height, .. }
             | RedoOp::ReassignV2 { block_height, .. }
             | RedoOp::PreserveUntil { block_height, .. }
@@ -1283,7 +1330,10 @@ impl RedoOp {
             RedoOp::Unspend { spending_data, .. } => {
                 32 + 4 + if spending_data.is_some() { 36 + 4 } else { 4 }
             }
-            RedoOp::SetMined { .. } => 32 + 4 + 4 + 4 + 1,
+            // Shared fields: block_id/block_height/subtree_idx (4 each) +
+            // on_longest_chain (1) + current_block_height/block_height_retention
+            // (4 each) + unset (1) + txids count (4) = 26, plus 32 bytes/txid.
+            RedoOp::SetMinedBatch { txids, .. } => 26 + txids.len() * 32,
             RedoOp::Freeze { .. } | RedoOp::Unfreeze { .. } | RedoOp::PruneSlot { .. } => 32 + 4,
             RedoOp::PruneSlotIfSpentBy { .. } => 32 + 4 + 32,
             RedoOp::FreezeV2 { .. } | RedoOp::UnfreezeV2 { .. } => 32 + 4 + 32,
@@ -1398,18 +1448,28 @@ impl RedoOp {
                     buf.extend_from_slice(hash);
                 }
             }
-            RedoOp::SetMined {
-                tx_key,
+            RedoOp::SetMinedBatch {
                 block_id,
                 block_height,
                 subtree_idx,
+                on_longest_chain,
+                current_block_height,
+                block_height_retention,
                 unset,
+                txids,
             } => {
-                buf.extend_from_slice(&tx_key.txid);
                 buf.extend_from_slice(&block_id.to_le_bytes());
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&subtree_idx.to_le_bytes());
+                buf.push(if *on_longest_chain { 1 } else { 0 });
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.push(if *unset { 1 } else { 0 });
+                let count = txids.len() as u32;
+                buf.extend_from_slice(&count.to_le_bytes());
+                for txid in txids {
+                    buf.extend_from_slice(&txid.txid);
+                }
             }
             RedoOp::Freeze { tx_key, offset }
             | RedoOp::Unfreeze { tx_key, offset }
@@ -1796,15 +1856,45 @@ impl RedoOp {
                     new_spent_count: cnt,
                 })
             }
-            OP_SET_MINED if data.len() >= 45 => {
-                let mut txid = [0u8; 32];
-                txid.copy_from_slice(&data[..32]);
-                Some(RedoOp::SetMined {
-                    tx_key: TxKey { txid },
-                    block_id: u32::from_le_bytes(data[32..36].try_into().unwrap()),
-                    block_height: u32::from_le_bytes(data[36..40].try_into().unwrap()),
-                    subtree_idx: u32::from_le_bytes(data[40..44].try_into().unwrap()),
-                    unset: data[44] != 0,
+            OP_SET_MINED_BATCH if data.len() >= 26 => {
+                // Layout: block_id(4) + block_height(4) + subtree_idx(4)
+                //       + on_longest_chain(1) + current_block_height(4)
+                //       + block_height_retention(4) + unset(1) + count(4)
+                //       + txids(32*N)
+                let block_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                let block_height = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                let subtree_idx = u32::from_le_bytes(data[8..12].try_into().unwrap());
+                let on_longest_chain = data[12] != 0;
+                let current_block_height = u32::from_le_bytes(data[13..17].try_into().unwrap());
+                let block_height_retention = u32::from_le_bytes(data[17..21].try_into().unwrap());
+                let unset = data[21] != 0;
+                let count_raw = u32::from_le_bytes(data[22..26].try_into().unwrap()) as usize;
+                // Bound the allocation BEFORE trusting `count_raw` to size a
+                // `Vec` — a corrupt-but-CRC-valid entry in a large redo log
+                // region could otherwise claim an enormous txid count.
+                if count_raw > MAX_SET_MINED_BATCH_TXIDS {
+                    return None;
+                }
+                let txids_end = 26usize.checked_add(count_raw.checked_mul(32)?)?;
+                if data.len() < txids_end {
+                    return None;
+                }
+                let mut txids: Vec<TxKey> = Vec::with_capacity(count_raw);
+                for i in 0..count_raw {
+                    let off = 26 + i * 32;
+                    let mut txid = [0u8; 32];
+                    txid.copy_from_slice(&data[off..off + 32]);
+                    txids.push(TxKey { txid });
+                }
+                Some(RedoOp::SetMinedBatch {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    on_longest_chain,
+                    current_block_height,
+                    block_height_retention,
+                    unset,
+                    txids,
                 })
             }
             // F-G4-008: distinct opcodes for V2 freeze/unfreeze. The old
@@ -5208,12 +5298,25 @@ mod tests {
                 updated_at: 6,
                 utxo_hash: Some(h),
             },
-            RedoOp::SetMined {
-                tx_key: k,
+            RedoOp::SetMinedBatch {
                 block_id: 1,
                 block_height: 2,
                 subtree_idx: 3,
+                on_longest_chain: true,
+                current_block_height: 4,
+                block_height_retention: 5,
                 unset: true,
+                txids: vec![k],
+            },
+            RedoOp::SetMinedBatch {
+                block_id: 1,
+                block_height: 2,
+                subtree_idx: 3,
+                on_longest_chain: false,
+                current_block_height: 4,
+                block_height_retention: 5,
+                unset: false,
+                txids: vec![k, k, k],
             },
             RedoOp::Freeze {
                 tx_key: k,
@@ -5940,19 +6043,25 @@ mod tests {
                 spending_data: Some([0xCD; 36]),
                 new_spent_count: 10,
             },
-            RedoOp::SetMined {
-                tx_key: test_key(3),
+            RedoOp::SetMinedBatch {
                 block_id: 100,
                 block_height: 800000,
                 subtree_idx: 7,
+                on_longest_chain: true,
+                current_block_height: 800000,
+                block_height_retention: 288,
                 unset: false,
+                txids: vec![test_key(3), test_key(30)],
             },
-            RedoOp::SetMined {
-                tx_key: test_key(4),
+            RedoOp::SetMinedBatch {
                 block_id: 200,
                 block_height: 900000,
                 subtree_idx: 3,
+                on_longest_chain: false,
+                current_block_height: 900000,
+                block_height_retention: 288,
                 unset: true,
+                txids: vec![test_key(4)],
             },
             RedoOp::Freeze {
                 tx_key: test_key(5),
@@ -6845,25 +6954,100 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_set_mined() {
-        assert_round_trip(RedoOp::SetMined {
-            tx_key: make_txid(0xC3),
+    fn round_trip_set_mined_batch() {
+        assert_round_trip(RedoOp::SetMinedBatch {
             block_id: 123456,
             block_height: 800_000,
             subtree_idx: 15,
+            on_longest_chain: true,
+            current_block_height: 800_000,
+            block_height_retention: 288,
             unset: false,
+            txids: vec![make_txid(0xC3), make_txid(0xC5), make_txid(0xC6)],
         });
     }
 
     #[test]
-    fn round_trip_set_mined_unset() {
-        assert_round_trip(RedoOp::SetMined {
-            tx_key: make_txid(0xC4),
+    fn round_trip_set_mined_batch_unset() {
+        assert_round_trip(RedoOp::SetMinedBatch {
             block_id: 654321,
             block_height: 900_001,
             subtree_idx: 0,
+            on_longest_chain: false,
+            current_block_height: 900_005,
+            block_height_retention: 288,
             unset: true,
+            txids: vec![make_txid(0xC4)],
         });
+    }
+
+    #[test]
+    fn round_trip_set_mined_batch_empty_txids() {
+        // A batch with zero txids is a legal (if degenerate) wire shape —
+        // decode must not choke on a zero count.
+        assert_round_trip(RedoOp::SetMinedBatch {
+            block_id: 1,
+            block_height: 2,
+            subtree_idx: 3,
+            on_longest_chain: true,
+            current_block_height: 4,
+            block_height_retention: 5,
+            unset: false,
+            txids: vec![],
+        });
+    }
+
+    /// D5/§9 + Task 11: direct `serialize_data`/`deserialize` round trip for
+    /// `SetMinedBatch`, covering the 0- and multi-txid shapes plus fail-closed
+    /// decode of a truncated buffer (no panic, no out-of-bounds read).
+    #[test]
+    fn set_mined_batch_encode_decode_roundtrip() {
+        let empty = RedoOp::SetMinedBatch {
+            block_id: 1,
+            block_height: 2,
+            subtree_idx: 3,
+            on_longest_chain: true,
+            current_block_height: 4,
+            block_height_retention: 5,
+            unset: false,
+            txids: vec![],
+        };
+        let mut buf = Vec::new();
+        empty.serialize_data(&mut buf);
+        assert_eq!(buf.len(), empty.serialized_data_len());
+        let decoded =
+            RedoOp::deserialize(OP_SET_MINED_BATCH, &buf).expect("decode empty-txid batch");
+        assert_eq!(decoded, empty);
+
+        let three = RedoOp::SetMinedBatch {
+            block_id: 10,
+            block_height: 800_000,
+            subtree_idx: 2,
+            on_longest_chain: false,
+            current_block_height: 800_005,
+            block_height_retention: 288,
+            unset: true,
+            txids: vec![make_txid(1), make_txid(2), make_txid(3)],
+        };
+        let mut buf3 = Vec::new();
+        three.serialize_data(&mut buf3);
+        assert_eq!(buf3.len(), three.serialized_data_len());
+        let decoded3 = RedoOp::deserialize(OP_SET_MINED_BATCH, &buf3).expect("decode 3-txid batch");
+        assert_eq!(decoded3, three);
+
+        // Truncated buffers must fail closed instead of panicking.
+        assert!(
+            RedoOp::deserialize(OP_SET_MINED_BATCH, &buf3[..buf3.len() - 1]).is_none(),
+            "one byte short of the last txid must be rejected"
+        );
+        assert!(
+            RedoOp::deserialize(OP_SET_MINED_BATCH, &buf3[..30]).is_none(),
+            "header present but truncated within the first txid must be rejected"
+        );
+        assert!(
+            RedoOp::deserialize(OP_SET_MINED_BATCH, &[]).is_none(),
+            "empty buffer must be rejected, not panic"
+        );
     }
 
     #[test]
@@ -7728,12 +7912,15 @@ mod tests {
                 spending_data: [0xDD; 36],
                 new_spent_count: 1,
             },
-            RedoOp::SetMined {
-                tx_key: make_txid(0x02),
+            RedoOp::SetMinedBatch {
                 block_id: 42,
                 block_height: 100_000,
                 subtree_idx: 3,
+                on_longest_chain: true,
+                current_block_height: 100_000,
+                block_height_retention: 288,
                 unset: false,
+                txids: vec![make_txid(0x02), make_txid(0x0A)],
             },
             RedoOp::ReplicaCreate {
                 tx_key: make_txid(0x03),
@@ -8819,12 +9006,15 @@ mod tests {
             freeze(1),
             spend_op(2, 200),  // hot path, op_data > 64 bytes
             spend_op(3, 1024), // forces buffer growth past pre_encode's +64
-            RedoOp::SetMined {
-                tx_key: test_key(4),
+            RedoOp::SetMinedBatch {
                 block_id: 7,
                 block_height: 42,
                 subtree_idx: 1,
+                on_longest_chain: true,
+                current_block_height: 42,
+                block_height_retention: 288,
                 unset: false,
+                txids: vec![test_key(4)],
             },
             freeze(5),
         ];

@@ -614,12 +614,15 @@ fn sweep_set_mined() {
             crash,
             |redo| {
                 redo.lock()
-                    .append_and_flush(RedoOp::SetMined {
-                        tx_key: k,
+                    .append_and_flush(RedoOp::SetMinedBatch {
                         block_id,
                         block_height: CURRENT_HEIGHT,
                         subtree_idx: 0,
+                        on_longest_chain: true,
+                        current_block_height: CURRENT_HEIGHT,
+                        block_height_retention: RETENTION,
                         unset: false,
+                        txids: vec![k],
                     })
                     .ok();
             },

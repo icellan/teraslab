@@ -3426,12 +3426,15 @@ fn compensate_replication_failure(
                         block_height_retention: *block_height_retention,
                     };
                     let _ = engine.set_mined(&req);
-                    comp_redo.push(RedoOp::SetMined {
-                        tx_key: *key,
+                    comp_redo.push(RedoOp::SetMinedBatch {
                         block_id: *block_id,
                         block_height: *block_height,
                         subtree_idx: *subtree_idx,
+                        on_longest_chain: false,
+                        current_block_height: *current_block_height,
+                        block_height_retention: *block_height_retention,
                         unset: true,
+                        txids: vec![*key],
                     });
                 }
                 ReplicaOp::UnsetMined {
@@ -3467,12 +3470,15 @@ fn compensate_replication_failure(
                     let _ = engine.set_mined(&req);
                     // Forward redo entry: re-add the original block entry
                     // (so a recovery replay applies the same restoration).
-                    comp_redo.push(RedoOp::SetMined {
-                        tx_key: *key,
+                    comp_redo.push(RedoOp::SetMinedBatch {
                         block_id: *block_id,
                         block_height: bh,
                         subtree_idx: sti,
+                        on_longest_chain: true,
+                        current_block_height: *current_block_height,
+                        block_height_retention: *block_height_retention,
                         unset: false,
+                        txids: vec![*key],
                     });
                     // Compensation-intent redo entry — only emitted when a
                     // real before-image was captured. On crash mid-
@@ -5504,9 +5510,11 @@ fn handle_set_mined_batch(
     }
 
     let mut errors = Vec::new();
-    let mut redo_ops: Vec<RedoOp> = Vec::new();
 
-    // Phase 1: Validate ownership and build redo ops from request params.
+    // Phase 1: Validate ownership and collect the owned items. The redo is
+    // built AFTER this loop (below) — D5/§9: WAL and replication carry one
+    // batched op per setMined RPC, and a batch's owned txids may span
+    // device-split stores, so the redo is split per store.
     struct ValidSetMined {
         idx: usize,
         key: TxKey,
@@ -5517,16 +5525,43 @@ fn handle_set_mined_batch(
             errors.push(redirect_err);
             continue;
         }
-        let key = TxKey { txid: *txid };
-        redo_ops.push(RedoOp::SetMined {
-            tx_key: key,
+        valid_items.push(ValidSetMined {
+            idx: i,
+            key: TxKey { txid: *txid },
+        });
+    }
+
+    // D5/§9: group the owned keys by their store (each key's primary-index
+    // `device_id`, falling back to store 0 for a key not yet indexed — same
+    // fallback `Engine::redo_store_for_op` uses) and build ONE
+    // `SetMinedBatch` per non-empty store group, so a batch whose txids span
+    // device-split stores becomes one redo entry per store instead of one
+    // per txid. All txs in a setMined batch share every field but the txid,
+    // so the shared params are copied into each store's entry.
+    let store_count = engine.store_count();
+    let mut txids_by_store: Vec<Vec<TxKey>> = (0..store_count).map(|_| Vec::new()).collect();
+    for v in &valid_items {
+        let store = engine
+            .lookup(&v.key)
+            .map(|e| e.device_id as usize)
+            .unwrap_or(0)
+            .min(store_count - 1);
+        txids_by_store[store].push(v.key);
+    }
+    let redo_ops: Vec<RedoOp> = txids_by_store
+        .into_iter()
+        .filter(|txids| !txids.is_empty())
+        .map(|txids| RedoOp::SetMinedBatch {
             block_id: params.block_id,
             block_height: params.block_height,
             subtree_idx: params.subtree_idx,
+            on_longest_chain: params.on_longest_chain,
+            current_block_height: params.current_block_height,
+            block_height_retention: params.block_height_retention,
             unset: params.unset_mined,
-        });
-        valid_items.push(ValidSetMined { idx: i, key });
-    }
+            txids,
+        })
+        .collect();
 
     // Per-key visibility for the apply window (released before replication).
     // Excludes a client read of THESE keys while set_mined applies, while
@@ -21874,6 +21909,63 @@ mod tests {
             m.operations.get(OpCode::SetMined, Outcome::ErrStorage) - before_err_storage,
             2,
             "operations{{set_mined,err_storage}} += 2"
+        );
+    }
+
+    /// D5/§9 + Task 11: a setMined batch RPC over N txids on ONE store
+    /// writes EXACTLY ONE `SetMinedBatch` redo entry — not N per-tx entries
+    /// — carrying every txid. This is the whole point of making the setMined
+    /// WAL batch-native.
+    #[test]
+    fn set_mined_batch_writes_one_redo_entry_carrying_all_txids() {
+        let h = RedoDispatchHarness::new();
+        const N: usize = 5;
+        let txids: Vec<[u8; 32]> = (0..N as u8).map(DispatchTestHarness::make_txid).collect();
+        for &txid in &txids {
+            assert_eq!(
+                h.create_tx(txid, 1).status,
+                STATUS_OK,
+                "seed create must succeed"
+            );
+        }
+
+        let params = SetMinedBatchParams {
+            block_id: 7,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        let resp = h.request(OP_SET_MINED_BATCH, encode_set_mined_batch(&params, &txids));
+        assert_eq!(resp.status, STATUS_OK, "batch setMined must succeed");
+
+        let entries = h.redo_log.lock().recover().expect("recover redo entries");
+        let set_mined_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.op, RedoOp::SetMinedBatch { .. }))
+            .collect();
+        assert_eq!(
+            set_mined_entries.len(),
+            1,
+            "an N-txid setMined batch confined to one store must write exactly \
+             one redo entry, got {}",
+            set_mined_entries.len()
+        );
+        let RedoOp::SetMinedBatch {
+            txids: got_txids, ..
+        } = &set_mined_entries[0].op
+        else {
+            unreachable!("filtered above");
+        };
+        let mut got: Vec<[u8; 32]> = got_txids.iter().map(|k| k.txid).collect();
+        got.sort_unstable();
+        let mut want = txids.clone();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "the single entry must carry every txid in the batch"
         );
     }
 
