@@ -5999,23 +5999,51 @@ fn stream_shard_baseline(
                 }
             }
 
-            // Replay block entries (mined state)
-            for i in 0..meta.block_entry_count as usize {
-                if i < crate::record::INLINE_BLOCK_ENTRIES {
-                    let be = &meta.block_entries_inline[i];
-                    if be.block_id != 0 || be.block_height != 0 {
-                        ops.push(ReplicaOp::SetMined {
-                            tx_key,
-                            block_id: be.block_id,
-                            block_height: be.block_height,
-                            subtree_idx: be.subtree_idx,
-                            on_longest_chain: true,
-                            current_block_height: 0,
-                            block_height_retention: 0,
-                            master_generation: record_gen,
-                        });
-                    }
+            // Replay mined state from the authoritative in-RAM MinedIndex —
+            // NOT the device's `meta.block_entries_inline` — so migration is
+            // store-to-store (a later task drops on-device block entries
+            // entirely). A record's blocks can carry DIFFERENT block_ids, so
+            // each is shipped as its own per-block `ReplicaOp::SetMined`; the
+            // coalesced `ReplicaOp::SetMinedBatch` shares one block_id across
+            // MANY txids — the orthogonal live/delta axis, not applicable to
+            // a single record's own block list.
+            let (mined_entries, unmined_since) = match engine.mined_block_entries(key) {
+                Ok(v) => v,
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    // Raced a concurrent delete between the
+                    // `read_record_snapshot` above and this lookup — the
+                    // Create/Spend/Freeze ops already queued for this key
+                    // still ship; there is simply no mined state left to
+                    // replay for it.
+                    tracing::debug!(
+                        shard = task.shard,
+                        key = ?key,
+                        "cluster: mined-state read raced a concurrent delete \
+                         during baseline stream; shipping no mined ops",
+                    );
+                    (Vec::new(), 0)
                 }
+                Err(e) => {
+                    return Err(format!(
+                        "baseline mined_block_entries shard {} key {:?}: {e:?}",
+                        task.shard, key
+                    ));
+                }
+            };
+            // NO_MINED_SLOT (never mined) returns `(vec![], 0)` above, so an
+            // unmined record naturally ships no mined ops here.
+            let on_longest_chain = unmined_since == 0;
+            for be in &mined_entries {
+                ops.push(ReplicaOp::SetMined {
+                    tx_key,
+                    block_id: be.block_id,
+                    block_height: be.block_height,
+                    subtree_idx: be.subtree_idx,
+                    on_longest_chain,
+                    current_block_height: 0,
+                    block_height_retention: 0,
+                    master_generation: record_gen,
+                });
             }
 
             // Replay conflicting/locked flags
@@ -9724,6 +9752,247 @@ mod tests {
             op,
             crate::replication::protocol::ReplicaOp::Create { tx_key, .. } if *tx_key == live_key
         )));
+    }
+
+    /// Task 15: the migration baseline's mined-state step must read from the
+    /// authoritative in-RAM `MinedIndex` (via `Engine::mined_block_entries`),
+    /// not the device's `meta.block_entries_inline` — migration is
+    /// store-to-store. A single record's blocks carry DIFFERENT block_ids
+    /// (mined into two distinct blocks here), so they must ship as two
+    /// per-block `ReplicaOp::SetMined`s, never a coalesced
+    /// `ReplicaOp::SetMinedBatch` (that op shares ONE block_id across MANY
+    /// txids — the orthogonal live/delta axis). An unmined record must ship
+    /// no mined ops at all.
+    #[test]
+    fn migration_baseline_ships_mined_state_from_mined_index() {
+        use crate::ops::set_mined::SetMinedRequest;
+        use std::io::{Read, Write};
+
+        let engine = test_engine();
+        let shard = 81u16;
+        let mined_key = tx_key_for_shard(shard, 1);
+        let unmined_key = tx_key_for_shard(shard, 2);
+        create_test_record(&engine, mined_key);
+        create_test_record(&engine, unmined_key);
+
+        // Mine `mined_key` into two DIFFERENT blocks, both on the longest
+        // chain (unmined_since == 0 after both applies).
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: mined_key,
+                block_id: 111,
+                block_height: 500_000,
+                subtree_idx: 3,
+                current_block_height: 500_010,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: mined_key,
+                block_id: 222,
+                block_height: 500_020,
+                subtree_idx: 7,
+                current_block_height: 500_030,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; payload_len];
+            stream.read_exact(&mut body).unwrap();
+
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            let batch =
+                crate::replication::protocol::ReplicaBatch::deserialize(&request.payload).unwrap();
+
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: crate::replication::protocol::ReplicaAck::Ok {
+                    through_sequence: 0,
+                }
+                .serialize(),
+            };
+            stream.write_all(&response.encode()).unwrap();
+            batch
+        });
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        stream_shard_baseline(
+            &task,
+            &[&mined_key, &unmined_key],
+            &engine,
+            &mut stream,
+            64,
+            /* cluster_key */ 0,
+            None,
+        )
+        .unwrap();
+
+        let batch = receiver.join().unwrap();
+
+        // Exactly one per-block SetMined per MinedIndex entry for the mined
+        // record, carrying the MinedIndex's own (block_id, block_height,
+        // subtree_idx, on_longest_chain) — not whatever the device happens
+        // to hold.
+        let mined_ops: Vec<(u32, u32, u32, bool)> = batch
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                crate::replication::protocol::ReplicaOp::SetMined {
+                    tx_key,
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    on_longest_chain,
+                    ..
+                } if *tx_key == mined_key => {
+                    Some((*block_id, *block_height, *subtree_idx, *on_longest_chain))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            mined_ops.len(),
+            2,
+            "expected one SetMined op per MinedIndex block entry, got {mined_ops:?}"
+        );
+        assert!(mined_ops.contains(&(111, 500_000, 3, true)));
+        assert!(mined_ops.contains(&(222, 500_020, 7, true)));
+        assert!(
+            !batch.ops.iter().any(|op| matches!(
+                op,
+                crate::replication::protocol::ReplicaOp::SetMinedBatch { .. }
+            )),
+            "a single record's own blocks (different block_ids) must ship as \
+             per-block SetMined, never a coalesced SetMinedBatch"
+        );
+
+        // The unmined record ships no mined ops whatsoever.
+        assert!(
+            !batch.ops.iter().any(|op| matches!(
+                op,
+                crate::replication::protocol::ReplicaOp::SetMined { tx_key, .. }
+                    if *tx_key == unmined_key
+            )),
+            "an unmined record must ship no SetMined ops"
+        );
+    }
+
+    /// Task 15 (full convergence): replay a captured migration baseline batch
+    /// onto a SEPARATE target engine via the receiver's real migration-apply
+    /// path (`apply_op_journal(.., journal=false, is_migration=true)` — see
+    /// `handle_replica_batch_with_tracker`'s `journal = !is_migration`) and
+    /// assert the target's `MinedIndex` converges with the source's: the
+    /// migrated block-set (and `unmined_since`) match exactly, proving
+    /// migration moved mined-state store-to-store without ever touching the
+    /// source's on-device block entries region during the read.
+    #[test]
+    fn migration_baseline_mined_state_converges_target_mined_index() {
+        use crate::ops::set_mined::SetMinedRequest;
+        use crate::replication::receiver::apply_op_journal;
+        use std::io::{Read, Write};
+
+        let source = test_engine();
+        let target = test_engine();
+        let shard = 82u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_test_record(&source, key);
+
+        source
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 333,
+                block_height: 600_000,
+                subtree_idx: 1,
+                current_block_height: 600_010,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        source
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 444,
+                block_height: 600_050,
+                subtree_idx: 9,
+                current_block_height: 600_060,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; payload_len];
+            stream.read_exact(&mut body).unwrap();
+
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            let batch =
+                crate::replication::protocol::ReplicaBatch::deserialize(&request.payload).unwrap();
+
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: crate::replication::protocol::ReplicaAck::Ok {
+                    through_sequence: 0,
+                }
+                .serialize(),
+            };
+            stream.write_all(&response.encode()).unwrap();
+            batch
+        });
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        stream_shard_baseline(&task, &[&key], &source, &mut stream, 64, 0, None).unwrap();
+
+        let batch = receiver.join().unwrap();
+        for op in &batch.ops {
+            apply_op_journal(&target, op, false, true).unwrap();
+        }
+
+        let (source_entries, source_unmined_since) = source.mined_block_entries(&key).unwrap();
+        let (target_entries, target_unmined_since) = target.mined_block_entries(&key).unwrap();
+        assert_eq!(
+            target_entries, source_entries,
+            "target MinedIndex block set must converge with the source's"
+        );
+        assert_eq!(target_unmined_since, source_unmined_since);
+        assert_eq!(target_entries.len(), 2, "both mined blocks must converge");
     }
 
     #[test]
