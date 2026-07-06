@@ -8262,16 +8262,36 @@ impl Engine {
     /// warning (bumping [`Self::enumeration_unreadable`]) rather than
     /// aborting boot — every other read path for that same record already
     /// fails identically, so skipping creates no new hazard. Its `mined_slot`
-    /// is left untouched (stale or sentinel, whichever it already was) until
-    /// the record can be read cleanly.
+    /// is re-pointed at [`crate::index::mined_index::NO_MINED_SLOT`] rather
+    /// than left untouched: a stale, non-sentinel `mined_slot` left in place
+    /// would alias whatever fresh slot this same pass (or later live traffic)
+    /// allocates next in that shard — slots are issued sequentially from 0 —
+    /// silently handing an unrelated transaction's block/unmined/all_spent
+    /// state to a read for the skipped record. Returning empty mined-state
+    /// for a record whose footer or overflow is genuinely unreadable is
+    /// correct: its whole record is unreadable anyway.
+    ///
+    /// Clears the entire [`ShardedMinedIndex`] first
+    /// ([`ShardedMinedIndex::clear`]), which also makes this function
+    /// idempotent — a repeat call re-derives the same state from the device
+    /// instead of `alloc_created`-ing a second, leaked slot for every record
+    /// on top of the first call's allocations. Safe only because this runs
+    /// once at boot before the engine serves traffic (no concurrent reader
+    /// could observe a shard mid-clear).
     ///
     /// # Errors
     ///
     /// Returns [`SpendError::StorageError`] if re-pointing a primary entry at
-    /// its fresh `mined_slot` fails (the redb primary backend's write
-    /// transaction failing to commit). Unlike a per-record device read
-    /// failure, this is a global storage fault and is NOT tolerated.
+    /// its fresh `mined_slot` (or, on a skip, at the sentinel) fails (the redb
+    /// primary backend's write transaction failing to commit). Unlike a
+    /// per-record device read failure, this is a global storage fault and is
+    /// NOT tolerated.
     pub fn rebuild_mined_index_from_device(&self) -> Result<(), SpendError> {
+        // Idempotency: reset the arena before repopulating so a repeat call
+        // re-issues the same deterministic slot numbers instead of leaking a
+        // fresh slot per record on top of whatever a prior call allocated.
+        self.mined_index.clear();
+
         // Snapshot the record locators under the index read lock (no I/O
         // held under the lock), then read each record's device state and
         // re-register outside it — same pattern as
@@ -8280,18 +8300,19 @@ impl Engine {
         // PRIMARY index's own shard routing (`shard_for_key` only hashes
         // bytes `[8..12]`, inside the preserved prefix) but NOT for
         // `ShardedMinedIndex::shard_for`, which hashes bytes `[16..24]`
-        // (zeroed in the slim key). So `for_each` here is used only to
-        // collect `(device_id, record_offset)`; the authoritative full txid
-        // — used for every `mined_index` call AND the `register` re-point
-        // below — is read back from each record's on-device footer
-        // (`meta.tx_id`), exactly as `rebuild_preserve_index_from_device`
-        // does.
-        let mut locs: Vec<(u8, u64)> = Vec::new();
-        self.index.for_each(|_key, entry| {
-            locs.push((entry.device_id, entry.record_offset));
+        // (zeroed in the slim key). So the slim key from `for_each` is kept
+        // only for the footer-unreadable sentinel re-point below (the
+        // primary index matches on the 12-byte prefix, so no device read is
+        // needed to re-register with it); every `mined_index` call AND the
+        // success-path `register` re-point use the authoritative full txid
+        // read back from each record's on-device footer (`meta.tx_id`),
+        // exactly as `rebuild_preserve_index_from_device` does.
+        let mut locs: Vec<(TxKey, u8, u64)> = Vec::new();
+        self.index.for_each(|key, entry| {
+            locs.push((key, entry.device_id, entry.record_offset));
         });
         let mut skipped = 0u64;
-        for (device_id, offset) in locs {
+        for (slim_key, device_id, offset) in locs {
             let meta = match self.read_metadata_fast(device_id, offset) {
                 Ok(m) => m,
                 Err(e) => {
@@ -8303,9 +8324,26 @@ impl Engine {
                         offset,
                         err = %e,
                         "rebuild_mined_index: footer unreadable; skipping (this record's \
-                         mined_slot is left untouched and may be stale/sentinel until it \
-                         is read cleanly)",
+                         mined_slot is reset to the sentinel until it is read cleanly)",
                     );
+                    // No device read is needed to re-point the sentinel: the
+                    // primary index matches on the 12-byte prefix already
+                    // present in `slim_key`.
+                    if let Err(e2) = self.index.register(
+                        slim_key,
+                        TxIndexEntry {
+                            device_id,
+                            record_offset: offset,
+                            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                        },
+                    ) {
+                        return Err(SpendError::StorageError {
+                            detail: format!(
+                                "mined-index rebuild: sentinel re-point after unreadable \
+                                 footer failed: {e2}"
+                            ),
+                        });
+                    }
                     continue;
                 }
             };
@@ -8326,8 +8364,23 @@ impl Engine {
                             offset,
                             err = %e,
                             "rebuild_mined_index: overflow block-entries unreadable; \
-                             skipping (mined_slot left untouched)",
+                             skipping (mined_slot reset to the sentinel)",
                         );
+                        if let Err(e2) = self.index.register(
+                            key,
+                            TxIndexEntry {
+                                device_id,
+                                record_offset: offset,
+                                mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                            },
+                        ) {
+                            return Err(SpendError::StorageError {
+                                detail: format!(
+                                    "mined-index rebuild: sentinel re-point after unreadable \
+                                     overflow failed: {e2}"
+                                ),
+                            });
+                        }
                         continue;
                     }
                 }
@@ -8371,7 +8424,7 @@ impl Engine {
             tracing::warn!(
                 skipped,
                 "rebuild_mined_index: {skipped} record(s) skipped (footer or overflow \
-                 unreadable); their mined_slot is untouched until read cleanly",
+                 unreadable); their mined_slot was reset to the sentinel until read cleanly",
             );
         }
         Ok(())
@@ -16200,6 +16253,269 @@ mod tests {
             vec![77],
             "rebuild must reproduce the device's block entries under the new slot"
         );
+    }
+
+    /// CRITICAL fix: a record skipped for an unreadable footer must NOT leave
+    /// its primary entry's stale `mined_slot` in place. Pre-fix, the skip left
+    /// `mined_slot` untouched; since this pass allocates fresh slots
+    /// sequentially from 0 in each `ShardedMinedIndex` shard, a stale value
+    /// that happened to coincide with a slot number allocated to a DIFFERENT
+    /// transaction in the SAME shard would silently alias that transaction's
+    /// mined-state. This reproduces the reviewer's exact repro: tx A (corrupt
+    /// footer, stale `mined_slot` pre-set to the slot B is about to receive)
+    /// and tx B (a real record, mined into a block) are engineered to route to
+    /// the same `ShardedMinedIndex` shard. After the rebuild, `A` must read
+    /// back as having no mined blocks (the sentinel), never `B`'s block data.
+    #[test]
+    fn rebuild_skips_corrupt_footer_without_aliasing_another_tx() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // Find two distinct single-byte txid seeds (matching how
+        // `make_create_req` stamps `tx_id[16] = n`, the only non-zero byte in
+        // the `[16..24]` range `ShardedMinedIndex::shard_for` hashes) that
+        // route to the SAME shard under this engine's (process-random)
+        // routing seed. 256 candidates over >=16 shards must collide by
+        // pigeonhole, so this always finds a pair.
+        let shard_for_seed = |n: u8| {
+            let mut txid = [0u8; 32];
+            txid[16] = n;
+            engine.mined_index().shard_for(&TxKey { txid })
+        };
+        let mut seen: std::collections::HashMap<usize, u8> = std::collections::HashMap::new();
+        let (n_a, n_b) = (0u8..=255)
+            .find_map(|n| {
+                let shard = shard_for_seed(n);
+                match seen.get(&shard) {
+                    Some(&other) => Some((other, n)),
+                    None => {
+                        seen.insert(shard, n);
+                        None
+                    }
+                }
+            })
+            .expect("256 seeds over >=16 shards must collide by pigeonhole");
+
+        // A: a record whose footer we will corrupt. Give it, up front, a
+        // stale non-sentinel `mined_slot` of 0 — the exact slot number B
+        // (the only OTHER record in this shard) will receive, since B is the
+        // sole survivor allocating into this freshly-cleared shard.
+        let (_, req_a) = make_create_req(n_a, 1);
+        let key_a = req_a.tx_key();
+        engine.create(&req_a).expect("create A succeeds");
+        let entry_a = engine.lookup(&key_a).expect("A registered");
+        engine
+            .index
+            .register(
+                key_a,
+                TxIndexEntry {
+                    device_id: entry_a.device_id,
+                    record_offset: entry_a.record_offset,
+                    mined_slot: 0,
+                },
+            )
+            .expect("stamp stale mined_slot on A");
+
+        // Corrupt A's on-device footer so its metadata read fails
+        // (torn/CRC-fail), exactly like `key_enumeration_skips_unreadable_footer_and_bumps_metric`.
+        let ptr = engine.device_ptr_for(entry_a.device_id);
+        assert!(!ptr.is_null(), "MemoryDevice must expose a raw pointer");
+        // SAFETY: `ptr` is the live base of A's store device buffer;
+        // `entry_a.record_offset` is an allocator-issued in-bounds record
+        // offset and `METADATA_SIZE` stays within that record, so this
+        // overwrites only A's header bytes.
+        unsafe {
+            std::ptr::write_bytes(
+                ptr.add(entry_a.record_offset as usize),
+                0xFF,
+                crate::record::METADATA_SIZE,
+            );
+        }
+        assert!(
+            engine.read_metadata(&key_a).is_err(),
+            "precondition: A's footer must be unreadable"
+        );
+
+        // B: a real record, mined into a block, routed to the same shard as A.
+        let (_, req_b) = make_create_req(n_b, 1);
+        let key_b = req_b.tx_key();
+        engine.create(&req_b).expect("create B succeeds");
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key_b,
+                block_id: 99,
+                block_height: 700,
+                subtree_idx: 0,
+                current_block_height: 700,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("setMined B succeeds");
+
+        engine
+            .rebuild_mined_index_from_device()
+            .expect("rebuild tolerates the corrupt footer");
+
+        // A's stale slot must be reset to the sentinel, never aliased to
+        // whatever B now occupies.
+        let after_a = engine.lookup(&key_a).expect("A still present");
+        assert_eq!(
+            after_a.mined_slot, NO_MINED_SLOT,
+            "a corrupt-footer skip must reset mined_slot to the sentinel, not leave it stale"
+        );
+        let (entries_a, unmined_a) = engine
+            .mined_block_entries(&key_a)
+            .expect("mined_block_entries on a sentinel slot returns Ok(empty), not an error");
+        assert!(
+            entries_a.is_empty(),
+            "A must read back as having no mined blocks, NOT B's block data (the aliasing bug)"
+        );
+        assert_eq!(
+            unmined_a, 0,
+            "sentinel mined_slot reads back unmined_since == 0, per mined_block_entries' contract"
+        );
+
+        // B's own state must be correct and unaffected by A's skip.
+        let (entries_b, unmined_b) = engine
+            .mined_block_entries(&key_b)
+            .expect("B's rebuilt slot reads back");
+        assert_eq!(unmined_b, 0, "B was mined on the longest chain");
+        assert_eq!(
+            entries_b.iter().map(|e| e.block_id).collect::<Vec<_>>(),
+            vec![99],
+            "B must keep its own block data"
+        );
+    }
+
+    /// IMPORTANT fix: `rebuild_mined_index_from_device` must be idempotent.
+    /// Pre-fix, every call `alloc_created`d a fresh slot per record without
+    /// ever freeing the previous call's slot, leaking one slot per record per
+    /// repeat invocation. Runs the rebuild TWICE against the same on-device
+    /// state and asserts the second run reproduces identical mined-state
+    /// (blocks, `unmined_since`, `all_spent`) AND assigns the SAME
+    /// `mined_slot` number as the first run. The slot equality is the
+    /// leak-proof: because the fix clears the whole arena before
+    /// repopulating, the sole record in this shard deterministically gets
+    /// slot 0 again; the pre-fix leaking behavior would instead hand it a
+    /// new, higher slot number on the second call.
+    #[test]
+    fn rebuild_mined_index_is_idempotent() {
+        use crate::index::mined_index::MINED_ALL_SPENT;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let (hashes, req) = make_create_req(251, 1);
+        let key = req.tx_key();
+        engine.create(&req).expect("create succeeds");
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 55,
+                block_height: 300,
+                subtree_idx: 0,
+                current_block_height: 300,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("setMined succeeds");
+        // Spend the single UTXO -> all_spent, so the idempotency check also
+        // covers the `MINED_ALL_SPENT` flag, not just block entries.
+        let mut spending_data = [0u8; 36];
+        spending_data[0] = 0xD0;
+        spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+        engine
+            .spend_multi(&SpendMultiRequest {
+                tx_key: key,
+                spends: vec![SpendItem {
+                    offset: 0,
+                    utxo_hash: hashes[0],
+                    spending_data,
+                    idx: 0,
+                }],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 300,
+                block_height_retention: 288,
+            })
+            .expect("spend succeeds");
+
+        engine
+            .rebuild_mined_index_from_device()
+            .expect("first rebuild succeeds");
+        let entry_after_1 = engine
+            .lookup(&key)
+            .expect("entry present after 1st rebuild");
+        let (entries_1, unmined_1) = engine
+            .mined_block_entries(&key)
+            .expect("mined_block_entries after 1st rebuild");
+        let all_spent_1 = engine
+            .mined_index()
+            .with_entry(&key, entry_after_1.mined_slot, |e| {
+                e.flags & MINED_ALL_SPENT != 0
+            })
+            .expect("slot live after 1st rebuild");
+
+        engine
+            .rebuild_mined_index_from_device()
+            .expect("second rebuild succeeds");
+        let entry_after_2 = engine
+            .lookup(&key)
+            .expect("entry present after 2nd rebuild");
+        let (entries_2, unmined_2) = engine
+            .mined_block_entries(&key)
+            .expect("mined_block_entries after 2nd rebuild");
+        let all_spent_2 = engine
+            .mined_index()
+            .with_entry(&key, entry_after_2.mined_slot, |e| {
+                e.flags & MINED_ALL_SPENT != 0
+            })
+            .expect("slot live after 2nd rebuild");
+
+        assert_eq!(
+            entry_after_2.mined_slot, entry_after_1.mined_slot,
+            "a repeat rebuild must reuse the same deterministic slot number, proving the \
+             arena was cleared rather than grown by a second uncleared allocation (a leak \
+             would instead hand out a new, higher slot number every call)"
+        );
+        assert_eq!(
+            entries_2.iter().map(|e| e.block_id).collect::<Vec<_>>(),
+            entries_1.iter().map(|e| e.block_id).collect::<Vec<_>>(),
+            "block entries must be identical across repeated rebuilds"
+        );
+        assert_eq!(
+            unmined_2, unmined_1,
+            "unmined_since must be identical across repeated rebuilds"
+        );
+        assert_eq!(
+            all_spent_2, all_spent_1,
+            "all_spent must be identical across repeated rebuilds"
+        );
+        assert!(all_spent_1, "precondition: the single UTXO was fully spent");
     }
 
     #[test]
