@@ -3712,11 +3712,20 @@ fn compensate_replication_failure(
                     // one batch-of-one `SetMinedBatch` per owned key (the same
                     // shape the retired per-tx `SetMined`/`UnsetMined` arms
                     // above handled), so `key` (this row's `TxKey`) is the
-                    // op's one and only txid in practice. Iterate `txids`
-                    // rather than assuming exactly one, reusing this row's
-                    // single captured before-image for each — correct as long
-                    // as this arm is only ever fed a batch-of-one, which is
-                    // the only shape any current producer emits.
+                    // op's one and only txid in practice. `lookup_before(i, j)`
+                    // returns THIS ROW's single captured before-image — it is
+                    // NOT indexed by txid, so reusing it for every `tx_key` in
+                    // `txids` is correct only when `txids` is a singleton. If
+                    // a future refactor ever batches compensation across
+                    // multiple txids per row, this loop must be restructured
+                    // to look up a before-image per txid instead; until then,
+                    // assert the invariant rather than silently misapplying
+                    // the row's before-image to every txid but the first.
+                    debug_assert!(
+                        txids.len() <= 1,
+                        "compensation SetMinedBatch must be batch-of-one; got {}",
+                        txids.len()
+                    );
                     for tx_key in txids {
                         if *unset {
                             // Mirrors the retired `ReplicaOp::UnsetMined` arm:
@@ -24518,6 +24527,109 @@ mod tests {
             .expect("restored overflow entry");
         assert_eq!({ restored.block_height }, 900_005);
         assert_eq!({ restored.subtree_idx }, 25);
+    }
+
+    /// Task 14: the ONLY producer of `ReplicaOp::SetMinedBatch` is
+    /// `handle_set_mined_batch`, and it always emits a batch-of-one (one
+    /// `SetMinedBatch` op per owned key). Mirrors
+    /// `rollback_unset_mined_restores_block_entry_exactly` but drives the
+    /// compensation arm through the real `SetMinedBatch { unset: true, .. }`
+    /// shape production actually feeds it, instead of the retired
+    /// `ReplicaOp::UnsetMined` variant no live handler produces anymore.
+    #[test]
+    fn rollback_set_mined_batch_restores_block_entry_exactly() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let h = RedoDispatchHarness::new();
+        let mut txid = [0u8; 32];
+        txid[0] = 0x44;
+        let key = rollback_seed_record(&h, txid, 1);
+
+        // Set mined with NON-zero height + subtree.
+        let block_id = 54321;
+        let block_height = 810_000;
+        let subtree_idx = 9;
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain: true,
+                unset_mined: false,
+                current_block_height: 0,
+                block_height_retention: 0,
+            })
+            .expect("set_mined seed");
+
+        // Now apply unset_mined locally. Capture the before-image FIRST.
+        let pre_meta = h.engine.read_metadata(&key).expect("read_metadata pre");
+        let count = pre_meta.block_entry_count as usize;
+        let inline = count.min(crate::record::INLINE_BLOCK_ENTRIES);
+        let mut captured: Option<BeforeImage> = None;
+        for i in 0..inline {
+            if { pre_meta.block_entries_inline[i].block_id } == block_id {
+                captured = Some(BeforeImage::UnsetMined {
+                    block_height: { pre_meta.block_entries_inline[i].block_height },
+                    subtree_idx: { pre_meta.block_entries_inline[i].subtree_idx },
+                });
+                break;
+            }
+        }
+        let before_image = captured.expect("captured before-image");
+
+        // Apply the unset locally (simulating `handle_set_mined_batch`'s
+        // engine.set_mined_batch with unset_mined=true).
+        h.engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain: false,
+                unset_mined: true,
+                current_block_height: 0,
+                block_height_retention: 0,
+            })
+            .expect("local unset");
+
+        // Run compensation as if replication failed, using the real
+        // batch-of-one `SetMinedBatch` shape `handle_set_mined_batch` emits
+        // (NOT the retired `ReplicaOp::UnsetMined`).
+        let repl_ops = vec![(
+            key,
+            vec![ReplicaOp::SetMinedBatch {
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain: false,
+                current_block_height: 0,
+                block_height_retention: 0,
+                unset: true,
+                txids: vec![key],
+            }],
+        )];
+        let before_images = vec![(key, vec![before_image])];
+        compensate_replication_failure(&h.engine, &repl_ops, &before_images, Some(&h.redo_log))
+            .unwrap();
+
+        // Post-compensation: the block entry MUST be restored with the
+        // original (height, subtree). Not zeros.
+        let post_meta = h.engine.read_metadata(&key).expect("read_metadata post");
+        let post_count = post_meta.block_entry_count as usize;
+        let post_inline = post_count.min(crate::record::INLINE_BLOCK_ENTRIES);
+        let mut found = false;
+        for i in 0..post_inline {
+            if { post_meta.block_entries_inline[i].block_id } == block_id {
+                let bh = { post_meta.block_entries_inline[i].block_height };
+                let st = { post_meta.block_entries_inline[i].subtree_idx };
+                assert_eq!(bh, block_height, "block_height not restored");
+                assert_eq!(st, subtree_idx, "subtree_idx not restored");
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "block entry not restored after compensation");
     }
 
     #[test]
