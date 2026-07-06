@@ -223,6 +223,24 @@ impl CheckpointConfig {
     }
 }
 
+/// Derive the MinedIndex snapshot section's sibling path from the primary
+/// index snapshot path (Task 13), by appending `.mined` — the same
+/// "sibling file" convention `Config::resolved_last_durable_height_path`
+/// uses for the durable-height file (append a suffix via `OsString`, not
+/// `Path::with_extension`, so a snapshot path that already has an extension,
+/// e.g. `teraslab-index.snap`, is not clobbered: `teraslab-index.snap.mined`).
+///
+/// Written by [`crate::ops::engine::Engine::snapshot_mined_index_by_key`]
+/// alongside the primary snapshot at `snapshot_path`, and read back by
+/// [`crate::ops::engine::Engine::recover_mined_index`] at startup using this
+/// SAME derivation — callers must use this function on both sides so the two
+/// never disagree.
+pub fn mined_index_snapshot_path(snapshot_path: &std::path::Path) -> PathBuf {
+    let mut p = snapshot_path.as_os_str().to_os_string();
+    p.push(".mined");
+    PathBuf::from(p)
+}
+
 /// Spawn the background checkpoint task. Returns a join handle and a
 /// shutdown flag the caller can flip to ask the task to exit cleanly.
 ///
@@ -787,6 +805,25 @@ where
         .snapshot_index(&config.snapshot_path)
         .map_err(|e| format!("snapshot_index: {e}"))?;
 
+    // 1a. Snapshot the authoritative in-RAM MinedIndex, TXID-keyed (Task 13).
+    //     Lets recovery restore mined-state (block entries / unmined_since /
+    //     all_spent) from this snapshot + the post-checkpoint redo tail
+    //     instead of `Engine::rebuild_mined_index_from_device`'s full device
+    //     scan. Best-effort and NON-FATAL: unlike the primary/DAH/unmined
+    //     snapshot above, a failure here does not abort the checkpoint —
+    //     recovery falls back to the device scan (Task 12, never removed)
+    //     whenever this section is absent, stale, or corrupt, so the only
+    //     cost of a failure is a slower next recovery, never lost data.
+    if let Err(e) =
+        engine.snapshot_mined_index_by_key(&mined_index_snapshot_path(&config.snapshot_path))
+    {
+        tracing::warn!(
+            err = %e,
+            "checkpoint: mined-index snapshot failed (non-fatal; recovery falls back to the \
+             device scan)",
+        );
+    }
+
     // 1b. Defrag fast path: reclaim fully-dead segments (log-structured engine)
     //     so the header persisted next reflects the reclaimed, reused layout —
     //     this is what bounds device growth under relocate-on-spend. No-op for the
@@ -933,6 +970,7 @@ mod tests {
     use crate::device::{BlockDevice, MemoryDevice};
     use crate::index::{DahIndex, Index, UnminedIndex};
     use crate::locks::StripedLocks;
+    use crate::ops::create::CreateRequest;
     use crate::ops::engine::Engine;
     use crate::redo::{RedoLog, RedoOp};
     use std::sync::Arc;
@@ -1865,6 +1903,509 @@ mod tests {
         );
         let slot1 = crate::io::read_utxo_slot(&*data_dev, record_offset, 1).unwrap();
         assert!(slot1.is_unspent(), "untouched slot must stay unspent");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 13: checkpoint snapshot + recovery of the MinedIndex.
+    // -----------------------------------------------------------------------
+
+    fn mined_test_create_req(tx_id: [u8; 32], utxo_hash: &[[u8; 32]]) -> CreateRequest<'_> {
+        CreateRequest {
+            tx_id,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 0,
+            is_coinbase: false,
+            spending_height: 0,
+            utxo_hashes: utxo_hash,
+            inputs: None,
+            outputs: None,
+            inpoints: None,
+            is_external: false,
+            created_at: 1_710_000_000_000,
+            block_height: 10,
+            mined_block_infos: &[],
+            frozen: false,
+            conflicting: false,
+            locked: false,
+            external_ref: None,
+            parent_txids: &[],
+        }
+    }
+
+    /// Full round-trip: checkpoint's TXID-keyed MinedIndex snapshot section,
+    /// restored + redo-tail-replayed into a completely FRESH engine (never
+    /// falling back to `rebuild_mined_index_from_device`'s device scan).
+    ///
+    /// Stage A: create + setMined (2 blocks) + spend-all a couple of txs,
+    /// checkpoint, then recover a fresh engine from JUST the snapshot (the
+    /// redo tail is empty at this point — the checkpoint compacted it) and
+    /// assert the MinedIndex matches for every tx.
+    ///
+    /// Stage B: WITHOUT taking a second checkpoint, perform more ops (another
+    /// setMined + a delete) on the ORIGINAL engine, append their redo
+    /// manually (mirroring what dispatch does independently of the engine
+    /// mutation), then recover ANOTHER fresh engine from the SAME snapshot +
+    /// the now-longer redo tail, and assert the post-checkpoint changes are
+    /// reflected — proving `replay_mined_index_redo_tail` actually replays
+    /// into the MinedIndex, not just the device.
+    #[test]
+    fn mined_index_snapshot_roundtrip_via_checkpoint() {
+        use crate::index::mined_index::MINED_ALL_SPENT;
+        use crate::ops::remaining::DeleteRequest;
+        use crate::ops::set_mined::SetMinedRequest;
+        use crate::ops::spend::SpendRequest;
+        use crate::record::TxMetadata;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("mined.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev.clone(), 0, 256 * 1024).unwrap(),
+        ));
+
+        // tx1: created, mined in 2 blocks (inline + overflow) on the longest
+        // chain, then its single UTXO is spent (-> all_spent).
+        let key1 = crate::index::TxKey { txid: [1u8; 32] };
+        let hash1 = [[0xAAu8; 32]];
+        engine
+            .create(&mined_test_create_req(key1.txid, &hash1))
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key1,
+                block_id: 100,
+                block_height: 50,
+                subtree_idx: 0,
+                current_block_height: 50,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key1,
+                block_id: 101,
+                block_height: 51,
+                subtree_idx: 1,
+                current_block_height: 51,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        engine
+            .spend(&SpendRequest {
+                tx_key: key1,
+                offset: 0,
+                utxo_hash: hash1[0],
+                spending_data: [0x11; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 51,
+                block_height_retention: 100_000,
+            })
+            .unwrap();
+
+        // tx2: created, stays unmined.
+        let key2 = crate::index::TxKey { txid: [2u8; 32] };
+        let hash2 = [[0xBBu8; 32]];
+        engine
+            .create(&mined_test_create_req(key2.txid, &hash2))
+            .unwrap();
+
+        // Checkpoint: snapshots primary/DAH/unmined AND (Task 13) the
+        // TXID-keyed MinedIndex section.
+        let cfg = CheckpointConfig::new(snap_path.clone());
+        perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
+        assert!(
+            mined_snap_path.exists(),
+            "checkpoint must also write the mined-index snapshot section"
+        );
+
+        // --- Stage A: recover a FRESH engine from JUST the snapshot (redo
+        //     tail is empty — the checkpoint compacted it). ---
+        {
+            let mut alloc2: crate::allocator::BoxedAllocator = Box::new(
+                SlotAllocator::recover(dev.clone())
+                    .expect("allocator header must be durable after checkpoint"),
+            );
+            let (restored_index, dah2, unmined2, _flags) =
+                crate::index::ShardedIndex::restore_all(&snap_path, 1)
+                    .expect("primary snapshot must restore");
+            let mut dah_b = crate::index::DahBackend::from(dah2);
+            let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
+            crate::recovery::recover_all_with_allocator(
+                &*dev,
+                &redo.lock(),
+                &restored_index,
+                &mut dah_b,
+                &mut unmined_b,
+                Some(&mut alloc2),
+            )
+            .expect("primary/device recovery must succeed");
+
+            let engine2 = Engine::new_with_sharded_index(
+                dev.clone(),
+                restored_index,
+                alloc2,
+                StripedLocks::new(16),
+                dah_b,
+                unmined_b,
+            );
+
+            let used_snapshot = engine2
+                .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
+                .expect("mined-index recovery must succeed");
+            assert!(
+                used_snapshot,
+                "must use the snapshot+redo path, not the device-scan fallback"
+            );
+
+            let e1 = engine2.lookup(&key1).expect("tx1 must still be indexed");
+            let (blocks1, unmined1) = engine2
+                .mined_index()
+                .read_block_entries(&key1, e1.mined_slot)
+                .expect("tx1 mined-state must be present");
+            assert_eq!(unmined1, 0, "tx1 is mined on the longest chain");
+            let block_ids: Vec<u32> = blocks1.iter().map(|b| b.block_id).collect();
+            assert_eq!(block_ids, vec![100, 101], "both blocks must survive");
+            let all_spent1 = engine2
+                .mined_index()
+                .with_entry(&key1, e1.mined_slot, |e| e.flags & MINED_ALL_SPENT != 0)
+                .expect("tx1 entry must be live");
+            assert!(all_spent1, "tx1's only UTXO was spent");
+
+            let e2 = engine2.lookup(&key2).expect("tx2 must still be indexed");
+            let (blocks2, unmined2_since) = engine2
+                .mined_index()
+                .read_block_entries(&key2, e2.mined_slot)
+                .expect("tx2 mined-state must be present");
+            assert!(blocks2.is_empty(), "tx2 has no blocks");
+            assert_eq!(
+                unmined2_since, 10,
+                "tx2 stays unmined at its creation height"
+            );
+        }
+
+        // --- Stage B: MORE ops after the checkpoint (no second checkpoint),
+        //     with matching redo appended manually (mirrors dispatch
+        //     building the redo entry from the same request fields the
+        //     engine call used). ---
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key2,
+                block_id: 200,
+                block_height: 60,
+                subtree_idx: 0,
+                current_block_height: 60,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: 200,
+                block_height: 60,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 60,
+                block_height_retention: 100_000,
+                unset: false,
+                txids: vec![key2],
+            })
+            .unwrap();
+
+        let tx1_entry_before_delete = engine.lookup(&key1).expect("tx1 indexed before delete");
+        engine
+            .delete(&DeleteRequest {
+                tx_key: key1,
+                due_guard: None,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(RedoOp::Delete {
+                tx_key: key1,
+                record_offset: tx1_entry_before_delete.record_offset,
+                record_size: TxMetadata::record_size_for(1),
+            })
+            .unwrap();
+
+        // --- Recover ANOTHER fresh engine from the SAME snapshot + the
+        //     now-longer redo tail. ---
+        let mut alloc3: crate::allocator::BoxedAllocator = Box::new(
+            SlotAllocator::recover(dev.clone()).expect("allocator header must still be durable"),
+        );
+        let (restored_index3, dah3, unmined3, _flags3) =
+            crate::index::ShardedIndex::restore_all(&snap_path, 1)
+                .expect("primary snapshot must restore again");
+        let mut dah_b3 = crate::index::DahBackend::from(dah3);
+        let mut unmined_b3 = crate::index::UnminedBackend::from(unmined3);
+        crate::recovery::recover_all_with_allocator(
+            &*dev,
+            &redo.lock(),
+            &restored_index3,
+            &mut dah_b3,
+            &mut unmined_b3,
+            Some(&mut alloc3),
+        )
+        .expect("primary/device recovery must succeed with the longer tail");
+
+        let engine3 = Engine::new_with_sharded_index(
+            dev.clone(),
+            restored_index3,
+            alloc3,
+            StripedLocks::new(16),
+            dah_b3,
+            unmined_b3,
+        );
+        let used_snapshot3 = engine3
+            .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
+            .expect("mined-index recovery must succeed with the longer tail");
+        assert!(used_snapshot3, "must still use the snapshot+redo path");
+
+        assert!(
+            engine3.lookup(&key1).is_none(),
+            "tx1 was deleted after the checkpoint; must be gone"
+        );
+        let e2_after = engine3.lookup(&key2).expect("tx2 must still be indexed");
+        let (blocks2_after, unmined2_after) = engine3
+            .mined_index()
+            .read_block_entries(&key2, e2_after.mined_slot)
+            .expect("tx2 mined-state must be present");
+        let block_ids_after: Vec<u32> = blocks2_after.iter().map(|b| b.block_id).collect();
+        assert_eq!(
+            block_ids_after,
+            vec![200],
+            "the post-checkpoint setMined must be reflected via redo-tail replay"
+        );
+        assert_eq!(unmined2_after, 0, "tx2 is now mined on the longest chain");
+    }
+
+    /// When the MinedIndex snapshot section is absent (e.g. a checkpoint
+    /// taken before Task 13, or the file was never written), recovery must
+    /// still correctly rebuild the MinedIndex — via the device-scan
+    /// fallback ([`crate::ops::engine::Engine::rebuild_mined_index_from_device`]).
+    #[test]
+    fn mined_index_recovery_falls_back_to_device_scan_when_snapshot_absent() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("no-mined-section.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let key = crate::index::TxKey { txid: [7u8; 32] };
+        let hash = [[0xCCu8; 32]];
+        engine
+            .create(&mined_test_create_req(key.txid, &hash))
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 900,
+                block_height: 5,
+                subtree_idx: 0,
+                current_block_height: 5,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        // Write the primary/DAH/unmined snapshot directly (bypassing
+        // `perform_checkpoint`, so the `.mined` sibling file is never
+        // written at all), plus the allocator header so recovery below can
+        // reconstruct it without a full device scan.
+        engine
+            .snapshot_index(&snap_path)
+            .expect("primary snapshot must succeed");
+        engine
+            .persist_allocator()
+            .expect("allocator header must persist");
+        assert!(
+            !mined_snap_path.exists(),
+            "test setup invariant: no mined-index snapshot section must exist"
+        );
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = RedoLog::open(redo_dev, 0, 64 * 1024).unwrap();
+
+        let mut alloc2: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(dev.clone()).expect("allocator header durable"));
+        let (restored_index, dah2, unmined2, _flags) =
+            crate::index::ShardedIndex::restore_all(&snap_path, 1)
+                .expect("primary snapshot must restore");
+        let mut dah_b = crate::index::DahBackend::from(dah2);
+        let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
+        crate::recovery::recover_all_with_allocator(
+            &*dev,
+            &redo,
+            &restored_index,
+            &mut dah_b,
+            &mut unmined_b,
+            Some(&mut alloc2),
+        )
+        .expect("primary/device recovery must succeed");
+
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            restored_index,
+            alloc2,
+            StripedLocks::new(16),
+            dah_b,
+            unmined_b,
+        );
+
+        let used_snapshot = engine2
+            .recover_mined_index(&mined_snap_path, &[])
+            .expect("mined-index recovery must succeed via the fallback");
+        assert!(
+            !used_snapshot,
+            "with no snapshot section, recovery must fall back to the device scan"
+        );
+
+        let e = engine2.lookup(&key).expect("tx must still be indexed");
+        assert_ne!(
+            e.mined_slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "the fallback must still allocate a mined_slot"
+        );
+        let (blocks, unmined_since) = engine2
+            .mined_index()
+            .read_block_entries(&key, e.mined_slot)
+            .expect("mined-state must be present via the device scan");
+        let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
+        assert_eq!(block_ids, vec![900]);
+        assert_eq!(unmined_since, 0);
+    }
+
+    /// A truncated/corrupt MinedIndex snapshot section must not panic — it
+    /// must fail closed and fall back to the device-scan rebuild, exactly
+    /// like the absent-file case.
+    #[test]
+    fn mined_index_recovery_falls_back_on_corrupt_snapshot_section() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("corrupt-mined.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let key = crate::index::TxKey { txid: [8u8; 32] };
+        let hash = [[0xDDu8; 32]];
+        engine
+            .create(&mined_test_create_req(key.txid, &hash))
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 700,
+                block_height: 3,
+                subtree_idx: 0,
+                current_block_height: 3,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap()));
+        let cfg = CheckpointConfig::new(snap_path.clone());
+        perform_checkpoint(&cfg, &engine, &redo).expect("checkpoint must succeed");
+        assert!(mined_snap_path.exists());
+
+        // Corrupt the mined-index snapshot section: truncate it mid-way.
+        let good = std::fs::read(&mined_snap_path).unwrap();
+        assert!(
+            good.len() > 4,
+            "test setup invariant: a real snapshot section"
+        );
+        std::fs::write(&mined_snap_path, &good[..good.len() / 2]).unwrap();
+
+        let mut alloc2: crate::allocator::BoxedAllocator =
+            Box::new(SlotAllocator::recover(dev.clone()).expect("allocator header durable"));
+        let (restored_index, dah2, unmined2, _flags) =
+            crate::index::ShardedIndex::restore_all(&snap_path, 1)
+                .expect("primary snapshot must restore");
+        let mut dah_b = crate::index::DahBackend::from(dah2);
+        let mut unmined_b = crate::index::UnminedBackend::from(unmined2);
+        crate::recovery::recover_all_with_allocator(
+            &*dev,
+            &redo.lock(),
+            &restored_index,
+            &mut dah_b,
+            &mut unmined_b,
+            Some(&mut alloc2),
+        )
+        .expect("primary/device recovery must succeed");
+
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            restored_index,
+            alloc2,
+            StripedLocks::new(16),
+            dah_b,
+            unmined_b,
+        );
+
+        let used_snapshot = engine2
+            .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
+            .expect("mined-index recovery must not panic on a corrupt section");
+        assert!(
+            !used_snapshot,
+            "a truncated snapshot section must fall back to the device scan, not panic"
+        );
+
+        let e = engine2.lookup(&key).expect("tx must still be indexed");
+        let (blocks, unmined_since) = engine2
+            .mined_index()
+            .read_block_entries(&key, e.mined_slot)
+            .expect("mined-state must be present via the fallback");
+        let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
+        assert_eq!(block_ids, vec![700]);
+        assert_eq!(unmined_since, 0);
     }
 
     /// G-1 (CRITICAL): with the redb (`OnDisk`) primary backend, per-op

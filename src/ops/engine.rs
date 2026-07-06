@@ -8430,6 +8430,456 @@ impl Engine {
         Ok(())
     }
 
+    /// Snapshot the authoritative in-RAM [`ShardedMinedIndex`] to `path`,
+    /// keyed by TXID (Task 13's checkpoint MinedIndex section) — the
+    /// alternative recovery source to [`Self::rebuild_mined_index_from_device`]'s
+    /// full device scan.
+    ///
+    /// Called by the checkpoint task (`crate::checkpoint::perform_checkpoint_inner`)
+    /// alongside [`Self::snapshot_index`].
+    ///
+    /// Enumerates every live primary entry with a live `mined_slot`,
+    /// resolving the AUTHORITATIVE full txid from each record's on-device
+    /// metadata footer. This is NOT optional: the in-memory primary
+    /// backend's hash table stores only a 12-byte txid PREFIX (zero-padded
+    /// to 32 bytes) internally — see `crate::index::hashtable`'s
+    /// `HashTableIter` enumeration caveat — which is unusable both as the
+    /// snapshot's key and for [`ShardedMinedIndex::shard_for`]'s routing
+    /// (hashes bytes `[16..24]`, zeroed in a slim key; using it directly
+    /// silently routes every entry's mined-state read to the wrong shard).
+    /// A record whose footer cannot be read (torn/CRC-failed) is skipped
+    /// with a warning — recovery's redo-tail replay, or failing that the
+    /// device-scan fallback, still covers it.
+    ///
+    /// Written as a SEPARATE file (tempfile + fsync + rename + parent-dir
+    /// fsync, mirroring [`ShardedIndex::snapshot_all_concurrent`]) so a
+    /// partial write of one section can never be paired with a stale or
+    /// mismatched read of the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`std::io::Error`] on any filesystem failure. Callers
+    /// (the checkpoint task) treat a failure here as NON-FATAL — recovery
+    /// falls back to the device scan when this section is absent or
+    /// corrupt, so a transient write failure only costs a slower recovery,
+    /// never data loss.
+    pub fn snapshot_mined_index_by_key(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let mut locs: Vec<(u8, u64, u32)> = Vec::new();
+        self.index.for_each(|_key, entry| {
+            if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+                locs.push((entry.device_id, entry.record_offset, entry.mined_slot));
+            }
+        });
+
+        let mut pairs: Vec<(TxKey, u32)> = Vec::with_capacity(locs.len());
+        let mut skipped = 0u64;
+        for (device_id, offset, slot) in locs {
+            match self.read_metadata_fast(device_id, offset) {
+                Ok(meta) => pairs.push((TxKey::from_bytes(meta.tx_id), slot)),
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        device_id,
+                        offset,
+                        err = %e,
+                        "snapshot_mined_index_by_key: footer unreadable; omitting this record \
+                         from the mined-index snapshot (recovery's redo-tail replay or the \
+                         device-scan fallback still covers it)",
+                    );
+                }
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "snapshot_mined_index_by_key: {skipped} record(s) omitted (footer unreadable)",
+            );
+        }
+
+        let mut buf = Vec::new();
+        self.mined_index.serialize_by_key(&pairs, &mut buf);
+
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, &buf)?;
+        let f = std::fs::File::open(&tmp_path)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, path)?;
+        crate::fsutil::fsync_parent_dir(path)?;
+        Ok(())
+    }
+
+    /// Rebuild the in-memory [`ShardedMinedIndex`] FRESH from a checkpoint's
+    /// TXID-keyed snapshot section (Task 13's alternative to
+    /// [`Self::rebuild_mined_index_from_device`]'s full device scan).
+    ///
+    /// Mirrors that function's shape, but sources each tx's block-entries /
+    /// `unmined_since` / `all_spent` from the snapshot `entries` instead of a
+    /// device read: `clear()`s the arena first (idempotent, same rationale as
+    /// the device-scan path), then for each snapshot entry looks up the
+    /// CURRENT primary index — which recovery has already fully replayed by
+    /// the time this runs — for the txid. A snapshot entry for a txid deleted
+    /// after the checkpoint (in the redo tail) has no current primary entry
+    /// and is simply skipped: there is nothing to point a fresh `mined_slot`
+    /// at, and [`Self::replay_mined_index_redo_tail`] never needs one either
+    /// (its own `Delete` handling only frees slots it allocated itself). For
+    /// every txid still present, allocates a fresh slot, replays its block
+    /// tuples (`on_longest_chain` derived from `unmined_since == 0`, matching
+    /// every other mined-state derivation in this file) and the `all_spent`
+    /// bit, then re-points the primary entry's `mined_slot` — preserving the
+    /// entry's CURRENT `device_id` / `record_offset` (never the snapshot's,
+    /// which may be stale for a since-relocated record).
+    ///
+    /// Call [`Self::replay_mined_index_redo_tail`] immediately afterward to
+    /// reconcile any post-checkpoint mutations the snapshot does not cover.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] if re-pointing a primary entry's
+    /// `mined_slot` fails (redb commit failure) — a global storage fault,
+    /// same severity as the device-scan path.
+    pub fn restore_mined_index_from_snapshot_entries(
+        &self,
+        entries: &[crate::index::mined_index::MinedByKeyEntry],
+    ) -> Result<(), SpendError> {
+        self.mined_index.clear();
+        for e in entries {
+            let key = TxKey::from_bytes(e.txid);
+            let Some(existing) = self.index.lookup(&key) else {
+                continue;
+            };
+            let slot = self.mined_index.alloc_created(&key, e.unmined_since);
+            let on_longest_chain = e.unmined_since == 0;
+            for be in &e.block_entries {
+                self.mined_index.apply_set_mined(
+                    &key,
+                    slot,
+                    be.block_id,
+                    be.block_height,
+                    be.subtree_idx,
+                    on_longest_chain,
+                );
+            }
+            if e.all_spent {
+                self.mined_index.set_all_spent(&key, slot, true);
+            }
+            let new_entry = TxIndexEntry {
+                device_id: existing.device_id,
+                record_offset: existing.record_offset,
+                mined_slot: slot,
+            };
+            if let Err(err) = self.index.register(key, new_entry) {
+                self.mined_index.free(&key, slot);
+                return Err(SpendError::StorageError {
+                    detail: format!("mined-index snapshot restore: index re-point failed: {err}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Shared "a create happened" application shared by every create-like
+    /// redo op [`Self::replay_mined_index_redo_tail`] replays
+    /// (`Create`/`CreateV2`/`ReplicaCreate`): allocate a fresh MinedIndex slot
+    /// from `meta`, seed its block tuples (inline entries only — see the
+    /// caller doc), free any STALE slot this same tail already associated
+    /// with `tx_key` (a create+delete+recreate cycle within one tail), and
+    /// re-point the primary entry's `mined_slot` if `tx_key` still exists in
+    /// the FINAL (fully-replayed) primary index.
+    fn apply_create_to_mined_index(
+        &self,
+        tx_key: &TxKey,
+        meta: &TxMetadata,
+        tail_slots: &mut std::collections::HashMap<TxKey, u32>,
+    ) -> Result<(), SpendError> {
+        let slot = self.mined_index.alloc_created(tx_key, meta.unmined_since);
+        let on_longest_chain = meta.unmined_since == 0;
+        let count = meta.block_entry_count as usize;
+        let inline = count.min(INLINE_BLOCK_ENTRIES);
+        for be in &meta.block_entries_inline[..inline] {
+            self.mined_index.apply_set_mined(
+                tx_key,
+                slot,
+                be.block_id,
+                be.block_height,
+                be.subtree_idx,
+                on_longest_chain,
+            );
+        }
+        if count > INLINE_BLOCK_ENTRIES {
+            tracing::warn!(
+                tx_key = ?tx_key.txid,
+                "mined-index redo-tail replay: Create carries overflow block entries not \
+                 captured by the redo entry; those blocks are not restored (matches \
+                 rebuild_mined_index_from_device's create-time-overflow limitation)",
+            );
+        }
+        if let Some(stale) = tail_slots.insert(*tx_key, slot) {
+            self.mined_index.free(tx_key, stale);
+        }
+        if let Some(existing) = self.index.lookup(tx_key) {
+            let new_entry = TxIndexEntry {
+                device_id: existing.device_id,
+                record_offset: existing.record_offset,
+                mined_slot: slot,
+            };
+            if let Err(e) = self.index.register(*tx_key, new_entry) {
+                self.mined_index.free(tx_key, slot);
+                tail_slots.remove(tx_key);
+                return Err(SpendError::StorageError {
+                    detail: format!("mined-index redo-tail replay: index re-point failed: {e}"),
+                });
+            }
+        }
+        // Else: `tx_key` is absent from the FINAL primary index (a later
+        // `Delete` in this tail removes it) — the slot stays in `tail_slots`
+        // until that `Delete` frees it.
+        Ok(())
+    }
+
+    /// Replay the post-checkpoint redo tail into the [`ShardedMinedIndex`],
+    /// reconciling mutations that happened after
+    /// [`Self::restore_mined_index_from_snapshot_entries`]'s snapshot was
+    /// taken. Call these two methods back-to-back at recovery (see
+    /// [`Self::recover_mined_index`]).
+    ///
+    /// Reads every entry currently in `redo_logs` (each log's `recover()` — a
+    /// pure, side-effect-free read) and replays, in GLOBAL sequence order
+    /// (mirrors `crate::recovery::recover_all_multi_store`'s cross-store
+    /// ordering), the op kinds that touch mined-state:
+    ///
+    /// - [`crate::redo::RedoOp::Create`][]: the metadata header is decoded
+    ///   straight out of the redo entry's own `record_bytes` — NOT a device
+    ///   read at `device_id`/`record_offset`. Those coordinates may have been
+    ///   reused by a LATER create/delete in this same tail, so reading them
+    ///   NOW (well after the primary index's own replay already ran) could
+    ///   return a completely different record's current bytes.
+    /// - [`crate::redo::RedoOp::CreateV2`][] / [`crate::redo::RedoOp::ReplicaCreate`][]:
+    ///   these carry no record bytes (buffered-durability / replication
+    ///   create), so the metadata is read from the device instead, via
+    ///   [`Self::read_metadata_for_key`] — which verifies `meta.tx_id`
+    ///   against `tx_key`, so a reused offset (the same hazard `Create`
+    ///   avoids by not touching the device at all) surfaces as a mismatch
+    ///   and is skipped rather than trusted.
+    /// - Both create variants funnel into [`Self::apply_create_to_mined_index`].
+    ///   Blocks beyond the 3 inline entries (`INLINE_BLOCK_ENTRIES`) are not
+    ///   recoverable from a create redo entry — this mirrors the SAME
+    ///   limitation [`Self::rebuild_mined_index_from_device`] has for
+    ///   create-time overflow (`Engine::build_create_record_bytes` never
+    ///   persists them either).
+    /// - [`crate::redo::RedoOp::SetMinedBatch`][]: `apply_set_mined`/
+    ///   `apply_unset` per txid, mirroring [`Self::set_mined`]'s dual-write.
+    /// - [`crate::redo::RedoOp::Delete`][]: frees the slot this SAME tail
+    ///   allocated for the txid (via the local `tail_slots` map), if any.
+    ///
+    /// `self.index` already reflects the FINAL post-replay primary-index
+    /// state (recovery replayed it before this engine was constructed) — it
+    /// is consulted here only to decide whether a txid still exists (so a
+    /// resurrected, already-deleted key is never re-registered) and to
+    /// preserve its CURRENT `device_id`/`record_offset` when re-pointing
+    /// `mined_slot`. The local `tail_slots` map tracks the slot THIS call
+    /// itself allocated for a txid, so a `Delete` can free it even for a
+    /// txid created-and-deleted entirely within this tail (where
+    /// `self.index` no longer carries any trace of it). The rare
+    /// create+delete+recreate cycle for the SAME txid within one tail
+    /// leaves the FIRST create's slot allocated-and-abandoned once the
+    /// second create overwrites `tail_slots`/`self.index`'s pointer — a
+    /// bounded, harmless leak that self-heals at the next checkpoint (whose
+    /// snapshot only walks the live final index) or a full restart
+    /// (`clear()`).
+    ///
+    /// Idempotent only in the sense that the CALLER always starts from a
+    /// freshly-`clear()`ed arena (via
+    /// [`Self::restore_mined_index_from_snapshot_entries`]) — like
+    /// [`Self::rebuild_mined_index_from_device`], this is safe to call only
+    /// once at boot, before serving traffic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] if reading a redo log fails, or
+    /// if re-pointing a primary entry's `mined_slot` fails (redb commit
+    /// failure).
+    pub fn replay_mined_index_redo_tail(
+        &self,
+        redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
+    ) -> Result<(), SpendError> {
+        let mut tagged: Vec<crate::redo::RedoEntry> = Vec::new();
+        for log in redo_logs {
+            let entries = log.lock().recover().map_err(|e| SpendError::StorageError {
+                detail: format!("mined-index redo-tail replay: reading redo log failed: {e}"),
+            })?;
+            tagged.extend(entries);
+        }
+        tagged.sort_by_key(|e| e.sequence);
+
+        let mut tail_slots: std::collections::HashMap<TxKey, u32> =
+            std::collections::HashMap::new();
+
+        for entry in &tagged {
+            match &entry.op {
+                crate::redo::RedoOp::Create {
+                    tx_key,
+                    record_bytes,
+                    ..
+                } => match TxMetadata::from_bytes(record_bytes) {
+                    Ok(meta) => self.apply_create_to_mined_index(tx_key, &meta, &mut tail_slots)?,
+                    Err(e) => {
+                        tracing::warn!(
+                            tx_key = ?tx_key.txid,
+                            err = %e,
+                            "mined-index redo-tail replay: Create record_bytes unreadable; \
+                             skipping mined-state for this record",
+                        );
+                    }
+                },
+                crate::redo::RedoOp::CreateV2 {
+                    tx_key,
+                    device_id,
+                    record_offset,
+                    ..
+                }
+                | crate::redo::RedoOp::ReplicaCreate {
+                    tx_key,
+                    device_id,
+                    record_offset,
+                    ..
+                } => match self.read_metadata_for_key(*device_id, tx_key, *record_offset) {
+                    Ok(meta) => self.apply_create_to_mined_index(tx_key, &meta, &mut tail_slots)?,
+                    Err(e) => {
+                        tracing::warn!(
+                            tx_key = ?tx_key.txid,
+                            device_id,
+                            record_offset,
+                            err = %e,
+                            "mined-index redo-tail replay: index-only create's device metadata \
+                             unreadable or no longer matches this txid (offset reused by a \
+                             later op in this tail); skipping mined-state for this record",
+                        );
+                    }
+                },
+                crate::redo::RedoOp::Delete { tx_key, .. } => {
+                    if let Some(slot) = tail_slots.remove(tx_key) {
+                        self.mined_index.free(tx_key, slot);
+                    }
+                    // A txid restored from the checkpoint snapshot and
+                    // deleted in this tail was never registered by
+                    // `restore_mined_index_from_snapshot_entries` in the
+                    // first place (its own existence check already skipped
+                    // it), so there is nothing to free for it here.
+                }
+                crate::redo::RedoOp::SetMinedBatch {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    on_longest_chain,
+                    current_block_height,
+                    unset,
+                    txids,
+                    ..
+                } => {
+                    for tx_key in txids {
+                        let slot = tail_slots.get(tx_key).copied().or_else(|| {
+                            self.index
+                                .lookup(tx_key)
+                                .map(|e| e.mined_slot)
+                                .filter(|&s| s != crate::index::mined_index::NO_MINED_SLOT)
+                        });
+                        let Some(slot) = slot else { continue };
+                        if *unset {
+                            self.mined_index.apply_unset(
+                                tx_key,
+                                slot,
+                                *block_id,
+                                *current_block_height,
+                            );
+                        } else {
+                            self.mined_index.apply_set_mined(
+                                tx_key,
+                                slot,
+                                *block_id,
+                                *block_height,
+                                *subtree_idx,
+                                *on_longest_chain,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Recover the [`ShardedMinedIndex`] at startup: try the checkpoint
+    /// snapshot + redo-tail replay path (Task 13) first, falling back to
+    /// [`Self::rebuild_mined_index_from_device`]'s full device scan (Task 12)
+    /// when the snapshot section is absent, truncated, or otherwise fails to
+    /// decode. The device-scan fallback is NEVER removed by this method —
+    /// it is the same call [`Self::rebuild_mined_index_from_device`] always
+    /// was, just reached conditionally now.
+    ///
+    /// Returns `Ok(true)` if the snapshot+redo-tail path was used, `Ok(false)`
+    /// if it fell back to the device scan. Both outcomes leave the
+    /// MinedIndex fully populated and every live primary entry's
+    /// `mined_slot` re-pointed — callers do not need to branch on the result
+    /// except for logging/tests.
+    ///
+    /// A snapshot DECODE failure (missing file, wrong version, truncated or
+    /// corrupt bytes) is expected and non-fatal — it just means this
+    /// checkpoint predates the mined-index snapshot feature, or the write
+    /// was interrupted; the device scan reconstructs the same authoritative
+    /// state directly from the device instead. A STORAGE failure while
+    /// restoring or replaying (a primary-index register call erroring) is
+    /// NOT tolerated, matching [`Self::rebuild_mined_index_from_device`]'s
+    /// own severity: it indicates a systemic index-write fault the device
+    /// scan would hit identically, so it is propagated as fatal rather than
+    /// silently falling back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] on a storage-level fault from
+    /// either recovery path.
+    pub fn recover_mined_index(
+        &self,
+        mined_snapshot_path: &std::path::Path,
+        redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
+    ) -> Result<bool, SpendError> {
+        let bytes = match std::fs::read(mined_snapshot_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::info!(
+                    path = %mined_snapshot_path.display(),
+                    err = %e,
+                    "mined-index recovery: no snapshot section (or unreadable); falling back \
+                     to the full device scan",
+                );
+                self.rebuild_mined_index_from_device()?;
+                return Ok(false);
+            }
+        };
+        let decoded = crate::index::mined_index::ShardedMinedIndex::deserialize_by_key(&bytes);
+        let entries = match decoded {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    path = %mined_snapshot_path.display(),
+                    err = %e,
+                    "mined-index recovery: snapshot section failed to decode; falling back to \
+                     the full device scan",
+                );
+                self.rebuild_mined_index_from_device()?;
+                return Ok(false);
+            }
+        };
+        self.restore_mined_index_from_snapshot_entries(&entries)?;
+        self.replay_mined_index_redo_tail(redo_logs)?;
+        tracing::info!(
+            entries = entries.len(),
+            "mined-index recovery: restored from checkpoint snapshot + redo-tail replay",
+        );
+        Ok(true)
+    }
+
     /// Read on-device metadata for a transaction.
     ///
     /// This is used by production read/diagnostic paths as well as tests.

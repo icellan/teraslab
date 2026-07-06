@@ -1443,22 +1443,38 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Rebuild the in-memory ShardedMinedIndex the same way: it lives only in
+    // Recover the in-memory ShardedMinedIndex the same way: it lives only in
     // RAM (unlike the primary index), so it boots empty on every restart —
     // both the snapshot-restore and device-scan-rebuild paths above converge
     // on `index` by this point, and either one leaves `mined_slot` stale or
-    // sentinel. Re-derive it here from each record's authoritative on-device
-    // block entries / unmined_since / spent counts, overwriting every
-    // primary entry's `mined_slot` with a freshly-allocated slot, before any
+    // sentinel. Task 13: try the checkpoint's TXID-keyed MinedIndex snapshot
+    // + post-checkpoint redo-tail replay first (bounded by the snapshot +
+    // redo, not the device); if that section is absent, truncated, or
+    // otherwise fails to decode, `Engine::recover_mined_index` falls back to
+    // `rebuild_mined_index_from_device`'s full device scan (Task 12, kept as
+    // the permanent fallback) automatically. Either path overwrites every
+    // primary entry's `mined_slot` with a freshly-allocated slot before any
     // client traffic (GET/spend/delete_eval all read mined-state from this
     // index, not the device).
-    if let Err(e) = engine.rebuild_mined_index_from_device() {
-        tracing::error!(
-            err = %e,
-            "FATAL: failed to rebuild the mined index from the recovered \
-             primary index; aborting startup",
-        );
-        std::process::exit(1);
+    let mined_snapshot_path =
+        teraslab::checkpoint::mined_index_snapshot_path(&config.resolved_index_snapshot_path());
+    let mined_redo_logs: &[Arc<Mutex<RedoLog>>] = redo_logs_arc.as_deref().unwrap_or(&[]);
+    match engine.recover_mined_index(&mined_snapshot_path, mined_redo_logs) {
+        Ok(used_snapshot) => {
+            tracing::info!(
+                used_snapshot,
+                "mined-index recovery complete (true = checkpoint snapshot + redo tail, \
+                 false = full device scan)",
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                err = %e,
+                "FATAL: failed to recover the mined index from the recovered \
+                 primary index; aborting startup",
+            );
+            std::process::exit(1);
+        }
     }
 
     // Attach the per-store redo logs so the engine performs two-phase durability

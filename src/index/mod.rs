@@ -28,7 +28,8 @@ pub use conflicting_index::ConflictingIndex;
 pub use dah_index::{DahIndex, DahRedoEntry};
 pub use hashtable::{TxIndexEntry, TxKey};
 pub use mined_index::{
-    MinedApplyResult, MinedEntry, MinedIndexError, NO_MINED_SLOT, ShardedMinedIndex,
+    MinedApplyResult, MinedByKeyEntry, MinedEntry, MinedIndexError, NO_MINED_SLOT,
+    ShardedMinedIndex,
 };
 pub use preserve_backend::PreserveBackend;
 pub use preserve_index::PreserveIndex;
