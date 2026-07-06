@@ -16902,6 +16902,63 @@ mod tests {
         );
     }
 
+    /// Task 16b: `rebuild_mined_index_from_device` must repopulate the
+    /// unmined height buckets WITH the real txid, not just the bare slot —
+    /// it re-derives every slot via the ordinary `alloc_created` call
+    /// (passing the txid read back from the device footer), which already
+    /// threads the key into the bucket as a side effect. Builds a tx that is
+    /// STILL unmined (never mined at all) across the simulated restart, then
+    /// asserts `collect_unmined_keys_below` returns its txid afterward.
+    #[test]
+    fn rebuild_mined_index_from_device_populates_txid_aware_unmined_bucket() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let key;
+        let block_height;
+        {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let (_, req) = make_create_req(252, 1);
+            key = req.tx_key();
+            block_height = req.block_height;
+            engine.create(&req).expect("create succeeds");
+            engine.allocator().lock().persist().unwrap();
+        } // engine (and its in-memory MinedIndex) dropped here — the "restart".
+
+        let recovered_alloc = SlotAllocator::recover(dev.clone()).unwrap();
+        let rebuilt_index = ShardedIndex::rebuild_in_memory(&*dev, &recovered_alloc, 16, 0)
+            .expect("device-scan rebuild succeeds");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            rebuilt_index,
+            recovered_alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        engine2
+            .rebuild_mined_index_from_device()
+            .expect("mined-index rebuild succeeds");
+
+        let keys = engine2
+            .mined_index()
+            .collect_unmined_keys_below(block_height + 1);
+        assert!(
+            keys.contains(&key),
+            "rebuild must populate the unmined height bucket with the real txid, \
+             not just the bare slot number"
+        );
+    }
+
     /// Task 12 (the actual bug this feature exists to close): a snapshot-
     /// restored primary entry carries a `mined_slot` from BEFORE the crash,
     /// but `Engine::new_inner` always builds a fresh, empty `ShardedMinedIndex`
@@ -17121,6 +17178,82 @@ mod tests {
         assert!(
             all_spent,
             "restore must reproduce the snapshot's all_spent bit"
+        );
+    }
+
+    /// Mirrors
+    /// [`rebuild_mined_index_from_device_populates_txid_aware_unmined_bucket`]
+    /// for the OTHER recovery path (Task 13's checkpoint snapshot restore):
+    /// `restore_mined_index_from_snapshot_entries` must also populate the
+    /// unmined height bucket with the real txid — it re-derives every slot
+    /// via the ordinary `alloc_created` call (passing the snapshot entry's
+    /// own txid), which already threads the key into the bucket as a side
+    /// effect.
+    #[test]
+    fn restore_from_snapshot_populates_txid_aware_unmined_bucket() {
+        use crate::index::mined_index::MinedByKeyEntry;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+        let (device_id, offset, key) = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let temp_engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let (_, req) = make_create_req(253, 1);
+            let key = req.tx_key();
+            temp_engine.create(&req).expect("create succeeds");
+            let entry = temp_engine.lookup(&key).expect("entry registered");
+            temp_engine.allocator().lock().persist().unwrap();
+            (entry.device_id, entry.record_offset, key)
+        };
+
+        let stale_index = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+        stale_index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id,
+                    record_offset: offset,
+                    mined_slot: 999,
+                },
+            )
+            .expect("register stale entry");
+
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            stale_index,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // The snapshot entry is STILL unmined as of height 555 — never
+        // mined at all.
+        let entries = vec![MinedByKeyEntry {
+            txid: key.txid,
+            block_entries: vec![],
+            unmined_since: 555,
+            all_spent: false,
+        }];
+
+        engine2
+            .restore_mined_index_from_snapshot_entries(&entries)
+            .expect("snapshot restore succeeds");
+
+        let keys = engine2.mined_index().collect_unmined_keys_below(556);
+        assert!(
+            keys.contains(&key),
+            "snapshot restore must populate the unmined height bucket with the real txid"
         );
     }
 

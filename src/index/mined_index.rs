@@ -2,7 +2,7 @@
 //! `specs/MINEDINDEX_SETMINED_DESIGN.md`. Replaces on-device block entries +
 //! the unmined secondary index.
 use crate::record::BlockEntry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// `flags` bit: the record's UTXOs are all spent (maintained by the spend path).
 pub const MINED_ALL_SPENT: u8 = 1;
@@ -126,7 +126,14 @@ struct MinedShard {
     live: Vec<bool>,
     free: Vec<u32>,
     overflow: HashMap<u32, Vec<BlockEntry>>,
-    unmined: HashMap<u32, HashSet<u32>>,
+    /// height -> (shard-local slot -> the tx's `TxKey`) for every currently
+    /// UNMINED slot in this shard. Only unmined txs are ever present here —
+    /// the mempool/unconfirmed backlog, bounded to millions of entries, not
+    /// the full (100M+) record set — so the extra 32-byte txid per bucket
+    /// entry costs tens of MB, not gigabytes. A mined record holds no txid
+    /// copy here at all (its bucket membership is removed the moment it's
+    /// mined on the longest chain — see [`Self::set_unmined`]).
+    unmined: HashMap<u32, HashMap<u32, TxKey>>,
 }
 
 impl MinedShard {
@@ -147,11 +154,18 @@ impl MinedShard {
     #[allow(dead_code)]
     fn free_slot(&mut self, slot: u32) {
         if (slot as usize) < self.live.len() && self.live[slot as usize] {
-            // Remove slot from its unmined bucket (if it was in one)
+            // Remove slot from its unmined bucket (if it was in one). A pure
+            // removal needs no `TxKey` (unlike an insert), so this is done
+            // directly rather than through `set_unmined`.
             if let Some(entry) = self.entries.get(slot as usize) {
                 let unmined_height = entry.unmined_since;
-                if unmined_height != 0 {
-                    self.set_unmined(slot, unmined_height, 0);
+                if unmined_height != 0
+                    && let Some(map) = self.unmined.get_mut(&unmined_height)
+                {
+                    map.remove(&slot);
+                    if map.is_empty() {
+                        self.unmined.remove(&unmined_height);
+                    }
                 }
             }
             self.live[slot as usize] = false;
@@ -176,32 +190,56 @@ impl MinedShard {
         }
     }
 
+    /// Move `slot` between unmined height buckets, from `old_height` to
+    /// `new_height` (either may be `0`, meaning "not in any bucket"). `key`
+    /// is the slot's `TxKey`, stored in the destination bucket when
+    /// `new_height != 0` — a pure removal (`new_height == 0`) never reads
+    /// it, but every caller here already has the key at hand, so it's
+    /// simplest to always require it (see [`MinedShard::free_slot`] for the
+    /// one caller that legitimately has no key, which bypasses this method).
     #[allow(dead_code)]
-    fn set_unmined(&mut self, slot: u32, old_height: u32, new_height: u32) {
+    fn set_unmined(&mut self, slot: u32, old_height: u32, new_height: u32, key: &TxKey) {
         if old_height == new_height {
             return;
         }
         if old_height != 0
-            && let Some(set) = self.unmined.get_mut(&old_height)
+            && let Some(map) = self.unmined.get_mut(&old_height)
         {
-            set.remove(&slot);
-            if set.is_empty() {
+            map.remove(&slot);
+            if map.is_empty() {
                 self.unmined.remove(&old_height);
             }
         }
         if new_height != 0 {
-            self.unmined.entry(new_height).or_default().insert(slot);
+            self.unmined
+                .entry(new_height)
+                .or_default()
+                .insert(slot, *key);
         }
     }
 
+    /// Collect the shard-local slots (deterministic order) of unmined
+    /// entries in buckets with height `< height`. Does not resolve txids —
+    /// see [`Self::unmined_keys_below`] for that.
     #[allow(dead_code)]
     fn unmined_below(&self, height: u32, out: &mut Vec<u32>) {
-        for (&h, set) in &self.unmined {
+        for (&h, map) in &self.unmined {
             if h < height {
-                out.extend(set.iter().copied());
+                out.extend(map.keys().copied());
             }
         }
         out.sort_unstable(); // deterministic order for tests + downstream batching
+    }
+
+    /// Collect the `TxKey`s of unmined entries in buckets with height
+    /// `< height`.
+    #[allow(dead_code)]
+    fn unmined_keys_below(&self, height: u32, out: &mut Vec<TxKey>) {
+        for (&h, map) in &self.unmined {
+            if h < height {
+                out.extend(map.values().copied());
+            }
+        }
     }
 
     /// Append this shard's full state (entries + live flags, free list, and
@@ -316,14 +354,30 @@ impl MinedShard {
         // `serialize`): re-derive each live slot's height bucket from its own
         // `unmined_since` field rather than trusting a separately-serialized
         // (and therefore independently corruptible) bucket structure.
-        let mut unmined: HashMap<u32, HashSet<u32>> = HashMap::new();
+        //
+        // This raw, slot-indexed snapshot format carries no txid per entry
+        // (see `serialize`'s doc) and is unreachable from real recovery —
+        // production exclusively restores the MinedIndex via the TXID-keyed
+        // checkpoint format (`Self::deserialize_by_key` /
+        // `Engine::restore_mined_index_from_snapshot_entries`) or the device
+        // scan (`Engine::rebuild_mined_index_from_device`), both of which
+        // thread the real key through the ordinary `alloc_created`/
+        // `apply_set_mined` calls and so populate the bucket with the real
+        // txid as a side effect. Only this type's own round-trip tests
+        // exercise `Self::deserialize`, so an all-zero placeholder key is
+        // stamped here purely to keep the slot-indexed `unmined_below` query
+        // working; callers must not treat it as a real txid.
+        let mut unmined: HashMap<u32, HashMap<u32, TxKey>> = HashMap::new();
         for (slot, &is_live) in live.iter().enumerate() {
             if !is_live {
                 continue;
             }
             let since = entries[slot].unmined_since;
             if since != 0 {
-                unmined.entry(since).or_default().insert(slot as u32);
+                unmined
+                    .entry(since)
+                    .or_default()
+                    .insert(slot as u32, TxKey { txid: [0u8; 32] });
             }
         }
 
@@ -405,7 +459,7 @@ impl ShardedMinedIndex {
             unmined_since: block_height,
             ..Default::default()
         });
-        sh.set_unmined(slot, 0, block_height);
+        sh.set_unmined(slot, 0, block_height, key);
         slot
     }
 
@@ -492,6 +546,25 @@ impl ShardedMinedIndex {
         }
     }
 
+    /// Collect the txids of every unmined entry below a given height.
+    ///
+    /// Iterates all shards and returns the `TxKey`s of entries with
+    /// `unmined_since` in `1..height` (mined entries — `unmined_since == 0`
+    /// — are never bucketed, so they can't appear here). Unlike
+    /// [`Self::collect_unmined_below`], this needs no follow-up lookup to
+    /// resolve a txid from a `(shard, slot)` pair: the height buckets carry
+    /// the key directly (see the `MinedShard::unmined` field doc). This is
+    /// the read path for the pruner's "old unmined" query
+    /// (`dispatch::handle_query_old_unmined`), superseding a lookup through
+    /// the separate unmined secondary index.
+    pub fn collect_unmined_keys_below(&self, height: u32) -> Vec<TxKey> {
+        let mut out = Vec::new();
+        for shard in self.shards.iter() {
+            shard.lock().unmined_keys_below(height, &mut out);
+        }
+        out
+    }
+
     /// Record a tx as mined in `block_id`, adding the block tuple inline (if
     /// the slot has none yet) or into the shard's overflow list (if the tx is
     /// already mined in a different block — a competing-chain reorg case).
@@ -543,7 +616,7 @@ impl ShardedMinedIndex {
                 e.unmined_since = 0;
             }
             if old_unmined != new_unmined_since {
-                sh.set_unmined(slot, old_unmined, new_unmined_since);
+                sh.set_unmined(slot, old_unmined, new_unmined_since, key);
             }
             return MinedApplyResult {
                 changed: false,
@@ -574,7 +647,7 @@ impl ShardedMinedIndex {
             e.unmined_since = 0;
         }
         if old_unmined != new_unmined_since {
-            sh.set_unmined(slot, old_unmined, new_unmined_since);
+            sh.set_unmined(slot, old_unmined, new_unmined_since, key);
         }
 
         MinedApplyResult {
@@ -648,7 +721,7 @@ impl ShardedMinedIndex {
             if let Some(e) = sh.get_mut(slot) {
                 e.unmined_since = current_height;
             }
-            sh.set_unmined(slot, old_unmined, current_height);
+            sh.set_unmined(slot, old_unmined, current_height, key);
         }
     }
 
@@ -677,7 +750,7 @@ impl ShardedMinedIndex {
         if let Some(e) = sh.get_mut(slot) {
             e.unmined_since = new_unmined;
         }
-        sh.set_unmined(slot, old_unmined, new_unmined);
+        sh.set_unmined(slot, old_unmined, new_unmined, key);
     }
 
     /// Set or clear the `MINED_ALL_SPENT` flag on the slot's entry.
@@ -1083,21 +1156,27 @@ mod tests {
 
     #[test]
     fn height_buckets_track_unmined_and_range_query() {
+        use crate::index::TxKey;
         let mut s = MinedShard::default();
+        let k_a = TxKey { txid: [30u8; 32] };
+        let k_b = TxKey { txid: [31u8; 32] };
         let a = s.alloc(MinedEntry {
             unmined_since: 5,
             ..Default::default()
         });
-        s.set_unmined(a, 0, 5); // enter bucket 5
+        s.set_unmined(a, 0, 5, &k_a); // enter bucket 5
         let b = s.alloc(MinedEntry {
             unmined_since: 9,
             ..Default::default()
         });
-        s.set_unmined(b, 0, 9);
+        s.set_unmined(b, 0, 9, &k_b);
         let mut out = Vec::new();
         s.unmined_below(8, &mut out); // want slots with unmined_since in 1..8 => only `a`
         assert_eq!(out, vec![a]);
-        s.set_unmined(a, 5, 0); // mined: leave the bucket
+        let mut keys = Vec::new();
+        s.unmined_keys_below(8, &mut keys);
+        assert_eq!(keys, vec![k_a], "the bucket must carry the real txid");
+        s.set_unmined(a, 5, 0, &k_a); // mined: leave the bucket
         out.clear();
         s.unmined_below(100, &mut out);
         assert_eq!(out, vec![b], "mined slot left its bucket");
@@ -1105,12 +1184,14 @@ mod tests {
 
     #[test]
     fn free_slot_clears_unmined_bucket() {
+        use crate::index::TxKey;
         let mut s = MinedShard::default();
+        let k = TxKey { txid: [32u8; 32] };
         let a = s.alloc(MinedEntry {
             unmined_since: 7,
             ..Default::default()
         });
-        s.set_unmined(a, 0, 7); // enter bucket 7
+        s.set_unmined(a, 0, 7, &k); // enter bucket 7
         let mut out = Vec::new();
         s.unmined_below(100, &mut out);
         assert_eq!(out, vec![a], "slot should be in unmined bucket");
@@ -1121,6 +1202,12 @@ mod tests {
         assert!(
             out.is_empty(),
             "freed slot should not appear in unmined_below"
+        );
+        let mut keys = Vec::new();
+        s.unmined_keys_below(100, &mut keys);
+        assert!(
+            keys.is_empty(),
+            "freed slot's key must not appear in unmined_keys_below"
         );
     }
 
@@ -1144,6 +1231,66 @@ mod tests {
             out.iter().any(|&(_s, sl)| sl == slot),
             "created tx appears in unmined range"
         );
+    }
+
+    /// Task 16b: `collect_unmined_keys_below` must return the actual txids
+    /// of unmined entries below a cutoff — not just their opaque
+    /// `(shard, slot)` locators — since that's what lets the
+    /// `OP_QUERY_OLD_UNMINED` reader source directly from the MinedIndex
+    /// instead of the separate unmined secondary index. Covers: several txs
+    /// unmined at different heights, a tx mined on the longest chain (must
+    /// be absent), and a mined-then-reorged-off-chain tx (must reappear).
+    #[test]
+    fn collect_unmined_keys_below_returns_txids() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+
+        // Unmined at height 10 and 20 respectively.
+        let k1 = TxKey { txid: [61u8; 32] };
+        idx.alloc_created(&k1, 10);
+        let k2 = TxKey { txid: [62u8; 32] };
+        idx.alloc_created(&k2, 20);
+
+        // Mined on the longest chain at creation -> unmined_since clears to
+        // 0, must never appear in any range query.
+        let k3 = TxKey { txid: [63u8; 32] };
+        let slot3 = idx.alloc_created(&k3, 5);
+        idx.apply_set_mined(&k3, slot3, 700, 40, 0, true);
+
+        // Mined on the longest chain, then reorged OFF the longest chain at
+        // height 25 — must reappear as unmined.
+        let k4 = TxKey { txid: [64u8; 32] };
+        let slot4 = idx.alloc_created(&k4, 5);
+        idx.apply_set_mined(&k4, slot4, 800, 6, 0, true);
+        idx.set_longest_chain(&k4, slot4, false, 25);
+
+        let below_30 = idx.collect_unmined_keys_below(30);
+        assert_eq!(
+            below_30.len(),
+            3,
+            "exactly the 3 unmined txids, no duplicates or extras: {below_30:?}"
+        );
+        assert!(
+            below_30.contains(&k1),
+            "unmined tx below the cutoff must be present"
+        );
+        assert!(
+            below_30.contains(&k2),
+            "unmined tx below the cutoff must be present"
+        );
+        assert!(
+            !below_30.contains(&k3),
+            "mined-on-longest-chain tx must be absent"
+        );
+        assert!(
+            below_30.contains(&k4),
+            "mined-then-reorged-off-chain tx must reappear as unmined"
+        );
+
+        // A tighter cutoff excludes k2 (unmined_since 20 >= 15).
+        let below_15 = idx.collect_unmined_keys_below(15);
+        assert!(below_15.contains(&k1));
+        assert!(!below_15.contains(&k2));
     }
 
     #[test]

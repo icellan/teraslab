@@ -9071,8 +9071,10 @@ fn handle_get_batch(
 // Pruner operations
 // ---------------------------------------------------------------------------
 
-/// Return the current unmined-index snapshot at the instant the index query
-/// runs. The result is not a read lock over subsequent engine mutations:
+/// Return the current unmined-txid snapshot at the instant the query runs,
+/// sourced from the authoritative [`ShardedMinedIndex`](crate::index::mined_index::ShardedMinedIndex)'s
+/// height buckets (Task 16b) rather than the separate unmined secondary
+/// index. The result is not a read lock over subsequent engine mutations:
 /// concurrent set-mined/mark-longest-chain updates may become visible
 /// immediately after this response is assembled.
 ///
@@ -9096,7 +9098,7 @@ fn handle_query_old_unmined(
     let Some(cutoff) = le_u32_at(&req.payload, 0) else {
         return error_response(req.request_id, ERR_PAYLOAD_MALFORMED, "malformed query");
     };
-    let candidates = engine.unmined_index().range_query(cutoff);
+    let candidates = engine.mined_index().collect_unmined_keys_below(cutoff);
     let mut keys = Vec::with_capacity(candidates.len());
     for key in candidates {
         // F-G5-003: skip keys this node does not master. Single-node mode
@@ -11018,6 +11020,51 @@ mod tests {
             self.request(OP_CREATE_BATCH, payload)
         }
 
+        /// Like [`Self::create_tx`], but with a caller-controlled creation
+        /// `block_height` — `create_tx` always uses `block_height: 0`, so
+        /// its records' `unmined_since` is always `0`, i.e. never bucketed
+        /// as unmined in the `ShardedMinedIndex` at all (see `Engine::create`'s
+        /// "Set unmined_since" step: `meta.unmined_since = req.block_height`
+        /// for an arrived-unmined create). Used by tests that need a real,
+        /// nonzero unmined height to exercise `collect_unmined_keys_below`.
+        fn create_tx_at_height(
+            &self,
+            txid: [u8; 32],
+            utxo_count: u32,
+            block_height: u32,
+        ) -> ResponseFrame {
+            let hashes: Vec<[u8; 32]> = (0..utxo_count)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[0] = (i & 0xFF) as u8;
+                    h[1] = ((i >> 8) & 0xFF) as u8;
+                    h
+                })
+                .collect();
+
+            let item = WireCreateItem {
+                txid,
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1700000000000,
+                flags: 0,
+                utxo_hashes: hashes,
+                cold_data: vec![],
+                block_height,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            };
+            let payload = encode_create_batch(&[item]);
+            self.request(OP_CREATE_BATCH, payload)
+        }
+
         /// Generate a deterministic txid from a byte value.
         fn make_txid(n: u8) -> [u8; 32] {
             let mut txid = [0u8; 32];
@@ -11393,20 +11440,18 @@ mod tests {
         let txid_b = DispatchTestHarness::make_txid(2);
         let txid_c = DispatchTestHarness::make_txid(3);
 
-        // Create 3 txs
-        assert_eq!(h.create_tx(txid_a, 2).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_b, 2).status, STATUS_OK);
-        assert_eq!(h.create_tx(txid_c, 2).status, STATUS_OK);
+        // Create 3 txs, unmined as of heights 100 / 199 / 300 respectively —
+        // Task 16b: the handler now sources candidates from the
+        // ShardedMinedIndex's own height buckets (populated at create time),
+        // not the separate unmined secondary index. The cutoff is EXCLUSIVE
+        // (`collect_unmined_keys_below`'s `unmined_since in 1..height`), so
+        // 199 (not 200) is used here to stay clear of the boundary — see
+        // `dispatch_query_old_unmined_cutoff_is_exclusive` for that case.
+        assert_eq!(h.create_tx_at_height(txid_a, 2, 100).status, STATUS_OK);
+        assert_eq!(h.create_tx_at_height(txid_b, 2, 199).status, STATUS_OK);
+        assert_eq!(h.create_tx_at_height(txid_c, 2, 300).status, STATUS_OK);
 
-        // Manually insert into unmined index at different heights
-        {
-            let ui = h.engine.unmined_index();
-            ui.insert(100, TxKey { txid: txid_a }, None).unwrap();
-            ui.insert(200, TxKey { txid: txid_b }, None).unwrap();
-            ui.insert(300, TxKey { txid: txid_c }, None).unwrap();
-        }
-
-        // Query with cutoff_height=200 — should return txid_a (100) and txid_b (200)
+        // Query with cutoff_height=200 — should return txid_a (100) and txid_b (199)
         let mut payload = Vec::new();
         payload.extend_from_slice(&200u32.to_le_bytes());
         let resp = h.request(OP_QUERY_OLD_UNMINED, payload);
@@ -11426,6 +11471,89 @@ mod tests {
         assert!(returned_txids.contains(&txid_a));
         assert!(returned_txids.contains(&txid_b));
         assert!(!returned_txids.contains(&txid_c));
+    }
+
+    /// The cutoff is EXCLUSIVE — "unmined since before cutoffHeight" (see the
+    /// Go/Rust client docs for `QueryOldUnmined`/`query_old_unmined`), which
+    /// matches `ShardedMinedIndex::collect_unmined_keys_below`'s own
+    /// `unmined_since in 1..height` contract: a tx unmined exactly AT the
+    /// cutoff height must not be returned. (Task 16b's reroute off the old
+    /// secondary index's inclusive `range(..=cutoff_height)` corrects this
+    /// boundary to match the documented contract.)
+    #[test]
+    fn dispatch_query_old_unmined_cutoff_is_exclusive() {
+        let h = DispatchTestHarness::new();
+        let txid = DispatchTestHarness::make_txid(30);
+        assert_eq!(h.create_tx_at_height(txid, 1, 200).status, STATUS_OK);
+
+        let resp = h.request(OP_QUERY_OLD_UNMINED, 200u32.to_le_bytes().to_vec());
+        assert_eq!(resp.status, STATUS_OK);
+        let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(
+            count, 0,
+            "a tx unmined exactly AT the cutoff height must not be returned (exclusive cutoff)"
+        );
+
+        let resp2 = h.request(OP_QUERY_OLD_UNMINED, 201u32.to_le_bytes().to_vec());
+        assert_eq!(resp2.status, STATUS_OK);
+        let count2 = u32::from_le_bytes(resp2.payload[0..4].try_into().unwrap());
+        assert_eq!(
+            count2, 1,
+            "cutoff one past the unmined height must return it"
+        );
+    }
+
+    /// Task 16b: `OP_QUERY_OLD_UNMINED` must source its candidates from the
+    /// `ShardedMinedIndex`'s own height buckets, not the separate unmined
+    /// secondary index. Proven directly: a txid inserted ONLY into the old
+    /// secondary index (`engine.unmined_index()`), with no corresponding
+    /// MinedIndex bucket entry, must NOT come back from the handler — if it
+    /// did, the handler would still be reading the old index.
+    #[test]
+    fn dispatch_query_old_unmined_uses_mined_index() {
+        let h = DispatchTestHarness::new();
+        let txid_real = DispatchTestHarness::make_txid(21);
+        let txid_stale_secondary_only = DispatchTestHarness::make_txid(22);
+
+        // A genuine unmined tx as of height 50 — present in the MinedIndex's
+        // own height bucket via the ordinary create path.
+        assert_eq!(h.create_tx_at_height(txid_real, 1, 50).status, STATUS_OK);
+        assert!(
+            h.engine
+                .mined_index()
+                .collect_unmined_keys_below(1_000)
+                .contains(&TxKey { txid: txid_real }),
+            "precondition: create must have populated the MinedIndex bucket"
+        );
+
+        // A different tx created already-mined (block_height 0, no
+        // unmined_since) — its MinedIndex bucket never gets an entry — but
+        // manually seeded into the OLD secondary unmined index directly.
+        // Pre-Task-16b this would have been returned by the handler; now it
+        // must not be, since the handler no longer reads that index.
+        assert_eq!(h.create_tx(txid_stale_secondary_only, 1).status, STATUS_OK);
+        {
+            let ui = h.engine.unmined_index();
+            ui.insert(
+                50,
+                TxKey {
+                    txid: txid_stale_secondary_only,
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        let resp = h.request(OP_QUERY_OLD_UNMINED, 1_000u32.to_le_bytes().to_vec());
+        assert_eq!(resp.status, STATUS_OK);
+        let count = u32::from_le_bytes(resp.payload[0..4].try_into().unwrap());
+        assert_eq!(count, 1, "only the MinedIndex-bucketed tx must be returned");
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&resp.payload[4..36]);
+        assert_eq!(
+            txid, txid_real,
+            "the tx seeded only in the old secondary index must be absent"
+        );
     }
 
     #[test]
@@ -11529,12 +11657,11 @@ mod tests {
     fn dispatch_query_old_unmined_skips_preserved_records() {
         let h = DispatchTestHarness::new();
         let txid = DispatchTestHarness::make_txid(9);
-        assert_eq!(h.create_tx(txid, 1).status, STATUS_OK);
-
-        {
-            let ui = h.engine.unmined_index();
-            ui.insert(100, TxKey { txid }, None).unwrap();
-        }
+        // Unmined as of height 100, so it's a genuine MinedIndex candidate
+        // below the cutoff before `preserve_until` is applied — otherwise
+        // this test's `count == 0` assertion would trivially pass for the
+        // wrong reason (the tx was never a candidate to begin with).
+        assert_eq!(h.create_tx_at_height(txid, 1, 100).status, STATUS_OK);
 
         let mut shared = Vec::new();
         shared.extend_from_slice(&1000u32.to_le_bytes());
