@@ -128,6 +128,16 @@ impl DahIndex {
         result
     }
 
+    /// The current `delete_at_height` recorded for `key`, or `None` if the key
+    /// is not in the index. O(1) via the reverse `by_txid` map.
+    ///
+    /// This is the AUTHORITATIVE live due-height for a record — the DAH sweep
+    /// gate reads it here rather than from the on-device `delete_at_height`
+    /// field, which `set_mined` no longer keeps current (Task 16d).
+    pub fn get_height(&self, key: &TxKey) -> Option<u32> {
+        self.by_txid.get(key).copied()
+    }
+
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
         self.by_txid.len()

@@ -7274,53 +7274,86 @@ impl Engine {
     /// ([`Self::delete`] with `due_guard`), the KO-2 sweep re-validation, and
     /// [`Self::is_due_for_sweep`] all use:
     ///
-    /// - `preserve_until == 0` — an active preservation always wins.
-    /// - `delete_at_height` set and `<= current_block_height` — DAH is due.
+    /// - `preserve_until == 0` (device) — an active preservation always wins.
+    /// - the record's LIVE DAH (`dah_index`, keyed by `key`) is set and
+    ///   `<= current_block_height` — DAH is due. This is read from the
+    ///   secondary index, NOT the on-device `delete_at_height`, which
+    ///   `set_mined` no longer keeps current (Task 16d).
     /// - CONFLICTING records are due unconditionally (KO-2): the
     ///   `setConflicting` path (Lua lines 985-995) DAH's losers regardless
     ///   of spent/longest-chain state, so the sweep MUST be able to delete
     ///   them — a conflicting double-spend loser is never all-spent and is
     ///   usually unmined.
-    /// - Otherwise the normal mined-record path: all-spent ∧ on-longest-chain
-    ///   (`spent_utxos == utxo_count && unmined_since == 0`).
-    fn record_due_for_sweep(meta: &TxMetadata, current_block_height: u32) -> bool {
+    /// - Otherwise the normal mined-record path: all-spent (device
+    ///   `spent_utxos == utxo_count`) ∧ has-blocks ∧ on-longest-chain, where
+    ///   has-blocks / on-longest-chain (`unmined_since == 0`) come from the
+    ///   authoritative MinedIndex — NOT the stale device fields. This is what
+    ///   stops a mined-then-reorg-unmined all-spent record from being deleted
+    ///   after a crash resurrects a stale-device DAH entry.
+    fn record_due_for_sweep(
+        &self,
+        key: &TxKey,
+        meta: &TxMetadata,
+        current_block_height: u32,
+    ) -> bool {
         if { meta.preserve_until } != 0 {
             return false;
         }
-        let dah = { meta.delete_at_height };
-        if dah == 0 || dah > current_block_height {
+        // Authoritative due-height: the live DAH secondary index, NOT the
+        // on-device `delete_at_height`. `set_mined` no longer writes that field
+        // (Task 16d), so a mined-then-reorg-unmined record's device DAH is
+        // stale (still carries the value the pre-unmine spend planted), while
+        // the live path removed the DAH index entry. Reading the index here
+        // means a record the live system chose to retain is never resurrected
+        // into the sweep.
+        let dah = match self.dah_index().get_height(key) {
+            Some(h) if h != 0 => h,
+            _ => return false,
+        };
+        if dah > current_block_height {
             return false;
         }
-        Self::sweep_eligible(meta)
+        // Mined-state (has_blocks / on-longest-chain) comes from the
+        // authoritative `ShardedMinedIndex`, never the stale device
+        // `block_entry_count` / `unmined_since`. A read failure is treated as
+        // NOT-due — the record is preserved, always the safe direction for a
+        // delete.
+        let (has_blocks, unmined_since) = match self.mined_block_entries(key) {
+            Ok((entries, unmined)) => (!entries.is_empty(), unmined),
+            Err(_) => return false,
+        };
+        Self::sweep_eligible_with_mined(meta, has_blocks, unmined_since)
     }
 
     /// Height-independent DAH-sweep eligibility: whether the record would be
     /// deletable by the sweep ONCE its `delete_at_height` arrives.
     ///
+    /// `has_blocks` and `unmined_since` are the record's *mined-state* inputs,
+    /// which callers MUST source from the authoritative
+    /// [`crate::index::mined_index::ShardedMinedIndex`] (via
+    /// [`Self::mined_block_entries`]) — NOT the device `block_entry_count` /
+    /// `unmined_since` fields, which `set_mined` no longer keeps current
+    /// (Task 16d). `spent_utxos` and the flags still come from `meta` (device).
+    ///
     /// - CONFLICTING → due unconditionally (KO-2): `setConflicting` DAH's
     ///   double-spend losers regardless of spent / longest-chain state.
     /// - REASSIGNED → never due (LP-3): a reassigned record is retained for the
     ///   audit trail and is never all-spent by design.
-    /// - otherwise the normal mined-record path: all-spent ∧ on-longest-chain.
+    /// - otherwise the normal mined-record path: all-spent ∧ has-blocks ∧
+    ///   on-longest-chain (`unmined_since == 0`).
     ///
     /// Used by two callers: [`Self::record_due_for_sweep`] (which adds the
     /// preserve / dah-height gates) and `expire_preservation_set_dah` (which
     /// gates whether to plant a DAH on preservation expiry). Gating expiry on
     /// it means the live mutation paths never PLANT a DAH on a
-    /// permanently-ineligible record (REASSIGNED, or never-all-spent) — such an
-    /// entry is immortal and, under the per-call sweep cap (#25), accumulates at
-    /// low heights and starves the cap.
-    ///
-    /// NOTE the recovery secondary reconcile (`reconcile_secondary_indexes_*`)
-    /// and the migration lifecycle restore (`restore_migrated_lifecycle`) do
-    /// NOT gate on this — they rebuild the DAH index verbatim from the
-    /// authoritative on-device `delete_at_height` (a record can legitimately
-    /// carry a DAH while transiently not-due, e.g. all-spent but unmined after
-    /// a reorg, and must stay indexed). So this does not by itself guarantee
-    /// the DAH index holds only drainable entries; a node upgraded in-place
-    /// from a build with unconditional expiry can still carry pre-existing
-    /// immortal entries until a separate scrub remediates them.
-    pub(crate) fn sweep_eligible(meta: &TxMetadata) -> bool {
+    /// permanently-ineligible record (REASSIGNED, unmined, or never-all-spent) —
+    /// such an entry is immortal and, under the per-call sweep cap (#25),
+    /// accumulates at low heights and starves the cap.
+    pub(crate) fn sweep_eligible_with_mined(
+        meta: &TxMetadata,
+        has_blocks: bool,
+        unmined_since: u32,
+    ) -> bool {
         if meta.flags.contains(TxFlags::CONFLICTING) {
             return true;
         }
@@ -7328,8 +7361,8 @@ impl Engine {
             return false;
         }
         let all_spent = { meta.spent_utxos } == { meta.utxo_count };
-        let on_longest_chain = { meta.unmined_since } == 0;
-        all_spent && on_longest_chain
+        let on_longest_chain = unmined_since == 0;
+        all_spent && has_blocks && on_longest_chain
     }
 
     /// Re-validate a DAH-sweep candidate under the per-tx stripe lock.
@@ -7369,7 +7402,7 @@ impl Engine {
             }
         };
         match self.read_metadata_for_key(entry.device_id, key, entry.record_offset) {
-            Ok(meta) => Self::record_due_for_sweep(&meta, current_block_height),
+            Ok(meta) => self.record_due_for_sweep(key, &meta, current_block_height),
             Err(_) => false,
         }
     }
@@ -7473,7 +7506,7 @@ impl Engine {
             let meta =
                 self.read_metadata_for_key(entry.device_id, &req.tx_key, entry.record_offset)?;
             if let Some(current_height) = req.due_guard
-                && !Self::record_due_for_sweep(&meta, current_height)
+                && !self.record_due_for_sweep(&req.tx_key, &meta, current_height)
             {
                 return Err(SpendError::NotDue);
             }
@@ -7627,7 +7660,7 @@ impl Engine {
     /// `delete_at_height = current_height + block_height_retention`, after
     /// which it is deleted `block_height_retention` blocks later by the sweep.
     ///
-    /// The DAH is set CONDITIONALLY on `sweep_eligible` (#25 follow-up),
+    /// The DAH is set CONDITIONALLY on `sweep_eligible_with_mined` (#25 follow-up),
     /// NOT unconditionally as the original Go pruner did. The Rust Phase-2
     /// sweep declines to delete a record that is not all-spent / not on the
     /// longest chain / REASSIGNED (KO-2/KO-3), so DAH-ing such a record on
@@ -7703,7 +7736,15 @@ impl Engine {
         //
         // (CONFLICTING records are due unconditionally — KO-2 — so they remain
         // eligible here even when not all-spent.)
-        let eligible = Self::sweep_eligible(&meta);
+        //
+        // Mined-state comes from the authoritative MinedIndex, not the stale
+        // device `block_entry_count` / `unmined_since` (Task 16d): a record
+        // reorg-unmined via `set_mined` carries stale device mined-state, and
+        // planting a DAH on it here (when it is actually unmined / retained)
+        // would seed the very orphan the sweep gate now rejects.
+        let (mined_entries, mined_unmined_since) = self.mined_block_entries(key)?;
+        let eligible =
+            Self::sweep_eligible_with_mined(&meta, !mined_entries.is_empty(), mined_unmined_since);
 
         let new_dah = if eligible {
             current_block_height
@@ -8901,6 +8942,126 @@ impl Engine {
             "mined-index recovery: restored from checkpoint snapshot + redo-tail replay",
         );
         Ok(true)
+    }
+
+    /// Rebuild the DAH and unmined secondary indexes store-authoritatively from
+    /// the recovered [`ShardedMinedIndex`] plus device `spent_utxos`/flags.
+    ///
+    /// Task 16d recovery reorder: this MUST run AFTER [`Self::recover_mined_index`]
+    /// (the MinedIndex is the authoritative mined-state source) and REPLACES the
+    /// old device-metadata reconcile in `crate::recovery::recover_all_multi_store`
+    /// for the server boot path. `set_mined` no longer writes the device
+    /// `block_entry_count` / `unmined_since` / `delete_at_height` fields, so a
+    /// reconcile that trusts them (a) resurrects a stale DAH entry for a record
+    /// the live system reorg-unmined and chose to retain, and (b) drops a
+    /// setMined-planted DAH the device never recorded.
+    ///
+    /// For every live primary record it recomputes the DAH via
+    /// [`crate::ops::delete_eval::evaluate_delete_at_height`], sourcing
+    /// `has_blocks` / `unmined_since` from the MinedIndex and `spent_utxos` /
+    /// flags / `preserve_until` from the device:
+    ///
+    /// - A record `delete_eval` would NOT keep DAH'd (unmined/reorged-out,
+    ///   not-all-spent, REASSIGNED, or preserved) is EXCLUDED from `dah_index` —
+    ///   this is what stops the reorg-unmine-then-crash resurrection.
+    /// - An eligible record is inserted at its EXACT device `delete_at_height`
+    ///   when that field is non-zero (spend / setConflicting write it in
+    ///   lockstep with the index), falling back to the re-derived value only
+    ///   when the device field is stale-0 (a setMined-planted DAH).
+    /// - `unmined_index` membership is taken from the MinedIndex height buckets:
+    ///   a record whose MinedIndex `unmined_since` is non-zero is (re)inserted.
+    ///
+    /// Both secondaries are CLEARED first, so entries for records deleted since
+    /// the last checkpoint (absent from the primary index, hence not visited)
+    /// are not left orphaned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] on a device metadata read failure, a
+    /// primary/MinedIndex desync (a live `mined_slot` absent from the MinedIndex),
+    /// or a secondary-index clear/insert failure; [`SpendError::DahOverflow`] if
+    /// `current_block_height + block_height_retention` overflows `u32`.
+    pub fn reconcile_secondaries_from_mined_index(
+        &self,
+        current_block_height: u32,
+        block_height_retention: u32,
+    ) -> Result<(), SpendError> {
+        // Snapshot the live records while holding only the primary shard read
+        // lock, then release it before the per-record device + MinedIndex reads
+        // and secondary-index writes (so no secondary lock nests under the
+        // primary lock).
+        let mut records: Vec<(TxKey, u8, u64, u32)> = Vec::with_capacity(self.index.len());
+        self.index.for_each(|key, entry| {
+            records.push((key, entry.device_id, entry.record_offset, entry.mined_slot));
+        });
+
+        self.dah_index
+            .clear()
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("mined-index reconcile: clearing DAH index failed: {e}"),
+            })?;
+        self.unmined_index
+            .clear()
+            .map_err(|e| SpendError::StorageError {
+                detail: format!("mined-index reconcile: clearing unmined index failed: {e}"),
+            })?;
+
+        for (key, device_id, record_offset, mined_slot) in records {
+            let meta = self.read_metadata_for_key(device_id, &key, record_offset)?;
+
+            // Authoritative mined-state from the MinedIndex, never the device.
+            let (entries, unmined_since) = if mined_slot == crate::index::mined_index::NO_MINED_SLOT
+            {
+                (Vec::new(), 0)
+            } else {
+                self.mined_index
+                    .read_block_entries(&key, mined_slot)
+                    .ok_or(SpendError::StorageError {
+                        detail: "mined-index reconcile: mined_slot present in primary index \
+                                     but absent from MinedIndex"
+                            .to_string(),
+                    })?
+            };
+            let has_blocks = !entries.is_empty();
+
+            let (_signal, patch) = evaluate_delete_at_height(
+                &meta,
+                has_blocks,
+                unmined_since,
+                current_block_height,
+                block_height_retention,
+            )?;
+            let device_dah = { meta.delete_at_height };
+            // `delete_eval`'s decision: the DAH the record SHOULD carry. Zero
+            // (or a clearing patch) means ineligible — retained, not swept.
+            let derived_dah = patch
+                .as_ref()
+                .map(|p| p.new_delete_at_height)
+                .unwrap_or(device_dah);
+            if derived_dah != 0 && { meta.preserve_until } == 0 {
+                // Prefer the exact device DAH when present; fall back to the
+                // re-derived value only when the device field is stale-0 (the
+                // setMined-planted case the device never recorded).
+                let dah_value = if device_dah != 0 {
+                    device_dah
+                } else {
+                    derived_dah
+                };
+                self.dah_index.insert(dah_value, key, None).map_err(|e| {
+                    SpendError::StorageError {
+                        detail: format!("mined-index reconcile: DAH insert failed: {e}"),
+                    }
+                })?;
+            }
+            if unmined_since != 0 {
+                self.unmined_index
+                    .insert(unmined_since, key, None)
+                    .map_err(|e| SpendError::StorageError {
+                        detail: format!("mined-index reconcile: unmined insert failed: {e}"),
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Read on-device metadata for a transaction.
@@ -10230,6 +10391,333 @@ mod tests {
                 block_height_retention: 288,
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 16d: finality-corruption regression — the delete-sweep gate and the
+    // recovery reconcile must be MinedIndex-authoritative, not device-field
+    // authoritative (`set_mined` no longer keeps the device mined-state fields
+    // current). A reorg-unmined all-spent record must never be swept.
+    // -----------------------------------------------------------------------
+
+    /// The reviewer's exact scenario, end-to-end: mine R on the longest chain,
+    /// spend all its UTXOs (plants a DAH), reorg-unmine R (zero device write),
+    /// crash, recover, advance past the OLD `delete_at_height`, run the DAH
+    /// sweep → R must NOT be deleted (the MinedIndex says R is unmined/retained).
+    ///
+    /// Reproduces the corruption: the device-based recovery reconcile resurrects
+    /// the stale DAH entry, and — before the fix — the gate trusts the stale
+    /// device `delete_at_height` / `unmined_since` and physically deletes a
+    /// record the live system chose to retain.
+    #[test]
+    fn reorg_unmine_all_spent_then_crash_does_not_delete_retained_record() {
+        use crate::index::{PrimaryBackend, ShardedIndex};
+        use crate::redo::{RedoLog, RedoOp};
+
+        const D: u32 = 1500; // stale delete_at_height from the pre-unmine spend
+        const BLOCK_ID: u32 = 77;
+        const UNMINE_HEIGHT: u32 = 1200;
+
+        let data_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(1024 * 1024, 4096).unwrap());
+
+        let mut txid = [0u8; 32];
+        txid[0] = 0x5A;
+        txid[1] = 0xC3;
+        let key = TxKey { txid };
+
+        // Crash-time device state: R is all-spent, and its device mined-state
+        // fields are STALE (Task 16d: set_mined wrote none of them).
+        //   unmined_since   = 0   → device says "on the longest chain"
+        //   delete_at_height = D  → the DAH the pre-unmine spend planted
+        //   block_entry_count = 0 → never written
+        let mut alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let record_size = TxMetadata::record_size_for(1);
+        let offset = alloc.allocate(record_size).unwrap();
+        let mut meta = TxMetadata::new(1);
+        meta.tx_id = txid;
+        meta.spent_utxos = 1;
+        meta.unmined_since = 0;
+        meta.delete_at_height = D;
+        meta.block_entry_count = 0;
+        let spent_slot = UtxoSlot::new_spent([0x11; 32], [0xAB; 36]);
+        io::write_full_record(&*data_dev, offset, &meta, &[spent_slot]).unwrap();
+        alloc.persist().unwrap();
+
+        // Redo log: the durable record of the mined-state transitions.
+        // recover_mined_index (fresh boot) replays these into the MinedIndex —
+        // the authoritative source — which correctly reports R as UNMINED.
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev.clone(), 0, 1024 * 1024).unwrap(),
+        ));
+        redo.lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: 0,
+                record_offset: offset,
+                utxo_count: 1,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: BLOCK_ID,
+                block_height: 1000,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                unset: false,
+                txids: vec![key],
+            })
+            .unwrap();
+        // Reorg-unmine: removes the block → R becomes unmined as of UNMINE_HEIGHT.
+        redo.lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: BLOCK_ID,
+                block_height: 1000,
+                subtree_idx: 0,
+                on_longest_chain: false,
+                current_block_height: UNMINE_HEIGHT,
+                block_height_retention: 288,
+                unset: true,
+                txids: vec![key],
+            })
+            .unwrap();
+
+        // Recovery: rebuild the primary index and rebuild the DAH/unmined
+        // secondaries FROM THE DEVICE — this is what RESURRECTS the stale DAH
+        // entry (device `delete_at_height` = D). Then recover the MinedIndex.
+        let recovered_alloc = SlotAllocator::recover(data_dev.clone()).unwrap();
+        let primary = PrimaryBackend::rebuild(&*data_dev, &recovered_alloc).unwrap();
+        let index = ShardedIndex::from_single(primary);
+        let (dah_idx, unmined_idx) =
+            PrimaryBackend::rebuild_secondary(&*data_dev, &recovered_alloc).unwrap();
+        let engine = Engine::new_with_sharded_index(
+            data_dev.clone(),
+            index,
+            recovered_alloc,
+            StripedLocks::new(64),
+            DahBackend::from(dah_idx),
+            UnminedBackend::from(unmined_idx),
+        );
+
+        // Repro precondition: the device-based reconcile resurrected the stale
+        // DAH entry, exactly as the reviewer traced.
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(D),
+            "device-based reconcile must resurrect the stale DAH entry",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = tmp.path().join("never-checkpointed.snap");
+        let mined_snap = crate::checkpoint::mined_index_snapshot_path(&snap);
+        let used_snapshot = engine
+            .recover_mined_index(&snap, &mined_snap, std::slice::from_ref(&redo))
+            .expect("fresh-boot mined recovery via full redo replay");
+        assert!(!used_snapshot, "no checkpoint exists → full-replay path");
+
+        // The recovered MinedIndex correctly reports R as UNMINED (retained).
+        let (_blocks, unmined_since) = engine.mined_block_entries(&key).unwrap();
+        assert_ne!(
+            unmined_since, 0,
+            "MinedIndex must report R reorg-unmined (retained)",
+        );
+
+        // The DAH sweep at a height PAST the old delete_at_height.
+        //   PRE-fix: the gate reads the stale device fields → R is "due" → the
+        //            guarded delete physically removes a retained record.
+        //   POST-fix: the gate reads the MinedIndex → R is unmined → NOT due.
+        let sweep_height = D + 10;
+        assert!(
+            !engine.is_due_for_sweep(&key, sweep_height),
+            "reorg-unmined all-spent record must NOT be due (MinedIndex says unmined)",
+        );
+
+        let del = engine.delete(&DeleteRequest {
+            tx_key: key,
+            due_guard: Some(sweep_height),
+        });
+        assert!(
+            matches!(del, Err(SpendError::NotDue)),
+            "guarded delete must refuse the retained record, got {del:?}",
+        );
+        assert!(
+            engine.lookup(&key).is_some(),
+            "the retained record must still exist after the sweep",
+        );
+    }
+
+    /// After setMined-only DAH transitions + crash + recover, the
+    /// MinedIndex-authoritative reconcile must reproduce the LIVE `dah_index`
+    /// membership exactly — no stale-device divergence, no orphan, no missing
+    /// entry: a setMined-planted DAH (which the device never recorded) is
+    /// present, and a reorg-unmined DAH (which the device still carries as a
+    /// stale value) is absent.
+    #[test]
+    fn recovered_dah_index_matches_live_for_setmined_only_transitions() {
+        const RETENTION: u32 = 288;
+        const RECOVERY_HEIGHT: u32 = 2000;
+        const D2_STALE: u32 = 1400;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // Helper: write an all-spent record with the given device fields and
+        // one inline mined block; register it (mined_slot filled in after the
+        // engine exists).
+        let mut write_record = |byte: u8, device_dah: u32| -> (TxKey, TxMetadata) {
+            let mut txid = [0u8; 32];
+            txid[0] = byte;
+            txid[1] = 0xD7;
+            let key = TxKey { txid };
+            let mut meta = TxMetadata::new(1);
+            meta.tx_id = txid;
+            meta.spent_utxos = 1; // all-spent
+            meta.unmined_since = 0;
+            meta.delete_at_height = device_dah;
+            meta.block_entry_count = 1;
+            meta.block_entries_inline[0] = BlockEntry {
+                block_id: byte as u32,
+                block_height: 1000,
+                subtree_idx: 0,
+            };
+            let record_size = TxMetadata::record_size_for(1);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slot = UtxoSlot::new_spent([byte; 32], [0xAB; 36]);
+            io::write_full_record(&*dev, offset, &meta, &[slot]).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+            (key, meta)
+        };
+
+        // R1: setMined-planted DAH — the device `delete_at_height` was NEVER
+        // written (stays 0), the live DAH lived only in the index.
+        let (r1, meta1) = write_record(0x01, 0);
+        // R2: reorg-unmined — the device still carries the stale DAH the
+        // pre-unmine spend planted.
+        let (r2, meta2) = write_record(0x02, D2_STALE);
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // Seed the MinedIndex to match the recovered (post-crash) mined-state:
+        // both mined on the longest chain, then R2 reorg-unmined.
+        let slot1 = seed_mined_index_for_test(&engine, &r1, &meta1);
+        let slot2 = seed_mined_index_for_test(&engine, &r2, &meta2);
+        for (key, slot) in [(r1, slot1), (r2, slot2)] {
+            let e = engine.index.lookup(&key).unwrap();
+            engine
+                .index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: e.record_offset,
+                        mined_slot: slot,
+                    },
+                )
+                .unwrap();
+        }
+        // R2 is reorg-unmined (block retained, moved off the longest chain).
+        engine
+            .mined_index()
+            .set_longest_chain(&r2, slot2, false, 1200);
+
+        // Pre-seed the WRONG, device-derived membership a naive reconcile would
+        // have produced (R2 orphan present, R1 missing) so the assertions below
+        // prove the store-authoritative reconcile CORRECTS both.
+        engine.dah_index().insert(D2_STALE, r2, None).unwrap();
+        assert_eq!(engine.dah_index().get_height(&r1), None);
+        assert_eq!(engine.dah_index().get_height(&r2), Some(D2_STALE));
+
+        engine
+            .reconcile_secondaries_from_mined_index(RECOVERY_HEIGHT, RETENTION)
+            .expect("store-authoritative reconcile must succeed");
+
+        // R1 (setMined-planted, device DAH stale-0) is re-derived INTO the index.
+        assert!(
+            engine.dah_index().get_height(&r1).is_some(),
+            "setMined-planted DAH must be re-derived into dah_index (no missing entry)",
+        );
+        // R2 (reorg-unmined, device DAH stale-nonzero) is EXCLUDED.
+        assert_eq!(
+            engine.dah_index().get_height(&r2),
+            None,
+            "reorg-unmined record must be excluded from dah_index (no orphan)",
+        );
+        // The unmined secondary reflects the MinedIndex bucket: R2 present, R1 absent.
+        let unmined_keys = engine.unmined_index().range_query(u32::MAX);
+        assert!(
+            unmined_keys.contains(&r2),
+            "R2 must be in the unmined index"
+        );
+        assert!(
+            !unmined_keys.contains(&r1),
+            "R1 (on longest chain) must not be in the unmined index",
+        );
+    }
+
+    /// A record whose DEVICE `unmined_since` / `delete_at_height` are stale
+    /// (mined-then-unmined) must NOT be swept: the sweep gate sources
+    /// mined-state from the MinedIndex, which reports it unmined.
+    #[test]
+    fn sweep_gate_reads_unmined_from_mined_index() {
+        let h = TestHarness::with_metadata(1, TxFlags::empty(), |m| {
+            m.spent_utxos = 1; // all-spent
+            m.unmined_since = 0; // STALE "on the longest chain" (device)
+            m.delete_at_height = 1500; // STALE DAH (device)
+            m.block_entry_count = 1; // seed one mined block via the harness
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 9,
+                block_height: 1000,
+                subtree_idx: 0,
+            };
+        });
+
+        // The live path removed the DAH entry on unmine; a device-based recovery
+        // reconcile RESURRECTS it from the stale device `delete_at_height`.
+        h.engine.dah_index().insert(1500, h.key, None).unwrap();
+
+        // Reorg-unmine at the MinedIndex level only (post-16d: zero device write).
+        let slot = h.engine.lookup(&h.key).unwrap().mined_slot;
+        h.engine
+            .mined_index()
+            .set_longest_chain(&h.key, slot, false, 1200);
+
+        // Precondition: MinedIndex says unmined, the device still says on-longest.
+        let (_blocks, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_ne!(unmined, 0, "MinedIndex must report the record unmined");
+        assert_eq!(
+            { h.engine.read_metadata(&h.key).unwrap().unmined_since },
+            0,
+            "device unmined_since stays stale-0 (set_mined wrote nothing)",
+        );
+
+        assert!(
+            !h.engine.is_due_for_sweep(&h.key, 1500),
+            "device fields say due, but the MinedIndex says unmined → must be retained",
+        );
     }
 
     /// Build an engine whose underlying device fails pwrites once a

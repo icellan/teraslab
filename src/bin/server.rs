@@ -1180,6 +1180,14 @@ fn main() {
             &mut dah_index,
             &mut unmined_index,
             full_secondary_rebuild,
+            // Task 16d: DEFER the device-metadata secondary reconcile. The
+            // device `block_entry_count` / `unmined_since` / `delete_at_height`
+            // fields are no longer kept current by `set_mined`, so reconciling
+            // from them here would resurrect a stale DAH entry for a
+            // reorg-unmined (retained) record. The secondaries are instead
+            // rebuilt store-authoritatively from the recovered MinedIndex below,
+            // AFTER `engine.recover_mined_index`.
+            true,
         ) {
             Ok((stats, pending, deleted)) => {
                 pending_conflicting_children = pending;
@@ -1484,6 +1492,32 @@ fn main() {
             std::process::exit(1);
         }
     }
+
+    // Task 16d recovery reorder: with the MinedIndex now recovered, rebuild the
+    // DAH + unmined secondary indexes store-authoritatively from it (the
+    // device-metadata reconcile in `recover_all_multi_store` was deferred
+    // above). Post-16d the device mined-state fields are stale, so this is the
+    // ONLY correct source: it EXCLUDES a reorg-unmined record's stale DAH (no
+    // premature delete of a retained record on crash recovery) and re-derives a
+    // setMined-planted DAH the device never recorded. `recovery_height_floor` is
+    // the highest block height the replayed redo proved this node has seen — the
+    // conservative "current height" for re-deriving any device-stale DAH.
+    if let Err(e) = engine.reconcile_secondaries_from_mined_index(
+        recovery_height_floor,
+        config.block_height_retention,
+    ) {
+        tracing::error!(
+            err = %e,
+            "FATAL: failed to rebuild the DAH/unmined secondary indexes from the \
+             recovered mined index; aborting startup",
+        );
+        std::process::exit(1);
+    }
+    tracing::info!(
+        dah_entries = engine.dah_index().len(),
+        unmined_entries = engine.unmined_index().len(),
+        "secondary indexes rebuilt store-authoritatively from the recovered mined index",
+    );
 
     // Attach the per-store redo logs so the engine performs two-phase durability
     // for secondary index updates (redo fsync BEFORE redb commit), routing each

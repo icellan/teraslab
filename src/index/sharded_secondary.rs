@@ -274,6 +274,19 @@ pub type ShardedDahIndex = ShardedSecondary<DahBackend>;
 /// Sharded `unmined_since` secondary index.
 pub type ShardedUnminedIndex = ShardedSecondary<UnminedBackend>;
 
+impl ShardedDahIndex {
+    /// The current `delete_at_height` recorded for `key`, or `None` if absent.
+    ///
+    /// Locks only the shard owning `key` and returns its authoritative live
+    /// due-height. The DAH sweep gate (`Engine::record_due_for_sweep`) uses this
+    /// instead of the on-device `delete_at_height`, which `set_mined` no longer
+    /// keeps current (Task 16d).
+    pub fn get_height(&self, key: &TxKey) -> Option<u32> {
+        let idx = self.shard_for(key);
+        self.shards[idx].lock().get_height(key)
+    }
+}
+
 impl<B: SecondaryBackend> ShardedSecondary<B> {
     /// Wrap a single backend as a one-shard `ShardedSecondary` (transparent
     /// pass-through).

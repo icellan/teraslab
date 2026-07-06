@@ -41,7 +41,6 @@ use crate::index::{
     DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
 };
 use crate::io;
-use crate::ops::delete_eval::{DahPatch, evaluate_delete_at_height};
 use crate::record::*;
 use crate::redo::{RedoEntry, RedoLog, RedoOp};
 use crate::storage::blob_gc::{self, BlobGcStats};
@@ -602,6 +601,14 @@ pub fn recover_all_with_allocator_collecting_pending_conflicts_progress(
 /// conflicting/deleted-child drains and stats are merged. The single-store path
 /// (`num_stores == 1`) is exactly the prior behaviour because the one store's
 /// log holds every entry.
+///
+/// `defer_secondary_reconcile` (Task 16d): when `true` the trailing DAH/unmined
+/// reconcile is SKIPPED — the caller (server boot) rebuilds those secondaries
+/// store-authoritatively from the recovered MinedIndex afterwards
+/// (`Engine::reconcile_secondaries_from_mined_index`), because the device
+/// mined-state fields are no longer kept current by `set_mined`. When `false`
+/// the legacy device-metadata reconcile runs (correct for callers that do not
+/// recover a MinedIndex).
 #[allow(clippy::too_many_arguments)]
 pub fn recover_all_multi_store(
     devices: &[std::sync::Arc<dyn BlockDevice>],
@@ -611,6 +618,7 @@ pub fn recover_all_multi_store(
     dah: &mut DahBackend,
     unmined: &mut UnminedBackend,
     full_secondary_rebuild: bool,
+    defer_secondary_reconcile: bool,
 ) -> Result<
     (
         RecoveryStats,
@@ -779,11 +787,29 @@ pub fn recover_all_multi_store(
     // `entry.device_id`. The fast path's precondition (clean/durable
     // secondaries) is identical to the single-store path's — the caller asserts
     // it by passing `full_secondary_rebuild == false`.
-    let dev_refs: Vec<&dyn BlockDevice> = devices.iter().map(|d| d.as_ref()).collect();
-    if full_secondary_rebuild {
-        reconcile_secondary_indexes_from_metadata_multi(&dev_refs, index, dah, unmined)?;
-    } else {
-        reconcile_secondary_indexes_for_keys_multi(&dev_refs, index, dah, unmined, &touched_keys)?;
+    // Task 16d: the server boot path DEFERS this device-metadata reconcile and
+    // instead rebuilds the secondaries store-authoritatively from the recovered
+    // MinedIndex AFTER `Engine::recover_mined_index`
+    // (`Engine::reconcile_secondaries_from_mined_index`). Post-16d the device
+    // `block_entry_count` / `unmined_since` / `delete_at_height` fields are no
+    // longer kept current by `set_mined`, so reconciling from them here would
+    // resurrect a stale DAH entry for a reorg-unmined record (and drop a
+    // setMined-planted DAH). Callers that do NOT recover a MinedIndex (the
+    // single-store test wrappers) pass `defer_secondary_reconcile == false` and
+    // get the legacy device-based reconcile, which is still correct for them.
+    if !defer_secondary_reconcile {
+        let dev_refs: Vec<&dyn BlockDevice> = devices.iter().map(|d| d.as_ref()).collect();
+        if full_secondary_rebuild {
+            reconcile_secondary_indexes_from_metadata_multi(&dev_refs, index, dah, unmined)?;
+        } else {
+            reconcile_secondary_indexes_for_keys_multi(
+                &dev_refs,
+                index,
+                dah,
+                unmined,
+                &touched_keys,
+            )?;
+        }
     }
     Ok((total, pending_cc, pending_dc))
 }
@@ -1520,10 +1546,13 @@ enum ReplayResult {
     Failed(ReplayCause),
 }
 
+/// Derived per-entry replay context (the `V2` spend/unspend fields recovery
+/// needs). Task 16d removed `current_block_height` / `block_height_retention`
+/// from here: replay no longer re-derives `delete_at_height` (the DAH secondary
+/// is rebuilt from the recovered MinedIndex after replay), so only the
+/// generation / timestamp watermark remains.
 #[derive(Debug, Clone, Copy)]
 struct ReplayDerivedContext {
-    current_block_height: u32,
-    block_height_retention: u32,
     target_generation: u32,
     updated_at: u64,
 }
@@ -1553,16 +1582,6 @@ fn count_spent_slots(
     Ok(spent as u32)
 }
 
-fn apply_replay_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
-    metadata.delete_at_height = patch.new_delete_at_height;
-    if patch.last_spent_all {
-        metadata.flags |= TxFlags::LAST_SPENT_ALL;
-    } else {
-        // F-G4-015: use the idiomatic bitflags clear pattern.
-        metadata.flags.remove(TxFlags::LAST_SPENT_ALL);
-    }
-}
-
 fn replay_entry(
     device: &dyn BlockDevice,
     index: &ShardedIndex,
@@ -1590,11 +1609,12 @@ fn replay_entry(
             offset,
             spending_data,
             new_spent_count,
-            current_block_height,
-            block_height_retention,
             target_generation,
             updated_at,
             utxo_hash,
+            // current_block_height / block_height_retention are no longer used:
+            // replay no longer re-derives the DAH (Task 16d).
+            ..
         } => replay_spend(
             device,
             index,
@@ -1603,8 +1623,6 @@ fn replay_entry(
             spending_data,
             *new_spent_count,
             Some(ReplayDerivedContext {
-                current_block_height: *current_block_height,
-                block_height_retention: *block_height_retention,
                 target_generation: *target_generation,
                 updated_at: *updated_at,
             }),
@@ -1630,11 +1648,12 @@ fn replay_entry(
             offset,
             spending_data,
             new_spent_count,
-            current_block_height,
-            block_height_retention,
             target_generation,
             updated_at,
             utxo_hash,
+            // current_block_height / block_height_retention are no longer used:
+            // replay no longer re-derives the DAH (Task 16d).
+            ..
         } => replay_unspend(
             device,
             index,
@@ -1643,8 +1662,6 @@ fn replay_entry(
             Some(spending_data),
             *new_spent_count,
             Some(ReplayDerivedContext {
-                current_block_height: *current_block_height,
-                block_height_retention: *block_height_retention,
                 target_generation: *target_generation,
                 updated_at: *updated_at,
             }),
@@ -1907,26 +1924,15 @@ fn replay_spend(
     if let Some(ctx) = derived {
         meta.generation = ctx.target_generation;
         meta.updated_at = ctx.updated_at;
-        // Sourced from the on-device `meta` fields, not the MinedIndex: this
-        // redo replay runs against the bare device/primary-index (no `Engine`,
-        // no `ShardedMinedIndex`) during boot, strictly before
-        // `Engine::recover_mined_index` rebuilds it from the (now-replayed)
-        // device state — there is no MinedIndex to read here yet.
-        let has_blocks = { meta.block_entry_count } > 0;
-        let unmined_since = { meta.unmined_since };
-        let dah_patch = match evaluate_delete_at_height(
-            &meta,
-            has_blocks,
-            unmined_since,
-            ctx.current_block_height,
-            ctx.block_height_retention,
-        ) {
-            Ok((_signal, patch)) => patch,
-            Err(_) => return ReplayResult::Failed(ReplayCause::LogicError),
-        };
-        if let Some(ref patch) = dah_patch {
-            apply_replay_dah_patch(&mut meta, patch);
-        }
+        // Task 16d: replay does NOT re-derive `delete_at_height` here. During
+        // redo replay the MinedIndex does not exist yet, so the only mined-state
+        // available is the device `block_entry_count` / `unmined_since` fields —
+        // which `set_mined` no longer keeps current, so a DAH derived from them
+        // would DIVERGE from what the live path produced. The DAH secondary
+        // index is instead rebuilt store-authoritatively from the recovered
+        // MinedIndex after replay (`Engine::reconcile_secondaries_from_mined_index`),
+        // the SOLE DAH authority now. Slot state + `spent_utxos` are still
+        // recomputed above — that remains device-authoritative.
     }
     if io::write_metadata(device, ie.record_offset, &meta).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
@@ -2018,24 +2024,14 @@ fn replay_unspend(
     if let Some(ctx) = derived {
         meta.generation = ctx.target_generation;
         meta.updated_at = ctx.updated_at;
-        // See `replay_spend`: no `Engine`/`ShardedMinedIndex` exists yet at
-        // this point in boot recovery, so has_blocks/unmined_since must come
-        // from the on-device `meta` fields.
-        let has_blocks = { meta.block_entry_count } > 0;
-        let unmined_since = { meta.unmined_since };
-        let dah_patch = match evaluate_delete_at_height(
-            &meta,
-            has_blocks,
-            unmined_since,
-            ctx.current_block_height,
-            ctx.block_height_retention,
-        ) {
-            Ok((_signal, patch)) => patch,
-            Err(_) => return ReplayResult::Failed(ReplayCause::LogicError),
-        };
-        if let Some(ref patch) = dah_patch {
-            apply_replay_dah_patch(&mut meta, patch);
-        }
+        // Task 16d: replay does NOT re-derive `delete_at_height` here (see
+        // `replay_spend`). The MinedIndex does not exist yet during redo replay,
+        // so a DAH derived from the stale device `block_entry_count` /
+        // `unmined_since` fields would diverge from what the live path produced.
+        // The DAH secondary index is rebuilt store-authoritatively from the
+        // recovered MinedIndex after replay
+        // (`Engine::reconcile_secondaries_from_mined_index`). Slot state +
+        // `spent_utxos` are still recomputed above — device-authoritative.
     }
     if io::write_metadata(device, ie.record_offset, &meta).is_err() {
         return ReplayResult::Failed(ReplayCause::IoError);
@@ -5123,6 +5119,7 @@ mod tests {
             &mut dah,
             &mut unmined,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(stats.entries_replayed, 2, "both creates must replay");
@@ -5235,6 +5232,7 @@ mod tests {
             &mut dah,
             &mut unmined,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(stats.entries_replayed, 1, "the replica create must replay");
@@ -5351,6 +5349,7 @@ mod tests {
             &mut dah,
             &mut unmined,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(stats.entries_failed, 0);
@@ -5488,6 +5487,7 @@ mod tests {
                 &mut dah,
                 &mut unmined,
                 true,
+                false,
             )
             .unwrap();
             assert_eq!(stats.entries_failed, 0, "no replay may fail");
@@ -5650,6 +5650,7 @@ mod tests {
             &mut dah,
             &mut unmined,
             true,
+            false,
         )
         .unwrap();
 
@@ -5772,6 +5773,7 @@ mod tests {
             &mut dah,
             &mut unmined,
             true,
+            false,
         )
         .unwrap();
 
@@ -5926,6 +5928,7 @@ mod tests {
                 &mut dah_full,
                 &mut unmined_full,
                 true,
+                false,
             )
             .unwrap();
         }
@@ -5960,6 +5963,7 @@ mod tests {
                 &index,
                 &mut dah_touch,
                 &mut unmined_touch,
+                false,
                 false,
             )
             .unwrap();
@@ -6080,6 +6084,7 @@ mod tests {
             &mut dah,
             &mut unmined,
             true,
+            false,
         )
         .unwrap();
 
@@ -8059,6 +8064,15 @@ mod tests {
         assert_eq!(unmined_backend.range_query(500).len(), 1);
     }
 
+    /// Task 16d: spend replay recomputes `spent_utxos` / `generation` /
+    /// `updated_at` but NO LONGER re-derives `delete_at_height` — during redo
+    /// replay the MinedIndex does not exist, and a DAH derived from the stale
+    /// device `block_entry_count` / `unmined_since` would diverge from the live
+    /// path. The DAH secondary is rebuilt store-authoritatively from the
+    /// recovered MinedIndex AFTER replay
+    /// (`Engine::reconcile_secondaries_from_mined_index`), so this single-store
+    /// replay leaves `delete_at_height` at its pre-replay device value and
+    /// stamps NO dah-index entry.
     #[test]
     fn recovery_post_replay_generation_matches_live_engine() {
         let mut h = RecoveryTestHarness::new();
@@ -8096,8 +8110,18 @@ mod tests {
         assert_eq!({ meta.spent_utxos }, 1);
         assert_eq!({ meta.generation }, 7);
         assert_eq!({ meta.updated_at }, 123_456);
-        assert_eq!({ meta.delete_at_height }, 1288);
-        assert_eq!(dah.range_query(1288), vec![key]);
+        // Replay no longer stamps a DAH (Task 16d): the field stays at its
+        // pre-replay value (0) and no dah-index entry is produced. The DAH is
+        // instead rebuilt from the MinedIndex after replay.
+        assert_eq!(
+            { meta.delete_at_height },
+            0,
+            "replay must NOT re-derive delete_at_height (Task 16d)",
+        );
+        assert!(
+            dah.range_query(u32::MAX).is_empty(),
+            "replay must NOT stamp a dah-index entry (rebuilt from MinedIndex post-replay)",
+        );
     }
 
     #[test]

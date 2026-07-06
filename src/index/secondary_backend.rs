@@ -169,6 +169,18 @@ impl DahBackend {
         }
     }
 
+    /// The current `delete_at_height` recorded for `key`, or `None` if absent.
+    ///
+    /// The authoritative live due-height for a record (Task 16d): the DAH sweep
+    /// gate reads it here rather than trusting the stale on-device
+    /// `delete_at_height` field.
+    pub fn get_height(&self, key: &TxKey) -> Option<u32> {
+        match self {
+            Self::InMemory(idx) => idx.get_height(key),
+            Self::OnDisk(redb) => redb.get_height(key),
+        }
+    }
+
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
         match self {
