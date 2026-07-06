@@ -1421,8 +1421,13 @@ pub fn apply_op_journal(
     // Ops without master_generation (legacy Create, Delete, PruneSlot) skip
     // this check; they rely on idempotency in their match arms instead.
     if let Some(master_gen) = op.master_generation() {
-        let tx_key = op.tx_key();
-        if let Ok(meta) = engine.read_metadata(&tx_key) {
+        // Invariant: every variant that returns `Some` from
+        // `master_generation()` is a single-key op — `SetMinedBatch` (the
+        // only multi-key variant) always returns `None` there, so `tx_key()`
+        // is guaranteed `Some` here.
+        if let Some(tx_key) = op.tx_key()
+            && let Ok(meta) = engine.read_metadata(&tx_key)
+        {
             let local_gen = { meta.generation };
             if local_gen != master_gen && generation_at_or_ahead(local_gen, master_gen) {
                 return Ok(()); // Stale op — already superseded by a newer mutation
@@ -1606,6 +1611,46 @@ pub fn apply_op_journal(
                 }
                 Err(e) => Err(format!("unset_mined: {e}")),
             }
+        }
+        ReplicaOp::SetMinedBatch {
+            block_id,
+            block_height,
+            subtree_idx,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
+            unset,
+            txids,
+        } => {
+            // Task 14: apply the SAME dual-write (device + MinedIndex) the
+            // master's own `handle_set_mined_batch` performs, once per txid.
+            // `set_mined_inner` is idempotent by block_id (see the variant's
+            // doc comment), so re-applying an already-applied batch is safe.
+            // A hard (non-TxNotFound) error on any txid aborts the whole op —
+            // the master retries the entire `ReplicaBatch`, which is safe
+            // since every txid's application is independently idempotent.
+            let params = crate::ops::set_mined::SetMinedSharedParams {
+                block_id: *block_id,
+                block_height: *block_height,
+                subtree_idx: *subtree_idx,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                on_longest_chain: *on_longest_chain,
+                unset_mined: *unset,
+            };
+            for tx_key in txids {
+                match engine.set_mined_inner(tx_key, &params) {
+                    Ok(_) => {}
+                    Err(crate::ops::error::SpendError::TxNotFound) => {
+                        record_apply_skipped_missing_tx(
+                            if *unset { "unset_mined" } else { "set_mined" },
+                            tx_key,
+                        );
+                    }
+                    Err(e) => return Err(format!("set_mined_batch: {e}")),
+                }
+            }
+            Ok(())
         }
         ReplicaOp::Freeze { tx_key, offset, .. } => {
             let hash = match engine.read_slot(tx_key, *offset) {
@@ -1997,7 +2042,17 @@ pub fn apply_op_journal(
     // legitimate op (or accept a stale one). Both branches now hard-fail
     // the batch ACK so the master retries.
     if let Some(master_gen) = op.master_generation() {
-        let tx_key = op.tx_key();
+        // Invariant: every variant that returns `Some` from
+        // `master_generation()` is a single-key op — `SetMinedBatch` (the
+        // only multi-key variant) always returns `None` there, so `tx_key()`
+        // is guaranteed `Some` here. Hard-fail rather than silently skip if
+        // that invariant is ever violated, matching the "both branches
+        // hard-fail the ACK" discipline this generation sync already uses.
+        let Some(tx_key) = op.tx_key() else {
+            return Err(format!(
+                "generation sync: op carries master_generation but no single tx_key: {op:?}"
+            ));
+        };
         // C-4: route the generation sync through the stripe-locked
         // `engine.set_record_generation` instead of a raw
         // `read_metadata` → mutate → `io::write_metadata` RMW. The lock-free
@@ -2150,10 +2205,10 @@ fn build_post_apply_redo_op(
                 utxo_hash,
             }))
         }
-        // D5/§9: the replica's local redo is now the batch-native
-        // `SetMinedBatch` shape too — a batch-of-one, since the wire
-        // `ReplicaOp::SetMined`/`UnsetMined` are still per-key (batch
-        // replication arrives with Task 14's `ReplicaOp::SetMinedBatch`).
+        // D5/§9: the replica's local redo is the batch-native `SetMinedBatch`
+        // shape too — a batch-of-one for the surviving per-tx
+        // `ReplicaOp::SetMined`/`UnsetMined` wire ops (migration baseline
+        // replay still produces these; see the variant's doc comment).
         // `RedoOp::SetMinedBatch::tx_key()` treats a batch of exactly one
         // key as a single-key op, so per-store routing
         // (`Engine::append_replica_redo_entry`) and recovery's
@@ -2193,6 +2248,29 @@ fn build_post_apply_redo_op(
             block_height_retention: *block_height_retention,
             unset: true,
             txids: vec![*tx_key],
+        })),
+        // Task 14: the received batch's txids echo straight into the local
+        // journal entry — `apply_op` (via `Engine::set_mined_inner`) already
+        // proved each one applies (or gracefully skipped a genuinely missing
+        // record), and replay tolerates a missing record the same way.
+        ReplicaOp::SetMinedBatch {
+            block_id,
+            block_height,
+            subtree_idx,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
+            unset,
+            txids,
+        } => Ok(Some(RedoOp::SetMinedBatch {
+            block_id: *block_id,
+            block_height: *block_height,
+            subtree_idx: *subtree_idx,
+            on_longest_chain: *on_longest_chain,
+            current_block_height: *current_block_height,
+            block_height_retention: *block_height_retention,
+            unset: *unset,
+            txids: txids.clone(),
         })),
         ReplicaOp::Freeze { tx_key, offset, .. } => {
             let slot = match engine.read_slot(tx_key, *offset) {
@@ -2359,6 +2437,51 @@ fn write_replica_redo_entry(
 ) -> std::result::Result<(), String> {
     // Per-store redo: route the entry to the log owning the op's store. The
     // batch-level flush makes them durable. No-op when no log is attached.
+    //
+    // Task 14: a `SetMinedBatch` built from a wire `ReplicaOp::SetMinedBatch`
+    // groups txids by CLUSTER SHARD (the wire op's own grouping criterion),
+    // which is independent of this node's per-key LOCAL store assignment
+    // (`device_id`) — two same-shard txids can easily live in different
+    // local stores. `Engine::redo_store_for_op`'s `SetMinedBatch` routing
+    // resolves the store from just the batch's FIRST txid, an invariant the
+    // MASTER upholds by grouping its own redo per store before ever
+    // constructing a `SetMinedBatch` (`handle_set_mined_batch`'s
+    // `txids_by_store`). Mirror that grouping here before journaling, so
+    // each split group's txids genuinely share one store and routing cannot
+    // silently pin a cross-store txid's entry into the wrong store's log.
+    if let crate::redo::RedoOp::SetMinedBatch {
+        block_id,
+        block_height,
+        subtree_idx,
+        on_longest_chain,
+        current_block_height,
+        block_height_retention,
+        unset,
+        txids,
+    } = op
+        && txids.len() > 1
+    {
+        let mut by_store: std::collections::HashMap<u8, Vec<TxKey>> =
+            std::collections::HashMap::new();
+        for tx_key in txids {
+            let store = engine.lookup(tx_key).map(|e| e.device_id).unwrap_or(0);
+            by_store.entry(store).or_default().push(*tx_key);
+        }
+        for store_txids in by_store.into_values() {
+            let split_op = crate::redo::RedoOp::SetMinedBatch {
+                block_id: *block_id,
+                block_height: *block_height,
+                subtree_idx: *subtree_idx,
+                on_longest_chain: *on_longest_chain,
+                current_block_height: *current_block_height,
+                block_height_retention: *block_height_retention,
+                unset: *unset,
+                txids: store_txids,
+            };
+            engine.append_replica_redo_entry(&split_op)?;
+        }
+        return Ok(());
+    }
     engine.append_replica_redo_entry(op)
 }
 
@@ -3997,6 +4120,140 @@ mod tests {
 
         let meta = engine.read_metadata(&k).unwrap();
         assert_eq!(meta.block_entry_count, 1);
+    }
+
+    /// Task 14: applying a `ReplicaOp::SetMinedBatch` with N txids sets each
+    /// txid's mined-state on the replica, via the SAME dual-write
+    /// (device + MinedIndex) `Engine::set_mined_inner` performs on the
+    /// master.
+    #[test]
+    fn receiver_applies_set_mined_batch() {
+        let engine = make_engine();
+        let k1 = key(60);
+        let k2 = key(61);
+        let k3 = key(62);
+        create_record(&engine, k1, 2);
+        create_record(&engine, k2, 2);
+        create_record(&engine, k3, 2);
+
+        apply_op(
+            &engine,
+            &ReplicaOp::SetMinedBatch {
+                block_id: 77,
+                block_height: 810_000,
+                subtree_idx: 5,
+                on_longest_chain: true,
+                current_block_height: 810_010,
+                block_height_retention: 288,
+                unset: false,
+                txids: vec![k1, k2, k3],
+            },
+        )
+        .unwrap();
+
+        for k in [k1, k2, k3] {
+            // Device: the block entry landed in the record's metadata.
+            let meta = engine.read_metadata(&k).unwrap();
+            assert_eq!(meta.block_entry_count, 1, "device metadata for {k:?}");
+
+            // MinedIndex: the SAME block entry is mirrored into the
+            // authoritative secondary index (Task 9 dual-write).
+            let entry = engine.lookup(&k).expect("indexed");
+            let (blocks, unmined_since) = engine
+                .mined_index()
+                .read_block_entries(&k, entry.mined_slot)
+                .expect("MinedIndex entry must be present");
+            let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
+            assert_eq!(block_ids, vec![77], "MinedIndex block_ids for {k:?}");
+            assert_eq!(unmined_since, 0, "on_longest_chain clears unmined_since");
+        }
+
+        // Idempotent: re-applying the same batch must not duplicate entries.
+        apply_op(
+            &engine,
+            &ReplicaOp::SetMinedBatch {
+                block_id: 77,
+                block_height: 810_000,
+                subtree_idx: 5,
+                on_longest_chain: true,
+                current_block_height: 810_010,
+                block_height_retention: 288,
+                unset: false,
+                txids: vec![k1, k2, k3],
+            },
+        )
+        .unwrap();
+        for k in [k1, k2, k3] {
+            let meta = engine.read_metadata(&k).unwrap();
+            assert_eq!(
+                meta.block_entry_count, 1,
+                "re-apply must not duplicate the block entry for {k:?}"
+            );
+        }
+
+        // unset: true removes the block entry on every txid, device + index.
+        apply_op(
+            &engine,
+            &ReplicaOp::SetMinedBatch {
+                block_id: 77,
+                block_height: 0,
+                subtree_idx: 0,
+                on_longest_chain: false,
+                current_block_height: 810_020,
+                block_height_retention: 288,
+                unset: true,
+                txids: vec![k1, k2, k3],
+            },
+        )
+        .unwrap();
+        for k in [k1, k2, k3] {
+            let meta = engine.read_metadata(&k).unwrap();
+            assert_eq!(meta.block_entry_count, 0, "unset for {k:?}");
+            let entry = engine.lookup(&k).expect("indexed");
+            let (blocks, _) = engine
+                .mined_index()
+                .read_block_entries(&k, entry.mined_slot)
+                .expect("MinedIndex entry must still be present after unset");
+            assert!(
+                blocks.is_empty(),
+                "MinedIndex block entry cleared for {k:?}"
+            );
+        }
+    }
+
+    /// Task 14: a txid genuinely missing on the replica (the master applied
+    /// it but this replica never received the Create) must be a graceful
+    /// skip — NOT a hard error that aborts the rest of the batch. Mirrors
+    /// the per-tx `ReplicaOp::SetMined`'s `TxNotFound` tolerance.
+    #[test]
+    fn receiver_applies_set_mined_batch_skips_missing_txid() {
+        let engine = make_engine();
+        let present = key(63);
+        let missing = key(64);
+        create_record(&engine, present, 2);
+        // `missing` is deliberately never created.
+
+        apply_op(
+            &engine,
+            &ReplicaOp::SetMinedBatch {
+                block_id: 88,
+                block_height: 820_000,
+                subtree_idx: 1,
+                on_longest_chain: true,
+                current_block_height: 820_010,
+                block_height_retention: 288,
+                unset: false,
+                txids: vec![missing, present],
+            },
+        )
+        .expect("a missing txid must not fail the whole batch");
+
+        let meta = engine.read_metadata(&present).unwrap();
+        assert_eq!(
+            meta.block_entry_count, 1,
+            "the present txid must still apply"
+        );
+        assert!(engine.lookup(&missing).is_none());
     }
 
     // ------------------------------------------------------------------

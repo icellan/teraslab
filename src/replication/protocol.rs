@@ -99,6 +99,10 @@ const OP_DELETE: u8 = 12;
 const OP_PRUNE_SLOT: u8 = 13;
 const OP_MARK_LONGEST_CHAIN: u8 = 14;
 const OP_PRUNE_SLOT_IF_SPENT_BY: u8 = 15;
+/// D5/§9 (Task 14): batch-native setMined replication op — one wire op per
+/// setMined RPC per target instead of one [`OP_SET_MINED`]/[`OP_UNSET_MINED`]
+/// per txid. Mirrors [`crate::redo::RedoOp::SetMinedBatch`]'s wire shape.
+const OP_SET_MINED_BATCH: u8 = 18;
 /// Deletion-tombstone §6: a delete that carries the tombstone fields so the
 /// replica records the tombstone alongside the record removal. The legacy
 /// [`OP_DELETE`] (tag 12) stays decodable for back-compat (an old peer or an
@@ -156,6 +160,34 @@ pub enum ReplicaOp {
         current_block_height: u32,
         block_height_retention: u32,
         master_generation: u32,
+    },
+    /// D5/§9 (Task 14): batch-native setMined replication — one op per
+    /// setMined RPC per replication target instead of one [`Self::SetMined`]/
+    /// [`Self::UnsetMined`] per txid. All txids share every field but
+    /// themselves (mirrors [`crate::redo::RedoOp::SetMinedBatch`]).
+    ///
+    /// Carries no `master_generation`: `Engine::set_mined_inner` is
+    /// idempotent by `block_id` (adding/removing the same block entry twice
+    /// is a no-op on the second application — see `set_mined_idempotent`),
+    /// so unlike `Spend`/`Unspend`/`MarkLongestChain` there is no
+    /// wrapping-generation staleness check to gate, and no per-key
+    /// generation to sync after apply. `master_generation()` therefore
+    /// returns `None` for this variant, matching `Delete`/`PruneSlot`/
+    /// `RemoveConflictingChild`.
+    SetMinedBatch {
+        block_id: u32,
+        block_height: u32,
+        subtree_idx: u32,
+        on_longest_chain: bool,
+        current_block_height: u32,
+        block_height_retention: u32,
+        /// If true, remove the block entry instead of adding it.
+        unset: bool,
+        /// The batch's txids. Every consumer that needs ALL of them (routing,
+        /// intent key-tracking, dedup) must match this variant directly —
+        /// [`Self::tx_key`] fail-closes to `None` for anything but a batch of
+        /// exactly one, mirroring `RedoOp::SetMinedBatch::tx_key()`.
+        txids: Vec<TxKey>,
     },
     Freeze {
         tx_key: TxKey,
@@ -251,8 +283,16 @@ pub enum ReplicaOp {
 }
 
 impl ReplicaOp {
-    /// Extract the transaction key from any op variant.
-    pub fn tx_key(&self) -> TxKey {
+    /// Extract the transaction key from any op variant, if it has exactly one.
+    ///
+    /// Returns `None` for [`Self::SetMinedBatch`] whenever it carries 0 or 2+
+    /// txids — mirroring [`crate::redo::RedoOp::tx_key`]'s fail-closed
+    /// pattern for `SetMinedBatch`. A caller that needs EVERY txid a batch
+    /// carries (routing, replication-intent key tracking, dedup) MUST match
+    /// `Self::SetMinedBatch` directly instead of relying on this accessor —
+    /// see `cluster::coordinator::redo_entry_to_replica_ops` and
+    /// `server::dispatch`'s replication-intent recovery loop.
+    pub fn tx_key(&self) -> Option<TxKey> {
         match self {
             Self::Spend { tx_key, .. }
             | Self::Unspend { tx_key, .. }
@@ -269,7 +309,11 @@ impl ReplicaOp {
             | Self::Delete { tx_key, .. }
             | Self::PruneSlot { tx_key, .. }
             | Self::PruneSlotIfSpentBy { tx_key, .. }
-            | Self::MarkLongestChain { tx_key, .. } => *tx_key,
+            | Self::MarkLongestChain { tx_key, .. } => Some(*tx_key),
+            Self::SetMinedBatch { txids, .. } => match txids.as_slice() {
+                [tx_key] => Some(*tx_key),
+                _ => None,
+            },
         }
     }
 
@@ -319,7 +363,11 @@ impl ReplicaOp {
             | Self::PruneSlotIfSpentBy { .. }
             // RemoveConflictingChild is an idempotent (parent, child) remove,
             // like Delete — no master-generation ordering token.
-            | Self::RemoveConflictingChild { .. } => None,
+            | Self::RemoveConflictingChild { .. }
+            // SetMinedBatch carries no master_generation — see the variant's
+            // doc comment: `set_mined_inner` is idempotent by block_id, so
+            // there is no staleness check to gate or generation to sync.
+            | Self::SetMinedBatch { .. } => None,
         }
     }
 }
@@ -405,6 +453,29 @@ impl ReplicaOp {
                 buf.extend_from_slice(&current_block_height.to_le_bytes());
                 buf.extend_from_slice(&block_height_retention.to_le_bytes());
                 buf.extend_from_slice(&master_generation.to_le_bytes());
+            }
+            ReplicaOp::SetMinedBatch {
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain,
+                current_block_height,
+                block_height_retention,
+                unset,
+                txids,
+            } => {
+                buf.push(OP_SET_MINED_BATCH);
+                buf.extend_from_slice(&block_id.to_le_bytes());
+                buf.extend_from_slice(&block_height.to_le_bytes());
+                buf.extend_from_slice(&subtree_idx.to_le_bytes());
+                buf.push(u8::from(*on_longest_chain));
+                buf.extend_from_slice(&current_block_height.to_le_bytes());
+                buf.extend_from_slice(&block_height_retention.to_le_bytes());
+                buf.push(u8::from(*unset));
+                buf.extend_from_slice(&(txids.len() as u32).to_le_bytes());
+                for tx_key in txids {
+                    buf.extend_from_slice(&tx_key.txid);
+                }
             }
             ReplicaOp::Freeze {
                 tx_key,
@@ -615,6 +686,46 @@ impl ReplicaOp {
                         master_generation: r_u32(rest, 44),
                     },
                     49,
+                ))
+            }
+            OP_SET_MINED_BATCH => {
+                need(rest, 26)?; // 4+4+4+1+4+4+1+4(count)
+                let block_id = r_u32(rest, 0);
+                let block_height = r_u32(rest, 4);
+                let subtree_idx = r_u32(rest, 8);
+                let on_longest_chain = rest[12] != 0;
+                let current_block_height = r_u32(rest, 13);
+                let block_height_retention = r_u32(rest, 17);
+                let unset = rest[21] != 0;
+                let count = r_u32(rest, 22) as usize;
+                let mut pos = 26;
+                // SECURITY: mirror the Create decoder's checked_mul so a
+                // corrupt/hostile `count` field cannot overflow `usize` and
+                // underflow the bounds check below (F-G4-006-style guard).
+                let txids_bytes = count.checked_mul(32).ok_or(ProtocolError::BufferTooShort {
+                    need: usize::MAX,
+                    have: rest.len(),
+                })?;
+                need(rest, pos + txids_bytes)?;
+                let mut txids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let mut txid = [0u8; 32];
+                    txid.copy_from_slice(&rest[pos..pos + 32]);
+                    txids.push(TxKey { txid });
+                    pos += 32;
+                }
+                Ok((
+                    ReplicaOp::SetMinedBatch {
+                        block_id,
+                        block_height,
+                        subtree_idx,
+                        on_longest_chain,
+                        current_block_height,
+                        block_height_retention,
+                        unset,
+                        txids,
+                    },
+                    1 + pos,
                 ))
             }
             OP_FREEZE => {
@@ -1173,6 +1284,16 @@ mod tests {
                 block_height_retention: 288,
                 master_generation: 0,
             },
+            ReplicaOp::SetMinedBatch {
+                block_id: 100,
+                block_height: 800000,
+                subtree_idx: 7,
+                on_longest_chain: true,
+                current_block_height: 800010,
+                block_height_retention: 288,
+                unset: false,
+                txids: vec![key(20), key(21), key(22)],
+            },
             ReplicaOp::Freeze {
                 tx_key: key(5),
                 offset: 3,
@@ -1383,9 +1504,105 @@ mod tests {
         assert_eq!(consumed2, 46);
 
         // Sanity: tx_key + master_generation are exposed via accessors.
-        assert_eq!(decoded.tx_key(), key(0xAA));
+        assert_eq!(decoded.tx_key(), Some(key(0xAA)));
         assert_eq!(decoded.master_generation(), Some(42));
         assert_eq!(decoded2.master_generation(), Some(u32::MAX));
+    }
+
+    /// Task 14: `ReplicaOp::SetMinedBatch` round-trips for both the 0-txid
+    /// (empty) and N-txid shapes, and a truncated frame fails closed rather
+    /// than mis-decoding or panicking.
+    #[test]
+    fn set_mined_batch_replica_op_wire_roundtrip() {
+        let empty = ReplicaOp::SetMinedBatch {
+            block_id: 5,
+            block_height: 900_000,
+            subtree_idx: 1,
+            on_longest_chain: true,
+            current_block_height: 900_010,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![],
+        };
+        let bytes = empty.serialize();
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, empty);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.tx_key(), None, "0-txid batch has no single key");
+        assert_eq!(decoded.master_generation(), None);
+
+        let many = ReplicaOp::SetMinedBatch {
+            block_id: 6,
+            block_height: 900_100,
+            subtree_idx: 2,
+            on_longest_chain: false,
+            current_block_height: 900_110,
+            block_height_retention: 144,
+            unset: true,
+            txids: vec![key(1), key(2), key(3), key(4)],
+        };
+        let bytes = many.serialize();
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, many);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.tx_key(), None, "4-txid batch has no single key");
+
+        // Batch-of-one DOES expose a single representative key, mirroring
+        // `RedoOp::SetMinedBatch::tx_key()`.
+        let one = ReplicaOp::SetMinedBatch {
+            block_id: 7,
+            block_height: 900_200,
+            subtree_idx: 3,
+            on_longest_chain: true,
+            current_block_height: 900_210,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![key(9)],
+        };
+        let bytes = one.serialize();
+        let (decoded, consumed) = ReplicaOp::deserialize(&bytes).unwrap();
+        assert_eq!(decoded, one);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.tx_key(), Some(key(9)));
+
+        // Fail-closed on truncation: drop the last txid's worth of bytes
+        // from the 4-txid frame — the decoder must error, never silently
+        // decode 3 txids from a 4-txid count.
+        let many_bytes = ReplicaOp::SetMinedBatch {
+            block_id: 6,
+            block_height: 900_100,
+            subtree_idx: 2,
+            on_longest_chain: false,
+            current_block_height: 900_110,
+            block_height_retention: 144,
+            unset: true,
+            txids: vec![key(1), key(2), key(3), key(4)],
+        }
+        .serialize();
+        let truncated = &many_bytes[..many_bytes.len() - 16];
+        let err = ReplicaOp::deserialize(truncated).expect_err("truncated batch must not decode");
+        match err {
+            ProtocolError::BufferTooShort { .. } => {}
+            other => panic!("expected BufferTooShort, got {other:?}"),
+        }
+
+        // A hostile huge count with no backing bytes must also fail closed
+        // rather than attempting a huge allocation (mirrors the Create
+        // decoder's checked_mul guard and the ReplicaBatch huge-count test).
+        let mut hostile = vec![OP_SET_MINED_BATCH];
+        hostile.extend_from_slice(&5u32.to_le_bytes()); // block_id
+        hostile.extend_from_slice(&900_000u32.to_le_bytes()); // block_height
+        hostile.extend_from_slice(&1u32.to_le_bytes()); // subtree_idx
+        hostile.push(1); // on_longest_chain
+        hostile.extend_from_slice(&900_010u32.to_le_bytes()); // current_block_height
+        hostile.extend_from_slice(&288u32.to_le_bytes()); // block_height_retention
+        hostile.push(0); // unset
+        hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // count
+        let err = ReplicaOp::deserialize(&hostile).expect_err("huge count must not decode");
+        match err {
+            ProtocolError::BufferTooShort { .. } => {}
+            other => panic!("expected BufferTooShort, got {other:?}"),
+        }
     }
 
     /// Future-proofing guard: an unknown opcode (e.g. a value the

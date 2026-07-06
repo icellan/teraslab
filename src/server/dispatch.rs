@@ -2479,12 +2479,156 @@ pub(crate) fn build_replication_targets(
     // sides; we only want addrs that are exclusively dual-write.
     dual_write_addrs.retain(|a| !regular_addrs.contains(a));
 
+    // Task 14: `handle_set_mined_batch` feeds this function one batch-of-one
+    // `ReplicaOp::SetMinedBatch` PER OWNED KEY (so the per-key shard routing
+    // above is untouched and unchanged from every other op type). The loop
+    // above then `.extend()`s each key's op onto every target address that
+    // owns its shard, same as always — for a multi-txid setMined RPC this
+    // means a target address ends up with N single-txid `SetMinedBatch`
+    // entries, one per key it owns. Coalesce those into ONE wire op per
+    // target here, cutting the wire op count from O(keys) to O(1) per
+    // target without touching the per-key routing/quorum logic at all.
+    for ops in by_addr.values_mut() {
+        let taken = std::mem::take(ops);
+        *ops = coalesce_set_mined_batches(taken);
+    }
+
     Ok(ReplicationPlan {
         by_addr,
         dual_write_only: dual_write_addrs,
         key_targets,
         addr_nodes,
     })
+}
+
+/// Coalesce every `ReplicaOp::SetMinedBatch` op in `ops` into a single wire
+/// op, unioning their `txids` — see the call site in
+/// [`build_replication_targets`].
+///
+/// A single `handle_set_mined_batch` RPC shares every setMined field
+/// (`block_id`, `block_height`, `subtree_idx`, `on_longest_chain`,
+/// `current_block_height`, `block_height_retention`, `unset`) across all its
+/// items — only the txid varies per key — so every `SetMinedBatch` destined
+/// for the SAME target address within one fan-out is guaranteed to agree on
+/// every field but `txids`. Defensively verifies that agreement instead of
+/// assuming it: returns `ops` UNCHANGED (no merge) if any non-`SetMinedBatch`
+/// op is present, or if two `SetMinedBatch` ops disagree on a shared field —
+/// so a future caller that somehow mixes incompatible setMined ops into one
+/// fan-out never has fields silently dropped.
+fn coalesce_set_mined_batches(ops: Vec<ReplicaOp>) -> Vec<ReplicaOp> {
+    if ops.len() <= 1 {
+        return ops;
+    }
+
+    #[derive(PartialEq)]
+    struct SharedFields {
+        block_id: u32,
+        block_height: u32,
+        subtree_idx: u32,
+        on_longest_chain: bool,
+        current_block_height: u32,
+        block_height_retention: u32,
+        unset: bool,
+    }
+
+    let mut shared: Option<SharedFields> = None;
+    for op in &ops {
+        let ReplicaOp::SetMinedBatch {
+            block_id,
+            block_height,
+            subtree_idx,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
+            unset,
+            ..
+        } = op
+        else {
+            return ops;
+        };
+        let fields = SharedFields {
+            block_id: *block_id,
+            block_height: *block_height,
+            subtree_idx: *subtree_idx,
+            on_longest_chain: *on_longest_chain,
+            current_block_height: *current_block_height,
+            block_height_retention: *block_height_retention,
+            unset: *unset,
+        };
+        match &shared {
+            None => shared = Some(fields),
+            Some(s) if *s == fields => {}
+            Some(_) => return ops,
+        }
+    }
+    let Some(fields) = shared else {
+        return ops;
+    };
+
+    let mut txids = Vec::new();
+    for op in ops {
+        if let ReplicaOp::SetMinedBatch { txids: mut t, .. } = op {
+            txids.append(&mut t);
+        }
+    }
+    vec![ReplicaOp::SetMinedBatch {
+        block_id: fields.block_id,
+        block_height: fields.block_height,
+        subtree_idx: fields.subtree_idx,
+        on_longest_chain: fields.on_longest_chain,
+        current_block_height: fields.current_block_height,
+        block_height_retention: fields.block_height_retention,
+        unset: fields.unset,
+        txids,
+    }]
+}
+
+/// Filter a `ReplicaOp::SetMinedBatch`'s txids down to the ones present in
+/// `owned_keys`, returning `None` if none remain. Used by the replication-
+/// intent recovery loop: `redo_entry_to_replica_ops` returns a `SetMinedBatch`
+/// covering every txid of a given shard that its (possibly-foreign) redo
+/// entry carries, so before re-shipping it from a specific pending intent we
+/// must drop any sibling txid that intent's own RPC does not own — never
+/// re-ship a foreign txid under this intent's key set. Any other op variant
+/// passes through unchanged (this call site only ever receives
+/// `SetMinedBatch`, since it is reached only from the `RedoOp::SetMinedBatch`
+/// branch above; kept total for safety).
+fn filter_set_mined_batch_to_owned(
+    op: ReplicaOp,
+    owned_keys: &std::collections::HashSet<[u8; 32]>,
+) -> Option<ReplicaOp> {
+    match op {
+        ReplicaOp::SetMinedBatch {
+            block_id,
+            block_height,
+            subtree_idx,
+            on_longest_chain,
+            current_block_height,
+            block_height_retention,
+            unset,
+            txids,
+        } => {
+            let filtered: Vec<TxKey> = txids
+                .into_iter()
+                .filter(|k| owned_keys.contains(&k.txid))
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(ReplicaOp::SetMinedBatch {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    on_longest_chain,
+                    current_block_height,
+                    block_height_retention,
+                    unset,
+                    txids: filtered,
+                })
+            }
+        }
+        other => Some(other),
+    }
 }
 
 fn replicate_all_ops(
@@ -2954,21 +3098,27 @@ where
                         // from an earlier iteration of this same batch.
                         continue;
                     }
+                    // Task 14: `redo_entry_to_replica_ops` now returns ONE
+                    // coalesced `ReplicaOp::SetMinedBatch` per shard (not one
+                    // `ReplicaOp` per txid), so there is no single
+                    // `op.tx_key()` to filter against `owned_keys` — filter
+                    // the returned op's OWN txids instead, dropping any
+                    // sibling txid of the same shard that this RPC does not
+                    // own (never re-ship it from this intent), and use the
+                    // outer loop's `tx_key` (already proven owned and
+                    // shard-matching) as the row's routing key.
                     for op in
                         crate::cluster::coordinator::redo_entry_to_replica_ops(entry, shard, engine)
                     {
-                        let op_key = op.tx_key();
-                        if !owned_keys.contains(&op_key.txid) {
-                            // A sibling txid sharing this shard that this RPC
-                            // does not own — never re-ship it.
+                        let Some(op) = filter_set_mined_batch_to_owned(op, &owned_keys) else {
                             continue;
-                        }
+                        };
                         debug_assert!(
                             entry.sequence >= range.first_sequence
                                 && entry.sequence <= range.last_sequence,
                             "recovery must only ship ops whose redo entry falls in the intent window",
                         );
-                        ops_by_key.push((op_key, vec![op]));
+                        ops_by_key.push((*tx_key, vec![op]));
                     }
                 }
                 continue;
@@ -2988,7 +3138,7 @@ where
             {
                 debug_assert_eq!(
                     op.tx_key(),
-                    tx_key,
+                    Some(tx_key),
                     "reconstructed replica op key must match its redo entry key",
                 );
                 debug_assert!(
@@ -3546,6 +3696,93 @@ fn compensate_replication_failure(
                             block_height: bh,
                             subtree_idx: sti,
                         });
+                    }
+                }
+                ReplicaOp::SetMinedBatch {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    current_block_height,
+                    block_height_retention,
+                    unset,
+                    txids,
+                    ..
+                } => {
+                    // Task 14: `handle_set_mined_batch` feeds `repl_ops_by_key`
+                    // one batch-of-one `SetMinedBatch` per owned key (the same
+                    // shape the retired per-tx `SetMined`/`UnsetMined` arms
+                    // above handled), so `key` (this row's `TxKey`) is the
+                    // op's one and only txid in practice. Iterate `txids`
+                    // rather than assuming exactly one, reusing this row's
+                    // single captured before-image for each — correct as long
+                    // as this arm is only ever fed a batch-of-one, which is
+                    // the only shape any current producer emits.
+                    for tx_key in txids {
+                        if *unset {
+                            // Mirrors the retired `ReplicaOp::UnsetMined` arm:
+                            // reverse unset -> re-set the block entry using
+                            // the captured pre-apply (block_height, subtree_idx).
+                            let (bh, sti) = match lookup_before(i, j) {
+                                BeforeImage::UnsetMined {
+                                    block_height,
+                                    subtree_idx,
+                                } => (block_height, subtree_idx),
+                                _ => (0u32, 0u32),
+                            };
+                            let req = crate::ops::set_mined::SetMinedRequest {
+                                tx_key: *tx_key,
+                                block_id: *block_id,
+                                block_height: bh,
+                                subtree_idx: sti,
+                                on_longest_chain: true,
+                                unset_mined: false,
+                                current_block_height: *current_block_height,
+                                block_height_retention: *block_height_retention,
+                            };
+                            let _ = engine.set_mined(&req);
+                            comp_redo.push(RedoOp::SetMinedBatch {
+                                block_id: *block_id,
+                                block_height: bh,
+                                subtree_idx: sti,
+                                on_longest_chain: true,
+                                current_block_height: *current_block_height,
+                                block_height_retention: *block_height_retention,
+                                unset: false,
+                                txids: vec![*tx_key],
+                            });
+                            if matches!(lookup_before(i, j), BeforeImage::UnsetMined { .. }) {
+                                comp_redo.push(RedoOp::CompensateUnsetMined {
+                                    tx_key: *tx_key,
+                                    block_id: *block_id,
+                                    block_height: bh,
+                                    subtree_idx: sti,
+                                });
+                            }
+                        } else {
+                            // Mirrors the retired `ReplicaOp::SetMined` arm:
+                            // reverse set -> unset the block entry.
+                            let req = crate::ops::set_mined::SetMinedRequest {
+                                tx_key: *tx_key,
+                                block_id: *block_id,
+                                block_height: *block_height,
+                                subtree_idx: *subtree_idx,
+                                on_longest_chain: false,
+                                unset_mined: true,
+                                current_block_height: *current_block_height,
+                                block_height_retention: *block_height_retention,
+                            };
+                            let _ = engine.set_mined(&req);
+                            comp_redo.push(RedoOp::SetMinedBatch {
+                                block_id: *block_id,
+                                block_height: *block_height,
+                                subtree_idx: *subtree_idx,
+                                on_longest_chain: false,
+                                current_block_height: *current_block_height,
+                                block_height_retention: *block_height_retention,
+                                unset: true,
+                                txids: vec![*tx_key],
+                            });
+                        }
                     }
                 }
                 ReplicaOp::Reassign {
@@ -5743,21 +5980,32 @@ fn handle_set_mined_batch(
         match result {
             Ok(resp) => {
                 succeeded += 1;
-                let mgen = resp.generation;
                 successes.push(BatchItemSuccess {
                     item_index: v.idx as u32,
                     signal: resp.signal.to_wire(),
                     block_ids: resp.block_ids.clone(),
                 });
+                // Task 14: ship one batch-of-one `ReplicaOp::SetMinedBatch`
+                // per owned key instead of the retired per-tx
+                // `ReplicaOp::SetMined`/`UnsetMined` — `build_replication_targets`
+                // coalesces every key routed to the SAME target address into
+                // ONE wire op carrying all of that target's owned txids
+                // (see its `coalesce_set_mined_batches` step), cutting a
+                // multi-txid batch from N wire ops per target down to 1.
+                // Carries no `master_generation` (see the variant's doc
+                // comment on `protocol.rs`) — `resp.generation` is unused here.
                 if params.unset_mined {
                     repl_ops_by_key.push((
                         v.key,
-                        vec![ReplicaOp::UnsetMined {
-                            tx_key: v.key,
+                        vec![ReplicaOp::SetMinedBatch {
                             block_id: params.block_id,
+                            block_height: params.block_height,
+                            subtree_idx: params.subtree_idx,
+                            on_longest_chain: params.on_longest_chain,
                             current_block_height: params.current_block_height,
                             block_height_retention: params.block_height_retention,
-                            master_generation: mgen,
+                            unset: true,
+                            txids: vec![v.key],
                         }],
                     ));
                     before_images_by_key.push((
@@ -5772,15 +6020,15 @@ fn handle_set_mined_batch(
                 } else {
                     repl_ops_by_key.push((
                         v.key,
-                        vec![ReplicaOp::SetMined {
-                            tx_key: v.key,
+                        vec![ReplicaOp::SetMinedBatch {
                             block_id: params.block_id,
                             block_height: params.block_height,
                             subtree_idx: params.subtree_idx,
                             on_longest_chain: params.on_longest_chain,
                             current_block_height: params.current_block_height,
                             block_height_retention: params.block_height_retention,
-                            master_generation: mgen,
+                            unset: false,
+                            txids: vec![v.key],
                         }],
                     ));
                     before_images_by_key.push((v.key, vec![BeforeImage::None]));
@@ -17186,11 +17434,15 @@ mod tests {
     }
 
     /// End-to-end: a durable replication intent recorded for a live 3-txid
-    /// `SetMinedBatch` RPC must, on crash recovery, replay all 3 txids as
-    /// `ReplicaOp::SetMined` — none dropped. This is the exact scenario the
-    /// CRITICAL finding covers: the lag-monitor / startup catch-up path
-    /// reconstructs `ReplicaOp`s from redo via the same conversion this
-    /// recovery path uses, and pre-fix a multi-txid batch vanished entirely.
+    /// `SetMinedBatch` RPC must, on crash recovery, replay all 3 txids —
+    /// none dropped. This is the exact scenario the CRITICAL finding covers:
+    /// the lag-monitor / startup catch-up path reconstructs `ReplicaOp`s
+    /// from redo via the same conversion this recovery path uses, and
+    /// pre-fix a multi-txid batch vanished entirely.
+    ///
+    /// Task 14: since all 3 txids share a shard, recovery now reconstructs
+    /// ONE coalesced `ReplicaOp::SetMinedBatch` (not 3 `ReplicaOp::SetMined`)
+    /// carrying every txid.
     #[test]
     fn pending_replication_recovery_replays_multi_txid_set_mined_batch() {
         let h = DispatchTestHarness::new();
@@ -17245,28 +17497,32 @@ mod tests {
             tracker.pending().is_empty(),
             "the intent must be committed once every owned txid is replayed"
         );
-        let observed_keys: Vec<TxKey> = observed_ops.iter().map(|(k, _)| *k).collect();
+        // Task 14: same-shard txids coalesce into ONE row/op, so there is
+        // exactly one `(TxKey, Vec<ReplicaOp>)` entry, not one per txid.
         assert_eq!(
-            observed_keys.len(),
-            3,
-            "recovery must replay every txid in the batch, got {observed_keys:?}"
+            observed_ops.len(),
+            1,
+            "same-shard txids must coalesce into a single row, got {observed_ops:?}"
         );
-        for expected in [k1, k2, k3] {
-            assert!(
-                observed_keys.contains(&expected),
-                "missing txid {expected:?} from replayed ops: {observed_keys:?}"
-            );
-        }
-        for (key, key_ops) in &observed_ops {
-            assert_eq!(key_ops.len(), 1);
-            match &key_ops[0] {
-                ReplicaOp::SetMined {
-                    tx_key,
-                    block_id: 9,
-                    ..
-                } => assert_eq!(tx_key, key),
-                other => panic!("expected ReplicaOp::SetMined for {key:?}, got {other:?}"),
+        let (_, key_ops) = &observed_ops[0];
+        assert_eq!(key_ops.len(), 1);
+        match &key_ops[0] {
+            ReplicaOp::SetMinedBatch {
+                block_id: 9, txids, ..
+            } => {
+                assert_eq!(
+                    txids.len(),
+                    3,
+                    "recovery must replay every txid in the batch, got {txids:?}"
+                );
+                for expected in [k1, k2, k3] {
+                    assert!(
+                        txids.contains(&expected),
+                        "missing txid {expected:?} from replayed op: {txids:?}"
+                    );
+                }
             }
+            other => panic!("expected ReplicaOp::SetMinedBatch, got {other:?}"),
         }
     }
 
@@ -18127,6 +18383,66 @@ mod tests {
         addr
     }
 
+    /// Like [`spawn_replica_receiver`] but ACKs every real batch and pushes
+    /// its ops (in wire order) onto `captured` — lets a test inspect exactly
+    /// what shipped over the wire, e.g. to verify a multi-key `SetMinedBatch`
+    /// coalesced into ONE op per target instead of one per key (Task 14).
+    fn spawn_capturing_replica_receiver(
+        captured: std::sync::Arc<Mutex<Vec<crate::replication::protocol::ReplicaOp>>>,
+    ) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let captured = captured.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        if stream.read_exact(&mut len_buf).is_err() {
+                            return;
+                        }
+                        let total = u32::from_le_bytes(len_buf) as usize;
+                        let mut body = vec![0u8; total];
+                        if stream.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let mut full = Vec::with_capacity(4 + total);
+                        full.extend_from_slice(&len_buf);
+                        full.extend_from_slice(&body);
+                        let (req, _) = match crate::protocol::frame::RequestFrame::decode(&full) {
+                            Ok(r) => r,
+                            Err(_) => return,
+                        };
+                        let batch = match ReplicaBatch::deserialize(&req.payload) {
+                            Ok(b) => b,
+                            Err(_) => return,
+                        };
+                        let through_sequence = if batch.ops.is_empty() {
+                            0
+                        } else {
+                            captured.lock().extend(batch.ops.iter().cloned());
+                            batch.last_sequence()
+                        };
+                        let resp = ResponseFrame {
+                            request_id: req.request_id,
+                            status: STATUS_OK,
+                            payload: ReplicaAck::Ok { through_sequence }.serialize(),
+                        };
+                        if stream.write_all(&resp.encode()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
     /// Build a 2-node RF=2 cluster mastered by node 1 with node 2 as the
     /// (sole) replica, its address pointed at `replica_addr`. Returns the
     /// cluster and a key the node masters. A fresh receiver address per call
@@ -18200,6 +18516,67 @@ mod tests {
         let outcome = replicate_all_ops(Some(&cluster), &ops, (10, 10), &[])
             .expect("key reached its own replica — batch must succeed");
         assert_eq!(outcome, ReplicationOutcome::Full);
+    }
+
+    /// Task 14 live/master→replica coverage: 3 txids owned by the SAME
+    /// shard (the shape `handle_set_mined_batch` feeds `replicate_all_ops`
+    /// via `repl_ops_by_key` — one batch-of-one `SetMinedBatch` per key)
+    /// must ship over the wire as ONE coalesced `ReplicaOp::SetMinedBatch`
+    /// to their shared replica target, not 3 separate ops.
+    #[test]
+    fn set_mined_batch_replication_ships_one_wire_op_per_target() {
+        use crate::replication::protocol::ReplicaOp;
+
+        let captured: std::sync::Arc<Mutex<Vec<ReplicaOp>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let replica_addr = spawn_capturing_replica_receiver(captured.clone());
+        let (cluster, key1) = two_node_rf2(replica_addr, Some(AckPolicy::WriteMajority));
+        let shard = crate::cluster::shards::ShardTable::shard_for_key(&key1);
+        let key2 = TxKey {
+            txid: txid_for_shard(shard, 72),
+        };
+        let key3 = TxKey {
+            txid: txid_for_shard(shard, 73),
+        };
+
+        let batch_of_one = |tx_key: TxKey| ReplicaOp::SetMinedBatch {
+            block_id: 42,
+            block_height: 800_000,
+            subtree_idx: 3,
+            on_longest_chain: true,
+            current_block_height: 800_010,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![tx_key],
+        };
+        let ops = vec![
+            (key1, vec![batch_of_one(key1)]),
+            (key2, vec![batch_of_one(key2)]),
+            (key3, vec![batch_of_one(key3)]),
+        ];
+
+        let outcome = replicate_all_ops(Some(&cluster), &ops, (10, 12), &[])
+            .expect("replication to a single ACKing target must succeed");
+        assert_eq!(outcome, ReplicationOutcome::Full);
+
+        let received = captured.lock();
+        assert_eq!(
+            received.len(),
+            1,
+            "3 same-shard keys must coalesce into ONE wire op, got {received:?}"
+        );
+        match &received[0] {
+            ReplicaOp::SetMinedBatch {
+                block_id, txids, ..
+            } => {
+                assert_eq!(*block_id, 42);
+                assert_eq!(txids.len(), 3, "must carry all 3 txids, got {txids:?}");
+                for k in [key1, key2, key3] {
+                    assert!(txids.contains(&k), "missing {k:?} from coalesced batch");
+                }
+            }
+            other => panic!("expected ReplicaOp::SetMinedBatch, got {other:?}"),
+        }
     }
 
     /// sc09 rejoin — intent recovery for a shard THIS node holds as a replica
