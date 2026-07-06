@@ -591,8 +591,8 @@ fn full_lifecycle_single_tx() {
             unset_mined: false,
         })
         .unwrap();
-    let meta = engine.read_metadata(&key).unwrap();
-    assert_eq!(meta.block_entry_count, 1);
+    let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+    assert_eq!(entries.len(), 1);
 
     // Delete
     engine
@@ -678,7 +678,7 @@ fn engine_lifecycle_for_backend(mode: IndexBackendMode) {
         })
         .unwrap();
     assert_eq!(
-        engine.read_metadata(&key).unwrap().block_entry_count,
+        engine.mined_block_entries(&key).unwrap().0.len(),
         1,
         "set_mined records a block entry on {mode:?}"
     );
@@ -792,9 +792,9 @@ fn simulate_block_reorg() {
         })
         .unwrap();
 
-    let meta = engine.read_metadata(&key).unwrap();
-    assert_eq!(meta.block_entry_count, 1);
-    assert_eq!({ meta.unmined_since }, 0); // On chain
+    let (entries, unmined) = engine.mined_block_entries(&key).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(unmined, 0); // On chain
 
     // Reorg: unmine block 100
     engine
@@ -810,9 +810,9 @@ fn simulate_block_reorg() {
         })
         .unwrap();
 
-    let meta = engine.read_metadata(&key).unwrap();
-    assert_eq!(meta.block_entry_count, 0);
-    assert_eq!({ meta.unmined_since }, 1001); // Off chain
+    let (entries, unmined) = engine.mined_block_entries(&key).unwrap();
+    assert_eq!(entries.len(), 0);
+    assert_eq!(unmined, 1001); // Off chain
 
     // Mark off longest chain
     engine
@@ -948,7 +948,10 @@ fn conflicting_lifecycle() {
         .unwrap();
 }
 
-/// Locked → spend blocked → setMined clears lock → spend succeeds.
+/// Locked → spend blocked → setMined mines it → effective lock clears
+/// (device LOCKED stays an immutable create-time marker post-16c/16d;
+/// spend's `device.LOCKED && !ignore_locked && MinedIndex.not-mined` check
+/// is what actually unlocks it) → spend succeeds.
 #[test]
 fn locked_cleared_by_set_mined() {
     let engine = create_engine();
@@ -963,7 +966,9 @@ fn locked_cleared_by_set_mined() {
     let meta = engine.read_metadata(&key).unwrap();
     assert!(meta.flags.contains(TxFlags::LOCKED));
 
-    // Mine → clears lock
+    // Mine → the record is no longer effectively locked, even though the
+    // device LOCKED bit itself is untouched (setMined performs zero device
+    // writes, Task 16d).
     engine
         .set_mined(&SetMinedRequest {
             tx_key: key,
@@ -977,9 +982,12 @@ fn locked_cleared_by_set_mined() {
         })
         .unwrap();
     let meta = engine.read_metadata(&key).unwrap();
-    assert!(!meta.flags.contains(TxFlags::LOCKED));
+    assert!(
+        meta.flags.contains(TxFlags::LOCKED),
+        "device LOCKED is an immutable create-time marker post-16d"
+    );
 
-    // Can spend now
+    // Can spend now (effective unlock via MinedIndex.not-mined)
     let mut sd = [0u8; 36];
     sd[0] = 0xBB;
     engine
@@ -1166,7 +1174,8 @@ fn concurrent_mixed_workload() {
     for &(key, _) in &keys {
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
-        assert_eq!(meta.block_entry_count, 1);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }
 

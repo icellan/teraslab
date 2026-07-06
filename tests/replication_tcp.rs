@@ -564,11 +564,12 @@ fn tcp_replicate_mixed_ops() {
         .unwrap();
     assert_eq!(slot.status, UTXO_FROZEN);
 
-    // Verify set_mined
-    let meta = replica_engine
-        .read_metadata(&key_from_txid(txid_mined))
+    // Verify set_mined (authoritative in the MinedIndex — Task 16d, the
+    // device's block-entry fields are no longer written by setMined).
+    let (entries, _unmined) = replica_engine
+        .mined_block_entries(&key_from_txid(txid_mined))
         .unwrap();
-    assert_eq!(meta.block_entry_count, 1);
+    assert_eq!(entries.len(), 1);
 
     _master_server.shutdown();
     _replica_server.shutdown();

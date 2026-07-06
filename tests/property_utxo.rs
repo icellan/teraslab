@@ -717,7 +717,12 @@ impl Model {
                 if !rec.mined.contains(&id) {
                     rec.mined.push(id);
                 }
-                rec.locked = false; // set_mined clears LOCKED
+                // Task 16c/16d: device LOCKED is now an immutable create-time
+                // marker — setMined performs zero device writes and no
+                // longer clears it. (The record's EFFECTIVE lock still
+                // clears once mined, via a separate MinedIndex-based check
+                // in `Engine::spend`, not modeled here since this model only
+                // tracks the device's raw LOCKED bit.)
                 Outcome::OkBlockIds(sorted(rec.mined.clone()))
             }
 
@@ -1039,7 +1044,21 @@ fn expected_slot_repr(slot_state: &SlotState) -> (u8, [u8; 36]) {
     }
 }
 
-fn verify_full_state(engine: &Engine, model: &Model) -> Result<(), TestCaseError> {
+/// `check_mined` gates the mined-block-entry comparison: Task 16d made
+/// `set_mined` a zero-device-write op, so mined-state now survives a crash
+/// ONLY via the redo log + `Engine::replay_mined_index_redo_tail` /
+/// `Engine::recover_mined_index` (Task 13) — never via the device. The
+/// crash-replay harness in this file has no redo log at all (it exercises
+/// PURE device-durability via `simulate_power_loss`, not WAL-based
+/// recovery), so mined-state is a known, expected casualty of a crash in
+/// that specific redo-less configuration — pass `false` there. The
+/// live (non-crash) property test passes `true`: no crash occurs, so the
+/// MinedIndex is simply whatever the live ops already produced.
+fn verify_full_state(
+    engine: &Engine,
+    model: &Model,
+    check_mined: bool,
+) -> Result<(), TestCaseError> {
     // Records the model says exist must match field-for-field.
     for (&tx, rec) in &model.txs {
         let key = tx_key(tx);
@@ -1095,23 +1114,29 @@ fn verify_full_state(engine: &Engine, model: &Model) -> Result<(), TestCaseError
             tx
         );
 
-        // Mined block ids (always inline: BLOCK_SPACE <= 3).
-        prop_assert_eq!(
-            meta.block_entry_count as usize,
-            rec.mined.len(),
-            "tx {}: block_entry_count mismatch",
-            tx
-        );
-        let inline = { meta.block_entries_inline };
-        let engine_blocks: Vec<u32> = (0..meta.block_entry_count as usize)
-            .map(|i| inline[i].block_id)
-            .collect();
-        prop_assert_eq!(
-            sorted(engine_blocks),
-            sorted(rec.mined.clone()),
-            "tx {}: mined block-id set mismatch",
-            tx
-        );
+        // Mined block ids: authoritative in the MinedIndex, not the device
+        // (Task 16d — setMined performs zero device writes, so
+        // `meta.block_entry_count`/`block_entries_inline` are no longer
+        // kept current). Skipped for the redo-less crash-replay harness —
+        // see `check_mined`'s doc comment above.
+        if check_mined {
+            let (mined_entries, _unmined) = engine
+                .mined_block_entries(&key)
+                .map_err(|e| TestCaseError::fail(format!("tx {tx}: mined_block_entries: {e:?}")))?;
+            prop_assert_eq!(
+                mined_entries.len(),
+                rec.mined.len(),
+                "tx {}: mined block-entry count mismatch",
+                tx
+            );
+            let engine_blocks: Vec<u32> = mined_entries.iter().map(|e| e.block_id).collect();
+            prop_assert_eq!(
+                sorted(engine_blocks),
+                sorted(rec.mined.clone()),
+                "tx {}: mined block-id set mismatch",
+                tx
+            );
+        }
 
         // Per-slot status, hash, and spending_data.
         for (vout, slot_state) in rec.slots.iter().enumerate() {
@@ -1188,7 +1213,7 @@ fn run_sequence(ops: &[Op]) -> Result<(), TestCaseError> {
         );
     }
 
-    verify_full_state(&engine, &model)
+    verify_full_state(&engine, &model, true)
 }
 
 /// Default case count, overridable with the standard `PROPTEST_CASES` env
@@ -1371,7 +1396,7 @@ fn run_crash_replay(ops: &[Op]) -> Result<(), TestCaseError> {
     drop(harness.engine);
 
     let recovered = rebuild_engine_from_device(harness.device.clone())?;
-    verify_full_state(&recovered, &model)
+    verify_full_state(&recovered, &model, false)
 }
 
 proptest! {

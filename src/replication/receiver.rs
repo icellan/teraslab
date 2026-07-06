@@ -4118,14 +4118,14 @@ mod tests {
         )
         .unwrap();
 
-        let meta = engine.read_metadata(&k).unwrap();
-        assert_eq!(meta.block_entry_count, 1);
+        let (entries, _unmined) = engine.mined_block_entries(&k).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     /// Task 14: applying a `ReplicaOp::SetMinedBatch` with N txids sets each
-    /// txid's mined-state on the replica, via the SAME dual-write
-    /// (device + MinedIndex) `Engine::set_mined_inner` performs on the
-    /// master.
+    /// txid's mined-state on the replica, via the SAME `Engine::set_mined_inner`
+    /// the master uses. Task 16d: `set_mined_inner` performs zero device
+    /// writes now — the MinedIndex is the sole write.
     #[test]
     fn receiver_applies_set_mined_batch() {
         let engine = make_engine();
@@ -4152,12 +4152,8 @@ mod tests {
         .unwrap();
 
         for k in [k1, k2, k3] {
-            // Device: the block entry landed in the record's metadata.
-            let meta = engine.read_metadata(&k).unwrap();
-            assert_eq!(meta.block_entry_count, 1, "device metadata for {k:?}");
-
-            // MinedIndex: the SAME block entry is mirrored into the
-            // authoritative secondary index (Task 9 dual-write).
+            // MinedIndex: the authoritative source for mined-state (Task 16d
+            // — there is no device metadata to cross-check against anymore).
             let entry = engine.lookup(&k).expect("indexed");
             let (blocks, unmined_since) = engine
                 .mined_index()
@@ -4184,14 +4180,15 @@ mod tests {
         )
         .unwrap();
         for k in [k1, k2, k3] {
-            let meta = engine.read_metadata(&k).unwrap();
+            let (entries, _unmined) = engine.mined_block_entries(&k).unwrap();
             assert_eq!(
-                meta.block_entry_count, 1,
+                entries.len(),
+                1,
                 "re-apply must not duplicate the block entry for {k:?}"
             );
         }
 
-        // unset: true removes the block entry on every txid, device + index.
+        // unset: true removes the block entry on every txid (MinedIndex).
         apply_op(
             &engine,
             &ReplicaOp::SetMinedBatch {
@@ -4207,8 +4204,8 @@ mod tests {
         )
         .unwrap();
         for k in [k1, k2, k3] {
-            let meta = engine.read_metadata(&k).unwrap();
-            assert_eq!(meta.block_entry_count, 0, "unset for {k:?}");
+            let (entries, _unmined) = engine.mined_block_entries(&k).unwrap();
+            assert_eq!(entries.len(), 0, "unset for {k:?}");
             let entry = engine.lookup(&k).expect("indexed");
             let (blocks, _) = engine
                 .mined_index()
@@ -4248,11 +4245,8 @@ mod tests {
         )
         .expect("a missing txid must not fail the whole batch");
 
-        let meta = engine.read_metadata(&present).unwrap();
-        assert_eq!(
-            meta.block_entry_count, 1,
-            "the present txid must still apply"
-        );
+        let (entries, _unmined) = engine.mined_block_entries(&present).unwrap();
+        assert_eq!(entries.len(), 1, "the present txid must still apply");
         assert!(engine.lookup(&missing).is_none());
     }
 

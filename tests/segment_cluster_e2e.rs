@@ -134,13 +134,16 @@ fn logical_state(engine: &Engine, key: &TxKey) -> LogicalState {
             (s.status, s.spending_data)
         })
         .collect();
+    // Task 16d: mined-block-entry count is authoritative in the MinedIndex,
+    // not the device (setMined no longer writes `block_entry_count`).
+    let (mined_entries, _unmined) = engine.mined_block_entries(key).unwrap();
     LogicalState {
         utxo_count,
         spent_utxos: { m.spent_utxos },
         generation: { m.generation },
         tx_flags: { m.flags }.bits(),
         delete_at_height: { m.delete_at_height },
-        block_entry_count: { m.block_entry_count },
+        block_entry_count: mined_entries.len() as u8,
         unmined_since: { m.unmined_since },
         slots,
     }
@@ -413,9 +416,11 @@ fn segment_non_spend_ops_replicate_in_place_no_relocate() {
         "non-spend ops must RMW in place on segment (no relocate)"
     );
     assert_eq!(replica.read_slot(&key, 0).unwrap().status, UTXO_FROZEN);
-    let m = replica.read_metadata(&key).unwrap();
+    // Task 16d: mined-block entries are authoritative in the MinedIndex, not
+    // the device.
+    let (mined_entries, _unmined) = replica.mined_block_entries(&key).unwrap();
     assert!(
-        { m.block_entry_count } >= 1,
+        !mined_entries.is_empty(),
         "setMined recorded a mined block entry"
     );
 

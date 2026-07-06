@@ -12377,8 +12377,10 @@ mod tests {
             ),
         );
         assert_eq!(resp.status, STATUS_OK, "set_mined must succeed on {mode:?}");
+        // Task 16d: setMined records mined-state in the MinedIndex, not the
+        // device — there is no device metadata field to check anymore.
         assert!(
-            { h.engine.read_metadata(&key).unwrap().block_entry_count } >= 1,
+            !h.engine.mined_block_entries(&key).unwrap().0.is_empty(),
             "set_mined must record a block entry on {mode:?}"
         );
 
@@ -13805,6 +13807,11 @@ mod tests {
             "FLAGS must match the record footer"
         );
 
+        // Task 16d: BLOCK_ENTRY_COUNT is a KNOWN, intentional divergence from
+        // `meta.block_entry_count` (the device footer) — GET reroutes it to
+        // the MinedIndex (Task 10), and `set_mined` no longer writes the
+        // device's block-entry fields at all (they stay whatever they were
+        // at creation, 0). The GET value must match the MinedIndex instead.
         let bec = decode_get_response(
             &h.request(
                 OP_GET_BATCH,
@@ -13813,18 +13820,18 @@ mod tests {
             .payload,
         )
         .unwrap();
+        let (mined_entries, _unmined) = h.engine.mined_block_entries(&key).unwrap();
         assert_eq!(
-            bec[0].data[0], meta.block_entry_count,
-            "BLOCK_ENTRY_COUNT must match the record footer"
+            bec[0].data[0] as usize,
+            mined_entries.len(),
+            "BLOCK_ENTRY_COUNT must match the MinedIndex, not the (intentionally stale) device \
+             footer"
         );
 
         // Sanity: the cycle actually mutated the record (non-tautological).
         assert_eq!({ meta.spent_utxos }, 1, "one UTXO was spent");
-        assert!(meta.block_entry_count > 0, "record is mined after setMined");
-        assert!(
-            { meta.generation } >= 1,
-            "generation bumped by spend + setMined"
-        );
+        assert!(!mined_entries.is_empty(), "record is mined after setMined");
+        assert!({ meta.generation } >= 1, "generation bumped by spend");
     }
 
     // -----------------------------------------------------------------------
@@ -13930,11 +13937,13 @@ mod tests {
     }
 
     /// Task 10: GET's BLOCK_ENTRIES / BLOCK_ENTRIES_ALL / BLOCK_ENTRY_COUNT /
-    /// UNMINED_SINCE fields now read the authoritative `ShardedMinedIndex`
-    /// slot instead of the device record. Since setMined dual-writes both
-    /// (Task 9), this must be byte-identical to the device metadata for the
-    /// same record — pin that equivalence, including the overflow case
-    /// (mining into more than `INLINE_BLOCK_ENTRIES` == 3 distinct blocks).
+    /// UNMINED_SINCE fields read the authoritative `ShardedMinedIndex` slot,
+    /// not the device record. Task 16d: `set_mined` no longer writes the
+    /// device's block-entry/unmined fields AT ALL (they stay whatever they
+    /// were at creation — 0), so this now pins GET's fields against the
+    /// MinedIndex directly (via `Engine::mined_block_entries`) rather than
+    /// the device, including the overflow case (mining into more than
+    /// `INLINE_BLOCK_ENTRIES` == 3 distinct blocks).
     #[test]
     fn get_block_fields_read_from_mined_index_match_device() {
         let h = DispatchTestHarness::new();
@@ -13948,19 +13957,18 @@ mod tests {
         let block_ids = [110u32, 220, 330, 440, 550];
         set_mined_into_blocks(&h, txid, &block_ids);
 
-        // Authoritative on-device record — the pre-reroute source of truth
-        // these GET fields must still match byte-identically now that they
-        // read the (dual-written, in-sync) MinedIndex instead.
-        let meta = h.engine.read_metadata(&key).expect("record must exist");
+        // Authoritative source: the MinedIndex (the device's block-entry/
+        // unmined fields are never written by setMined post-16d).
+        let (mined_entries, mined_unmined) = h.engine.mined_block_entries(&key).unwrap();
         assert_eq!(
-            { meta.unmined_since },
-            0,
-            "mined on the longest chain must clear unmined_since on the device"
+            mined_unmined, 0,
+            "mined on the longest chain must clear unmined_since in the MinedIndex"
         );
         assert!(
-            meta.block_entry_count as usize > crate::record::INLINE_BLOCK_ENTRIES,
+            mined_entries.len() > crate::record::INLINE_BLOCK_ENTRIES,
             "test setup must actually produce an overflow entry"
         );
+        let mined_count = mined_entries.len() as u8;
 
         // BLOCK_ENTRY_COUNT
         let bec = decode_get_response(
@@ -13973,8 +13981,8 @@ mod tests {
         .unwrap();
         assert_eq!(bec[0].status, 0);
         assert_eq!(
-            bec[0].data[0], meta.block_entry_count,
-            "BLOCK_ENTRY_COUNT from the MinedIndex must match the device record"
+            bec[0].data[0], mined_count,
+            "BLOCK_ENTRY_COUNT must match the MinedIndex"
         );
 
         // UNMINED_SINCE
@@ -13989,8 +13997,8 @@ mod tests {
         assert_eq!(unmined[0].status, 0);
         assert_eq!(
             u32::from_le_bytes(unmined[0].data[0..4].try_into().unwrap()),
-            { meta.unmined_since },
-            "UNMINED_SINCE from the MinedIndex must match the device record"
+            mined_unmined,
+            "UNMINED_SINCE must match the MinedIndex"
         );
 
         let expected: Vec<(u32, u32, u32)> = block_ids
@@ -14011,12 +14019,12 @@ mod tests {
         assert_eq!(be[0].status, 0);
         let (count, entries) = decode_block_entries_section(&be[0].data);
         assert_eq!(
-            count, meta.block_entry_count,
-            "BLOCK_ENTRIES declared count must match the device record"
+            count, mined_count,
+            "BLOCK_ENTRIES declared count must match the MinedIndex"
         );
         assert_eq!(entries, expected[..3].to_vec());
 
-        // BLOCK_ENTRIES_ALL: uncapped, must match the device's full block set.
+        // BLOCK_ENTRIES_ALL: uncapped, must match the MinedIndex's full block set.
         let all = decode_get_response(
             &h.request(
                 OP_GET_BATCH,
@@ -14027,24 +14035,8 @@ mod tests {
         .unwrap();
         assert_eq!(all[0].status, 0);
         let (all_count, all_entries) = decode_block_entries_section(&all[0].data);
-        assert_eq!(all_count, meta.block_entry_count);
+        assert_eq!(all_count, mined_count);
         assert_eq!(all_entries, expected);
-
-        // Cross-check against the device-backed engine accessor directly, to
-        // pin that the MinedIndex-backed GET path and the (still present,
-        // still device-backed) `read_all_block_entries` agree exactly.
-        let device_entries: Vec<(u32, u32, u32)> = h
-            .engine
-            .read_all_block_entries(&key)
-            .expect("device read_all_block_entries should succeed")
-            .iter()
-            .map(|e| (e.block_id, e.block_height, e.subtree_idx))
-            .collect();
-        assert_eq!(
-            all_entries, device_entries,
-            "MinedIndex-backed BLOCK_ENTRIES_ALL must match the device-backed \
-             read_all_block_entries"
-        );
     }
 
     #[test]
@@ -14083,18 +14075,23 @@ mod tests {
         assert_eq!(entries, vec![(7, 1000, 0), (9, 1001, 1)]);
     }
 
+    /// Task 16d: `Engine::read_all_block_entries` (a device-only reader) was
+    /// removed — it had no production caller and setMined no longer writes
+    /// anything for it to read. This pins the same inline/overflow-ordering
+    /// property via `Engine::mined_block_entries`, the MinedIndex-backed
+    /// replacement every real reader now uses.
     #[test]
-    fn engine_read_all_block_entries_inline_and_overflow() {
+    fn mined_block_entries_inline_and_overflow_ordering() {
         let h = DispatchTestHarness::new();
 
-        // Case 1: count <= 3 → only inline entries, no overflow read.
+        // Case 1: count <= 3 → only inline entries, no overflow.
         let txid_small = DispatchTestHarness::make_txid(82);
         assert_eq!(h.create_tx(txid_small, 2).status, STATUS_OK);
         set_mined_into_blocks(&h, txid_small, &[100u32, 200]);
-        let entries = h
+        let (entries, _unmined) = h
             .engine
-            .read_all_block_entries(&TxKey { txid: txid_small })
-            .expect("read_all_block_entries should succeed for inline-only record");
+            .mined_block_entries(&TxKey { txid: txid_small })
+            .expect("mined_block_entries should succeed for inline-only record");
         let got: Vec<(u32, u32, u32)> = entries
             .iter()
             .map(|e| (e.block_id, e.block_height, e.subtree_idx))
@@ -14106,10 +14103,10 @@ mod tests {
         assert_eq!(h.create_tx(txid_big, 2).status, STATUS_OK);
         let block_ids = [11u32, 22, 33, 44, 55, 66];
         set_mined_into_blocks(&h, txid_big, &block_ids);
-        let entries = h
+        let (entries, _unmined) = h
             .engine
-            .read_all_block_entries(&TxKey { txid: txid_big })
-            .expect("read_all_block_entries should succeed for overflow record");
+            .mined_block_entries(&TxKey { txid: txid_big })
+            .expect("mined_block_entries should succeed for overflow record");
         let got: Vec<(u32, u32, u32)> = entries
             .iter()
             .map(|e| (e.block_id, e.block_height, e.subtree_idx))
@@ -24518,21 +24515,18 @@ mod tests {
             })
             .expect("set_mined seed");
 
-        // Now apply unset_mined locally. Capture the before-image FIRST.
-        let pre_meta = h.engine.read_metadata(&key).expect("read_metadata pre");
-        let count = pre_meta.block_entry_count as usize;
-        let inline = count.min(crate::record::INLINE_BLOCK_ENTRIES);
-        let mut captured: Option<BeforeImage> = None;
-        for i in 0..inline {
-            if { pre_meta.block_entries_inline[i].block_id } == block_id {
-                captured = Some(BeforeImage::UnsetMined {
-                    block_height: { pre_meta.block_entries_inline[i].block_height },
-                    subtree_idx: { pre_meta.block_entries_inline[i].subtree_idx },
-                });
-                break;
-            }
-        }
-        let before_image = captured.expect("captured before-image");
+        // Now apply unset_mined locally. Capture the before-image FIRST —
+        // Task 16d: `read_block_entry` reads the MinedIndex (the device's
+        // block-entry fields are no longer written by setMined at all).
+        let before = h
+            .engine
+            .read_block_entry(&key, block_id)
+            .expect("read before image")
+            .expect("captured before-image");
+        let before_image = BeforeImage::UnsetMined {
+            block_height: { before.block_height },
+            subtree_idx: { before.subtree_idx },
+        };
 
         // Apply the unset locally (simulating the dispatch handler's
         // engine.set_mined_batch with unset_mined=true).
@@ -24565,22 +24559,23 @@ mod tests {
             .unwrap();
 
         // Post-compensation: the block entry MUST be restored with the
-        // original (height, subtree). Not zeros.
-        let post_meta = h.engine.read_metadata(&key).expect("read_metadata post");
-        let post_count = post_meta.block_entry_count as usize;
-        let post_inline = post_count.min(crate::record::INLINE_BLOCK_ENTRIES);
-        let mut found = false;
-        for i in 0..post_inline {
-            if { post_meta.block_entries_inline[i].block_id } == block_id {
-                let bh = { post_meta.block_entries_inline[i].block_height };
-                let st = { post_meta.block_entries_inline[i].subtree_idx };
-                assert_eq!(bh, block_height, "block_height not restored");
-                assert_eq!(st, subtree_idx, "subtree_idx not restored");
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "block entry not restored after compensation");
+        // original (height, subtree). Not zeros. `read_block_entry` reads
+        // the MinedIndex (Task 16d).
+        let restored = h
+            .engine
+            .read_block_entry(&key, block_id)
+            .expect("read restored entry")
+            .expect("block entry not restored after compensation");
+        assert_eq!(
+            { restored.block_height },
+            block_height,
+            "block_height not restored"
+        );
+        assert_eq!(
+            { restored.subtree_idx },
+            subtree_idx,
+            "subtree_idx not restored"
+        );
     }
 
     #[test]
@@ -24689,21 +24684,18 @@ mod tests {
             })
             .expect("set_mined seed");
 
-        // Now apply unset_mined locally. Capture the before-image FIRST.
-        let pre_meta = h.engine.read_metadata(&key).expect("read_metadata pre");
-        let count = pre_meta.block_entry_count as usize;
-        let inline = count.min(crate::record::INLINE_BLOCK_ENTRIES);
-        let mut captured: Option<BeforeImage> = None;
-        for i in 0..inline {
-            if { pre_meta.block_entries_inline[i].block_id } == block_id {
-                captured = Some(BeforeImage::UnsetMined {
-                    block_height: { pre_meta.block_entries_inline[i].block_height },
-                    subtree_idx: { pre_meta.block_entries_inline[i].subtree_idx },
-                });
-                break;
-            }
-        }
-        let before_image = captured.expect("captured before-image");
+        // Now apply unset_mined locally. Capture the before-image FIRST —
+        // Task 16d: `read_block_entry` reads the MinedIndex (the device's
+        // block-entry fields are no longer written by setMined at all).
+        let before = h
+            .engine
+            .read_block_entry(&key, block_id)
+            .expect("read before image")
+            .expect("captured before-image");
+        let before_image = BeforeImage::UnsetMined {
+            block_height: { before.block_height },
+            subtree_idx: { before.subtree_idx },
+        };
 
         // Apply the unset locally (simulating `handle_set_mined_batch`'s
         // engine.set_mined_batch with unset_mined=true).
@@ -24741,22 +24733,23 @@ mod tests {
             .unwrap();
 
         // Post-compensation: the block entry MUST be restored with the
-        // original (height, subtree). Not zeros.
-        let post_meta = h.engine.read_metadata(&key).expect("read_metadata post");
-        let post_count = post_meta.block_entry_count as usize;
-        let post_inline = post_count.min(crate::record::INLINE_BLOCK_ENTRIES);
-        let mut found = false;
-        for i in 0..post_inline {
-            if { post_meta.block_entries_inline[i].block_id } == block_id {
-                let bh = { post_meta.block_entries_inline[i].block_height };
-                let st = { post_meta.block_entries_inline[i].subtree_idx };
-                assert_eq!(bh, block_height, "block_height not restored");
-                assert_eq!(st, subtree_idx, "subtree_idx not restored");
-                found = true;
-                break;
-            }
-        }
-        assert!(found, "block entry not restored after compensation");
+        // original (height, subtree). Not zeros. `read_block_entry` reads
+        // the MinedIndex (Task 16d).
+        let restored = h
+            .engine
+            .read_block_entry(&key, block_id)
+            .expect("read restored entry")
+            .expect("block entry not restored after compensation");
+        assert_eq!(
+            { restored.block_height },
+            block_height,
+            "block_height not restored"
+        );
+        assert_eq!(
+            { restored.subtree_idx },
+            subtree_idx,
+            "subtree_idx not restored"
+        );
     }
 
     #[test]
@@ -25350,12 +25343,20 @@ mod tests {
         );
     }
 
-    /// Test 4 (gap #8): a crash mid-rollback. Persist a Compensate*
-    /// redo entry, simulate crash before the engine apply runs, then
-    /// startup recovery must complete the compensation from the redo
-    /// entry alone. Verifies the durability invariant: any Compensate*
-    /// entry that reaches the redo log produces a deterministic
-    /// post-recovery state.
+    /// Test 4 (gap #8): a crash mid-rollback. Persist the compensation's
+    /// redo entries, simulate a crash before the engine apply runs, then
+    /// startup recovery must complete the compensation from redo alone.
+    /// Verifies the durability invariant: any Compensate* entry that
+    /// reaches the redo log produces a deterministic post-recovery state.
+    ///
+    /// Task 16d: `CompensateUnsetMined` is no longer replayed against the
+    /// device (see its recovery.rs doc comment) — restoration is now
+    /// carried entirely by the paired forward `SetMinedBatch` redo entry
+    /// (`compensate_replication_failure` always emits both together), via
+    /// `Engine::replay_mined_index_redo_tail` (Task 13) into the
+    /// MinedIndex. This test appends BOTH entries, mirroring the real
+    /// atomic batch, and verifies the MinedIndex — not the device — is
+    /// restored.
     #[test]
     fn crash_mid_rollback_recovers_compensation_from_redo() {
         use crate::ops::set_mined::SetMinedRequest;
@@ -25384,8 +25385,8 @@ mod tests {
 
         // Unset mined locally (the engine apply happens; we'd then attempt
         // replication, fail, and roll back — but here we simulate a crash
-        // BEFORE the engine.set_mined(restore) runs by ONLY appending
-        // the Compensate* redo entry and crashing immediately.
+        // BEFORE the engine.set_mined(restore) runs by ONLY appending the
+        // compensation's redo entries and crashing immediately.
         h.engine
             .set_mined(&SetMinedRequest {
                 tx_key: key,
@@ -25399,9 +25400,23 @@ mod tests {
             })
             .expect("local unset");
 
-        // Append the compensation intent to the redo log (simulating the
-        // first half of `compensate_replication_failure`'s work) but DO
-        // NOT run the engine restore.
+        // Append the compensation intents to the redo log (simulating the
+        // first half of `compensate_replication_failure`'s work — it
+        // always emits the forward `SetMinedBatch` alongside
+        // `CompensateUnsetMined`) but DO NOT run the engine restore.
+        h.redo_log
+            .lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain: true,
+                current_block_height: 0,
+                block_height_retention: 0,
+                unset: false,
+                txids: vec![key],
+            })
+            .expect("append forward set-mined intent");
         h.redo_log
             .lock()
             .append_and_flush(RedoOp::CompensateUnsetMined {
@@ -25412,39 +25427,42 @@ mod tests {
             })
             .expect("append compensate intent");
 
-        // Verify the slot's metadata pre-recovery: the entry should be
-        // ABSENT (the unset removed it; the compensation hasn't run yet).
-        let pre_meta = h.engine.read_metadata(&key).expect("pre meta");
-        let pre_inline =
-            (pre_meta.block_entry_count as usize).min(crate::record::INLINE_BLOCK_ENTRIES);
-        let pre_present =
-            (0..pre_inline).any(|i| { pre_meta.block_entries_inline[i].block_id } == block_id);
+        // Verify pre-recovery: the entry should be ABSENT from the
+        // MinedIndex (the unset removed it; the compensation hasn't run
+        // yet).
+        let (pre_entries, _unmined) = h.engine.mined_block_entries(&key).expect("pre mined-state");
         assert!(
-            !pre_present,
+            !pre_entries.iter().any(|e| e.block_id == block_id),
             "block entry should be absent before recovery (precondition)"
         );
 
-        // Crash + recover. Recovery must replay the CompensateUnsetMined
-        // entry and restore the block entry exactly.
+        // Crash + recover. Primary-index recovery restores the record;
+        // the MinedIndex is then reconstructed by replaying the SAME redo
+        // tail (mirrors `Engine::recover_mined_index`'s snapshot+redo path
+        // — this test harness has no checkpoint, so it exercises the pure
+        // redo-replay side of that same mechanism).
         let h2 = h.crash_and_recover();
+        h2.engine
+            .replay_mined_index_redo_tail(std::slice::from_ref(&h2.redo_log))
+            .expect("mined-index redo-tail replay");
 
-        let post_meta = h2.engine.read_metadata(&key).expect("post meta");
-        let post_inline =
-            (post_meta.block_entry_count as usize).min(crate::record::INLINE_BLOCK_ENTRIES);
-        let mut restored = false;
-        for i in 0..post_inline {
-            if { post_meta.block_entries_inline[i].block_id } == block_id {
-                let bh = { post_meta.block_entries_inline[i].block_height };
-                let st = { post_meta.block_entries_inline[i].subtree_idx };
-                assert_eq!(bh, block_height, "post-recovery height not restored");
-                assert_eq!(st, subtree_idx, "post-recovery subtree not restored");
-                restored = true;
-                break;
-            }
-        }
-        assert!(
-            restored,
-            "block entry not restored from CompensateUnsetMined replay"
+        let (post_entries, _unmined) = h2
+            .engine
+            .mined_block_entries(&key)
+            .expect("post mined-state");
+        let restored = *post_entries
+            .iter()
+            .find(|e| e.block_id == block_id)
+            .expect("block entry not restored from redo replay");
+        assert_eq!(
+            { restored.block_height },
+            block_height,
+            "post-recovery height not restored"
+        );
+        assert_eq!(
+            { restored.subtree_idx },
+            subtree_idx,
+            "post-recovery subtree not restored"
         );
     }
 

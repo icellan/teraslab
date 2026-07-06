@@ -226,7 +226,8 @@ fn e2e_concurrent_10_threads_zero_mismatches() {
         };
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
-        assert_eq!(meta.block_entry_count, 1);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }
 
@@ -326,13 +327,13 @@ fn realistic_block_arrival() {
     );
 
     for i in 0..tx_count {
-        let meta = engine
-            .read_metadata(&TxKey {
-                txid: make_tx_id(i),
-            })
-            .unwrap();
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
+        let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
-        assert_eq!(meta.block_entry_count, 1);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }
 
@@ -389,15 +390,12 @@ fn realistic_block_reorg() {
             .unwrap();
     }
     for i in 0..tx_count {
-        assert_eq!(
-            engine
-                .read_metadata(&TxKey {
-                    txid: make_tx_id(i)
-                })
-                .unwrap()
-                .block_entry_count,
-            1
-        );
+        let (entries, _unmined) = engine
+            .mined_block_entries(&TxKey {
+                txid: make_tx_id(i),
+            })
+            .unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     // Reorg: unmine all
@@ -418,13 +416,12 @@ fn realistic_block_reorg() {
             .unwrap();
     }
     for i in 0..tx_count {
-        let meta = engine
-            .read_metadata(&TxKey {
-                txid: make_tx_id(i),
-            })
-            .unwrap();
-        assert_eq!(meta.block_entry_count, 0);
-        assert_ne!({ meta.unmined_since }, 0);
+        let key = TxKey {
+            txid: make_tx_id(i),
+        };
+        let (entries, unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 0);
+        assert_ne!(unmined, 0);
     }
 }
 

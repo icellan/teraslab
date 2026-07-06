@@ -1447,24 +1447,32 @@ fn main() {
     // RAM (unlike the primary index), so it boots empty on every restart —
     // both the snapshot-restore and device-scan-rebuild paths above converge
     // on `index` by this point, and either one leaves `mined_slot` stale or
-    // sentinel. Task 13: try the checkpoint's TXID-keyed MinedIndex snapshot
-    // + post-checkpoint redo-tail replay first (bounded by the snapshot +
-    // redo, not the device); if that section is absent, truncated, or
-    // otherwise fails to decode, `Engine::recover_mined_index` falls back to
-    // `rebuild_mined_index_from_device`'s full device scan (Task 12, kept as
-    // the permanent fallback) automatically. Either path overwrites every
-    // primary entry's `mined_slot` with a freshly-allocated slot before any
-    // client traffic (GET/spend/delete_eval all read mined-state from this
-    // index, not the device).
+    // sentinel. Task 16d: pure store-auth recovery — the checkpoint's
+    // TXID-keyed MinedIndex snapshot + post-checkpoint redo-tail replay is
+    // the ONLY path now (the device-scan fallback was removed: `set_mined`
+    // performs zero device writes, so the device is no longer a trustworthy
+    // reconstruction source). A genuinely fresh boot (no checkpoint has ever
+    // run) instead does a full redo-tail replay from genesis. Either
+    // outcome overwrites every primary entry's `mined_slot` with a
+    // freshly-allocated slot before any client traffic (GET/spend/
+    // delete_eval all read mined-state from this index, not the device); an
+    // absent/corrupt/stale-fenced `.mined` section despite an EXISTING
+    // checkpoint is now FATAL (aborts startup below) rather than silently
+    // rebuilding stale mined-state from the device.
+    let primary_snapshot_path = config.resolved_index_snapshot_path();
     let mined_snapshot_path =
-        teraslab::checkpoint::mined_index_snapshot_path(&config.resolved_index_snapshot_path());
+        teraslab::checkpoint::mined_index_snapshot_path(&primary_snapshot_path);
     let mined_redo_logs: &[Arc<Mutex<RedoLog>>] = redo_logs_arc.as_deref().unwrap_or(&[]);
-    match engine.recover_mined_index(&mined_snapshot_path, mined_redo_logs) {
+    match engine.recover_mined_index(
+        &primary_snapshot_path,
+        &mined_snapshot_path,
+        mined_redo_logs,
+    ) {
         Ok(used_snapshot) => {
             tracing::info!(
                 used_snapshot,
                 "mined-index recovery complete (true = checkpoint snapshot + redo tail, \
-                 false = full device scan)",
+                 false = fresh boot, full redo-tail replay from genesis)",
             );
         }
         Err(e) => {

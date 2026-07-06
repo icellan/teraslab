@@ -36,7 +36,7 @@
 //! across multiple recovery passes (e.g. crash mid-replay).
 
 use crate::allocator::BoxedAllocator;
-use crate::device::{AlignedBuf, BlockDevice, DeviceError};
+use crate::device::{BlockDevice, DeviceError};
 use crate::index::{
     DahBackend, DahRedoEntry, ShardedIndex, TxIndexEntry, TxKey, UnminedBackend, UnminedRedoEntry,
 };
@@ -1013,44 +1013,20 @@ fn replay_one_recovery_entry(
                 )
             }
         }
-        RedoOp::CompensateUnsetMined {
-            tx_key,
-            block_id,
-            block_height,
-            subtree_idx,
-        } => replay_compensate_unset_mined_with_allocator(
-            device,
-            index,
-            allocator.as_deref_mut(),
-            tx_key,
-            *block_id,
-            *block_height,
-            *subtree_idx,
-        ),
-        // SetMined may need the overflow region (4th+ block entry,
-        // or unset of an overflow-resident entry) — route through
-        // the allocator-aware replay so it can allocate/free it.
-        RedoOp::SetMinedBatch {
-            block_id,
-            block_height,
-            subtree_idx,
-            unset,
-            txids,
-            // `on_longest_chain` / `current_block_height` /
-            // `block_height_retention` are carried for a later
-            // store-authoritative replay target (Task 12+); today's
-            // device replay does not consume them.
-            ..
-        } => replay_set_mined_batch_with_allocator(
-            device,
-            index,
-            allocator,
-            txids,
-            *block_id,
-            *block_height,
-            *subtree_idx,
-            *unset,
-        ),
+        // Task 16d: `CompensateUnsetMined` and `SetMinedBatch` are no longer
+        // replayed against the device. `set_mined` (live) and the
+        // compensation path it backs both went through the same zero-
+        // device-write `Engine::set_mined_inner` (Task 16d), so there is no
+        // device-side block-entry state left for a device replay to restore
+        // — mined-state recovery is handled ENTIRELY by
+        // `Engine::replay_mined_index_redo_tail` (Task 13), a separate
+        // recovery phase that runs after primary-index recovery and reads
+        // these SAME redo entries (both carry the full txid-batch/block
+        // payload it needs). Replaying them again here would re-derive
+        // device state nobody reads and (pre-fix) actively corrupted device
+        // records via untested overflow-allocator interleaving with the
+        // rest of this replay loop — see the 16d task report.
+        RedoOp::CompensateUnsetMined { .. } | RedoOp::SetMinedBatch { .. } => ReplayResult::Skipped,
         _ => replay_entry(device, index, offset_owners, entry),
     }
 }
@@ -1674,22 +1650,9 @@ fn replay_entry(
             }),
             utxo_hash.as_ref(),
         ),
-        RedoOp::SetMinedBatch {
-            block_id,
-            block_height,
-            subtree_idx,
-            unset,
-            txids,
-            ..
-        } => replay_set_mined_batch(
-            device,
-            index,
-            txids,
-            *block_id,
-            *block_height,
-            *subtree_idx,
-            *unset,
-        ),
+        // Task 16d: no longer replayed against the device — see the
+        // matching arm's doc comment in `replay_one_recovery_entry`.
+        RedoOp::SetMinedBatch { .. } => ReplayResult::Skipped,
         RedoOp::Freeze { tx_key, offset } => replay_freeze(device, index, tx_key, *offset, None),
         RedoOp::FreezeV2 {
             tx_key,
@@ -1815,19 +1778,15 @@ fn replay_entry(
         // restores the captured pre-apply state. Replay is idempotent —
         // each handler reads the current device state and skips when it
         // already matches the captured before-image.
-        RedoOp::CompensateUnsetMined {
-            tx_key,
-            block_id,
-            block_height,
-            subtree_idx,
-        } => replay_compensate_unset_mined(
-            device,
-            index,
-            tx_key,
-            *block_id,
-            *block_height,
-            *subtree_idx,
-        ),
+        //
+        // Task 16d: `CompensateUnsetMined` is no longer replayed against
+        // the device — see the matching arm's doc comment in
+        // `replay_one_recovery_entry`. Its paired forward `SetMinedBatch`
+        // redo entry (always emitted alongside it by
+        // `compensate_replication_failure`) is what
+        // `Engine::replay_mined_index_redo_tail` uses to restore the
+        // MinedIndex.
+        RedoOp::CompensateUnsetMined { .. } => ReplayResult::Skipped,
         RedoOp::CompensateReassign {
             tx_key,
             offset,
@@ -2083,303 +2042,6 @@ fn replay_unspend(
     }
 
     ReplayResult::Applied
-}
-
-/// Allocator-aware `SetMined` replay, mirroring the live `set_mined`
-/// path's overflow handling: the 4th+ block entry spills to the
-/// separately-allocated overflow region, dedup checks scan inline AND
-/// overflow entries, and unset can remove an overflow-resident entry
-/// (pulling the last overflow entry into a vacated inline slot, exactly
-/// like `ops/engine.rs`).
-///
-/// Pre-fix the inline-only version silently dropped the 4th+ entry on
-/// the append path (a crash in the WAL-to-device window lost block
-/// entries past the inline cap on replay) and could not find
-/// overflow-resident entries on the unset path. When overflow storage
-/// must be touched but no allocator is available (the legacy
-/// single-backend `recover` path), the entry fails closed with
-/// `LogicError` instead of silently diverging — production startup
-/// always supplies the allocator via `recover_all_with_allocator`.
-// Per-entry replay path: arguments are the decoded set-mined fields (key,
-// block id/height, subtree index, unset flag) plus the device, index, and
-// optional allocator they act on. Independent inputs with no cohesive grouping,
-// so the count is warranted.
-#[allow(clippy::too_many_arguments)]
-fn replay_set_mined_with_allocator(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
-    tx_key: &TxKey,
-    block_id: u32,
-    block_height: u32,
-    subtree_idx: u32,
-    unset: bool,
-) -> ReplayResult {
-    let ie = match index.lookup(tx_key) {
-        Some(e) => e,
-        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
-    };
-
-    let mut meta = match io::read_metadata(device, ie.record_offset) {
-        Ok(m) => m,
-        // `read_metadata` returns `Err` for both raw I/O failures and
-        // corrupt magic / version mismatches in the metadata block.
-        // Treat both as fatal — they indicate the record on device is
-        // unreadable, which is more severe than a missing-primary case.
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
-    };
-
-    let count = meta.block_entry_count as usize;
-    let inline = count.min(INLINE_BLOCK_ENTRIES);
-    let has_overflow = count > INLINE_BLOCK_ENTRIES;
-
-    if unset {
-        let mut found_inline = None;
-        for i in 0..inline {
-            if { meta.block_entries_inline[i].block_id } == block_id {
-                found_inline = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = found_inline {
-            if has_overflow {
-                // Mirror live set_mined: pull the last overflow entry
-                // into the vacated inline slot, shrink the overflow.
-                let mut overflow = match read_recovery_overflow_entries(device, &meta) {
-                    Ok(v) => v,
-                    Err(RecoveryOverflowError::Io) => {
-                        return ReplayResult::Failed(ReplayCause::IoError);
-                    }
-                    Err(RecoveryOverflowError::Logic) => {
-                        return ReplayResult::Failed(ReplayCause::LogicError);
-                    }
-                };
-                let Some(last) = overflow.pop() else {
-                    return ReplayResult::Failed(ReplayCause::LogicError);
-                };
-                meta.block_entries_inline[i] = last;
-                let Some(alloc) = allocator.as_deref_mut() else {
-                    return ReplayResult::Failed(ReplayCause::LogicError);
-                };
-                match write_recovery_overflow_entries(device, alloc, &mut meta, &overflow) {
-                    Ok(()) => {}
-                    Err(RecoveryOverflowError::Io) => {
-                        return ReplayResult::Failed(ReplayCause::IoError);
-                    }
-                    Err(RecoveryOverflowError::Logic) => {
-                        return ReplayResult::Failed(ReplayCause::LogicError);
-                    }
-                }
-            } else {
-                if i < inline - 1 {
-                    meta.block_entries_inline[i] = meta.block_entries_inline[inline - 1];
-                }
-                meta.block_entries_inline[inline - 1] = BlockEntry {
-                    block_id: 0,
-                    block_height: 0,
-                    subtree_idx: 0,
-                };
-                meta.block_entry_count -= 1;
-            }
-        } else if has_overflow {
-            let mut overflow = match read_recovery_overflow_entries(device, &meta) {
-                Ok(v) => v,
-                Err(RecoveryOverflowError::Io) => {
-                    return ReplayResult::Failed(ReplayCause::IoError);
-                }
-                Err(RecoveryOverflowError::Logic) => {
-                    return ReplayResult::Failed(ReplayCause::LogicError);
-                }
-            };
-            let Some(pos) = overflow.iter().position(|e| { e.block_id } == block_id) else {
-                return ReplayResult::Skipped;
-            };
-            overflow.swap_remove(pos);
-            let Some(alloc) = allocator.as_deref_mut() else {
-                return ReplayResult::Failed(ReplayCause::LogicError);
-            };
-            match write_recovery_overflow_entries(device, alloc, &mut meta, &overflow) {
-                Ok(()) => {}
-                Err(RecoveryOverflowError::Io) => {
-                    return ReplayResult::Failed(ReplayCause::IoError);
-                }
-                Err(RecoveryOverflowError::Logic) => {
-                    return ReplayResult::Failed(ReplayCause::LogicError);
-                }
-            }
-        } else {
-            return ReplayResult::Skipped;
-        }
-    } else {
-        // Duplicate check: inline entries first, then overflow — a
-        // replayed SetMined whose entry already lives in overflow must
-        // be a Skipped no-op (no second generation bump).
-        for i in 0..inline {
-            if { meta.block_entries_inline[i].block_id } == block_id {
-                return ReplayResult::Skipped;
-            }
-        }
-        if has_overflow {
-            let overflow = match read_recovery_overflow_entries(device, &meta) {
-                Ok(v) => v,
-                Err(RecoveryOverflowError::Io) => {
-                    return ReplayResult::Failed(ReplayCause::IoError);
-                }
-                Err(RecoveryOverflowError::Logic) => {
-                    return ReplayResult::Failed(ReplayCause::LogicError);
-                }
-            };
-            if overflow.iter().any(|e| { e.block_id } == block_id) {
-                return ReplayResult::Skipped;
-            }
-        }
-        if count < INLINE_BLOCK_ENTRIES {
-            meta.block_entries_inline[count] = BlockEntry {
-                block_id,
-                block_height,
-                subtree_idx,
-            };
-            meta.block_entry_count += 1;
-        } else {
-            // 4th+ entry: needs the overflow region. Pre-fix this case
-            // fell through silently (entry dropped, generation still
-            // bumped). Fail closed when no allocator is available.
-            let Some(alloc) = allocator else {
-                return ReplayResult::Failed(ReplayCause::LogicError);
-            };
-            match append_recovery_overflow_block_entry(
-                device,
-                alloc,
-                &mut meta,
-                BlockEntry {
-                    block_id,
-                    block_height,
-                    subtree_idx,
-                },
-            ) {
-                Ok(()) => {}
-                Err(RecoveryOverflowError::Io) => {
-                    return ReplayResult::Failed(ReplayCause::IoError);
-                }
-                Err(RecoveryOverflowError::Logic) => {
-                    return ReplayResult::Failed(ReplayCause::LogicError);
-                }
-            }
-        }
-    }
-
-    meta.generation = { meta.generation }.wrapping_add(1);
-
-    // R-013: propagate metadata write failure instead of returning Applied with a dropped error.
-    if io::write_metadata(device, ie.record_offset, &meta).is_err() {
-        return ReplayResult::Failed(ReplayCause::IoError);
-    }
-    ReplayResult::Applied
-}
-
-/// D5/§9: replay a batch-native `SetMinedBatch` entry (no allocator — the
-/// legacy single-backend `recover` path). See
-/// [`replay_set_mined_batch_with_allocator`].
-fn replay_set_mined_batch(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    txids: &[TxKey],
-    block_id: u32,
-    block_height: u32,
-    subtree_idx: u32,
-    unset: bool,
-) -> ReplayResult {
-    replay_set_mined_batch_with_allocator(
-        device,
-        index,
-        None,
-        txids,
-        block_id,
-        block_height,
-        subtree_idx,
-        unset,
-    )
-}
-
-/// D5/§9: replay a batch-native `SetMinedBatch` redo entry against the
-/// device — all txs in the batch share every field but the txid, so this
-/// applies the SAME per-key device mutation
-/// [`replay_set_mined_with_allocator`] performs for a single-tx `SetMined`,
-/// once per txid (Task 12 will retarget this to the MinedIndex; today's
-/// dual-write era still authors the device record).
-///
-/// Every txid is attempted regardless of an earlier one's outcome in this
-/// same batch — the device mutations are independent (different record
-/// offsets), so one missing/failed key must not shadow the rest of the
-/// block from being replayed. The aggregate `ReplayResult` reported to the
-/// caller is the worst-observed outcome:
-/// - a fatal failure (`IoError`/`LogicError`/`CorruptEntry`) anywhere in the
-///   batch is surfaced (after every txid has still been given a chance to
-///   apply), so the caller's F-G4-007 "stop on first non-tolerable failure"
-///   contract still halts subsequent redo entries;
-/// - otherwise, `Applied` if at least one txid actually mutated the device
-///   (this is a minor stats-granularity simplification versus the retired
-///   per-tx-entry model: a rare non-fatal `MissingPrimary` for one txid
-///   inside an otherwise-successful batch is not separately counted in
-///   `RecoveryStats` — the device mutations themselves are still complete
-///   and correct for every key regardless);
-/// - otherwise a non-fatal failure if every txid failed non-fatally;
-/// - otherwise `Skipped` (every txid already applied — the idempotent
-///   double-replay case — or the batch is empty).
-#[allow(clippy::too_many_arguments)]
-fn replay_set_mined_batch_with_allocator(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    mut allocator: Option<&mut crate::allocator::BoxedAllocator>,
-    txids: &[TxKey],
-    block_id: u32,
-    block_height: u32,
-    subtree_idx: u32,
-    unset: bool,
-) -> ReplayResult {
-    let mut any_applied = false;
-    let mut any_skipped = false;
-    let mut worst_fatal: Option<ReplayCause> = None;
-    let mut worst_non_fatal: Option<ReplayCause> = None;
-
-    for tx_key in txids {
-        let outcome = replay_set_mined_with_allocator(
-            device,
-            index,
-            allocator.as_deref_mut(),
-            tx_key,
-            block_id,
-            block_height,
-            subtree_idx,
-            unset,
-        );
-        match outcome {
-            ReplayResult::Applied => any_applied = true,
-            ReplayResult::Skipped => any_skipped = true,
-            ReplayResult::Failed(cause) if is_fatal_replay_cause(cause) => {
-                worst_fatal.get_or_insert(cause);
-            }
-            ReplayResult::Failed(cause) => {
-                worst_non_fatal.get_or_insert(cause);
-            }
-        }
-    }
-
-    if let Some(cause) = worst_fatal {
-        return ReplayResult::Failed(cause);
-    }
-    if any_applied {
-        return ReplayResult::Applied;
-    }
-    if let Some(cause) = worst_non_fatal {
-        return ReplayResult::Failed(cause);
-    }
-    if any_skipped {
-        return ReplayResult::Skipped;
-    }
-    // Empty batch (txids.is_empty()): nothing to apply — treat as a no-op,
-    // mirroring how a Checkpoint/no-op entry is handled.
-    ReplayResult::Skipped
 }
 
 fn replay_freeze(
@@ -3292,307 +2954,6 @@ fn replay_metadata_op(
 }
 
 /// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): replay a
-/// `CompensateUnsetMined` redo entry recorded mid-rollback.
-///
-/// Re-adds the captured `block_id` / `block_height` / `subtree_idx` triple
-/// to the record's block-entry list, restoring the state that existed
-/// BEFORE the failed-replication unset-mined was applied. Idempotent: if
-/// the block entry is already present (with matching height/subtree),
-/// the call is a no-op.
-fn replay_compensate_unset_mined(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    tx_key: &TxKey,
-    block_id: u32,
-    block_height: u32,
-    subtree_idx: u32,
-) -> ReplayResult {
-    replay_compensate_unset_mined_with_allocator(
-        device,
-        index,
-        None,
-        tx_key,
-        block_id,
-        block_height,
-        subtree_idx,
-    )
-}
-
-fn replay_compensate_unset_mined_with_allocator(
-    device: &dyn BlockDevice,
-    index: &ShardedIndex,
-    allocator: Option<&mut crate::allocator::BoxedAllocator>,
-    tx_key: &TxKey,
-    block_id: u32,
-    block_height: u32,
-    subtree_idx: u32,
-) -> ReplayResult {
-    let mut allocator = allocator;
-    let ie = match index.lookup(tx_key) {
-        Some(e) => e,
-        // Compensation against a record that was deleted later in the log
-        // is benign — the record state we'd restore no longer exists.
-        // Use MissingPrimary which is the tolerable class.
-        None => return ReplayResult::Failed(ReplayCause::MissingPrimary),
-    };
-
-    let mut meta = match io::read_metadata(device, ie.record_offset) {
-        Ok(m) => m,
-        Err(_) => return ReplayResult::Failed(ReplayCause::IoError),
-    };
-
-    let count = meta.block_entry_count as usize;
-    let inline = count.min(INLINE_BLOCK_ENTRIES);
-
-    // Idempotency: if the entry is already present with matching values,
-    // skip. This handles re-replay of the same compensation entry.
-    for i in 0..inline {
-        if { meta.block_entries_inline[i].block_id } == block_id {
-            let existing = meta.block_entries_inline[i];
-            if { existing.block_height } == block_height && { existing.subtree_idx } == subtree_idx
-            {
-                return ReplayResult::Skipped;
-            }
-            // A different height/subtree for the same block_id is an
-            // unexpected divergence — overwrite to the captured values.
-            meta.block_entries_inline[i] = BlockEntry {
-                block_id,
-                block_height,
-                subtree_idx,
-            };
-            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
-                return ReplayResult::Failed(ReplayCause::IoError);
-            }
-            return ReplayResult::Applied;
-        }
-    }
-
-    // Idempotency must also cover OVERFLOW-resident entries: pre-fix
-    // the dup-check stopped at the inline cap, so re-replaying a
-    // compensation for an entry that lives in overflow appended a
-    // duplicate.
-    if count > INLINE_BLOCK_ENTRIES {
-        let mut overflow = match read_recovery_overflow_entries(device, &meta) {
-            Ok(v) => v,
-            Err(RecoveryOverflowError::Io) => return ReplayResult::Failed(ReplayCause::IoError),
-            Err(RecoveryOverflowError::Logic) => {
-                return ReplayResult::Failed(ReplayCause::LogicError);
-            }
-        };
-        if let Some(pos) = overflow.iter().position(|e| { e.block_id } == block_id) {
-            let existing = overflow[pos];
-            if { existing.block_height } == block_height && { existing.subtree_idx } == subtree_idx
-            {
-                return ReplayResult::Skipped;
-            }
-            // Divergence: overwrite in place (same entry count, so the
-            // region size is unchanged and the rewrite reuses it).
-            overflow[pos] = BlockEntry {
-                block_id,
-                block_height,
-                subtree_idx,
-            };
-            let Some(alloc) = allocator.as_deref_mut() else {
-                return ReplayResult::Failed(ReplayCause::LogicError);
-            };
-            match write_recovery_overflow_entries(device, alloc, &mut meta, &overflow) {
-                Ok(()) => {}
-                Err(RecoveryOverflowError::Io) => {
-                    return ReplayResult::Failed(ReplayCause::IoError);
-                }
-                Err(RecoveryOverflowError::Logic) => {
-                    return ReplayResult::Failed(ReplayCause::LogicError);
-                }
-            }
-            if io::write_metadata(device, ie.record_offset, &meta).is_err() {
-                return ReplayResult::Failed(ReplayCause::IoError);
-            }
-            return ReplayResult::Applied;
-        }
-    }
-
-    // Not present — append to inline if room.
-    if count < INLINE_BLOCK_ENTRIES {
-        meta.block_entries_inline[count] = BlockEntry {
-            block_id,
-            block_height,
-            subtree_idx,
-        };
-        meta.block_entry_count += 1;
-        if io::write_metadata(device, ie.record_offset, &meta).is_err() {
-            return ReplayResult::Failed(ReplayCause::IoError);
-        }
-        ReplayResult::Applied
-    } else {
-        let Some(alloc) = allocator else {
-            // The legacy `recover` path has no allocator handle. Fail
-            // closed rather than silently dropping a compensation entry
-            // that needs overflow storage.
-            return ReplayResult::Failed(ReplayCause::LogicError);
-        };
-        match append_recovery_overflow_block_entry(
-            device,
-            alloc,
-            &mut meta,
-            BlockEntry {
-                block_id,
-                block_height,
-                subtree_idx,
-            },
-        ) {
-            Ok(()) => {
-                if io::write_metadata(device, ie.record_offset, &meta).is_err() {
-                    ReplayResult::Failed(ReplayCause::IoError)
-                } else {
-                    ReplayResult::Applied
-                }
-            }
-            Err(RecoveryOverflowError::Io) => ReplayResult::Failed(ReplayCause::IoError),
-            Err(RecoveryOverflowError::Logic) => ReplayResult::Failed(ReplayCause::LogicError),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum RecoveryOverflowError {
-    Io,
-    Logic,
-}
-
-fn append_recovery_overflow_block_entry(
-    device: &dyn BlockDevice,
-    allocator: &mut crate::allocator::BoxedAllocator,
-    metadata: &mut TxMetadata,
-    entry: BlockEntry,
-) -> std::result::Result<(), RecoveryOverflowError> {
-    let count = metadata.block_entry_count as usize;
-    let overflow_count = count.saturating_sub(INLINE_BLOCK_ENTRIES);
-    let mut overflow = read_recovery_overflow_entries(device, metadata)?;
-    if overflow.len() != overflow_count {
-        return Err(RecoveryOverflowError::Logic);
-    }
-    overflow.push(entry);
-    write_recovery_overflow_entries(device, allocator, metadata, &overflow)
-}
-
-/// Rewrite a record's overflow block-entry region during replay.
-///
-/// Mirrors the live `write_overflow_entries` in `ops/engine.rs`,
-/// including the F-G2-003 exact-size free + realloc-on-size-change
-/// discipline: growing the region across an alignment boundary
-/// REALLOCATES instead of writing past the existing allocation into
-/// whatever the allocator placed next (silent neighbour corruption —
-/// the pre-fix recovery-side writer reused the old offset
-/// unconditionally). An emptied region is freed and the overflow
-/// pointer cleared.
-///
-/// Precondition: the inline slots are full (`block_entry_count >=
-/// INLINE_BLOCK_ENTRIES` on entry — overflow only exists past the
-/// inline cap). On success `block_overflow_offset` and
-/// `block_entry_count` reflect `entries`.
-fn write_recovery_overflow_entries(
-    device: &dyn BlockDevice,
-    allocator: &mut crate::allocator::BoxedAllocator,
-    metadata: &mut TxMetadata,
-    entries: &[BlockEntry],
-) -> std::result::Result<(), RecoveryOverflowError> {
-    let alignment = device.alignment();
-    let old_offset = { metadata.block_overflow_offset };
-    // Derive the OLD allocation size from the pre-mutation count (the
-    // caller has not touched `block_entry_count` yet). Defensive
-    // fallback to one alignment unit matches `overflow_block_size`'s
-    // contract in ops/engine.rs for a live pointer with a stale count.
-    let old_total = metadata.block_entry_count as usize;
-    let old_block_size = if old_total <= INLINE_BLOCK_ENTRIES {
-        alignment
-    } else {
-        io::align_up(
-            (old_total - INLINE_BLOCK_ENTRIES) * BLOCK_ENTRY_SIZE,
-            alignment,
-        )
-    };
-
-    let new_total = INLINE_BLOCK_ENTRIES
-        .checked_add(entries.len())
-        .filter(|&t| t <= u8::MAX as usize)
-        .ok_or(RecoveryOverflowError::Logic)?;
-
-    if entries.is_empty() {
-        if old_offset != 0 {
-            allocator
-                .free(old_offset, old_block_size as u64)
-                .map_err(|_| RecoveryOverflowError::Logic)?;
-            metadata.block_overflow_offset = 0;
-        }
-        metadata.block_entry_count = INLINE_BLOCK_ENTRIES as u8;
-        return Ok(());
-    }
-
-    let data_size = entries.len() * BLOCK_ENTRY_SIZE;
-    let new_block_size = io::align_up(data_size, alignment);
-    let offset = if old_offset == 0 {
-        allocator
-            .allocate(new_block_size as u64)
-            .map_err(|_| RecoveryOverflowError::Logic)?
-    } else if new_block_size == old_block_size {
-        // Same alignment-rounded size: overwrite in place.
-        old_offset
-    } else {
-        // Grow or shrink across an alignment boundary: exact-size free
-        // of the old region, fresh allocation for the new size.
-        allocator
-            .free(old_offset, old_block_size as u64)
-            .map_err(|_| RecoveryOverflowError::Logic)?;
-        allocator
-            .allocate(new_block_size as u64)
-            .map_err(|_| RecoveryOverflowError::Logic)?
-    };
-
-    let mut buf = AlignedBuf::new(new_block_size, alignment);
-    for (i, overflow_entry) in entries.iter().enumerate() {
-        let start = i * BLOCK_ENTRY_SIZE;
-        overflow_entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
-    }
-    device
-        .pwrite_all_at(&buf, offset)
-        .map_err(|_| RecoveryOverflowError::Io)?;
-    metadata.block_overflow_offset = offset;
-    metadata.block_entry_count = new_total as u8;
-    Ok(())
-}
-
-fn read_recovery_overflow_entries(
-    device: &dyn BlockDevice,
-    metadata: &TxMetadata,
-) -> std::result::Result<Vec<BlockEntry>, RecoveryOverflowError> {
-    let overflow_count = (metadata.block_entry_count as usize).saturating_sub(INLINE_BLOCK_ENTRIES);
-    if overflow_count == 0 {
-        return Ok(Vec::new());
-    }
-    let overflow_offset = metadata.block_overflow_offset;
-    if overflow_offset == 0 {
-        return Err(RecoveryOverflowError::Logic);
-    }
-
-    let alignment = device.alignment();
-    let data_size = overflow_count * BLOCK_ENTRY_SIZE;
-    let read_size = io::align_up(data_size, alignment);
-    let mut buf = AlignedBuf::new(read_size, alignment);
-    device
-        .pread_exact_at(&mut buf, overflow_offset)
-        .map_err(|_| RecoveryOverflowError::Io)?;
-
-    let mut entries = Vec::with_capacity(overflow_count);
-    for i in 0..overflow_count {
-        let start = i * BLOCK_ENTRY_SIZE;
-        entries.push(BlockEntry::from_bytes(
-            &buf[start..start + BLOCK_ENTRY_SIZE],
-        ));
-    }
-    Ok(entries)
-}
-
-/// Gap #8 (TERANODE_PRODUCTION_READINESS_GAPS.md): replay a
 /// `CompensateReassign` redo entry recorded mid-rollback.
 ///
 /// Restores the slot's `utxo_hash` to the captured pre-reassign value
@@ -3850,7 +3211,7 @@ pub fn recover_allocator_frontiers(
 mod tests {
     use super::*;
     use crate::allocator::SlotAllocator;
-    use crate::device::MemoryDevice;
+    use crate::device::{AlignedBuf, MemoryDevice};
     use crate::index::PrimaryBackend;
     use crate::locks::StripedLocks;
     use crate::ops::engine::Engine;
@@ -4950,11 +4311,19 @@ mod tests {
         assert_eq!(slot.spending_data, [0xAB; 36]);
     }
 
+    /// Task 16d: `SetMinedBatch` is no longer replayed against the device —
+    /// mined-state (block_id 42's presence) lives ONLY in the MinedIndex now,
+    /// reconstructed separately by `Engine::replay_mined_index_redo_tail`
+    /// (Task 13). This device-level `recover()` must report the entry as
+    /// `Skipped` and leave the record's device footer completely untouched
+    /// (not even a generation bump), never attempting to write it.
     #[test]
-    fn crash_between_redo_and_data_write_set_mined() {
+    fn set_mined_batch_is_not_replayed_against_the_device() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(2, 5);
         let ie = h.index.lookup(&key).unwrap();
+
+        let before = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SetMinedBatch {
@@ -4969,17 +4338,18 @@ mod tests {
         })
         .unwrap();
 
-        // Block entry not yet written
-        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        assert_eq!(meta.block_entry_count, 0);
-
-        // Recovery replays
+        // Recovery does not replay it against the device.
         let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
-        assert_eq!(stats.entries_replayed, 1);
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 1);
 
-        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        assert_eq!(meta.block_entry_count, 1);
-        assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+        let after = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+        assert_eq!(after.block_entry_count, 0, "device stays at 0, not 1");
+        assert_eq!(
+            { after.generation },
+            { before.generation },
+            "no device write at all — generation must not bump"
+        );
     }
 
     #[test]
@@ -5041,17 +4411,25 @@ mod tests {
         assert_eq!({ meta.spent_utxos }, 1);
     }
 
-    /// D5/§9 + Task 11: a `SetMinedBatch` covering several txids reproduces
-    /// the device block-entries for ALL of them from a single redo entry,
-    /// and replaying the SAME batch entry a second time is a no-op for
-    /// every txid (idempotent), exactly as the retired per-tx `SetMined`
-    /// replay was.
+    /// Task 16d: a `SetMinedBatch` covering several txids is no longer
+    /// replayed against the device for ANY of them — mined-state
+    /// reconstruction for the whole batch is `Engine::replay_mined_index_redo_tail`'s
+    /// job now (Task 13), operating on the MinedIndex, not the device. Every
+    /// replay of this entry (first or repeated) must be a device-level
+    /// no-op, and none of the batch's records may gain a block entry or a
+    /// generation bump on the device.
     #[test]
-    fn set_mined_batch_replays_all_txids_and_is_idempotent() {
+    fn set_mined_batch_is_not_replayed_against_the_device_for_any_txid() {
         let mut h = RecoveryTestHarness::new();
         let key_a = h.create_record(5, 5);
         let key_b = h.create_record(6, 5);
         let key_c = h.create_record(7, 5);
+        let before: Vec<_> = [key_a, key_b, key_c]
+            .iter()
+            .map(|k| {
+                io::read_metadata(&*h.data_dev, h.index.lookup(k).unwrap().record_offset).unwrap()
+            })
+            .collect();
 
         let mut redo = h.redo_log();
         let batch = RedoOp::SetMinedBatch {
@@ -5068,22 +4446,22 @@ mod tests {
         redo.append_and_flush(batch).unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
-        // First entry applies (mutates all 3 device records); the identical
-        // second entry is a full no-op re-replay.
-        assert_eq!(stats.entries_replayed, 1);
-        assert_eq!(stats.entries_skipped, 1);
+        // Both entries (the original and the identical repeat) are
+        // device-level no-ops.
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 2);
 
-        for key in [key_a, key_b, key_c] {
+        for (key, before) in [key_a, key_b, key_c].into_iter().zip(before) {
             let ie = h.index.lookup(&key).unwrap();
-            let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+            let after = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
             assert_eq!(
-                meta.block_entry_count, 1,
-                "each txid in the batch must have exactly one block entry"
+                after.block_entry_count, 0,
+                "no txid in the batch gains a device block entry"
             );
             assert_eq!(
-                { meta.block_entries_inline[0].block_id },
-                10,
-                "block entry must carry the batch's shared block_id"
+                { after.generation },
+                { before.generation },
+                "no device write at all — generation must not bump"
             );
         }
     }
@@ -7421,8 +6799,13 @@ mod tests {
         assert_eq!(stats.entries_skipped, 1);
     }
 
+    /// Task 16d: `SetMinedBatch` replay no longer touches the device at
+    /// all — the device's `generation` must stay at its pre-replay value
+    /// (0), not bump. Mined-state (block_entry_count reaching 1) is
+    /// reconstructed by `Engine::replay_mined_index_redo_tail` into the
+    /// MinedIndex instead (Task 13), never the device.
     #[test]
-    fn replay_set_mined_bumps_on_device_generation_when_applied() {
+    fn replay_set_mined_does_not_bump_device_generation() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(79, 1);
         let record_offset = h.index.lookup(&key).unwrap().record_offset;
@@ -7449,11 +6832,16 @@ mod tests {
         .unwrap();
 
         let stats = recover(&*h.data_dev, &redo, &h.index).unwrap();
-        assert_eq!(stats.entries_replayed, 1);
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 1);
 
         let meta = io::read_metadata(&*h.data_dev, record_offset).unwrap();
-        assert_eq!({ meta.block_entry_count }, 1);
-        assert_eq!({ meta.generation }, 1);
+        assert_eq!({ meta.block_entry_count }, 0, "device untouched");
+        assert_eq!(
+            { meta.generation },
+            0,
+            "no device write at all — generation must not bump"
+        );
     }
 
     /// AUDIT M1.4 regression — a torn (CRC-failing) slot covered by a FreezeV2
@@ -8393,8 +7781,16 @@ mod tests {
         assert!(unmined_backend.is_empty());
     }
 
+    /// Task 16d: `CompensateUnsetMined` is no longer replayed against the
+    /// device — its paired forward `SetMinedBatch` redo entry (always
+    /// emitted alongside it by `compensate_replication_failure`) is what
+    /// `Engine::replay_mined_index_redo_tail` uses to restore the
+    /// MinedIndex. Replaying `CompensateUnsetMined` alone (as this
+    /// device-level `recover_all_with_allocator` does — it never touches
+    /// the MinedIndex) must be a device-level no-op: no overflow
+    /// allocation, no metadata write, no generation bump.
     #[test]
-    fn compensate_unset_mined_recovery_allocates_overflow() {
+    fn compensate_unset_mined_is_not_replayed_against_the_device() {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(0xE9, 1);
         let ie = h.index.lookup(&key).unwrap();
@@ -8409,6 +7805,7 @@ mod tests {
         }
         meta.block_entry_count = INLINE_BLOCK_ENTRIES as u8;
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+        let before = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::CompensateUnsetMined {
@@ -8431,21 +7828,25 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stats.entries_replayed, 1);
+        assert_eq!(stats.entries_replayed, 0);
+        assert_eq!(stats.entries_skipped, 1);
         assert_eq!(stats.entries_failed, 0);
 
-        let meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        assert_eq!(meta.block_entry_count, 4);
-        let overflow_offset = meta.block_overflow_offset;
-        assert_ne!(overflow_offset, 0);
-        let overflow = read_recovery_overflow_entries(&*h.data_dev, &meta).unwrap();
+        let after = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!(
-            overflow,
-            vec![BlockEntry {
-                block_id: 99,
-                block_height: 901_999,
-                subtree_idx: 7,
-            }]
+            after.block_entry_count,
+            { before.block_entry_count },
+            "device untouched — still only the 3 inline entries seeded above"
+        );
+        assert_eq!(
+            { after.block_overflow_offset },
+            0,
+            "no overflow region allocated"
+        );
+        assert_eq!(
+            { after.generation },
+            { before.generation },
+            "no device write at all — generation must not bump"
         );
     }
 

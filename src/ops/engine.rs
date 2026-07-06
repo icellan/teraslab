@@ -3246,7 +3246,11 @@ impl Engine {
 
         // Handle empty spends list
         if req.spends.is_empty() {
-            let block_ids = collect_block_ids(&metadata).to_vec();
+            // Task 16d: block_ids come from the MinedIndex, not the device —
+            // `metadata.block_entries_inline` is no longer kept current by
+            // setMined.
+            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            let block_ids: Vec<u32> = mined_entries.into_iter().map(|e| e.block_id).collect();
             return Ok(PreparedSpend {
                 tx_key: req.tx_key,
                 valid_spends: Vec::new(),
@@ -3427,7 +3431,9 @@ impl Engine {
             }
         }
 
-        let block_ids = collect_block_ids(&metadata).to_vec();
+        // Task 16d: block_ids come from the MinedIndex, not the device.
+        let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+        let block_ids: Vec<u32> = mined_entries.into_iter().map(|e| e.block_id).collect();
 
         Ok(PreparedSpend {
             tx_key: req.tx_key,
@@ -3583,7 +3589,11 @@ impl Engine {
                             });
                         }
                     }
-                    let block_ids = collect_block_ids(&metadata).to_vec();
+                    // Task 16d: block_ids come from the MinedIndex, not the
+                    // device.
+                    let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+                    let block_ids: Vec<u32> =
+                        mined_entries.into_iter().map(|e| e.block_id).collect();
                     return Ok(SpendResponse {
                         signal: Signal::None,
                         block_ids,
@@ -3694,7 +3704,9 @@ impl Engine {
         let new_dah = { metadata.delete_at_height };
         self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
-        let block_ids = collect_block_ids(&metadata).to_vec();
+        // Task 16d: block_ids come from the MinedIndex (already fetched
+        // above for the DAH eval), not the device.
+        let block_ids: Vec<u32> = mined_entries.into_iter().map(|e| e.block_id).collect();
 
         Ok(SpendResponse { signal, block_ids })
     }
@@ -3882,8 +3894,9 @@ impl Engine {
 
     /// Set or unset the mined state of a transaction.
     ///
-    /// Adds or removes a block entry in the metadata. Only modifies the
-    /// metadata region — UTXO slots are not touched.
+    /// Task 16d: mined-state lives ONLY in the [`ShardedMinedIndex`] now —
+    /// this performs a single device READ (for DAH-eval inputs) and ZERO
+    /// device WRITES. See [`Self::set_mined_inner`] for the full contract.
     #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_mined(&self, req: &SetMinedRequest) -> Result<SetMinedResponse, SpendError> {
         let params = SetMinedSharedParams {
@@ -3902,14 +3915,72 @@ impl Engine {
     ///
     /// Used by both [`set_mined`] (single request) and [`set_mined_batch`]
     /// (batch with shared params). Acquires the per-transaction stripe lock.
-    /// Apply a single `set_mined` under this record's own stripe lock.
     ///
     /// Shared by [`Self::set_mined_batch`] and the dispatch handler's parallel
     /// apply fan-out. Self-locking (takes the per-key stripe lock on entry) and
-    /// touching only Mutex-guarded secondary indexes and the per-offset
-    /// device locks, so independent keys are safe to apply concurrently. Writes
-    /// no redo — the caller has already made the batch's `SetMined` intents
-    /// durable (WAL-first), so a parallel apply does not affect crash recovery.
+    /// touching only Mutex-guarded secondary indexes, so independent keys are
+    /// safe to apply concurrently. Writes no redo — the caller has already
+    /// made the batch's `SetMined` intents durable (WAL-first), so a parallel
+    /// apply does not affect crash recovery.
+    ///
+    /// # Task 16d — zero device writes (the perf win)
+    ///
+    /// Mined-state (`block_ids`/`unmined_since`) is authoritative in the
+    /// in-RAM [`ShardedMinedIndex`] (durable via its own checkpoint snapshot +
+    /// redo replay, Task 13) — GET/delete-eval/spend's LOCKED check already
+    /// read it there (Tasks 10/16a/16c), not from the device. This method
+    /// therefore performs exactly ONE device READ (for the DAH-eval inputs
+    /// that remain device-only: `flags`, `preserve_until`, `spent_utxos`,
+    /// `utxo_count`, `delete_at_height`) and applies the mined-state
+    /// transition to the `MinedIndex` — its write is now the SOLE mutation
+    /// this op performs. It never reads or writes the on-device block-entry
+    /// region (inline or overflow) at all, and never issues a
+    /// `write_metadata_direct`/`write_metadata_fast` RMW.
+    ///
+    /// **Accepted semantic change**: the on-device `generation`, `updated_at`,
+    /// and `delete_at_height` footer fields are no longer bumped by this op
+    /// (there is nothing to write them into). They go stale immediately after
+    /// the first setMined call that would previously have changed them. This
+    /// is safe because nothing consensus-critical reads those fields off the
+    /// device anymore for mined-state: `GET`'s block-fields and `unmined`
+    /// come from the `MinedIndex`, and the DAH *secondary index*
+    /// (`dah_index`, RAM/redb, not a device write) is kept current here via
+    /// [`Self::update_dah_index`] — it stays authoritative for deletability.
+    /// The device's own `delete_at_height`/`LAST_SPENT_ALL` fields are used
+    /// only as this call's OWN eval inputs (see below), never re-published.
+    ///
+    /// The pre-16d "clear LOCKED on setMined" behavior is also gone — 16c
+    /// made device `LOCKED` an immutable create-time marker (`spend`'s
+    /// effective-lock check is `device.LOCKED && !ignore_locked &&
+    /// MinedIndex.not-mined`), so there is no longer anything to clear here.
+    ///
+    /// **Known residual gap (fail-safe, not consensus-breaking)**: because
+    /// `delete_at_height`/`LAST_SPENT_ALL` are read fresh from the device
+    /// every call but never re-written by this op, TWO setMined-driven DAH
+    /// transitions in a row (e.g. set → reorg-driven unset) with NO
+    /// intervening device-writing op (`spend`/`unspend`/
+    /// `mark_on_longest_chain`, all unaffected by this task) will each derive
+    /// their "existing DAH" baseline from the SAME stale device snapshot. If
+    /// the first call's patch would have cleared/moved a real `dah_index`
+    /// entry, the second call may not see that it needs to — the secondary
+    /// index can retain an orphaned entry indefinitely. This is fail-safe:
+    /// [`Self::record_due_for_sweep`] (the pruner's final gate) reads the
+    /// SAME on-device `delete_at_height`, so the two sides stay mutually
+    /// consistent and an orphaned entry is never wrongly deleted — at worst
+    /// it is never (re-)swept until some other device-writing op refreshes
+    /// the field. Flagged for a possible follow-up (source `existing_dah`
+    /// from `dah_index` itself rather than the device) rather than fixed
+    /// here, since it is out of this task's scope and never causes an early
+    /// or incorrect delete.
+    ///
+    /// Also drops the OLD `unmined_index` (`ShardedUnminedIndex`) update this
+    /// op used to perform: that index's "old" value would suffer the exact
+    /// same staleness as `delete_at_height` above, and unlike `dah_index` it
+    /// has no remaining correctness-critical reader (only 4 `.len()` metrics
+    /// endpoints in `http.rs`, already tracked for a reroute onto the
+    /// `MinedIndex`'s own unmined-count). `mark_on_longest_chain` and
+    /// create/delete still maintain it on their own axes, so it is not fully
+    /// abandoned — just no longer updated by the setMined axis.
     pub(crate) fn set_mined_inner(
         &self,
         tx_key: &TxKey,
@@ -3922,7 +3993,7 @@ impl Engine {
         self.observe_block_height(req.current_block_height);
         let _guard = self.locks.lock(tx_key);
 
-        // 1. Index lookup
+        // 1. Index lookup.
         let entry = self
             .index
             .lookup_checked(tx_key)
@@ -3933,379 +4004,110 @@ impl Engine {
         let record_offset = entry.record_offset;
         let device_id = entry.device_id;
 
-        // ---------------------------------------------------------------
-        // FAST PATH: first-ever setMined (count == 0), write-only.
-        //
-        // When no block entries exist yet, we can skip the block-entry
-        // reconciliation: no duplicates to check, no existing block_ids to
-        // return. The slim primary no longer caches the block-entry count,
-        // so eligibility is decided from the authoritative on-device
-        // metadata read below (the RMW needs that read anyway).
-        // ---------------------------------------------------------------
-        if !req.unset_mined && !self.device_ptr_for(device_id).is_null() {
-            // Read the authoritative on-device metadata up front and derive
-            // EVERY DAH/flag/counter input from it. The fast path already
-            // needs this read for the RMW (CRC must cover the full
-            // post-state), so it is free.
-            // SAFETY: `device_ptr` is non-null (the fast path is gated on
-            // `!self.device_ptr_for(device_id).is_null()`) and live for the engine's
-            // lifetime; `record_offset` is allocator-valid. The set_mined
-            // caller holds this record's stripe lock, and
-            // `read_metadata_direct` takes the per-offset `io_locks()` read
-            // side, so the read is torn-read-safe.
-            let mut meta = unsafe {
-                io::read_metadata_direct(self.device_ptr_for(device_id), record_offset).map_err(
-                    |e| SpendError::StorageError {
-                        detail: format!("{e}"),
-                    },
-                )?
-            };
+        // 2. The ONE device read this op performs: DAH-eval inputs
+        //    (flags/preserve_until/spent_utxos/utxo_count/delete_at_height)
+        //    plus confirmation the record still exists. No write follows.
+        let meta = self.read_metadata_fast(device_id, record_offset)?;
 
-            // Fast-path eligibility: the record must have no block entries
-            // yet. When it already does, writing into inline slot 0 would
-            // clobber an existing entry, so fall through to the slow path,
-            // which reads and reconciles the full entry list.
-            if { meta.block_entry_count } != 0 {
-                // Re-read via the slow path below (it re-reads metadata).
-            } else {
-                let new_count = 1u8;
-                let new_entry = BlockEntry {
-                    block_id: req.block_id,
-                    block_height: req.block_height,
-                    subtree_idx: req.subtree_idx,
-                };
-
-                // Derive flags + DAH inputs from the FRESH meta (not cache).
-                let mut tf = meta.flags;
-                tf.remove(TxFlags::LOCKED); // setMined clears LOCKED
-                let meta_unmined = { meta.unmined_since };
-                let new_unmined = if req.on_longest_chain {
-                    0u32
-                } else {
-                    meta_unmined
-                };
-                let old_unmined = meta_unmined;
-                let preserve = { meta.preserve_until };
-                let has_preserve = preserve != 0;
-                let meta_dah = { meta.delete_at_height };
-                // `old_dah` is the DAH the secondary index currently
-                // reflects: the on-device DAH when not preserved, else 0
-                // (preservation clears the DAH).
-                let old_dah = if has_preserve { 0 } else { meta_dah };
-                let meta_spent = { meta.spent_utxos };
-                let meta_utxo_count = { meta.utxo_count };
-
-                // DAH evaluation from fresh-meta fields. `new_count`/
-                // `new_unmined` are the post-mutation values about to be
-                // dual-written into the MinedIndex below (Task 16a: value
-                // already in hand, no extra MinedIndex read needed).
-                let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
-                    tf,
-                    meta_spent,
-                    meta_utxo_count,
-                    new_count,
-                    new_unmined,
-                    has_preserve,
-                    if has_preserve { preserve } else { meta_dah },
-                    req.current_block_height,
-                    req.block_height_retention,
-                )?;
-                let mut new_dah = old_dah;
-                if let Some(ref patch) = dah_patch {
-                    tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
-                    new_dah = patch.new_delete_at_height;
-                }
-
-                let updated_at = self.now_millis();
-
-                // Read-modify-write so CRC covers the full post-state
-                // (block-entry-count, inline entry, and footer fields).
-                // Generation is taken from the on-device value (F-G2-011).
-                let generation = { meta.generation }.wrapping_add(1);
-                meta.flags = tf;
-                meta.generation = generation;
-                meta.updated_at = updated_at;
-                meta.delete_at_height = new_dah;
-                meta.unmined_since = new_unmined;
-                meta.block_entry_count = new_count;
-                meta.block_entries_inline[0] = new_entry;
-                // SAFETY: `device_ptr` is non-null (fast-path gate) and live
-                // for the engine's lifetime; `record_offset` is
-                // allocator-valid. The caller holds this record's stripe
-                // lock; `write_metadata_direct` takes the per-offset
-                // `io_locks()` write side for torn-read-safe publication.
-                unsafe {
-                    io::write_metadata_direct(self.device_ptr_for(device_id), record_offset, &meta);
-                }
-
-                // Update secondary indexes with two-phase durability.
-                // Batched into a single redo fsync when both change.
-                self.update_both_secondary_indexes(
-                    tx_key,
-                    old_dah,
-                    new_dah,
-                    old_unmined,
-                    new_unmined,
-                )?;
-
-                // Dual-write (Task 9): mirror the same mined-state
-                // transition into the authoritative MinedIndex so it stays
-                // in sync with the device. Device remains the read path
-                // until Task 10 reroutes readers.
-                if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
-                    self.mined_index().apply_set_mined(
-                        tx_key,
-                        entry.mined_slot,
-                        req.block_id,
-                        req.block_height,
-                        req.subtree_idx,
-                        req.on_longest_chain,
-                    );
-                }
-
-                return Ok(SetMinedResponse {
-                    signal,
-                    block_ids: vec![req.block_id],
-                    generation,
+        // 3. Apply the mined-state transition to the MinedIndex — the SOLE
+        //    write this op performs (Task 9's dual-write call; the device
+        //    half of that dual-write is what Task 16d removes).
+        if entry.mined_slot == crate::index::mined_index::NO_MINED_SLOT {
+            // Should not happen for a live record — `create` always
+            // allocates a mined_slot (Task 7). Tolerated defensively (the
+            // pre-16d dual-write branch was gated the same way): there is no
+            // device fallback left to fall into, so the mined-state
+            // transition this call intended is simply lost. Surfaced loudly
+            // since it indicates an index invariant violation elsewhere.
+            tracing::error!(
+                tx_key = ?tx_key.txid,
+                "set_mined_inner: live record has no mined_slot allocated; mined-state \
+                 transition for this call cannot be recorded anywhere (post-16d there is no \
+                 device fallback)",
+            );
+        } else if req.unset_mined {
+            self.mined_index().apply_unset(
+                tx_key,
+                entry.mined_slot,
+                req.block_id,
+                req.current_block_height,
+            );
+        } else {
+            // BUG-2 guard, preserved: the pre-16d device counter was a `u8`,
+            // so a 256th DISTINCT block_id would wrap `255 -> 0` rather than
+            // erroring. The MinedIndex's overflow `Vec<BlockEntry>` has no
+            // such physical width constraint, but the cap is a deliberate
+            // bound against unbounded per-tx memory growth (a client
+            // repeatedly setMined-ing the same tx into new block_ids), not
+            // merely a storage-format artifact — so it is kept here rather
+            // than dropped. Idempotent re-application of an ALREADY-recorded
+            // block_id must still succeed even at capacity (mirrors the old
+            // `exists` short-circuit), so only a genuinely new distinct
+            // block_id is checked against the cap.
+            let (existing_before, _) = self.mined_block_entries(tx_key)?;
+            let already_present = existing_before.iter().any(|e| e.block_id == req.block_id);
+            if !already_present && existing_before.len() >= u8::MAX as usize {
+                return Err(SpendError::BlockEntriesFull {
+                    cap: u8::MAX as usize,
                 });
             }
+            self.mined_index().apply_set_mined(
+                tx_key,
+                entry.mined_slot,
+                req.block_id,
+                req.block_height,
+                req.subtree_idx,
+                req.on_longest_chain,
+            );
         }
 
-        // ---------------------------------------------------------------
-        // SLOW PATH: unset_mined, overflow (count >= 3), or no direct ptr.
-        // Full metadata read + write.
-        // ---------------------------------------------------------------
+        // 4. Read the post-mutation mined-state back from the MinedIndex —
+        //    the authoritative source (Task 10) — for the DAH eval and the
+        //    response's block_ids. Not a device read.
+        let (block_entries, new_unmined) = self.mined_block_entries(tx_key)?;
+        let has_blocks = !block_entries.is_empty();
 
-        // 2. Read metadata
-        let mut metadata = self.read_metadata_fast(device_id, record_offset)?;
-
-        let old_unmined = { metadata.unmined_since };
-        let old_dah = { metadata.delete_at_height };
-
-        if req.unset_mined {
-            // Remove block entry by scanning inline and overflow entries
-            let count = metadata.block_entry_count as usize;
-            let inline_count = count.min(INLINE_BLOCK_ENTRIES);
-            let mut found = false;
-
-            // Check inline entries first
-            for i in 0..inline_count {
-                if { metadata.block_entries_inline[i].block_id } == req.block_id {
-                    // Swap with last entry (may be inline or from overflow)
-                    if count > INLINE_BLOCK_ENTRIES {
-                        // Last entry is in overflow — pull it into the inline slot
-                        let mut overflow =
-                            read_overflow_entries(&**self.device_for(device_id), &metadata)
-                                .map_err(|e| SpendError::StorageError {
-                                    detail: format!("{e}"),
-                                })?;
-                        // F-G2-004: `count > INLINE_BLOCK_ENTRIES` implies a
-                        // non-empty overflow, so this pop is unreachable-None
-                        // in current code. Surface as a StorageError instead
-                        // of a panic so any future divergence between the
-                        // in-memory count and the on-device overflow list is
-                        // reported, not crashed on.
-                        let last = overflow.pop().ok_or_else(|| SpendError::StorageError {
-                            detail: format!(
-                                "overflow read returned no entries despite \
-                                 block_entry_count={count} > INLINE_BLOCK_ENTRIES"
-                            ),
-                        })?;
-                        metadata.block_entries_inline[i] = last;
-                        write_overflow_entries(
-                            &**self.device_for(device_id),
-                            record_offset,
-                            self.allocator_for(device_id),
-                            &mut metadata,
-                            &overflow,
-                        )
-                        .map_err(|e| SpendError::StorageError {
-                            detail: format!("{e}"),
-                        })?;
-                    } else if i < inline_count - 1 {
-                        metadata.block_entries_inline[i] =
-                            metadata.block_entries_inline[inline_count - 1];
-                    }
-                    if count <= INLINE_BLOCK_ENTRIES {
-                        let last_idx = inline_count - 1;
-                        metadata.block_entries_inline[last_idx] = BlockEntry {
-                            block_id: 0,
-                            block_height: 0,
-                            subtree_idx: 0,
-                        };
-                    }
-                    metadata.block_entry_count -= 1;
-                    found = true;
-                    break;
-                }
-            }
-
-            // Check overflow entries if not found inline
-            if !found && count > INLINE_BLOCK_ENTRIES {
-                let mut overflow = read_overflow_entries(&**self.device_for(device_id), &metadata)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("{e}"),
-                    })?;
-                if let Some(pos) = overflow.iter().position(|e| e.block_id == req.block_id) {
-                    overflow.swap_remove(pos);
-                    write_overflow_entries(
-                        &**self.device_for(device_id),
-                        record_offset,
-                        self.allocator_for(device_id),
-                        &mut metadata,
-                        &overflow,
-                    )
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("{e}"),
-                    })?;
-                    metadata.block_entry_count -= 1;
-                }
-            }
-        } else {
-            // Add block entry (slow path — overflow or no direct ptr)
-            let count = metadata.block_entry_count as usize;
-            let inline_count = count.min(INLINE_BLOCK_ENTRIES);
-            let mut exists = false;
-
-            for i in 0..inline_count {
-                if { metadata.block_entries_inline[i].block_id } == req.block_id {
-                    exists = true;
-                    break;
-                }
-            }
-
-            if !exists && count > INLINE_BLOCK_ENTRIES {
-                let overflow = read_overflow_entries(&**self.device_for(device_id), &metadata)
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("{e}"),
-                    })?;
-                if overflow.iter().any(|e| e.block_id == req.block_id) {
-                    exists = true;
-                }
-            }
-
-            if !exists {
-                // BUG-2: `block_entry_count` is a single `u8`. Adding a new
-                // distinct block entry when the count is already at the
-                // maximum would wrap `255 → 0` (release) or panic (debug)
-                // below, desyncing the count from the overflow list and
-                // zeroing `has_blocks`. Reject with a typed capacity error
-                // before mutating any state — mirroring the children-list
-                // `u8::MAX` guard.
-                if metadata.block_entry_count == u8::MAX {
-                    return Err(SpendError::BlockEntriesFull {
-                        cap: u8::MAX as usize,
-                    });
-                }
-                if count < INLINE_BLOCK_ENTRIES {
-                    metadata.block_entries_inline[count] = BlockEntry {
-                        block_id: req.block_id,
-                        block_height: req.block_height,
-                        subtree_idx: req.subtree_idx,
-                    };
-                } else {
-                    let mut overflow =
-                        read_overflow_entries(&**self.device_for(device_id), &metadata).map_err(
-                            |e| SpendError::StorageError {
-                                detail: format!("{e}"),
-                            },
-                        )?;
-                    overflow.push(BlockEntry {
-                        block_id: req.block_id,
-                        block_height: req.block_height,
-                        subtree_idx: req.subtree_idx,
-                    });
-                    write_overflow_entries(
-                        &**self.device_for(device_id),
-                        record_offset,
-                        self.allocator_for(device_id),
-                        &mut metadata,
-                        &overflow,
-                    )
-                    .map_err(|e| SpendError::StorageError {
-                        detail: format!("{e}"),
-                    })?;
-                }
-                metadata.block_entry_count += 1;
-            }
-        }
-
-        // Update unmined_since
-        let new_count = metadata.block_entry_count;
-        if new_count > 0 && req.on_longest_chain {
-            metadata.unmined_since = 0;
-        } else if new_count == 0 {
-            metadata.unmined_since = req.current_block_height;
-        }
-
-        // Clear LOCKED flag if set
-        if metadata.flags.contains(TxFlags::LOCKED) {
-            metadata.flags -= TxFlags::LOCKED;
-        }
-
-        // Mutation bookkeeping
-        metadata.generation = { metadata.generation }.wrapping_add(1);
-        metadata.updated_at = self.now_millis();
-
-        // Evaluate deleteAtHeight. `metadata.block_entry_count`/`unmined_since`
-        // already hold the freshly-computed post-mutation values (set above)
-        // that are about to be dual-written into the MinedIndex below — this
-        // is the "value already in hand" case, so no extra MinedIndex read is
-        // needed.
+        // 5. DAH evaluation, mirroring `mark_on_longest_chain`'s existing use
+        //    of the same `&TxMetadata` + explicit has_blocks/unmined_since
+        //    overload: `meta`'s flags/preserve_until/spent_utxos/utxo_count/
+        //    delete_at_height (device-only inputs) combined with the fresh
+        //    MinedIndex-sourced has_blocks/unmined_since.
         let (signal, dah_patch) = evaluate_delete_at_height(
-            &metadata,
-            { metadata.block_entry_count } > 0,
-            metadata.unmined_since,
+            &meta,
+            has_blocks,
+            new_unmined,
             req.current_block_height,
             req.block_height_retention,
         )?;
-        if let Some(ref patch) = dah_patch {
-            apply_dah_patch(&mut metadata, patch);
-        }
 
-        // Write full metadata (slow path)
-        self.write_metadata_fast(device_id, record_offset, &metadata)?;
-
-        // Update secondary indexes with two-phase durability, batched.
-        let new_dah = { metadata.delete_at_height };
-        let new_unmined = { metadata.unmined_since };
-        self.update_both_secondary_indexes(tx_key, old_dah, new_dah, old_unmined, new_unmined)?;
-
-        // Dual-write (Task 9): mirror the same mined-state transition into
-        // the authoritative MinedIndex so it stays in sync with the device.
-        // Covers both the slow-path ADD (unset_mined == false: has existing
-        // entries or overflow) and the slow-path UNSET branches above.
-        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT {
-            if req.unset_mined {
-                self.mined_index().apply_unset(
-                    tx_key,
-                    entry.mined_slot,
-                    req.block_id,
-                    req.current_block_height,
-                );
-            } else {
-                self.mined_index().apply_set_mined(
-                    tx_key,
-                    entry.mined_slot,
-                    req.block_id,
-                    req.block_height,
-                    req.subtree_idx,
-                    req.on_longest_chain,
-                );
-            }
-        }
-
-        let block_ids = if (metadata.block_entry_count as usize) <= INLINE_BLOCK_ENTRIES {
-            collect_block_ids(&metadata).to_vec()
-        } else {
-            collect_all_block_ids(&**self.device_for(device_id), &metadata)
-                .unwrap_or_else(|_| collect_block_ids(&metadata).to_vec())
-        };
+        // 6. Update the DAH secondary index only (RAM/redb, not a device
+        //    write) — the sole remaining durable side effect besides the
+        //    MinedIndex write. See the residual-staleness note above.
+        //
+        //    Routed through `update_both_secondary_indexes` with the unmined
+        //    pair pinned to `(0, 0)` (a permanent no-op there, since
+        //    `unmined_changed` is false whenever old==new) rather than the
+        //    simpler `update_dah_index` alone: `update_dah_index` hands the
+        //    redo intent straight to the backend, which fsyncs it
+        //    unconditionally (see spend/unspend's own use of it), while
+        //    `update_both_secondary_indexes` pre-journals through
+        //    `journal_secondary_ops`, which HONORS buffered-durability mode
+        //    (append-only, coalesced by the background flusher) instead of
+        //    fsyncing per call. setMined is the hot batch-of-thousands path
+        //    this whole task is optimizing, so keeping that coalescing intact
+        //    matters — using the plain single-index helper here would trade
+        //    away exactly the throughput win buffered mode exists for.
+        let old_dah = { meta.delete_at_height };
+        let new_dah = dah_patch
+            .as_ref()
+            .map(|patch| patch.new_delete_at_height)
+            .unwrap_or(old_dah);
+        self.update_both_secondary_indexes(tx_key, old_dah, new_dah, 0, 0)?;
 
         Ok(SetMinedResponse {
             signal,
-            block_ids,
-            generation: { metadata.generation },
+            block_ids: block_entries.into_iter().map(|e| e.block_id).collect(),
+            generation: { meta.generation },
         })
     }
 
@@ -6538,50 +6340,6 @@ impl Engine {
         self.read_conflicting_children_at(device_id, count, offset)
     }
 
-    /// Read the COMPLETE block-entry set for a transaction — the inline
-    /// entries PLUS every on-device overflow entry.
-    ///
-    /// Returns entries in a stable order: the inline entries first (in their
-    /// on-disk slot order), then the overflow entries (in their stored
-    /// order). This is the same order the setMined path maintains (it fills
-    /// inline slots `0..INLINE_BLOCK_ENTRIES` before appending to overflow),
-    /// so the returned slice is a faithful, uncapped view of the record's
-    /// block membership.
-    ///
-    /// When `block_entry_count <= INLINE_BLOCK_ENTRIES` no device read for
-    /// overflow is performed and only the inline entries are returned.
-    ///
-    /// # Errors
-    ///
-    /// - [`SpendError::TxNotFound`] if the transaction is not in the index.
-    /// - [`SpendError::StorageError`] if the index lookup, the metadata read,
-    ///   or the overflow read fails.
-    pub fn read_all_block_entries(&self, key: &TxKey) -> Result<Vec<BlockEntry>, SpendError> {
-        let entry = self
-            .index
-            .lookup_checked(key)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            })?
-            .ok_or(SpendError::TxNotFound)?;
-        let device_id = entry.device_id;
-        let meta = self.read_metadata_fast(device_id, entry.record_offset)?;
-
-        let count = meta.block_entry_count as usize;
-        let inline = count.min(INLINE_BLOCK_ENTRIES);
-        let mut entries: Vec<BlockEntry> = meta.block_entries_inline[..inline].to_vec();
-        if count > INLINE_BLOCK_ENTRIES {
-            let overflow =
-                read_overflow_entries(&**self.device_for(device_id), &meta).map_err(|e| {
-                    SpendError::StorageError {
-                        detail: format!("overflow block-entry read failed: {e}"),
-                    }
-                })?;
-            entries.extend(overflow);
-        }
-        Ok(entries)
-    }
-
     /// Read a key's authoritative mined-state — block entries plus
     /// `unmined_since` — from the [`ShardedMinedIndex`], not the device.
     ///
@@ -8341,6 +8099,19 @@ impl Engine {
     /// once at boot before the engine serves traffic (no concurrent reader
     /// could observe a shard mid-clear).
     ///
+    /// # Task 16d: no longer called as [`Self::recover_mined_index`]'s
+    /// fallback
+    ///
+    /// `set_mined` performs ZERO device writes now (the perf win this task
+    /// series exists for), so the on-device block-entry fields are stale for
+    /// any tx that has been through a post-16d setMined — a device scan can
+    /// no longer be trusted as a recovery fallback (see
+    /// [`Self::recover_mined_index`]'s doc comment). This function is kept
+    /// because it is still CORRECT for a device whose mined-state was
+    /// entirely written pre-16d (or hand-written directly, bypassing
+    /// `set_mined`, as several unit tests below do) — but production
+    /// recovery no longer reaches it.
+    ///
     /// # Errors
     ///
     /// Returns [`SpendError::StorageError`] if re-pointing a primary entry at
@@ -8977,107 +8748,148 @@ impl Engine {
         Ok(min_fence)
     }
 
-    /// Recover the [`ShardedMinedIndex`] at startup: try the checkpoint
-    /// snapshot + redo-tail replay path (Task 13) first, falling back to
-    /// [`Self::rebuild_mined_index_from_device`]'s full device scan (Task 12)
-    /// when the snapshot section is absent, stale, truncated, or otherwise
-    /// fails to decode. The device-scan fallback is NEVER removed by this
-    /// method — it is the same call [`Self::rebuild_mined_index_from_device`]
-    /// always was, just reached conditionally now.
+    /// Recover the [`ShardedMinedIndex`] at startup: the checkpoint snapshot
+    /// + redo-tail replay path (Task 13) is now the ONLY recovery route.
+    ///
+    /// Task 16d removed the [`Self::rebuild_mined_index_from_device`]
+    /// fallback from this call: `set_mined` no longer writes ANY mined-state
+    /// to the device (see its doc comment), so a device scan performed for
+    /// any tx that has EVER been through a post-16d `setMined` would
+    /// reconstruct WRONG (stale, pre-mining) mined-state — silently, with no
+    /// way to detect it. Pure store-auth recovery (D1): the snapshot + redo
+    /// tail is the sole source of truth from here on. The function is kept
+    /// (see its own doc comment) for tests and the one case it is still
+    /// correct for — a device that pre-dates this branch's first-ever
+    /// checkpoint — but it is no longer CALLED here.
+    ///
+    /// # Two distinct "no snapshot" cases
+    ///
+    /// - **Genuine fresh boot** (`primary_snapshot_path` does not exist — NO
+    ///   checkpoint has EVER run): the redo log has never been truncated, so
+    ///   a FULL replay from its start correctly reconstructs the MinedIndex
+    ///   via [`Self::replay_mined_index_redo_tail`]'s `Create`/`CreateV2`/
+    ///   `ReplicaCreate`/`SetMinedBatch`/`Delete` handling — no snapshot
+    ///   restore is needed or attempted. Returns `Ok(false)`.
+    /// - **A checkpoint HAS run** (`primary_snapshot_path` exists) but the
+    ///   `.mined` section is absent, fails to decode, or its stamped fence
+    ///   doesn't match the redo logs' current persisted fence: the primary
+    ///   and `.mined` snapshots are written atomically & fatally by the same
+    ///   checkpoint (`perform_checkpoint_inner` propagates a `.mined` write
+    ///   failure via `?` BEFORE the redo is fenced/truncated), so a present
+    ///   primary snapshot implies a present, valid `.mined` UNLESS something
+    ///   is now corrupt — and by the time any checkpoint has run, the redo
+    ///   HAS been truncated, so a full replay would silently reconstruct an
+    ///   INCOMPLETE (missing pre-truncation) MinedIndex. This case is now
+    ///   FATAL: returns `Err`, never silently rebuilds from stale device
+    ///   data. Mirrors how a corrupt primary-index snapshot's write-time
+    ///   atomicity is reasoned about — the two sections are never supposed
+    ///   to disagree about which checkpoint they belong to.
     ///
     /// Returns `Ok(true)` if the snapshot+redo-tail path was used, `Ok(false)`
-    /// if it fell back to the device scan. Both outcomes leave the
+    /// for the genuine-fresh-boot full-replay path. Both outcomes leave the
     /// MinedIndex fully populated and every live primary entry's
-    /// `mined_slot` re-pointed — callers do not need to branch on the result
-    /// except for logging/tests.
-    ///
-    /// A snapshot DECODE failure (missing file, wrong version, truncated or
-    /// corrupt bytes) is expected and non-fatal — it just means this
-    /// checkpoint predates the mined-index snapshot feature, or the write
-    /// was interrupted; the device scan reconstructs the same authoritative
-    /// state directly from the device instead.
-    ///
-    /// STALENESS CHECK (Task 13 CRITICAL fix, defense-in-depth on top of
-    /// [`Self::snapshot_mined_index_by_key`]'s write now being fatal to the
-    /// checkpoint): a well-formed snapshot's stamped `fence` is compared
-    /// against [`Self::min_redo_recovery_fence`]. These must have been
-    /// written by the SAME checkpoint (the primary/DAH/unmined snapshot and
-    /// the redo fence/truncation are fatal-on-failure and therefore always
-    /// consistent with each other; the `.mined` fence must match that same
-    /// value too). Any mismatch — including no redo logs to verify
-    /// against — means this `.mined` section is from an EARLIER checkpoint
-    /// than the currently-fenced redo (a stale snapshot that would silently
-    /// drop every mined mutation between the two fences), so it is treated
-    /// exactly like an absent/corrupt snapshot: fall back to the device
-    /// scan.
-    ///
-    /// A STORAGE failure while restoring or replaying (a primary-index
-    /// register call erroring) is NOT tolerated, matching
-    /// [`Self::rebuild_mined_index_from_device`]'s own severity: it
-    /// indicates a systemic index-write fault the device scan would hit
-    /// identically, so it is propagated as fatal rather than silently
-    /// falling back.
+    /// `mined_slot` re-pointed.
     ///
     /// # Errors
     ///
-    /// Returns [`SpendError::StorageError`] on a storage-level fault from
-    /// either recovery path.
+    /// Returns [`SpendError::StorageError`] if the `.mined` section is absent/
+    /// corrupt/stale-fenced despite an existing primary-index checkpoint (see
+    /// above), or on a storage-level fault while restoring or replaying (a
+    /// primary-index register call erroring — a systemic index-write fault,
+    /// propagated as fatal).
     pub fn recover_mined_index(
         &self,
+        primary_snapshot_path: &std::path::Path,
         mined_snapshot_path: &std::path::Path,
         redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
     ) -> Result<bool, SpendError> {
+        let checkpoint_ever_taken = primary_snapshot_path.exists();
+
         let bytes = match std::fs::read(mined_snapshot_path) {
             Ok(b) => b,
             Err(e) => {
-                tracing::info!(
+                if !checkpoint_ever_taken {
+                    tracing::info!(
+                        path = %mined_snapshot_path.display(),
+                        err = %e,
+                        "mined-index recovery: fresh boot (no checkpoint has ever run); \
+                         reconstructing the MinedIndex via full redo-tail replay from genesis",
+                    );
+                    self.mined_index.clear();
+                    self.replay_mined_index_redo_tail(redo_logs)?;
+                    return Ok(false);
+                }
+                tracing::error!(
                     path = %mined_snapshot_path.display(),
                     err = %e,
-                    "mined-index recovery: no snapshot section (or unreadable); falling back \
-                     to the full device scan",
+                    "FATAL: mined-index snapshot section absent despite an existing \
+                     primary-index checkpoint — the device-scan fallback was removed (Task \
+                     16d); recovery cannot safely reconstruct mined-state",
                 );
-                self.rebuild_mined_index_from_device()?;
-                return Ok(false);
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "mined-index recovery: snapshot section absent at {} despite an \
+                         existing primary-index checkpoint at {}: {e}",
+                        mined_snapshot_path.display(),
+                        primary_snapshot_path.display()
+                    ),
+                });
             }
         };
         let decoded = crate::index::mined_index::ShardedMinedIndex::deserialize_by_key(&bytes);
         let (snapshot_fence, entries) = match decoded {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     path = %mined_snapshot_path.display(),
                     err = %e,
-                    "mined-index recovery: snapshot section failed to decode; falling back to \
-                     the full device scan",
+                    "FATAL: mined-index snapshot section failed to decode — the device-scan \
+                     fallback was removed (Task 16d); recovery cannot safely reconstruct \
+                     mined-state",
                 );
-                self.rebuild_mined_index_from_device()?;
-                return Ok(false);
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "mined-index recovery: snapshot section at {} failed to decode: {e}",
+                        mined_snapshot_path.display()
+                    ),
+                });
             }
         };
 
         match Self::min_redo_recovery_fence(redo_logs)? {
             Some(redo_fence) if redo_fence == snapshot_fence => {}
             Some(redo_fence) => {
-                tracing::warn!(
+                tracing::error!(
                     path = %mined_snapshot_path.display(),
                     snapshot_fence,
                     redo_fence,
-                    "mined-index recovery: snapshot fence does not match the redo logs' \
-                     current persisted fence (stale snapshot); falling back to the full \
-                     device scan",
+                    "FATAL: mined-index snapshot fence does not match the redo logs' current \
+                     persisted fence (stale snapshot) — the device-scan fallback was removed \
+                     (Task 16d); recovery cannot safely reconstruct mined-state",
                 );
-                self.rebuild_mined_index_from_device()?;
-                return Ok(false);
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "mined-index recovery: snapshot fence {snapshot_fence} at {} does not \
+                         match the redo logs' persisted fence {redo_fence}",
+                        mined_snapshot_path.display()
+                    ),
+                });
             }
             None => {
-                tracing::warn!(
+                tracing::error!(
                     path = %mined_snapshot_path.display(),
                     snapshot_fence,
-                    "mined-index recovery: no redo logs attached to verify the snapshot's \
-                     fence; falling back to the full device scan",
+                    "FATAL: no redo logs attached to verify the mined-index snapshot's fence \
+                     — the device-scan fallback was removed (Task 16d); recovery cannot \
+                     safely reconstruct mined-state",
                 );
-                self.rebuild_mined_index_from_device()?;
-                return Ok(false);
+                return Err(SpendError::StorageError {
+                    detail: format!(
+                        "mined-index recovery: no redo logs attached to verify snapshot fence \
+                         {snapshot_fence} at {}",
+                        mined_snapshot_path.display()
+                    ),
+                });
             }
         }
 
@@ -9244,70 +9056,22 @@ impl Engine {
         Ok((meta, slots))
     }
 
-    /// Read one mined-block entry, including entries stored in overflow.
+    /// Read one mined-block entry.
     ///
-    /// This is used by dispatch before-image capture. Like [`Self::read_metadata`],
-    /// it is a diagnostic snapshot unless the caller already holds the
-    /// transaction's mutation stripe. The metadata fetch verifies
-    /// `meta.tx_id == key.txid` (F-G2-001).
+    /// This is used by dispatch before-image capture (setMined-batch
+    /// replication-failure compensation needs the entry's `block_height`/
+    /// `subtree_idx` before an unset). Task 16d: sourced from the
+    /// authoritative [`ShardedMinedIndex`] via [`Self::mined_block_entries`],
+    /// not the device — the on-device block-entry region is no longer kept
+    /// current by `set_mined` (see its doc comment), so a device read here
+    /// would silently return stale/empty data for any post-16d setMined.
     pub fn read_block_entry(
         &self,
         key: &TxKey,
         block_id: u32,
     ) -> Result<Option<BlockEntry>, SpendError> {
-        let entry = self
-            .index
-            .lookup_checked(key)
-            .map_err(|e| SpendError::StorageError {
-                detail: format!("index lookup failed: {e}"),
-            })?
-            .ok_or(SpendError::TxNotFound)?;
-        let record_offset = entry.record_offset;
-        let device_id = entry.device_id;
-        let dev = &**self.device_for(device_id);
-        // F-G2-001: hold ONE record-level read guard across the metadata read
-        // AND the overflow-block read so a `delete + create_at_offset` cannot
-        // change the record's identity (or free/reuse the overflow region)
-        // between them. The prior code took a separate guard for the metadata,
-        // released it, read the overflow unguarded, then re-checked the
-        // metadata under a third guard — the offset-keyed-guard + ABA pattern
-        // (a recreate-same-txid cycle could return another tx's block entries
-        // under `key`), and the overflow read was torn-read-unsafe against the
-        // now-guarded `write_overflow_entries`. We MUST use
-        // `io::read_metadata_unguarded` (NOT `io::read_metadata`, which now
-        // self-acquires the SAME striped read guard — the F-G2 torn-read fix —
-        // and would deadlock re-entrantly behind a queued
-        // `write_overflow_entries` writer). `read_metadata_unguarded` and
-        // `read_overflow_entries` are both UNGUARDED device reads, so they run
-        // under the single held guard without re-entering the lock; the guard
-        // pairs (same key) with `write_overflow_entries`' write guard, which
-        // supplies the torn-read exclusion the inner reads need.
-        let _g = io::record_read_guard(record_offset);
-        let metadata = io::read_metadata_unguarded(dev, record_offset).map_err(|e| {
-            SpendError::StorageError {
-                detail: format!("{e}"),
-            }
-        })?;
-        if metadata.tx_id != key.txid {
-            return Err(SpendError::TxNotFound);
-        }
-        let count = metadata.block_entry_count as usize;
-        let inline = count.min(INLINE_BLOCK_ENTRIES);
-        for i in 0..inline {
-            if { metadata.block_entries_inline[i].block_id } == block_id {
-                return Ok(Some(metadata.block_entries_inline[i]));
-            }
-        }
-        if count <= INLINE_BLOCK_ENTRIES {
-            return Ok(None);
-        }
-        let overflow =
-            read_overflow_entries(dev, &metadata).map_err(|e| SpendError::StorageError {
-                detail: format!("{e}"),
-            })?;
-        Ok(overflow
-            .into_iter()
-            .find(|entry| entry.block_id == block_id))
+        let (entries, _unmined_since) = self.mined_block_entries(key)?;
+        Ok(entries.into_iter().find(|entry| entry.block_id == block_id))
     }
 
     /// Borrow the sharded DAH secondary index.
@@ -10096,53 +9860,6 @@ fn apply_dah_patch(metadata: &mut TxMetadata, patch: &DahPatch) {
     }
 }
 
-/// Inline block IDs stored on the stack (max `INLINE_BLOCK_ENTRIES`).
-struct InlineBlockIds {
-    ids: [u32; INLINE_BLOCK_ENTRIES],
-    len: u8,
-}
-
-impl InlineBlockIds {
-    /// Convert to a `Vec<u32>` for use in response types.
-    fn to_vec(&self) -> Vec<u32> {
-        self.ids[..self.len as usize].to_vec()
-    }
-}
-
-fn collect_block_ids(metadata: &TxMetadata) -> InlineBlockIds {
-    let count = metadata.block_entry_count as usize;
-    let inline = count.min(INLINE_BLOCK_ENTRIES);
-    let mut ids = [0u32; INLINE_BLOCK_ENTRIES];
-    for (id_slot, entry) in ids
-        .iter_mut()
-        .zip(metadata.block_entries_inline[..inline].iter())
-    {
-        *id_slot = entry.block_id;
-    }
-    InlineBlockIds {
-        ids,
-        len: inline as u8,
-    }
-}
-
-/// Collect all block IDs including overflow entries read from device.
-fn collect_all_block_ids(
-    device: &dyn BlockDevice,
-    metadata: &TxMetadata,
-) -> Result<Vec<u32>, crate::device::DeviceError> {
-    let count = metadata.block_entry_count as usize;
-    let inline = count.min(INLINE_BLOCK_ENTRIES);
-    let mut ids: Vec<u32> = metadata.block_entries_inline[..inline]
-        .iter()
-        .map(|e| e.block_id)
-        .collect();
-    if count > INLINE_BLOCK_ENTRIES {
-        let overflow = read_overflow_entries(device, metadata)?;
-        ids.extend(overflow.iter().map(|e| e.block_id));
-    }
-    Ok(ids)
-}
-
 /// Read overflow block entries from the device.
 fn read_overflow_entries(
     device: &dyn BlockDevice,
@@ -10172,124 +9889,6 @@ fn read_overflow_entries(
         ));
     }
     Ok(entries)
-}
-
-/// Compute the on-device byte size of the overflow block that backs the
-/// current `metadata.block_overflow_offset`.
-///
-/// Pre-fix (F-G2-003) the free path always freed exactly `alignment`
-/// bytes — correct for the 4 KiB device alignment in production but a
-/// silent leak on a 512-byte-aligned device (`align_up(252 * 12, 512) =
-/// 3072` allocated, only 512 freed). The new helper rederives the
-/// previously-allocated size from `block_entry_count`: overflow holds
-/// the count past the inline cap, rounded up to the device's alignment.
-/// Callers must invoke this BEFORE mutating `block_entry_count` so the
-/// returned size matches the live allocation.
-#[inline]
-fn overflow_block_size(metadata: &TxMetadata, alignment: usize) -> usize {
-    let total = metadata.block_entry_count as usize;
-    if total <= INLINE_BLOCK_ENTRIES {
-        return 0;
-    }
-    let overflow_count = total - INLINE_BLOCK_ENTRIES;
-    io::align_up(overflow_count * BLOCK_ENTRY_SIZE, alignment)
-}
-
-/// Write overflow block entries to the device.
-///
-/// Allocates, reuses, or frees the overflow block.
-///
-/// # F-G2-003: exact-size free + grow-aware reuse
-///
-/// The free path now passes the actual allocated size (rederived from
-/// `metadata.block_entry_count`) to `allocator.free`. The grow path
-/// detects when `new_size > old_size` and reallocates rather than writing
-/// past the existing allocation. The allocator free error is propagated
-/// instead of being silently swallowed via `let _ = ...`.
-fn write_overflow_entries(
-    device: &dyn BlockDevice,
-    record_offset: u64,
-    allocator: &parking_lot::Mutex<BoxedAllocator>,
-    metadata: &mut TxMetadata,
-    entries: &[BlockEntry],
-) -> Result<(), crate::device::DeviceError> {
-    // F-G2-001: hold the record-level write guard (keyed by `record_offset`,
-    // the SAME key the lock-free `read_block_entry` reader takes via
-    // `io::record_read_guard`) across the whole free/alloc/pwrite/pointer
-    // update, so a reader cannot observe a torn overflow block or read a
-    // just-freed overflow region. The overflow `pwrite` targets a separate
-    // offset, but mutual exclusion is by the guard KEY. Lock order is
-    // io_locks().write -> allocator.lock(); there is no allocator-then-io_locks
-    // path (the allocator is never held across a device write — reserve/commit
-    // and the record I/O are separate phases), so no inversion.
-    let _w = io::record_write_guard(record_offset);
-    let alignment = device.alignment();
-    let old_offset = { metadata.block_overflow_offset };
-    let old_block_size = overflow_block_size(metadata, alignment);
-
-    if entries.is_empty() {
-        // Free the overflow block if one exists. F-G2-003: free the
-        // *full* allocated size, not just one alignment unit, and
-        // propagate the error instead of swallowing it.
-        if old_offset != 0 {
-            let free_size = if old_block_size > 0 {
-                old_block_size as u64
-            } else {
-                // Defensive: if `block_entry_count` already reflected
-                // the post-shrink state (count <= INLINE) but the
-                // overflow pointer is still live, fall back to one
-                // alignment unit to avoid double-free of unallocated
-                // space. This matches the legacy behaviour for the case
-                // it was correct for.
-                alignment as u64
-            };
-            allocator.lock().free(old_offset, free_size).map_err(|e| {
-                crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
-            })?;
-            metadata.block_overflow_offset = 0;
-        }
-        return Ok(());
-    }
-
-    let data_size = entries.len() * BLOCK_ENTRY_SIZE;
-    let new_block_size = io::align_up(data_size, alignment);
-
-    // Decide allocate / reuse / reallocate.
-    // - No prior block: fresh allocation.
-    // - Same alignment-rounded size as prior: reuse in place (writes are
-    //   overwrites, no allocator churn).
-    // - Different size (grow OR shrink across alignment boundary): free
-    //   the old allocation and grab a fresh one. Shrinking-but-reusing
-    //   would leak the trailing alignment unit(s) on the next free
-    //   (which only sees the new, smaller size). The allocator free
-    //   error is propagated; pre-fix it was swallowed via `let _ =`.
-    let offset = if old_offset == 0 {
-        allocator
-            .lock()
-            .allocate(new_block_size as u64)
-            .map_err(|e| {
-                crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
-            })?
-    } else if new_block_size == old_block_size {
-        old_offset
-    } else {
-        let mut a = allocator.lock();
-        a.free(old_offset, old_block_size as u64).map_err(|e| {
-            crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
-        })?;
-        a.allocate(new_block_size as u64).map_err(|e| {
-            crate::device::DeviceError::Io(std::io::Error::other(format!("allocator: {e}")))
-        })?
-    };
-
-    let mut buf = AlignedBuf::new(new_block_size, alignment);
-    for (i, entry) in entries.iter().enumerate() {
-        let start = i * BLOCK_ENTRY_SIZE;
-        entry.to_bytes(&mut buf[start..start + BLOCK_ENTRY_SIZE]);
-    }
-    device.pwrite_all_at(&buf, offset)?;
-    metadata.block_overflow_offset = offset;
-    Ok(())
 }
 
 /// Get the current wall-clock time in milliseconds since Unix epoch.
@@ -12007,7 +11606,13 @@ mod tests {
         let h = TestHarness::new(1, TxFlags::empty());
 
         // 255 distinct block_ids succeed and fill the u8 count to its max.
-        for block_id in 0..255u32 {
+        // Starts at 1, not 0: the MinedIndex's `MinedEntry` uses
+        // `block_id == 0` as its own "inline slot empty" sentinel (see
+        // `ShardedMinedIndex::apply_set_mined`/`read_block_entries`), so a
+        // genuine block_id of 0 is indistinguishable from "no entry" there —
+        // a pre-existing MinedIndex-representation limitation, unrelated to
+        // this capacity guard, that this test does not need to probe.
+        for block_id in 1..=255u32 {
             let req = SetMinedRequest {
                 tx_key: h.key,
                 block_id,
@@ -12022,10 +11627,10 @@ mod tests {
                 .set_mined(&req)
                 .unwrap_or_else(|e| panic!("block_id {block_id} must succeed: {e:?}"));
         }
-        let meta = h.engine.read_metadata(&h.key).unwrap();
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
         assert_eq!(
-            { meta.block_entry_count },
-            u8::MAX,
+            entries.len(),
+            u8::MAX as usize,
             "255 distinct block_ids must fill the count to u8::MAX"
         );
 
@@ -12033,7 +11638,7 @@ mod tests {
         // capacity error — no wrap, no panic.
         let req_256 = SetMinedRequest {
             tx_key: h.key,
-            block_id: 255,
+            block_id: 256,
             block_height: 1155,
             subtree_idx: 0,
             current_block_height: 1000,
@@ -12051,18 +11656,18 @@ mod tests {
         );
 
         // The count must be UNCHANGED (still 255), never wrapped to 0.
-        let meta_after = h.engine.read_metadata(&h.key).unwrap();
+        let (entries_after, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
         assert_eq!(
-            { meta_after.block_entry_count },
-            u8::MAX,
-            "rejected set_mined must not mutate block_entry_count (no wrap-to-zero)"
+            entries_after.len(),
+            u8::MAX as usize,
+            "rejected set_mined must not mutate the MinedIndex block-entry count (no wrap-to-zero)"
         );
 
         // Re-applying an EXISTING block_id (idempotent, no new entry) must
         // still succeed even at capacity — it adds nothing.
         let req_dup = SetMinedRequest {
             tx_key: h.key,
-            block_id: 0,
+            block_id: 1,
             block_height: 900,
             subtree_idx: 0,
             current_block_height: 1000,
@@ -13834,19 +13439,13 @@ mod tests {
         let resp = h.engine.set_mined(&req).unwrap();
         assert_eq!(resp.block_ids, vec![7]);
 
-        // Preserved record keeps DAH == 0.
+        // Preserved record keeps DAH == 0. (Task 16d: the device field is no
+        // longer written by setMined at all, so it stays 0 regardless —
+        // `dah_index` below is the authoritative, live check.)
         let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(
-            { meta.delete_at_height },
-            0,
-            "preserved record must not gain a DAH on setMined",
-        );
         assert_eq!({ meta.preserve_until }, 5000);
-        assert_eq!(
-            { meta.block_entry_count },
-            1,
-            "block entry must be recorded"
-        );
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 1, "block entry must be recorded");
 
         let dah = h.engine.dah_index();
         assert!(
@@ -15093,17 +14692,22 @@ mod tests {
                 resp.block_ids.contains(&42),
                 "item {i} should have block_id 42"
             );
-            assert!(
-                resp.generation > 0,
-                "item {i} should have incremented generation"
+            // Task 16d: setMined performs zero device writes, so it no
+            // longer bumps `generation` — the response echoes the
+            // unchanged value read off the device (0, `TxMetadata::new`'s
+            // default, since these txs were freshly created).
+            assert_eq!(
+                resp.generation, 0,
+                "item {i}: generation is no longer bumped by setMined"
             );
         }
 
-        // Verify all three txs have the block entry.
+        // Verify all three txs have the block entry (via the MinedIndex —
+        // the authoritative source; the device fields stay untouched).
         for key in &keys {
-            let meta = engine.read_metadata(key).unwrap();
-            assert_eq!(meta.block_entry_count, 1);
-            assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+            let (entries, _unmined) = engine.mined_block_entries(key).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!({ entries[0].block_id }, 42);
         }
     }
 
@@ -15161,11 +14765,13 @@ mod tests {
         let resp = h.engine.set_mined(&req).unwrap();
         assert_eq!(resp.block_ids, vec![42]);
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 1);
-        assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
-        assert_eq!({ meta.block_entries_inline[0].block_height }, 800_000);
-        assert_eq!({ meta.block_entries_inline[0].subtree_idx }, 7);
+        // Task 16d: mined-state lives in the MinedIndex, not the device —
+        // the device's block-entry fields are no longer written by setMined.
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!({ entries[0].block_id }, 42);
+        assert_eq!({ entries[0].block_height }, 800_000);
+        assert_eq!({ entries[0].subtree_idx }, 7);
     }
 
     #[test]
@@ -15184,8 +14790,8 @@ mod tests {
         h.engine.set_mined(&req).unwrap();
         h.engine.set_mined(&req).unwrap(); // Second call
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 1); // Not duplicated
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 1); // Not duplicated
     }
 
     #[test]
@@ -15206,8 +14812,8 @@ mod tests {
                 .unwrap();
         }
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 3);
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 3);
 
         let resp = h
             .engine
@@ -15244,13 +14850,19 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.block_entries_inline[0].block_height }, 12345);
-        assert_eq!({ meta.block_entries_inline[0].subtree_idx }, 42);
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!({ entries[0].block_height }, 12345);
+        assert_eq!({ entries[0].subtree_idx }, 42);
     }
 
     #[test]
     fn set_mined_clears_locked() {
+        // Task 16c/16d: device LOCKED is now an immutable create-time marker
+        // — setMined no longer clears it (there is no device write left to
+        // clear it with). The EFFECTIVE lock is `device.LOCKED &&
+        // !ignore_locked && MinedIndex.not-mined` (16c), so a locked-then-
+        // mined record must become spendable even though the raw device
+        // LOCKED bit stays set.
         let h = TestHarness::new(10, TxFlags::LOCKED);
         let meta_before = h.engine.read_metadata(&h.key).unwrap();
         assert!(meta_before.flags.contains(TxFlags::LOCKED));
@@ -15269,7 +14881,14 @@ mod tests {
             .unwrap();
 
         let meta_after = h.engine.read_metadata(&h.key).unwrap();
-        assert!(!meta_after.flags.contains(TxFlags::LOCKED));
+        assert!(
+            meta_after.flags.contains(TxFlags::LOCKED),
+            "device LOCKED is an immutable create-time marker post-16d; setMined must not \
+             touch the device at all",
+        );
+        // Effective unlock: spend must now succeed despite the raw device
+        // LOCKED bit, because the tx is mined (MinedIndex.not-mined is false).
+        assert!(h.engine.spend(&h.spend_req(0)).is_ok());
     }
 
     #[test]
@@ -15325,8 +14944,8 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 0);
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]
@@ -15359,8 +14978,8 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 1); // Original still there
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 1); // Original still there
     }
 
     #[test]
@@ -15395,11 +15014,9 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 2);
-        let ids: Vec<u32> = (0..2)
-            .map(|i| meta.block_entries_inline[i].block_id)
-            .collect();
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 2);
+        let ids: Vec<u32> = entries.iter().map(|e| e.block_id).collect();
         assert!(ids.contains(&10));
         assert!(ids.contains(&30));
         assert!(!ids.contains(&20));
@@ -15459,8 +15076,8 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.unmined_since }, 0);
+        let (_entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(unmined, 0);
     }
 
     #[test]
@@ -15482,9 +15099,9 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
+        let (_entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
         // unmined_since not cleared because not on_longest_chain
-        assert_eq!({ meta.unmined_since }, 500);
+        assert_eq!(unmined, 500);
     }
 
     #[test]
@@ -15516,8 +15133,8 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.unmined_since }, 200);
+        let (_entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(unmined, 200);
     }
 
     // -- Signal/DAH integration for setMined --
@@ -15543,9 +15160,10 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_ne!({ meta.delete_at_height }, 0);
-        assert!(!h.engine.dah_index().range_query(u32::MAX).is_empty());
+        // Task 16d: the device `delete_at_height` field is no longer
+        // written by setMined — the DAH secondary index (`dah_index`) is
+        // the authoritative, live source now.
+        assert!(h.engine.dah_index().range_query(u32::MAX).contains(&h.key));
         // External flag not set, so signal is not DAHSET but the DAH was still set
         let _ = resp;
     }
@@ -15568,8 +15186,7 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.delete_at_height }, 0);
+        assert!(!h.engine.dah_index().range_query(u32::MAX).contains(&h.key));
     }
 
     #[test]
@@ -15627,8 +15244,8 @@ mod tests {
             h.join().unwrap();
         }
 
-        let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(meta.block_entry_count, 3);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 3);
     }
 
     #[test]
@@ -15672,8 +15289,9 @@ mod tests {
         h1.join().unwrap();
         h2.join().unwrap();
 
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 1);
         let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(meta.block_entry_count, 1);
         assert_eq!({ meta.spent_utxos }, 1);
     }
 
@@ -16081,8 +15699,8 @@ mod tests {
         h2.join().unwrap();
 
         // Both should complete without corruption
-        let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(meta.block_entry_count, 1);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     // -- Phase 4 additional tests --
@@ -16107,9 +15725,11 @@ mod tests {
             assert_eq!(resp.block_ids.len(), bid as usize);
         }
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 4);
-        assert_ne!({ meta.block_overflow_offset }, 0); // Overflow block allocated
+        // Task 16d: mined-state (including anything beyond the 3 inline
+        // slots) lives ONLY in the MinedIndex now — there is no device
+        // overflow block to check for; `set_mined` never allocates one.
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 4);
     }
 
     #[test]
@@ -16211,8 +15831,8 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 4);
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 4);
 
         // Remove block 4 (in overflow)
         h.engine
@@ -16228,12 +15848,9 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 3);
-        // Should only have inline entries now
-        let ids: Vec<u32> = (0..3)
-            .map(|i| meta.block_entries_inline[i].block_id)
-            .collect();
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 3);
+        let ids: Vec<u32> = entries.iter().map(|e| e.block_id).collect();
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
@@ -16271,8 +15888,8 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta.block_entry_count, 4); // Not duplicated
+        let (entries, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries.len(), 4); // Not duplicated
     }
 
     #[test]
@@ -16296,8 +15913,8 @@ mod tests {
                 .unwrap();
         }
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.unmined_since }, 0); // Stays cleared after multiple setMined
+        let (_entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(unmined, 0); // Stays cleared after multiple setMined
     }
 
     #[test]
@@ -16319,7 +15936,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        assert_eq!({ h.engine.read_metadata(&h.key).unwrap().unmined_since }, 0);
+        assert_eq!(h.engine.mined_block_entries(&h.key).unwrap().1, 0);
 
         // Remove both
         for bid in [1, 2] {
@@ -16337,8 +15954,8 @@ mod tests {
                 .unwrap();
         }
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.unmined_since }, 300);
+        let (_entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(unmined, 300);
     }
 
     #[test]
@@ -16378,11 +15995,13 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        // With no blocks, DAH conditions are not met (has_blocks=false)
-        // The evaluate_delete_at_height would signal AllSpent but not set DAH
-        // Since DAH was previously set and conditions are now unmet, it should be cleared
-        assert_eq!({ meta.delete_at_height }, 0);
+        // With no blocks, DAH conditions are not met (has_blocks=false).
+        // Since DAH was previously set and conditions are now unmet, it must
+        // be cleared. Task 16d: this clear only happens in the DAH
+        // secondary index — the device `delete_at_height` field is no
+        // longer written by setMined (it stays at whatever `spend` last
+        // wrote), so `dah_index` is the authoritative check here.
+        assert!(!h.engine.dah_index().range_query(u32::MAX).contains(&h.key));
     }
 
     #[test]
@@ -16415,8 +16034,8 @@ mod tests {
             h.join().unwrap();
         }
 
-        let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(meta.block_entry_count, 10);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 10);
     }
 
     #[test]
@@ -16910,32 +16529,33 @@ mod tests {
             key = req.tx_key();
             engine.create(&req).expect("create succeeds");
 
-            // Mined into 2 blocks, both on the longest chain -> unmined_since
-            // must end up 0 and both block entries must be recorded.
+            // Task 16d: the live `set_mined` no longer writes the device's
+            // block-entry fields at all, so this device-scan-rebuild test
+            // (which specifically exercises `rebuild_mined_index_from_device`
+            // reading THOSE fields) must hand-write them directly instead —
+            // mirroring what setMined used to do — rather than going through
+            // `engine.set_mined`. Mined into 2 blocks, both on the longest
+            // chain -> unmined_since must end up 0 and both block entries
+            // must be recorded.
+            let entry = engine.lookup(&key).expect("create must register the entry");
+            let mut meta = engine
+                .read_metadata(&key)
+                .expect("metadata must be readable");
+            meta.block_entry_count = 2;
+            meta.block_entries_inline[0] = BlockEntry {
+                block_id: 11,
+                block_height: 500,
+                subtree_idx: 0,
+            };
+            meta.block_entries_inline[1] = BlockEntry {
+                block_id: 22,
+                block_height: 501,
+                subtree_idx: 1,
+            };
+            meta.unmined_since = 0;
             engine
-                .set_mined(&SetMinedRequest {
-                    tx_key: key,
-                    block_id: 11,
-                    block_height: 500,
-                    subtree_idx: 0,
-                    current_block_height: 500,
-                    block_height_retention: 288,
-                    on_longest_chain: true,
-                    unset_mined: false,
-                })
-                .expect("setMined block 1 succeeds");
-            engine
-                .set_mined(&SetMinedRequest {
-                    tx_key: key,
-                    block_id: 22,
-                    block_height: 501,
-                    subtree_idx: 1,
-                    current_block_height: 501,
-                    block_height_retention: 288,
-                    on_longest_chain: true,
-                    unset_mined: false,
-                })
-                .expect("setMined block 2 succeeds");
+                .write_metadata_fast(entry.device_id, entry.record_offset, &meta)
+                .expect("hand-written device metadata must persist");
 
             // Spend both UTXOs -> all_spent.
             for (i, hash) in hashes.iter().enumerate() {
@@ -17111,19 +16731,23 @@ mod tests {
             let (_, req) = make_create_req(242, 1);
             let key = req.tx_key();
             temp_engine.create(&req).expect("create succeeds");
-            temp_engine
-                .set_mined(&SetMinedRequest {
-                    tx_key: key,
-                    block_id: 77,
-                    block_height: 900,
-                    subtree_idx: 0,
-                    current_block_height: 900,
-                    block_height_retention: 288,
-                    on_longest_chain: true,
-                    unset_mined: false,
-                })
-                .expect("setMined succeeds");
+            // Task 16d: `set_mined` no longer writes the device's block-entry
+            // fields — hand-write them directly so the device actually has
+            // something for `rebuild_mined_index_from_device` to scan.
             let entry = temp_engine.lookup(&key).expect("entry registered");
+            let mut meta = temp_engine
+                .read_metadata(&key)
+                .expect("metadata must be readable");
+            meta.block_entry_count = 1;
+            meta.block_entries_inline[0] = BlockEntry {
+                block_id: 77,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+            meta.unmined_since = 0;
+            temp_engine
+                .write_metadata_fast(entry.device_id, entry.record_offset, &meta)
+                .expect("hand-written device metadata must persist");
             temp_engine.allocator().lock().persist().unwrap();
             (entry.device_id, entry.record_offset, key)
         };
@@ -17473,21 +17097,24 @@ mod tests {
         );
 
         // B: a real record, mined into a block, routed to the same shard as A.
+        // Task 16d: `set_mined` no longer writes the device's block-entry
+        // fields — hand-write them so `rebuild_mined_index_from_device`
+        // (a device-scanning function) has something real to reproduce.
         let (_, req_b) = make_create_req(n_b, 1);
         let key_b = req_b.tx_key();
         engine.create(&req_b).expect("create B succeeds");
+        let entry_b = engine.lookup(&key_b).expect("B registered");
+        let mut meta_b = engine.read_metadata(&key_b).expect("B metadata readable");
+        meta_b.block_entry_count = 1;
+        meta_b.block_entries_inline[0] = BlockEntry {
+            block_id: 99,
+            block_height: 700,
+            subtree_idx: 0,
+        };
+        meta_b.unmined_since = 0;
         engine
-            .set_mined(&SetMinedRequest {
-                tx_key: key_b,
-                block_id: 99,
-                block_height: 700,
-                subtree_idx: 0,
-                current_block_height: 700,
-                block_height_retention: 288,
-                on_longest_chain: true,
-                unset_mined: false,
-            })
-            .expect("setMined B succeeds");
+            .write_metadata_fast(entry_b.device_id, entry_b.record_offset, &meta_b)
+            .expect("hand-written device metadata for B must persist");
 
         engine
             .rebuild_mined_index_from_device()
@@ -17575,9 +17202,11 @@ mod tests {
             })
             .expect("set_mined succeeds");
 
-        assert_eq!(
-            { engine.read_metadata(&key).unwrap().delete_at_height },
-            1288,
+        // Task 16d: setMined performs zero device writes, so
+        // `delete_at_height` is NOT written to the device here — the DAH
+        // secondary index is the authoritative, live check now.
+        assert!(
+            engine.dah_index().range_query(u32::MAX).contains(&key),
             "precondition: DAH set after mine (all-spent + has-blocks + on-chain)"
         );
         let (mined_entries, mined_unmined_since) = engine
@@ -17596,13 +17225,18 @@ mod tests {
         // Hand-corrupt ONLY the on-device footer — make it look never-mined
         // and off the longest chain — WITHOUT touching the MinedIndex. A
         // real dual-write never does this; it simulates the desync that
-        // proves which side a caller actually reads.
+        // proves which side a caller actually reads. `set_conflicting` is
+        // untouched by Task 16d (still reads+writes the device directly),
+        // so it needs a real on-device `delete_at_height` baseline to prove
+        // it survives — stamped here by hand since setMined no longer wrote
+        // it in the first place.
         let entry = engine.lookup(&key).expect("record exists");
         let mut meta = engine
             .read_metadata_fast(entry.device_id, entry.record_offset)
             .unwrap();
         meta.block_entry_count = 0;
         meta.unmined_since = 555_000;
+        meta.delete_at_height = 1288;
         engine
             .write_metadata_fast(entry.device_id, entry.record_offset, &meta)
             .unwrap();
@@ -18815,12 +18449,17 @@ mod tests {
     }
 
     /// Drive `n` two-phase secondary-index updates (the `setMined` reorg path
-    /// that journals `SecondaryDahUpdate`/`SecondaryUnminedUpdate`) over a redo
-    /// log on a sync-counting device, and return how many redo fsyncs it cost.
-    /// `buffered` selects the durability mode under test. Each key is setMined
-    /// twice (off-chain then on-chain) so `unmined_since` is guaranteed to move
-    /// on at least one call regardless of the create-time default — i.e. the
-    /// secondary path provably fires for every key.
+    /// that journals `SecondaryDahUpdate`) over a redo log on a sync-counting
+    /// device, and return how many redo fsyncs it cost. `buffered` selects the
+    /// durability mode under test. Task 16d: `set_mined` no longer maintains
+    /// the OLD `unmined_index` axis (its "old" value tracking would be
+    /// device-stale post-16d, and it has no remaining correctness-critical
+    /// reader — see `set_mined_inner`'s doc comment), so this drives the DAH
+    /// axis instead: each key is fully spent (making it eligible once mined),
+    /// then setMined off-chain (no DAH change — not yet on the longest chain)
+    /// then on-chain (all-spent && has-blocks && on-chain -> DAH set), so the
+    /// DAH-changing journal is guaranteed to fire on the second call for
+    /// every key — i.e. the secondary path provably fires for every key.
     fn secondary_update_fsyncs(n: u8, buffered: bool) -> u64 {
         let data_dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -18845,15 +18484,30 @@ mod tests {
         engine.set_redo_logs(vec![Arc::new(parking_lot::Mutex::new(log))]);
         engine.set_buffered_durability(buffered);
 
-        // Create n records.
+        // Create n records (1 UTXO each) and spend the sole UTXO so every key
+        // is already all-spent by the time it gets mined below.
         let mut keys = Vec::new();
         for i in 0..n {
-            let (_, req) = make_create_req(i + 1, 2);
+            let (hashes, req) = make_create_req(i + 1, 1);
             engine.create(&req).unwrap();
-            keys.push(req.tx_key());
+            let key = req.tx_key();
+            engine
+                .spend(&SpendRequest {
+                    tx_key: key,
+                    offset: 0,
+                    utxo_hash: hashes[0],
+                    spending_data: [0x22u8; 36],
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 900_000,
+                    block_height_retention: 288,
+                })
+                .unwrap();
+            keys.push(key);
         }
 
-        // Count only the secondary-path fsyncs (skip create's own journalling).
+        // Count only the secondary-path fsyncs (skip create/spend's own
+        // journalling).
         let baseline = syncs.load(Ordering::SeqCst);
 
         let off_chain = SetMinedSharedParams {
@@ -20037,9 +19691,9 @@ mod tests {
             })
             .unwrap();
 
-        let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(meta.block_entry_count, 1);
-        assert_eq!({ meta.block_entries_inline[0].block_id }, 42);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!({ entries[0].block_id }, 42);
     }
 
     // -- Duplicate detection --
@@ -23080,18 +22734,24 @@ mod tests {
         };
 
         h.engine.set_mined(&req).unwrap();
-        let meta_after_first = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta_after_first.block_entry_count, 1);
+        let (entries_first, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries_first.len(), 1);
 
         // Call set_mined again with same block_id — should be idempotent
         h.engine.set_mined(&req).unwrap();
-        let meta_after_second = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!(meta_after_second.block_entry_count, 1); // NOT double-counted
-        assert_eq!({ meta_after_second.block_entries_inline[0].block_id }, 42);
+        let (entries_second, _unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(entries_second.len(), 1); // NOT double-counted
+        assert_eq!({ entries_second[0].block_id }, 42);
     }
 
     #[test]
     fn set_mined_clears_locked_flag() {
+        // Task 16c/16d: device LOCKED is now an immutable create-time marker
+        // — setMined performs no device write at all, so it cannot clear it.
+        // The EFFECTIVE lock (`device.LOCKED && !ignore_locked &&
+        // MinedIndex.not-mined`, 16c) is what actually unlocks the record
+        // once mined; see `set_mined_clears_locked` for that behavioral
+        // check via `spend`.
         let engine = create_engine();
         let (_, req) = make_create_req(200, 5);
         let key = req.tx_key();
@@ -23107,7 +22767,6 @@ mod tests {
         let meta = engine.read_metadata(&key).unwrap();
         assert!(meta.flags.contains(TxFlags::LOCKED));
 
-        // set_mined should clear LOCKED
         engine
             .set_mined(&SetMinedRequest {
                 tx_key: key,
@@ -23123,8 +22782,8 @@ mod tests {
 
         let meta = engine.read_metadata(&key).unwrap();
         assert!(
-            !meta.flags.contains(TxFlags::LOCKED),
-            "LOCKED flag should be cleared after set_mined"
+            meta.flags.contains(TxFlags::LOCKED),
+            "device LOCKED must stay set — setMined performs zero device writes post-16d",
         );
     }
 
@@ -23133,7 +22792,8 @@ mod tests {
         // The CREATING flag does not exist in TeraSlab (it was eliminated
         // because TeraSlab uses single-record design). Verify that the
         // only flags that exist are the 5 defined bits, and set_mined
-        // does not leave any stray bits set.
+        // (which now performs zero device writes, Task 16d) does not
+        // introduce any stray bits.
         let engine = create_engine();
         let (_, mut req) = make_create_req(201, 5);
         req.locked = true;
@@ -23158,9 +22818,9 @@ mod tests {
             .unwrap();
 
         let meta_after = engine.read_metadata(&key).unwrap();
-        // LOCKED should be cleared — no stray flags remain from any
-        // "creating" concept (which doesn't exist in this codebase)
-        assert!(!meta_after.flags.contains(TxFlags::LOCKED));
+        // LOCKED is an immutable create-time marker post-16c/16d — setMined
+        // never touches the device, so it stays set.
+        assert!(meta_after.flags.contains(TxFlags::LOCKED));
         // Only known flags should be set
         let known_mask = TxFlags::IS_COINBASE
             | TxFlags::CONFLICTING
@@ -23192,8 +22852,8 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
-        assert_eq!({ meta.unmined_since }, 0); // On chain
+        let (_entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
+        assert_eq!(unmined, 0); // On chain
 
         // Unmine the last block at current_block_height=750
         h.engine
@@ -23209,25 +22869,24 @@ mod tests {
             })
             .unwrap();
 
-        let meta = h.engine.read_metadata(&h.key).unwrap();
+        let (_entries, unmined) = h.engine.mined_block_entries(&h.key).unwrap();
         // unmined_since should be set to the provided current_block_height, not 0
         assert_eq!(
-            { meta.unmined_since },
-            750,
+            unmined, 750,
             "unmined_since should equal current_block_height after unmining last block"
         );
     }
 
     /// Task 9: `set_mined_inner` dual-writes mined-state to the authoritative
-    /// `MinedIndex`, keeping it in sync with the device (the pre-existing
-    /// device RMW is left untouched — only readers, not writers, migrate off
-    /// the device in later tasks). Proves the MinedIndex mirrors the device
-    /// across all three transitions: first setMined (fast path), a second
-    /// setMined (slow-path add, spills to MinedIndex overflow since a
-    /// `MinedEntry` has only one inline block tuple vs. the device's three),
-    /// and an unsetMined (slow-path remove).
+    /// `MinedIndex`. Task 16d removed the device half of the dual-write
+    /// entirely (setMined performs zero device writes now), so this only
+    /// asserts the MinedIndex's own state across all three transitions:
+    /// first setMined (a fresh slot's inline tuple), a second setMined (a 2nd
+    /// distinct block spills into the shard's overflow map, since a
+    /// `MinedEntry` has only one inline block tuple), and an unsetMined
+    /// (removing the inline entry promotes the overflow entry back into it).
     #[test]
-    fn setmined_dual_writes_mined_index_matches_device() {
+    fn setmined_populates_mined_index_states() {
         use crate::index::mined_index::{MINED_HAS_OVERFLOW, NO_MINED_SLOT};
 
         let engine = create_engine();
@@ -23245,7 +22904,7 @@ mod tests {
         const B1: u32 = 111;
         const B2: u32 = 222;
 
-        // -- setMined B1 (fast path: first-ever block entry) --
+        // -- setMined B1 (first-ever block entry) --
         engine
             .set_mined(&SetMinedRequest {
                 tx_key: key,
@@ -23259,22 +22918,6 @@ mod tests {
             })
             .expect("setMined B1 succeeds");
 
-        let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(
-            meta.block_entry_count, 1,
-            "device: one block entry after B1"
-        );
-        assert_eq!(
-            { meta.block_entries_inline[0].block_id },
-            B1,
-            "device: inline[0] is B1"
-        );
-        assert_eq!(
-            { meta.unmined_since },
-            0,
-            "device: on-chain -> unmined_since 0"
-        );
-
         engine
             .mined_index()
             .with_entry(&key, slot, |e| {
@@ -23286,7 +22929,7 @@ mod tests {
             })
             .expect("mined-index slot must still be live after B1");
 
-        // -- setMined B2 (slow path: a 2nd distinct block, competing chain) --
+        // -- setMined B2 (a 2nd distinct block, competing chain) --
         engine
             .set_mined(&SetMinedRequest {
                 tx_key: key,
@@ -23300,25 +22943,12 @@ mod tests {
             })
             .expect("setMined B2 succeeds");
 
-        let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(
-            meta.block_entry_count, 2,
-            "device: two block entries after B2"
-        );
-        assert_eq!({ meta.block_entries_inline[0].block_id }, B1);
-        assert_eq!(
-            { meta.block_entries_inline[1].block_id },
-            B2,
-            "device: inline[1] is B2"
-        );
-
         // The MinedEntry only has room for one inline block tuple, so B2
         // must have spilled into the shard's overflow map — assert both the
         // inline value (still B1, unchanged) and the overflow flag (proving
-        // a 2nd block is tracked, matching the device's count of 2). The
-        // overflow map itself is private to the mined_index module; its
-        // content (must be exactly B2) is confirmed below when unsetting B1
-        // promotes it back into the inline slot.
+        // a 2nd block is tracked). The overflow map itself is private to the
+        // mined_index module; its content (must be exactly B2) is confirmed
+        // below when unsetting B1 promotes it back into the inline slot.
         engine
             .mined_index()
             .with_entry(&key, slot, |e| {
@@ -23331,7 +22961,7 @@ mod tests {
             })
             .expect("mined-index slot must still be live after B2");
 
-        // -- unsetMined B1 (slow path: remove; B2 must remain) --
+        // -- unsetMined B1 (remove; B2 must remain, promoted into inline) --
         engine
             .set_mined(&SetMinedRequest {
                 tx_key: key,
@@ -23344,17 +22974,6 @@ mod tests {
                 unset_mined: true,
             })
             .expect("unsetMined B1 succeeds");
-
-        let meta = engine.read_metadata(&key).unwrap();
-        assert_eq!(
-            meta.block_entry_count, 1,
-            "device: one block entry remains after unsetting B1"
-        );
-        assert_eq!(
-            { meta.block_entries_inline[0].block_id },
-            B2,
-            "device: B2 remains after removing B1"
-        );
 
         engine
             .mined_index()

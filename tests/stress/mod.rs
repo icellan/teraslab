@@ -199,7 +199,8 @@ pub fn stress_random_operations() {
         };
         let meta = engine.read_metadata(&key).unwrap();
         assert_eq!({ meta.spent_utxos }, 5);
-        assert_eq!(meta.block_entry_count, 1);
+        let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     // ----- Contended phase (REL-108) -----
@@ -474,8 +475,10 @@ pub fn stress_set_mined_reorg_churn() {
                 })
                 .unwrap();
 
-            let meta = engine.read_metadata(&key).unwrap();
-            assert_eq!(meta.block_entry_count, 1);
+            // Task 16d: mined-state is authoritative in the MinedIndex, not
+            // the device.
+            let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+            assert_eq!(entries.len(), 1);
 
             engine
                 .set_mined(&SetMinedRequest {
@@ -490,9 +493,9 @@ pub fn stress_set_mined_reorg_churn() {
                 })
                 .unwrap();
 
-            let meta = engine.read_metadata(&key).unwrap();
-            assert_eq!(meta.block_entry_count, 0);
-            assert_eq!({ meta.unmined_since }, block_height + 1);
+            let (entries, unmined) = engine.mined_block_entries(&key).unwrap();
+            assert_eq!(entries.len(), 0);
+            assert_eq!(unmined, block_height + 1);
         }
     }
 }
@@ -534,8 +537,13 @@ pub fn stress_mark_longest_chain_reorg_churn() {
                 })
                 .unwrap();
 
+            // Task 16d: mined-block entries are authoritative in the
+            // MinedIndex, not the device — `unmined_since` here comes from
+            // `mark_on_longest_chain`, which is untouched by 16d and still
+            // writes the device.
+            let (entries, _unmined) = engine.mined_block_entries(&key).unwrap();
+            assert_eq!(entries.len(), 1);
             let meta = engine.read_metadata(&key).unwrap();
-            assert_eq!(meta.block_entry_count, 1);
             let expected_unmined = if on_longest_chain {
                 0
             } else {

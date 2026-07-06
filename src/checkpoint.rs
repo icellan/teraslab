@@ -979,6 +979,7 @@ mod tests {
     use crate::locks::StripedLocks;
     use crate::ops::create::CreateRequest;
     use crate::ops::engine::Engine;
+    use crate::ops::error::SpendError;
     use crate::redo::{RedoLog, RedoOp};
     use std::sync::Arc;
 
@@ -2079,11 +2080,11 @@ mod tests {
             );
 
             let used_snapshot = engine2
-                .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
+                .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
                 .expect("mined-index recovery must succeed");
             assert!(
                 used_snapshot,
-                "must use the snapshot+redo path, not the device-scan fallback"
+                "must use the snapshot+redo path (the only path since Task 16d)"
             );
 
             let e1 = engine2.lookup(&key1).expect("tx1 must still be indexed");
@@ -2185,7 +2186,7 @@ mod tests {
             unmined_b3,
         );
         let used_snapshot3 = engine3
-            .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
             .expect("mined-index recovery must succeed with the longer tail");
         assert!(used_snapshot3, "must still use the snapshot+redo path");
 
@@ -2207,12 +2208,12 @@ mod tests {
         assert_eq!(unmined2_after, 0, "tx2 is now mined on the longest chain");
     }
 
-    /// When the MinedIndex snapshot section is absent (e.g. a checkpoint
-    /// taken before Task 13, or the file was never written), recovery must
-    /// still correctly rebuild the MinedIndex — via the device-scan
-    /// fallback ([`crate::ops::engine::Engine::rebuild_mined_index_from_device`]).
+    /// Task 16d: the device-scan fallback is GONE. When a checkpoint HAS run
+    /// (a primary-index snapshot exists) but the `.mined` section is absent,
+    /// recovery must NOT silently rebuild from the device (which is stale
+    /// for any post-16d setMined) — it must fail closed.
     #[test]
-    fn mined_index_recovery_falls_back_to_device_scan_when_snapshot_absent() {
+    fn recovery_without_mined_snapshot_is_fatal_when_checkpoint_exists() {
         use crate::ops::set_mined::SetMinedRequest;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2252,7 +2253,12 @@ mod tests {
         // Write the primary/DAH/unmined snapshot directly (bypassing
         // `perform_checkpoint`, so the `.mined` sibling file is never
         // written at all), plus the allocator header so recovery below can
-        // reconstruct it without a full device scan.
+        // reconstruct it without a full device scan. A REAL checkpoint's
+        // primary+`.mined` writes are atomic (see `recover_mined_index`'s
+        // doc comment) — this reproduces the anomalous case where a
+        // primary snapshot exists without its `.mined` sibling (corruption /
+        // a crash between the two writes), which is exactly what must now
+        // be fatal rather than silently device-rebuilt.
         engine
             .snapshot_index(&snap_path)
             .expect("primary snapshot must succeed");
@@ -2293,34 +2299,152 @@ mod tests {
             unmined_b,
         );
 
+        let err = engine2
+            .recover_mined_index(&snap_path, &mined_snap_path, &[])
+            .expect_err(
+                "an existing primary checkpoint with a missing `.mined` section must be FATAL, \
+                 not silently device-rebuilt",
+            );
+        assert!(
+            matches!(err, SpendError::StorageError { .. }),
+            "expected StorageError, got {err:?}"
+        );
+    }
+
+    /// Task 16d: a genuinely FRESH boot — no checkpoint has EVER run, so
+    /// neither the primary nor the `.mined` snapshot file exists at all —
+    /// must still correctly reconstruct the MinedIndex, via a FULL
+    /// redo-tail replay from genesis (the log has never been truncated).
+    /// This is the one case where an absent `.mined` section is expected
+    /// and non-fatal.
+    #[test]
+    fn recovery_fresh_boot_no_checkpoint_reconstructs_via_redo_replay() {
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Neither of these paths is ever written to in this test — a
+        // genuinely fresh boot has no checkpoint of any kind yet.
+        let snap_path = dir.path().join("never-checkpointed.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(64 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 64 * 1024).unwrap()));
+
+        let key = crate::index::TxKey { txid: [11u8; 32] };
+        let hash = [[0xDDu8; 32]];
+        engine
+            .create(&mined_test_create_req(key.txid, &hash))
+            .unwrap();
+        // Mirror dispatch's WAL-first discipline: the engine call itself
+        // writes no redo (see `set_mined_inner`'s doc comment) — the redo
+        // entries are built independently, exactly as the real dispatch
+        // layer does before calling into the engine.
+        let entry = engine.lookup(&key).expect("create registers the entry");
+        redo.lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id: entry.device_id,
+                record_offset: entry.record_offset,
+                utxo_count: 1,
+                is_conflicting: false,
+                parent_txids: Vec::new(),
+            })
+            .unwrap();
+
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 42,
+                block_height: 5,
+                subtree_idx: 0,
+                current_block_height: 5,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        redo.lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: 42,
+                block_height: 5,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 5,
+                block_height_retention: 100_000,
+                unset: false,
+                txids: vec![key],
+            })
+            .unwrap();
+
+        assert!(
+            !snap_path.exists(),
+            "test setup invariant: no checkpoint has ever run"
+        );
+        // The allocator header is persisted independently of the
+        // primary/mined checkpoint sections (unrelated to Task 16d) — a real
+        // node persists it on its own cadence, so recovery can locate the
+        // live high-water mark without a full checkpoint ever having run.
+        engine
+            .persist_allocator()
+            .expect("allocator header must persist");
+
+        // "Restart": primary index reconstructed via a plain device scan
+        // (mirroring server.rs's own `!snap_path.exists()` branch) — this
+        // is the PRIMARY index's own recovery, untouched by Task 16d.
+        let recovered_alloc = SlotAllocator::recover(dev.clone()).unwrap();
+        let rebuilt_index =
+            crate::index::ShardedIndex::rebuild_in_memory(&*dev, &recovered_alloc, 1, 0)
+                .expect("device-scan rebuild of the primary index succeeds");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            rebuilt_index,
+            recovered_alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
         let used_snapshot = engine2
-            .recover_mined_index(&mined_snap_path, &[])
-            .expect("mined-index recovery must succeed via the fallback");
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
+            .expect("fresh-boot recovery must succeed via full redo-tail replay");
         assert!(
             !used_snapshot,
-            "with no snapshot section, recovery must fall back to the device scan"
+            "no snapshot exists yet, so recovery must report the full-replay path"
         );
 
         let e = engine2.lookup(&key).expect("tx must still be indexed");
         assert_ne!(
             e.mined_slot,
             crate::index::mined_index::NO_MINED_SLOT,
-            "the fallback must still allocate a mined_slot"
+            "the full replay must allocate a mined_slot via the CreateV2 entry"
         );
         let (blocks, unmined_since) = engine2
             .mined_index()
             .read_block_entries(&key, e.mined_slot)
-            .expect("mined-state must be present via the device scan");
+            .expect("mined-state must be present via the redo replay");
         let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
-        assert_eq!(block_ids, vec![900]);
+        assert_eq!(block_ids, vec![42]);
         assert_eq!(unmined_since, 0);
     }
 
-    /// A truncated/corrupt MinedIndex snapshot section must not panic — it
-    /// must fail closed and fall back to the device-scan rebuild, exactly
-    /// like the absent-file case.
+    /// A truncated/corrupt MinedIndex snapshot section must not panic — and,
+    /// since Task 16d removed the device-scan fallback, must fail CLOSED
+    /// (return `Err`) rather than silently reconstruct from the
+    /// now-untrustworthy device.
     #[test]
-    fn mined_index_recovery_falls_back_on_corrupt_snapshot_section() {
+    fn mined_index_recovery_fatal_on_corrupt_snapshot_section() {
         use crate::ops::set_mined::SetMinedRequest;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2397,42 +2521,33 @@ mod tests {
             unmined_b,
         );
 
-        let used_snapshot = engine2
-            .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
-            .expect("mined-index recovery must not panic on a corrupt section");
+        let err = engine2
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
+            .expect_err("a truncated snapshot section must fail closed, not panic or fall back");
         assert!(
-            !used_snapshot,
-            "a truncated snapshot section must fall back to the device scan, not panic"
+            matches!(err, SpendError::StorageError { .. }),
+            "expected StorageError, got {err:?}"
         );
-
-        let e = engine2.lookup(&key).expect("tx must still be indexed");
-        let (blocks, unmined_since) = engine2
-            .mined_index()
-            .read_block_entries(&key, e.mined_slot)
-            .expect("mined-state must be present via the fallback");
-        let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
-        assert_eq!(block_ids, vec![700]);
-        assert_eq!(unmined_since, 0);
     }
 
-    /// CRITICAL fix (Finding 1): a `.mined` snapshot whose stamped fence no
-    /// longer matches the redo logs' CURRENT persisted fence is STALE — it
-    /// belongs to an EARLIER checkpoint than the one that most recently
-    /// fenced/truncated the redo — and trusting it would silently drop
-    /// every mined mutation between the two fences. Reproduces exactly the
-    /// pre-fix hazard this closes: a well-formed `.mined` from checkpoint 1
-    /// (fence F1) is left in place (checkpoint 2's `.mined` write never
-    /// happens in this test, standing in for the write having FAILED), while
-    /// the redo log is independently fenced/truncated PAST F1 (as
-    /// checkpoint 2's primary/DAH/unmined snapshot + redo truncation would
-    /// have done regardless, since those steps are unconditionally fatal and
-    /// unrelated to the `.mined` write's own success). Asserts
-    /// `recover_mined_index` detects the fence mismatch, returns `Ok(false)`
-    /// (device-scan fallback, NOT the stale snapshot), and that the
-    /// recovered state matches the DEVICE's current truth — NOT what the
-    /// stale snapshot would have shown.
+    /// CRITICAL fix (Finding 1, Task 13) + Task 16d: a `.mined` snapshot
+    /// whose stamped fence no longer matches the redo logs' CURRENT
+    /// persisted fence is STALE — it belongs to an EARLIER checkpoint than
+    /// the one that most recently fenced/truncated the redo — and trusting
+    /// it would silently drop every mined mutation between the two fences.
+    /// Reproduces exactly the pre-fix hazard this closes: a well-formed
+    /// `.mined` from checkpoint 1 (fence F1) is left in place (checkpoint 2's
+    /// `.mined` write never happens in this test, standing in for the write
+    /// having FAILED), while the redo log is independently fenced/truncated
+    /// PAST F1 (as checkpoint 2's primary/DAH/unmined snapshot + redo
+    /// truncation would have done regardless, since those steps are
+    /// unconditionally fatal and unrelated to the `.mined` write's own
+    /// success). Task 16d removed the device-scan fallback entirely, so a
+    /// detected fence mismatch is now FATAL — there is no device state left
+    /// to fall back to that would be trustworthy (`set_mined` no longer
+    /// writes it).
     #[test]
-    fn mined_snapshot_stale_fence_falls_back_to_device_scan() {
+    fn mined_snapshot_stale_fence_is_fatal_not_device_rebuilt() {
         use crate::ops::set_mined::SetMinedRequest;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2479,9 +2594,10 @@ mod tests {
         assert!(mined_snap_path.exists());
 
         // MORE mutations on the SAME live engine, past checkpoint 1's fence:
-        // a real device write (dual-write updates the on-device footer
-        // directly) plus the matching redo entry appended manually
-        // (mirrors dispatch building redo independently of the engine call).
+        // updates the MinedIndex + DAH secondary index (setMined performs no
+        // device write, Task 16d) plus the matching redo entry appended
+        // manually (mirrors dispatch building redo independently of the
+        // engine call).
         engine
             .set_mined(&SetMinedRequest {
                 tx_key: key,
@@ -2552,32 +2668,16 @@ mod tests {
             unmined_b,
         );
 
-        let used_snapshot = engine2
-            .recover_mined_index(&mined_snap_path, std::slice::from_ref(&redo))
-            .expect("mined-index recovery must succeed via the fallback");
+        let err = engine2
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
+            .expect_err(
+                "a stale snapshot (fence mismatch against the redo's current persisted fence) \
+                 must be fatal, never trusted and never silently device-rebuilt",
+            );
         assert!(
-            !used_snapshot,
-            "a stale snapshot (fence mismatch against the redo's current persisted fence) must \
-             fall back to the device scan, never be trusted"
+            matches!(err, SpendError::StorageError { .. }),
+            "expected StorageError, got {err:?}"
         );
-
-        // The recovered state must match the DEVICE's current truth — BOTH
-        // blocks (100 from before checkpoint 1, 200 from after) — NOT what
-        // the stale snapshot + gapped redo tail would have shown (block 100
-        // only), which would silently lose the block-200 mutation.
-        let e = engine2.lookup(&key).expect("tx must still be indexed");
-        let (blocks, unmined_since) = engine2
-            .mined_index()
-            .read_block_entries(&key, e.mined_slot)
-            .expect("mined-state must be present via the device-scan fallback");
-        let block_ids: Vec<u32> = blocks.iter().map(|b| b.block_id).collect();
-        assert_eq!(
-            block_ids,
-            vec![100, 200],
-            "the device scan must reflect the LATEST device state (both blocks), not the stale \
-             snapshot's (block 100 only, silently losing the block-200 mutation)"
-        );
-        assert_eq!(unmined_since, 0);
     }
 
     /// G-1 (CRITICAL): with the redb (`OnDisk`) primary backend, per-op
