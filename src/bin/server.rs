@@ -1443,6 +1443,24 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Rebuild the in-memory ShardedMinedIndex the same way: it lives only in
+    // RAM (unlike the primary index), so it boots empty on every restart —
+    // both the snapshot-restore and device-scan-rebuild paths above converge
+    // on `index` by this point, and either one leaves `mined_slot` stale or
+    // sentinel. Re-derive it here from each record's authoritative on-device
+    // block entries / unmined_since / spent counts, overwriting every
+    // primary entry's `mined_slot` with a freshly-allocated slot, before any
+    // client traffic (GET/spend/delete_eval all read mined-state from this
+    // index, not the device).
+    if let Err(e) = engine.rebuild_mined_index_from_device() {
+        tracing::error!(
+            err = %e,
+            "FATAL: failed to rebuild the mined index from the recovered \
+             primary index; aborting startup",
+        );
+        std::process::exit(1);
+    }
+
     // Attach the per-store redo logs so the engine performs two-phase durability
     // for secondary index updates (redo fsync BEFORE redb commit), routing each
     // intent to the owning store's log. This is the SOLE attach point: store 0's

@@ -8225,6 +8225,158 @@ impl Engine {
         }
     }
 
+    /// Rebuild the in-memory [`ShardedMinedIndex`] from authoritative device
+    /// metadata, overwriting every live primary entry's `mined_slot` with a
+    /// freshly-allocated slot.
+    ///
+    /// Called once at startup, after recovery has reconstructed the primary
+    /// index AND replayed the redo log — whichever of the snapshot-restore or
+    /// device-scan-rebuild path produced `self.index` — and BEFORE the server
+    /// serves traffic. `RedoOp::SetMinedBatch` replay updates the device only
+    /// (see `crate::recovery`), so this must run against the FINAL post-replay
+    /// device state, not before it.
+    ///
+    /// The `ShardedMinedIndex` lives only in RAM (unlike the primary index),
+    /// so it boots empty on every restart — `new_inner` always allocates a
+    /// fresh, empty arena. Every live primary entry's existing `mined_slot` is
+    /// therefore untrustworthy regardless of which load path produced it: a
+    /// snapshot-restored entry carries a stale slot number pointing into an
+    /// arena that no longer exists, and a device-scan-rebuilt entry carries
+    /// [`crate::index::mined_index::NO_MINED_SLOT`]. Both cases are handled
+    /// identically here — allocate a FRESH slot
+    /// ([`ShardedMinedIndex::alloc_created`]), replay the record's on-device
+    /// block entries into it in the same inline-then-overflow order
+    /// [`Self::read_all_block_entries`] returns
+    /// ([`ShardedMinedIndex::apply_set_mined`], mirroring
+    /// [`Self::seed_mined_index_from_infos`]), re-derive the `all_spent` bit
+    /// from `spent_utxos == utxo_count`
+    /// ([`ShardedMinedIndex::set_all_spent`]), and re-point the primary entry
+    /// at the fresh slot via `self.index.register` — which overwrites the
+    /// existing key on its owning shard in place without touching
+    /// `shard_record_count` (the same mechanism `relocate` uses to re-point
+    /// `device_id`/`record_offset`).
+    ///
+    /// Mirrors [`Self::rebuild_preserve_index_from_device`] /
+    /// [`Self::rebuild_conflicting_index`]: a record whose footer or overflow
+    /// block-entries are unreadable (torn/CRC-failed) is skipped with a
+    /// warning (bumping [`Self::enumeration_unreadable`]) rather than
+    /// aborting boot — every other read path for that same record already
+    /// fails identically, so skipping creates no new hazard. Its `mined_slot`
+    /// is left untouched (stale or sentinel, whichever it already was) until
+    /// the record can be read cleanly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpendError::StorageError`] if re-pointing a primary entry at
+    /// its fresh `mined_slot` fails (the redb primary backend's write
+    /// transaction failing to commit). Unlike a per-record device read
+    /// failure, this is a global storage fault and is NOT tolerated.
+    pub fn rebuild_mined_index_from_device(&self) -> Result<(), SpendError> {
+        // Snapshot the record locators under the index read lock (no I/O
+        // held under the lock), then read each record's device state and
+        // re-register outside it — same pattern as
+        // `rebuild_preserve_index_from_device`. The slim primary index yields
+        // only a 12-byte txid prefix (bytes 12.. zeroed) — safe for the
+        // PRIMARY index's own shard routing (`shard_for_key` only hashes
+        // bytes `[8..12]`, inside the preserved prefix) but NOT for
+        // `ShardedMinedIndex::shard_for`, which hashes bytes `[16..24]`
+        // (zeroed in the slim key). So `for_each` here is used only to
+        // collect `(device_id, record_offset)`; the authoritative full txid
+        // — used for every `mined_index` call AND the `register` re-point
+        // below — is read back from each record's on-device footer
+        // (`meta.tx_id`), exactly as `rebuild_preserve_index_from_device`
+        // does.
+        let mut locs: Vec<(u8, u64)> = Vec::new();
+        self.index.for_each(|_key, entry| {
+            locs.push((entry.device_id, entry.record_offset));
+        });
+        let mut skipped = 0u64;
+        for (device_id, offset) in locs {
+            let meta = match self.read_metadata_fast(device_id, offset) {
+                Ok(m) => m,
+                Err(e) => {
+                    skipped += 1;
+                    self.enumeration_unreadable
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        device_id,
+                        offset,
+                        err = %e,
+                        "rebuild_mined_index: footer unreadable; skipping (this record's \
+                         mined_slot is left untouched and may be stale/sentinel until it \
+                         is read cleanly)",
+                    );
+                    continue;
+                }
+            };
+            let key = TxKey::from_bytes(meta.tx_id);
+
+            let count = meta.block_entry_count as usize;
+            let inline = count.min(INLINE_BLOCK_ENTRIES);
+            let mut entries: Vec<BlockEntry> = meta.block_entries_inline[..inline].to_vec();
+            if count > INLINE_BLOCK_ENTRIES {
+                match read_overflow_entries(&**self.device_for(device_id), &meta) {
+                    Ok(overflow) => entries.extend(overflow),
+                    Err(e) => {
+                        skipped += 1;
+                        self.enumeration_unreadable
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            device_id,
+                            offset,
+                            err = %e,
+                            "rebuild_mined_index: overflow block-entries unreadable; \
+                             skipping (mined_slot left untouched)",
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // Allocate a FRESH slot — overwriting any prior mined_slot on the
+            // entry is mandatory (see doc comment above): a snapshot-restored
+            // entry may point into an arena that no longer exists.
+            let slot = self.mined_index.alloc_created(&key, meta.unmined_since);
+            let on_longest_chain = meta.unmined_since == 0;
+            for be in &entries {
+                self.mined_index.apply_set_mined(
+                    &key,
+                    slot,
+                    be.block_id,
+                    be.block_height,
+                    be.subtree_idx,
+                    on_longest_chain,
+                );
+            }
+            if meta.spent_utxos == meta.utxo_count {
+                self.mined_index.set_all_spent(&key, slot, true);
+            }
+
+            let new_entry = TxIndexEntry {
+                device_id,
+                record_offset: offset,
+                mined_slot: slot,
+            };
+            if let Err(e) = self.index.register(key, new_entry) {
+                // Release the just-allocated slot before failing so a caller
+                // that tolerates the error (unlike the boot path, which
+                // exits) never leaks it.
+                self.mined_index.free(&key, slot);
+                return Err(SpendError::StorageError {
+                    detail: format!("mined-index rebuild: index re-point failed: {e}"),
+                });
+            }
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "rebuild_mined_index: {skipped} record(s) skipped (footer or overflow \
+                 unreadable); their mined_slot is untouched until read cleanly",
+            );
+        }
+        Ok(())
+    }
+
     /// Read on-device metadata for a transaction.
     ///
     /// This is used by production read/diagnostic paths as well as tests.
@@ -15798,6 +15950,256 @@ mod tests {
                 "recovered record read from wrong store"
             );
         }
+    }
+
+    /// Task 12: after a restart the `ShardedMinedIndex` is empty (it lives
+    /// only in RAM), so `Engine::rebuild_mined_index_from_device` must
+    /// repopulate it — and re-point every primary entry's `mined_slot` at a
+    /// fresh slot — from the device alone. Builds a tx that is unmined at
+    /// creation, mined into 2 blocks on the longest chain, and fully spent;
+    /// simulates a restart via a device-scan-rebuilt primary index (which
+    /// carries `NO_MINED_SLOT`, since a device scan cannot recover the old
+    /// slot number) fed into a brand-new `Engine` (a fresh, empty
+    /// `ShardedMinedIndex`); then asserts the rebuild reproduces the block
+    /// entries, `unmined_since`, `all_spent`, and a live `mined_slot`.
+    #[test]
+    fn mined_index_rebuilt_from_device_on_recovery() {
+        use crate::index::mined_index::{MINED_ALL_SPENT, NO_MINED_SLOT};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let key;
+        {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let (hashes, req) = make_create_req(240, 2);
+            key = req.tx_key();
+            engine.create(&req).expect("create succeeds");
+
+            // Mined into 2 blocks, both on the longest chain -> unmined_since
+            // must end up 0 and both block entries must be recorded.
+            engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: key,
+                    block_id: 11,
+                    block_height: 500,
+                    subtree_idx: 0,
+                    current_block_height: 500,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("setMined block 1 succeeds");
+            engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: key,
+                    block_id: 22,
+                    block_height: 501,
+                    subtree_idx: 1,
+                    current_block_height: 501,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("setMined block 2 succeeds");
+
+            // Spend both UTXOs -> all_spent.
+            for (i, hash) in hashes.iter().enumerate() {
+                let mut spending_data = [0u8; 36];
+                spending_data[0] = 0xC0 + i as u8;
+                spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+                engine
+                    .spend_multi(&SpendMultiRequest {
+                        tx_key: key,
+                        spends: vec![SpendItem {
+                            offset: i as u32,
+                            utxo_hash: *hash,
+                            spending_data,
+                            idx: 0,
+                        }],
+                        ignore_conflicting: false,
+                        ignore_locked: false,
+                        current_block_height: 501,
+                        block_height_retention: 288,
+                    })
+                    .expect("spend succeeds");
+            }
+
+            // Persist the allocator header so the post-restart device scan
+            // sees the correct high-water mark (mirrors the real checkpoint
+            // step in `txid_placement_records_recover_with_correct_device_id_across_restart`).
+            engine.allocator().lock().persist().unwrap();
+        } // engine (and its in-memory MinedIndex) dropped here — the "restart".
+
+        // "Restart": every mutation above already landed synchronously on
+        // `dev` (this test attaches no redo log), so a plain device-scan
+        // rebuild of the primary index reproduces the live state. Its
+        // entries carry NO_MINED_SLOT — a device scan has no way to recover
+        // the pre-crash slot number.
+        let recovered_alloc = SlotAllocator::recover(dev.clone()).unwrap();
+        let rebuilt_index = ShardedIndex::rebuild_in_memory(&*dev, &recovered_alloc, 16, 0)
+            .expect("device-scan rebuild succeeds");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            rebuilt_index,
+            recovered_alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        let entry_before = engine2.lookup(&key).expect("record recovered from device");
+        assert_eq!(
+            entry_before.mined_slot, NO_MINED_SLOT,
+            "precondition: device-scan rebuild cannot recover the old mined_slot",
+        );
+
+        engine2
+            .rebuild_mined_index_from_device()
+            .expect("mined-index rebuild succeeds");
+
+        let entry_after = engine2.lookup(&key).expect("record still present");
+        assert_ne!(
+            entry_after.mined_slot, NO_MINED_SLOT,
+            "rebuild must allocate and register a fresh mined_slot",
+        );
+
+        let (entries, unmined_since) = engine2
+            .mined_block_entries(&key)
+            .expect("mined_block_entries reads the rebuilt slot");
+        assert_eq!(
+            unmined_since, 0,
+            "both blocks were on the longest chain -> unmined_since must be 0"
+        );
+        let block_ids: Vec<u32> = entries.iter().map(|e| e.block_id).collect();
+        assert_eq!(
+            block_ids,
+            vec![11, 22],
+            "rebuild must reproduce both block entries in device order"
+        );
+
+        let all_spent = engine2
+            .mined_index()
+            .with_entry(&key, entry_after.mined_slot, |e| {
+                e.flags & MINED_ALL_SPENT != 0
+            })
+            .expect("rebuilt slot must be live");
+        assert!(
+            all_spent,
+            "the fully-spent record must have all_spent set after rebuild"
+        );
+    }
+
+    /// Task 12 (the actual bug this feature exists to close): a snapshot-
+    /// restored primary entry carries a `mined_slot` from BEFORE the crash,
+    /// but `Engine::new_inner` always builds a fresh, empty `ShardedMinedIndex`
+    /// arena — so that slot number, even though it is not the `NO_MINED_SLOT`
+    /// sentinel, points at nothing (or worse, at some unrelated future
+    /// allocation once the engine starts serving traffic). The rebuild MUST
+    /// unconditionally overwrite `mined_slot` rather than special-casing
+    /// "already looks assigned, leave it alone" — the latter would silently
+    /// wire the primary entry to a slot the MinedIndex never allocated.
+    #[test]
+    fn rebuild_mined_index_from_device_overwrites_stale_nonsentinel_mined_slot() {
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+        // Build the on-device record via a throwaway engine, then discard
+        // its index — only the device bytes and the locator matter.
+        let (device_id, offset, key) = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let temp_engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+                UnminedIndex::new(),
+            );
+            let (_, req) = make_create_req(242, 1);
+            let key = req.tx_key();
+            temp_engine.create(&req).expect("create succeeds");
+            temp_engine
+                .set_mined(&SetMinedRequest {
+                    tx_key: key,
+                    block_id: 77,
+                    block_height: 900,
+                    subtree_idx: 0,
+                    current_block_height: 900,
+                    block_height_retention: 288,
+                    on_longest_chain: true,
+                    unset_mined: false,
+                })
+                .expect("setMined succeeds");
+            let entry = temp_engine.lookup(&key).expect("entry registered");
+            temp_engine.allocator().lock().persist().unwrap();
+            (entry.device_id, entry.record_offset, key)
+        };
+
+        // Hand-build a primary index carrying a STALE, non-sentinel
+        // `mined_slot` (999) for this key — simulating a snapshot restored
+        // into a fresh engine whose `ShardedMinedIndex` has allocated
+        // nothing at all yet.
+        let stale_index = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+        stale_index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id,
+                    record_offset: offset,
+                    mined_slot: 999,
+                },
+            )
+            .expect("register stale entry");
+
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            stale_index,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+            UnminedIndex::new(),
+        );
+
+        // Precondition: the fresh MinedIndex has allocated nothing, so slot
+        // 999 is absent — the stale pointer is already dangling.
+        assert!(
+            engine2
+                .mined_index()
+                .with_entry(&key, 999, |_| ())
+                .is_none(),
+            "precondition: the fresh arena must not have slot 999 live"
+        );
+
+        engine2
+            .rebuild_mined_index_from_device()
+            .expect("mined-index rebuild succeeds");
+
+        let after = engine2.lookup(&key).expect("entry still present");
+        assert_ne!(
+            after.mined_slot, 999,
+            "rebuild must overwrite a stale non-sentinel mined_slot, not trust it"
+        );
+
+        let (entries, unmined_since) = engine2
+            .mined_block_entries(&key)
+            .expect("mined_block_entries reads the freshly re-pointed slot");
+        assert_eq!(unmined_since, 0);
+        assert_eq!(
+            entries.iter().map(|e| e.block_id).collect::<Vec<_>>(),
+            vec![77],
+            "rebuild must reproduce the device's block entries under the new slot"
+        );
     }
 
     #[test]
