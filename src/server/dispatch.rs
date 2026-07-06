@@ -25991,4 +25991,294 @@ mod tests {
         assert_eq!(pending[0].first_sequence, comp_range.0);
         assert_eq!(pending[0].last_sequence, comp_range.1);
     }
+
+    // -----------------------------------------------------------------------
+    // Task 17: setMined burst perf proof — zero data-device writes +
+    // throughput far below the pre-16d device-RMW path (specs/
+    // MINEDINDEX_SETMINED_DESIGN.md measured ~2.45 us/tx cache-hot).
+    // -----------------------------------------------------------------------
+
+    /// Test-only [`BlockDevice`] wrapper that counts `pwrite` calls against
+    /// the inner device. Mirrors `CountingDevice` (`src/io.rs`) /
+    /// `CountingSyncDevice` (this file, sync-counting) / `SyncCountingDevice`
+    /// (`src/ops/engine.rs`), but counts writes — used to prove
+    /// `OP_SET_MINED_BATCH` (Task 16d: mined-state lives only in the in-RAM
+    /// `ShardedMinedIndex` + redo) issues ZERO writes to the DATA device.
+    struct WriteCountingDevice {
+        inner: Arc<MemoryDevice>,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl WriteCountingDevice {
+        fn new(inner: Arc<MemoryDevice>) -> Self {
+            Self {
+                inner,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn write_count(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl BlockDevice for WriteCountingDevice {
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.pwrite(buf, offset)
+        }
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+    }
+
+    /// Deterministic distinct txid from an index — unlike
+    /// `DispatchTestHarness::make_txid` (`u8`, 256-value ceiling), this
+    /// supports the tens-of-thousands of distinct txids the Task 17 perf
+    /// burst needs.
+    fn mined_burst_txid(k: usize) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[0..8].copy_from_slice(&(k as u64).to_le_bytes());
+        t
+    }
+
+    fn mined_burst_create_items(n: usize) -> Vec<WireCreateItem> {
+        (0..n)
+            .map(|k| WireCreateItem {
+                txid: mined_burst_txid(k),
+                tx_version: 1,
+                locktime: 0,
+                fee: 500,
+                size_in_bytes: 250,
+                extended_size: 250,
+                is_coinbase: false,
+                spending_height: 0,
+                created_at: 1_700_000_000_000,
+                flags: 0,
+                utxo_hashes: vec![[k as u8; 32]],
+                cold_data: vec![],
+                block_height: 0,
+                mined_block_id: None,
+                mined_block_height: None,
+                mined_subtree_idx: None,
+                parent_txids: vec![],
+            })
+            .collect()
+    }
+
+    /// Task 17(a): setMined must issue ZERO writes to the DATA device — the
+    /// perf win Task 16d exists to deliver. Wraps the data device in a
+    /// write-counting `BlockDevice`, creates N txs (which DO write the
+    /// device — asserted below as a liveness sanity check so a silently
+    /// no-op counter can't make this pass vacuously), snapshots the write
+    /// count, then drives one `OP_SET_MINED_BATCH` over all N txids and
+    /// asserts the count did not move. Mined-state correctness is checked
+    /// independently via GET(BLOCK_ENTRIES), which (Task 10) reads the
+    /// `ShardedMinedIndex`, not the device. The redo log is intentionally
+    /// NOT attached here (`DispatchTestHarness` drives `handle_request` with
+    /// `redo_log: None`) — this test counts only the DATA device, never a
+    /// redo/WAL device.
+    #[test]
+    fn setmined_batch_does_zero_data_device_writes() {
+        let _m = test_metrics();
+        let _ = test_histograms();
+
+        let dev = Arc::new(WriteCountingDevice::new(Arc::new(
+            MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap(),
+        )));
+        let h = DispatchTestHarness::with_device(dev.clone() as Arc<dyn BlockDevice>);
+
+        const N: usize = 200;
+        let txids: Vec<[u8; 32]> = (0..N).map(mined_burst_txid).collect();
+
+        let create_resp = h.request_with_max_batch(
+            OP_CREATE_BATCH,
+            encode_create_batch(&mined_burst_create_items(N)),
+            N as u32,
+        );
+        assert_eq!(create_resp.status, STATUS_OK, "seed creates must succeed");
+
+        // Creates DO write the DATA device — a nonzero baseline proves the
+        // counting wrapper is actually live, not vacuously zero throughout.
+        let writes_before = dev.write_count();
+        assert!(
+            writes_before > 0,
+            "creates must write the data device (sanity: the counter must be live)"
+        );
+
+        const BLOCK_ID: u32 = 999;
+        let params = SetMinedBatchParams {
+            block_id: BLOCK_ID,
+            block_height: 900_000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 900_000,
+            block_height_retention: 288,
+        };
+        let resp = h.request_with_max_batch(
+            OP_SET_MINED_BATCH,
+            encode_set_mined_batch(&params, &txids),
+            N as u32,
+        );
+        assert_eq!(resp.status, STATUS_OK, "setMined batch must succeed");
+
+        let writes_after = dev.write_count();
+        assert_eq!(
+            writes_after, writes_before,
+            "setMined must issue ZERO writes to the DATA device"
+        );
+
+        // Mined-state correctness: GET(BLOCK_ENTRIES) reads the MinedIndex
+        // (Task 10), not the device — must reflect the new block for every tx.
+        let get_resp = h.request_with_max_batch(
+            OP_GET_BATCH,
+            encode_get_batch(FieldMask::BLOCK_ENTRIES, &txids),
+            N as u32,
+        );
+        assert_eq!(get_resp.status, STATUS_OK);
+        let results = decode_get_response(&get_resp.payload).unwrap();
+        assert_eq!(results.len(), N);
+        for r in &results {
+            assert_eq!(r.status, 0, "GET must succeed for every txid");
+            let (count, entries) = decode_block_entries_section(&r.data);
+            assert_eq!(count, 1, "each tx must show exactly one mined block");
+            assert_eq!(
+                entries[0].0, BLOCK_ID,
+                "block id must match what was just mined"
+            );
+        }
+    }
+
+    /// Drive ONE `OP_SET_MINED_BATCH` over `n` freshly-created txs on a brand
+    /// new `DispatchTestHarness` (built from `make_device`), returning the
+    /// elapsed ns/tx. Asserts the batch fully succeeded (`STATUS_OK`, i.e.
+    /// zero per-item errors) so a fast-but-wrong run can't pass silently.
+    fn setmined_burst_ns_per_tx(
+        n: usize,
+        make_device: impl FnOnce() -> Arc<dyn BlockDevice>,
+    ) -> f64 {
+        let h = DispatchTestHarness::with_device(make_device());
+
+        let create_resp = h.request_with_max_batch(
+            OP_CREATE_BATCH,
+            encode_create_batch(&mined_burst_create_items(n)),
+            n as u32,
+        );
+        assert_eq!(create_resp.status, STATUS_OK, "seed creates must succeed");
+
+        let txids: Vec<[u8; 32]> = (0..n).map(mined_burst_txid).collect();
+        let params = SetMinedBatchParams {
+            block_id: 777,
+            block_height: 900_000,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            unset_mined: false,
+            current_block_height: 900_000,
+            block_height_retention: 288,
+        };
+        let payload = encode_set_mined_batch(&params, &txids);
+
+        let start = std::time::Instant::now();
+        let resp = h.request_with_max_batch(OP_SET_MINED_BATCH, payload, n as u32);
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "every setMined in the burst must succeed (STATUS_OK), or this measurement is vacuous"
+        );
+
+        elapsed.as_nanos() as f64 / n as f64
+    }
+
+    /// Task 17(b): measure setMined burst throughput and pin it far below the
+    /// pre-decoupling device-RMW path (`specs/MINEDINDEX_SETMINED_DESIGN.md`
+    /// §2: ~2.45 us/tx CPU, cache-hot, before any device write). Runs several
+    /// fresh-harness reps and takes the MIN (least scheduling/allocator
+    /// noise), both over a direct `MemoryDevice` and over a
+    /// `CachingDevice`-wrapped one (the production write-back cache shape —
+    /// the fairest comparison to the old cache-hot number, even though
+    /// setMined itself never touches the cache: Task 17(a) proves that).
+    #[test]
+    fn perf_measure_setmined_burst_minedindex() {
+        let _m = test_metrics();
+        let _ = test_histograms();
+
+        const N: usize = 20_000;
+        const REPS: usize = 5;
+        const DEVICE_BYTES: u64 = 256 * 1024 * 1024;
+
+        let direct_min_ns = (0..REPS)
+            .map(|_| {
+                setmined_burst_ns_per_tx(N, || {
+                    Arc::new(MemoryDevice::new(DEVICE_BYTES, 4096).unwrap()) as Arc<dyn BlockDevice>
+                })
+            })
+            .fold(f64::MAX, f64::min);
+        eprintln!(
+            "[perf] setMined burst (direct MemoryDevice), N={N}: min {direct_min_ns:.1} ns/tx over {REPS} reps"
+        );
+
+        let cached_min_ns = (0..REPS)
+            .map(|_| {
+                setmined_burst_ns_per_tx(N, || {
+                    let inner: Arc<dyn BlockDevice> =
+                        Arc::new(MemoryDevice::new(DEVICE_BYTES, 4096).unwrap());
+                    Arc::new(crate::cache::CachingDevice::new(
+                        inner,
+                        64 * 1024 * 1024,
+                        true,
+                        3_600_000,
+                    )) as Arc<dyn BlockDevice>
+                })
+            })
+            .fold(f64::MAX, f64::min);
+        eprintln!(
+            "[perf] setMined burst (CachingDevice write-back), N={N}: min {cached_min_ns:.1} ns/tx over {REPS} reps"
+        );
+
+        // Loose upper bound: comfortably below the pre-decoupling ~2450 ns/tx
+        // cache-hot RMW measurement (specs/MINEDINDEX_SETMINED_DESIGN.md §2).
+        //
+        // Debug builds (unoptimized — what `cargo test --all` runs in CI) are
+        // several times slower in absolute ns terms than release, purely from
+        // missing codegen optimizations having nothing to do with the
+        // algorithmic win being pinned here. Same rationale as
+        // `metrics_overhead_under_20ns` (src/metrics.rs): debug gets a laxer
+        // SANITY ceiling (still catches a gross regression), release enforces
+        // the REAL target against the old production number. Bounds carry
+        // generous headroom above locally measured maxima across repeated
+        // runs: release direct ~520-602 ns/tx, cached ~1396-1458 ns/tx;
+        // debug direct ~3470-3500 ns/tx, cached ~4400-4470 ns/tx. The cached
+        // variant's bound sits closer to the old ~2450 ns/tx figure than
+        // direct's because a per-tx DAH-eval device READ still happens
+        // (`set_mined_inner` step 2) and a cache-shard lookup is not free —
+        // real, but a smaller win than the write-elimination alone, which
+        // direct's ~4x margin shows in isolation.
+        let (direct_limit, cached_limit): (f64, f64) = if cfg!(debug_assertions) {
+            (6000.0, 7500.0)
+        } else {
+            (1000.0, 2000.0)
+        };
+        assert!(
+            direct_min_ns < direct_limit,
+            "direct-device setMined burst must stay far below the old ~2450 ns/tx RMW path, \
+             got {direct_min_ns:.1} ns/tx (limit {direct_limit})"
+        );
+        assert!(
+            cached_min_ns < cached_limit,
+            "cached-device setMined burst must stay below the old ~2450 ns/tx RMW path, \
+             got {cached_min_ns:.1} ns/tx (limit {cached_limit})"
+        );
+    }
 }
