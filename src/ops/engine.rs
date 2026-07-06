@@ -3220,7 +3220,16 @@ impl Engine {
             return Err(SpendError::Conflicting);
         }
         if metadata.flags.contains(TxFlags::LOCKED) && !req.ignore_locked {
-            return Err(SpendError::Locked);
+            // Task 16c: `device.LOCKED` is now an immutable create-time
+            // marker rather than something `setMined` clears, so a record
+            // is locked-for-spend only while it remains unmined. Read
+            // mined-state fresh from the authoritative MinedIndex (Task
+            // 16a) — a record with at least one live block entry stays
+            // spendable even if the on-device bit is still set.
+            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            if mined_entries.is_empty() {
+                return Err(SpendError::Locked);
+            }
         }
         let spending_height = { metadata.spending_height };
         if metadata.flags.contains(TxFlags::IS_COINBASE)
@@ -3476,7 +3485,13 @@ impl Engine {
             return Err(SpendError::Conflicting);
         }
         if metadata.flags.contains(TxFlags::LOCKED) && !req.ignore_locked {
-            return Err(SpendError::Locked);
+            // Task 16c: see the identical reroute in `prepare_spend_multi`
+            // — LOCKED is now an immutable create-time marker, so a record
+            // is locked-for-spend only while unmined per the MinedIndex.
+            let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+            if mined_entries.is_empty() {
+                return Err(SpendError::Locked);
+            }
         }
         let spending_height = { metadata.spending_height };
         if metadata.flags.contains(TxFlags::IS_COINBASE)
@@ -10881,6 +10896,113 @@ mod tests {
         let mut req = h.spend_req(0);
         req.ignore_locked = true;
         assert!(h.engine.spend(&req).is_ok());
+    }
+
+    /// Task 16c: `device.LOCKED` is an immutable create-time marker — a
+    /// record with LOCKED set and no mined-state (never went through
+    /// `setMined`) must still be rejected, and `ignore_locked` must still
+    /// bypass the rejection, exactly as before the reroute.
+    #[test]
+    fn spend_rejects_locked_unmined_record() {
+        let h = TestHarness::new(10, TxFlags::LOCKED);
+        match h.engine.spend(&h.spend_req(0)) {
+            Err(SpendError::Locked) => {}
+            other => panic!("expected Locked, got {other:?}"),
+        }
+
+        let mut req = h.spend_req(0);
+        req.ignore_locked = true;
+        assert!(h.engine.spend(&req).is_ok());
+    }
+
+    /// Task 16c: reroutes the LOCKED-for-spend check to also require the
+    /// record is NOT mined. Builds a record whose on-device `LOCKED` bit
+    /// is still set — as it will be once a later sub-task stops `setMined`
+    /// from clearing it — but which already carries a live block entry in
+    /// the authoritative MinedIndex (via the `TestHarness::with_metadata`
+    /// customize hook + `seed_mined_index_for_test`, i.e. WITHOUT going
+    /// through `setMined`'s LOCKED-clear). The pre-reroute code would have
+    /// rejected this spend with `SpendError::Locked`; the reroute must let
+    /// it through because the record is mined.
+    #[test]
+    fn spend_allows_locked_but_mined_record() {
+        let h = TestHarness::with_metadata(10, TxFlags::LOCKED, |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+        });
+
+        let result = h.engine.spend(&h.spend_req(0));
+        assert!(
+            result.is_ok(),
+            "a mined record must be spendable even if device LOCKED is still set, got {result:?}"
+        );
+        let slot = h.engine.read_slot(&h.key, 0).unwrap();
+        assert!(slot.is_spent());
+    }
+
+    /// `prepare_spend_multi`'s LOCKED check must be rerouted identically to
+    /// the single-spend path above.
+    #[test]
+    fn spend_multi_rejects_locked_unmined_record() {
+        let h = TestHarness::new(10, TxFlags::LOCKED);
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 0,
+                utxo_hash: h.slot_hash(0),
+                spending_data: h.make_spending_data(0xAB),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+        match h.engine.spend_multi(&req) {
+            Err(SpendError::Locked) => {}
+            other => panic!("expected Locked, got {other:?}"),
+        }
+
+        let mut ignore_req = req;
+        ignore_req.ignore_locked = true;
+        assert!(h.engine.spend_multi(&ignore_req).is_ok());
+    }
+
+    /// `prepare_spend_multi` variant of `spend_allows_locked_but_mined_record`.
+    #[test]
+    fn spend_multi_allows_locked_but_mined_record() {
+        let h = TestHarness::with_metadata(10, TxFlags::LOCKED, |m| {
+            m.block_entry_count = 1;
+            m.block_entries_inline[0] = BlockEntry {
+                block_id: 1,
+                block_height: 900,
+                subtree_idx: 0,
+            };
+        });
+        let req = SpendMultiRequest {
+            tx_key: h.key,
+            spends: vec![SpendItem {
+                offset: 0,
+                utxo_hash: h.slot_hash(0),
+                spending_data: h.make_spending_data(0xAB),
+                idx: 0,
+            }],
+            ignore_conflicting: false,
+            ignore_locked: false,
+            current_block_height: 1000,
+            block_height_retention: 288,
+        };
+
+        let resp = h.engine.spend_multi(&req);
+        assert!(
+            resp.is_ok(),
+            "a mined record must be spendable via spend_multi even if device LOCKED is still set, got {resp:?}"
+        );
+        assert!(resp.unwrap().errors.is_empty());
     }
 
     #[test]

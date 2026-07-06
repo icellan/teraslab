@@ -517,7 +517,15 @@ impl Model {
                 if rec.conflicting {
                     return Outcome::Conflicting;
                 }
-                if rec.locked {
+                // Task 16c: `LOCKED` only blocks a spend while the record is
+                // unmined — `engine.spend`'s reroute reads mined-state fresh
+                // from the MinedIndex, so a record with at least one mined
+                // block stays spendable even if `SetLocked{true}` re-sets
+                // the device bit AFTER it was mined (SetMined itself still
+                // clears `locked` in this model, per the unchanged
+                // `Op::SetMined` handler below — this extra check exists for
+                // the re-lock-after-mined case).
+                if rec.locked && rec.mined.is_empty() {
                     return Outcome::Locked;
                 }
                 // Engine guard: `spending_height > 0 && spending_height >
