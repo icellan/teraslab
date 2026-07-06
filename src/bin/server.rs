@@ -215,7 +215,7 @@ fn run_one_catchup_pass(
             };
             entries
                 .iter()
-                .flat_map(|e| {
+                .map(|e| {
                     // CRITICAL FIX: `RedoOp::tx_key()` only represents a
                     // `SetMinedBatch` of exactly one txid (`None` for 0 or
                     // 2+), so a genuine multi-txid batch must be expanded
@@ -224,29 +224,42 @@ fn run_one_catchup_pass(
                     // single-key ops have. Without this, a live setMined RPC
                     // touching 2+ txids was silently dropped from replica
                     // catch-up with no error or retry (permanent divergence).
-                    if let teraslab::redo::RedoOp::SetMinedBatch { txids, .. } = &e.op {
-                        let mut ops = Vec::new();
-                        let mut seen_shards = std::collections::HashSet::new();
-                        for tx_key in txids {
+                    //
+                    // Each entry keeps its own sequence paired with its full
+                    // `ReplicaOp` expansion (rather than flattening into one
+                    // list) so `run_catchup_for_replica` can apply the
+                    // per-pass op budget at entry granularity — never
+                    // splitting one entry's (possibly multi-op) expansion
+                    // across two passes, and never over-reporting the
+                    // watermark past ops that were not actually sent.
+                    let ops: Vec<teraslab::replication::protocol::ReplicaOp> =
+                        if let teraslab::redo::RedoOp::SetMinedBatch { txids, .. } = &e.op {
+                            let mut ops = Vec::new();
+                            let mut seen_shards = std::collections::HashSet::new();
+                            for tx_key in txids {
+                                let shard =
+                                    teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
+                                if seen_shards.insert(shard) {
+                                    ops.extend(
+                                        teraslab::cluster::coordinator::redo_entry_to_replica_ops(
+                                            e, shard, &eng_ref,
+                                        ),
+                                    );
+                                }
+                            }
+                            ops
+                        } else if let Some(tx_key) = e.op.tx_key() {
                             let shard =
                                 teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
-                            if seen_shards.insert(shard) {
-                                ops.extend(
-                                    teraslab::cluster::coordinator::redo_entry_to_replica_ops(
-                                        e, shard, &eng_ref,
-                                    ),
-                                );
-                            }
-                        }
-                        return ops;
-                    }
-                    let Some(tx_key) = e.op.tx_key() else {
-                        return Vec::new();
-                    };
-                    let shard = teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
-                    teraslab::cluster::coordinator::redo_entry_to_replica_op(e, shard, &eng_ref)
-                        .into_iter()
-                        .collect()
+                            teraslab::cluster::coordinator::redo_entry_to_replica_op(
+                                e, shard, &eng_ref,
+                            )
+                            .into_iter()
+                            .collect()
+                        } else {
+                            Vec::new()
+                        };
+                    (e.sequence, ops)
                 })
                 .collect()
         },

@@ -1790,7 +1790,13 @@ fn tcp_catchup_chunk_boundary_no_skip() {
             .unwrap();
         all_ops.push(spend_op_for(txid, i as u8));
     }
-    let ops_for_cb = all_ops.clone();
+    // One redo entry per op, at sequences 1..=12 (matches the master's
+    // real redo numbering: one spend per txid).
+    let entries_for_cb: Vec<(u64, Vec<teraslab::replication::protocol::ReplicaOp>)> = all_ops
+        .iter()
+        .enumerate()
+        .map(|(i, op)| (1 + i as u64, vec![op.clone()]))
+        .collect();
 
     // Replica is 12 redo ops behind: redo seqs 1..=12, batch_size 5 →
     // chunks of 5,5,2 (two boundaries).
@@ -1800,7 +1806,7 @@ fn tcp_catchup_chunk_boundary_no_skip() {
         13,
         5,
         10_000,
-        &move |_from| ops_for_cb.clone(),
+        &move |_from| entries_for_cb.clone(),
         Some(1),
         &|chunk| send_replica_ops_to(addr, chunk, Duration::from_secs(5), None, 0, node_id, 0),
     );

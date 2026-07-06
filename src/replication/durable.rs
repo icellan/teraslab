@@ -863,19 +863,33 @@ pub fn check_redo_truncation(
 /// `send_chunk(chunk)` must return `Ok(())` only once the replica has
 /// durably applied (or provably already applied) every op in `chunk`.
 ///
-/// Returns `Ok(through_redo_seq)` on success: the highest redo sequence
-/// covered by the pass, computed conservatively as
-/// `from_seq + ops_sent - 1` (redo entries that produce no `ReplicaOp`
-/// are under-counted; re-replaying them later is idempotent). Callers
-/// record this against the [`AckTracker`]. Failure modes are the typed
-/// [`CatchupError`] variants; callers that dispatch on "redo wrapped —
-/// request a full resync" MUST `match` on `RedoReclaimed` rather than
-/// substring-matching the rendered message — see `bin/server.rs` for the
-/// canonical pattern.
+/// Returns `Ok(through_redo_seq)` on success: the redo sequence of the last
+/// **fully-included** entry in this pass. The per-pass op budget
+/// (`max_ops_per_pass`) is applied at redo-ENTRY granularity, never at the
+/// level of the flattened `ReplicaOp` list: whole entries are accumulated
+/// in order, and the pass stops before an entry that would push the
+/// running op count over budget — but only once at least one entry has
+/// already been accumulated. A single entry whose own expansion alone
+/// exceeds the budget still ships whole (a multi-txid `SetMinedBatch`
+/// expansion is atomic and must never be split across passes). This
+/// matters because one redo sequence can expand to N `ReplicaOp`s (e.g. a
+/// multi-txid `SetMinedBatch`): a prior version derived the watermark as
+/// `from_seq + ops_sent - 1` and truncated the flattened op list, which
+/// could both split a batch's expansion mid-entry and over-report how many
+/// redo sequences were actually fully sent — silently advancing the
+/// replica's ACK past ops that were never delivered. Callers record the
+/// returned watermark against the [`AckTracker`] and resume the next pass
+/// at `watermark + 1`. Failure modes are the typed [`CatchupError`]
+/// variants; callers that dispatch on "redo wrapped — request a full
+/// resync" MUST `match` on `RedoReclaimed` rather than substring-matching
+/// the rendered message — see `bin/server.rs` for the canonical pattern.
 ///
 /// The `ops_from_seq` callback should read redo entries starting at the
-/// given sequence and convert them to `ReplicaOp`s. It returns an empty
-/// vec when the entries have been reclaimed (circular redo log wrapped).
+/// given sequence and return one `(sequence, ReplicaOps)` group per entry,
+/// in ascending sequence order — the group's ops is the entry's full
+/// `ReplicaOp` expansion (possibly empty, e.g. for entries that carry no
+/// replicated mutation). It returns an empty vec when the entries have
+/// been reclaimed (circular redo log wrapped).
 ///
 /// The `first_available_seq` callback returns the sequence number of the
 /// earliest available redo entry, or `None` if the log is empty. Used to
@@ -892,7 +906,7 @@ pub fn run_catchup_for_replica(
     current_seq: u64,
     batch_size: usize,
     max_ops_per_pass: usize,
-    ops_from_seq: &dyn Fn(u64) -> Vec<ReplicaOp>,
+    ops_from_seq: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)>,
     first_available_seq: Option<u64>,
     send_chunk: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String>,
 ) -> std::result::Result<u64, CatchupError> {
@@ -915,29 +929,50 @@ pub fn run_catchup_for_replica(
         });
     }
 
-    let mut ops = ops_from_seq(from_seq);
-    if ops.is_empty() {
+    let entries = ops_from_seq(from_seq);
+    if entries.is_empty() {
         return Err(CatchupError::RedoReclaimed {
             from: from_seq,
             available: first_available_seq,
         });
     }
+
+    // Accumulate whole entries (each entry = one redo sequence's full
+    // `ReplicaOp` expansion) up to the `max_ops_per_pass` budget. Never
+    // split a single entry's expansion across passes: the first entry
+    // accumulated is always included in full — even if it alone exceeds
+    // the budget — because a batch must ship atomically and the cap is
+    // only a soft budget once at least one entry has already been taken.
     let max_ops_per_pass = max_ops_per_pass.max(1);
-    if ops.len() > max_ops_per_pass {
-        ops.truncate(max_ops_per_pass);
+    let mut ops: Vec<ReplicaOp> = Vec::new();
+    let mut op_count: usize = 0;
+    let mut through_seq: Option<u64> = None;
+    for (seq, entry_ops) in entries {
+        let would_be = op_count + entry_ops.len();
+        if through_seq.is_some() && would_be > max_ops_per_pass {
+            break;
+        }
+        op_count = would_be;
+        ops.extend(entry_ops);
+        through_seq = Some(seq);
     }
+    // `entries` was checked non-empty above, and the budget check above
+    // only ever triggers `break` after `through_seq` is already `Some`
+    // (the first entry is always accumulated unconditionally), so
+    // `through_seq` is always set here. `unwrap_or` (rather than
+    // `unwrap`/`expect`, banned in library code) keeps this branch total
+    // without ever actually being reached.
+    let through_seq = through_seq.unwrap_or(from_seq);
 
     let batch_size = batch_size.max(1);
-    let mut sent: u64 = 0;
     for chunk in ops.chunks(batch_size) {
         send_chunk(chunk).map_err(|detail| CatchupError::Transport {
             addr: *addr,
             detail,
         })?;
-        sent += chunk.len() as u64;
     }
 
-    Ok(from_seq + sent - 1)
+    Ok(through_seq)
 }
 
 // ---------------------------------------------------------------------------
@@ -1865,19 +1900,23 @@ mod tests {
 
     /// R-D2 regression (unit level): the catch-up runner must deliver
     /// every op exactly once across chunk boundaries and report redo
-    /// coverage as `from_seq + ops_sent - 1`. Pre-fix the runner
-    /// labeled chunk N+1 with the last ACKED sequence instead of
+    /// coverage as the last fully-included entry's sequence. Pre-fix the
+    /// runner labeled chunk N+1 with the last ACKED sequence instead of
     /// acked+1, so the receiver's dedup dropped the first op of every
     /// chunk after the first. Labeling now lives in the `send_chunk`
     /// callback (the dispatch-side dense stream cursor); this test pins
     /// that the runner itself hands over contiguous, complete,
-    /// non-overlapping chunks.
+    /// non-overlapping chunks. One op per entry here (sequences 5..=14) so
+    /// the expected watermark (14) matches the pre-entry-boundary-fix
+    /// value exactly — the entry-boundary accounting introduced by the P0
+    /// fix is exercised separately by
+    /// `catchup_truncates_at_entry_boundary_not_mid_batch`.
     #[test]
     fn run_catchup_chunks_cover_all_ops_without_skips_or_overlap() {
         use crate::index::TxKey;
 
         let addr: SocketAddr = "127.0.0.1:65533".parse().unwrap();
-        // 10 distinguishable ops: Delete on tx_key marked by index.
+        // 10 distinguishable ops, one per entry, at sequences 5..=14.
         let make_ops = |n: u8| -> Vec<ReplicaOp> {
             (0..n)
                 .map(|i| ReplicaOp::Delete {
@@ -1886,7 +1925,11 @@ mod tests {
                 .collect()
         };
         let all_ops = make_ops(10);
-        let ops_for_cb = all_ops.clone();
+        let entries_for_cb: Vec<(u64, Vec<ReplicaOp>)> = all_ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| (5 + i as u64, vec![op.clone()]))
+            .collect();
 
         let delivered: std::sync::Mutex<Vec<ReplicaOp>> = std::sync::Mutex::new(Vec::new());
         let chunk_sizes: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -1897,7 +1940,7 @@ mod tests {
             15, // current_seq
             3,  // batch_size → chunks of 3,3,3,1
             10_000,
-            &move |_from| ops_for_cb.clone(),
+            &move |_from| entries_for_cb.clone(),
             Some(5),
             &|chunk| {
                 chunk_sizes.lock().unwrap().push(chunk.len());
@@ -1909,7 +1952,7 @@ mod tests {
         assert_eq!(
             result.unwrap(),
             14,
-            "redo coverage must be from_seq + ops_sent - 1 = 5 + 10 - 1",
+            "watermark must be the last fully-included entry's sequence (14)",
         );
         assert_eq!(*chunk_sizes.lock().unwrap(), vec![3, 3, 3, 1]);
         assert_eq!(
@@ -1940,7 +1983,7 @@ mod tests {
             7,
             2,
             10_000,
-            &move |_from| ops.clone(),
+            &move |_from| vec![(1u64, ops.clone())],
             Some(1),
             &|_chunk| {
                 let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1979,7 +2022,7 @@ mod tests {
     #[test]
     fn run_catchup_returns_typed_redo_reclaimed_when_log_wrapped() {
         let addr: SocketAddr = "127.0.0.1:65535".parse().unwrap();
-        let no_ops: &dyn Fn(u64) -> Vec<ReplicaOp> = &|_| Vec::new();
+        let no_ops: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)> = &|_| Vec::new();
         let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
             &|_| panic!("send_chunk must not be called when redo wrapped");
 
@@ -2037,7 +2080,7 @@ mod tests {
     #[test]
     fn run_catchup_already_caught_up_returns_ok() {
         let addr: SocketAddr = "127.0.0.1:65534".parse().unwrap();
-        let no_ops: &dyn Fn(u64) -> Vec<ReplicaOp> = &|_| Vec::new();
+        let no_ops: &dyn Fn(u64) -> Vec<(u64, Vec<ReplicaOp>)> = &|_| Vec::new();
         let no_send: &dyn Fn(&[ReplicaOp]) -> std::result::Result<(), String> =
             &|_| panic!("send_chunk must not be called when already caught up");
 
@@ -2046,5 +2089,157 @@ mod tests {
 
         let result = run_catchup_for_replica(&addr, 200, 100, 16, 100, no_ops, Some(50), no_send);
         assert_eq!(result.unwrap(), 200);
+    }
+
+    /// P0 regression: the pre-fix runner flattened every redo entry's
+    /// `ReplicaOp` expansion into one `Vec<ReplicaOp>` before applying
+    /// `max_ops_per_pass`, so `truncate` could cut a single multi-txid
+    /// `SetMinedBatch` expansion in half, and the returned watermark
+    /// (`from_seq + ops_sent - 1`) over-reported how many redo SEQUENCES
+    /// had actually been fully sent — advancing the replica's ACK past ops
+    /// that were silently dropped (permanent divergence with a false
+    /// "caught up" signal).
+    ///
+    /// This models the exact repro: 3 redo entries expand to
+    /// `[1 op, 5 ops (a 5-txid batch), 1 op]` = 7 ops total, with
+    /// `max_ops_per_pass = 4`. The fix applies the budget at entry
+    /// (sequence) granularity: whole entries are accumulated, and the pass
+    /// stops BEFORE an entry that would push the running total over budget
+    /// once at least one entry has already been accumulated. The returned
+    /// watermark is the sequence of the last FULLY-INCLUDED entry, so a
+    /// second pass resuming at `watermark + 1` delivers exactly the
+    /// remaining entries with nothing dropped and nothing re-sent.
+    #[test]
+    fn catchup_truncates_at_entry_boundary_not_mid_batch() {
+        use crate::index::TxKey;
+
+        let addr: SocketAddr = "127.0.0.1:65531".parse().unwrap();
+        let op = |b: u8| ReplicaOp::Delete {
+            tx_key: TxKey::from_bytes([b; 32]),
+        };
+
+        // Entry 10: 1 op. Entry 11: 5 ops (the multi-txid batch). Entry 12:
+        // 1 op. Total 7 ops across 3 entries.
+        let entry_10_ops = vec![op(1)];
+        let entry_11_ops: Vec<ReplicaOp> = (2..=6).map(op).collect();
+        let entry_12_ops = vec![op(7)];
+        let all_entries = vec![
+            (10u64, entry_10_ops.clone()),
+            (11u64, entry_11_ops.clone()),
+            (12u64, entry_12_ops.clone()),
+        ];
+
+        let ops_from_seq = {
+            let all_entries = all_entries.clone();
+            move |from: u64| -> Vec<(u64, Vec<ReplicaOp>)> {
+                all_entries
+                    .iter()
+                    .filter(|(seq, _)| *seq >= from)
+                    .cloned()
+                    .collect()
+            }
+        };
+
+        let delivered: std::sync::Mutex<Vec<ReplicaOp>> = std::sync::Mutex::new(Vec::new());
+        let send = |chunk: &[ReplicaOp]| -> std::result::Result<(), String> {
+            delivered.lock().unwrap().extend_from_slice(chunk);
+            Ok(())
+        };
+
+        // First pass: from_seq = 10, max_ops_per_pass = 4. Entry 10 (1 op)
+        // fits; entry 11 would bring the running total to 6 > 4, and an
+        // entry is already accumulated, so entry 11 must NOT be included.
+        let result = run_catchup_for_replica(&addr, 10, 13, 10, 4, &ops_from_seq, Some(10), &send);
+
+        assert_eq!(
+            result.unwrap(),
+            10,
+            "watermark must be the last FULLY-INCLUDED entry's sequence (10), not \
+             from_seq + ops_sent - 1",
+        );
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            entry_10_ops,
+            "pass must ship only whole entries within budget: entry 10's single op, \
+             stopping before the 5-op batch at entry 11",
+        );
+
+        // Second pass resumes at watermark + 1 = 11 with a budget generous
+        // enough to take both remaining entries whole.
+        delivered.lock().unwrap().clear();
+        let result2 =
+            run_catchup_for_replica(&addr, 11, 13, 10, 10_000, &ops_from_seq, Some(10), &send);
+
+        assert_eq!(
+            result2.unwrap(),
+            12,
+            "second pass must cover through the last remaining entry (12)",
+        );
+        let mut expected_remaining = entry_11_ops;
+        expected_remaining.extend(entry_12_ops);
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            expected_remaining,
+            "second pass must deliver the remaining entries with nothing dropped and \
+             nothing re-sent",
+        );
+    }
+
+    /// A single redo entry whose `ReplicaOp` expansion alone exceeds
+    /// `max_ops_per_pass` must still ship whole in one pass — a
+    /// `SetMinedBatch` expansion is atomic, and splitting it would
+    /// resurrect the mid-batch truncation bug. The returned watermark is
+    /// that entry's own sequence, and the next entry must NOT be pulled
+    /// into the same pass.
+    #[test]
+    fn catchup_single_oversized_batch_ships_whole() {
+        use crate::index::TxKey;
+
+        let addr: SocketAddr = "127.0.0.1:65530".parse().unwrap();
+        let op = |b: u8| ReplicaOp::Delete {
+            tx_key: TxKey::from_bytes([b; 32]),
+        };
+
+        // Entry 20 alone expands to 10 ops -- far over the budget of 3.
+        // Entry 21 (2 more ops) must not be pulled in alongside it.
+        let big_entry_ops: Vec<ReplicaOp> = (1..=10).map(op).collect();
+        let entries = [
+            (20u64, big_entry_ops.clone()),
+            (21u64, vec![op(11), op(12)]),
+        ];
+
+        let delivered: std::sync::Mutex<Vec<ReplicaOp>> = std::sync::Mutex::new(Vec::new());
+
+        let result = run_catchup_for_replica(
+            &addr,
+            20,
+            22,
+            100, // batch_size: large enough to send in one chunk
+            3,   // max_ops_per_pass: smaller than the single entry's 10 ops
+            &move |from: u64| {
+                entries
+                    .iter()
+                    .filter(|(seq, _)| *seq >= from)
+                    .cloned()
+                    .collect()
+            },
+            Some(20),
+            &|chunk| {
+                delivered.lock().unwrap().extend_from_slice(chunk);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            20,
+            "watermark must be the oversized entry's own sequence",
+        );
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            big_entry_ops,
+            "the oversized single entry must ship whole (not split), and the next entry \
+             must not be pulled into the same pass",
+        );
     }
 }
