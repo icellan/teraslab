@@ -8419,6 +8419,28 @@ impl Engine {
     /// taken. Call these two methods back-to-back at recovery (see
     /// [`Self::recover_mined_index`]).
     ///
+    /// `min_sequence_exclusive` is the RESTORED snapshot's stamped fence:
+    /// only entries with `sequence > min_sequence_exclusive` are replayed
+    /// (the fresh-boot delegator [`Self::replay_mined_index_redo_tail`]
+    /// passes `0`, replaying everything `recover()` yields). The snapshot
+    /// already folds in every redo effect at or below its fence, so those
+    /// entries must NOT be re-applied. In the healthy case the snapshot
+    /// fence equals each log's persisted redo fence and `recover()` already
+    /// excludes them, so the floor changes nothing. In the
+    /// crash-in-checkpoint-window case — the `.mined` snapshot was fsynced at
+    /// fence `F` but the redo fence had not yet advanced past the prior
+    /// checkpoint's `F_prev < F` when the crash hit — `recover()` STILL
+    /// returns the whole `F_prev..F` overlap (every entry already folded into
+    /// the snapshot). Replaying that overlap is NOT a clean no-op: a `Create`
+    /// in it calls `alloc_created`, minting a FRESH slot and ORPHANING the
+    /// snapshot-restored slot — which, if the tx is unmined, is left dangling
+    /// in its height bucket, double-counting `unmined_len` /
+    /// `collect_unmined_keys_below`. Passing `F` as the floor skips the
+    /// overlap entirely: correct, because the snapshot is the authoritative
+    /// fold of everything `<= F`, and `apply_set_mined`/`apply_unset` replay
+    /// for the post-`F` tail remains idempotent over any fuzzy-window effect
+    /// the snapshot happened to also capture.
+    ///
     /// Reads every entry currently in `redo_logs` (each log's `recover()` — a
     /// pure, side-effect-free read) and replays, in GLOBAL sequence order
     /// (mirrors `crate::recovery::recover_all_multi_store`'s cross-store
@@ -8477,9 +8499,10 @@ impl Engine {
     /// Returns [`SpendError::StorageError`] if reading a redo log fails, or
     /// if re-pointing a primary entry's `mined_slot` fails (redb commit
     /// failure).
-    pub fn replay_mined_index_redo_tail(
+    pub fn replay_mined_index_redo_tail_above(
         &self,
         redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
+        min_sequence_exclusive: u64,
     ) -> Result<(), SpendError> {
         let mut tagged: Vec<crate::redo::RedoEntry> = Vec::new();
         for log in redo_logs {
@@ -8494,6 +8517,13 @@ impl Engine {
             std::collections::HashMap::new();
 
         for entry in &tagged {
+            // Entries at or below the restored snapshot's fence are already
+            // folded into it (see the method doc) — the floor is EXCLUSIVE.
+            // Re-applying them is unsafe for a `Create` (orphans the snapshot
+            // slot); skip the whole overlap.
+            if entry.sequence <= min_sequence_exclusive {
+                continue;
+            }
             match &entry.op {
                 crate::redo::RedoOp::Create {
                     tx_key,
@@ -8588,6 +8618,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Replay the ENTIRE recovered redo tail into the [`ShardedMinedIndex`]
+    /// (no snapshot floor) — the genuine-fresh-boot full-replay path.
+    ///
+    /// Thin wrapper over [`Self::replay_mined_index_redo_tail_above`] with a
+    /// `0` floor: `recover()` already excludes entries at or below each log's
+    /// own persisted fence, so a `0` floor filters nothing additional and this
+    /// preserves the pre-existing replay-everything behavior byte-for-byte.
+    /// The snapshot+redo path in [`Self::recover_mined_index`] calls
+    /// `replay_mined_index_redo_tail_above` directly with the snapshot fence.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::replay_mined_index_redo_tail_above`].
+    pub fn replay_mined_index_redo_tail(
+        &self,
+        redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
+    ) -> Result<(), SpendError> {
+        self.replay_mined_index_redo_tail_above(redo_logs, 0)
+    }
+
     /// The MINIMUM "persisted recovery fence" across every attached redo
     /// log — the sequence through which each log's OWN tail replay is
     /// already bounded (see [`crate::redo::RedoLog::recover_with_fence`]).
@@ -8643,19 +8693,34 @@ impl Engine {
     ///   `ReplicaCreate`/`SetMinedBatch`/`Delete` handling — no snapshot
     ///   restore is needed or attempted. Returns `Ok(false)`.
     /// - **A checkpoint HAS run** (`primary_snapshot_path` exists) but the
-    ///   `.mined` section is absent, fails to decode, or its stamped fence
-    ///   doesn't match the redo logs' current persisted fence: the primary
-    ///   and `.mined` snapshots are written atomically & fatally by the same
+    ///   `.mined` section is absent or fails to decode: the primary and
+    ///   `.mined` snapshots are written atomically & fatally by the same
     ///   checkpoint (`perform_checkpoint_inner` propagates a `.mined` write
     ///   failure via `?` BEFORE the redo is fenced/truncated), so a present
     ///   primary snapshot implies a present, valid `.mined` UNLESS something
     ///   is now corrupt — and by the time any checkpoint has run, the redo
     ///   HAS been truncated, so a full replay would silently reconstruct an
-    ///   INCOMPLETE (missing pre-truncation) MinedIndex. This case is now
-    ///   FATAL: returns `Err`, never silently rebuilds from stale device
-    ///   data. Mirrors how a corrupt primary-index snapshot's write-time
-    ///   atomicity is reasoned about — the two sections are never supposed
-    ///   to disagree about which checkpoint they belong to.
+    ///   INCOMPLETE (missing pre-truncation) MinedIndex. This case is FATAL:
+    ///   returns `Err`, never silently rebuilds from stale device data.
+    ///
+    /// # Fence relationship (present, decodable `.mined`)
+    ///
+    /// When the `.mined` section IS present and decodes, its stamped fence is
+    /// compared against the redo logs' current persisted fence:
+    ///
+    /// - `snapshot_fence >= redo_fence` → RECOVERABLE. Restore the snapshot,
+    ///   then replay the redo tail STRICTLY ABOVE `snapshot_fence`. Equality
+    ///   is the healthy case; `snapshot_fence > redo_fence` is the
+    ///   crash-in-checkpoint-window case (the `.mined` write at fence `F`
+    ///   completed but the crash hit before the redo fence advanced past the
+    ///   prior checkpoint's `F_prev`). The intact `F_prev..F` overlap is
+    ///   already folded into the snapshot, so it is SKIPPED rather than
+    ///   re-applied — re-applying an overlap `Create` would orphan a restored
+    ///   slot and corrupt the unmined height buckets.
+    /// - `snapshot_fence < redo_fence` → FATAL. The redo was reclaimed PAST
+    ///   what the snapshot covers, so the entries between them are gone and
+    ///   the snapshot is genuinely stale (`Err`, never a device rebuild — Task
+    ///   16d removed it).
     ///
     /// Returns `Ok(true)` if the snapshot+redo-tail path was used, `Ok(false)`
     /// for the genuine-fresh-boot full-replay path. Both outcomes leave the
@@ -8728,21 +8793,44 @@ impl Engine {
             }
         };
 
+        // Fence contract (CRITICAL — a wrong branch here either bricks boot or
+        // silently loses mined-state):
+        //
+        // * `snapshot_fence >= redo_fence` → RECOVERABLE. The `.mined` snapshot
+        //   covers at least as far as the redo's current persisted fence, so
+        //   restoring it and replaying the redo tail ABOVE the snapshot fence
+        //   reproduces the correct MinedIndex. Equality is the healthy case.
+        //   `snapshot_fence > redo_fence` is the crash-in-checkpoint-window
+        //   case: the checkpoint fsynced `.mined` at fence `F` (step 1a) but
+        //   crashed BEFORE advancing the redo fence past the previous
+        //   checkpoint's `F_prev` (step 4). The redo tail is fully intact; the
+        //   `F_prev..F` overlap is already folded into the snapshot, so the
+        //   replay floor (`snapshot_fence`) SKIPS it — never re-applying a
+        //   `Create` that would orphan a restored slot. Pre-16d this was
+        //   wrongly treated as a stale snapshot and FATAL'd, permanently
+        //   bricking boot on any crash inside that multi-second window.
+        //
+        // * `snapshot_fence < redo_fence` → FATAL. The redo was reclaimed PAST
+        //   what the snapshot covers, so the `snapshot_fence..redo_fence`
+        //   entries are GONE — the snapshot is genuinely stale and there is no
+        //   trustworthy device state to fall back to (Task 16d removed it).
         match Self::min_redo_recovery_fence(redo_logs)? {
-            Some(redo_fence) if redo_fence == snapshot_fence => {}
+            Some(redo_fence) if snapshot_fence >= redo_fence => {}
             Some(redo_fence) => {
                 tracing::error!(
                     path = %mined_snapshot_path.display(),
                     snapshot_fence,
                     redo_fence,
-                    "FATAL: mined-index snapshot fence does not match the redo logs' current \
-                     persisted fence (stale snapshot) — the device-scan fallback was removed \
-                     (Task 16d); recovery cannot safely reconstruct mined-state",
+                    "FATAL: mined-index snapshot fence is BEHIND the redo logs' current \
+                     persisted fence (redo reclaimed past the snapshot — genuinely stale) — \
+                     the device-scan fallback was removed (Task 16d); recovery cannot safely \
+                     reconstruct mined-state",
                 );
                 return Err(SpendError::StorageError {
                     detail: format!(
-                        "mined-index recovery: snapshot fence {snapshot_fence} at {} does not \
-                         match the redo logs' persisted fence {redo_fence}",
+                        "mined-index recovery: snapshot fence {snapshot_fence} at {} is behind \
+                         the redo logs' persisted fence {redo_fence} (redo reclaimed past the \
+                         snapshot)",
                         mined_snapshot_path.display()
                     ),
                 });
@@ -8766,7 +8854,15 @@ impl Engine {
         }
 
         self.restore_mined_index_from_snapshot_entries(&entries)?;
-        self.replay_mined_index_redo_tail(redo_logs)?;
+        // Replay ONLY the tail strictly above the snapshot's fence. In the
+        // healthy `snapshot_fence == redo_fence` case this equals replaying the
+        // whole recovered tail; in the crash-window `snapshot_fence >
+        // redo_fence` case it deliberately SKIPS the `redo_fence..snapshot_fence`
+        // overlap already folded into the just-restored snapshot (see
+        // `replay_mined_index_redo_tail_above`'s doc — replaying an overlap
+        // `Create` would orphan a restored slot and corrupt the unmined
+        // buckets).
+        self.replay_mined_index_redo_tail_above(redo_logs, snapshot_fence)?;
         tracing::info!(
             entries = entries.len(),
             fence = snapshot_fence,

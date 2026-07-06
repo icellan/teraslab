@@ -5937,6 +5937,43 @@ fn stream_shard_baseline(
 
             let utxo_hashes: Vec<_> = slots.iter().map(|s| s.hash).collect();
 
+            // Source the record's mined-state — both its block entries AND its
+            // `unmined_since` — from the authoritative in-RAM MinedIndex, NOT
+            // the device footer. Post-16d, setMined/unset write mined-state
+            // ONLY to the MinedIndex; the device footer's `unmined_since` is
+            // stale for any tx mined-then-reorged after creation (only
+            // `mark_on_longest_chain` still syncs it back). Shipping the stale
+            // device value in the Create op below would seed the RECEIVER's
+            // MinedIndex with the wrong (create-time) height and prune the
+            // still-unmined UTXO early. This mirrors how the per-block SetMined
+            // ops further down already source their block set from the
+            // MinedIndex (Task 15).
+            let (mined_entries, unmined_since) = match engine.mined_block_entries(key) {
+                Ok(v) => v,
+                Err(crate::ops::error::SpendError::TxNotFound) => {
+                    // Raced a concurrent delete between the
+                    // `read_record_snapshot` above and this lookup — the
+                    // Create/Spend/Freeze ops already queued for this key
+                    // still ship; there is simply no mined state left to
+                    // replay for it. Fall back to the device footer's
+                    // `unmined_since` for the shipped Create (the record is
+                    // being removed anyway, so a stale height is harmless).
+                    tracing::debug!(
+                        shard = task.shard,
+                        key = ?key,
+                        "cluster: mined-state read raced a concurrent delete \
+                         during baseline stream; shipping no mined ops",
+                    );
+                    (Vec::new(), { meta.unmined_since })
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "baseline mined_block_entries shard {} key {:?}: {e:?}",
+                        task.shard, key
+                    ));
+                }
+            };
+
             // Serialize metadata (70 bytes with extended fields).
             let mut meta_buf = Vec::with_capacity(70);
             meta_buf.extend_from_slice(&meta.tx_version.to_le_bytes());
@@ -5952,7 +5989,9 @@ fn stream_shard_baseline(
             meta_buf.push(wire_flags);
             meta_buf.extend_from_slice(&meta.generation.to_le_bytes());
             meta_buf.extend_from_slice(&meta.updated_at.to_le_bytes());
-            meta_buf.extend_from_slice(&meta.unmined_since.to_le_bytes());
+            // MinedIndex-sourced (see the `mined_block_entries` read above),
+            // NOT `meta.unmined_since` (stale device footer post-16d).
+            meta_buf.extend_from_slice(&unmined_since.to_le_bytes());
             meta_buf.extend_from_slice(&meta.delete_at_height.to_le_bytes());
             meta_buf.extend_from_slice(&meta.preserve_until.to_le_bytes());
 
@@ -6002,35 +6041,15 @@ fn stream_shard_baseline(
             // Replay mined state from the authoritative in-RAM MinedIndex —
             // NOT the device's `meta.block_entries_inline` — so migration is
             // store-to-store (a later task drops on-device block entries
-            // entirely). A record's blocks can carry DIFFERENT block_ids, so
-            // each is shipped as its own per-block `ReplicaOp::SetMined`; the
-            // coalesced `ReplicaOp::SetMinedBatch` shares one block_id across
-            // MANY txids — the orthogonal live/delta axis, not applicable to
-            // a single record's own block list.
-            let (mined_entries, unmined_since) = match engine.mined_block_entries(key) {
-                Ok(v) => v,
-                Err(crate::ops::error::SpendError::TxNotFound) => {
-                    // Raced a concurrent delete between the
-                    // `read_record_snapshot` above and this lookup — the
-                    // Create/Spend/Freeze ops already queued for this key
-                    // still ship; there is simply no mined state left to
-                    // replay for it.
-                    tracing::debug!(
-                        shard = task.shard,
-                        key = ?key,
-                        "cluster: mined-state read raced a concurrent delete \
-                         during baseline stream; shipping no mined ops",
-                    );
-                    (Vec::new(), 0)
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "baseline mined_block_entries shard {} key {:?}: {e:?}",
-                        task.shard, key
-                    ));
-                }
-            };
-            // NO_MINED_SLOT (never mined) returns `(vec![], 0)` above, so an
+            // entirely). `mined_entries` / `unmined_since` were read from the
+            // MinedIndex ABOVE (so the Create op's shipped `unmined_since`
+            // matches this block set). A record's blocks can carry DIFFERENT
+            // block_ids, so each is shipped as its own per-block
+            // `ReplicaOp::SetMined`; the coalesced `ReplicaOp::SetMinedBatch`
+            // shares one block_id across MANY txids — the orthogonal live/delta
+            // axis, not applicable to a single record's own block list.
+            //
+            // NO_MINED_SLOT (never mined) yielded `(vec![], 0)` above, so an
             // unmined record naturally ships no mined ops here.
             let on_longest_chain = unmined_since == 0;
             for be in &mined_entries {
@@ -9893,6 +9912,147 @@ mod tests {
                     if *tx_key == unmined_key
             )),
             "an unmined record must ship no SetMined ops"
+        );
+    }
+
+    /// The migration BASELINE Create op must ship `unmined_since` sourced from
+    /// the authoritative MinedIndex, NOT the (post-16d stale) device footer.
+    ///
+    /// For a mined-then-fully-unmined tx the two DISAGREE: setMined/unset write
+    /// mined-state only to the MinedIndex, so the device footer keeps its
+    /// create-time `unmined_since` while the MinedIndex carries the reorg
+    /// height. Shipping the stale device value would seed the receiver's
+    /// MinedIndex with the wrong (create-time) height and prune the
+    /// still-unmined UTXO early. The shipped Create op's `unmined_since` bytes
+    /// (metadata offset 58..62) must equal the SOURCE MinedIndex value.
+    #[test]
+    fn migration_baseline_ships_unmined_since_from_mined_index() {
+        use crate::ops::set_mined::SetMinedRequest;
+        use std::io::{Read, Write};
+
+        let engine = test_engine();
+        let shard = 83u16;
+        let key = tx_key_for_shard(shard, 1);
+        create_test_record(&engine, key);
+
+        // Mine on the longest chain, then reorg it FULLY out at height 700_000.
+        // The MinedIndex ends with no blocks and `unmined_since == 700_000`;
+        // the device footer keeps its stale create-time value (0), because
+        // setMined/unset write nothing to the device post-16d.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 500,
+                block_height: 650_000,
+                subtree_idx: 0,
+                current_block_height: 650_010,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 500,
+                block_height: 650_000,
+                subtree_idx: 0,
+                current_block_height: 700_000,
+                block_height_retention: 288,
+                on_longest_chain: false,
+                unset_mined: true,
+            })
+            .unwrap();
+
+        // Precondition: device footer and MinedIndex genuinely disagree.
+        let device_unmined = { engine.read_metadata(&key).unwrap().unmined_since };
+        let (mined_blocks, mined_unmined) = engine.mined_block_entries(&key).unwrap();
+        assert!(
+            mined_blocks.is_empty(),
+            "tx was fully reorged out — no blocks remain"
+        );
+        assert_eq!(
+            mined_unmined, 700_000,
+            "MinedIndex holds the reorg height as unmined_since"
+        );
+        assert_ne!(
+            device_unmined, mined_unmined,
+            "test premise: the device footer's unmined_since ({device_unmined}) must be \
+             STALE relative to the MinedIndex ({mined_unmined})"
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).unwrap();
+            let payload_len = u32::from_le_bytes(header) as usize;
+            let mut body = vec![0u8; payload_len];
+            stream.read_exact(&mut body).unwrap();
+
+            let mut frame_bytes = header.to_vec();
+            frame_bytes.extend_from_slice(&body);
+            let (request, _) = crate::protocol::frame::RequestFrame::decode(&frame_bytes).unwrap();
+            let batch =
+                crate::replication::protocol::ReplicaBatch::deserialize(&request.payload).unwrap();
+
+            let response = crate::protocol::frame::ResponseFrame {
+                request_id: request.request_id,
+                status: crate::protocol::opcodes::STATUS_OK,
+                payload: crate::replication::protocol::ReplicaAck::Ok {
+                    through_sequence: 0,
+                }
+                .serialize(),
+            };
+            stream.write_all(&response.encode()).unwrap();
+            batch
+        });
+
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        let task = MigrationTask {
+            shard,
+            from_node: NodeId(1),
+            to_node: NodeId(2),
+            is_master: true,
+        };
+        stream_shard_baseline(
+            &task,
+            &[&key],
+            &engine,
+            &mut stream,
+            64,
+            /* cluster_key */ 0,
+            None,
+        )
+        .unwrap();
+
+        let batch = receiver.join().unwrap();
+
+        // Parse the shipped Create op's `unmined_since` (metadata bytes 58..62).
+        let shipped_unmined = batch
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                crate::replication::protocol::ReplicaOp::Create {
+                    tx_key,
+                    metadata_bytes,
+                    ..
+                } if *tx_key == key => Some(u32::from_le_bytes(
+                    metadata_bytes[58..62].try_into().unwrap(),
+                )),
+                _ => None,
+            })
+            .expect("baseline must ship a Create op for the key");
+
+        assert_eq!(
+            shipped_unmined, mined_unmined,
+            "the shipped Create must carry the MinedIndex's unmined_since (reorg height \
+             {mined_unmined}), NOT the stale device footer value ({device_unmined})"
+        );
+        assert_ne!(
+            shipped_unmined, device_unmined,
+            "regression guard: the stale device value must never be what ships"
         );
     }
 

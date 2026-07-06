@@ -820,10 +820,18 @@ where
     //     error aborts the checkpoint HERE, before the redo fence/truncation
     //     runs, so `.mined` and the redo can never disagree about which
     //     checkpoint they belong to. `snapshot_fence_sequence` is stamped
-    //     into the snapshot so `Engine::recover_mined_index` can also verify
-    //     this independently at recovery time (defense-in-depth): recovery
-    //     falls back to the device scan (Task 12, never removed) whenever
-    //     this section is absent, stale (fence mismatch), or corrupt.
+    //     into the snapshot so `Engine::recover_mined_index` can relate it to
+    //     the redo's persisted fence at recovery time. This step (1a) writes
+    //     `.mined` at fence F; the redo fence only advances to F at step 4,
+    //     with a multi-second device-sync barrier (step 3) in between. A crash
+    //     in that window leaves `.mined` stamped F while the redo is still
+    //     fenced at the PRIOR checkpoint's F_prev (< F) with the whole
+    //     F_prev..F tail intact — recovery treats `snapshot_fence >=
+    //     redo_fence` as RECOVERABLE (restore `.mined`@F, replay the tail
+    //     ABOVE F), and only a snapshot fence BEHIND the redo fence
+    //     (redo reclaimed past the snapshot) is fatal. The device-scan
+    //     fallback was removed in Task 16d — the snapshot + redo tail is the
+    //     sole source of truth.
     engine
         .snapshot_mined_index_by_key(
             &mined_index_snapshot_path(&config.snapshot_path),
@@ -2509,10 +2517,13 @@ mod tests {
     /// PAST F1 (as checkpoint 2's primary/DAH/unmined snapshot + redo
     /// truncation would have done regardless, since those steps are
     /// unconditionally fatal and unrelated to the `.mined` write's own
-    /// success). Task 16d removed the device-scan fallback entirely, so a
-    /// detected fence mismatch is now FATAL — there is no device state left
-    /// to fall back to that would be trustworthy (`set_mined` no longer
-    /// writes it).
+    /// success). This is the `snapshot_fence < redo_fence` case: the redo was
+    /// reclaimed PAST what the snapshot covers, so the entries in between are
+    /// gone. Task 16d removed the device-scan fallback entirely, so this stays
+    /// FATAL — there is no trustworthy state left to fall back to (`set_mined`
+    /// no longer writes it). (The opposite `snapshot_fence > redo_fence`
+    /// direction — the crash-in-checkpoint-window — is instead RECOVERABLE;
+    /// see `crash_between_mined_snapshot_and_redo_fence_advance_recovers`.)
     #[test]
     fn mined_snapshot_stale_fence_is_fatal_not_device_rebuilt() {
         use crate::ops::set_mined::SetMinedRequest;
@@ -2639,6 +2650,237 @@ mod tests {
         assert!(
             matches!(err, SpendError::StorageError { .. }),
             "expected StorageError, got {err:?}"
+        );
+    }
+
+    /// CRITICAL crash-safety: a crash INSIDE the checkpoint window — after the
+    /// `.mined` snapshot was fsynced at fence `F` (step 1a) but BEFORE the redo
+    /// fence advanced past the prior checkpoint's `F_prev < F` (step 4) — must
+    /// RECOVER, not brick boot. The `.mined`@F snapshot and the whole intact
+    /// `F_prev..F` redo tail both cover the mutations in between, so recovery
+    /// restores `.mined`@F and replays the redo tail STRICTLY ABOVE `F`.
+    ///
+    /// The discriminator is a tx CREATED in the `F_prev..F` overlap that is
+    /// UNMINED at `F`: it lives in `.mined`@F (restored into a fresh slot,
+    /// bucketed at its creation height) AND still has its `Create` redo entry
+    /// in the overlap. If recovery re-applied that overlap `Create` (replaying
+    /// from `redo_fence` instead of from the snapshot fence), `alloc_created`
+    /// would mint a SECOND slot and orphan the restored one — leaving it
+    /// dangling in the unmined height bucket, so `unmined_len` /
+    /// `collect_unmined_keys_below` double-count it even after a later
+    /// (post-`F`) setMined moves the tx onto the longest chain. Replaying only
+    /// above `F` skips the already-folded overlap and keeps exactly one slot.
+    #[test]
+    fn crash_between_mined_snapshot_and_redo_fence_advance_recovers() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        use crate::index::{Index, ShardedIndex, TxIndexEntry};
+        use crate::ops::set_mined::SetMinedRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("crash-window.snap");
+        let mined_snap_path = mined_index_snapshot_path(&snap_path);
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(8 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(128).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(16),
+            DahIndex::new(),
+        );
+
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+        let redo = Arc::new(Mutex::new(RedoLog::open(redo_dev, 0, 256 * 1024).unwrap()));
+
+        // key_stable: created + mined on the longest chain BEFORE the window.
+        // It lives purely in `.mined`@F (no redo entry in the recovered tail),
+        // proving the snapshot-restore side keeps working alongside the overlap
+        // handling.
+        let key_stable = crate::index::TxKey { txid: [1u8; 32] };
+        let hash_stable = [[0xAAu8; 32]];
+        engine
+            .create(&mined_test_create_req(key_stable.txid, &hash_stable))
+            .unwrap();
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key_stable,
+                block_id: 100,
+                block_height: 20,
+                subtree_idx: 0,
+                current_block_height: 20,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+
+        // key_overlap: CREATED in the window. `mined_test_create_req` uses
+        // block_height 10, so its MinedIndex slot is unmined at height 10.
+        let key_overlap = crate::index::TxKey { txid: [2u8; 32] };
+        let hash_overlap = [[0xBBu8; 32]];
+        engine
+            .create(&mined_test_create_req(key_overlap.txid, &hash_overlap))
+            .unwrap();
+        let overlap_entry = engine.lookup(&key_overlap).expect("key_overlap indexed");
+        let stable_entry = engine.lookup(&key_stable).expect("key_stable indexed");
+
+        // The overlap `Create` redo entry (index-only CreateV2 — reads the
+        // record's own footer at replay). Its assigned sequence is F: the
+        // highest sequence the `.mined` snapshot below covers.
+        let f = redo
+            .lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key_overlap,
+                device_id: overlap_entry.device_id,
+                record_offset: overlap_entry.record_offset,
+                utxo_count: 1,
+                is_conflicting: false,
+                parent_txids: vec![],
+            })
+            .unwrap();
+
+        // Persist the allocator so a fresh allocator can recover the device,
+        // then write BOTH snapshots. `.mined` is stamped at fence F while the
+        // redo fence stays at its genesis value (0 == F_prev < F): exactly the
+        // crash-in-window on-disk state.
+        engine.persist_allocator().unwrap();
+        engine
+            .snapshot_mined_index_by_key(&mined_snap_path, f)
+            .expect("mined snapshot at fence F");
+        engine
+            .snapshot_index(&snap_path)
+            .expect("primary snapshot must exist so checkpoint_ever_taken is true");
+
+        // POST-F tail (sequence F+1 > F): key_overlap is mined onto the longest
+        // chain. Applied to the source too so its live MinedIndex reflects the
+        // true crash-point state we must converge to.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key_overlap,
+                block_id: 200,
+                block_height: 30,
+                subtree_idx: 0,
+                current_block_height: 30,
+                block_height_retention: 100_000,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .unwrap();
+        let post_f = redo
+            .lock()
+            .append_and_flush(RedoOp::SetMinedBatch {
+                block_id: 200,
+                block_height: 30,
+                subtree_idx: 0,
+                on_longest_chain: true,
+                current_block_height: 30,
+                block_height_retention: 100_000,
+                unset: false,
+                txids: vec![key_overlap],
+            })
+            .unwrap();
+        assert!(post_f > f, "post-F tail must sit strictly above the fence");
+
+        // Source's true crash-point state: both records mined, nothing unmined.
+        assert_eq!(
+            engine.mined_index().unmined_len(),
+            0,
+            "source: key_stable + key_overlap are both mined on the longest chain"
+        );
+
+        // Redo fence is still 0 (F_prev): recover() must expose BOTH the
+        // overlap CreateV2 and the post-F SetMinedBatch.
+        assert_eq!(
+            redo.lock().recover().unwrap().len(),
+            2,
+            "test setup invariant: redo unfenced past F_prev=0, so the whole \
+             F_prev..post-F tail (overlap Create + post-F setMined) is present"
+        );
+
+        // A FRESH engine, primary index fully replayed (both keys live,
+        // NO_MINED_SLOT), MinedIndex empty — recovery's exact precondition.
+        let fresh_index = ShardedIndex::from_single(Index::new(128).unwrap().into());
+        fresh_index
+            .register(
+                key_stable,
+                TxIndexEntry {
+                    device_id: stable_entry.device_id,
+                    record_offset: stable_entry.record_offset,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register key_stable");
+        fresh_index
+            .register(
+                key_overlap,
+                TxIndexEntry {
+                    device_id: overlap_entry.device_id,
+                    record_offset: overlap_entry.record_offset,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register key_overlap");
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            fresh_index,
+            alloc2,
+            StripedLocks::new(16),
+            DahIndex::new(),
+        );
+
+        // The crash-window recovery: must NOT be fatal (snapshot_fence F >=
+        // redo_fence 0), and must use the snapshot+redo path.
+        let used_snapshot = engine2
+            .recover_mined_index(&snap_path, &mined_snap_path, std::slice::from_ref(&redo))
+            .expect("crash-in-window recovery must RECOVER, not brick boot");
+        assert!(used_snapshot, "must use the snapshot+redo-tail path");
+
+        // key_overlap converges to mined-on-longest-chain via restore(unmined@F)
+        // + post-F setMined replay — and, crucially, exactly ONE slot: the
+        // overlap Create was skipped, so no orphaned slot lingers.
+        let (ov_blocks, ov_unmined) = engine2
+            .mined_block_entries(&key_overlap)
+            .expect("key_overlap mined-state present");
+        let ov_block_ids: Vec<u32> = ov_blocks.iter().map(|b| b.block_id).collect();
+        assert_eq!(
+            ov_block_ids,
+            vec![200],
+            "post-F setMined must be reflected via the above-fence tail replay"
+        );
+        assert_eq!(
+            ov_unmined, 0,
+            "key_overlap is now mined on the longest chain"
+        );
+
+        // key_stable restored intact from `.mined`@F.
+        let (st_blocks, st_unmined) = engine2
+            .mined_block_entries(&key_stable)
+            .expect("key_stable mined-state present");
+        assert_eq!(
+            st_blocks.iter().map(|b| b.block_id).collect::<Vec<_>>(),
+            vec![100],
+            "key_stable's block survives the snapshot restore"
+        );
+        assert_eq!(st_unmined, 0, "key_stable stays mined on the longest chain");
+
+        // THE discriminator: no orphaned unmined-bucket entry. Without the
+        // above-fence floor, replaying the overlap Create would leave the
+        // restored key_overlap slot dangling in bucket 10, so this would be 1.
+        assert_eq!(
+            engine2.mined_index().unmined_len(),
+            0,
+            "recovered MinedIndex must have NO stale unmined entry (overlap Create \
+             must not have orphaned key_overlap's restored slot)"
+        );
+        assert!(
+            engine2
+                .mined_index()
+                .collect_unmined_keys_below(u32::MAX)
+                .is_empty(),
+            "no txid may appear in an unmined height bucket after recovery"
         );
     }
 
