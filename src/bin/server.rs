@@ -215,10 +215,38 @@ fn run_one_catchup_pass(
             };
             entries
                 .iter()
-                .filter_map(|e| {
-                    let tx_key = e.op.tx_key()?;
+                .flat_map(|e| {
+                    // CRITICAL FIX: `RedoOp::tx_key()` only represents a
+                    // `SetMinedBatch` of exactly one txid (`None` for 0 or
+                    // 2+), so a genuine multi-txid batch must be expanded
+                    // across every shard its txids belong to — there is no
+                    // single "the" shard to derive via `tx_key()` the way
+                    // single-key ops have. Without this, a live setMined RPC
+                    // touching 2+ txids was silently dropped from replica
+                    // catch-up with no error or retry (permanent divergence).
+                    if let teraslab::redo::RedoOp::SetMinedBatch { txids, .. } = &e.op {
+                        let mut ops = Vec::new();
+                        let mut seen_shards = std::collections::HashSet::new();
+                        for tx_key in txids {
+                            let shard =
+                                teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
+                            if seen_shards.insert(shard) {
+                                ops.extend(
+                                    teraslab::cluster::coordinator::redo_entry_to_replica_ops(
+                                        e, shard, &eng_ref,
+                                    ),
+                                );
+                            }
+                        }
+                        return ops;
+                    }
+                    let Some(tx_key) = e.op.tx_key() else {
+                        return Vec::new();
+                    };
                     let shard = teraslab::cluster::shards::ShardTable::shard_for_key(tx_key);
                     teraslab::cluster::coordinator::redo_entry_to_replica_op(e, shard, &eng_ref)
+                        .into_iter()
+                        .collect()
                 })
                 .collect()
         },

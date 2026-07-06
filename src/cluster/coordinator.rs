@@ -6565,13 +6565,14 @@ pub fn redo_entry_to_replica_op(
             // (`replication/receiver.rs`'s `replica_op_to_redo_op`). A
             // genuine multi-key batch (the primary WAL entry
             // `handle_set_mined_batch` writes for a live setMined RPC) has
-            // no single key to hang one `ReplicaOp` off of; its post-crash
-            // catch-up reconstruction arrives with Task 14's
-            // `ReplicaOp::SetMinedBatch`. Until then such an entry is not
-            // reshipped by the pending-replication-intent catch-up path —
-            // live replication (dispatch Phase 4) is unaffected, since it
-            // ships the per-key `ReplicaOp::SetMined`/`UnsetMined`
-            // independently of this redo-entry reconstruction.
+            // no single key to hang one `ReplicaOp` off of — callers that
+            // may see a multi-key batch (replica catch-up, migration delta,
+            // the R-036 intent-replay path) MUST use
+            // [`redo_entry_to_replica_ops`] instead, which expands every
+            // txid in the batch into its own `ReplicaOp`. This single-op
+            // accessor stays fail-closed (`None`) for a genuine multi-key
+            // batch so a caller that forgets to switch cannot silently drop
+            // txids without at least losing test coverage against `None`.
             let [tx_key] = txids.as_slice() else {
                 return None;
             };
@@ -6881,6 +6882,81 @@ pub fn redo_entry_to_replica_op(
     }
 }
 
+/// Convert a redo log entry into EVERY `ReplicaOp` it represents for `shard`.
+///
+/// CRITICAL FIX: [`redo_entry_to_replica_op`] can only ever produce a single
+/// `ReplicaOp`, so a genuine multi-txid [`crate::redo::RedoOp::SetMinedBatch`]
+/// (the primary WAL entry `handle_set_mined_batch` writes for a live setMined
+/// RPC spanning several txids) had no representation there and was silently
+/// dropped by every caller that used it for post-crash reconstruction —
+/// replica catch-up (`run_catchup_for_replica`) and the shard-migration delta
+/// stream (`collect_migration_delta_ops`) would permanently lose those txids,
+/// diverging the replica/target from the master with no error or retry.
+///
+/// This is the one-to-many replacement: for a `SetMinedBatch`, it expands
+/// every txid whose shard matches `shard` into its own
+/// `ReplicaOp::SetMined`/`UnsetMined` (sharing the batch's block fields) —
+/// identical to the per-tx `ReplicaOp`s the retired per-tx `RedoOp::SetMined`
+/// produced pre-Task-11. For every other op it delegates to
+/// [`redo_entry_to_replica_op`] and wraps the 0-or-1 result in a `Vec`.
+///
+/// Task 14 will make replication natively batch-native
+/// (`ReplicaOp::SetMinedBatch`); until then this expansion is the correct
+/// interim behavior — every txid still ships, just as N wire ops instead of
+/// one.
+pub fn redo_entry_to_replica_ops(
+    entry: &crate::redo::RedoEntry,
+    shard: u16,
+    engine: &Engine,
+) -> Vec<crate::replication::protocol::ReplicaOp> {
+    use crate::redo::RedoOp;
+    use crate::replication::protocol::ReplicaOp;
+
+    if let RedoOp::SetMinedBatch {
+        block_id,
+        block_height,
+        subtree_idx,
+        on_longest_chain,
+        current_block_height,
+        block_height_retention,
+        unset,
+        txids,
+    } = &entry.op
+    {
+        let gen_for =
+            |k: &TxKey| -> u32 { engine.read_metadata(k).map(|m| m.generation).unwrap_or(0) };
+        return txids
+            .iter()
+            .filter(|tx_key| ShardTable::shard_for_key(tx_key) == shard)
+            .map(|tx_key| {
+                if *unset {
+                    ReplicaOp::UnsetMined {
+                        tx_key: *tx_key,
+                        block_id: *block_id,
+                        current_block_height: *current_block_height,
+                        block_height_retention: *block_height_retention,
+                        master_generation: gen_for(tx_key),
+                    }
+                } else {
+                    ReplicaOp::SetMined {
+                        tx_key: *tx_key,
+                        block_id: *block_id,
+                        block_height: *block_height,
+                        subtree_idx: *subtree_idx,
+                        on_longest_chain: *on_longest_chain,
+                        current_block_height: *current_block_height,
+                        block_height_retention: *block_height_retention,
+                        master_generation: gen_for(tx_key),
+                    }
+                }
+            })
+            .collect();
+    }
+    redo_entry_to_replica_op(entry, shard, engine)
+        .into_iter()
+        .collect()
+}
+
 fn collect_migration_delta_ops(
     redo_log: &Option<Arc<ParkingMutex<RedoLog>>>,
     snapshot_seq: u64,
@@ -6907,7 +6983,7 @@ fn collect_migration_delta_ops(
     Ok(entries
         .iter()
         .filter(|e| e.sequence < fence_seq)
-        .filter_map(|e| redo_entry_to_replica_op(e, shard, engine))
+        .flat_map(|e| redo_entry_to_replica_ops(e, shard, engine))
         .collect())
 }
 
@@ -10523,6 +10599,75 @@ mod tests {
                 assert_eq!(*master_generation, 0);
             }
             other => panic!("expected SetLocked delta, got {other:?}"),
+        }
+    }
+
+    /// CRITICAL FIX: a multi-txid `SetMinedBatch` landing in the migration
+    /// delta window must ship every txid it carries as its own
+    /// `ReplicaOp::SetMined`, not vanish. Pre-fix, `collect_migration_delta_ops`
+    /// used `redo_entry_to_replica_op` (single-op) via `filter_map`, which
+    /// returns `None` for any `SetMinedBatch` of more than one txid — the
+    /// migration target would never receive the mutation, permanently
+    /// diverging from the source for every txid in the batch.
+    #[test]
+    fn migration_delta_ops_include_multi_txid_set_mined_batch() {
+        let engine = test_engine();
+        let shard = 88u16;
+        let k1 = tx_key_for_shard(shard, 1);
+        let k2 = tx_key_for_shard(shard, 2);
+        let k3 = tx_key_for_shard(shard, 3);
+        let other_shard = tx_key_for_shard(shard + 1, 4);
+        let redo_dev: Arc<dyn crate::device::BlockDevice> =
+            Arc::new(crate::device::MemoryDevice::new(1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(ParkingMutex::new(
+            RedoLog::open(redo_dev, 0, 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_log(redo.clone());
+
+        let snapshot_seq = redo.lock().current_sequence();
+        redo.lock()
+            .append_and_flush(crate::redo::RedoOp::SetMinedBatch {
+                block_id: 12,
+                block_height: 820_000,
+                subtree_idx: 1,
+                on_longest_chain: true,
+                current_block_height: 820_010,
+                block_height_retention: 288,
+                unset: false,
+                // A same-store batch may still span shards (store split ≠
+                // shard split) — include a foreign-shard txid to confirm it
+                // is excluded while the 3 same-shard txids all ship.
+                txids: vec![k1, k2, other_shard, k3],
+            })
+            .unwrap();
+        let fence_seq = redo.lock().current_sequence();
+        let redo_log = Some(redo);
+
+        let ops = collect_migration_delta_ops(&redo_log, snapshot_seq, fence_seq, shard, &engine)
+            .expect("delta collection should succeed");
+        assert_eq!(
+            ops.len(),
+            3,
+            "every same-shard txid in the batch must ship, got {ops:?}"
+        );
+        let observed_keys: Vec<TxKey> = ops.iter().map(|op| op.tx_key()).collect();
+        for expected in [k1, k2, k3] {
+            assert!(
+                observed_keys.contains(&expected),
+                "missing txid {expected:?} from migration delta: {observed_keys:?}"
+            );
+        }
+        assert!(
+            !observed_keys.contains(&other_shard),
+            "the foreign-shard txid must not ship in this shard's delta"
+        );
+        for op in &ops {
+            match op {
+                crate::replication::protocol::ReplicaOp::SetMined { block_id, .. } => {
+                    assert_eq!(*block_id, 12);
+                }
+                other => panic!("expected SetMined delta, got {other:?}"),
+            }
         }
     }
 
@@ -15268,4 +15413,129 @@ mod tests {
     // source uniquely holding it would never have the target checked for it,
     // would wrongly relinquish, and would lose the re-creation.
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // CRITICAL FIX: a multi-txid `SetMinedBatch` redo entry must expand into
+    // one `ReplicaOp::SetMined`/`UnsetMined` per txid, not vanish. Pre-fix,
+    // `redo_entry_to_replica_op` returned `None` for any batch of more than
+    // one key, silently dropping every live setMined RPC touching 2+ txids
+    // from replica catch-up and migration-delta reconstruction.
+    // -----------------------------------------------------------------------
+
+    /// A 3-txid `SetMinedBatch` must expand into 3 `ReplicaOp::SetMined`, one
+    /// per txid, each carrying the batch's shared block fields — the same
+    /// shape the retired per-tx `RedoOp::SetMined` produced pre-Task-11.
+    #[test]
+    fn set_mined_batch_expands_to_per_tx_replica_ops() {
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::ReplicaOp;
+
+        let engine = test_engine();
+        let shard = 3u16;
+        let k1 = tx_key_for_shard(shard, 1);
+        let k2 = tx_key_for_shard(shard, 2);
+        let k3 = tx_key_for_shard(shard, 3);
+
+        let make_entry = |txids: Vec<TxKey>| RedoEntry {
+            sequence: 1,
+            op: RedoOp::SetMinedBatch {
+                block_id: 7,
+                block_height: 800_000,
+                subtree_idx: 2,
+                on_longest_chain: true,
+                current_block_height: 800_050,
+                block_height_retention: 288,
+                unset: false,
+                txids,
+            },
+        };
+
+        let three = make_entry(vec![k1, k2, k3]);
+        let ops = redo_entry_to_replica_ops(&three, shard, &engine);
+        assert_eq!(
+            ops.len(),
+            3,
+            "every txid in the batch must ship, got {ops:?}"
+        );
+        let observed_keys: Vec<TxKey> = ops.iter().map(|op| op.tx_key()).collect();
+        assert_eq!(
+            observed_keys,
+            vec![k1, k2, k3],
+            "must expand in the batch's own txid order"
+        );
+        for op in &ops {
+            match op {
+                ReplicaOp::SetMined {
+                    block_id,
+                    block_height,
+                    subtree_idx,
+                    on_longest_chain,
+                    current_block_height,
+                    block_height_retention,
+                    ..
+                } => {
+                    assert_eq!(*block_id, 7);
+                    assert_eq!(*block_height, 800_000);
+                    assert_eq!(*subtree_idx, 2);
+                    assert!(*on_longest_chain);
+                    assert_eq!(*current_block_height, 800_050);
+                    assert_eq!(*block_height_retention, 288);
+                }
+                other => panic!("expected ReplicaOp::SetMined, got {other:?}"),
+            }
+        }
+
+        // A 1-txid batch yields exactly 1 op (the same shape a batch-of-one
+        // always produced through the single-op accessor).
+        let one = make_entry(vec![k1]);
+        assert_eq!(redo_entry_to_replica_ops(&one, shard, &engine).len(), 1);
+
+        // A 0-txid batch yields 0 ops.
+        let empty = make_entry(vec![]);
+        assert_eq!(redo_entry_to_replica_ops(&empty, shard, &engine).len(), 0);
+
+        // A txid whose shard does not match the requested shard is excluded,
+        // mirroring every other op's shard-ownership filter.
+        let other_shard_key = tx_key_for_shard(shard + 1, 9);
+        let mixed = make_entry(vec![k1, other_shard_key]);
+        let mixed_ops = redo_entry_to_replica_ops(&mixed, shard, &engine);
+        assert_eq!(mixed_ops.len(), 1);
+        assert_eq!(mixed_ops[0].tx_key(), k1);
+    }
+
+    /// `unset: true` must expand into `ReplicaOp::UnsetMined` per txid too,
+    /// not just the `SetMined` (add) direction.
+    #[test]
+    fn set_mined_batch_unset_expands_to_per_tx_unset_mined_ops() {
+        use crate::redo::{RedoEntry, RedoOp};
+        use crate::replication::protocol::ReplicaOp;
+
+        let engine = test_engine();
+        let shard = 11u16;
+        let k1 = tx_key_for_shard(shard, 1);
+        let k2 = tx_key_for_shard(shard, 2);
+
+        let entry = RedoEntry {
+            sequence: 5,
+            op: RedoOp::SetMinedBatch {
+                block_id: 3,
+                block_height: 700_000,
+                subtree_idx: 0,
+                on_longest_chain: false,
+                current_block_height: 700_010,
+                block_height_retention: 288,
+                unset: true,
+                txids: vec![k1, k2],
+            },
+        };
+
+        let ops = redo_entry_to_replica_ops(&entry, shard, &engine);
+        assert_eq!(ops.len(), 2);
+        for op in &ops {
+            assert!(
+                matches!(op, ReplicaOp::UnsetMined { block_id: 3, .. }),
+                "expected UnsetMined, got {op:?}"
+            );
+        }
+    }
 }

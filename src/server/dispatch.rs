@@ -2138,11 +2138,25 @@ fn begin_replication_intent_with_tracker(
 /// same key set that the corresponding `ReplicaOp`s carry, so recovery can
 /// filter the merged redo window to exactly this RPC's keys and never re-ship a
 /// foreign op whose sequence interleaved into the range.
+///
+/// CRITICAL FIX: `RedoOp::tx_key()` only represents a `SetMinedBatch` of
+/// exactly one txid (`None` for 0 or 2+) — a genuine multi-txid batch (the
+/// entry a live multi-tx setMined RPC writes) must contribute EVERY txid it
+/// carries, not zero. Under-collecting here meant the durable intent's key
+/// set omitted the batch's txids entirely, so `recover_pending_replication_intents`
+/// (via `owned_keys`) could never replay them on crash recovery even after the
+/// redo→replica conversion itself is fixed to expand the batch.
 fn intent_keys_from_redo_ops(ops: &[RedoOp]) -> Vec<TxKey> {
     let mut keys: Vec<TxKey> = Vec::with_capacity(ops.len());
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for op in ops {
-        if let Some(tx_key) = op.tx_key()
+        if let RedoOp::SetMinedBatch { txids, .. } = op {
+            for tx_key in txids {
+                if seen.insert(tx_key.txid) {
+                    keys.push(*tx_key);
+                }
+            }
+        } else if let Some(tx_key) = op.tx_key()
             && seen.insert(tx_key.txid)
         {
             keys.push(*tx_key);
@@ -2918,6 +2932,47 @@ where
         // replica from a foreign RPC's interleaved sequence.
         let mut ops_by_key = Vec::new();
         for entry in &entries {
+            // CRITICAL FIX: `RedoOp::tx_key()` only represents a
+            // `SetMinedBatch` of exactly one txid (`None` for 0 or 2+), so a
+            // genuine multi-txid batch must be unpacked directly here — same
+            // pattern as `recovery.rs`'s `touched_keys` collection — instead
+            // of falling through to the `tx_key()` branch below, where it
+            // would `continue` and drop every txid in the batch.
+            if let RedoOp::SetMinedBatch { txids, .. } = &entry.op {
+                let mut expanded_shards: std::collections::HashSet<u16> =
+                    std::collections::HashSet::new();
+                for tx_key in txids {
+                    if !owned_keys.contains(&tx_key.txid) {
+                        // Foreign txid that interleaved into this range under
+                        // the shared sequence counter. Never re-ship it from
+                        // this intent.
+                        continue;
+                    }
+                    let shard = ShardTable::shard_for_key(tx_key);
+                    if !expanded_shards.insert(shard) {
+                        // Already expanded every owned txid of this shard
+                        // from an earlier iteration of this same batch.
+                        continue;
+                    }
+                    for op in
+                        crate::cluster::coordinator::redo_entry_to_replica_ops(entry, shard, engine)
+                    {
+                        let op_key = op.tx_key();
+                        if !owned_keys.contains(&op_key.txid) {
+                            // A sibling txid sharing this shard that this RPC
+                            // does not own — never re-ship it.
+                            continue;
+                        }
+                        debug_assert!(
+                            entry.sequence >= range.first_sequence
+                                && entry.sequence <= range.last_sequence,
+                            "recovery must only ship ops whose redo entry falls in the intent window",
+                        );
+                        ops_by_key.push((op_key, vec![op]));
+                    }
+                }
+                continue;
+            }
             let Some(tx_key) = entry.op.tx_key().copied() else {
                 continue;
             };
@@ -17062,6 +17117,157 @@ mod tests {
             tracker.pending().is_empty(),
             "the intent must be committed after replaying its owned keys"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // CRITICAL FIX: a multi-txid `SetMinedBatch` redo entry must contribute
+    // EVERY txid to the replication intent's key set and be replayed in
+    // full on crash recovery — not silently dropped because
+    // `RedoOp::tx_key()` only represents a batch of exactly one key.
+    // -------------------------------------------------------------------
+
+    /// `intent_keys_from_redo_ops` over a 3-txid `SetMinedBatch` must return
+    /// all 3 keys, not zero (pre-fix: `tx_key()` returns `None` for any
+    /// batch of more than one txid, so the intent's key set silently
+    /// omitted every txid in a live multi-tx setMined RPC).
+    #[test]
+    fn set_mined_batch_intent_keys_include_all_txids() {
+        let k1 = TxKey {
+            txid: txid_for_shard(12, 1),
+        };
+        let k2 = TxKey {
+            txid: txid_for_shard(12, 2),
+        };
+        let k3 = TxKey {
+            txid: txid_for_shard(12, 3),
+        };
+        let ops = vec![RedoOp::SetMinedBatch {
+            block_id: 1,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 105,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![k1, k2, k3],
+        }];
+        let keys = intent_keys_from_redo_ops(&ops);
+        assert_eq!(
+            keys,
+            vec![k1, k2, k3],
+            "every txid in the batch must contribute a key"
+        );
+
+        // A batch of one still yields exactly one key (unchanged behavior).
+        let one = vec![RedoOp::SetMinedBatch {
+            block_id: 1,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 105,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![k1],
+        }];
+        assert_eq!(intent_keys_from_redo_ops(&one), vec![k1]);
+
+        // An empty batch yields no keys.
+        let empty = vec![RedoOp::SetMinedBatch {
+            block_id: 1,
+            block_height: 100,
+            subtree_idx: 0,
+            on_longest_chain: true,
+            current_block_height: 105,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![],
+        }];
+        assert!(intent_keys_from_redo_ops(&empty).is_empty());
+    }
+
+    /// End-to-end: a durable replication intent recorded for a live 3-txid
+    /// `SetMinedBatch` RPC must, on crash recovery, replay all 3 txids as
+    /// `ReplicaOp::SetMined` — none dropped. This is the exact scenario the
+    /// CRITICAL finding covers: the lag-monitor / startup catch-up path
+    /// reconstructs `ReplicaOp`s from redo via the same conversion this
+    /// recovery path uses, and pre-fix a multi-txid batch vanished entirely.
+    #[test]
+    fn pending_replication_recovery_replays_multi_txid_set_mined_batch() {
+        let h = DispatchTestHarness::new();
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo_log = Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).expect("redo log opens on memory device"),
+        );
+        let tracker = crate::replication::durable::ReplicationIntentTracker::in_memory();
+
+        // All 3 txids share a shard, mirroring a realistic single-store
+        // `SetMinedBatch` (`handle_set_mined_batch` groups by store device,
+        // not by shard, but same-shard keys are the common case).
+        let k1 = TxKey {
+            txid: txid_for_shard(50, 1),
+        };
+        let k2 = TxKey {
+            txid: txid_for_shard(50, 2),
+        };
+        let k3 = TxKey {
+            txid: txid_for_shard(50, 3),
+        };
+        let ops = vec![RedoOp::SetMinedBatch {
+            block_id: 9,
+            block_height: 810_000,
+            subtree_idx: 4,
+            on_longest_chain: true,
+            current_block_height: 810_020,
+            block_height_retention: 288,
+            unset: false,
+            txids: vec![k1, k2, k3],
+        }];
+
+        let range = write_redo_ops(&h.engine, Some(&redo_log), &ops).expect("redo write succeeds");
+        let keys = intent_keys_from_redo_ops(&ops);
+        assert_eq!(keys.len(), 3, "intent must carry every txid in the batch");
+        tracker.begin(range.0, range.1, &keys).unwrap();
+
+        let mut observed_ops: Vec<(TxKey, Vec<ReplicaOp>)> = Vec::new();
+        recover_pending_replication_intents_from_tracker(
+            &tracker,
+            Some(&redo_log),
+            &h.engine,
+            |ops, _range| {
+                observed_ops.extend_from_slice(ops);
+                Ok(())
+            },
+        )
+        .expect("pending intent recovery succeeds");
+
+        assert!(
+            tracker.pending().is_empty(),
+            "the intent must be committed once every owned txid is replayed"
+        );
+        let observed_keys: Vec<TxKey> = observed_ops.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            observed_keys.len(),
+            3,
+            "recovery must replay every txid in the batch, got {observed_keys:?}"
+        );
+        for expected in [k1, k2, k3] {
+            assert!(
+                observed_keys.contains(&expected),
+                "missing txid {expected:?} from replayed ops: {observed_keys:?}"
+            );
+        }
+        for (key, key_ops) in &observed_ops {
+            assert_eq!(key_ops.len(), 1);
+            match &key_ops[0] {
+                ReplicaOp::SetMined {
+                    tx_key,
+                    block_id: 9,
+                    ..
+                } => assert_eq!(tx_key, key),
+                other => panic!("expected ReplicaOp::SetMined for {key:?}, got {other:?}"),
+            }
+        }
     }
 
     /// Even with a key-carrying intent, a GENUINELY reclaimed (compacted-away)

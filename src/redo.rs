@@ -1458,6 +1458,18 @@ impl RedoOp {
                 unset,
                 txids,
             } => {
+                // Mirror the decode-side `MAX_SET_MINED_BATCH_TXIDS` cap: a
+                // caller building an in-process `SetMinedBatch` with more
+                // txids than any legitimate per-store batch could ever carry
+                // (bounded by `Config::max_batch_size` before it reaches the
+                // redo layer) indicates a construction bug upstream, not a
+                // value this encoder should silently serialize.
+                debug_assert!(
+                    txids.len() <= MAX_SET_MINED_BATCH_TXIDS,
+                    "SetMinedBatch txids ({}) exceeds MAX_SET_MINED_BATCH_TXIDS ({})",
+                    txids.len(),
+                    MAX_SET_MINED_BATCH_TXIDS,
+                );
                 buf.extend_from_slice(&block_id.to_le_bytes());
                 buf.extend_from_slice(&block_height.to_le_bytes());
                 buf.extend_from_slice(&subtree_idx.to_le_bytes());
