@@ -1929,6 +1929,12 @@ impl Engine {
 
         self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
 
+        // followup-1 dual-write: mirror PRESERVED (= preserve_until != 0) into
+        // the DE-flag cache from the migrated footer. `meta.flags` is
+        // untouched by this path, so the other DE bits are reseeded to their
+        // existing (unchanged) values.
+        self.mirror_de_flags(key, entry.mined_slot, &meta);
+
         self.sync_primary_and_both_secondary_atomic(key, old_dah, delete_at_height)?;
 
         // Mirror the unmined_since transition into the authoritative
@@ -3567,6 +3573,11 @@ impl Engine {
             }
         }
 
+        // followup-1 dual-write: the footer just persisted may have flipped
+        // LAST_SPENT_ALL (apply_dah_patch above). Mirror the DE-flag cache to
+        // the durable footer under this same stripe lock.
+        self.mirror_de_flags(&req.tx_key, entry.mined_slot, &metadata);
+
         // 9. Update DAH secondary index (two-phase durable) — both engines.
         let new_dah = { metadata.delete_at_height };
         self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
@@ -3749,6 +3760,15 @@ impl Engine {
                 self.write_metadata_fast(device_id, record_offset, &metadata)?;
             }
 
+            // followup-1 dual-write: this branch is the ONLY path on which the
+            // footer is persisted, so LAST_SPENT_ALL (flipped by
+            // apply_dah_patch above) reaches the device only here. Mirror the
+            // DE-flag cache to the persisted footer inside the same block; on
+            // the skipped-persist path the device is unchanged and the cache
+            // already agrees, so no mirror is needed (or wanted — it would
+            // otherwise lead the device with an un-persisted value).
+            self.mirror_de_flags(&req.tx_key, entry.mined_slot, &metadata);
+
             // Update DAH secondary index (two-phase durable).
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
         }
@@ -3875,6 +3895,29 @@ impl Engine {
         //    (flags/preserve_until/spent_utxos/utxo_count/delete_at_height)
         //    plus confirmation the record still exists. No write follows.
         let meta = self.read_metadata_fast(device_id, record_offset)?;
+
+        // followup-1 proving guard (Task 2 removes both this and the device
+        // read above): the DAH-relevant device flag bits are now mirrored into
+        // the MinedEntry at every flag-mutating op and reseeded on recovery.
+        // Before Task 2 sources them from RAM, assert the cache never drifts
+        // from the freshly-read device footer. setMined itself never touches a
+        // DE bit on either side, so this holds equally before/after step 3's
+        // mined-state mutation. Debug/test builds only (zero release cost).
+        #[cfg(debug_assertions)]
+        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT
+            && let Some(ram_de) = self.mined_index().read_de_flags(tx_key, entry.mined_slot)
+        {
+            let device_de = crate::index::mined_index::device_de_flags(
+                meta.flags,
+                { meta.preserve_until } != 0,
+            );
+            debug_assert_eq!(
+                ram_de, device_de,
+                "setMined flag-cache drift for {:?}: ram={ram_de:#010b} device={device_de:#010b} \
+                 (a flag-mutating op failed to dual-write the MinedEntry DE cache)",
+                tx_key.txid,
+            );
+        }
 
         // 3. Apply the mined-state transition to the MinedIndex — the SOLE
         //    write this op performs (Task 9's dual-write call; the device
@@ -4066,6 +4109,11 @@ impl Engine {
         } else {
             self.write_metadata_fast(device_id, record_offset, &metadata)?;
         }
+
+        // followup-1 dual-write: the footer just persisted may have flipped
+        // LAST_SPENT_ALL (apply_dah_patch above). Mirror the DE-flag cache to
+        // the durable footer under this same stripe lock.
+        self.mirror_de_flags(&req.tx_key, entry.mined_slot, &metadata);
 
         // H1: atomic primary + DAH update under one critical section. Any
         // reader that locks dah_index observes a consistent view with the
@@ -4265,6 +4313,13 @@ impl Engine {
                 req.mined_block_infos,
             );
         }
+
+        // followup-1 dual-write: seed the fresh slot's cached DAH-eval flag
+        // bits (EXTERNAL / CONFLICTING, plus PRESERVED — always 0 at create)
+        // from the footer just written. `alloc_created` leaves them zeroed, so
+        // this is what makes the cache agree with `meta.flags` for a
+        // just-created record.
+        self.mirror_de_flags(&key, mined_slot, &meta);
 
         // Register in index
         let index_entry = TxIndexEntry {
@@ -4626,6 +4681,11 @@ impl Engine {
                 req.mined_block_infos,
             );
         }
+
+        // followup-1 dual-write: seed the fresh slot's cached DAH-eval flag
+        // bits from the footer just written (see the matching call in
+        // `create`).
+        self.mirror_de_flags(&key, mined_slot, &meta);
 
         let index_entry = TxIndexEntry {
             device_id,
@@ -5374,6 +5434,10 @@ impl Engine {
         let new_dah = { meta.delete_at_height };
 
         self.write_metadata_fast(entry.device_id, entry.record_offset, &meta)?;
+        // followup-1 dual-write: the footer just persisted may have cleared
+        // LAST_SPENT_ALL (apply_dah_patch above, on the strict-DAH-reduction
+        // branch). Mirror the DE-flag cache to the durable footer.
+        self.mirror_de_flags(parent_key, entry.mined_slot, &meta);
         // BUG-3: keep the DAH secondary index in lock-step with the cleared
         // on-record DAH so the now-prunable-by-other-means record stops
         // being re-scanned on every sweep.
@@ -5720,6 +5784,10 @@ impl Engine {
         meta.generation = { meta.generation }.wrapping_add(1);
         meta.updated_at = self.now_millis();
         self.write_metadata_fast(device_id, ro, &meta)?;
+
+        // followup-1 dual-write: mirror the newly-set REASSIGNED bit into the
+        // DE-flag cache from the persisted footer.
+        self.mirror_de_flags(&req.tx_key, entry.mined_slot, &meta);
 
         let generation = { meta.generation };
         Ok(generation)
@@ -6780,6 +6848,11 @@ impl Engine {
                 io::write_metadata_direct(self.device_ptr_for(device_id), ro, &meta);
             }
 
+            // followup-1 dual-write: mirror CONFLICTING (req.value) and any
+            // LAST_SPENT_ALL transition (set on `tf` above) into the DE-flag
+            // cache from the persisted footer.
+            self.mirror_de_flags(&req.tx_key, entry.mined_slot, &meta);
+
             // Update DAH secondary index (two-phase durable)
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
 
@@ -6810,6 +6883,11 @@ impl Engine {
             }
 
             self.write_metadata_fast(device_id, ro, &meta)?;
+
+            // followup-1 dual-write: mirror CONFLICTING (req.value) and any
+            // LAST_SPENT_ALL transition (apply_dah_patch above) into the
+            // DE-flag cache from the persisted footer.
+            self.mirror_de_flags(&req.tx_key, entry.mined_slot, &meta);
 
             let new_dah = { meta.delete_at_height };
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
@@ -7064,6 +7142,11 @@ impl Engine {
         meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(device_id, ro, &meta)?;
+
+        // followup-1 dual-write: mirror PRESERVED (= preserve_until != 0) into
+        // the DE-flag cache from the persisted footer. `req.block_height == 0`
+        // (the UNDO path) clears it.
+        self.mirror_de_flags(&req.tx_key, entry.mined_slot, &meta);
 
         // R-019 (A-12): sync the index cache so subsequent fast-path
         // ops (set_mined / set_conflicting / set_locked) see
@@ -7593,6 +7676,9 @@ impl Engine {
         meta.updated_at = self.now_millis();
 
         self.write_metadata_fast(device_id, ro, &meta)?;
+        // followup-1 dual-write: the footer just cleared preserve_until, so
+        // mirror PRESERVED = false into the DE-flag cache.
+        self.mirror_de_flags(key, entry.mined_slot, &meta);
         // Mutual-exclusion transition preserve -> DAH. Remove from the preserve
         // index BEFORE inserting into DAH so a concurrent reader range-querying
         // both indexes sees the key in NEITHER transiently (never BOTH),
@@ -7703,6 +7789,38 @@ impl Engine {
     /// (`dispatch::handle_query_old_unmined`) that used to read it).
     pub fn mined_index(&self) -> &ShardedMinedIndex {
         &self.mined_index
+    }
+
+    /// Mirror the device-authoritative DAH-eval flag inputs of `meta` into the
+    /// record's MinedEntry cache (followup-1 dual-write).
+    ///
+    /// Reseeds the whole cached DE-flag group
+    /// ([`crate::index::mined_index::MINED_DE_FLAG_MASK`]) — EXTERNAL,
+    /// CONFLICTING, LAST_SPENT_ALL, REASSIGNED, and PRESERVED
+    /// (`preserve_until != 0`) — to exactly match the just-written footer, so
+    /// the RAM cache never drifts from the device. A no-op when the record has
+    /// no live mined slot (`NO_MINED_SLOT`).
+    ///
+    /// # Invariant
+    ///
+    /// MUST be called under the record's stripe lock, AFTER the authoritative
+    /// device metadata write for `meta` has actually been persisted — never
+    /// before, and never on a code path where the write was skipped — so the
+    /// cache can never lead the device. The reseed is idempotent (bits that
+    /// did not change are rewritten to the same value), so calling it at every
+    /// device-flag write site, even ones that only move one bit, is correct
+    /// and self-healing (the setMined cross-check proves it).
+    fn mirror_de_flags(&self, key: &TxKey, mined_slot: u32, meta: &TxMetadata) {
+        if mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            self.mined_index().reseed_de_flags(
+                key,
+                mined_slot,
+                crate::index::mined_index::device_de_flags(
+                    meta.flags,
+                    { meta.preserve_until } != 0,
+                ),
+            );
+        }
     }
 
     /// Seed a freshly-`alloc_created` MinedIndex slot with block tuples for
@@ -8773,6 +8891,24 @@ impl Engine {
             };
             let has_blocks = !entries.is_empty();
 
+            // followup-1 recovery reseed: the MinedIndex was rebuilt fresh by
+            // `recover_mined_index` (which ran just before this pass on every
+            // boot — see `bin/server.rs`), so its DE-flag cache is zeroed.
+            // Reseed it from the device-authoritative footer (`meta.flags` +
+            // `preserve_until`) so setMined's cache-sourced DAH eval (Task 2)
+            // starts correct post-recovery. Records with no live mined slot
+            // hold no cache to seed.
+            if mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+                self.mined_index.reseed_de_flags(
+                    &key,
+                    mined_slot,
+                    crate::index::mined_index::device_de_flags(
+                        meta.flags,
+                        { meta.preserve_until } != 0,
+                    ),
+                );
+            }
+
             let (_signal, patch) = evaluate_delete_at_height(
                 &meta,
                 has_blocks,
@@ -9501,6 +9637,12 @@ impl PreparedSpend {
             }
         }
 
+        // followup-1 dual-write: the footer just persisted may have flipped
+        // LAST_SPENT_ALL (apply_dah_patch above). Mirror the DE-flag cache to
+        // the durable footer under the caller's stripe lock (held across this
+        // guard-free apply).
+        engine.mirror_de_flags(&tx_key, mined_slot, &metadata);
+
         // 10. Update the DAH secondary index (two-phase durable). When the
         // caller asked to defer (batched spend path), return the transition so
         // it can fold every group's SecondaryDahUpdate intent into one fsync;
@@ -9989,6 +10131,17 @@ mod tests {
                 on_longest_chain,
             );
         }
+        // followup-1: uphold the same device<->MinedIndex DE-flag sync the live
+        // create/setMined dual-write maintains — a harness that hand-writes
+        // `meta` straight to the device (bypassing `Engine::create`) must also
+        // seed the cached DAH-eval flag bits from `meta.flags`/`preserve_until`,
+        // or `set_mined_inner`'s cache cross-check would (correctly) fire on
+        // these records for any device flag left unmirrored in RAM.
+        engine.mined_index().reseed_de_flags(
+            key,
+            slot,
+            crate::index::mined_index::device_de_flags(meta.flags, { meta.preserve_until } != 0),
+        );
         slot
     }
 
@@ -10410,6 +10563,476 @@ mod tests {
         assert!(
             !unmined_keys.contains(&r1),
             "R1 (on longest chain) must not be in the unmined index",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // followup-1: cached DAH-eval flag inputs (MinedEntry DE-flag cache).
+    // Per flag-mutating op, drive the REAL op through `Engine::create` (so the
+    // record carries a real mined_slot the dual-write targets) and assert the
+    // RAM cache (`read_de_flags`) equals the device footer's derived DE bits.
+    // The whole existing suite is the broad guard via `set_mined_inner`'s
+    // debug_assert; these are the targeted, per-site proofs.
+    // -----------------------------------------------------------------------
+
+    /// Assert the record's cached DE-flag bits exactly equal the bits derived
+    /// from its live device footer (`meta.flags` + `preserve_until != 0`).
+    fn assert_de_cache_matches_device(engine: &Engine, key: &TxKey) {
+        let slot = engine.lookup(key).expect("record present").mined_slot;
+        assert_ne!(
+            slot,
+            crate::index::mined_index::NO_MINED_SLOT,
+            "a real create must allocate a mined slot for the DE cache to live in",
+        );
+        let meta = engine.read_metadata(key).expect("read metadata");
+        let flags = meta.flags;
+        let preserve = { meta.preserve_until };
+        let expected = crate::index::mined_index::device_de_flags(flags, preserve != 0);
+        let actual = engine
+            .mined_index()
+            .read_de_flags(key, slot)
+            .expect("live slot must have a readable DE cache");
+        assert_eq!(
+            actual, expected,
+            "DE cache must match device footer: got {actual:#010b}, want {expected:#010b} \
+             (flags={flags:?}, preserve_until={preserve})",
+        );
+    }
+
+    #[test]
+    fn de_cache_create_mirrors_external_and_conflicting() {
+        use crate::index::mined_index::{MINED_CONFLICTING, MINED_EXTERNAL};
+
+        let engine = create_engine();
+
+        // Plain create: no DE bits.
+        let (_h, plain) = make_create_req(0xE0, 2);
+        engine.create(&plain).expect("plain create");
+        let plain_key = plain.tx_key();
+        assert_eq!(
+            engine
+                .mined_index()
+                .read_de_flags(&plain_key, engine.lookup(&plain_key).unwrap().mined_slot),
+            Some(0),
+            "a plain create carries no cached DE flags",
+        );
+        assert_de_cache_matches_device(&engine, &plain_key);
+
+        // External + conflicting create: both DE bits mirrored from the footer.
+        let (_h2, mut ext) = make_create_req(0xE1, 2);
+        ext.is_external = true;
+        ext.conflicting = true;
+        ext.inputs = None;
+        ext.outputs = None;
+        ext.inpoints = None;
+        ext.external_ref = Some(test_external_ref(ext.tx_id));
+        engine.create(&ext).expect("external+conflicting create");
+        let ext_key = ext.tx_key();
+        let slot = engine.lookup(&ext_key).unwrap().mined_slot;
+        assert_eq!(
+            engine.mined_index().read_de_flags(&ext_key, slot),
+            Some(MINED_EXTERNAL | MINED_CONFLICTING),
+            "EXTERNAL and CONFLICTING must be mirrored into the cache at create",
+        );
+        assert_de_cache_matches_device(&engine, &ext_key);
+    }
+
+    #[test]
+    fn de_cache_reassign_sets_reassigned_bit() {
+        use crate::index::mined_index::MINED_REASSIGNED;
+
+        let engine = create_engine();
+        let (_h, create) = make_create_req(0xE2, 3);
+        let key = create.tx_key();
+        engine.create(&create).expect("create");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot),
+            Some(0),
+            "no REASSIGNED bit before reassign",
+        );
+
+        engine
+            .freeze(&FreezeRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+            })
+            .expect("freeze");
+        engine
+            .reassign(&ReassignRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+                new_utxo_hash: [0xCC; 32],
+                block_height: 1000,
+                spendable_after: 100,
+            })
+            .expect("reassign");
+
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_REASSIGNED,
+            0,
+            "reassign must mirror REASSIGNED into the DE cache",
+        );
+        assert_de_cache_matches_device(&engine, &key);
+    }
+
+    #[test]
+    fn de_cache_set_conflicting_toggles_bit() {
+        use crate::index::mined_index::MINED_CONFLICTING;
+
+        let engine = create_engine();
+        let (_h, create) = make_create_req(0xE3, 2);
+        let key = create.tx_key();
+        engine.create(&create).expect("create");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("set_conflicting(true)");
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_CONFLICTING,
+            0,
+            "set_conflicting(true) must mirror CONFLICTING",
+        );
+        assert_de_cache_matches_device(&engine, &key);
+
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("set_conflicting(false)");
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_CONFLICTING,
+            0,
+            "set_conflicting(false) must clear the mirrored CONFLICTING bit",
+        );
+        assert_de_cache_matches_device(&engine, &key);
+    }
+
+    #[test]
+    fn de_cache_spend_to_all_spent_sets_last_spent_all() {
+        use crate::index::mined_index::MINED_LAST_SPENT_ALL;
+
+        let engine = create_engine();
+        let (_h, create) = make_create_req(0xE4, 1);
+        let key = create.tx_key();
+        engine.create(&create).expect("create");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+
+        // Mine on the longest chain so the spend's DAH eval reaches the
+        // all-spent → LAST_SPENT_ALL transition (needs has_blocks +
+        // on_longest_chain).
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 7,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined");
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "LAST_SPENT_ALL not set before the record is all-spent",
+        );
+
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend last utxo");
+
+        // Sanity: the device footer really did gain LAST_SPENT_ALL.
+        let dev_flags = engine.read_metadata(&key).unwrap().flags;
+        assert!(
+            dev_flags.contains(TxFlags::LAST_SPENT_ALL),
+            "precondition: the all-spent spend must set device LAST_SPENT_ALL",
+        );
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "spend-to-all-spent must mirror LAST_SPENT_ALL into the DE cache",
+        );
+        assert_de_cache_matches_device(&engine, &key);
+    }
+
+    #[test]
+    fn de_cache_preserve_sets_and_clears_preserved() {
+        use crate::index::mined_index::MINED_PRESERVED;
+
+        let engine = create_engine();
+        let (_h, create) = make_create_req(0xE5, 2);
+        let key = create.tx_key();
+        engine.create(&create).expect("create");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .expect("preserve_until(5000)");
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_PRESERVED,
+            0,
+            "preserve_until(nonzero) must mirror PRESERVED",
+        );
+        assert_de_cache_matches_device(&engine, &key);
+
+        // The UNDO path (block_height == 0) clears preserve_until.
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 0,
+            })
+            .expect("preserve_until(0) undo");
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_PRESERVED,
+            0,
+            "preserve_until(0) must clear the mirrored PRESERVED bit",
+        );
+        assert_de_cache_matches_device(&engine, &key);
+    }
+
+    #[test]
+    fn de_cache_expire_preservation_clears_preserved() {
+        use crate::index::mined_index::MINED_PRESERVED;
+
+        let engine = create_engine();
+        let (_h, create) = make_create_req(0xE6, 1);
+        let key = create.tx_key();
+        engine.create(&create).expect("create");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+
+        // Make the record sweep-eligible (mined + all-spent on longest chain)
+        // so `expire_preservation_set_dah` actually transitions preserve→DAH.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 9,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined");
+        engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("spend last utxo");
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .expect("preserve_until(5000)");
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_PRESERVED,
+            0,
+        );
+
+        let expired = engine
+            .expire_preservation_set_dah(&key, 6000, 288)
+            .expect("expire");
+        assert!(expired, "an eligible preserved record must expire");
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_PRESERVED,
+            0,
+            "expire_preservation_set_dah must clear the mirrored PRESERVED bit",
+        );
+        assert_de_cache_matches_device(&engine, &key);
+    }
+
+    #[test]
+    fn de_cache_set_mined_cross_check_holds_with_device_flags() {
+        // Exercises `set_mined_inner`'s cross-check directly: a record with
+        // several device DE flags set must setMined WITHOUT tripping the
+        // debug_assert, and the cache must still match the device after.
+        let engine = create_engine();
+        let (_h, mut create) = make_create_req(0xE7, 2);
+        create.is_external = true;
+        create.conflicting = true;
+        create.inputs = None;
+        create.outputs = None;
+        create.inpoints = None;
+        create.external_ref = Some(test_external_ref(create.tx_id));
+        let key = create.tx_key();
+        engine.create(&create).expect("create");
+
+        // setMined runs the cross-check; a drifted cache would panic here.
+        engine
+            .set_mined(&SetMinedRequest {
+                tx_key: key,
+                block_id: 3,
+                block_height: 100,
+                subtree_idx: 0,
+                current_block_height: 1000,
+                block_height_retention: 288,
+                on_longest_chain: true,
+                unset_mined: false,
+            })
+            .expect("set_mined must not trip the flag-cache cross-check");
+        assert_de_cache_matches_device(&engine, &key);
+    }
+
+    /// The key recovery test: records carrying a variety of device DAH-eval
+    /// flags, whose RAM DE cache is then clobbered to ALL-ONES (simulating the
+    /// zeroed/uninitialised cache a freshly-rebuilt MinedIndex holds right
+    /// after `recover_mined_index`, before this reseed pass runs). Running
+    /// `reconcile_secondaries_from_mined_index` — the boot-time pass that runs
+    /// on every startup immediately after recovery (see `bin/server.rs`) — must
+    /// reseed each record's cache to EXACTLY its device footer, both SETTING
+    /// the bits it carries and CLEARING the clobbered bits it does not.
+    ///
+    /// Hand-writes near-zero txids + explicit device flags rather than driving
+    /// `Engine::create`: the same pattern the sibling reconcile tests use, so
+    /// the for-each slim-key iteration lines up byte-for-byte with the device
+    /// footer's full tx_id (a txid with entropy beyond byte 12 would not).
+    #[test]
+    fn de_cache_reseeded_by_reconcile_from_device() {
+        use crate::index::mined_index::MINED_DE_FLAG_MASK;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // Write an all-spent, on-longest-chain 1-UTXO record carrying the given
+        // device flags + preserve_until; register it (mined_slot filled in
+        // after the engine exists). Near-zero txid so the slim primary-index
+        // key equals the device footer's full tx_id.
+        let mut write_record =
+            |byte: u8, flags: TxFlags, preserve_until: u32| -> (TxKey, TxMetadata) {
+                let mut txid = [0u8; 32];
+                txid[0] = byte;
+                txid[1] = 0xD7;
+                let key = TxKey { txid };
+                let mut meta = TxMetadata::new(1);
+                meta.tx_id = txid;
+                meta.spent_utxos = 1; // all-spent
+                meta.unmined_since = 0; // on the longest chain
+                meta.flags = flags;
+                meta.preserve_until = preserve_until;
+                let record_size = TxMetadata::record_size_for(1);
+                let offset = alloc.allocate(record_size).unwrap();
+                let slot = UtxoSlot::new_spent([byte; 32], [0xAB; 36]);
+                io::write_full_record(&*dev, offset, &meta, &[slot]).unwrap();
+                index
+                    .register(
+                        key,
+                        TxIndexEntry {
+                            device_id: 0,
+                            record_offset: offset,
+                            mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                        },
+                    )
+                    .unwrap();
+                (key, meta)
+            };
+
+        let records: Vec<(TxKey, TxMetadata)> = vec![
+            write_record(0x01, TxFlags::EXTERNAL | TxFlags::CONFLICTING, 0),
+            write_record(0x02, TxFlags::REASSIGNED, 0),
+            write_record(0x03, TxFlags::LAST_SPENT_ALL, 0),
+            write_record(0x04, TxFlags::empty(), 5000), // preserved
+            write_record(0x05, TxFlags::empty(), 0),    // no DE flags at all
+        ];
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Seed each record's MinedIndex slot (one inline block → has_blocks),
+        // re-point the primary entry at it, then CLOBBER the cache to all-ones
+        // — the WRONG value for every record — so the reconcile below has to
+        // both set and clear bits to reach the device-authoritative value.
+        for (key, meta) in &records {
+            let bid = key.txid[0] as u32; // nonzero (0x01..0x05)
+            let slot = seed_mined_index_for_test(&engine, key, meta, &[(bid, 1000, 0)]);
+            let e = engine.index.lookup(key).unwrap();
+            engine
+                .index
+                .register(
+                    *key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: e.record_offset,
+                        mined_slot: slot,
+                    },
+                )
+                .unwrap();
+            engine
+                .mined_index()
+                .reseed_de_flags(key, slot, MINED_DE_FLAG_MASK);
+            assert_eq!(
+                engine.mined_index().read_de_flags(key, slot),
+                Some(MINED_DE_FLAG_MASK),
+                "precondition: cache clobbered to all-ones before reconcile",
+            );
+        }
+
+        // The boot-time reseed pass (runs right after recover_mined_index).
+        engine
+            .reconcile_secondaries_from_mined_index(2000, 288)
+            .expect("reconcile must reseed the DE cache");
+
+        // Every record's cache now exactly matches its device footer, both the
+        // bits it carries (set) and the clobbered bits it does not (cleared).
+        for (key, meta) in &records {
+            let slot = engine.lookup(key).unwrap().mined_slot;
+            let flags = meta.flags;
+            let preserve = { meta.preserve_until };
+            let expected = crate::index::mined_index::device_de_flags(flags, preserve != 0);
+            assert_eq!(
+                engine.mined_index().read_de_flags(key, slot),
+                Some(expected),
+                "reconcile must reseed DE cache to the device footer \
+                 (flags={flags:?}, preserve_until={preserve})",
+            );
+        }
+        // Explicit: the no-flags record's clobbered bits were fully cleared.
+        let plain_slot = engine.lookup(&records[4].0).unwrap().mined_slot;
+        assert_eq!(
+            engine
+                .mined_index()
+                .read_de_flags(&records[4].0, plain_slot),
+            Some(0),
+            "reconcile must CLEAR DE bits a record does not carry on device",
         );
     }
 

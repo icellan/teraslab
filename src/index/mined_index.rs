@@ -1,13 +1,72 @@
 //! Dedicated authoritative in-RAM mined-state store. See
 //! `specs/MINEDINDEX_SETMINED_DESIGN.md`. Replaces on-device block entries +
 //! the unmined secondary index.
-use crate::record::BlockEntry;
+use crate::record::{BlockEntry, TxFlags};
 use std::collections::HashMap;
 
 /// `flags` bit: the record's UTXOs are all spent (maintained by the spend path).
 pub const MINED_ALL_SPENT: u8 = 1;
 /// `flags` bit: this tx is mined in >1 block; extra tuples live in `overflow`.
 pub const MINED_HAS_OVERFLOW: u8 = 2;
+
+// ---------------------------------------------------------------------------
+// Cached DAH-eval flag inputs (followup-1).
+//
+// These five bits mirror the device-authoritative `TxMetadata.flags`
+// (EXTERNAL/CONFLICTING/LAST_SPENT_ALL/REASSIGNED) plus `preserve_until != 0`
+// that `evaluate_delete_at_height` consumes. They are dual-written into the
+// MinedEntry at every flag-mutating op (under the record's stripe lock) and
+// reseeded from the device at recovery, so setMined's DAH evaluation can
+// source them from RAM instead of a per-call device read (Task 2). Their bit
+// VALUES are the MinedEntry's own `flags`-byte namespace — deliberately
+// unrelated to the numeric `TxFlags` bit positions; the mapping lives in
+// [`device_de_flags`].
+// ---------------------------------------------------------------------------
+
+/// `flags` bit: mirrors `TxFlags::EXTERNAL` (device).
+pub const MINED_EXTERNAL: u8 = 4;
+/// `flags` bit: mirrors `TxFlags::CONFLICTING` (device).
+pub const MINED_CONFLICTING: u8 = 8;
+/// `flags` bit: mirrors `TxFlags::LAST_SPENT_ALL` (device).
+pub const MINED_LAST_SPENT_ALL: u8 = 16;
+/// `flags` bit: mirrors `TxFlags::REASSIGNED` (device).
+pub const MINED_REASSIGNED: u8 = 32;
+/// `flags` bit: mirrors `preserve_until != 0` (device).
+pub const MINED_PRESERVED: u8 = 64;
+
+/// The set of MinedEntry `flags` bits that cache the DAH-eval device inputs
+/// (see [`MINED_EXTERNAL`] … [`MINED_PRESERVED`]). Read back by
+/// [`ShardedMinedIndex::read_de_flags`] and rewritten wholesale by
+/// [`ShardedMinedIndex::reseed_de_flags`]; the remaining bits
+/// ([`MINED_ALL_SPENT`], [`MINED_HAS_OVERFLOW`]) are untouched by both.
+pub const MINED_DE_FLAG_MASK: u8 =
+    MINED_EXTERNAL | MINED_CONFLICTING | MINED_LAST_SPENT_ALL | MINED_REASSIGNED | MINED_PRESERVED;
+
+/// Map the device-authoritative DAH-eval flag inputs — `TxMetadata.flags` and
+/// `preserve_until != 0` — into the MinedEntry [`MINED_DE_FLAG_MASK`] bit
+/// space. This is the single source of truth for the device→cache mapping:
+/// both the dual-write reseed and the setMined cross-check derive the expected
+/// cache value through it. `has_preserve_until` is `metadata.preserve_until !=
+/// 0` (only the boolean matters to `evaluate_delete_at_height`).
+pub fn device_de_flags(device_flags: TxFlags, has_preserve_until: bool) -> u8 {
+    let mut de = 0u8;
+    if device_flags.contains(TxFlags::EXTERNAL) {
+        de |= MINED_EXTERNAL;
+    }
+    if device_flags.contains(TxFlags::CONFLICTING) {
+        de |= MINED_CONFLICTING;
+    }
+    if device_flags.contains(TxFlags::LAST_SPENT_ALL) {
+        de |= MINED_LAST_SPENT_ALL;
+    }
+    if device_flags.contains(TxFlags::REASSIGNED) {
+        de |= MINED_REASSIGNED;
+    }
+    if has_preserve_until {
+        de |= MINED_PRESERVED;
+    }
+    de
+}
 
 /// One tx's mined-state: the first block tuple inline + lifecycle bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -854,6 +913,76 @@ impl ShardedMinedIndex {
         }
     }
 
+    /// Set or clear one (or more) cached DAH-eval flag bit(s) — see
+    /// [`MINED_DE_FLAG_MASK`] — on the slot's entry (followup-1 dual-write).
+    ///
+    /// `flag_mask` names the bit(s) to touch; `on` chooses set vs clear. Only
+    /// the masked bits change — every other `flags` bit (including
+    /// [`MINED_ALL_SPENT`] / [`MINED_HAS_OVERFLOW`]) is preserved.
+    ///
+    /// Key_fp-verified exactly like [`Self::with_entry`]: a no-op if the slot
+    /// is absent OR its stamped `key_fp` no longer matches `key` (the ABA
+    /// guard — see [`MinedEntry::key_fp`]). Callers hold the record's stripe
+    /// lock, so under normal operation the fingerprint always matches; the
+    /// check is defense-in-depth mirroring the read path.
+    pub fn set_de_flag(&self, key: &TxKey, slot: u32, flag_mask: u8, on: bool) {
+        let fp = key_fp(key);
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        if let Some(entry) = sh.get_mut(slot) {
+            if entry.key_fp != fp {
+                return;
+            }
+            if on {
+                entry.flags |= flag_mask;
+            } else {
+                entry.flags &= !flag_mask;
+            }
+        }
+    }
+
+    /// Read back the slot's cached DAH-eval flag bits (the
+    /// [`MINED_DE_FLAG_MASK`] subset of `flags`), or `None` if the slot is
+    /// absent / freed / reallocated to a different key.
+    ///
+    /// Key_fp-verified and returns `None` on mismatch, identical to
+    /// [`Self::with_entry`]'s ABA guard, so a lock-free caller racing a
+    /// delete+realloc never reads another tx's cached flags. The setMined
+    /// cross-check (and, in Task 2, the DAH eval itself) compares this against
+    /// [`device_de_flags`].
+    pub fn read_de_flags(&self, key: &TxKey, slot: u32) -> Option<u8> {
+        let fp = key_fp(key);
+        let sh = self.shards[self.shard_for(key)].lock();
+        let entry = sh.get(slot)?;
+        if entry.key_fp != fp {
+            return None;
+        }
+        Some(entry.flags & MINED_DE_FLAG_MASK)
+    }
+
+    /// Overwrite the slot's entire cached DAH-eval flag group
+    /// ([`MINED_DE_FLAG_MASK`]) with `de_flags`, leaving all other `flags`
+    /// bits ([`MINED_ALL_SPENT`], [`MINED_HAS_OVERFLOW`]) untouched.
+    ///
+    /// This is the bulk counterpart to [`Self::set_de_flag`]: it sets AND
+    /// clears every DE bit in one shard-lock acquisition to exactly match a
+    /// device-derived value (see [`device_de_flags`]). Used at create (a
+    /// fresh slot's DE bits) and at recovery
+    /// (`Engine::reconcile_secondaries_from_mined_index`, reseeding the cache
+    /// from the device-authoritative footer), and at every op that rewrites
+    /// device flags (to keep the cache in lockstep). Key_fp-verified like
+    /// [`Self::set_de_flag`]; a no-op if the slot is absent or the fingerprint
+    /// mismatches.
+    pub fn reseed_de_flags(&self, key: &TxKey, slot: u32, de_flags: u8) {
+        let fp = key_fp(key);
+        let mut sh = self.shards[self.shard_for(key)].lock();
+        if let Some(entry) = sh.get_mut(slot) {
+            if entry.key_fp != fp {
+                return;
+            }
+            entry.flags = (entry.flags & !MINED_DE_FLAG_MASK) | (de_flags & MINED_DE_FLAG_MASK);
+        }
+    }
+
     /// Serialize the entire index (the routing seed, plus every shard's
     /// entries, free list, and overflow map) into a versioned snapshot,
     /// appended to `out`.
@@ -1689,6 +1818,174 @@ mod tests {
                 0,
                 "flag cleared after set_all_spent(false)"
             );
+        });
+    }
+
+    /// followup-1: `device_de_flags` maps each device DAH-eval flag input
+    /// (`TxFlags` bit + `preserve_until != 0`) onto its MinedEntry cache bit,
+    /// and ONLY those — non-DAH device flags (LOCKED / IS_COINBASE) never leak
+    /// into the cache byte.
+    #[test]
+    fn device_de_flags_maps_each_input_bit() {
+        assert_eq!(device_de_flags(TxFlags::empty(), false), 0);
+        assert_eq!(device_de_flags(TxFlags::EXTERNAL, false), MINED_EXTERNAL);
+        assert_eq!(
+            device_de_flags(TxFlags::CONFLICTING, false),
+            MINED_CONFLICTING
+        );
+        assert_eq!(
+            device_de_flags(TxFlags::LAST_SPENT_ALL, false),
+            MINED_LAST_SPENT_ALL
+        );
+        assert_eq!(
+            device_de_flags(TxFlags::REASSIGNED, false),
+            MINED_REASSIGNED
+        );
+        // preserve is carried purely by the boolean, not any TxFlags bit.
+        assert_eq!(device_de_flags(TxFlags::empty(), true), MINED_PRESERVED);
+
+        // Non-DAH device flags must NOT map into the cache.
+        assert_eq!(device_de_flags(TxFlags::LOCKED, false), 0);
+        assert_eq!(device_de_flags(TxFlags::IS_COINBASE, false), 0);
+
+        // A combined footer maps to the union, preserve included.
+        let combined = TxFlags::EXTERNAL
+            | TxFlags::CONFLICTING
+            | TxFlags::LAST_SPENT_ALL
+            | TxFlags::REASSIGNED
+            | TxFlags::LOCKED;
+        assert_eq!(
+            device_de_flags(combined, true),
+            MINED_EXTERNAL
+                | MINED_CONFLICTING
+                | MINED_LAST_SPENT_ALL
+                | MINED_REASSIGNED
+                | MINED_PRESERVED,
+        );
+        assert_eq!(
+            device_de_flags(combined, true) & !MINED_DE_FLAG_MASK,
+            0,
+            "device_de_flags must never set a bit outside MINED_DE_FLAG_MASK"
+        );
+    }
+
+    /// followup-1: `set_de_flag` sets/clears exactly the masked DE bit(s) and
+    /// preserves every other `flags` bit; `read_de_flags` reflects the DE
+    /// subset.
+    #[test]
+    fn set_de_flag_toggles_only_masked_bit() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [90u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        // A pre-existing non-DE bit must survive DE-bit mutation.
+        idx.set_all_spent(&k, slot, true);
+        assert_eq!(idx.read_de_flags(&k, slot), Some(0), "no DE bits yet");
+
+        idx.set_de_flag(&k, slot, MINED_CONFLICTING, true);
+        assert_eq!(idx.read_de_flags(&k, slot), Some(MINED_CONFLICTING));
+        idx.set_de_flag(&k, slot, MINED_EXTERNAL, true);
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(MINED_CONFLICTING | MINED_EXTERNAL)
+        );
+
+        // MINED_ALL_SPENT (a non-DE bit) must be intact throughout.
+        idx.with_entry(&k, slot, |e| {
+            assert_ne!(e.flags & MINED_ALL_SPENT, 0, "non-DE bit preserved");
+        });
+
+        idx.set_de_flag(&k, slot, MINED_CONFLICTING, false);
+        assert_eq!(idx.read_de_flags(&k, slot), Some(MINED_EXTERNAL));
+        idx.with_entry(&k, slot, |e| {
+            assert_ne!(
+                e.flags & MINED_ALL_SPENT,
+                0,
+                "clearing a DE bit must not touch MINED_ALL_SPENT"
+            );
+        });
+    }
+
+    /// followup-1: `read_de_flags`/`set_de_flag` honour the key_fp ABA guard —
+    /// a slot reallocated to a different key reads as absent for the old key
+    /// and refuses a stale-key write.
+    #[test]
+    fn de_flag_helpers_reject_reallocated_slot() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+
+        // Same shard (bytes [16..24]), different fingerprint (bytes [0..4]).
+        let key_a = TxKey { txid: [0xAAu8; 32] };
+        let mut txid_b = [0xAAu8; 32];
+        txid_b[0..4].copy_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB]);
+        let key_b = TxKey { txid: txid_b };
+        assert_eq!(idx.shard_for(&key_a), idx.shard_for(&key_b));
+
+        let slot_a = idx.alloc_created(&key_a, 10);
+        idx.free(&key_a, slot_a);
+        let slot_b = idx.alloc_created(&key_b, 20);
+        assert_eq!(slot_b, slot_a, "LIFO free-list reuses the slot number");
+        idx.set_de_flag(&key_b, slot_b, MINED_CONFLICTING, true);
+
+        // Stale key A must not read B's cached flags…
+        assert_eq!(
+            idx.read_de_flags(&key_a, slot_a),
+            None,
+            "stale key must read absent"
+        );
+        // …and a stale-key write must be a no-op (not clobber B's bits).
+        idx.set_de_flag(&key_a, slot_a, MINED_EXTERNAL, true);
+        assert_eq!(
+            idx.read_de_flags(&key_b, slot_b),
+            Some(MINED_CONFLICTING),
+            "stale-key write must not corrupt the rightful occupant's cache"
+        );
+
+        // A freed/never-allocated slot reads absent.
+        idx.free(&key_b, slot_b);
+        assert_eq!(idx.read_de_flags(&key_b, slot_b), None);
+    }
+
+    /// followup-1: `reseed_de_flags` overwrites the whole DE group to an exact
+    /// device-derived value (setting AND clearing), while leaving non-DE bits
+    /// alone.
+    #[test]
+    fn reseed_de_flags_replaces_whole_group() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [91u8; 32] };
+        let slot = idx.alloc_created(&k, 10);
+
+        // Pre-load some DE bits + a non-DE bit.
+        idx.set_all_spent(&k, slot, true);
+        idx.set_de_flag(&k, slot, MINED_REASSIGNED | MINED_CONFLICTING, true);
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(MINED_REASSIGNED | MINED_CONFLICTING)
+        );
+
+        // Reseed to a different exact value: EXTERNAL+PRESERVED, dropping the
+        // previously-set REASSIGNED/CONFLICTING.
+        let target = device_de_flags(TxFlags::EXTERNAL, true);
+        idx.reseed_de_flags(&k, slot, target);
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(MINED_EXTERNAL | MINED_PRESERVED)
+        );
+        idx.with_entry(&k, slot, |e| {
+            assert_ne!(
+                e.flags & MINED_ALL_SPENT,
+                0,
+                "reseed must not disturb non-DE bits"
+            );
+        });
+
+        // Reseed to empty clears every DE bit but keeps MINED_ALL_SPENT.
+        idx.reseed_de_flags(&k, slot, 0);
+        assert_eq!(idx.read_de_flags(&k, slot), Some(0));
+        idx.with_entry(&k, slot, |e| {
+            assert_ne!(e.flags & MINED_ALL_SPENT, 0);
         });
     }
 
