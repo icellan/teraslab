@@ -235,11 +235,12 @@ pub enum SpendError {
         cap: usize,
     },
 
-    /// BUG-2: a record's block-entry list (inline + overflow) is already at
-    /// the on-disk capacity (`u8::MAX` = 255 entries) and cannot accept
-    /// another distinct `block_id`. The on-device metadata stores the count
-    /// in a single `u8` ([`crate::record::TxMetadata::block_entry_count`]),
-    /// so 255 is a hard structural limit.
+    /// BUG-2: a record's block-entry list is already at capacity
+    /// (`u8::MAX` = 255 distinct blocks) and cannot accept another distinct
+    /// `block_id`. Block-entries now live in the in-RAM `MinedIndex` (the
+    /// on-device count field was removed with the block-entry region); the
+    /// 255 cap is retained as a deliberate bound against unbounded per-tx
+    /// memory growth, so it is a hard limit.
     ///
     /// Pre-fix `set_mined` incremented the count with no upper bound, so the
     /// 256th distinct `block_id` wrapped `255 → 0` (release) or panicked

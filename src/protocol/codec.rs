@@ -1125,12 +1125,13 @@ impl FieldMask {
     /// `count` × 12-byte entries. The difference is that ALL `count` entries
     /// are emitted, not just the inline `min(count, 3)`. Use this when a
     /// consumer needs the full block-membership set (e.g. reorg/rewind
-    /// decisions for a tx mined into more than
-    /// [`crate::record::INLINE_BLOCK_ENTRIES`] blocks after a deep reorg),
-    /// where the truncated [`Self::BLOCK_ENTRIES`] view is insufficient.
+    /// decisions for a tx mined into more than the inline 3 blocks after a
+    /// deep reorg), where the truncated [`Self::BLOCK_ENTRIES`] view is
+    /// insufficient.
     ///
-    /// This is a heavier field than [`Self::BLOCK_ENTRIES`]: when the record
-    /// has overflow entries it triggers an additional device read. It is
+    /// This is a heavier field than [`Self::BLOCK_ENTRIES`]: it returns the
+    /// full block set the server holds in the in-RAM MinedIndex rather than
+    /// only the inline prefix. It is
     /// therefore deliberately OUTSIDE [`Self::ALL_METADATA`] and [`Self::ALL`]
     /// (kept opt-in, matching how [`Self::COLD_DATA`] / [`Self::BLOCK_ENTRIES`]
     /// sit outside `ALL_METADATA`).
