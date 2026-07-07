@@ -6753,6 +6753,13 @@ fn handle_create_batch(
         // the longest chain. The device inline block-entry region is thus no
         // longer the recovery carrier for mined-at-creation state.
         for info in pending.create_req.mined_block_infos {
+            // Skip the no-block sentinel (mirrors `create_companion_set_mined_ops`
+            // on the replica path): `block_id == 0` means "no block", and feeding
+            // it to `apply_set_mined` would trip its `debug_assert!(block_id != 0)`
+            // (and record the sentinel as a real block in release).
+            if info.block_id == 0 {
+                continue;
+            }
             redo_ops.push(RedoOp::SetMinedBatch {
                 block_id: info.block_id,
                 block_height: info.block_height,
