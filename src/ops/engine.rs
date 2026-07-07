@@ -8306,8 +8306,25 @@ impl Engine {
     /// entry's CURRENT `device_id` / `record_offset` (never the snapshot's,
     /// which may be stale for a since-relocated record).
     ///
-    /// Call [`Self::replay_mined_index_redo_tail`] immediately afterward to
+    /// Call [`Self::replay_mined_index_redo_tail_above`] immediately
+    /// afterward, passing the returned map as its `tail_slots` seed, to
     /// reconcile any post-checkpoint mutations the snapshot does not cover.
+    ///
+    /// Seeding matters, not just convenience: the checkpoint scan this
+    /// method's `entries` come from is FUZZY (non-blocking) — a txid created
+    /// while the scan is in flight can be captured live by `for_each` even
+    /// though its own `Create`/`CreateV2` redo entry lands at a sequence
+    /// strictly above the snapshot's stamped fence. That entry is therefore
+    /// still replayed (the fence floor only skips `<=` fence entries — see
+    /// [`Self::replay_mined_index_redo_tail_above`]), and without a seed
+    /// [`Self::apply_create_to_mined_index`] would `alloc_created` a SECOND
+    /// slot for the same txid, orphaning the one just restored here (it stays
+    /// live in its unmined height bucket, double-counting `unmined_len` /
+    /// `collect_unmined_keys_below`). Seeding `tail_slots` with this
+    /// function's own freshly-allocated slot makes that replay hit the exact
+    /// same dedup path an in-tail create-then-recreate already uses: the
+    /// stale (here, snapshot-restored) slot is freed and the primary entry is
+    /// re-pointed at the fresh one, leaving exactly one live slot.
     ///
     /// # Errors
     ///
@@ -8317,8 +8334,9 @@ impl Engine {
     pub fn restore_mined_index_from_snapshot_entries(
         &self,
         entries: &[crate::index::mined_index::MinedByKeyEntry],
-    ) -> Result<(), SpendError> {
+    ) -> Result<std::collections::HashMap<TxKey, u32>, SpendError> {
         self.mined_index.clear();
+        let mut restored_slots = std::collections::HashMap::with_capacity(entries.len());
         for e in entries {
             let key = TxKey::from_bytes(e.txid);
             let Some(existing) = self.index.lookup(&key) else {
@@ -8350,18 +8368,31 @@ impl Engine {
                     detail: format!("mined-index snapshot restore: index re-point failed: {err}"),
                 });
             }
+            restored_slots.insert(key, slot);
         }
-        Ok(())
+        Ok(restored_slots)
     }
 
     /// Shared "a create happened" application shared by every create-like
     /// redo op [`Self::replay_mined_index_redo_tail`] replays
     /// (`Create`/`CreateV2`/`ReplicaCreate`): allocate a fresh MinedIndex slot
     /// from `meta`, seed its block tuples (inline entries only — see the
-    /// caller doc), free any STALE slot this same tail already associated
-    /// with `tx_key` (a create+delete+recreate cycle within one tail), and
-    /// re-point the primary entry's `mined_slot` if `tx_key` still exists in
-    /// the FINAL (fully-replayed) primary index.
+    /// caller doc), free any STALE slot `tail_slots` already associates with
+    /// `tx_key`, and re-point the primary entry's `mined_slot` if `tx_key`
+    /// still exists in the FINAL (fully-replayed) primary index.
+    ///
+    /// The "STALE slot" `tail_slots` may already hold for `tx_key` comes from
+    /// one of two sources, and this method treats them identically (it never
+    /// needs to distinguish): (1) an EARLIER create in this SAME tail (a
+    /// create+delete+recreate cycle within one replay), or (2) the slot
+    /// [`Self::restore_mined_index_from_snapshot_entries`] allocated for this
+    /// txid when the CALLER seeded `tail_slots` from that method's return
+    /// value — the fuzzy-checkpoint-overlap case where a txid created during
+    /// the (non-blocking) snapshot scan is captured by both the snapshot AND
+    /// its own above-fence `Create` redo entry. Either way, freeing the old
+    /// slot before/alongside allocating the fresh one keeps exactly one live
+    /// MinedIndex slot per txid, so `unmined_len`/`collect_unmined_keys_below`
+    /// never double-count it.
     fn apply_create_to_mined_index(
         &self,
         tx_key: &TxKey,
@@ -8417,7 +8448,8 @@ impl Engine {
     /// reconciling mutations that happened after
     /// [`Self::restore_mined_index_from_snapshot_entries`]'s snapshot was
     /// taken. Call these two methods back-to-back at recovery (see
-    /// [`Self::recover_mined_index`]).
+    /// [`Self::recover_mined_index`]), passing that method's returned map as
+    /// this one's `tail_slots` seed.
     ///
     /// `min_sequence_exclusive` is the RESTORED snapshot's stamped fence:
     /// only entries with `sequence > min_sequence_exclusive` are replayed
@@ -8440,6 +8472,23 @@ impl Engine {
     /// fold of everything `<= F`, and `apply_set_mined`/`apply_unset` replay
     /// for the post-`F` tail remains idempotent over any fuzzy-window effect
     /// the snapshot happened to also capture.
+    ///
+    /// The floor alone does NOT cover every overlap, though: the checkpoint
+    /// scan behind `entries` is itself fuzzy (non-blocking), so it can
+    /// capture a txid created WHILE it was scanning — that txid's own
+    /// `Create`/`CreateV2` redo entry lands at a sequence strictly ABOVE `F`
+    /// (the floor doesn't and can't skip it; it is a real above-fence tail
+    /// entry that must be replayed for every txid created after the
+    /// checkpoint). Left unhandled, replaying it would `alloc_created` a
+    /// second slot for that txid and orphan the one
+    /// [`Self::restore_mined_index_from_snapshot_entries`] just restored —
+    /// the same double-count hazard, from the opposite direction. `tail_slots`
+    /// is the fix: the caller seeds it with that method's return value (txid
+    /// -> the slot it restored), so [`Self::apply_create_to_mined_index`]'s
+    /// existing same-tail dedup (`tail_slots.insert` returning the prior
+    /// slot) frees the snapshot-restored slot the moment the above-fence
+    /// `Create` replays, exactly as it already does for an in-tail
+    /// create-then-recreate cycle.
     ///
     /// Reads every entry currently in `redo_logs` (each log's `recover()` — a
     /// pure, side-effect-free read) and replays, in GLOBAL sequence order
@@ -8475,18 +8524,21 @@ impl Engine {
     /// is consulted here only to decide whether a txid still exists (so a
     /// resurrected, already-deleted key is never re-registered) and to
     /// preserve its CURRENT `device_id`/`record_offset` when re-pointing
-    /// `mined_slot`. The local `tail_slots` map tracks the slot THIS call
-    /// itself allocated for a txid, so a `Delete` can free it even for a
-    /// txid created-and-deleted entirely within this tail (where
-    /// `self.index` no longer carries any trace of it). The rare
-    /// create+delete+recreate cycle for the SAME txid within one tail
-    /// leaves the FIRST create's slot allocated-and-abandoned once the
-    /// second create overwrites `tail_slots`/`self.index`'s pointer — a
-    /// bounded, harmless leak (wasted RAM, unreachable, never aliased to
-    /// another txid). It does NOT self-heal at the next checkpoint —
-    /// `snapshot_mined_index_by_key` only READS the live final index via
-    /// `self.index.for_each`, it never scrubs the arena for orphaned slots —
-    /// only a full restart (`clear()`) reclaims it.
+    /// `mined_slot`. The `tail_slots` map tracks the slot currently
+    /// associated with a txid for the DURATION of this call — either seeded
+    /// by the caller from [`Self::restore_mined_index_from_snapshot_entries`]
+    /// (the fuzzy-checkpoint-overlap case) or allocated by an earlier create
+    /// in this SAME tail — so a `Delete` can free it even for a txid
+    /// created-and-deleted entirely within this tail (where `self.index` no
+    /// longer carries any trace of it). The rare create+delete+recreate cycle
+    /// for the SAME txid within one tail leaves the FIRST create's slot
+    /// allocated-and-abandoned once the second create overwrites
+    /// `tail_slots`/`self.index`'s pointer — a bounded, harmless leak (wasted
+    /// RAM, unreachable, never aliased to another txid). It does NOT
+    /// self-heal at the next checkpoint — `snapshot_mined_index_by_key` only
+    /// READS the live final index via `self.index.for_each`, it never scrubs
+    /// the arena for orphaned slots — only a full restart (`clear()`)
+    /// reclaims it.
     ///
     /// Idempotent only in the sense that the CALLER always starts from a
     /// freshly-`clear()`ed arena (via
@@ -8503,6 +8555,7 @@ impl Engine {
         &self,
         redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
         min_sequence_exclusive: u64,
+        mut tail_slots: std::collections::HashMap<TxKey, u32>,
     ) -> Result<(), SpendError> {
         let mut tagged: Vec<crate::redo::RedoEntry> = Vec::new();
         for log in redo_logs {
@@ -8512,9 +8565,6 @@ impl Engine {
             tagged.extend(entries);
         }
         tagged.sort_by_key(|e| e.sequence);
-
-        let mut tail_slots: std::collections::HashMap<TxKey, u32> =
-            std::collections::HashMap::new();
 
         for entry in &tagged {
             // Entries at or below the restored snapshot's fence are already
@@ -8622,11 +8672,15 @@ impl Engine {
     /// (no snapshot floor) — the genuine-fresh-boot full-replay path.
     ///
     /// Thin wrapper over [`Self::replay_mined_index_redo_tail_above`] with a
-    /// `0` floor: `recover()` already excludes entries at or below each log's
-    /// own persisted fence, so a `0` floor filters nothing additional and this
-    /// preserves the pre-existing replay-everything behavior byte-for-byte.
+    /// `0` floor and an empty `tail_slots` seed: `recover()` already excludes
+    /// entries at or below each log's own persisted fence, so a `0` floor
+    /// filters nothing additional and this preserves the pre-existing
+    /// replay-everything behavior byte-for-byte. There is no snapshot restore
+    /// preceding this call (this is the no-checkpoint-ever, full-replay-from-
+    /// genesis path), so there is nothing to seed `tail_slots` from either.
     /// The snapshot+redo path in [`Self::recover_mined_index`] calls
-    /// `replay_mined_index_redo_tail_above` directly with the snapshot fence.
+    /// `replay_mined_index_redo_tail_above` directly with the snapshot fence
+    /// and [`Self::restore_mined_index_from_snapshot_entries`]'s returned map.
     ///
     /// # Errors
     ///
@@ -8635,7 +8689,7 @@ impl Engine {
         &self,
         redo_logs: &[Arc<parking_lot::Mutex<crate::redo::RedoLog>>],
     ) -> Result<(), SpendError> {
-        self.replay_mined_index_redo_tail_above(redo_logs, 0)
+        self.replay_mined_index_redo_tail_above(redo_logs, 0, std::collections::HashMap::new())
     }
 
     /// The MINIMUM "persisted recovery fence" across every attached redo
@@ -8853,16 +8907,23 @@ impl Engine {
             }
         }
 
-        self.restore_mined_index_from_snapshot_entries(&entries)?;
-        // Replay ONLY the tail strictly above the snapshot's fence. In the
-        // healthy `snapshot_fence == redo_fence` case this equals replaying the
-        // whole recovered tail; in the crash-window `snapshot_fence >
-        // redo_fence` case it deliberately SKIPS the `redo_fence..snapshot_fence`
-        // overlap already folded into the just-restored snapshot (see
-        // `replay_mined_index_redo_tail_above`'s doc — replaying an overlap
-        // `Create` would orphan a restored slot and corrupt the unmined
-        // buckets).
-        self.replay_mined_index_redo_tail_above(redo_logs, snapshot_fence)?;
+        let restored_slots = self.restore_mined_index_from_snapshot_entries(&entries)?;
+        // Replay the tail strictly above the snapshot's fence, seeded with
+        // the slots just restored. In the healthy `snapshot_fence ==
+        // redo_fence` case this equals replaying the whole recovered tail; in
+        // the crash-window `snapshot_fence > redo_fence` case the floor
+        // deliberately SKIPS the `redo_fence..snapshot_fence` overlap already
+        // folded into the just-restored snapshot (see
+        // `replay_mined_index_redo_tail_above`'s doc — replaying that overlap
+        // would orphan a restored slot and corrupt the unmined buckets). The
+        // floor alone doesn't cover the OTHER overlap direction, though: the
+        // checkpoint's own scan is fuzzy, so it can capture a txid created
+        // WHILE it scanned, whose `Create` redo lands strictly ABOVE the
+        // fence and so is NOT skipped by the floor. Passing `restored_slots`
+        // as the seed makes that above-fence `Create` free the
+        // snapshot-restored slot via the same in-tail dedup a
+        // create-then-recreate cycle already uses, instead of orphaning it.
+        self.replay_mined_index_redo_tail_above(redo_logs, snapshot_fence, restored_slots)?;
         tracing::info!(
             entries = entries.len(),
             fence = snapshot_fence,
@@ -17375,6 +17436,162 @@ mod tests {
         assert!(
             keys.contains(&key),
             "snapshot restore must populate the unmined height bucket with the real txid"
+        );
+    }
+
+    /// CRITICAL fix: production checkpoints are FUZZY (non-blocking). A txid
+    /// created WHILE the `.mined` snapshot's scan is in flight can be
+    /// captured live by that scan even though its own `Create`/`CreateV2`
+    /// redo entry lands at a sequence strictly ABOVE the snapshot's stamped
+    /// fence — the fence floor in `replay_mined_index_redo_tail_above` only
+    /// skips entries `<=` the fence, so that above-fence `Create` is
+    /// genuinely replayed, not skipped.
+    ///
+    /// Pre-fix, `apply_create_to_mined_index` unconditionally
+    /// `alloc_created`d a FRESH slot for that replay without knowing a slot
+    /// already existed, orphaning the one
+    /// `restore_mined_index_from_snapshot_entries` had just allocated for
+    /// the SAME txid from the snapshot. The orphan stayed live in its
+    /// unmined height bucket (never freed, never re-pointed-to), so
+    /// `unmined_len`/`collect_unmined_keys_below` double-counted the one
+    /// txid. The fix threads `restore_mined_index_from_snapshot_entries`'s
+    /// returned txid->slot map into `replay_mined_index_redo_tail_above` as
+    /// its `tail_slots` seed, so the above-fence `Create` hits the exact same
+    /// in-tail dedup a create-then-recreate cycle already uses: the
+    /// snapshot-restored slot is freed the moment the fresh one is
+    /// allocated, leaving exactly one live slot.
+    #[test]
+    fn fuzzy_create_in_snapshot_window_does_not_double_count_on_recovery() {
+        use crate::index::mined_index::{MinedByKeyEntry, NO_MINED_SLOT};
+        use crate::redo::{RedoLog, RedoOp};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+        // A real on-device record for the tx "created during" the fuzzy
+        // checkpoint scan — only the footer/locator matter, this throwaway
+        // engine's own index/MinedIndex are discarded.
+        let (device_id, offset, key) = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let temp_engine = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+            );
+            let (_, req) = make_create_req(77, 1);
+            let key = req.tx_key();
+            temp_engine.create(&req).expect("create succeeds");
+            let entry = temp_engine.lookup(&key).expect("entry registered");
+            temp_engine.allocator().lock().persist().unwrap();
+            (entry.device_id, entry.record_offset, key)
+        };
+
+        // A FRESH engine sharing the same device, whose primary index
+        // already carries the key with the NO_MINED_SLOT sentinel — the real
+        // recovery precondition: the primary index has already been fully
+        // replayed (mined_slot untouched) by the time `recover_mined_index`
+        // runs.
+        let fresh_index = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+        fresh_index
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id,
+                    record_offset: offset,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register key");
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            fresh_index,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+
+        // The `.mined` snapshot's fuzzy scan ALSO captured this txid live
+        // (it was already registered in the primary index by the time the
+        // scan visited it) — still unmined at its creation height (1000,
+        // `make_create_req`'s fixed `block_height`).
+        let entries = vec![MinedByKeyEntry {
+            txid: key.txid,
+            block_entries: vec![],
+            unmined_since: 1000,
+            all_spent: false,
+        }];
+        let restored_slots = engine2
+            .restore_mined_index_from_snapshot_entries(&entries)
+            .expect("snapshot restore succeeds");
+
+        // Precondition: the snapshot restore alone already produced exactly
+        // one live, unmined slot for this txid.
+        assert_eq!(
+            engine2.mined_index().unmined_len(),
+            1,
+            "precondition: snapshot restore alone must register exactly one unmined slot"
+        );
+
+        // The SAME txid's own `CreateV2` redo entry — appended during the
+        // fuzzy scan window, landing at sequence 1 (strictly above the
+        // snapshot's fence, 0) — is therefore replayed, not skipped by the
+        // fence floor.
+        let redo_dev: Arc<dyn BlockDevice> = Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 256 * 1024).unwrap(),
+        ));
+        redo.lock()
+            .append_and_flush(RedoOp::CreateV2 {
+                tx_key: key,
+                device_id,
+                record_offset: offset,
+                utxo_count: 1,
+                is_conflicting: false,
+                parent_txids: vec![],
+            })
+            .expect("append CreateV2");
+
+        engine2
+            .replay_mined_index_redo_tail_above(std::slice::from_ref(&redo), 0, restored_slots)
+            .expect("redo-tail replay succeeds");
+
+        // The bug: without seeding `tail_slots` from the snapshot restore,
+        // the above-fence `CreateV2` replay allocates a SECOND slot for the
+        // same txid without freeing the snapshot-restored one, leaving it
+        // orphaned but still live in the unmined bucket — `unmined_len`
+        // reads 2 for one txid instead of 1.
+        assert_eq!(
+            engine2.mined_index().unmined_len(),
+            1,
+            "fuzzy-window overlap Create must not double-count the txid's unmined slot"
+        );
+
+        let unmined_keys = engine2.mined_index().collect_unmined_keys_below(u32::MAX);
+        assert_eq!(
+            unmined_keys.iter().filter(|&&k| k == key).count(),
+            1,
+            "the txid must appear exactly once in the unmined-below query, not duplicated"
+        );
+
+        // The primary index must point at the single live slot, and that
+        // slot must actually be live (not a dangling orphan pointer).
+        let after = engine2.lookup(&key).expect("entry still present");
+        assert_ne!(
+            after.mined_slot, NO_MINED_SLOT,
+            "recovery must leave a live mined_slot pointer"
+        );
+        let (blocks, unmined_since) = engine2
+            .mined_index()
+            .read_block_entries(&key, after.mined_slot)
+            .expect("primary mined_slot must point at the single live slot, not the orphan");
+        assert!(blocks.is_empty(), "tx has no mined blocks");
+        assert_eq!(
+            unmined_since, 1000,
+            "the live slot must carry the tx's unmined-since height"
         );
     }
 
