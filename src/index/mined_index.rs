@@ -34,13 +34,25 @@ pub const MINED_REASSIGNED: u8 = 32;
 /// `flags` bit: mirrors `preserve_until != 0` (device).
 pub const MINED_PRESERVED: u8 = 64;
 
-/// The set of MinedEntry `flags` bits that cache the DAH-eval device inputs
-/// (see [`MINED_EXTERNAL`] … [`MINED_PRESERVED`]). Read back by
-/// [`ShardedMinedIndex::read_de_flags`] and rewritten wholesale by
-/// [`ShardedMinedIndex::reseed_de_flags`]; the remaining bits
-/// ([`MINED_ALL_SPENT`], [`MINED_HAS_OVERFLOW`]) are untouched by both.
+/// The set of MinedEntry `flags` bits that cache the DAH-eval flag inputs
+/// (see [`MINED_EXTERNAL`] … [`MINED_PRESERVED`]) — all FIVE. Read back
+/// wholesale by [`ShardedMinedIndex::read_de_flags`] and used by the setMined
+/// DAH path / cross-checks; the remaining bits ([`MINED_ALL_SPENT`],
+/// [`MINED_HAS_OVERFLOW`]) are untouched by those.
 pub const MINED_DE_FLAG_MASK: u8 =
     MINED_EXTERNAL | MINED_CONFLICTING | MINED_LAST_SPENT_ALL | MINED_REASSIGNED | MINED_PRESERVED;
+
+/// The DEVICE-authoritative subset of [`MINED_DE_FLAG_MASK`] — the four DAH-eval
+/// flags whose truth still lives on the device footer (EXTERNAL, CONFLICTING,
+/// REASSIGNED, PRESERVED) and are reseeded from it. Deliberately EXCLUDES
+/// [`MINED_LAST_SPENT_ALL`]: followup-2 task 3 made the MinedEntry cache the
+/// SINGLE SOURCE OF TRUTH for `LAST_SPENT_ALL` (setMined updates it RAM-only,
+/// zero device I/O, so the device copy is vestigial and can lag). This is the
+/// mask [`ShardedMinedIndex::reseed_de_flags`] rewrites, so a device→cache
+/// reseed can never clobber the cache-authoritative LSA bit from a stale
+/// device value.
+pub const MINED_DE_DEVICE_MASK: u8 =
+    MINED_EXTERNAL | MINED_CONFLICTING | MINED_REASSIGNED | MINED_PRESERVED;
 
 /// Map the device-authoritative DAH-eval flag inputs — `TxMetadata.flags` and
 /// `preserve_until != 0` — into the MinedEntry [`MINED_DE_FLAG_MASK`] bit
@@ -1005,19 +1017,29 @@ impl ShardedMinedIndex {
         Some(entry.flags & MINED_ALL_SPENT != 0)
     }
 
-    /// Overwrite the slot's entire cached DAH-eval flag group
-    /// ([`MINED_DE_FLAG_MASK`]) with `de_flags`, leaving all other `flags`
-    /// bits ([`MINED_ALL_SPENT`], [`MINED_HAS_OVERFLOW`]) untouched.
+    /// Overwrite the slot's DEVICE-authoritative cached DAH-eval flag group
+    /// ([`MINED_DE_DEVICE_MASK`] — EXTERNAL, CONFLICTING, REASSIGNED, PRESERVED)
+    /// from `de_flags`, leaving every other `flags` bit untouched — INCLUDING
+    /// the cache-authoritative [`MINED_LAST_SPENT_ALL`] and the
+    /// [`MINED_ALL_SPENT`] / [`MINED_HAS_OVERFLOW`] bits.
     ///
     /// This is the bulk counterpart to [`Self::set_de_flag`]: it sets AND
-    /// clears every DE bit in one shard-lock acquisition to exactly match a
-    /// device-derived value (see [`device_de_flags`]). Used at create (a
-    /// fresh slot's DE bits) and at recovery
-    /// (`Engine::reconcile_secondaries_from_mined_index`, reseeding the cache
-    /// from the device-authoritative footer), and at every op that rewrites
-    /// device flags (to keep the cache in lockstep). Key_fp-verified like
-    /// [`Self::set_de_flag`]; a no-op if the slot is absent or the fingerprint
-    /// mismatches.
+    /// clears every DEVICE DE bit in one shard-lock acquisition to exactly
+    /// match a device-derived value (see [`device_de_flags`]). Used at create
+    /// (a fresh slot's DE bits) and at recovery
+    /// (`Engine::reconcile_secondaries_from_mined_index`, reseeding the four
+    /// device flags from the device-authoritative footer), and at every op that
+    /// rewrites device flags (to keep the cache in lockstep).
+    ///
+    /// followup-2 task 3: `LAST_SPENT_ALL` is DELIBERATELY excluded. The
+    /// MinedEntry cache is its single source of truth (setMined updates it
+    /// RAM-only), so reseeding it from a possibly-stale device value would
+    /// clobber the authoritative bit. Any `MINED_LAST_SPENT_ALL` bit present in
+    /// `de_flags` is ignored; the existing cache LSA is preserved. Writers set
+    /// the cache LSA explicitly via [`Self::set_de_flag`].
+    ///
+    /// Key_fp-verified like [`Self::set_de_flag`]; a no-op if the slot is absent
+    /// or the fingerprint mismatches.
     pub fn reseed_de_flags(&self, key: &TxKey, slot: u32, de_flags: u8) {
         let fp = key_fp(key);
         let mut sh = self.shards[self.shard_for(key)].lock();
@@ -1025,7 +1047,7 @@ impl ShardedMinedIndex {
             if entry.key_fp != fp {
                 return;
             }
-            entry.flags = (entry.flags & !MINED_DE_FLAG_MASK) | (de_flags & MINED_DE_FLAG_MASK);
+            entry.flags = (entry.flags & !MINED_DE_DEVICE_MASK) | (de_flags & MINED_DE_DEVICE_MASK);
         }
     }
 
@@ -1993,9 +2015,9 @@ mod tests {
         assert_eq!(idx.read_de_flags(&key_b, slot_b), None);
     }
 
-    /// followup-1: `reseed_de_flags` overwrites the whole DE group to an exact
-    /// device-derived value (setting AND clearing), while leaving non-DE bits
-    /// alone.
+    /// followup-1/2: `reseed_de_flags` overwrites the DEVICE DE group
+    /// ([`MINED_DE_DEVICE_MASK`]) to an exact device-derived value (setting AND
+    /// clearing), while leaving non-DE bits alone.
     #[test]
     fn reseed_de_flags_replaces_whole_group() {
         use crate::index::TxKey;
@@ -2027,12 +2049,52 @@ mod tests {
             );
         });
 
-        // Reseed to empty clears every DE bit but keeps MINED_ALL_SPENT.
+        // Reseed to empty clears every DEVICE DE bit but keeps MINED_ALL_SPENT.
         idx.reseed_de_flags(&k, slot, 0);
         assert_eq!(idx.read_de_flags(&k, slot), Some(0));
         idx.with_entry(&k, slot, |e| {
             assert_ne!(e.flags & MINED_ALL_SPENT, 0);
         });
+    }
+
+    /// followup-2 task 3: `reseed_de_flags` must NEVER touch the
+    /// cache-authoritative [`MINED_LAST_SPENT_ALL`] bit — neither setting it
+    /// from an incoming `de_flags` value nor clearing an existing one. This is
+    /// the property that stops a device→cache reseed (via `mirror_de_flags`)
+    /// from clobbering an LSA the cache-only setMined path just wrote.
+    #[test]
+    fn reseed_de_flags_preserves_last_spent_all() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [77u8; 32] };
+        let slot = idx.alloc_created(&k, 0);
+
+        // Cache-only LSA set (as setMined would do), plus a device flag.
+        idx.set_de_flag(&k, slot, MINED_LAST_SPENT_ALL, true);
+        idx.set_de_flag(&k, slot, MINED_CONFLICTING, true);
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(MINED_LAST_SPENT_ALL | MINED_CONFLICTING),
+        );
+
+        // A device→cache reseed carrying LSA=0 (stale device) must NOT clear
+        // the cache LSA, and must still update the device flags around it.
+        idx.reseed_de_flags(&k, slot, device_de_flags(TxFlags::EXTERNAL, false));
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(MINED_LAST_SPENT_ALL | MINED_EXTERNAL),
+            "reseed must preserve cache LSA and swap CONFLICTING→EXTERNAL",
+        );
+
+        // Symmetrically, a reseed carrying LSA=1 must NOT set a cache LSA that
+        // is currently clear.
+        idx.set_de_flag(&k, slot, MINED_LAST_SPENT_ALL, false);
+        idx.reseed_de_flags(&k, slot, device_de_flags(TxFlags::LAST_SPENT_ALL, false));
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(0),
+            "reseed must not set cache LSA from an incoming LSA bit",
+        );
     }
 
     /// Task 2: `tx_flags_from_de_flags` is the exact inverse of

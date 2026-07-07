@@ -3523,6 +3523,16 @@ impl Engine {
         // the authoritative MinedIndex (Task 16a) rather than the device
         // metadata's `block_entry_count`/`unmined_since` fields.
         let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
+        // followup-2 task 3: source `was_all_spent` from the cache-authoritative
+        // LSA, not the (now-vestigial) device footer.
+        metadata.flags.set(
+            TxFlags::LAST_SPENT_ALL,
+            self.cache_authoritative_lsa(
+                &req.tx_key,
+                entry.mined_slot,
+                metadata.flags.contains(TxFlags::LAST_SPENT_ALL),
+            ),
+        );
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
             !mined_entries.is_empty(),
@@ -3573,10 +3583,14 @@ impl Engine {
             }
         }
 
-        // followup-1 dual-write: the footer just persisted may have flipped
-        // LAST_SPENT_ALL (apply_dah_patch above). Mirror the DE-flag cache to
-        // the durable footer under this same stripe lock.
+        // followup-1 dual-write: mirror the DEVICE DE flags to the durable
+        // footer under this same stripe lock. followup-2 task 3: mirror no
+        // longer syncs LAST_SPENT_ALL (cache-authoritative), so set the cache
+        // LSA explicitly from the patch when one was produced.
         self.mirror_de_flags(&req.tx_key, entry.mined_slot, &metadata);
+        if let Some(ref patch) = dah_patch {
+            self.set_cache_lsa(&req.tx_key, entry.mined_slot, patch.last_spent_all);
+        }
 
         // 9. Update DAH secondary index (two-phase durable) — both engines.
         let new_dah = { metadata.delete_at_height };
@@ -3723,6 +3737,16 @@ impl Engine {
         //    metadata's `block_entry_count`/`unmined_since` fields.
         let old_dah = { metadata.delete_at_height };
         let (mined_entries, mined_unmined_since) = self.mined_block_entries(&req.tx_key)?;
+        // followup-2 task 3: source `was_all_spent` from the cache-authoritative
+        // LSA, not the (now-vestigial) device footer.
+        metadata.flags.set(
+            TxFlags::LAST_SPENT_ALL,
+            self.cache_authoritative_lsa(
+                &req.tx_key,
+                entry.mined_slot,
+                metadata.flags.contains(TxFlags::LAST_SPENT_ALL),
+            ),
+        );
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
             !mined_entries.is_empty(),
@@ -3761,13 +3785,18 @@ impl Engine {
             }
 
             // followup-1 dual-write: this branch is the ONLY path on which the
-            // footer is persisted, so LAST_SPENT_ALL (flipped by
-            // apply_dah_patch above) reaches the device only here. Mirror the
-            // DE-flag cache to the persisted footer inside the same block; on
-            // the skipped-persist path the device is unchanged and the cache
-            // already agrees, so no mirror is needed (or wanted — it would
-            // otherwise lead the device with an un-persisted value).
+            // footer is persisted. Mirror the DEVICE DE flags to the persisted
+            // footer inside the same block; on the skipped-persist path the
+            // device is unchanged and the cache already agrees, so no mirror is
+            // needed (or wanted — it would otherwise lead the device with an
+            // un-persisted value). followup-2 task 3: mirror no longer syncs
+            // LAST_SPENT_ALL (cache-authoritative), so set the cache LSA
+            // explicitly from the patch — also only when the footer persisted,
+            // keeping cache and device in lockstep.
             self.mirror_de_flags(&req.tx_key, entry.mined_slot, &metadata);
+            if let Some(ref patch) = dah_patch {
+                self.set_cache_lsa(&req.tx_key, entry.mined_slot, patch.last_spent_all);
+            }
 
             // Update DAH secondary index (two-phase durable).
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
@@ -4098,6 +4127,16 @@ impl Engine {
         // computed above (in hand — this op is the one mutating it), not a
         // MinedIndex re-read of the pre-mutation state.
         let (mined_entries, _) = self.mined_block_entries(&req.tx_key)?;
+        // followup-2 task 3: source `was_all_spent` from the cache-authoritative
+        // LSA, not the (now-vestigial) device footer.
+        metadata.flags.set(
+            TxFlags::LAST_SPENT_ALL,
+            self.cache_authoritative_lsa(
+                &req.tx_key,
+                entry.mined_slot,
+                metadata.flags.contains(TxFlags::LAST_SPENT_ALL),
+            ),
+        );
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
             !mined_entries.is_empty(),
@@ -4124,10 +4163,15 @@ impl Engine {
             self.write_metadata_fast(device_id, record_offset, &metadata)?;
         }
 
-        // followup-1 dual-write: the footer just persisted may have flipped
-        // LAST_SPENT_ALL (apply_dah_patch above). Mirror the DE-flag cache to
-        // the durable footer under this same stripe lock.
+        // followup-1 dual-write: mirror the DEVICE DE flags to the durable
+        // footer under this same stripe lock. followup-2 task 3: mirror no
+        // longer syncs LAST_SPENT_ALL (cache-authoritative), so set the cache
+        // LSA explicitly from the patch when one was produced (a longest-chain
+        // flip can move the all-spent-on-chain DAH condition).
         self.mirror_de_flags(&req.tx_key, entry.mined_slot, &metadata);
+        if let Some(ref patch) = dah_patch {
+            self.set_cache_lsa(&req.tx_key, entry.mined_slot, patch.last_spent_all);
+        }
 
         // H1: atomic primary + DAH update under one critical section. Any
         // reader that locks dah_index observes a consistent view with the
@@ -5438,12 +5482,25 @@ impl Engine {
         // on_longest_chain) are reachable.
         let (mined_entries, mined_unmined_since) = self.mined_block_entries(parent_key)?;
         let old_dah = { meta.delete_at_height };
+        // followup-2 task 3: source `was_all_spent` from the cache-authoritative
+        // LSA, not the (now-vestigial) device footer.
+        meta.flags.set(
+            TxFlags::LAST_SPENT_ALL,
+            self.cache_authoritative_lsa(
+                parent_key,
+                entry.mined_slot,
+                meta.flags.contains(TxFlags::LAST_SPENT_ALL),
+            ),
+        );
         let (_signal, dah_patch) =
             evaluate_delete_at_height(&meta, !mined_entries.is_empty(), mined_unmined_since, 0, 1)?;
         if let Some(patch) = dah_patch
             && patch.new_delete_at_height < old_dah
         {
             apply_dah_patch(&mut meta, &patch);
+            // followup-2 task 3: the applied strict-reduction patch cleared the
+            // cache-authoritative LSA (mirror no longer syncs it).
+            self.set_cache_lsa(parent_key, entry.mined_slot, patch.last_spent_all);
         }
         let new_dah = { meta.delete_at_height };
 
@@ -6823,6 +6880,16 @@ impl Engine {
                 tf.remove(TxFlags::CONFLICTING);
             }
 
+            // followup-2 task 3: source `was_all_spent` from the
+            // cache-authoritative LSA, not the (now-vestigial) device footer.
+            tf.set(
+                TxFlags::LAST_SPENT_ALL,
+                self.cache_authoritative_lsa(
+                    &req.tx_key,
+                    entry.mined_slot,
+                    tf.contains(TxFlags::LAST_SPENT_ALL),
+                ),
+            );
             let (signal, dah_patch) = crate::ops::delete_eval::evaluate_dah_cached(
                 tf,
                 meta_spent,
@@ -6841,6 +6908,9 @@ impl Engine {
             if let Some(ref patch) = dah_patch {
                 tf.set(TxFlags::LAST_SPENT_ALL, patch.last_spent_all);
                 new_dah = patch.new_delete_at_height;
+                // followup-2 task 3: mirror no longer syncs LAST_SPENT_ALL
+                // (cache-authoritative), so set the cache LSA explicitly.
+                self.set_cache_lsa(&req.tx_key, entry.mined_slot, patch.last_spent_all);
             }
 
             // Generation derives from the on-device value, not the cache.
@@ -6885,6 +6955,16 @@ impl Engine {
             meta.generation = { meta.generation }.wrapping_add(1);
             meta.updated_at = self.now_millis();
 
+            // followup-2 task 3: source `was_all_spent` from the
+            // cache-authoritative LSA, not the (now-vestigial) device footer.
+            meta.flags.set(
+                TxFlags::LAST_SPENT_ALL,
+                self.cache_authoritative_lsa(
+                    &req.tx_key,
+                    entry.mined_slot,
+                    meta.flags.contains(TxFlags::LAST_SPENT_ALL),
+                ),
+            );
             let (signal, dah_patch) = evaluate_delete_at_height(
                 &meta,
                 has_blocks,
@@ -6898,10 +6978,14 @@ impl Engine {
 
             self.write_metadata_fast(device_id, ro, &meta)?;
 
-            // followup-1 dual-write: mirror CONFLICTING (req.value) and any
-            // LAST_SPENT_ALL transition (apply_dah_patch above) into the
-            // DE-flag cache from the persisted footer.
+            // followup-1 dual-write: mirror CONFLICTING (req.value) into the
+            // DEVICE DE-flag cache from the persisted footer. followup-2 task 3:
+            // mirror no longer syncs LAST_SPENT_ALL (cache-authoritative), so
+            // set the cache LSA explicitly from the patch when one was produced.
             self.mirror_de_flags(&req.tx_key, entry.mined_slot, &meta);
+            if let Some(ref patch) = dah_patch {
+                self.set_cache_lsa(&req.tx_key, entry.mined_slot, patch.last_spent_all);
+            }
 
             let new_dah = { meta.delete_at_height };
             self.update_dah_index(&req.tx_key, old_dah, new_dah)?;
@@ -7833,6 +7917,49 @@ impl Engine {
                     meta.flags,
                     { meta.preserve_until } != 0,
                 ),
+            );
+        }
+    }
+
+    /// The cache-authoritative `LAST_SPENT_ALL` state for a record's DAH
+    /// evaluation (followup-2 task 3).
+    ///
+    /// The MinedEntry DE-flag cache is the SINGLE SOURCE OF TRUTH for
+    /// `LAST_SPENT_ALL`: setMined updates it RAM-only (zero device I/O), so the
+    /// device footer's copy is vestigial and can lag. Every device-reading
+    /// DAH-eval site must therefore take `was_all_spent` from the cache, not
+    /// `meta.flags`. When the record has a live mined slot with a readable cache
+    /// entry, the cache LSA bit wins; otherwise (`NO_MINED_SLOT`, or an
+    /// absent/ABA-reallocated slot) the record never took setMined's cache-only
+    /// path — every mutation wrote the device in lockstep — so the supplied
+    /// `device_lsa` is authoritative. Callers hold the record's stripe lock.
+    fn cache_authoritative_lsa(&self, key: &TxKey, mined_slot: u32, device_lsa: bool) -> bool {
+        if mined_slot != crate::index::mined_index::NO_MINED_SLOT
+            && let Some(de) = self.mined_index().read_de_flags(key, mined_slot)
+        {
+            return de & crate::index::mined_index::MINED_LAST_SPENT_ALL != 0;
+        }
+        device_lsa
+    }
+
+    /// Write the cache-authoritative `LAST_SPENT_ALL` bit from a DAH patch
+    /// (followup-2 task 3).
+    ///
+    /// Because [`Self::mirror_de_flags`] no longer syncs `LAST_SPENT_ALL` from
+    /// the device (it is cache-authoritative), every keyed DAH-eval site that
+    /// applies a patch must set the cache bit explicitly to
+    /// `patch.last_spent_all`. A no-op when the record has no live mined slot
+    /// (`NO_MINED_SLOT`) — there is no cache to hold it, and such a record never
+    /// took setMined's cache-only path. Callers hold the record's stripe lock
+    /// and invoke this AFTER the patch's device write, mirroring
+    /// [`Self::mirror_de_flags`]'s ordering contract.
+    fn set_cache_lsa(&self, key: &TxKey, mined_slot: u32, last_spent_all: bool) {
+        if mined_slot != crate::index::mined_index::NO_MINED_SLOT {
+            self.mined_index().set_de_flag(
+                key,
+                mined_slot,
+                crate::index::mined_index::MINED_LAST_SPENT_ALL,
+                last_spent_all,
             );
         }
     }
@@ -8908,10 +9035,29 @@ impl Engine {
             // followup-1 recovery reseed: the MinedIndex was rebuilt fresh by
             // `recover_mined_index` (which ran just before this pass on every
             // boot — see `bin/server.rs`), so its DE-flag cache is zeroed.
-            // Reseed it from the device-authoritative footer (`meta.flags` +
-            // `preserve_until`) so setMined's cache-sourced DAH eval (Task 2)
-            // starts correct post-recovery. Records with no live mined slot
-            // hold no cache to seed.
+            // Reseed the FOUR device-authoritative DE flags from the device
+            // footer (`meta.flags` + `preserve_until`) so setMined's
+            // cache-sourced DAH eval (Task 2) starts correct post-recovery.
+            // Records with no live mined slot hold no cache to seed.
+            //
+            // followup-2 task 3: LAST_SPENT_ALL is NOT reseeded from the device
+            // (it is cache-authoritative and the device copy can lag). Instead
+            // reconstruct it from AUTHORITATIVE state: a record's steady-state
+            // `LAST_SPENT_ALL` is its current effective all-spent status —
+            // `spent_utxos == utxo_count` with the LP-3 REASSIGNED exclusion.
+            // This is the fixpoint of `evaluate_delete_at_height`'s LSA
+            // transitions for a non-conflicting record (the all-spent SET branch
+            // AND the no-blocks all-spent transition both drive LSA to
+            // `effective_all_spent`, and the not-all-spent path drives it to
+            // false), so it is correct whether or not the record is
+            // mined/on-chain — the covered-all-spent and all-spent-not-mined
+            // cases both reconstruct to true. Conflicting/preserved records
+            // freeze LSA at a pre-transition value not recoverable from RAM;
+            // using the current all-spent status is the closest RAM-derived
+            // reconstruction and keeps the cache internally consistent (impact
+            // is bounded to advisory AllSpent/NotAllSpent signals). Spend
+            // counters and REASSIGNED are device-authoritative, so this never
+            // reads the vestigial device LAST_SPENT_ALL bit.
             if mined_slot != crate::index::mined_index::NO_MINED_SLOT {
                 self.mined_index.reseed_de_flags(
                     &key,
@@ -8921,6 +9067,9 @@ impl Engine {
                         { meta.preserve_until } != 0,
                     ),
                 );
+                let effective_all_spent = { meta.spent_utxos } == { meta.utxo_count }
+                    && !meta.flags.contains(TxFlags::REASSIGNED);
+                self.set_cache_lsa(&key, mined_slot, effective_all_spent);
             }
 
             let (_signal, patch) = evaluate_delete_at_height(
@@ -9607,6 +9756,16 @@ impl PreparedSpend {
         // MinedIndex (Task 16a) rather than the device metadata's
         // `block_entry_count`/`unmined_since` fields.
         let (mined_entries, mined_unmined_since) = engine.mined_block_entries(&tx_key)?;
+        // followup-2 task 3: source `was_all_spent` from the cache-authoritative
+        // LSA, not the (now-vestigial) device footer.
+        metadata.flags.set(
+            TxFlags::LAST_SPENT_ALL,
+            engine.cache_authoritative_lsa(
+                &tx_key,
+                mined_slot,
+                metadata.flags.contains(TxFlags::LAST_SPENT_ALL),
+            ),
+        );
         let (signal, dah_patch) = evaluate_delete_at_height(
             &metadata,
             !mined_entries.is_empty(),
@@ -9651,11 +9810,14 @@ impl PreparedSpend {
             }
         }
 
-        // followup-1 dual-write: the footer just persisted may have flipped
-        // LAST_SPENT_ALL (apply_dah_patch above). Mirror the DE-flag cache to
-        // the durable footer under the caller's stripe lock (held across this
-        // guard-free apply).
+        // followup-1 dual-write: mirror the DEVICE DE flags to the durable
+        // footer under the caller's stripe lock (held across this guard-free
+        // apply). followup-2 task 3: mirror no longer syncs LAST_SPENT_ALL
+        // (cache-authoritative), so set the cache LSA explicitly from the patch.
         engine.mirror_de_flags(&tx_key, mined_slot, &metadata);
+        if let Some(ref patch) = dah_patch {
+            engine.set_cache_lsa(&tx_key, mined_slot, patch.last_spent_all);
+        }
 
         // 10. Update the DAH secondary index (two-phase durable). When the
         // caller asked to defer (batched spend path), return the transition so
@@ -10643,9 +10805,17 @@ mod tests {
     // debug_assert; these are the targeted, per-site proofs.
     // -----------------------------------------------------------------------
 
-    /// Assert the record's cached DE-flag bits exactly equal the bits derived
-    /// from its live device footer (`meta.flags` + `preserve_until != 0`).
+    /// Assert the record's cached DEVICE DE-flag bits exactly equal the bits
+    /// derived from its live device footer (`meta.flags` + `preserve_until !=
+    /// 0`).
+    ///
+    /// followup-2 task 3: `LAST_SPENT_ALL` is EXCLUDED from this cross-check —
+    /// it is cache-authoritative and intentionally allowed to differ from the
+    /// (vestigial) device footer. Only the four device-authoritative flags
+    /// ([`crate::index::mined_index::MINED_DE_DEVICE_MASK`]) are compared here;
+    /// LSA parity is proven by the dedicated LSA/interleaving/recovery tests.
     fn assert_de_cache_matches_device(engine: &Engine, key: &TxKey) {
+        use crate::index::mined_index::MINED_DE_DEVICE_MASK;
         let slot = engine.lookup(key).expect("record present").mined_slot;
         assert_ne!(
             slot,
@@ -10655,14 +10825,16 @@ mod tests {
         let meta = engine.read_metadata(key).expect("read metadata");
         let flags = meta.flags;
         let preserve = { meta.preserve_until };
-        let expected = crate::index::mined_index::device_de_flags(flags, preserve != 0);
+        let expected =
+            crate::index::mined_index::device_de_flags(flags, preserve != 0) & MINED_DE_DEVICE_MASK;
         let actual = engine
             .mined_index()
             .read_de_flags(key, slot)
-            .expect("live slot must have a readable DE cache");
+            .expect("live slot must have a readable DE cache")
+            & MINED_DE_DEVICE_MASK;
         assert_eq!(
             actual, expected,
-            "DE cache must match device footer: got {actual:#010b}, want {expected:#010b} \
+            "device DE cache must match device footer: got {actual:#010b}, want {expected:#010b} \
              (flags={flags:?}, preserve_until={preserve})",
         );
     }
@@ -10991,7 +11163,7 @@ mod tests {
     /// footer's full tx_id (a txid with entropy beyond byte 12 would not).
     #[test]
     fn de_cache_reseeded_by_reconcile_from_device() {
-        use crate::index::mined_index::MINED_DE_FLAG_MASK;
+        use crate::index::mined_index::MINED_DE_DEVICE_MASK;
 
         let dev: Arc<dyn BlockDevice> =
             Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
@@ -11066,13 +11238,19 @@ mod tests {
                     },
                 )
                 .unwrap();
+            // Clobber the four DEVICE DE bits to all-ones (the WRONG value for
+            // every record) so the reconcile below must both set and clear them
+            // to reach the device-authoritative value. LAST_SPENT_ALL is
+            // excluded from this cross-check (followup-2 task 3): it is
+            // cache-authoritative and reconstructed from all-spent status, not
+            // reseeded from the device — see `reconcile_reconstructs_last_spent_all`.
             engine
                 .mined_index()
-                .reseed_de_flags(key, slot, MINED_DE_FLAG_MASK);
+                .reseed_de_flags(key, slot, MINED_DE_DEVICE_MASK);
             assert_eq!(
                 engine.mined_index().read_de_flags(key, slot),
-                Some(MINED_DE_FLAG_MASK),
-                "precondition: cache clobbered to all-ones before reconcile",
+                Some(MINED_DE_DEVICE_MASK),
+                "precondition: device DE bits clobbered to all-ones before reconcile",
             );
         }
 
@@ -11081,29 +11259,330 @@ mod tests {
             .reconcile_secondaries_from_mined_index(2000, 288)
             .expect("reconcile must reseed the DE cache");
 
-        // Every record's cache now exactly matches its device footer, both the
-        // bits it carries (set) and the clobbered bits it does not (cleared).
+        // Every record's DEVICE DE bits now exactly match its device footer,
+        // both the bits it carries (set) and the clobbered bits it does not
+        // (cleared). LAST_SPENT_ALL is masked out — see the dedicated
+        // reconstruction test.
         for (key, meta) in &records {
             let slot = engine.lookup(key).unwrap().mined_slot;
             let flags = meta.flags;
             let preserve = { meta.preserve_until };
-            let expected = crate::index::mined_index::device_de_flags(flags, preserve != 0);
+            let expected = crate::index::mined_index::device_de_flags(flags, preserve != 0)
+                & MINED_DE_DEVICE_MASK;
             assert_eq!(
-                engine.mined_index().read_de_flags(key, slot),
+                engine
+                    .mined_index()
+                    .read_de_flags(key, slot)
+                    .map(|f| f & MINED_DE_DEVICE_MASK),
                 Some(expected),
-                "reconcile must reseed DE cache to the device footer \
+                "reconcile must reseed the DEVICE DE cache to the device footer \
                  (flags={flags:?}, preserve_until={preserve})",
             );
         }
-        // Explicit: the no-flags record's clobbered bits were fully cleared.
+        // Explicit: the no-flags record's clobbered DEVICE bits were fully cleared.
         let plain_slot = engine.lookup(&records[4].0).unwrap().mined_slot;
         assert_eq!(
             engine
                 .mined_index()
-                .read_de_flags(&records[4].0, plain_slot),
+                .read_de_flags(&records[4].0, plain_slot)
+                .map(|f| f & MINED_DE_DEVICE_MASK),
             Some(0),
-            "reconcile must CLEAR DE bits a record does not carry on device",
+            "reconcile must CLEAR DEVICE DE bits a record does not carry on device",
         );
+    }
+
+    /// followup-2 task 3 headline (interleaving): `LAST_SPENT_ALL` is
+    /// cache-authoritative. A setMined that sets the cache LSA (device footer
+    /// stays stale-false, zero I/O) followed by a NON-LSA device op
+    /// (`preserve_until`, whose `mirror_de_flags` reseeds the DE group from the
+    /// footer) must NOT clobber the cache LSA back from the stale device value.
+    /// Pre-fix the mirror reseeded LSA from `meta.flags` and wrongly cleared it,
+    /// which then produced a spurious duplicate AllSpent on the next setMined.
+    #[test]
+    fn last_spent_all_cache_survives_non_lsa_device_op() {
+        use crate::index::mined_index::MINED_LAST_SPENT_ALL;
+        let engine = create_engine();
+        let (_hashes, create) = make_create_req(0xF3, 1);
+        let key = create.tx_key();
+        engine.create(&create).expect("create");
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+
+        let mined = |unset: bool| SetMinedRequest {
+            tx_key: key,
+            block_id: 7,
+            block_height: 100,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: unset,
+        };
+
+        // Mine on the longest chain (has_blocks + on-chain), not yet all-spent.
+        engine.set_mined(&mined(false)).expect("set_mined");
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "LSA clear before the record is all-spent",
+        );
+
+        // Spend the only UTXO with retention=0: sets the cache MINED_ALL_SPENT
+        // bit, but the DAH eval early-returns (retention==0), so LAST_SPENT_ALL
+        // stays CLEAR on both device and cache.
+        let sresp = engine
+            .spend(&SpendRequest {
+                tx_key: key,
+                offset: 0,
+                utxo_hash: create.utxo_hashes[0],
+                spending_data: [0xAB; 36],
+                ignore_conflicting: false,
+                ignore_locked: false,
+                current_block_height: 1000,
+                block_height_retention: 0,
+            })
+            .expect("spend retention=0");
+        assert_eq!(
+            sresp.signal,
+            Signal::None,
+            "a retention=0 spend runs no DAH eval, so emits no signal",
+        );
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "LSA still clear after the retention=0 spend",
+        );
+        assert!(
+            !engine
+                .read_metadata(&key)
+                .unwrap()
+                .flags
+                .contains(TxFlags::LAST_SPENT_ALL),
+            "device LSA clear after the retention=0 spend",
+        );
+
+        // setMined with retention>0 on the now all-spent, mined, on-chain record
+        // → the DAH-set branch fires (signal None for this non-external record)
+        // and cache LSA flips TRUE (RAM-only, zero device I/O). The device footer
+        // LSA stays stale-false: the divergence this task removes.
+        let m1 = engine
+            .set_mined(&mined(false))
+            .expect("set_mined→all-spent");
+        assert_eq!(
+            m1.signal,
+            Signal::None,
+            "a non-external mined all-spent record gets a DAH with signal None",
+        );
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(1288),
+            "setMined drove the all-spent on-chain record to a DAH",
+        );
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "setMined set the cache LSA",
+        );
+        assert!(
+            !engine
+                .read_metadata(&key)
+                .unwrap()
+                .flags
+                .contains(TxFlags::LAST_SPENT_ALL),
+            "device LSA is still stale-false (setMined did zero device I/O) — divergence",
+        );
+
+        // A NON-LSA device op: preserve_until writes the device footer and calls
+        // mirror_de_flags WITHOUT an LSA-changing DAH eval. Pre-fix its mirror
+        // reseeded the whole DE group from the stale footer, clobbering the cache
+        // LSA to false. Now mirror leaves LAST_SPENT_ALL untouched.
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 5000,
+            })
+            .expect("preserve_until");
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "cache LSA must survive the non-LSA device op (no mirror clobber)",
+        );
+
+        // Undo preservation; LSA stays intact through the second mirror.
+        engine
+            .preserve_until(&PreserveUntilRequest {
+                tx_key: key,
+                block_height: 0,
+            })
+            .expect("preserve_until undo");
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "cache LSA must survive the preserve-undo mirror too",
+        );
+
+        // Signal-sequence discriminator. The divergence is still live (preserve
+        // never wrote `delete_at_height` or the device LSA), so `mark_on_longest_chain(false)`
+        // runs its DAH eval with the device `delete_at_height` == 0 (setMined
+        // did zero I/O) — the transition branch, which DOES depend on
+        // `was_all_spent`. Sourced from the cache it is TRUE, and all-spent is
+        // unchanged → NO transition → Signal::None. Had the preserve mirror
+        // clobbered the cache LSA to false, `all_spent(true) != was_all_spent(false)`
+        // would fire a SPURIOUS AllSpent. So this asserts the signal sequence
+        // stays duplicate-free across the interleave.
+        let reorg = engine
+            .mark_on_longest_chain(&MarkOnLongestChainRequest {
+                tx_key: key,
+                on_longest_chain: false,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("reorg-unmine");
+        assert_eq!(
+            reorg.signal,
+            Signal::None,
+            "no spurious AllSpent — the cache LSA proves was_all_spent already true",
+        );
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap() & MINED_LAST_SPENT_ALL,
+            0,
+            "the record is still effectively all-spent, so cache LSA stays set",
+        );
+    }
+
+    /// followup-2 task 3 headline (recovery): `reconcile_secondaries_from_mined_index`
+    /// (which runs on EVERY boot right after `recover_mined_index`) must
+    /// reconstruct each record's cache `LAST_SPENT_ALL` from AUTHORITATIVE RAM
+    /// state — the effective all-spent status (`spent_utxos == utxo_count` with
+    /// the LP-3 REASSIGNED exclusion) — NOT from the device footer's (vestigial)
+    /// LSA bit. To prove independence, every record's device LSA is scribbled to
+    /// the WRONG value and its cache LSA is clobbered to the opposite of the
+    /// expected reconstruction before reconcile runs.
+    #[test]
+    fn reconcile_reconstructs_last_spent_all_from_ram_not_device() {
+        use crate::index::mined_index::MINED_LAST_SPENT_ALL;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        // Hand-write a record with an explicit (possibly scribbled-wrong) device
+        // footer. Near-zero txid so the slim primary-index key equals the device
+        // footer's full tx_id. `spent`/`utxo_count`/`unmined_since`/`flags` are
+        // written verbatim; slots are filler (reconcile keys off the counters).
+        let mut write_record = |byte: u8,
+                                utxo_count: u32,
+                                spent: u32,
+                                unmined_since: u32,
+                                flags: TxFlags|
+         -> (TxKey, TxMetadata) {
+            let mut txid = [0u8; 32];
+            txid[0] = byte;
+            txid[1] = 0xE9;
+            let key = TxKey { txid };
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.spent_utxos = spent;
+            meta.unmined_since = unmined_since;
+            meta.flags = flags;
+            let record_size = TxMetadata::record_size_for(utxo_count);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    if i < spent {
+                        UtxoSlot::new_spent([byte.wrapping_add(i as u8); 32], [0xAB; 36])
+                    } else {
+                        UtxoSlot::new_unspent([byte.wrapping_add(i as u8); 32])
+                    }
+                })
+                .collect();
+            io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+            (key, meta)
+        };
+
+        // (key, meta, has_blocks, expected_reconstructed_lsa). Device LSA in each
+        // `flags` is deliberately the OPPOSITE of the correct value.
+        let r1 = write_record(0x01, 1, 1, 0, TxFlags::empty()); // covered-all-spent → LSA true; device LSA scribbled off
+        let r2 = write_record(0x02, 1, 1, 0, TxFlags::empty()); // all-spent-not-mined → LSA true; device off
+        let r3 = write_record(0x03, 2, 1, 0, TxFlags::LAST_SPENT_ALL); // mined-not-all-spent → LSA false; device scribbled on
+        let r4 = write_record(0x04, 1, 1, 1200, TxFlags::empty()); // reorg-unmined all-spent → LSA true; device off
+        let r5 = write_record(0x05, 1, 1, 0, TxFlags::REASSIGNED | TxFlags::LAST_SPENT_ALL); // reassigned → LSA false (LP-3); device scribbled on
+        let cases: [(&(TxKey, TxMetadata), bool, bool); 5] = [
+            (&r1, true, true),
+            (&r2, false, true),
+            (&r3, true, false),
+            (&r4, true, true),
+            (&r5, true, false),
+        ];
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        // Seed each record's MinedIndex slot (with or without a block →
+        // has_blocks), re-point the primary entry at it, then CLOBBER the cache
+        // LSA to the OPPOSITE of the expected reconstruction — so reconcile must
+        // actively set it right, not merely inherit a lucky default.
+        for (rec, has_blocks, expected_lsa) in cases {
+            let (key, meta) = rec;
+            let bid = key.txid[0] as u32; // nonzero (0x01..0x05)
+            let blocks: &[(u32, u32, u32)] = if has_blocks { &[(bid, 1000, 0)] } else { &[] };
+            let slot = seed_mined_index_for_test(&engine, key, meta, blocks);
+            let e = engine.index.lookup(key).unwrap();
+            engine
+                .index
+                .register(
+                    *key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: e.record_offset,
+                        mined_slot: slot,
+                    },
+                )
+                .unwrap();
+            engine
+                .mined_index()
+                .set_de_flag(key, slot, MINED_LAST_SPENT_ALL, !expected_lsa);
+        }
+
+        // The boot-time reconcile (runs right after recover_mined_index).
+        engine
+            .reconcile_secondaries_from_mined_index(2000, 288)
+            .expect("reconcile must reconstruct the cache LSA");
+
+        for (rec, _has_blocks, expected_lsa) in cases {
+            let (key, meta) = rec;
+            let slot = engine.lookup(key).unwrap().mined_slot;
+            let got =
+                engine.mined_index().read_de_flags(key, slot).unwrap() & MINED_LAST_SPENT_ALL != 0;
+            let dev_lsa = meta.flags.contains(TxFlags::LAST_SPENT_ALL);
+            assert_eq!(
+                got,
+                expected_lsa,
+                "reconcile must reconstruct LSA={expected_lsa} from RAM state for txid \
+                 byte {:#x} (spent={}/{}, unmined_since={}, reassigned={}); the scribbled \
+                 device LSA was {dev_lsa} and must NOT have been used",
+                key.txid[0],
+                { meta.spent_utxos },
+                { meta.utxo_count },
+                { meta.unmined_since },
+                meta.flags.contains(TxFlags::REASSIGNED),
+            );
+        }
     }
 
     /// followup-2 headline test: `set_mined_inner` performs ZERO device reads
