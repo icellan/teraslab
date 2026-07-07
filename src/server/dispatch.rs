@@ -6737,6 +6737,33 @@ fn handle_create_batch(
                 parent_txids,
             });
         }
+        // Companion mined-state redo for a create that arrives already-mined.
+        // The live create seeds the MinedIndex at runtime
+        // (`Engine::seed_mined_index_from_infos`), but the `Create`/`CreateV2`
+        // op carries NO mined-state — recovery's `apply_create_to_mined_index`
+        // allocs an UNMINED slot only (Task 1). Emit a companion
+        // `SetMinedBatch` (one per mined block; a create carries <= 1) into the
+        // SAME `redo_ops` batch, so it co-flushes atomically with the create
+        // (one fsync, all-or-nothing — a crash can never make the create
+        // durable without its mining) and, on replay, restores the block via
+        // the tested `SetMinedBatch` arm (which resolves the slot the create
+        // arm just populated in `tail_slots`). `on_longest_chain` mirrors
+        // `seed_mined_index_from_infos`: an already-mined create maps to
+        // `unmined_since == 0` (see `build_create_record_bytes`), i.e. mined on
+        // the longest chain. The device inline block-entry region is thus no
+        // longer the recovery carrier for mined-at-creation state.
+        for info in pending.create_req.mined_block_infos {
+            redo_ops.push(RedoOp::SetMinedBatch {
+                block_id: info.block_id,
+                block_height: info.block_height,
+                subtree_idx: info.subtree_idx,
+                on_longest_chain: true,
+                current_block_height: pending.create_req.block_height,
+                block_height_retention: 0,
+                unset: false,
+                txids: vec![key],
+            });
+        }
         valid_items.push(ValidCreate {
             idx: pending.idx,
             create_req: pending.create_req,
@@ -11229,6 +11256,259 @@ mod tests {
             txids.len(),
             "every record must be journaled exactly once across the store logs"
         );
+    }
+
+    /// Task 1 (crash-safety): an already-mined create must emit a companion
+    /// `SetMinedBatch` into the SAME redo batch as its `Create`/`CreateV2` so
+    /// that after a crash in the post-checkpoint redo-tail window the recovered
+    /// MinedIndex restores the mined-at-creation block WITHOUT reading the
+    /// on-device `block_entries_inline` (the region Task 2 deletes).
+    ///
+    /// Drives the real `handle_create_batch` emission path, then:
+    ///   1. asserts the companion is present in the redo log alongside the
+    ///      create, co-flushed (single-log `recover()`; companion sequenced
+    ///      strictly after its create so replay resolves the slot the create
+    ///      arm populated);
+    ///   2. ZEROES the record's on-device inline block-entry region (recomputing
+    ///      the CRC so the record still decodes) to prove recovery no longer
+    ///      depends on it;
+    ///   3. replays the redo tail into a FRESH MinedIndex and asserts the record
+    ///      recovers MINED with the exact block_id/height/subtree,
+    ///      unmined_since==0, all_spent==false, and EXACTLY ONE block entry
+    ///      (no double-apply).
+    ///
+    /// RED before the companion existed (no `SetMinedBatch` emitted + the
+    /// zeroed inline => mining lost on recovery); GREEN after. Run for BOTH
+    /// durability modes — strict emits `RedoOp::Create` (mining recovered from
+    /// the companion; the create's own embedded `record_bytes` inline region is
+    /// likewise ignored, see the engine unit test
+    /// `create_arm_does_not_seed_mining_from_inline_block_entries`), buffered
+    /// emits the index-only `RedoOp::CreateV2` (which would otherwise read the
+    /// now-zeroed device region).
+    fn already_mined_create_recovers_mining_from_companion(buffered: bool) {
+        use crate::device::AlignedBuf;
+        use crate::index::TxIndexEntry;
+        use crate::index::mined_index::{MINED_ALL_SPENT, NO_MINED_SLOT};
+        use crate::record::{BlockEntry, INLINE_BLOCK_ENTRIES, METADATA_SIZE, TxMetadata};
+
+        let _g = metrics_test_lock();
+        let data_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(16 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(data_dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            data_dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        engine.set_buffered_durability(buffered);
+        let redo_log = Arc::new(Mutex::new(
+            RedoLog::open(redo_dev, 0, 16 * 1024 * 1024).unwrap(),
+        ));
+
+        let request = |op: u16, payload: Vec<u8>| -> ResponseFrame {
+            let req = RequestFrame {
+                request_id: 1,
+                op_code: op,
+                flags: 0,
+                payload: payload.into(),
+            };
+            let mut cs = crate::server::ConnectionState::new();
+            handle_request(&req, &engine, 8192, None, Some(&redo_log), &mut cs, None)
+        };
+
+        const BID: u32 = 7;
+        const BHT: u32 = 800_123;
+        const BSI: u32 = 4;
+        let mut txid = [0u8; 32];
+        txid[0] = 0x51;
+        let mut hsh = [0u8; 32];
+        hsh[0] = 0x51;
+        let item = WireCreateItem {
+            txid,
+            tx_version: 1,
+            locktime: 0,
+            fee: 500,
+            size_in_bytes: 250,
+            extended_size: 250,
+            is_coinbase: false,
+            spending_height: 0,
+            created_at: 1_700_000_000_000,
+            flags: 0,
+            utxo_hashes: vec![hsh],
+            cold_data: vec![],
+            block_height: 900_000,
+            mined_block_id: Some(BID),
+            mined_block_height: Some(BHT),
+            mined_subtree_idx: Some(BSI),
+            parent_txids: vec![],
+        };
+        assert_eq!(
+            request(OP_CREATE_BATCH, encode_create_batch(&[item])).status,
+            STATUS_OK,
+            "already-mined create succeeds"
+        );
+
+        let key = TxKey { txid };
+        let entry = engine.lookup(&key).expect("record registered");
+        // Persist the allocator so the fresh recovery engine below can
+        // `SlotAllocator::recover` the same device.
+        engine.allocator().lock().persist().unwrap();
+
+        // (1) Companion present in the SAME log, sequenced after the create.
+        let entries = redo_log.lock().recover().expect("recover redo entries");
+        let create_seq = entries
+            .iter()
+            .find_map(|e| match &e.op {
+                RedoOp::Create { tx_key, .. } | RedoOp::CreateV2 { tx_key, .. }
+                    if *tx_key == key =>
+                {
+                    Some(e.sequence)
+                }
+                _ => None,
+            })
+            .expect("create entry present in redo log");
+        let companion = entries
+            .iter()
+            .find(|e| matches!(&e.op, RedoOp::SetMinedBatch { txids, .. } if txids.contains(&key)))
+            .expect("companion SetMinedBatch present in the same redo log");
+        match &companion.op {
+            RedoOp::SetMinedBatch {
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain,
+                unset,
+                txids,
+                ..
+            } => {
+                assert_eq!(*block_id, BID, "companion carries the mined block_id");
+                assert_eq!(*block_height, BHT);
+                assert_eq!(*subtree_idx, BSI);
+                assert!(
+                    *on_longest_chain,
+                    "an already-mined create has unmined_since==0 => mined on the longest chain"
+                );
+                assert!(!*unset, "companion adds the block, never unsets it");
+                assert_eq!(
+                    txids,
+                    &vec![key],
+                    "one companion carries exactly this create's txid"
+                );
+            }
+            _ => unreachable!("matched SetMinedBatch above"),
+        }
+        assert!(
+            companion.sequence > create_seq,
+            "companion must sequence AFTER its create (same batch) so the SetMinedBatch \
+             replay arm resolves the slot the create arm just populated in tail_slots"
+        );
+
+        // (2) Zero the record's on-device inline block-entry region, recomputing
+        // the CRC so the record still decodes — proving recovery does not read it.
+        {
+            let mut buf = AlignedBuf::new(4096, 4096);
+            data_dev
+                .pread(&mut buf[..], entry.record_offset)
+                .expect("read record block");
+            let mut meta =
+                TxMetadata::from_bytes(&buf[..METADATA_SIZE]).expect("decode record metadata");
+            meta.block_entry_count = 0;
+            meta.block_entries_inline = [BlockEntry {
+                block_id: 0,
+                block_height: 0,
+                subtree_idx: 0,
+            }; INLINE_BLOCK_ENTRIES];
+            meta.to_bytes(&mut buf[..METADATA_SIZE]);
+            data_dev
+                .pwrite(&buf[..], entry.record_offset)
+                .expect("rewrite zeroed metadata");
+            // Confirm the wipe landed (guards against a silent no-op).
+            let mut check = AlignedBuf::new(4096, 4096);
+            data_dev
+                .pread(&mut check[..], entry.record_offset)
+                .expect("re-read record block");
+            let re =
+                TxMetadata::from_bytes(&check[..METADATA_SIZE]).expect("zeroed metadata decodes");
+            assert_eq!(
+                { re.block_entry_count },
+                0,
+                "device inline block-entry region must be zeroed"
+            );
+        }
+
+        // (3) Recover a FRESH MinedIndex from the redo tail alone.
+        let fresh = crate::index::ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        fresh
+            .register(
+                key,
+                TxIndexEntry {
+                    device_id: entry.device_id,
+                    record_offset: entry.record_offset,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register key in fresh index");
+        let alloc2 = SlotAllocator::recover(data_dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            data_dev.clone(),
+            fresh,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        engine2
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo_log))
+            .expect("mined-index redo-tail replay succeeds");
+
+        let after = engine2
+            .lookup(&key)
+            .expect("key still registered after replay");
+        assert_ne!(
+            after.mined_slot, NO_MINED_SLOT,
+            "recovery must allocate a live mined slot"
+        );
+        let (blocks, unmined) = engine2
+            .mined_index()
+            .read_block_entries(&key, after.mined_slot)
+            .expect("mined-state present after recovery");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "exactly one mined block after recovery (no double-apply); got {blocks:?}"
+        );
+        let (r_bid, r_bht, r_bsi) = ({ blocks[0].block_id }, { blocks[0].block_height }, {
+            blocks[0].subtree_idx
+        });
+        assert_eq!(r_bid, BID, "recovered block_id from the companion");
+        assert_eq!(r_bht, BHT);
+        assert_eq!(r_bsi, BSI);
+        assert_eq!(
+            unmined, 0,
+            "already-mined create is mined on the longest chain: unmined_since==0"
+        );
+        let all_spent = engine2
+            .mined_index()
+            .with_entry(&key, after.mined_slot, |e| e.flags & MINED_ALL_SPENT != 0)
+            .unwrap_or(true);
+        assert!(
+            !all_spent,
+            "the single unspent UTXO means all_spent must be false after recovery"
+        );
+    }
+
+    #[test]
+    fn already_mined_create_recovers_mining_from_companion_strict() {
+        already_mined_create_recovers_mining_from_companion(false);
+    }
+
+    #[test]
+    fn already_mined_create_recovers_mining_from_companion_buffered() {
+        already_mined_create_recovers_mining_from_companion(true);
     }
 
     /// FIX 1 (P2): the Phase-3 register loop is parallelized across scoped

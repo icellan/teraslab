@@ -2100,16 +2100,98 @@ pub fn apply_op_journal(
     // the master uses on its own write path. Failure to journal the entry
     // is a hard batch-level error: ACKing without the local log would
     // re-introduce the same divergence R-034 was opened to fix.
-    if journal && let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
-        match pre_delete_device_id {
-            // Route the Delete redo to the record's own store log (see the
-            // capture above) so it shares the log of the record's Create.
-            Some(device_id) => engine.append_replica_redo_entry_to_store(&redo_op, device_id)?,
-            None => write_replica_redo_entry(engine, &redo_op)?,
+    if journal {
+        if let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
+            match pre_delete_device_id {
+                // Route the Delete redo to the record's own store log (see the
+                // capture above) so it shares the log of the record's Create.
+                Some(device_id) => {
+                    engine.append_replica_redo_entry_to_store(&redo_op, device_id)?
+                }
+                None => write_replica_redo_entry(engine, &redo_op)?,
+            }
+        }
+        // Companion mined-state redo for an already-mined replicated create.
+        // Journaled AFTER the `ReplicaCreate` above (higher sequence) and into
+        // the same batch flush, so a crash cannot make the create durable
+        // without its mining. See `create_companion_set_mined_ops`. The record
+        // is already applied+indexed at this point, so `write_replica_redo_entry`
+        // routes each companion to the same store log the ReplicaCreate landed
+        // in (both resolve the key's `device_id` from the primary index).
+        for companion in create_companion_set_mined_ops(op) {
+            write_replica_redo_entry(engine, &companion)?;
         }
     }
 
     Ok(())
+}
+
+/// Build the companion `SetMinedBatch` redo op(s) for an already-mined
+/// replicated create — the receiver-side analogue of the master create path's
+/// companion (`server::dispatch::handle_create_batch`).
+///
+/// A create whose master shipped `mined_block_infos` seeds mined-state at
+/// runtime (via `engine.create` in [`apply_create_replica`]), but the
+/// `RedoOp::ReplicaCreate` this receiver journals carries none — after Task 1,
+/// recovery's `apply_create_to_mined_index` allocs an UNMINED slot only. Emit a
+/// companion `SetMinedBatch` per mined block so the replica's own crash
+/// recovery restores mining from the redo tail, NOT the (Task-2-removed)
+/// on-device inline block-entry region. The caller journals these into the
+/// same batch flush as the `ReplicaCreate`.
+///
+/// `on_longest_chain` is derived from the create's `unmined_since` (the
+/// extended-lifecycle field at byte 58) exactly as
+/// [`crate::ops::engine::Engine::seed_mined_index_from_infos`] does — an
+/// already-mined create maps to `unmined_since == 0`. `block_id == 0` (the
+/// no-block sentinel) is skipped. Returns an empty `Vec` for any non-`Create`
+/// op, a legacy 46-byte create, or a create with no mined blocks.
+fn create_companion_set_mined_ops(op: &ReplicaOp) -> Vec<crate::redo::RedoOp> {
+    let ReplicaOp::Create {
+        tx_key,
+        metadata_bytes,
+        ..
+    } = op
+    else {
+        return Vec::new();
+    };
+    let m = metadata_bytes.as_slice();
+    // The extended block-entry section (block_height at 70, block_count at 74,
+    // entries from 75) and the lifecycle `unmined_since` (byte 58) are only
+    // present for a full >=75-byte payload; a legacy 46-byte create is never
+    // already-mined. Parsing mirrors the `ReplicaOp::Create` apply arm.
+    if m.len() < 75 {
+        return Vec::new();
+    }
+    let unmined_since = u32::from_le_bytes([m[58], m[59], m[60], m[61]]);
+    let on_longest_chain = unmined_since == 0;
+    let create_block_height = u32::from_le_bytes([m[70], m[71], m[72], m[73]]);
+    let block_count = m[74] as usize;
+    let mut ops = Vec::new();
+    let mut pos = 75;
+    for _ in 0..block_count {
+        if pos + 12 > m.len() {
+            break;
+        }
+        let block_id = u32::from_le_bytes([m[pos], m[pos + 1], m[pos + 2], m[pos + 3]]);
+        let block_height = u32::from_le_bytes([m[pos + 4], m[pos + 5], m[pos + 6], m[pos + 7]]);
+        let subtree_idx = u32::from_le_bytes([m[pos + 8], m[pos + 9], m[pos + 10], m[pos + 11]]);
+        pos += 12;
+        if block_id == 0 {
+            // No-block sentinel; `apply_set_mined` asserts a nonzero block_id.
+            continue;
+        }
+        ops.push(crate::redo::RedoOp::SetMinedBatch {
+            block_id,
+            block_height,
+            subtree_idx,
+            on_longest_chain,
+            current_block_height: create_block_height,
+            block_height_retention: 0,
+            unset: false,
+            txids: vec![*tx_key],
+        });
+    }
+    ops
 }
 
 /// Build the post-apply redo entry for a `ReplicaOp` after it was
@@ -4967,6 +5049,142 @@ mod tests {
         assert_eq!(block_count, 1);
         let be_id = { meta.block_entries_inline[0].block_id };
         assert_eq!(be_id, 42);
+    }
+
+    /// Task 1 (crash-safety), replication path: an already-mined REPLICATED
+    /// create must journal a companion `SetMinedBatch` alongside its
+    /// `ReplicaCreate`, so the replica's OWN crash recovery restores the
+    /// mined-at-creation block from the redo tail — WITHOUT reading the
+    /// on-device inline region Task 2 deletes. Mirrors the master create path.
+    /// Asserts the companion is journaled (sequenced after the ReplicaCreate),
+    /// then replays the redo tail into a FRESH MinedIndex and asserts the
+    /// record recovers MINED with the exact block, unmined_since==0, and
+    /// exactly one block entry (no double-apply).
+    #[test]
+    fn already_mined_replica_create_journals_companion_set_mined() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        use crate::index::{ShardedIndex, TxIndexEntry};
+        use crate::redo::{RedoLog, RedoOp};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        const BID: u32 = 42;
+        const BHT: u32 = 1000;
+        const BSI: u32 = 7;
+        let k = key(113);
+        // build_full_metadata stamps unmined_since == 0 => already-mined.
+        let meta_bytes = build_full_metadata(2, false, 0, 5, 900_000, &[(BID, BHT, BSI)], &[]);
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: meta_bytes,
+            utxo_hashes: vec![[0xAA; 32]; 3],
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op(&engine, &op).expect("replicated already-mined create applies");
+        engine.flush_all_redo().expect("flush replica redo");
+
+        let entry = engine.lookup(&k).expect("replica record registered");
+        engine.allocator().lock().persist().unwrap();
+
+        // Companion journaled after the ReplicaCreate, correct fields.
+        let entries = redo.lock().recover().expect("recover replica redo");
+        let rc_seq = entries
+            .iter()
+            .find_map(|e| match &e.op {
+                RedoOp::ReplicaCreate { tx_key, .. } if *tx_key == k => Some(e.sequence),
+                _ => None,
+            })
+            .expect("ReplicaCreate journaled");
+        let companion = entries
+            .iter()
+            .find(|e| matches!(&e.op, RedoOp::SetMinedBatch { txids, .. } if txids.contains(&k)))
+            .expect("companion SetMinedBatch journaled alongside ReplicaCreate");
+        match &companion.op {
+            RedoOp::SetMinedBatch {
+                block_id,
+                block_height,
+                subtree_idx,
+                on_longest_chain,
+                unset,
+                txids,
+                ..
+            } => {
+                assert_eq!(*block_id, BID);
+                assert_eq!(*block_height, BHT);
+                assert_eq!(*subtree_idx, BSI);
+                assert!(*on_longest_chain, "unmined_since==0 => on longest chain");
+                assert!(!*unset);
+                assert_eq!(txids, &vec![k]);
+            }
+            _ => unreachable!("matched SetMinedBatch above"),
+        }
+        assert!(
+            companion.sequence > rc_seq,
+            "companion must sequence after its ReplicaCreate"
+        );
+
+        // Fresh MinedIndex recovery from the replica's redo tail alone.
+        let fresh = ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        fresh
+            .register(
+                k,
+                TxIndexEntry {
+                    device_id: entry.device_id,
+                    record_offset: entry.record_offset,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register key");
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            fresh,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        engine2
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo))
+            .expect("mined-index redo-tail replay");
+
+        let after = engine2.lookup(&k).expect("key registered after replay");
+        assert_ne!(after.mined_slot, NO_MINED_SLOT);
+        let (blocks, unmined) = engine2
+            .mined_index()
+            .read_block_entries(&k, after.mined_slot)
+            .expect("mined-state present after recovery");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "exactly one mined block (no double-apply); got {blocks:?}"
+        );
+        let (r_bid, r_bht, r_bsi) = ({ blocks[0].block_id }, { blocks[0].block_height }, {
+            blocks[0].subtree_idx
+        });
+        assert_eq!(r_bid, BID);
+        assert_eq!(r_bht, BHT);
+        assert_eq!(r_bsi, BSI);
+        assert_eq!(
+            unmined, 0,
+            "already-mined replicated create: unmined_since==0"
+        );
     }
 
     #[test]

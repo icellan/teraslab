@@ -8375,11 +8375,20 @@ impl Engine {
 
     /// Shared "a create happened" application shared by every create-like
     /// redo op [`Self::replay_mined_index_redo_tail`] replays
-    /// (`Create`/`CreateV2`/`ReplicaCreate`): allocate a fresh MinedIndex slot
-    /// from `meta`, seed its block tuples (inline entries only — see the
-    /// caller doc), free any STALE slot `tail_slots` already associates with
-    /// `tx_key`, and re-point the primary entry's `mined_slot` if `tx_key`
-    /// still exists in the FINAL (fully-replayed) primary index.
+    /// (`Create`/`CreateV2`/`ReplicaCreate`): allocate a fresh UNMINED
+    /// MinedIndex slot from `meta.unmined_since`, free any STALE slot
+    /// `tail_slots` already associates with `tx_key`, and re-point the primary
+    /// entry's `mined_slot` if `tx_key` still exists in the FINAL
+    /// (fully-replayed) primary index.
+    ///
+    /// Task 1: this arm no longer seeds the slot's block-set from
+    /// `meta.block_entries_inline`. A create that arrived already-mined carries
+    /// its mined-at-creation block on a companion `SetMinedBatch` redo op
+    /// (emitted into the same redo batch as the create — see
+    /// `server::dispatch::handle_create_batch` and
+    /// `replication::receiver::apply_op_journal`), whose replay arm resolves
+    /// this slot via `tail_slots` and applies the block exactly once. The
+    /// inline region is thus non-load-bearing for recovery.
     ///
     /// The "STALE slot" `tail_slots` may already hold for `tx_key` comes from
     /// one of two sources, and this method treats them identically (it never
@@ -8399,28 +8408,18 @@ impl Engine {
         meta: &TxMetadata,
         tail_slots: &mut std::collections::HashMap<TxKey, u32>,
     ) -> Result<(), SpendError> {
+        // Task 1: alloc an UNMINED slot only. A create that arrived already-
+        // mined does NOT seed its block-set here — mining rides through
+        // recovery on the companion `SetMinedBatch` redo op emitted beside the
+        // create (same redo batch, co-flushed before ACK). That op's replay arm
+        // (the `SetMinedBatch` match arm in
+        // [`Self::replay_mined_index_redo_tail_above`]) resolves THIS slot via
+        // `tail_slots` (populated just below) and applies the block. Reading
+        // `meta.block_entries_inline` here is therefore obsolete — and doing so
+        // would DOUBLE-apply the block once the companion also replays. Keeping
+        // it out makes the inline region non-load-bearing for recovery, the
+        // invariant Task 2 relies on when it deletes the field.
         let slot = self.mined_index.alloc_created(tx_key, meta.unmined_since);
-        let on_longest_chain = meta.unmined_since == 0;
-        let count = meta.block_entry_count as usize;
-        let inline = count.min(INLINE_BLOCK_ENTRIES);
-        for be in &meta.block_entries_inline[..inline] {
-            self.mined_index.apply_set_mined(
-                tx_key,
-                slot,
-                be.block_id,
-                be.block_height,
-                be.subtree_idx,
-                on_longest_chain,
-            );
-        }
-        if count > INLINE_BLOCK_ENTRIES {
-            tracing::warn!(
-                tx_key = ?tx_key.txid,
-                "mined-index redo-tail replay: Create carries overflow block entries not \
-                 captured by the redo entry; those blocks are not restored (matches \
-                 rebuild_mined_index_from_device's create-time-overflow limitation)",
-            );
-        }
         if let Some(stale) = tail_slots.insert(*tx_key, slot) {
             self.mined_index.free(tx_key, stale);
         }
@@ -16587,6 +16586,31 @@ mod tests {
         (hashes, req)
     }
 
+    /// An already-mined create request: `make_create_req` plus a single
+    /// `MinedBlockInfo`. `build_create_record_bytes` maps this to
+    /// `unmined_since == 0` and a populated `block_entries_inline` — the exact
+    /// shape a create that arrives already-mined takes on the wire.
+    fn make_create_req_mined(
+        n: u8,
+        utxo_count: usize,
+        block_id: u32,
+        block_height: u32,
+        subtree_idx: u32,
+    ) -> CreateRequest<'static> {
+        let (_hashes, mut req) = make_create_req(n, utxo_count);
+        // Leak for a 'static lifetime, matching `make_create_req`'s convention.
+        let infos: &'static [crate::ops::create::MinedBlockInfo] = Box::leak(
+            vec![crate::ops::create::MinedBlockInfo {
+                block_id,
+                block_height,
+                subtree_idx,
+            }]
+            .into_boxed_slice(),
+        );
+        req.mined_block_infos = infos;
+        req
+    }
+
     fn test_external_ref(tx_id: [u8; 32]) -> ExternalRef {
         ExternalRef {
             store_type: 1,
@@ -18269,6 +18293,149 @@ mod tests {
             unmined2, 1000,
             "tx2 must be unmined at its creation height, matching its own device footer"
         );
+    }
+
+    /// Task-1 reroute contract: `apply_create_to_mined_index` (the shared
+    /// create-arm of every `Create`/`CreateV2`/`ReplicaCreate` the mined-index
+    /// redo-tail replay handles) must NOT seed mining from the record's
+    /// `block_entries_inline`. After Task 1, mining rides through recovery
+    /// SOLELY on the companion `SetMinedBatch` redo op emitted beside every
+    /// already-mined create, so the create arm only allocs an unmined slot.
+    /// This locks in that the inline region is no longer load-bearing for redo
+    /// recovery — the invariant Task 2 relies on when it deletes the field.
+    ///
+    /// Covers BOTH create-arm shapes: the index-only `CreateV2` (reads the
+    /// record's mined block-entries back from the DEVICE) and the full-payload
+    /// `Create` (reads them from the redo entry's embedded `record_bytes`). In
+    /// both cases a create-only redo tail (no companion) for an already-mined
+    /// record must leave the recovered slot with ZERO mined blocks even though
+    /// the inline region is fully populated.
+    ///
+    /// RED before the reroute (the arm copied the inline block into the slot,
+    /// so `blocks` was non-empty); GREEN after (blocks empty, mining deferred
+    /// to the companion).
+    #[test]
+    fn create_arm_does_not_seed_mining_from_inline_block_entries() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        use crate::redo::{RedoLog, RedoOp};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+
+        // An on-device already-mined record: block_entries_inline populated,
+        // unmined_since == 0. Also capture its full record image (== the strict
+        // `Create` redo op's embedded `record_bytes`).
+        let (device_id, offset, key, record_bytes) = {
+            let alloc = SlotAllocator::new(dev.clone()).unwrap();
+            let index = Index::new(1000).unwrap();
+            let temp = Engine::new(
+                dev.clone(),
+                index,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+            );
+            let req = make_create_req_mined(41, 1, 7, 800_123, 4);
+            let key = req.tx_key();
+            let record_bytes = temp
+                .build_create_record_bytes(&req)
+                .expect("build record bytes")
+                .0;
+            temp.create(&req).expect("already-mined create succeeds");
+            let e = temp.lookup(&key).expect("tx registered");
+            let meta = temp.read_metadata(&key).expect("read metadata");
+            assert_eq!(
+                { meta.block_entry_count },
+                1,
+                "setup invariant: record carries one inline block entry on device"
+            );
+            assert_eq!(
+                { meta.unmined_since },
+                0,
+                "setup invariant: an already-mined create has unmined_since == 0"
+            );
+            temp.allocator().lock().persist().unwrap();
+            (e.device_id, e.record_offset, key, record_bytes)
+        };
+
+        // Replay a single-op redo tail on a FRESH engine whose primary index
+        // already carries `key` with NO_MINED_SLOT (the recovery precondition),
+        // and return the recovered slot's (block entries, unmined_since).
+        let replay_blocks = |op: RedoOp| -> (Vec<crate::record::BlockEntry>, u32) {
+            let fresh = ShardedIndex::from_single(Index::new(1000).unwrap().into());
+            fresh
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id,
+                        record_offset: offset,
+                        mined_slot: NO_MINED_SLOT,
+                    },
+                )
+                .expect("register key");
+            let alloc = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+            let engine = Engine::new_with_sharded_index(
+                dev.clone(),
+                fresh,
+                alloc,
+                StripedLocks::new(1024),
+                DahIndex::new(),
+            );
+            let redo_dev: Arc<dyn BlockDevice> =
+                Arc::new(MemoryDevice::new(256 * 1024, 4096).unwrap());
+            let redo = Arc::new(parking_lot::Mutex::new(
+                RedoLog::open(redo_dev, 0, 256 * 1024).unwrap(),
+            ));
+            redo.lock().append_and_flush(op).expect("append redo op");
+            engine
+                .replay_mined_index_redo_tail(std::slice::from_ref(&redo))
+                .expect("redo-tail replay succeeds");
+            let after = engine.lookup(&key).expect("key still registered");
+            assert_ne!(
+                after.mined_slot, NO_MINED_SLOT,
+                "create replay must allocate a live mined slot"
+            );
+            engine
+                .mined_index()
+                .read_block_entries(&key, after.mined_slot)
+                .expect("mined-state present for the allocated slot")
+        };
+
+        // CreateV2 (index-only; reads the record's block entries from the DEVICE).
+        let (blocks_v2, unmined_v2) = replay_blocks(RedoOp::CreateV2 {
+            tx_key: key,
+            device_id,
+            record_offset: offset,
+            utxo_count: 1,
+            is_conflicting: false,
+            parent_txids: vec![],
+        });
+        assert!(
+            blocks_v2.is_empty(),
+            "CreateV2 arm must NOT seed mining from the device inline region \
+             (mining now rides the companion SetMinedBatch); got {blocks_v2:?}"
+        );
+        assert_eq!(
+            unmined_v2, 0,
+            "already-mined create allocs its slot at unmined_since == 0"
+        );
+
+        // Strict Create (full payload; reads block entries from embedded record_bytes).
+        let (blocks_c, unmined_c) = replay_blocks(RedoOp::Create {
+            tx_key: key,
+            device_id,
+            record_offset: offset,
+            utxo_count: 1,
+            is_conflicting: false,
+            record_bytes: record_bytes.into(),
+            parent_txids: vec![],
+        });
+        assert!(
+            blocks_c.is_empty(),
+            "Create arm must NOT seed mining from the embedded record_bytes inline \
+             region (mining now rides the companion SetMinedBatch); got {blocks_c:?}"
+        );
+        assert_eq!(unmined_c, 0);
     }
 
     /// IMPORTANT fix: `rebuild_mined_index_from_device` must be idempotent.
