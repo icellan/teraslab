@@ -68,6 +68,33 @@ pub fn device_de_flags(device_flags: TxFlags, has_preserve_until: bool) -> u8 {
     de
 }
 
+/// Reconstruct the four DAH-relevant [`TxFlags`] from a cached DE-flag byte —
+/// the inverse of [`device_de_flags`] for the flag bits.
+///
+/// Maps `MINED_EXTERNAL`/`MINED_CONFLICTING`/`MINED_LAST_SPENT_ALL`/
+/// `MINED_REASSIGNED` back to their `TxFlags` counterparts. `MINED_PRESERVED`
+/// is deliberately NOT decoded here — it corresponds to `preserve_until != 0`,
+/// which `evaluate_dah_from_ram` takes as a separate `has_preserve_until` bool
+/// rather than a `TxFlags` bit; callers read it directly with
+/// `de & MINED_PRESERVED != 0`. Used by `Engine::set_mined_inner` to source the
+/// DAH evaluation's flag inputs from RAM (Task 2) with zero device reads.
+pub fn tx_flags_from_de_flags(de: u8) -> TxFlags {
+    let mut flags = TxFlags::empty();
+    if de & MINED_EXTERNAL != 0 {
+        flags |= TxFlags::EXTERNAL;
+    }
+    if de & MINED_CONFLICTING != 0 {
+        flags |= TxFlags::CONFLICTING;
+    }
+    if de & MINED_LAST_SPENT_ALL != 0 {
+        flags |= TxFlags::LAST_SPENT_ALL;
+    }
+    if de & MINED_REASSIGNED != 0 {
+        flags |= TxFlags::REASSIGNED;
+    }
+    flags
+}
+
 /// One tx's mined-state: the first block tuple inline + lifecycle bits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MinedEntry {
@@ -957,6 +984,25 @@ impl ShardedMinedIndex {
             return None;
         }
         Some(entry.flags & MINED_DE_FLAG_MASK)
+    }
+
+    /// Read the slot's cached [`MINED_ALL_SPENT`] bit (`spent_utxos ==
+    /// utxo_count`, maintained by the spend/unspend/prune paths), or `None` if
+    /// the slot is absent / freed / reallocated to a different key.
+    ///
+    /// Key_fp-verified with the same ABA guard as [`Self::read_de_flags`]. The
+    /// setMined RAM DAH path (Task 2) reads this to feed
+    /// [`crate::ops::delete_eval::evaluate_dah_from_ram`]'s `all_spent` input
+    /// without a device read. The bit is the RAW all-spent state (the LP-3
+    /// reassigned-audit exclusion is applied inside the evaluator, not here).
+    pub fn is_all_spent(&self, key: &TxKey, slot: u32) -> Option<bool> {
+        let fp = key_fp(key);
+        let sh = self.shards[self.shard_for(key)].lock();
+        let entry = sh.get(slot)?;
+        if entry.key_fp != fp {
+            return None;
+        }
+        Some(entry.flags & MINED_ALL_SPENT != 0)
     }
 
     /// Overwrite the slot's entire cached DAH-eval flag group
@@ -1987,6 +2033,71 @@ mod tests {
         idx.with_entry(&k, slot, |e| {
             assert_ne!(e.flags & MINED_ALL_SPENT, 0);
         });
+    }
+
+    /// Task 2: `tx_flags_from_de_flags` is the exact inverse of
+    /// `device_de_flags` for the four DAH-relevant flag bits, and never decodes
+    /// `MINED_PRESERVED` (that rides as a separate bool).
+    #[test]
+    fn tx_flags_from_de_flags_inverts_device_de_flags() {
+        // Round-trip each single flag and the union.
+        for f in [
+            TxFlags::EXTERNAL,
+            TxFlags::CONFLICTING,
+            TxFlags::LAST_SPENT_ALL,
+            TxFlags::REASSIGNED,
+        ] {
+            assert_eq!(
+                tx_flags_from_de_flags(device_de_flags(f, false)),
+                f,
+                "single flag {f:?} must round-trip through the cache byte",
+            );
+        }
+        let all4 = TxFlags::EXTERNAL
+            | TxFlags::CONFLICTING
+            | TxFlags::LAST_SPENT_ALL
+            | TxFlags::REASSIGNED;
+        assert_eq!(tx_flags_from_de_flags(device_de_flags(all4, true)), all4);
+
+        // PRESERVED is NOT decoded into TxFlags (it is the has_preserve bool).
+        assert_eq!(tx_flags_from_de_flags(MINED_PRESERVED), TxFlags::empty());
+        // An empty cache decodes to no flags.
+        assert_eq!(tx_flags_from_de_flags(0), TxFlags::empty());
+    }
+
+    /// Task 2: `is_all_spent` reads exactly the `MINED_ALL_SPENT` bit,
+    /// independent of DE flags, and honours the key_fp ABA guard.
+    #[test]
+    fn is_all_spent_reads_only_the_all_spent_bit() {
+        use crate::index::TxKey;
+        let idx = ShardedMinedIndex::new(16);
+        let k = TxKey { txid: [77u8; 32] };
+        let slot = idx.alloc_created(&k, 0);
+
+        assert_eq!(
+            idx.is_all_spent(&k, slot),
+            Some(false),
+            "fresh slot not all-spent"
+        );
+
+        // Setting DE flags must not flip all_spent.
+        idx.set_de_flag(&k, slot, MINED_EXTERNAL | MINED_CONFLICTING, true);
+        assert_eq!(idx.is_all_spent(&k, slot), Some(false));
+
+        idx.set_all_spent(&k, slot, true);
+        assert_eq!(idx.is_all_spent(&k, slot), Some(true));
+        // DE flags still readable and unaffected.
+        assert_eq!(
+            idx.read_de_flags(&k, slot),
+            Some(MINED_EXTERNAL | MINED_CONFLICTING)
+        );
+
+        idx.set_all_spent(&k, slot, false);
+        assert_eq!(idx.is_all_spent(&k, slot), Some(false));
+
+        // Absent / freed slot reads None.
+        idx.free(&k, slot);
+        assert_eq!(idx.is_all_spent(&k, slot), None);
     }
 
     #[test]

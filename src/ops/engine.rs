@@ -12,7 +12,7 @@ use crate::index::{
 use crate::io;
 use crate::locks::StripedLocks;
 use crate::ops::create::*;
-use crate::ops::delete_eval::{DahPatch, evaluate_delete_at_height};
+use crate::ops::delete_eval::{DahPatch, evaluate_dah_from_ram, evaluate_delete_at_height};
 use crate::ops::error::SpendError;
 use crate::ops::mark_longest_chain::*;
 use crate::ops::remaining::*;
@@ -3810,55 +3810,58 @@ impl Engine {
     /// made the batch's `SetMined` intents durable (WAL-first), so a parallel
     /// apply does not affect crash recovery.
     ///
-    /// # Task 16d — zero device writes (the perf win)
+    /// # Task 16d + followup-2 — zero device I/O (the perf win)
     ///
     /// Mined-state (`block_ids`/`unmined_since`) is authoritative in the
     /// in-RAM [`ShardedMinedIndex`] (durable via its own checkpoint snapshot +
     /// redo replay, Task 13) — GET/delete-eval/spend's LOCKED check already
-    /// read it there (Tasks 10/16a/16c), not from the device. This method
-    /// therefore performs exactly ONE device READ (for the DAH-eval inputs
-    /// that remain device-only: `flags`, `preserve_until`, `spent_utxos`,
-    /// `utxo_count`, `delete_at_height`) and applies the mined-state
-    /// transition to the `MinedIndex` — its write is now the SOLE mutation
-    /// this op performs. It never reads or writes the on-device block-entry
-    /// region (inline or overflow) at all, and never issues a
-    /// `write_metadata_direct`/`write_metadata_fast` RMW.
+    /// read it there (Tasks 10/16a/16c), not from the device. Task 16d cut the
+    /// device WRITE; followup-2 cuts the last device READ. This method now
+    /// performs **zero** device I/O: it applies the mined-state transition to
+    /// the `MinedIndex` (the SOLE mutation this op performs) and sources every
+    /// DAH-eval input from RAM. It never reads or writes the on-device
+    /// block-entry region (inline or overflow) and never issues a
+    /// `read_metadata_*`/`write_metadata_*` on the record footer.
+    ///
+    /// ## DAH-eval inputs, sourced from RAM
+    ///
+    /// The four DAH-relevant flags (`EXTERNAL`, `CONFLICTING`,
+    /// `LAST_SPENT_ALL`, `REASSIGNED`) and `preserve_until != 0` come from the
+    /// MinedEntry DE-flag cache ([`ShardedMinedIndex::read_de_flags`], a
+    /// followup-1 mirror kept in lockstep with the device footer at every
+    /// flag-mutating op and reseeded on recovery). `all_spent` comes from the
+    /// cached `MINED_ALL_SPENT` bit ([`ShardedMinedIndex::is_all_spent`]).
+    /// `has_blocks`/`unmined_since` come from the MinedIndex block tuples.
+    /// `old_dah` comes from the authoritative DAH secondary index
+    /// ([`crate::index::dah_index`]'s `get_height`), NOT the device footer.
+    /// These feed [`crate::ops::delete_eval::evaluate_dah_from_ram`] — the same
+    /// decision body [`evaluate_dah_cached`] uses, proven equivalent to the
+    /// device-reading [`evaluate_delete_at_height`] by a full-matrix parity
+    /// test.
     ///
     /// **Accepted semantic change**: the on-device `generation`, `updated_at`,
-    /// and `delete_at_height` footer fields are no longer bumped by this op
-    /// (there is nothing to write them into). They go stale immediately after
-    /// the first setMined call that would previously have changed them. This
-    /// is safe because nothing consensus-critical reads those fields off the
-    /// device anymore for mined-state: `GET`'s block-fields and `unmined`
-    /// come from the `MinedIndex`, and the DAH *secondary index*
-    /// (`dah_index`, RAM/redb, not a device write) is kept current here via
-    /// [`Self::update_dah_index`] — it stays authoritative for deletability.
-    /// The device's own `delete_at_height`/`LAST_SPENT_ALL` fields are used
-    /// only as this call's OWN eval inputs (see below), never re-published.
+    /// `delete_at_height`, and `LAST_SPENT_ALL` footer fields are no longer
+    /// touched by this op. They go stale immediately, which is safe because
+    /// nothing consensus-critical reads them off the device for mined-state:
+    /// `GET`'s block-fields and `unmined` come from the `MinedIndex`, and the
+    /// DAH *secondary index* (`dah_index`, RAM/redb) is kept current here — it
+    /// stays authoritative for deletability. Sourcing `old_dah` from
+    /// `dah_index` rather than the stale device footer also CLOSES the former
+    /// "known residual gap" (two back-to-back setMined DAH transitions each
+    /// re-deriving `existing_dah` from the same stale device snapshot, leaving
+    /// an orphaned secondary-index entry): the baseline is now the live index.
+    ///
+    /// Because the device `LAST_SPENT_ALL` is never rewritten, this op instead
+    /// mirrors the DAH patch's `last_spent_all` into the MinedEntry cache
+    /// ([`ShardedMinedIndex::set_de_flag`]) so a following setMined reads the
+    /// correct `was_all_spent`. The cache's `LAST_SPENT_ALL` may therefore lead
+    /// the (frozen) device footer; this only affects advisory AllSpent/
+    /// NotAllSpent transition signals, never a delete/retain decision.
     ///
     /// The pre-16d "clear LOCKED on setMined" behavior is also gone — 16c
     /// made device `LOCKED` an immutable create-time marker (`spend`'s
     /// effective-lock check is `device.LOCKED && !ignore_locked &&
     /// MinedIndex.not-mined`), so there is no longer anything to clear here.
-    ///
-    /// **Known residual gap (fail-safe, not consensus-breaking)**: because
-    /// `delete_at_height`/`LAST_SPENT_ALL` are read fresh from the device
-    /// every call but never re-written by this op, TWO setMined-driven DAH
-    /// transitions in a row (e.g. set → reorg-driven unset) with NO
-    /// intervening device-writing op (`spend`/`unspend`/
-    /// `mark_on_longest_chain`, all unaffected by this task) will each derive
-    /// their "existing DAH" baseline from the SAME stale device snapshot. If
-    /// the first call's patch would have cleared/moved a real `dah_index`
-    /// entry, the second call may not see that it needs to — the secondary
-    /// index can retain an orphaned entry indefinitely. This is fail-safe:
-    /// [`Self::record_due_for_sweep`] (the pruner's final gate) reads the
-    /// SAME on-device `delete_at_height`, so the two sides stay mutually
-    /// consistent and an orphaned entry is never wrongly deleted — at worst
-    /// it is never (re-)swept until some other device-writing op refreshes
-    /// the field. Flagged for a possible follow-up (source `existing_dah`
-    /// from `dah_index` itself rather than the device) rather than fixed
-    /// here, since it is out of this task's scope and never causes an early
-    /// or incorrect delete.
     ///
     /// Also drops the OLD `unmined_index` (`ShardedUnminedIndex`) update this
     /// op used to perform: that index's "old" value would suffer the exact
@@ -3880,7 +3883,10 @@ impl Engine {
         self.observe_block_height(req.current_block_height);
         let _guard = self.locks.lock(tx_key);
 
-        // 1. Index lookup.
+        // 1. Index lookup. Confirms the record exists (the device read that
+        //    used to double as an existence check is gone — followup-2). The
+        //    stripe lock held above pins this entry against a concurrent
+        //    delete, so no device confirmation is needed.
         let entry = self
             .index
             .lookup_checked(tx_key)
@@ -3888,38 +3894,8 @@ impl Engine {
                 detail: format!("index lookup failed: {e}"),
             })?
             .ok_or(SpendError::TxNotFound)?;
-        let record_offset = entry.record_offset;
-        let device_id = entry.device_id;
 
-        // 2. The ONE device read this op performs: DAH-eval inputs
-        //    (flags/preserve_until/spent_utxos/utxo_count/delete_at_height)
-        //    plus confirmation the record still exists. No write follows.
-        let meta = self.read_metadata_fast(device_id, record_offset)?;
-
-        // followup-1 proving guard (Task 2 removes both this and the device
-        // read above): the DAH-relevant device flag bits are now mirrored into
-        // the MinedEntry at every flag-mutating op and reseeded on recovery.
-        // Before Task 2 sources them from RAM, assert the cache never drifts
-        // from the freshly-read device footer. setMined itself never touches a
-        // DE bit on either side, so this holds equally before/after step 3's
-        // mined-state mutation. Debug/test builds only (zero release cost).
-        #[cfg(debug_assertions)]
-        if entry.mined_slot != crate::index::mined_index::NO_MINED_SLOT
-            && let Some(ram_de) = self.mined_index().read_de_flags(tx_key, entry.mined_slot)
-        {
-            let device_de = crate::index::mined_index::device_de_flags(
-                meta.flags,
-                { meta.preserve_until } != 0,
-            );
-            debug_assert_eq!(
-                ram_de, device_de,
-                "setMined flag-cache drift for {:?}: ram={ram_de:#010b} device={device_de:#010b} \
-                 (a flag-mutating op failed to dual-write the MinedEntry DE cache)",
-                tx_key.txid,
-            );
-        }
-
-        // 3. Apply the mined-state transition to the MinedIndex — the SOLE
+        // 2. Apply the mined-state transition to the MinedIndex — the SOLE
         //    write this op performs (Task 9's dual-write call; the device
         //    half of that dual-write is what Task 16d removes).
         if entry.mined_slot == crate::index::mined_index::NO_MINED_SLOT {
@@ -3971,28 +3947,52 @@ impl Engine {
             );
         }
 
-        // 4. Read the post-mutation mined-state back from the MinedIndex —
+        // 3. Read the post-mutation mined-state back from the MinedIndex —
         //    the authoritative source (Task 10) — for the DAH eval and the
         //    response's block_ids. Not a device read.
         let (block_entries, new_unmined) = self.mined_block_entries(tx_key)?;
         let has_blocks = !block_entries.is_empty();
 
-        // 5. DAH evaluation, mirroring `mark_on_longest_chain`'s existing use
-        //    of the same `&TxMetadata` + explicit has_blocks/unmined_since
-        //    overload: `meta`'s flags/preserve_until/spent_utxos/utxo_count/
-        //    delete_at_height (device-only inputs) combined with the fresh
-        //    MinedIndex-sourced has_blocks/unmined_since.
-        let (signal, dah_patch) = evaluate_delete_at_height(
-            &meta,
+        // 4. DAH evaluation sourced ENTIRELY from RAM (followup-2 — no device
+        //    read). The four DAH-relevant flags + preserve come from the
+        //    MinedEntry DE-flag cache, `all_spent` from the cached
+        //    MINED_ALL_SPENT bit, `old_dah` from the authoritative DAH
+        //    secondary index, and has_blocks/unmined_since from the MinedIndex.
+        //    `read_de_flags`/`is_all_spent` return `None` only for a slot that
+        //    is absent or reallocated (the defensive NO_MINED_SLOT branch above,
+        //    or an ABA race the stripe lock precludes); defaulting to
+        //    empty/false there degrades to "no DAH change", never a wrong
+        //    delete.
+        let de_flags = self
+            .mined_index()
+            .read_de_flags(tx_key, entry.mined_slot)
+            .unwrap_or(0);
+        let tx_flags = crate::index::mined_index::tx_flags_from_de_flags(de_flags);
+        let has_preserve = de_flags & crate::index::mined_index::MINED_PRESERVED != 0;
+        let all_spent = self
+            .mined_index()
+            .is_all_spent(tx_key, entry.mined_slot)
+            .unwrap_or(false);
+        // Authoritative existing DAH: the live secondary-index height, not the
+        // (now-frozen) device footer. Sourcing it here also closes the former
+        // back-to-back-setMined staleness gap (each call now baselines
+        // `existing_dah` on the live index rather than a stale device snapshot).
+        let old_dah = self.dah_index.get_height(tx_key).unwrap_or(0);
+
+        let (signal, dah_patch) = evaluate_dah_from_ram(
+            tx_flags,
+            all_spent,
             has_blocks,
             new_unmined,
+            has_preserve,
+            old_dah,
             req.current_block_height,
             req.block_height_retention,
         )?;
 
-        // 6. Update the DAH secondary index only (RAM/redb, not a device
+        // 5. Update the DAH secondary index only (RAM/redb, not a device
         //    write) — the sole remaining durable side effect besides the
-        //    MinedIndex write. See the residual-staleness note above.
+        //    MinedIndex write.
         //
         //    Routed through `update_both_secondary_indexes` rather than the
         //    simpler `update_dah_index`: `update_dah_index` hands the redo
@@ -4005,17 +4005,31 @@ impl Engine {
         //    this whole task is optimizing, so keeping that coalescing intact
         //    matters — using the plain single-index helper here would trade
         //    away exactly the throughput win buffered mode exists for.
-        let old_dah = { meta.delete_at_height };
         let new_dah = dah_patch
             .as_ref()
             .map(|patch| patch.new_delete_at_height)
             .unwrap_or(old_dah);
         self.update_both_secondary_indexes(tx_key, old_dah, new_dah)?;
 
+        // 6. followup-2 RAM-only LAST_SPENT_ALL self-update. The device footer
+        //    is no longer rewritten by this op, so setMined must mirror the DAH
+        //    patch's `last_spent_all` into the MinedEntry cache under this same
+        //    stripe lock — otherwise a following setMined would read a stale
+        //    `was_all_spent`. (Every device-writing op applies this via
+        //    `apply_dah_patch` + `mirror_de_flags`; setMined does it RAM-only.)
+        //    A no-op when the eval produced no patch or the slot is absent.
+        if let Some(ref patch) = dah_patch {
+            self.mined_index().set_de_flag(
+                tx_key,
+                entry.mined_slot,
+                crate::index::mined_index::MINED_LAST_SPENT_ALL,
+                patch.last_spent_all,
+            );
+        }
+
         Ok(SetMinedResponse {
             signal,
             block_ids: block_entries.into_iter().map(|e| e.block_id).collect(),
-            generation: { meta.generation },
         })
     }
 
@@ -10098,6 +10112,60 @@ mod tests {
         }
     }
 
+    /// Wrap a device and count every `pread` / `pwrite`. Reports `None` from
+    /// `as_raw_ptr` so ALL record I/O routes through the counted pread/pwrite
+    /// path (the mmap fast path would otherwise bypass the counters and make a
+    /// zero-I/O assertion blind). Used by the followup-2 test proving
+    /// `set_mined_inner` performs zero device reads AND zero device writes.
+    struct RwCountingDevice {
+        inner: Arc<dyn BlockDevice>,
+        reads: Arc<AtomicU64>,
+        writes: Arc<AtomicU64>,
+    }
+
+    impl RwCountingDevice {
+        fn new(inner: Arc<dyn BlockDevice>) -> (Arc<Self>, Arc<AtomicU64>, Arc<AtomicU64>) {
+            let reads = Arc::new(AtomicU64::new(0));
+            let writes = Arc::new(AtomicU64::new(0));
+            (
+                Arc::new(Self {
+                    inner,
+                    reads: reads.clone(),
+                    writes: writes.clone(),
+                }),
+                reads,
+                writes,
+            )
+        }
+    }
+
+    impl BlockDevice for RwCountingDevice {
+        fn alignment(&self) -> usize {
+            self.inner.alignment()
+        }
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.pread(buf, offset)
+        }
+        fn pread_nocache(&self, buf: &mut [u8], offset: u64) -> crate::device::Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.pread_nocache(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> crate::device::Result<usize> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.pwrite(buf, offset)
+        }
+        fn sync(&self) -> crate::device::Result<()> {
+            self.inner.sync()
+        }
+        fn as_raw_ptr(&self) -> Option<*mut u8> {
+            None
+        }
+    }
+
     /// Seed `engine`'s MinedIndex with a fresh slot at a hand-crafted
     /// `TxMetadata`'s `unmined_since`, apply each `(block_id, block_height,
     /// subtree_idx)` in `blocks`, and return the allocated slot.
@@ -10876,9 +10944,12 @@ mod tests {
 
     #[test]
     fn de_cache_set_mined_cross_check_holds_with_device_flags() {
-        // Exercises `set_mined_inner`'s cross-check directly: a record with
-        // several device DE flags set must setMined WITHOUT tripping the
-        // debug_assert, and the cache must still match the device after.
+        // A record with several device DE flags set (EXTERNAL+CONFLICTING) must
+        // setMined and leave the DE cache still matching the device footer.
+        // Pre-followup-2 this exercised set_mined_inner's device-vs-cache
+        // debug_assert; that read+assert are now gone (the eval is RAM-only), so
+        // this guards that the RAM path does not corrupt the cache for a
+        // non-all-spent record (LAST_SPENT_ALL stays clear, so cache==device).
         let engine = create_engine();
         let (_h, mut create) = make_create_req(0xE7, 2);
         create.is_external = true;
@@ -10890,7 +10961,6 @@ mod tests {
         let key = create.tx_key();
         engine.create(&create).expect("create");
 
-        // setMined runs the cross-check; a drifted cache would panic here.
         engine
             .set_mined(&SetMinedRequest {
                 tx_key: key,
@@ -10902,7 +10972,7 @@ mod tests {
                 on_longest_chain: true,
                 unset_mined: false,
             })
-            .expect("set_mined must not trip the flag-cache cross-check");
+            .expect("set_mined must not corrupt the flag cache");
         assert_de_cache_matches_device(&engine, &key);
     }
 
@@ -11033,6 +11103,215 @@ mod tests {
                 .read_de_flags(&records[4].0, plain_slot),
             Some(0),
             "reconcile must CLEAR DE bits a record does not carry on device",
+        );
+    }
+
+    /// followup-2 headline test: `set_mined_inner` performs ZERO device reads
+    /// AND zero device writes for a plain mined transition, an unmined
+    /// transition, and an all-spent DAH-setting case. The data device counts
+    /// every pread/pwrite and hides the mmap fast path, so any stray record I/O
+    /// (as the pre-followup-2 `read_metadata_fast` did) would trip an assert.
+    #[test]
+    fn set_mined_inner_performs_zero_device_io() {
+        let inner: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let (dev, reads, writes) = RwCountingDevice::new(inner);
+        let dev: Arc<dyn BlockDevice> = dev;
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(1000).unwrap();
+        let engine = Engine::new(dev, index, alloc, StripedLocks::new(1024), DahIndex::new());
+
+        // A real 2-UTXO create (device I/O here is measured BEFORE the snapshot).
+        let (_hashes, req) = make_create_req(0xF0, 2);
+        engine.create(&req).expect("create");
+        let key = req.tx_key();
+
+        let params = |unset: bool, block_id: u32| SetMinedSharedParams {
+            block_id,
+            block_height: 100,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: unset,
+        };
+
+        // Snapshot counters and assert an op moved neither.
+        let assert_zero_io = |label: &str, before_r: u64, before_w: u64| {
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                before_r,
+                "{label}: set_mined_inner must perform 0 device reads",
+            );
+            assert_eq!(
+                writes.load(Ordering::SeqCst),
+                before_w,
+                "{label}: set_mined_inner must perform 0 device writes",
+            );
+        };
+
+        // Case 1: a plain mined transition.
+        let (r, w) = (reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst));
+        let resp = engine
+            .set_mined_inner(&key, &params(false, 7))
+            .expect("mined");
+        assert_eq!(resp.block_ids, vec![7]);
+        assert_zero_io("mined transition", r, w);
+
+        // Case 2: an unmined transition (reorg-unset the block just added).
+        let (r, w) = (reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst));
+        let resp = engine
+            .set_mined_inner(&key, &params(true, 7))
+            .expect("unset");
+        assert!(resp.block_ids.is_empty(), "unset removed the sole block");
+        assert_zero_io("unmined transition", r, w);
+
+        // Case 3: an all-spent DAH-setting case. Spend both UTXOs (device I/O
+        // in spend, before the snapshot), then a setMined drives the record to
+        // a DAH — still zero device I/O inside set_mined_inner.
+        for i in 0..2u32 {
+            let mut utxo_hash = [0u8; 32];
+            utxo_hash[0] = i as u8;
+            utxo_hash[1] = (i >> 8) as u8;
+            let mut spending_data = [0u8; 36];
+            spending_data[0] = 0xAB;
+            spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+            engine
+                .spend(&SpendRequest {
+                    tx_key: key,
+                    offset: i,
+                    utxo_hash,
+                    spending_data,
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .expect("spend");
+        }
+        let (r, w) = (reads.load(Ordering::SeqCst), writes.load(Ordering::SeqCst));
+        engine
+            .set_mined_inner(&key, &params(false, 8))
+            .expect("mined all-spent");
+        assert_zero_io("all-spent DAH-setting", r, w);
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(1288),
+            "all-spent + mined + on-chain must set DAH = current(1000) + retention(288)",
+        );
+    }
+
+    /// followup-2 end-to-end: a setMined that drives an all-spent record to a
+    /// DAH, an unset that clears it, and a re-set that restores it — all via the
+    /// RAM-sourced DAH eval — produce the correct DAH-index state at each step,
+    /// AND the DE-flag cache stays coherent through a conflicting interaction.
+    ///
+    /// Notably the unset CLEARS the DAH-index entry: sourcing `old_dah` from the
+    /// live `dah_index` (not the frozen device footer) closes the former
+    /// residual-staleness gap where a setMined-driven unset left an orphaned
+    /// entry behind.
+    #[test]
+    fn set_mined_ram_path_drives_dah_index_end_to_end() {
+        let engine = create_engine();
+        let (_hashes, req) = make_create_req(0xF1, 2);
+        engine.create(&req).expect("create");
+        let key = req.tx_key();
+        let slot = engine.lookup(&key).unwrap().mined_slot;
+
+        let set = |unset: bool, block_id: u32| SetMinedRequest {
+            tx_key: key,
+            block_id,
+            block_height: 100,
+            subtree_idx: 0,
+            current_block_height: 1000,
+            block_height_retention: 288,
+            on_longest_chain: true,
+            unset_mined: unset,
+        };
+
+        // Spend both UTXOs first (unmined) → all-spent, LAST_SPENT_ALL set by
+        // the spend path, but NO DAH yet (no blocks).
+        for i in 0..2u32 {
+            let mut utxo_hash = [0u8; 32];
+            utxo_hash[0] = i as u8;
+            utxo_hash[1] = (i >> 8) as u8;
+            let mut spending_data = [0u8; 36];
+            spending_data[0] = 0xAB;
+            spending_data[32..36].copy_from_slice(&1u32.to_le_bytes());
+            engine
+                .spend(&SpendRequest {
+                    tx_key: key,
+                    offset: i,
+                    utxo_hash,
+                    spending_data,
+                    ignore_conflicting: false,
+                    ignore_locked: false,
+                    current_block_height: 1000,
+                    block_height_retention: 288,
+                })
+                .expect("spend");
+        }
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            None,
+            "no DAH before mining"
+        );
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap()
+                & crate::index::mined_index::MINED_LAST_SPENT_ALL,
+            0,
+            "spend-to-all-spent set LAST_SPENT_ALL in the cache",
+        );
+
+        // setMined drives the all-spent record to a DAH (RAM-only eval).
+        engine.set_mined(&set(false, 8)).expect("setMined→DAH");
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(1288),
+            "setMined must drive the all-spent on-chain record to DAH 1288",
+        );
+
+        // Reorg-unset: has_blocks=false → the DAH is CLEARED (old_dah sourced
+        // from the live dah_index, so the entry is actually removed).
+        engine.set_mined(&set(true, 8)).expect("unset");
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            None,
+            "unset must clear the DAH-index entry (residual gap closed)",
+        );
+        assert_eq!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap()
+                & crate::index::mined_index::MINED_LAST_SPENT_ALL,
+            0,
+            "the DAH-clear patch cleared the cache LAST_SPENT_ALL (RAM-only self-update)",
+        );
+
+        // Re-set: was_all_spent now false in the cache, but all_spent is still
+        // true and has_blocks/on_chain hold → DAH is restored, proving the
+        // setMined→setMined sequence reads was_all_spent from the cache.
+        engine.set_mined(&set(false, 9)).expect("re-set→DAH");
+        assert_eq!(
+            engine.dah_index().get_height(&key),
+            Some(1288),
+            "re-setMined must restore DAH 1288",
+        );
+
+        // A conflicting interaction (device-writing) must keep the cache
+        // coherent with the device footer, and the followup-1 invariant holds.
+        engine
+            .set_conflicting(&SetConflictingRequest {
+                tx_key: key,
+                value: true,
+                current_block_height: 1000,
+                block_height_retention: 288,
+            })
+            .expect("set_conflicting");
+        assert_de_cache_matches_device(&engine, &key);
+        assert_ne!(
+            engine.mined_index().read_de_flags(&key, slot).unwrap()
+                & crate::index::mined_index::MINED_CONFLICTING,
+            0,
+            "set_conflicting mirrored CONFLICTING into the cache",
         );
     }
 
@@ -15389,14 +15668,9 @@ mod tests {
                 resp.block_ids.contains(&42),
                 "item {i} should have block_id 42"
             );
-            // Task 16d: setMined performs zero device writes, so it no
-            // longer bumps `generation` — the response echoes the
-            // unchanged value read off the device (0, `TxMetadata::new`'s
-            // default, since these txs were freshly created).
-            assert_eq!(
-                resp.generation, 0,
-                "item {i}: generation is no longer bumped by setMined"
-            );
+            // followup-2: `generation` was dropped from `SetMinedResponse`
+            // entirely — setMined does zero device I/O, so there is no
+            // generation to echo (it was already unused by the dispatch layer).
         }
 
         // Verify all three txs have the block entry (via the MinedIndex —

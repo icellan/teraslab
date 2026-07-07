@@ -205,10 +205,16 @@ pub fn evaluate_delete_at_height(
 /// Evaluate `deleteAtHeight` from cached index fields — no metadata read needed.
 ///
 /// Same logic as [`evaluate_delete_at_height`] but takes individual cached values
-/// from `TxIndexEntry` instead of a `&TxMetadata` reference.
+/// from `TxIndexEntry` instead of a `&TxMetadata` reference. A thin adapter over
+/// [`evaluate_dah_from_ram`]: it derives the raw all-spent bit
+/// (`spent_utxos == utxo_count`) and the has-blocks bool
+/// (`block_entry_count > 0`) and forwards to the shared branch tree, so this and
+/// the setMined RAM path can never diverge.
 ///
 /// The `has_preserve_until` flag indicates whether `dah_or_preserve` holds
-/// `preserve_until` (true) or `delete_at_height` (false).
+/// `preserve_until` (true) or `delete_at_height` (false). When it is `true` the
+/// evaluation early-returns before `dah_or_preserve` is read, so passing the
+/// preserve value through the `delete_at_height` slot is harmless.
 ///
 /// # Errors
 ///
@@ -227,6 +233,56 @@ pub fn evaluate_dah_cached(
     current_block_height: u32,
     block_height_retention: u32,
 ) -> DahEvalResult {
+    evaluate_dah_from_ram(
+        tx_flags,
+        spent_utxos == utxo_count,
+        block_entry_count > 0,
+        unmined_since,
+        has_preserve_until,
+        dah_or_preserve,
+        current_block_height,
+        block_height_retention,
+    )
+}
+
+/// Evaluate `deleteAtHeight` entirely from in-RAM inputs — the shared decision
+/// body used by both [`evaluate_dah_cached`] and setMined's zero-device-I/O
+/// path (`Engine::set_mined_inner`).
+///
+/// This holds the single copy of the DAH branch tree that the cached callers
+/// share; [`evaluate_delete_at_height`] is the independent reference
+/// implementation the parity tests check this against.
+///
+/// Inputs are the exact values setMined sources from RAM after Task 2:
+/// - `tx_flags`: the four DAH-relevant flags reconstructed from the MinedEntry
+///   DE-flag cache (`EXTERNAL`, `CONFLICTING`, `LAST_SPENT_ALL`, `REASSIGNED`).
+/// - `all_spent`: the raw `MINED_ALL_SPENT` bit (`spent_utxos == utxo_count`).
+///   The LP-3 reassigned-audit exclusion is applied HERE (a `REASSIGNED` record
+///   is never treated as all-spent), so callers pass the raw bit — mirroring
+///   `MINED_ALL_SPENT`'s own semantics, which the spend path maintains without
+///   the reassigned exclusion.
+/// - `has_blocks`: whether the MinedIndex holds any block tuple for the record.
+/// - `unmined_since`: `0` == on the longest chain.
+/// - `has_preserve_until`: the `MINED_PRESERVED` bit (`preserve_until != 0`).
+/// - `delete_at_height`: the record's current DAH — for setMined this is the
+///   authoritative `dah_index` height, not the (stale) on-device field.
+///
+/// # Errors
+///
+/// Returns [`SpendError::DahOverflow`] if `current_block_height +
+/// block_height_retention` would overflow `u32`. See
+/// [`evaluate_delete_at_height`] for rationale.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_dah_from_ram(
+    tx_flags: TxFlags,
+    all_spent: bool,
+    has_blocks: bool,
+    unmined_since: u32,
+    has_preserve_until: bool,
+    delete_at_height: u32,
+    current_block_height: u32,
+    block_height_retention: u32,
+) -> DahEvalResult {
     if block_height_retention == 0 {
         return Ok((Signal::None, None));
     }
@@ -235,7 +291,7 @@ pub fn evaluate_dah_cached(
         return Ok((Signal::None, None));
     }
 
-    let existing_dah = dah_or_preserve; // it's delete_at_height when !has_preserve_until
+    let existing_dah = delete_at_height;
     let new_dah = checked_new_dah(current_block_height, block_height_retention)?;
     let is_external = tx_flags.contains(TxFlags::EXTERNAL);
 
@@ -259,10 +315,10 @@ pub fn evaluate_dah_cached(
     }
 
     // LP-3: reassigned records are never all-spent (see
-    // `evaluate_delete_at_height`). The discriminant rides in `tx_flags`,
-    // synced from metadata by `sync_index_cache`.
-    let all_spent = spent_utxos == utxo_count && !tx_flags.contains(TxFlags::REASSIGNED);
-    let has_blocks = block_entry_count > 0;
+    // `evaluate_delete_at_height`). The discriminant rides in `tx_flags`;
+    // `all_spent` arrives as the raw `MINED_ALL_SPENT` bit, so the exclusion is
+    // applied here rather than by the caller.
+    let all_spent = all_spent && !tx_flags.contains(TxFlags::REASSIGNED);
     let on_longest_chain = unmined_since == 0;
     let was_all_spent = tx_flags.contains(TxFlags::LAST_SPENT_ALL);
 
@@ -568,5 +624,96 @@ mod tests {
                 .expect("no overflow at normal heights");
         let p = patch.unwrap();
         assert_eq!(p.new_delete_at_height, 801_000);
+    }
+
+    /// Task 2 decision parity: the RAM path (`evaluate_dah_from_ram`, the shared
+    /// body setMined uses after dropping its device read) must yield the SAME
+    /// `(signal, dah_patch)` as the independent reference
+    /// (`evaluate_delete_at_height`) for EVERY combination of the four
+    /// DAH-relevant flags, all-spent, has-blocks, on-longest-chain, has-preserve,
+    /// and existing DAH. This is the proof that Task 2 changed no behavior — only
+    /// where the inputs are sourced from.
+    #[test]
+    fn ram_path_matches_reference_across_all_flag_combinations() {
+        let flag_bits = [
+            TxFlags::EXTERNAL,
+            TxFlags::CONFLICTING,
+            TxFlags::LAST_SPENT_ALL,
+            TxFlags::REASSIGNED,
+        ];
+        let current = 1000u32;
+        let mut checked = 0usize;
+
+        // Enumerate every subset of the four flags (2^4).
+        for mask in 0u8..16 {
+            let mut flags = TxFlags::empty();
+            for (bit, f) in flag_bits.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    flags |= *f;
+                }
+            }
+            for all_spent in [false, true] {
+                for has_blocks in [false, true] {
+                    for on_longest_chain in [false, true] {
+                        for has_preserve in [false, true] {
+                            for &old_dah in &[0u32, 500, 2000] {
+                                for &retention in &[0u32, 288] {
+                                    let unmined_since = if on_longest_chain { 0 } else { 900 };
+
+                                    // Build the metadata the reference reads its
+                                    // inputs from. `all_spent` maps to
+                                    // spent_utxos == utxo_count (raw — the
+                                    // REASSIGNED exclusion happens inside both
+                                    // paths); has-preserve maps to a non-zero
+                                    // preserve_until.
+                                    let (utxo_count, spent) = if all_spent {
+                                        (1u32, 1u32)
+                                    } else {
+                                        (2u32, 0u32)
+                                    };
+                                    let mut meta = TxMetadata::new(utxo_count);
+                                    meta.spent_utxos = spent;
+                                    meta.flags = flags;
+                                    meta.delete_at_height = old_dah;
+                                    meta.preserve_until = if has_preserve { 500 } else { 0 };
+
+                                    let reference = evaluate_delete_at_height(
+                                        &meta,
+                                        has_blocks,
+                                        unmined_since,
+                                        current,
+                                        retention,
+                                    );
+                                    let ram = evaluate_dah_from_ram(
+                                        flags,
+                                        all_spent,
+                                        has_blocks,
+                                        unmined_since,
+                                        has_preserve,
+                                        old_dah,
+                                        current,
+                                        retention,
+                                    );
+
+                                    assert_eq!(
+                                        reference, ram,
+                                        "parity mismatch: flags={flags:?} all_spent={all_spent} \
+                                         has_blocks={has_blocks} on_chain={on_longest_chain} \
+                                         preserve={has_preserve} old_dah={old_dah} \
+                                         retention={retention}",
+                                    );
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            16 * 2 * 2 * 2 * 2 * 3 * 2,
+            "full matrix must be exercised"
+        );
     }
 }
