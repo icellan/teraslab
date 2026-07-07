@@ -3916,17 +3916,10 @@ mod tests {
         let build = || {
             let mut h = RecoveryTestHarness::new();
             let key = h.create_record(0xB5, 2);
-            // Record has blocks + on longest chain so DAH would be set IF
-            // (and only if) all slots were spent.
-            let ie = h.index.lookup(&key).unwrap();
-            let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-            meta.block_entry_count = 1;
-            meta.block_entries_inline[0] = BlockEntry {
-                block_id: 1,
-                block_height: 900,
-                subtree_idx: 0,
-            };
-            io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+            // The record is on the longest chain (unmined_since == 0) so a DAH
+            // would be set IF (and only if) all slots were spent. Mined-state
+            // no longer lives on the device; this test only exercises the spend
+            // replay's all-spent gating, which is driven by slot state.
             (h, key)
         };
 
@@ -4017,16 +4010,10 @@ mod tests {
         let key = h.create_record(0xB6, 2);
         let ie = h.index.lookup(&key).unwrap();
 
-        // Record has blocks + on longest chain. Pre-stamp an OVER-COUNTED
-        // counter (2 == utxo_count) that would falsely read "all spent",
-        // while only slot 0 is actually spent and slot 1 is live.
+        // On longest chain. Pre-stamp an OVER-COUNTED counter (2 == utxo_count)
+        // that would falsely read "all spent", while only slot 0 is actually
+        // spent and slot 1 is live.
         let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.block_entry_count = 1;
-        meta.block_entries_inline[0] = BlockEntry {
-            block_id: 1,
-            block_height: 900,
-            subtree_idx: 0,
-        };
         meta.spent_utxos = 2; // over-counted: pretends all-spent
         io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
 
@@ -4216,11 +4203,11 @@ mod tests {
         assert_eq!(stats.entries_skipped, 1);
 
         let after = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        assert_eq!(after.block_entry_count, 0, "device stays at 0, not 1");
+        // Mined-state lives only in the MinedIndex now; the device footer must
+        // be byte-for-byte identical — not even a generation bump.
         assert_eq!(
-            { after.generation },
-            { before.generation },
-            "no device write at all — generation must not bump"
+            before, after,
+            "no device write at all — footer must be completely untouched"
         );
     }
 
@@ -4326,14 +4313,11 @@ mod tests {
         for (key, before) in [key_a, key_b, key_c].into_iter().zip(before) {
             let ie = h.index.lookup(&key).unwrap();
             let after = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
+            // Mined-state lives only in the MinedIndex now; no txid in the batch
+            // gains any device write — the footer must be byte-for-byte identical.
             assert_eq!(
-                after.block_entry_count, 0,
-                "no txid in the batch gains a device block entry"
-            );
-            assert_eq!(
-                { after.generation },
-                { before.generation },
-                "no device write at all — generation must not bump"
+                before, after,
+                "no device write at all — footer must be completely untouched"
             );
         }
     }
@@ -6663,11 +6647,11 @@ mod tests {
         assert_eq!(stats.entries_skipped, 1);
 
         let meta = io::read_metadata(&*h.data_dev, record_offset).unwrap();
-        assert_eq!({ meta.block_entry_count }, 0, "device untouched");
         assert_eq!(
             { meta.generation },
             0,
-            "no device write at all — generation must not bump"
+            "no device write at all — generation must not bump (mined-state \
+             lives only in the MinedIndex now)"
         );
     }
 
@@ -7453,16 +7437,8 @@ mod tests {
         let key = h.create_record(0xE9, 1);
         let ie = h.index.lookup(&key).unwrap();
 
-        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        for i in 0..INLINE_BLOCK_ENTRIES {
-            meta.block_entries_inline[i] = BlockEntry {
-                block_id: (i + 1) as u32,
-                block_height: 900_000 + i as u32,
-                subtree_idx: i as u32,
-            };
-        }
-        meta.block_entry_count = INLINE_BLOCK_ENTRIES as u8;
-        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+        // Mined-state no longer lives on the device (Task 2 removed the inline
+        // block-entry region), so the device footer starts and must stay bare.
         let before = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
 
         let mut redo = h.redo_log();
@@ -7485,19 +7461,9 @@ mod tests {
 
         let after = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
         assert_eq!(
-            after.block_entry_count,
-            { before.block_entry_count },
-            "device untouched — still only the 3 inline entries seeded above"
-        );
-        assert_eq!(
-            { after.block_overflow_offset },
-            0,
-            "no overflow region allocated"
-        );
-        assert_eq!(
-            { after.generation },
-            { before.generation },
-            "no device write at all — generation must not bump"
+            before, after,
+            "device untouched — no metadata write, no overflow allocation, no \
+             generation bump (CompensateUnsetMined touches only the MinedIndex)"
         );
     }
 
@@ -7656,14 +7622,8 @@ mod tests {
         let mut h = RecoveryTestHarness::new();
         let key = h.create_record(35, 1);
         let ie = h.index.lookup(&key).unwrap();
-        let mut meta = io::read_metadata(&*h.data_dev, ie.record_offset).unwrap();
-        meta.block_entry_count = 1;
-        meta.block_entries_inline[0] = BlockEntry {
-            block_id: 1,
-            block_height: 900,
-            subtree_idx: 0,
-        };
-        io::write_metadata(&*h.data_dev, ie.record_offset, &meta).unwrap();
+        // Mined-state no longer lives on the device; this test exercises the
+        // spend replay's generation/updated_at/DAH handling only.
 
         let mut redo = h.redo_log();
         redo.append_and_flush(RedoOp::SpendV2 {

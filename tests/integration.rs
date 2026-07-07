@@ -121,16 +121,39 @@ fn create_engine_with_backends(
     index: PrimaryBackend,
     dah: DahBackend,
 ) -> Arc<Engine> {
-    let engine = Arc::new(Engine::new(dev, index, alloc, StripedLocks::new(1024), dah));
     // `Engine::new`/`new_inner` always starts with a fresh, empty
     // `ShardedMinedIndex` — unlike `dah_index` it is never reconciled from an
-    // existing backend (see `Engine::new_inner`'s doc comment). For a
-    // brand-new engine this is a no-op (the primary index has no entries
-    // yet); for the "reopen after restart" call sites in this file (a
-    // recovered/rebuilt primary index over a device with real records) this
-    // repopulates mined/unmined state from the device, mirroring what a real
-    // startup's device-scan fallback does.
-    engine.rebuild_mined_index_from_device().unwrap();
+    // existing backend. For a brand-new engine the primary index is empty and
+    // the loop below is a no-op; for the "reopen after restart" call sites
+    // (a rebuilt primary index over a device with real records) it repopulates
+    // the MinedIndex's UNMINED membership from each record's still-present
+    // device `unmined_since`.
+    //
+    // Task 2 removed the on-device block-entry region and the device-scan
+    // MinedIndex rebuild: production restores the MinedIndex from the redo
+    // tail / checkpoint snapshot (which also restores per-block mined-state).
+    // These integration reopens deliberately skip redo, so only the unmined
+    // membership — the sole mined-state field still on the device — is
+    // reconstructed here, which is all these tests assert survives reopen.
+    //
+    // Read each record's footer BY OFFSET directly off the device (before the
+    // engine takes ownership): the primary index key is a 12-byte slim prefix
+    // (txid bytes 12.. zeroed), and both `Engine::read_metadata` (tx_id verify)
+    // and the MinedIndex shard routing (txid bytes [16..24]) need the FULL
+    // txid, which only the on-device `meta.tx_id` carries.
+    let mut unmined: Vec<(TxKey, u32)> = Vec::new();
+    for (_slim_key, entry) in index.iter() {
+        if let Ok(meta) = teraslab::io::read_metadata(&*dev, entry.record_offset) {
+            let unmined_since = { meta.unmined_since };
+            if unmined_since != 0 {
+                unmined.push((TxKey::from_bytes(meta.tx_id), unmined_since));
+            }
+        }
+    }
+    let engine = Arc::new(Engine::new(dev, index, alloc, StripedLocks::new(1024), dah));
+    for (key, unmined_since) in unmined {
+        engine.mined_index().alloc_created(&key, unmined_since);
+    }
     engine
 }
 
@@ -1672,10 +1695,6 @@ fn snapshot_deletion_forces_device_scan_rebuild_with_exact_state() {
             { got.spent_utxos },
             { exp_meta.spent_utxos },
             "spent_utxos for {key:?}"
-        );
-        assert_eq!(
-            got.block_entry_count, exp_meta.block_entry_count,
-            "block_entry_count for {key:?}"
         );
         assert_eq!(
             { got.flags }.bits(),

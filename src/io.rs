@@ -14,8 +14,8 @@
 use crate::device::{AlignedBuf, BlockDevice, DeviceError};
 use crate::locks::StripedRwLocks;
 use crate::record::{
-    BLOCK_ENTRY_SIZE, BlockEntry, CRC32_OFFSET, IDENTITY_READ_LEN, METADATA_SIZE, TxIdentity,
-    TxMetadata, UTXO_SLOT_SIZE, UtxoSlot,
+    CRC32_OFFSET, IDENTITY_READ_LEN, METADATA_SIZE, TxIdentity, TxMetadata, UTXO_SLOT_SIZE,
+    UtxoSlot,
 };
 
 /// Result type for I/O helper operations.
@@ -25,15 +25,15 @@ pub type Result<T> = std::result::Result<T, DeviceError>;
 // F-X-007 / BC-02: torn-read fix — record-offset striped RwLock
 // ---------------------------------------------------------------------------
 //
-// The `*_direct` helpers below memcpy `TxMetadata` (320 bytes) and
+// The `*_direct` helpers below memcpy `TxMetadata` (256 bytes) and
 // `UtxoSlot` (73 bytes) via plain `copy_from_slice`. On AArch64 release
 // builds the LLVM-emitted SIMD memcpy is non-atomic and may publish bytes
 // in any order. The original BC-02 contract claimed the CRC32 at the end
 // of the metadata header would catch every torn read; the regression
 // test `direct_read_write_concurrent_stress_never_returns_torn_data`
 // proves the claim is empirically false on Apple Silicon (m-series).
-// Mechanism: the CRC slot lives near the *end* of the 320-byte header
-// (offset 253, not 4-byte aligned). NEON-based memcpy can land the new
+// Mechanism: the CRC slot lives near the *end* of the 256-byte header
+// (offset 221, not 4-byte aligned). NEON-based memcpy can land the new
 // CRC bytes before the new field bytes; a concurrent reader observes
 // the new CRC paired with mostly-old field bytes, recomputes a matching
 // CRC against the partial state, and returns garbage to the caller.
@@ -296,26 +296,18 @@ pub const META_OFF_SPENT_UTXOS: usize = 97;
 pub const META_OFF_GENERATION: usize = 105;
 /// Byte offset of `updated_at` (u64 LE) within TxMetadata.
 pub const META_OFF_UPDATED_AT: usize = 109;
-/// Byte offset of `block_entry_count` (u8) within TxMetadata.
-pub const META_OFF_BLOCK_ENTRY_COUNT: usize = 117;
-/// Byte offset of `block_entries_inline` ([BlockEntry; 3]) within TxMetadata.
-pub const META_OFF_BLOCK_ENTRIES: usize = 118;
 /// Byte offset of `unmined_since` (u32 LE) within TxMetadata.
-pub const META_OFF_UNMINED_SINCE: usize = 171;
+pub const META_OFF_UNMINED_SINCE: usize = 126;
 /// Byte offset of `delete_at_height` (u32 LE) within TxMetadata.
-pub const META_OFF_DELETE_AT_HEIGHT: usize = 175;
+pub const META_OFF_DELETE_AT_HEIGHT: usize = 130;
 /// Byte offset of `preserve_until` (u32 LE) within TxMetadata.
-pub const META_OFF_PRESERVE_UNTIL: usize = 179;
+pub const META_OFF_PRESERVE_UNTIL: usize = 134;
 
 // Compile-time verification of offsets against the actual struct layout.
 const _: () = assert!(std::mem::offset_of!(TxMetadata, flags) == META_OFF_FLAGS);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, spent_utxos) == META_OFF_SPENT_UTXOS);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, generation) == META_OFF_GENERATION);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, updated_at) == META_OFF_UPDATED_AT);
-const _: () =
-    assert!(std::mem::offset_of!(TxMetadata, block_entry_count) == META_OFF_BLOCK_ENTRY_COUNT);
-const _: () =
-    assert!(std::mem::offset_of!(TxMetadata, block_entries_inline) == META_OFF_BLOCK_ENTRIES);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, unmined_since) == META_OFF_UNMINED_SINCE);
 const _: () =
     assert!(std::mem::offset_of!(TxMetadata, delete_at_height) == META_OFF_DELETE_AT_HEIGHT);
@@ -412,34 +404,6 @@ pub unsafe fn write_mined_footer_direct(base_ptr: *mut u8, record_offset: u64, m
     }
 }
 
-/// Write block_entry_count + one inline BlockEntry (for setMined inline add). 13 bytes.
-///
-/// # Safety
-///
-/// Same as [`write_mutation_footer_direct`]. `inline_index` must be < 3.
-#[inline]
-pub unsafe fn write_block_entry_direct(
-    base_ptr: *mut u8,
-    record_offset: u64,
-    count: u8,
-    inline_index: usize,
-    entry: &BlockEntry,
-) {
-    unsafe {
-        let p = base_ptr.add(off_to_usize(record_offset));
-        // F-G1-003: atomic chunked store — see `write_mutation_footer_direct`.
-        // block_entry_count (1 byte)
-        atomic_store_u64_rmw(p.add(META_OFF_BLOCK_ENTRY_COUNT), &[count]);
-        // BlockEntry at inline_index (12 bytes)
-        let entry_offset = META_OFF_BLOCK_ENTRIES + inline_index * BLOCK_ENTRY_SIZE;
-        let mut buf = [0u8; BLOCK_ENTRY_SIZE];
-        entry.to_bytes(&mut buf);
-        atomic_store_u64_rmw(p.add(entry_offset), &buf);
-    }
-    // Callers MUST follow with [`write_crc_direct`] using a meta snapshot
-    // that reflects the final disk state.
-}
-
 /// Write the common mutation footer AND restamp the CRC in one call.
 ///
 /// F-G1-002: the preferred entrypoint for callers that mutate the
@@ -447,8 +411,8 @@ pub unsafe fn write_block_entry_direct(
 /// and have no other in-flight header edits to batch. The individual
 /// [`write_mutation_footer_direct`] + [`write_crc_direct`] pair is
 /// still public for the rare caller that needs to interleave multiple
-/// footer writes (e.g. footer + block_entry) and stamp the CRC once at
-/// the end — but every other caller should use this combined helper so
+/// footer writes and stamp the CRC once at the end — but every other
+/// caller should use this combined helper so
 /// "forgot the CRC finalizer" cannot happen by omission.
 ///
 /// # Safety
@@ -700,32 +664,6 @@ pub unsafe fn write_mined_footer_and_crc_direct(
     }
 }
 
-/// Write a single inline block entry AND restamp the CRC in one call.
-///
-/// # Safety
-///
-/// Same as [`write_block_entry_direct`].
-#[inline]
-pub unsafe fn write_block_entry_and_crc_direct(
-    base_ptr: *mut u8,
-    record_offset: u64,
-    count: u8,
-    inline_index: usize,
-    entry: &BlockEntry,
-    meta: &TxMetadata,
-) {
-    // F-X-007: see write_mutation_footer_and_crc_direct for the
-    // record-level write-guard rationale.
-    let _w = io_locks().write(record_offset);
-    // Safety: see write_mutation_footer_and_crc_direct. `meta` must
-    // reflect the post-write block_entry_count + block_entries_inline
-    // state so the CRC matches the on-disk bytes.
-    unsafe {
-        write_block_entry_direct(base_ptr, record_offset, count, inline_index, entry);
-        write_crc_direct(base_ptr, record_offset, meta);
-    }
-}
-
 /// Write only the CRC32 field of a metadata header (4 bytes at
 /// [`CRC32_OFFSET`]), computed from the full in-memory `meta`.
 ///
@@ -786,7 +724,7 @@ pub unsafe fn write_crc_direct(base_ptr: *mut u8, record_offset: u64, meta: &TxM
 ///
 /// **Why the lock is required.** The previous design relied on CRC32
 /// alone to surface torn reads. On AArch64 release builds with NEON
-/// memcpy, the on-disk CRC slot (offset 253 inside the 320-byte
+/// memcpy, the on-disk CRC slot (offset 221 inside the 256-byte
 /// header, not 4-byte aligned) can be published before the matching
 /// field bytes; a reader observes the new CRC paired with mostly-old
 /// fields, recomputes a CRC that coincidentally matches the mix, and
@@ -2666,7 +2604,7 @@ mod tests {
 
     /// F-G1-003: the targeted footer helpers (`write_mutation_footer_direct`,
     /// `write_spend_footer_direct`, `write_mined_footer_direct`,
-    /// `write_block_entry_direct`, `write_crc_direct`) now route through
+    /// `write_crc_direct`) now route through
     /// `atomic_store_u64_rmw` so every store uses the SAME atomic width
     /// (u64) as the bulk `write_metadata_direct` path. Without this,
     /// miri's weak-memory model panics with "cannot have partially

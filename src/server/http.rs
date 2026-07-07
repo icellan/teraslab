@@ -3454,7 +3454,15 @@ async fn handle_debug_record(
             let unmined_since = { meta.unmined_since };
             let delete_at_height = { meta.delete_at_height };
             let preserve_until = { meta.preserve_until };
-            let block_entry_count = { meta.block_entry_count };
+            // Mined-state (including the block-entry count) lives in the in-RAM
+            // MinedIndex now, not the device header. Source the authoritative
+            // count from there; fall back to 0 if the lookup fails (the record
+            // was found above, so this is only a defensive guard).
+            let block_entry_count = state
+                .engine
+                .mined_block_entries(&key)
+                .map(|(entries, _)| entries.len() as u32)
+                .unwrap_or(0);
             let flags = { meta.flags }.bits();
             let body = serde_json::json!({
                 "tx_version": tx_version,

@@ -4,7 +4,7 @@
 //! record in one I/O operation, and registers it in the index.
 
 use crate::index::TxKey;
-use crate::record::{BlockEntry, ExternalRef};
+use crate::record::ExternalRef;
 use thiserror::Error;
 
 /// Errors from record creation.
@@ -101,18 +101,6 @@ impl CreateRequest<'_> {
     /// Build a [`TxKey`] from this request's tx_id.
     pub fn tx_key(&self) -> TxKey {
         TxKey { txid: self.tx_id }
-    }
-
-    /// Compute block entries from mined_block_infos (up to inline limit).
-    pub fn block_entries(&self) -> Vec<BlockEntry> {
-        self.mined_block_infos
-            .iter()
-            .map(|info| BlockEntry {
-                block_id: info.block_id,
-                block_height: info.block_height,
-                subtree_idx: info.subtree_idx,
-            })
-            .collect()
     }
 }
 

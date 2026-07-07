@@ -176,7 +176,7 @@ const (
 	FieldColdData            uint32 = 1 << 20
 	FieldBlockEntries        uint32 = 1 << 21
 	FieldConflictingChildren uint32 = 1 << 22
-	// FieldRawMetadata returns the full 320-byte on-disk metadata struct
+	// FieldRawMetadata returns the full 256-byte on-disk metadata struct
 	// as-is, including internal fields (magic, schema_version, device
 	// offsets, padding). For debugging only. Takes precedence over
 	// individual metadata field bits if set.

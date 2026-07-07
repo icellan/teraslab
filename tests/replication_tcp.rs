@@ -982,15 +982,17 @@ fn tcp_consistency_verification() {
         );
     }
 
-    // Check mined metadata
+    // Check mined metadata. Mined-state lives in the in-RAM MinedIndex now, not
+    // the device header, so compare the replicated block-entry counts there.
     for i in 70..90u32 {
         let txid = test_txid(1000 + i);
         let key = key_from_txid(txid);
-        let master_meta = master_engine.read_metadata(&key).unwrap();
-        let replica_meta = replica_engine.read_metadata(&key).unwrap();
+        let (master_blocks, _) = master_engine.mined_block_entries(&key).unwrap();
+        let (replica_blocks, _) = replica_engine.mined_block_entries(&key).unwrap();
         assert_eq!(
-            master_meta.block_entry_count, replica_meta.block_entry_count,
-            "block_entry_count mismatch for record {i}"
+            master_blocks.len(),
+            replica_blocks.len(),
+            "block entry count mismatch for record {i}"
         );
     }
 

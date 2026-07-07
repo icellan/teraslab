@@ -330,22 +330,12 @@ pub fn evaluate_dah_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::{BlockEntry, TxMetadata};
+    use crate::record::TxMetadata;
 
     fn make_meta(utxo_count: u32, spent: u32, flags: TxFlags) -> TxMetadata {
         let mut m = TxMetadata::new(utxo_count);
         m.spent_utxos = spent;
         m.flags = flags;
-        m
-    }
-
-    fn with_blocks(mut m: TxMetadata) -> TxMetadata {
-        m.block_entry_count = 1;
-        m.block_entries_inline[0] = BlockEntry {
-            block_id: 1,
-            block_height: 100,
-            subtree_idx: 0,
-        };
         m
     }
 
@@ -386,7 +376,7 @@ mod tests {
 
     #[test]
     fn all_spent_with_blocks_on_chain_sets_dah() {
-        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let m = make_meta(10, 10, TxFlags::empty());
         // unmined_since = 0 means on longest chain
         let (sig, patch) = evaluate_delete_at_height(&m, true, 0, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::None); // Not external
@@ -409,7 +399,7 @@ mod tests {
 
     #[test]
     fn not_all_spent_no_signal() {
-        let m = with_blocks(make_meta(10, 5, TxFlags::empty()));
+        let m = make_meta(10, 5, TxFlags::empty());
         let (sig, patch) = evaluate_delete_at_height(&m, true, 0, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::None);
         assert!(patch.is_none());
@@ -417,7 +407,7 @@ mod tests {
 
     #[test]
     fn transition_all_to_not_all_spent() {
-        let m = with_blocks(make_meta(10, 5, TxFlags::LAST_SPENT_ALL));
+        let m = make_meta(10, 5, TxFlags::LAST_SPENT_ALL);
         let (sig, patch) = evaluate_delete_at_height(&m, true, 0, 1000, 288).expect("no overflow");
         // Was all-spent, now not -> signal + clear DAH
         assert_eq!(sig, Signal::NotAllSpent);
@@ -428,7 +418,7 @@ mod tests {
 
     #[test]
     fn external_tx_signals_dah_set() {
-        let m = with_blocks(make_meta(10, 10, TxFlags::EXTERNAL));
+        let m = make_meta(10, 10, TxFlags::EXTERNAL);
         let (sig, patch) = evaluate_delete_at_height(&m, true, 0, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::DeleteAtHeightSet);
         let p = patch.unwrap();
@@ -444,7 +434,7 @@ mod tests {
 
     #[test]
     fn clear_dah_when_conditions_unmet() {
-        let mut m = with_blocks(make_meta(10, 5, TxFlags::LAST_SPENT_ALL));
+        let mut m = make_meta(10, 5, TxFlags::LAST_SPENT_ALL);
         m.delete_at_height = 500;
         let (sig, patch) = evaluate_delete_at_height(&m, true, 0, 1000, 288).expect("no overflow");
         // Non-external tx: clearing DAH returns Signal::None (not DAHUNSET)
@@ -457,11 +447,7 @@ mod tests {
 
     #[test]
     fn external_clear_dah_signals_unset() {
-        let mut m = with_blocks(make_meta(
-            10,
-            5,
-            TxFlags::EXTERNAL | TxFlags::LAST_SPENT_ALL,
-        ));
+        let mut m = make_meta(10, 5, TxFlags::EXTERNAL | TxFlags::LAST_SPENT_ALL);
         m.delete_at_height = 500;
         let (sig, patch) = evaluate_delete_at_height(&m, true, 0, 1000, 288).expect("no overflow");
         assert_eq!(sig, Signal::DeleteAtHeightUnset);
@@ -474,7 +460,7 @@ mod tests {
         // All slots SPENT, mined, on longest chain — but REASSIGNED set, so
         // the all-spent check is forced false and no DAH is set (LP-3 /
         // Lua recordUtxos+1).
-        let m = with_blocks(make_meta(10, 10, TxFlags::REASSIGNED));
+        let m = make_meta(10, 10, TxFlags::REASSIGNED);
         let (sig, patch) = evaluate_delete_at_height(&m, true, 0, 1000, 288).expect("no overflow");
         // Not all-spent (reassigned) and no DAH was set → no signal, no patch.
         assert_eq!(sig, Signal::None);
@@ -506,7 +492,7 @@ mod tests {
 
     #[test]
     fn unmined_tx_no_dah() {
-        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let m = make_meta(10, 10, TxFlags::empty());
         // has_blocks=true, unmined_since=500 (not on longest chain) — passed
         // explicitly rather than read off `m.unmined_since`, matching how a
         // caller sources this from the MinedIndex rather than the device.
@@ -524,7 +510,7 @@ mod tests {
     fn dah_overflow_errors_instead_of_saturating() {
         // u32::MAX - 5 + 10 would wrap to 4. saturating_add would clamp to
         // u32::MAX and pin the UTXO as unprunable. checked_add must error.
-        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let m = make_meta(10, 10, TxFlags::empty());
         let err = evaluate_delete_at_height(&m, true, 0, u32::MAX - 5, 10).unwrap_err();
         match err {
             SpendError::DahOverflow {
@@ -542,7 +528,7 @@ mod tests {
     fn dah_normal_height_returns_correct_sum() {
         // Sanity guard: for realistic BSV heights, checked_add matches
         // the documented behavior exactly.
-        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let m = make_meta(10, 10, TxFlags::empty());
         let (_sig, patch) = evaluate_delete_at_height(&m, true, 0, 800_000, 1000)
             .expect("no overflow at normal heights");
         let p = patch.expect("all-spent on-chain tx with blocks produces patch");
@@ -552,7 +538,7 @@ mod tests {
     #[test]
     fn dah_overflow_boundary_exact_u32_max() {
         // current + retention == u32::MAX exactly is the last legal value.
-        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let m = make_meta(10, 10, TxFlags::empty());
         let (_sig, patch) = evaluate_delete_at_height(&m, true, 0, u32::MAX - 1000, 1000)
             .expect("equal to u32::MAX is OK");
         let p = patch.unwrap();
@@ -562,7 +548,7 @@ mod tests {
     #[test]
     fn dah_overflow_one_past_boundary_errors() {
         // current + retention == u32::MAX + 1 must error.
-        let m = with_blocks(make_meta(10, 10, TxFlags::empty()));
+        let m = make_meta(10, 10, TxFlags::empty());
         let err = evaluate_delete_at_height(&m, true, 0, u32::MAX - 1000, 1001).unwrap_err();
         assert!(matches!(err, SpendError::DahOverflow { .. }));
     }

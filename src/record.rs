@@ -5,7 +5,7 @@
 //!
 //! # Record integrity
 //!
-//! [`TxMetadata`] embeds a CRC32 checksum computed over the entire 320-byte
+//! [`TxMetadata`] embeds a CRC32 checksum computed over the entire 256-byte
 //! header (with the checksum slot zeroed during computation). Each
 //! [`UtxoSlot`] also stores a CRC32 over its logical 69-byte payload. Every
 //! write recomputes the relevant CRC and every read validates it, returning
@@ -31,16 +31,22 @@ pub const UTXO_SLOT_CRC32_OFFSET: usize = UTXO_SLOT_PAYLOAD_SIZE;
 pub const UTXO_SLOT_SIZE: usize = UTXO_SLOT_PAYLOAD_SIZE + 4;
 
 /// Size of a single block entry in bytes.
+///
+/// Block entries live only in the in-RAM [`crate::index::mined_index`] now;
+/// they are no longer persisted inline in the on-device metadata header.
 pub const BLOCK_ENTRY_SIZE: usize = 12;
-
-/// Number of block entries stored inline in metadata.
-pub const INLINE_BLOCK_ENTRIES: usize = 3;
 
 /// Magic number identifying a valid TeraSlab record ("SLAB" in ASCII).
 pub const METADATA_MAGIC: u32 = 0x534C_4142;
 
 /// Current schema version.
-pub const METADATA_VERSION: u32 = 2;
+///
+/// Bumped 2 → 3 when the on-device inline block-entry region
+/// (`block_entry_count` + `block_entries_inline` + `block_overflow_offset`)
+/// was removed — mined-state now lives solely in the in-RAM MinedIndex and is
+/// recovered from the redo log. This is a breaking on-disk format change with
+/// no migration: old stores are not readable by this version.
+pub const METADATA_VERSION: u32 = 3;
 
 /// UTXO status: the output is unspent and available.
 pub const UTXO_UNSPENT: u8 = 0x00;
@@ -471,9 +477,6 @@ struct TxMetadataRaw {
     _pruned_utxos: u32,
     _generation: u32,
     _updated_at: u64,
-    _block_entry_count: u8,
-    _block_entries_inline: [BlockEntry; INLINE_BLOCK_ENTRIES],
-    _block_overflow_offset: u64,
     _reassignment_offset: u64,
     _reassignment_count: u8,
     _unmined_since: u32,
@@ -551,12 +554,6 @@ pub struct TxMetadata {
     /// Timestamp of last mutation (milliseconds since epoch).
     pub updated_at: u64,
 
-    /// Total block entries (inline + overflow).
-    pub block_entry_count: u8,
-    /// First 3 block entries stored inline.
-    pub block_entries_inline: [BlockEntry; INLINE_BLOCK_ENTRIES],
-    /// Device offset to overflow block (0 = no overflow).
-    pub block_overflow_offset: u64,
     /// Device offset to reassignment extension block (0 = none).
     pub reassignment_offset: u64,
     /// Number of reassignments recorded.
@@ -627,13 +624,6 @@ impl TxMetadata {
             pruned_utxos: 0,
             generation: 0,
             updated_at: 0,
-            block_entry_count: 0,
-            block_entries_inline: [BlockEntry {
-                block_id: 0,
-                block_height: 0,
-                subtree_idx: 0,
-            }; INLINE_BLOCK_ENTRIES],
-            block_overflow_offset: 0,
             reassignment_offset: 0,
             reassignment_count: 0,
             unmined_since: 0,
@@ -825,18 +815,14 @@ pub const RAW_META_OFF_TX_ID: usize = 16;
 pub const RAW_META_OFF_FLAGS: usize = 84;
 /// Byte offset of `spent_utxos` (u32 LE) within TxMetadata.
 pub const RAW_META_OFF_SPENT_UTXOS: usize = 97;
-/// Byte offset of `block_entry_count` (u8) within TxMetadata.
-pub const RAW_META_OFF_BLOCK_ENTRY_COUNT: usize = 117;
-/// Byte offset of `block_overflow_offset` (u64 LE) within TxMetadata.
-pub const RAW_META_OFF_BLOCK_OVERFLOW_OFFSET: usize = 154;
 /// Byte offset of `reassignment_offset` (u64 LE) within TxMetadata.
-pub const RAW_META_OFF_REASSIGNMENT_OFFSET: usize = 162;
+pub const RAW_META_OFF_REASSIGNMENT_OFFSET: usize = 117;
 /// Byte offset of `reassignment_count` (u8) within TxMetadata.
-pub const RAW_META_OFF_REASSIGNMENT_COUNT: usize = 170;
+pub const RAW_META_OFF_REASSIGNMENT_COUNT: usize = 125;
 /// Byte offset of `conflicting_children_count` (u8) within TxMetadata.
-pub const RAW_META_OFF_CONFLICTING_CHILDREN_COUNT: usize = 248;
+pub const RAW_META_OFF_CONFLICTING_CHILDREN_COUNT: usize = 203;
 /// Byte offset of `conflicting_children_offset` (u64 LE) within TxMetadata.
-pub const RAW_META_OFF_CONFLICTING_CHILDREN_OFFSET: usize = 249;
+pub const RAW_META_OFF_CONFLICTING_CHILDREN_OFFSET: usize = 204;
 
 const _: () = assert!(std::mem::offset_of!(TxMetadata, magic) == RAW_META_OFF_MAGIC);
 const _: () =
@@ -846,11 +832,6 @@ const _: () = assert!(std::mem::offset_of!(TxMetadata, utxo_count) == RAW_META_O
 const _: () = assert!(std::mem::offset_of!(TxMetadata, tx_id) == RAW_META_OFF_TX_ID);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, flags) == RAW_META_OFF_FLAGS);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, spent_utxos) == RAW_META_OFF_SPENT_UTXOS);
-const _: () =
-    assert!(std::mem::offset_of!(TxMetadata, block_entry_count) == RAW_META_OFF_BLOCK_ENTRY_COUNT);
-const _: () = assert!(
-    std::mem::offset_of!(TxMetadata, block_overflow_offset) == RAW_META_OFF_BLOCK_OVERFLOW_OFFSET
-);
 const _: () = assert!(
     std::mem::offset_of!(TxMetadata, reassignment_offset) == RAW_META_OFF_REASSIGNMENT_OFFSET
 );
@@ -970,7 +951,6 @@ impl std::fmt::Debug for TxMetadata {
             .field("flags", &self.flags)
             .field("spent_utxos", &{ self.spent_utxos })
             .field("generation", &{ self.generation })
-            .field("block_entry_count", &self.block_entry_count)
             .finish()
     }
 }
@@ -998,10 +978,13 @@ const _: () = assert!(UTXO_SLOT_PAYLOAD_SIZE == 69);
 const _: () = assert!(UTXO_SLOT_SIZE == 73);
 const _: () = assert!(std::mem::size_of::<TxFlags>() == 1);
 const _: () = assert!(METADATA_SIZE.is_multiple_of(64));
-// METADATA_SIZE is 320 bytes (grew from 256 to accommodate the trailing
-// `crc32` field — see task C7). The header is cache-line aligned and UTXO
-// slots live at a deterministic offset `METADATA_SIZE + vout * UTXO_SLOT_SIZE`.
-const _: () = assert!(METADATA_SIZE == 320);
+// METADATA_SIZE is 256 bytes. It was 320 while the inline block-entry region
+// (`block_entry_count` + `block_entries_inline` + `block_overflow_offset`,
+// 45 bytes) lived in the header; removing that region (mined-state now lives
+// only in the in-RAM MinedIndex) shrinks the padded header back to 256. The
+// header is cache-line aligned and UTXO slots live at a deterministic offset
+// `METADATA_SIZE + vout * UTXO_SLOT_SIZE`.
+const _: () = assert!(METADATA_SIZE == 256);
 const _: () = assert!(std::mem::size_of::<TxMetadata>() == METADATA_SIZE);
 // The CRC slot must sit inside the header (before the padding tail) so it
 // is covered by the checksum computation.
@@ -1475,17 +1458,6 @@ mod tests {
         meta.pruned_utxos = 3;
         meta.generation = 42;
         meta.updated_at = 1710000001000;
-        meta.block_entry_count = 2;
-        meta.block_entries_inline[0] = BlockEntry {
-            block_id: 1,
-            block_height: 800_000,
-            subtree_idx: 10,
-        };
-        meta.block_entries_inline[1] = BlockEntry {
-            block_id: 2,
-            block_height: 800_001,
-            subtree_idx: 20,
-        };
         meta.unmined_since = 799_000;
         meta.delete_at_height = 801_000;
         meta.preserve_until = 802_000;
@@ -1505,46 +1477,6 @@ mod tests {
         meta.to_bytes(&mut buf);
         let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
         assert_eq!({ restored.magic }, METADATA_MAGIC);
-    }
-
-    #[test]
-    fn metadata_zero_block_entries() {
-        let meta = TxMetadata::new(5);
-        assert_eq!(meta.block_entry_count, 0);
-        let mut buf = vec![0u8; METADATA_SIZE];
-        meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
-        assert_eq!(restored.block_entry_count, 0);
-    }
-
-    #[test]
-    fn metadata_three_block_entries() {
-        let mut meta = TxMetadata::new(10);
-        meta.block_entry_count = 3;
-        meta.block_entries_inline[0] = BlockEntry {
-            block_id: 100,
-            block_height: 1,
-            subtree_idx: 0,
-        };
-        meta.block_entries_inline[1] = BlockEntry {
-            block_id: 200,
-            block_height: 2,
-            subtree_idx: 1,
-        };
-        meta.block_entries_inline[2] = BlockEntry {
-            block_id: 300,
-            block_height: 3,
-            subtree_idx: 2,
-        };
-
-        let mut buf = vec![0u8; METADATA_SIZE];
-        meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
-
-        assert_eq!(restored.block_entry_count, 3);
-        assert_eq!({ restored.block_entries_inline[0].block_id }, 100);
-        assert_eq!({ restored.block_entries_inline[1].block_id }, 200);
-        assert_eq!({ restored.block_entries_inline[2].block_id }, 300);
     }
 
     #[test]
@@ -1646,33 +1578,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_block_entry_count_zero_ignores_inline() {
-        let mut meta = TxMetadata::new(5);
-        meta.block_entry_count = 0;
-        // Write garbage into inline entries — should be irrelevant when count is 0
-        meta.block_entries_inline[0] = BlockEntry {
-            block_id: 999,
-            block_height: 888,
-            subtree_idx: 777,
-        };
-        meta.block_entries_inline[1] = BlockEntry {
-            block_id: 111,
-            block_height: 222,
-            subtree_idx: 333,
-        };
-
-        let mut buf = vec![0u8; METADATA_SIZE];
-        meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
-
-        // The count must be 0, meaning a consumer should not read any inline entries.
-        assert_eq!(restored.block_entry_count, 0);
-        // The inline bytes still survive the round-trip (raw memcpy), but they
-        // are logically meaningless because count is 0.
-        assert_eq!(meta, restored);
-    }
-
-    #[test]
     fn identity_prefix_roundtrips() {
         let mut m = TxMetadata::new(7);
         m.tx_id = [0xAB; 32];
@@ -1739,45 +1644,6 @@ mod tests {
             b[IDENTITY_CRC_OFFSET..IDENTITY_CRC_OFFSET + 4],
             "identity CRC must not change when mutable fields change"
         );
-    }
-
-    #[test]
-    fn metadata_block_entry_count_3_inline_round_trip() {
-        let mut meta = TxMetadata::new(10);
-        meta.block_entry_count = INLINE_BLOCK_ENTRIES as u8;
-        meta.block_entries_inline[0] = BlockEntry {
-            block_id: 1000,
-            block_height: 500_000,
-            subtree_idx: 7,
-        };
-        meta.block_entries_inline[1] = BlockEntry {
-            block_id: 2000,
-            block_height: 500_001,
-            subtree_idx: 14,
-        };
-        meta.block_entries_inline[2] = BlockEntry {
-            block_id: 3000,
-            block_height: 500_002,
-            subtree_idx: 21,
-        };
-
-        let mut buf = vec![0u8; METADATA_SIZE];
-        meta.to_bytes(&mut buf);
-        let restored = TxMetadata::from_bytes(&buf).expect("valid CRC");
-
-        assert_eq!(restored.block_entry_count, 3);
-        for i in 0..INLINE_BLOCK_ENTRIES {
-            assert_eq!({ restored.block_entries_inline[i].block_id }, {
-                meta.block_entries_inline[i].block_id
-            });
-            assert_eq!({ restored.block_entries_inline[i].block_height }, {
-                meta.block_entries_inline[i].block_height
-            });
-            assert_eq!({ restored.block_entries_inline[i].subtree_idx }, {
-                meta.block_entries_inline[i].subtree_idx
-            });
-        }
-        assert_eq!(meta, restored);
     }
 
     #[test]
@@ -1895,13 +1761,6 @@ mod tests {
         meta.pruned_utxos = u32::MAX;
         meta.generation = u32::MAX;
         meta.updated_at = u64::MAX;
-        meta.block_entry_count = u8::MAX;
-        meta.block_entries_inline = [BlockEntry {
-            block_id: u32::MAX,
-            block_height: u32::MAX,
-            subtree_idx: u32::MAX,
-        }; INLINE_BLOCK_ENTRIES];
-        meta.block_overflow_offset = u64::MAX;
         meta.reassignment_offset = u64::MAX;
         meta.reassignment_count = u8::MAX;
         meta.unmined_since = u32::MAX;
@@ -1939,8 +1798,6 @@ mod tests {
         assert_eq!({ restored.pruned_utxos }, u32::MAX);
         assert_eq!({ restored.generation }, u32::MAX);
         assert_eq!({ restored.updated_at }, u64::MAX);
-        assert_eq!(restored.block_entry_count, u8::MAX);
-        assert_eq!({ restored.block_overflow_offset }, u64::MAX);
         assert_eq!({ restored.reassignment_offset }, u64::MAX);
         assert_eq!(restored.reassignment_count, u8::MAX);
         assert_eq!({ restored.unmined_since }, u32::MAX);
@@ -2087,7 +1944,7 @@ mod tests {
 // Golden vector — FIELD_RAW_METADATA cross-language anti-drift guard
 // ---------------------------------------------------------------------------
 //
-// This 320-byte vector is shared verbatim across three test sites:
+// This 256-byte vector is shared verbatim across three test sites:
 //   1. This file (`golden_vector_raw_metadata` below): asserts `to_bytes()`
 //      produces exactly these bytes.
 //   2. `client/rust/src/types.rs` tests: asserts `TxMetadataRaw::decode`
@@ -2103,38 +1960,33 @@ mod tests {
 // Sentinel values (deliberately non-zero and distinct so any offset bug
 // reads a mismatching neighbor's bytes instead of coincidentally landing on
 // another zero field):
-//   magic=0x534C4142, schema_version=2, record_size=0x11111111, utxo_count=7,
+//   magic=0x534C4142, schema_version=3, record_size=0x11111111, utxo_count=7,
 //   tx_id=[0xAB;32], flags=CONFLICTING|LOCKED (0x06), spent_utxos=3,
-//   block_entry_count=1, block_overflow_offset=0x4444444444444444,
 //   reassignment_offset=0x2222222222222222, reassignment_count=4,
 //   conflicting_children_count=5, conflicting_children_offset=0x3333333333333333.
-// `identity_crc` (offset 56) and `crc32` (offset 266) are computed by
+// `identity_crc` (offset 56) and `crc32` (offset 221) are computed by
 // `to_bytes()`, not hand-picked.
 #[cfg(test)]
 mod golden_vector_tests {
     use super::*;
 
     #[rustfmt::skip]
-    const GOLDEN_RAW_METADATA: [u8; 320] = [
-        0x42, 0x41, 0x4C, 0x53, 0x02, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x07, 0x00, 0x00, 0x00,
+    const GOLDEN_RAW_METADATA: [u8; 256] = [
+        0x42, 0x41, 0x4C, 0x53, 0x03, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x07, 0x00, 0x00, 0x00,
         0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
         0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x77, 0x89, 0xE1, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, 0x8B, 0x45, 0x88, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
-        0x44, 0x44, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x04, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
-        0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBB, 0xAC, 0x84, 0x03, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x33, 0x33, 0x33, 0x33,
+        0x33, 0x33, 0x33, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x8F, 0x14, 0x4E,
+        0x99, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
@@ -2145,8 +1997,6 @@ mod golden_vector_tests {
         meta.tx_id = [0xAB; 32];
         meta.flags = TxFlags::CONFLICTING | TxFlags::LOCKED;
         meta.spent_utxos = 3;
-        meta.block_entry_count = 1;
-        meta.block_overflow_offset = 0x4444_4444_4444_4444;
         meta.reassignment_offset = 0x2222_2222_2222_2222;
         meta.reassignment_count = 4;
         meta.conflicting_children_count = 5;
@@ -2161,7 +2011,7 @@ mod golden_vector_tests {
         let mut buf = [0u8; METADATA_SIZE];
         meta.to_bytes(&mut buf);
 
-        assert_eq!(METADATA_SIZE, 320, "METADATA_SIZE must stay 320 bytes");
+        assert_eq!(METADATA_SIZE, 256, "METADATA_SIZE must stay 256 bytes");
         assert_eq!(
             buf, GOLDEN_RAW_METADATA,
             "to_bytes() output no longer matches the pinned golden vector — \

@@ -512,13 +512,14 @@ impl ShardedMinedIndex {
     /// [`Self::alloc_created`] call on each shard reissues slots
     /// deterministically starting from 0.
     ///
-    /// Used by `Engine::rebuild_mined_index_from_device` to make its boot-time
-    /// device scan idempotent: without a clear, re-running the rebuild would
-    /// `alloc_created` a brand-new slot for every record on top of whatever
-    /// the previous run already allocated, leaking one slot per record per
-    /// repeat call. Safe to call here specifically because the rebuild runs
-    /// once at boot before the engine serves any traffic — there is no
-    /// concurrent reader/writer that could observe a shard mid-reset.
+    /// Used by `Engine::restore_mined_index_from_snapshot_entries` /
+    /// `Engine::recover_mined_index` to make the boot-time rebuild idempotent:
+    /// without a clear, re-running the rebuild would `alloc_created` a brand-new
+    /// slot for every record on top of whatever the previous run already
+    /// allocated, leaking one slot per record per repeat call. Safe to call
+    /// here specifically because the rebuild runs once at boot before the
+    /// engine serves any traffic — there is no concurrent reader/writer that
+    /// could observe a shard mid-reset.
     pub fn clear(&self) {
         for shard in self.shards.iter() {
             *shard.lock() = MinedShard::default();

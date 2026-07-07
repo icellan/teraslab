@@ -5044,11 +5044,11 @@ mod tests {
         let restored_gen = { meta.generation };
         assert_eq!(restored_gen, 5);
 
-        // Verify block entry was applied.
-        let block_count = { meta.block_entry_count };
-        assert_eq!(block_count, 1);
-        let be_id = { meta.block_entries_inline[0].block_id };
-        assert_eq!(be_id, 42);
+        // Verify the block entry was applied to the MinedIndex (mined-state
+        // lives there now, not on the device).
+        let (entries, _unmined) = engine.mined_block_entries(&k).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!({ entries[0].block_id }, 42);
     }
 
     /// Task 1 (crash-safety), replication path: an already-mined REPLICATED
@@ -5216,9 +5216,9 @@ mod tests {
 
         let slot = engine.read_slot(&k, 0).unwrap();
         assert_eq!(slot.status, UTXO_UNSPENT);
-        let meta = engine.read_metadata(&k).unwrap();
-        let block_count = { meta.block_entry_count };
-        assert_eq!(block_count, 0); // No block entries in 46-byte format
+        // No block entries in the 46-byte format → the MinedIndex has none.
+        let (entries, _unmined) = engine.mined_block_entries(&k).unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]

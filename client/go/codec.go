@@ -883,9 +883,9 @@ func DecodeTxMetadata(fieldMask uint32, data []byte) (*TxMetadata, int, error) {
 }
 
 // RawMetadataSize is the byte size of the full on-disk metadata struct (FIELD_RAW_METADATA).
-const RawMetadataSize = 320
+const RawMetadataSize = 256
 
-// DecodeTxMetadataRaw parses the full 320-byte on-disk metadata struct returned
+// DecodeTxMetadataRaw parses the full 256-byte on-disk metadata struct returned
 // by FIELD_RAW_METADATA. The raw bytes are preserved for inspection, and key
 // internal fields are parsed into convenience accessors. For debugging only.
 //
@@ -915,21 +915,22 @@ const RawMetadataSize = 320
 //	101: pruned_utxos (u32)
 //	105: generation (u32)
 //	109: updated_at (u64)
-//	117: block_entry_count (u8)
-//	118: block_entries_inline (3 x BlockEntry(12) = 36)
-//	154: block_overflow_offset (u64)
-//	162: reassignment_offset (u64)
-//	170: reassignment_count (u8)
-//	171: unmined_since (u32)
-//	175: delete_at_height (u32)
-//	179: preserve_until (u32)
-//	183: external_ref (ExternalRef = 65 bytes)
-//	248: conflicting_children_count (u8)
-//	249: conflicting_children_offset (u64)
-//	257: deleted_children_count (u8)
-//	258: deleted_children_offset (u64)
-//	266: crc32 (u32)
-//	270: _padding (50 bytes to reach 320)
+//	117: reassignment_offset (u64)
+//	125: reassignment_count (u8)
+//	126: unmined_since (u32)
+//	130: delete_at_height (u32)
+//	134: preserve_until (u32)
+//	138: external_ref (ExternalRef = 65 bytes)
+//	203: conflicting_children_count (u8)
+//	204: conflicting_children_offset (u64)
+//	212: deleted_children_count (u8)
+//	213: deleted_children_offset (u64)
+//	221: crc32 (u32)
+//	225: _padding (31 bytes to reach 256)
+//
+// The on-device inline block-entry region (block_entry_count +
+// block_entries_inline + block_overflow_offset) was removed — mined state now
+// lives only in the server's in-RAM MinedIndex.
 func DecodeTxMetadataRaw(data []byte) (*TxMetadataRaw, error) {
 	if len(data) < RawMetadataSize {
 		return nil, fmt.Errorf("raw metadata: need %d bytes, have %d", RawMetadataSize, len(data))
@@ -941,12 +942,10 @@ func DecodeTxMetadataRaw(data []byte) (*TxMetadataRaw, error) {
 		UtxoCount:                 getU32(data[12:16]),
 		Flags:                     data[84],
 		SpentUtxos:                getU32(data[97:101]),
-		BlockEntryCount:           data[117],
-		BlockOverflowOffset:       getU64(data[154:162]),
-		ReassignmentOffset:        getU64(data[162:170]),
-		ReassignmentCount:         data[170],
-		ConflictingChildrenCount:  data[248],
-		ConflictingChildrenOffset: getU64(data[249:257]),
+		ReassignmentOffset:        getU64(data[117:125]),
+		ReassignmentCount:         data[125],
+		ConflictingChildrenCount:  data[203],
+		ConflictingChildrenOffset: getU64(data[204:212]),
 	}
 	copy(raw.Bytes[:], data[:RawMetadataSize])
 	copy(raw.TxID[:], data[16:48])
@@ -973,19 +972,19 @@ func DecodeUtxoSlots(data []byte) ([]UtxoSlot, error) {
 	return slots, nil
 }
 
-// MaxInlineBlockEntries is the number of block entries carried in a record's
-// inline metadata. Transactions mined into more blocks than this store the
-// surplus on disk behind block_overflow_offset, which is not reachable through
-// the inline GetBatch response.
+// MaxInlineBlockEntries is the number of block entries the inline BLOCK_ENTRIES
+// GetBatch field ships. Transactions mined into more blocks than this keep the
+// surplus in the server's in-RAM MinedIndex; fetch the full set with the
+// BLOCK_ENTRIES_ALL field.
 const MaxInlineBlockEntries = 3
 
 // DecodeBlockEntries parses the inline block entries section from a
 // GetResult.Data field.
 //
 // At most MaxInlineBlockEntries entries are returned: records mined into more
-// blocks keep the overflow on disk behind block_overflow_offset, which this
-// inline decode does not follow. Use DecodeBlockEntriesWithCount to detect when
-// entries were omitted.
+// blocks keep the surplus in the server's MinedIndex, which this inline decode
+// does not fetch. Use DecodeBlockEntriesWithCount to detect when entries were
+// omitted, or request the BLOCK_ENTRIES_ALL field for the complete set.
 func DecodeBlockEntries(data []byte) ([]BlockEntry, error) {
 	entries, _, err := DecodeBlockEntriesWithCount(data)
 	return entries, err
@@ -994,7 +993,8 @@ func DecodeBlockEntries(data []byte) ([]BlockEntry, error) {
 // DecodeBlockEntriesWithCount is like DecodeBlockEntries but also returns the
 // total number of block entries the record declares (the on-wire count byte).
 // When total > len(entries) the inline section was capped at
-// MaxInlineBlockEntries and the remaining entries live in on-disk overflow.
+// MaxInlineBlockEntries and the remaining entries live in the server's
+// MinedIndex (fetch them with the BLOCK_ENTRIES_ALL field).
 func DecodeBlockEntriesWithCount(data []byte) (entries []BlockEntry, total int, err error) {
 	if len(data) < 1 {
 		return nil, 0, fmt.Errorf("block entries: need 1 byte, have %d", len(data))

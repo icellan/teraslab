@@ -11268,35 +11268,32 @@ mod tests {
     /// Task 1 (crash-safety): an already-mined create must emit a companion
     /// `SetMinedBatch` into the SAME redo batch as its `Create`/`CreateV2` so
     /// that after a crash in the post-checkpoint redo-tail window the recovered
-    /// MinedIndex restores the mined-at-creation block WITHOUT reading the
-    /// on-device `block_entries_inline` (the region Task 2 deletes).
+    /// MinedIndex restores the mined-at-creation block. Task 2 then removed the
+    /// on-device inline block-entry region entirely, so the companion is the
+    /// SOLE carrier of mined-at-creation state through recovery.
     ///
     /// Drives the real `handle_create_batch` emission path, then:
     ///   1. asserts the companion is present in the redo log alongside the
     ///      create, co-flushed (single-log `recover()`; companion sequenced
     ///      strictly after its create so replay resolves the slot the create
     ///      arm populated);
-    ///   2. ZEROES the record's on-device inline block-entry region (recomputing
-    ///      the CRC so the record still decodes) to prove recovery no longer
-    ///      depends on it;
+    ///   2. (the device carries no mined-state to wipe — the inline region is
+    ///      gone — so recovery structurally cannot depend on it);
     ///   3. replays the redo tail into a FRESH MinedIndex and asserts the record
     ///      recovers MINED with the exact block_id/height/subtree,
     ///      unmined_since==0, all_spent==false, and EXACTLY ONE block entry
     ///      (no double-apply).
     ///
-    /// RED before the companion existed (no `SetMinedBatch` emitted + the
-    /// zeroed inline => mining lost on recovery); GREEN after. Run for BOTH
-    /// durability modes — strict emits `RedoOp::Create` (mining recovered from
-    /// the companion; the create's own embedded `record_bytes` inline region is
-    /// likewise ignored, see the engine unit test
+    /// RED before the companion existed (no `SetMinedBatch` emitted => mining
+    /// lost on recovery); GREEN after. Run for BOTH durability modes — strict
+    /// emits `RedoOp::Create` (mining recovered from the companion; the
+    /// create's own embedded `record_bytes` carry no mined-state either, see
+    /// the engine unit test
     /// `create_arm_does_not_seed_mining_from_inline_block_entries`), buffered
-    /// emits the index-only `RedoOp::CreateV2` (which would otherwise read the
-    /// now-zeroed device region).
+    /// emits the index-only `RedoOp::CreateV2`.
     fn already_mined_create_recovers_mining_from_companion(buffered: bool) {
-        use crate::device::AlignedBuf;
         use crate::index::TxIndexEntry;
         use crate::index::mined_index::{MINED_ALL_SPENT, NO_MINED_SLOT};
-        use crate::record::{BlockEntry, INLINE_BLOCK_ENTRIES, METADATA_SIZE, TxMetadata};
 
         let _g = metrics_test_lock();
         let data_dev: Arc<dyn BlockDevice> =
@@ -11415,38 +11412,12 @@ mod tests {
              replay arm resolves the slot the create arm just populated in tail_slots"
         );
 
-        // (2) Zero the record's on-device inline block-entry region, recomputing
-        // the CRC so the record still decodes — proving recovery does not read it.
-        {
-            let mut buf = AlignedBuf::new(4096, 4096);
-            data_dev
-                .pread(&mut buf[..], entry.record_offset)
-                .expect("read record block");
-            let mut meta =
-                TxMetadata::from_bytes(&buf[..METADATA_SIZE]).expect("decode record metadata");
-            meta.block_entry_count = 0;
-            meta.block_entries_inline = [BlockEntry {
-                block_id: 0,
-                block_height: 0,
-                subtree_idx: 0,
-            }; INLINE_BLOCK_ENTRIES];
-            meta.to_bytes(&mut buf[..METADATA_SIZE]);
-            data_dev
-                .pwrite(&buf[..], entry.record_offset)
-                .expect("rewrite zeroed metadata");
-            // Confirm the wipe landed (guards against a silent no-op).
-            let mut check = AlignedBuf::new(4096, 4096);
-            data_dev
-                .pread(&mut check[..], entry.record_offset)
-                .expect("re-read record block");
-            let re =
-                TxMetadata::from_bytes(&check[..METADATA_SIZE]).expect("zeroed metadata decodes");
-            assert_eq!(
-                { re.block_entry_count },
-                0,
-                "device inline block-entry region must be zeroed"
-            );
-        }
+        // (2) Recovery cannot depend on any on-device mined-state: Task 2
+        // removed the inline block-entry region from the record header
+        // entirely, so there is nothing on the device to carry mining. The
+        // companion `SetMinedBatch` (asserted present above) is the sole
+        // carrier through the redo tail — proven by the fresh-recovery step
+        // below.
 
         // (3) Recover a FRESH MinedIndex from the redo tail alone.
         let fresh = crate::index::ShardedIndex::from_single(Index::new(10_000).unwrap().into());
@@ -14182,8 +14153,8 @@ mod tests {
             "mined on the longest chain must clear unmined_since in the MinedIndex"
         );
         assert!(
-            mined_entries.len() > crate::record::INLINE_BLOCK_ENTRIES,
-            "test setup must actually produce an overflow entry"
+            mined_entries.len() > 3,
+            "test setup must actually produce more than the 3-entry wire cap"
         );
         let mined_count = mined_entries.len() as u8;
 
