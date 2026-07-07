@@ -354,7 +354,7 @@ Available field masks (combine with `|`):
 | `FieldColdData` | `1 << 20` | Full transaction inputs/outputs |
 | `FieldBlockEntries` | `1 << 21` | Block entries (block ID, height, subtree index) |
 | `FieldConflictingChildren` | `1 << 22` | Conflicting child transaction IDs |
-| `FieldRawMetadata` | `1 << 23` | Full 256-byte on-disk metadata (debugging only) |
+| `FieldRawMetadata` | `1 << 23` | Full 320-byte on-disk metadata (debugging only) |
 | `FieldAllMetadata` | `0x0007_FFFF` | All metadata fields (bits 0-18) |
 | `FieldAll` | `0x007F_FFFF` | All client-facing fields (bits 0-22) |
 

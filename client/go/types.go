@@ -434,13 +434,13 @@ type TxMetadata struct {
 	BlockEntryCount uint8
 }
 
-// TxMetadataRaw contains the full 256-byte on-disk metadata struct returned
+// TxMetadataRaw contains the full 320-byte on-disk metadata struct returned
 // by FIELD_RAW_METADATA. Includes internal storage details for debugging.
 //
 // Decode with DecodeTxMetadataRaw.
 type TxMetadataRaw struct {
-	// Bytes is the raw 256-byte on-disk representation.
-	Bytes [256]byte
+	// Bytes is the raw 320-byte on-disk representation.
+	Bytes [320]byte
 
 	// Parsed convenience accessors for commonly inspected fields:
 	Magic                     uint32

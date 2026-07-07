@@ -16,7 +16,7 @@ type TxRecord struct {
 	Metadata *TxMetadata
 
 	// RawMetadata is non-nil when FieldRawMetadata was requested.
-	// Contains the full 256-byte on-disk struct for debugging.
+	// Contains the full 320-byte on-disk struct for debugging.
 	RawMetadata *TxMetadataRaw
 
 	// Slots contains one entry per UTXO output.  Non-nil when FieldUtxoSlots

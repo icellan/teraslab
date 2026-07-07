@@ -883,11 +883,53 @@ func DecodeTxMetadata(fieldMask uint32, data []byte) (*TxMetadata, int, error) {
 }
 
 // RawMetadataSize is the byte size of the full on-disk metadata struct (FIELD_RAW_METADATA).
-const RawMetadataSize = 256
+const RawMetadataSize = 320
 
-// DecodeTxMetadataRaw parses the full 256-byte on-disk metadata struct returned
+// DecodeTxMetadataRaw parses the full 320-byte on-disk metadata struct returned
 // by FIELD_RAW_METADATA. The raw bytes are preserved for inspection, and key
 // internal fields are parsed into convenience accessors. For debugging only.
+//
+// The on-disk layout is repr(C, packed) TxMetadata from src/record.rs. These
+// offsets are pinned server-side by offset_of! compile-time asserts
+// (RAW_META_OFF_* in src/record.rs) and by the golden_vector_raw_metadata
+// test, so a server-side layout change breaks the build/test loudly instead
+// of silently drifting this client out of sync again.
+//
+// Offsets (from record.rs TxMetadata):
+//
+//	  0: magic (u32)
+//	  4: schema_version (u32)
+//	  8: record_size (u32)
+//	 12: utxo_count (u32)
+//	 16: tx_id ([u8; 32])
+//	 48: tx_version (u32)
+//	 52: locktime (u32)
+//	 56: identity_crc (u32)
+//	 60: fee (u64)
+//	 68: size_in_bytes (u64)
+//	 76: extended_size (u64)
+//	 84: flags (u8)
+//	 85: spending_height (u32)
+//	 89: created_at (u64)
+//	 97: spent_utxos (u32)
+//	101: pruned_utxos (u32)
+//	105: generation (u32)
+//	109: updated_at (u64)
+//	117: block_entry_count (u8)
+//	118: block_entries_inline (3 x BlockEntry(12) = 36)
+//	154: block_overflow_offset (u64)
+//	162: reassignment_offset (u64)
+//	170: reassignment_count (u8)
+//	171: unmined_since (u32)
+//	175: delete_at_height (u32)
+//	179: preserve_until (u32)
+//	183: external_ref (ExternalRef = 65 bytes)
+//	248: conflicting_children_count (u8)
+//	249: conflicting_children_offset (u64)
+//	257: deleted_children_count (u8)
+//	258: deleted_children_offset (u64)
+//	266: crc32 (u32)
+//	270: _padding (50 bytes to reach 320)
 func DecodeTxMetadataRaw(data []byte) (*TxMetadataRaw, error) {
 	if len(data) < RawMetadataSize {
 		return nil, fmt.Errorf("raw metadata: need %d bytes, have %d", RawMetadataSize, len(data))
@@ -897,14 +939,14 @@ func DecodeTxMetadataRaw(data []byte) (*TxMetadataRaw, error) {
 		SchemaVersion:             getU32(data[4:8]),
 		RecordSize:                getU32(data[8:12]),
 		UtxoCount:                 getU32(data[12:16]),
-		Flags:                     data[80],
-		SpentUtxos:                getU32(data[93:97]),
-		BlockEntryCount:           data[113],
-		BlockOverflowOffset:       getU64(data[150:158]),
-		ReassignmentOffset:        getU64(data[158:166]),
-		ReassignmentCount:         data[166],
-		ConflictingChildrenCount:  data[244],
-		ConflictingChildrenOffset: getU64(data[245:253]),
+		Flags:                     data[84],
+		SpentUtxos:                getU32(data[97:101]),
+		BlockEntryCount:           data[117],
+		BlockOverflowOffset:       getU64(data[154:162]),
+		ReassignmentOffset:        getU64(data[162:170]),
+		ReassignmentCount:         data[170],
+		ConflictingChildrenCount:  data[248],
+		ConflictingChildrenOffset: getU64(data[249:257]),
 	}
 	copy(raw.Bytes[:], data[:RawMetadataSize])
 	copy(raw.TxID[:], data[16:48])

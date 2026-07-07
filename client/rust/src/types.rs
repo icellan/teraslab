@@ -1090,7 +1090,7 @@ impl TxMetadata {
 }
 
 /// The byte size of the raw on-disk metadata struct (FIELD_RAW_METADATA).
-pub const RAW_METADATA_SIZE: usize = 256;
+pub const RAW_METADATA_SIZE: usize = 320;
 
 /// Full on-disk metadata struct returned by [`FIELD_RAW_METADATA`].
 ///
@@ -1100,7 +1100,7 @@ pub const RAW_METADATA_SIZE: usize = 256;
 /// Decode with [`TxMetadataRaw::decode`].
 #[derive(Debug, Clone)]
 pub struct TxMetadataRaw {
-    /// Raw 256-byte on-disk representation.
+    /// Raw 320-byte on-disk representation.
     pub bytes: [u8; RAW_METADATA_SIZE],
     // Parsed convenience accessors for the most commonly inspected fields:
     /// Magic number (should be 0x534C4142 = "SLAB").
@@ -1135,7 +1135,7 @@ impl TxMetadataRaw {
     /// Decode the full on-disk metadata struct from a [`FIELD_RAW_METADATA`]
     /// response.
     ///
-    /// The data must be at least 256 bytes.
+    /// The data must be at least 320 bytes.
     ///
     /// # Errors
     ///
@@ -1154,10 +1154,15 @@ impl TxMetadataRaw {
         let mut tx_id = [0u8; 32];
         tx_id.copy_from_slice(&data[16..48]);
 
-        // The on-disk layout is repr(C, packed) TxMetadataRaw from record.rs.
+        // The on-disk layout is repr(C, packed) TxMetadata from record.rs.
         // We parse the key fields by their known offsets in that struct.
+        // These offsets are pinned server-side by `offset_of!` compile-time
+        // asserts (`RAW_META_OFF_*` in src/record.rs) and by the
+        // `golden_vector_raw_metadata` test, so a server-side layout change
+        // breaks the build/test loudly instead of silently drifting the
+        // clients out of sync again.
         //
-        // Offsets (from record.rs TxMetadataRaw):
+        // Offsets (from record.rs TxMetadata):
         //   0: magic (u32)
         //   4: schema_version (u32)
         //   8: record_size (u32)
@@ -1165,28 +1170,32 @@ impl TxMetadataRaw {
         //  16: tx_id ([u8; 32])
         //  48: tx_version (u32)
         //  52: locktime (u32)
-        //  56: fee (u64)
-        //  64: size_in_bytes (u64)
-        //  72: extended_size (u64)
-        //  80: flags (u8)
-        //  81: spending_height (u32)
-        //  85: created_at (u64)
-        //  93: spent_utxos (u32)
-        //  97: pruned_utxos (u32)
-        // 101: generation (u32)
-        // 105: updated_at (u64)
-        // 113: block_entry_count (u8)
-        // 114: block_entries_inline (3 × BlockEntry(12) = 36)
-        // 150: block_overflow_offset (u64)
-        // 158: reassignment_offset (u64)
-        // 166: reassignment_count (u8)
-        // 167: unmined_since (u32)
-        // 171: delete_at_height (u32)
-        // 175: preserve_until (u32)
-        // 179: external_ref (ExternalRef = 65 bytes)
-        // 244: conflicting_children_count (u8)
-        // 245: conflicting_children_offset (u64)
-        // 253: _padding (3 bytes to reach 256)
+        //  56: identity_crc (u32)
+        //  60: fee (u64)
+        //  68: size_in_bytes (u64)
+        //  76: extended_size (u64)
+        //  84: flags (u8)
+        //  85: spending_height (u32)
+        //  89: created_at (u64)
+        //  97: spent_utxos (u32)
+        // 101: pruned_utxos (u32)
+        // 105: generation (u32)
+        // 109: updated_at (u64)
+        // 117: block_entry_count (u8)
+        // 118: block_entries_inline (3 × BlockEntry(12) = 36)
+        // 154: block_overflow_offset (u64)
+        // 162: reassignment_offset (u64)
+        // 170: reassignment_count (u8)
+        // 171: unmined_since (u32)
+        // 175: delete_at_height (u32)
+        // 179: preserve_until (u32)
+        // 183: external_ref (ExternalRef = 65 bytes)
+        // 248: conflicting_children_count (u8)
+        // 249: conflicting_children_offset (u64)
+        // 257: deleted_children_count (u8)
+        // 258: deleted_children_offset (u64)
+        // 266: crc32 (u32)
+        // 270: _padding (50 bytes to reach 320)
 
         Ok(Self {
             bytes,
@@ -1195,14 +1204,14 @@ impl TxMetadataRaw {
             record_size: u32::from_le_bytes(data[8..12].try_into().unwrap()),
             utxo_count: u32::from_le_bytes(data[12..16].try_into().unwrap()),
             tx_id,
-            flags: data[80],
-            spent_utxos: u32::from_le_bytes(data[93..97].try_into().unwrap()),
-            block_entry_count: data[113],
-            block_overflow_offset: u64::from_le_bytes(data[150..158].try_into().unwrap()),
-            reassignment_offset: u64::from_le_bytes(data[158..166].try_into().unwrap()),
-            reassignment_count: data[166],
-            conflicting_children_count: data[244],
-            conflicting_children_offset: u64::from_le_bytes(data[245..253].try_into().unwrap()),
+            flags: data[84],
+            spent_utxos: u32::from_le_bytes(data[97..101].try_into().unwrap()),
+            block_entry_count: data[117],
+            block_overflow_offset: u64::from_le_bytes(data[154..162].try_into().unwrap()),
+            reassignment_offset: u64::from_le_bytes(data[162..170].try_into().unwrap()),
+            reassignment_count: data[170],
+            conflicting_children_count: data[248],
+            conflicting_children_offset: u64::from_le_bytes(data[249..257].try_into().unwrap()),
         })
     }
 }
@@ -1410,7 +1419,7 @@ pub const FIELD_COLD_DATA: u32 = 1 << 20;
 pub const FIELD_BLOCK_ENTRIES: u32 = 1 << 21;
 /// Include conflicting children txids in GetBatch response (variable).
 pub const FIELD_CONFLICTING_CHILDREN: u32 = 1 << 22;
-/// Include the raw on-disk metadata struct (256 bytes, for debugging).
+/// Include the raw on-disk metadata struct (320 bytes, for debugging).
 /// When set, the full struct is returned as-is including internal fields.
 /// Takes precedence over per-field metadata bits if both are set.
 pub const FIELD_RAW_METADATA: u32 = 1 << 23;
@@ -1521,5 +1530,63 @@ mod tests {
         assert_eq!(entries.len(), 3, "inline decode must remain capped at 3");
         assert_eq!(entries[0].block_id, 100);
         assert_eq!(entries[2].subtree_idx, 2);
+    }
+
+    // -- FIELD_RAW_METADATA golden vector (cross-language anti-drift guard) --
+    //
+    // This 320-byte vector is byte-for-byte identical to `GOLDEN_RAW_METADATA`
+    // in `src/record.rs` (server) and `golden_vectors_test.go` (Go client). It
+    // is generated by constructing a known `TxMetadata` record server-side and
+    // serializing it with `to_bytes()` — see the doc comment on
+    // `golden_vector_tests` in `src/record.rs` for the sentinel values and
+    // regeneration instructions. Do not hand-edit these bytes.
+    #[rustfmt::skip]
+    const GOLDEN_RAW_METADATA: [u8; 320] = [
+        0x42, 0x41, 0x4C, 0x53, 0x02, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x07, 0x00, 0x00, 0x00,
+        0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
+        0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x77, 0x89, 0xE1, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+        0x44, 0x44, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+        0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBB, 0xAC, 0x84, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn decode_raw_metadata_golden_vector() {
+        let raw = TxMetadataRaw::decode(&GOLDEN_RAW_METADATA)
+            .expect("golden vector must decode as valid raw metadata");
+
+        assert_eq!(raw.magic, 0x534C_4142);
+        assert_eq!(raw.schema_version, 2);
+        assert_eq!(raw.record_size, 0x1111_1111);
+        assert_eq!(raw.utxo_count, 7);
+        assert_eq!(raw.tx_id, [0xAB; 32]);
+        assert_eq!(raw.flags, 0x06);
+        assert_eq!(raw.spent_utxos, 3);
+        assert_eq!(raw.block_entry_count, 1);
+        assert_eq!(raw.block_overflow_offset, 0x4444_4444_4444_4444);
+        assert_eq!(raw.reassignment_offset, 0x2222_2222_2222_2222);
+        assert_eq!(raw.reassignment_count, 4);
+        assert_eq!(raw.conflicting_children_count, 5);
+        assert_eq!(raw.conflicting_children_offset, 0x3333_3333_3333_3333);
+        assert_eq!(raw.bytes, GOLDEN_RAW_METADATA);
+    }
+
+    #[test]
+    fn raw_metadata_size_is_320() {
+        assert_eq!(RAW_METADATA_SIZE, 320);
     }
 }

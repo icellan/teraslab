@@ -798,6 +798,74 @@ const _: () = assert!(std::mem::offset_of!(TxMetadata, locktime) + 4 == IDENTITY
 const _: () = assert!(std::mem::offset_of!(TxMetadata, utxo_count) + 4 <= IDENTITY_PREFIX_LEN);
 const _: () = assert!(std::mem::offset_of!(TxMetadata, tx_id) + 32 <= IDENTITY_PREFIX_LEN);
 
+// ---------------------------------------------------------------------------
+// FIELD_RAW_METADATA client-exposed offsets
+// ---------------------------------------------------------------------------
+//
+// Both language clients (`client/rust/src/types.rs::TxMetadataRaw::decode`,
+// `client/go/codec.go::DecodeTxMetadataRaw`) hardcode these byte offsets to
+// parse the raw on-disk `TxMetadata` header returned by `FIELD_RAW_METADATA`.
+// They previously drifted 4 bytes stale (predating `identity_crc`) because
+// nothing pinned them to the real struct layout. These `offset_of!` asserts
+// are that anti-drift guard: if the struct layout ever changes, the build
+// fails here instead of the clients silently decoding garbage. Keep this set
+// in sync with the field list the clients actually parse — do not add fields
+// here that the clients don't expose.
+/// Byte offset of `magic` (u32 LE) within TxMetadata.
+pub const RAW_META_OFF_MAGIC: usize = 0;
+/// Byte offset of `schema_version` (u32 LE) within TxMetadata.
+pub const RAW_META_OFF_SCHEMA_VERSION: usize = 4;
+/// Byte offset of `record_size` (u32 LE) within TxMetadata.
+pub const RAW_META_OFF_RECORD_SIZE: usize = 8;
+/// Byte offset of `utxo_count` (u32 LE) within TxMetadata.
+pub const RAW_META_OFF_UTXO_COUNT: usize = 12;
+/// Byte offset of `tx_id` (32 bytes) within TxMetadata.
+pub const RAW_META_OFF_TX_ID: usize = 16;
+/// Byte offset of `flags` (u8) within TxMetadata.
+pub const RAW_META_OFF_FLAGS: usize = 84;
+/// Byte offset of `spent_utxos` (u32 LE) within TxMetadata.
+pub const RAW_META_OFF_SPENT_UTXOS: usize = 97;
+/// Byte offset of `block_entry_count` (u8) within TxMetadata.
+pub const RAW_META_OFF_BLOCK_ENTRY_COUNT: usize = 117;
+/// Byte offset of `block_overflow_offset` (u64 LE) within TxMetadata.
+pub const RAW_META_OFF_BLOCK_OVERFLOW_OFFSET: usize = 154;
+/// Byte offset of `reassignment_offset` (u64 LE) within TxMetadata.
+pub const RAW_META_OFF_REASSIGNMENT_OFFSET: usize = 162;
+/// Byte offset of `reassignment_count` (u8) within TxMetadata.
+pub const RAW_META_OFF_REASSIGNMENT_COUNT: usize = 170;
+/// Byte offset of `conflicting_children_count` (u8) within TxMetadata.
+pub const RAW_META_OFF_CONFLICTING_CHILDREN_COUNT: usize = 248;
+/// Byte offset of `conflicting_children_offset` (u64 LE) within TxMetadata.
+pub const RAW_META_OFF_CONFLICTING_CHILDREN_OFFSET: usize = 249;
+
+const _: () = assert!(std::mem::offset_of!(TxMetadata, magic) == RAW_META_OFF_MAGIC);
+const _: () =
+    assert!(std::mem::offset_of!(TxMetadata, schema_version) == RAW_META_OFF_SCHEMA_VERSION);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, record_size) == RAW_META_OFF_RECORD_SIZE);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, utxo_count) == RAW_META_OFF_UTXO_COUNT);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, tx_id) == RAW_META_OFF_TX_ID);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, flags) == RAW_META_OFF_FLAGS);
+const _: () = assert!(std::mem::offset_of!(TxMetadata, spent_utxos) == RAW_META_OFF_SPENT_UTXOS);
+const _: () =
+    assert!(std::mem::offset_of!(TxMetadata, block_entry_count) == RAW_META_OFF_BLOCK_ENTRY_COUNT);
+const _: () = assert!(
+    std::mem::offset_of!(TxMetadata, block_overflow_offset) == RAW_META_OFF_BLOCK_OVERFLOW_OFFSET
+);
+const _: () = assert!(
+    std::mem::offset_of!(TxMetadata, reassignment_offset) == RAW_META_OFF_REASSIGNMENT_OFFSET
+);
+const _: () = assert!(
+    std::mem::offset_of!(TxMetadata, reassignment_count) == RAW_META_OFF_REASSIGNMENT_COUNT
+);
+const _: () = assert!(
+    std::mem::offset_of!(TxMetadata, conflicting_children_count)
+        == RAW_META_OFF_CONFLICTING_CHILDREN_COUNT
+);
+const _: () = assert!(
+    std::mem::offset_of!(TxMetadata, conflicting_children_offset)
+        == RAW_META_OFF_CONFLICTING_CHILDREN_OFFSET
+);
+
 /// The immutable identity of a record, extractable from just its first
 /// cache line via [`TxMetadata::read_identity_from`].
 ///
@@ -2012,5 +2080,93 @@ mod tests {
             );
         }
         assert_eq!(slot, restored);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Golden vector — FIELD_RAW_METADATA cross-language anti-drift guard
+// ---------------------------------------------------------------------------
+//
+// This 320-byte vector is shared verbatim across three test sites:
+//   1. This file (`golden_vector_raw_metadata` below): asserts `to_bytes()`
+//      produces exactly these bytes.
+//   2. `client/rust/src/types.rs` tests: asserts `TxMetadataRaw::decode`
+//      recovers every sentinel value from these same bytes.
+//   3. `client/go/golden_vectors_test.go`: same assertion, Go client.
+//
+// If the on-disk `TxMetadata` layout ever changes, this server-side assertion
+// fails first (loudly, in CI), rather than the clients silently drifting out
+// of sync with the wire format again (the bug this test suite exists to
+// prevent). All three copies must stay byte-for-byte identical; regenerate
+// by constructing the same golden record and printing `to_bytes()`.
+//
+// Sentinel values (deliberately non-zero and distinct so any offset bug
+// reads a mismatching neighbor's bytes instead of coincidentally landing on
+// another zero field):
+//   magic=0x534C4142, schema_version=2, record_size=0x11111111, utxo_count=7,
+//   tx_id=[0xAB;32], flags=CONFLICTING|LOCKED (0x06), spent_utxos=3,
+//   block_entry_count=1, block_overflow_offset=0x4444444444444444,
+//   reassignment_offset=0x2222222222222222, reassignment_count=4,
+//   conflicting_children_count=5, conflicting_children_offset=0x3333333333333333.
+// `identity_crc` (offset 56) and `crc32` (offset 266) are computed by
+// `to_bytes()`, not hand-picked.
+#[cfg(test)]
+mod golden_vector_tests {
+    use super::*;
+
+    #[rustfmt::skip]
+    const GOLDEN_RAW_METADATA: [u8; 320] = [
+        0x42, 0x41, 0x4C, 0x53, 0x02, 0x00, 0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x07, 0x00, 0x00, 0x00,
+        0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
+        0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x27, 0x77, 0x89, 0xE1, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44,
+        0x44, 0x44, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+        0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBB, 0xAC, 0x84, 0x03, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// Builds the shared golden record. Kept in sync with `GOLDEN_RAW_METADATA`
+    /// above and with the sentinel values documented in the module doc comment.
+    fn build_golden_metadata() -> TxMetadata {
+        let mut meta = TxMetadata::new(7);
+        meta.tx_id = [0xAB; 32];
+        meta.flags = TxFlags::CONFLICTING | TxFlags::LOCKED;
+        meta.spent_utxos = 3;
+        meta.block_entry_count = 1;
+        meta.block_overflow_offset = 0x4444_4444_4444_4444;
+        meta.reassignment_offset = 0x2222_2222_2222_2222;
+        meta.reassignment_count = 4;
+        meta.conflicting_children_count = 5;
+        meta.conflicting_children_offset = 0x3333_3333_3333_3333;
+        meta.record_size = 0x1111_1111;
+        meta
+    }
+
+    #[test]
+    fn golden_vector_raw_metadata() {
+        let meta = build_golden_metadata();
+        let mut buf = [0u8; METADATA_SIZE];
+        meta.to_bytes(&mut buf);
+
+        assert_eq!(METADATA_SIZE, 320, "METADATA_SIZE must stay 320 bytes");
+        assert_eq!(
+            buf, GOLDEN_RAW_METADATA,
+            "to_bytes() output no longer matches the pinned golden vector — \
+             if this is an intentional layout change, regenerate all three \
+             GOLDEN copies (server + client/rust + client/go)"
+        );
     }
 }
