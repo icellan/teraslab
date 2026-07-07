@@ -2394,6 +2394,47 @@ impl ServerConfig {
             }
         }
 
+        // Issue #1 hardening: a cluster-migration baseline now journals a
+        // lightweight index-only redo entry per op (a ~24-byte `ReplicaCreate`
+        // per create + a `SetMinedBatch` per mined block) so mined-state
+        // survives a pre-checkpoint crash (the on-device block-entry backing
+        // was removed). Those writes stall on the issue-#29 redo-backpressure
+        // gate, which reserves `redo_log_size / 8` of headroom and gates only
+        // BATCH ENTRY — so one `migration_batch_size` batch must fit within that
+        // reserve, or it can overflow the redo log mid-batch and poison (fence)
+        // the node. Reject a `migration_batch_size` that could exceed the
+        // reserve at startup rather than bricking a node during a scale event.
+        {
+            // Mirrors `dispatch::REDO_BACKPRESSURE_RESERVE_DIVISOR` (8). Kept as
+            // a local literal to avoid a config -> server layering dependency;
+            // if that constant changes, update this too.
+            const RESERVE_DIVISOR: u64 = 8;
+            // Conservative upper bound on the redo bytes one migration op
+            // appends (index-only `ReplicaCreate`/`SetMinedBatch` payload plus
+            // the entry header/length/CRC framing). Real entries are ~24-64 B;
+            // 128 B leaves headroom against an underestimate without flagging
+            // reasonable configs.
+            const MIGRATION_REDO_BYTES_PER_OP: u64 = 128;
+            let reserve = self.redo_log_size / RESERVE_DIVISOR;
+            let batch_redo =
+                (self.migration_batch_size as u64).saturating_mul(MIGRATION_REDO_BYTES_PER_OP);
+            if batch_redo > reserve {
+                let max_batch = (reserve / MIGRATION_REDO_BYTES_PER_OP).max(1);
+                return Err(ConfigError::InvalidSizing(format!(
+                    "migration_batch_size = {} appends up to {} B of redo per batch, exceeding the \
+                     redo-backpressure reserve of {} B (redo_log_size {} / {}). A single migration \
+                     batch must fit the reserve or it can overflow the redo log mid-batch and fence \
+                     the node. Lower migration_batch_size to <= {} or raise redo_log_size.",
+                    self.migration_batch_size,
+                    batch_redo,
+                    reserve,
+                    self.redo_log_size,
+                    RESERVE_DIVISOR,
+                    max_batch,
+                )));
+            }
+        }
+
         // BC-01: checkpoint watermarks must form a valid hysteresis
         // band (0 < low < high < 1) so the background trigger has
         // somewhere to fall back to between consecutive checkpoints.
@@ -2754,6 +2795,45 @@ backend = ""
         assert!(!cfg.storage.packed, "packed must default to OFF");
         cfg.validate_safe_defaults()
             .expect("default config (packed off) must validate");
+    }
+
+    #[test]
+    fn migration_batch_size_that_could_overflow_redo_reserve_is_rejected() {
+        // Issue #1: a migration baseline journals lightweight redo per op, gated
+        // at batch entry against the `redo_log_size / 8` backpressure reserve, so
+        // a migration_batch_size whose batch could exceed that reserve must be
+        // rejected at startup rather than bricking the node mid-migration.
+        // Default (500 ops, 64 MiB redo) is far under the reserve and must pass.
+        ServerConfig::default()
+            .validate_sizes()
+            .expect("default migration_batch_size must validate");
+
+        // A pathological batch size (200k ops × 128 B = 25.6 MB) exceeds the
+        // 8 MiB reserve of the default 64 MiB redo → rejected, naming the field.
+        let err = ServerConfig {
+            migration_batch_size: 200_000,
+            ..ServerConfig::default()
+        }
+        .validate_sizes()
+        .expect_err("an oversized migration_batch_size must be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidSizing(ref m) if m.contains("migration_batch_size")),
+            "expected an InvalidSizing error naming migration_batch_size, got {err:?}"
+        );
+
+        // Boundary: reserve = 64 MiB / 8 = 8 MiB; 8 MiB / 128 B = 65536 ops max.
+        ServerConfig {
+            migration_batch_size: 65_536,
+            ..ServerConfig::default()
+        }
+        .validate_sizes()
+        .expect("migration_batch_size exactly at the reserve boundary must pass");
+        ServerConfig {
+            migration_batch_size: 65_537,
+            ..ServerConfig::default()
+        }
+        .validate_sizes()
+        .expect_err("one op over the reserve boundary must be rejected");
     }
 
     #[test]

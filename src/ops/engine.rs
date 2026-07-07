@@ -756,17 +756,25 @@ impl Engine {
     /// durability journalling.
     ///
     /// Returns `None` while a [`MigrationJournalGuard`] is active on the
-    /// current thread, which suppresses ALL engine-internal redo journalling
-    /// (secondary-index intents, create's unmined insert, etc.) for the
-    /// duration of a migration-baseline apply. Migrated baseline data is
+    /// current thread, which suppresses the HEAVY per-record engine-internal
+    /// redo journalling (secondary-index intents, create's unmined insert,
+    /// etc.) for the duration of a migration-baseline apply. The record DATA is
     /// idempotently re-drivable from the source under the persisted inbound
     /// fence (the source never commits the handoff until
     /// `OP_MIGRATION_COMPLETE`), so a receiver that crashes mid-baseline
     /// re-acquires the fence and the source re-runs a fresh full baseline.
-    /// Baseline records therefore need NO receiver redo entries for
-    /// crash-safety, and journalling them would fill the redo log during a
-    /// large migration (`redo log full`). The data writes themselves are NOT
-    /// suppressed — only the redo journalling is.
+    ///
+    /// Issue #1: the guard is now DROPPED before `apply_op_journal`'s
+    /// post-apply redo block (`receiver.rs`), so a baseline still journals the
+    /// LIGHTWEIGHT index-only redo (a ~24-byte `ReplicaCreate` per create + a
+    /// `SetMinedBatch` per standalone `SetMined`). That is required for
+    /// crash-safety of the mined-state + MinedIndex slot, which — after the
+    /// on-device block-entry region and the device-scan MinedIndex rebuild were
+    /// removed — can only be reconstructed from the redo tail or the `.mined`
+    /// snapshot. Bulk `redo log full` is now bounded by the issue-#29
+    /// backpressure gate + checkpoint drain (as for normal replication), not by
+    /// the old zero-redo guarantee. The data writes themselves are NOT
+    /// suppressed — only the heavy redo journalling is.
     ///
     /// When per-store logs are attached, returns that store's log; otherwise
     /// falls back to the single representative handle (test /
