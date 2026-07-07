@@ -9052,12 +9052,9 @@ impl Engine {
             // false), so it is correct whether or not the record is
             // mined/on-chain — the covered-all-spent and all-spent-not-mined
             // cases both reconstruct to true. Conflicting/preserved records
-            // freeze LSA at a pre-transition value not recoverable from RAM;
-            // using the current all-spent status is the closest RAM-derived
-            // reconstruction and keeps the cache internally consistent (impact
-            // is bounded to advisory AllSpent/NotAllSpent signals). Spend
-            // counters and REASSIGNED are device-authoritative, so this never
-            // reads the vestigial device LAST_SPENT_ALL bit.
+            // are the exception (handled below): they freeze LSA, and since
+            // setMined freezes it for them too, the device bit is authoritative
+            // for those records and is read back verbatim.
             if mined_slot != crate::index::mined_index::NO_MINED_SLOT {
                 self.mined_index.reseed_de_flags(
                     &key,
@@ -9067,9 +9064,26 @@ impl Engine {
                         { meta.preserve_until } != 0,
                     ),
                 );
-                let effective_all_spent = { meta.spent_utxos } == { meta.utxo_count }
-                    && !meta.flags.contains(TxFlags::REASSIGNED);
-                self.set_cache_lsa(&key, mined_slot, effective_all_spent);
+                // Conflicting/preserved records FREEZE LAST_SPENT_ALL: the
+                // CONFLICTING branch and the preserve early-return in
+                // `evaluate_delete_at_height` never recompute it, and setMined
+                // freezes it for them too (its RAM eval takes the same frozen
+                // branches), so the cache never diverges from the device for
+                // these records — the device `LAST_SPENT_ALL` bit is NOT
+                // vestigial here, it holds the exact frozen value. Reconstruct
+                // it verbatim from the device so the frozen value survives
+                // recovery. For every other record LAST_SPENT_ALL is
+                // cache-authoritative (setMined may have advanced it past the
+                // lagging device), so reconstruct from authoritative state.
+                let reconstructed_lsa =
+                    if meta.flags.contains(TxFlags::CONFLICTING) || { meta.preserve_until } != 0 {
+                        meta.flags.contains(TxFlags::LAST_SPENT_ALL)
+                    } else {
+                        let spent = { meta.spent_utxos };
+                        let count = { meta.utxo_count };
+                        spent == count && !meta.flags.contains(TxFlags::REASSIGNED)
+                    };
+                self.set_cache_lsa(&key, mined_slot, reconstructed_lsa);
             }
 
             let (_signal, patch) = evaluate_delete_at_height(
@@ -11581,6 +11595,139 @@ mod tests {
                 { meta.utxo_count },
                 { meta.unmined_since },
                 meta.flags.contains(TxFlags::REASSIGNED),
+            );
+        }
+    }
+
+    /// followup-2 issue-fix: CONFLICTING and PRESERVED records FREEZE
+    /// `LAST_SPENT_ALL` — `evaluate_delete_at_height`'s CONFLICTING branch and
+    /// preserve early-return never recompute it, and setMined freezes it for
+    /// them too — so the device bit stays authoritative for those records and
+    /// `reconcile` must reconstruct LSA from the DEVICE, not from the current
+    /// all-spent status (which would flip an advisory AllSpent/NotAllSpent
+    /// signal after recovery). Each case's `spent`/`count` is set so
+    /// `effective_all_spent` DISAGREES with the frozen device LSA, proving
+    /// reconcile uses the device value for these records specifically.
+    #[test]
+    fn reconcile_uses_device_lsa_for_conflicting_and_preserved() {
+        use crate::index::mined_index::MINED_LAST_SPENT_ALL;
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let mut alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let mut index = Index::new(64).unwrap();
+
+        let mut write_record = |byte: u8,
+                                utxo_count: u32,
+                                spent: u32,
+                                flags: TxFlags,
+                                preserve_until: u32|
+         -> (TxKey, TxMetadata) {
+            let mut txid = [0u8; 32];
+            txid[0] = byte;
+            txid[1] = 0xE9;
+            let key = TxKey { txid };
+            let mut meta = TxMetadata::new(utxo_count);
+            meta.tx_id = txid;
+            meta.spent_utxos = spent;
+            meta.flags = flags;
+            meta.preserve_until = preserve_until;
+            let record_size = TxMetadata::record_size_for(utxo_count);
+            let offset = alloc.allocate(record_size).unwrap();
+            let slots: Vec<UtxoSlot> = (0..utxo_count)
+                .map(|i| {
+                    if i < spent {
+                        UtxoSlot::new_spent([byte.wrapping_add(i as u8); 32], [0xAB; 36])
+                    } else {
+                        UtxoSlot::new_unspent([byte.wrapping_add(i as u8); 32])
+                    }
+                })
+                .collect();
+            io::write_full_record(&*dev, offset, &meta, &slots).unwrap();
+            index
+                .register(
+                    key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: offset,
+                        mined_slot: crate::index::mined_index::NO_MINED_SLOT,
+                    },
+                )
+                .unwrap();
+            (key, meta)
+        };
+
+        // In every case the FROZEN device LSA and effective_all_spent DISAGREE,
+        // so the expected value can only come from reading the device bit.
+        // c1: CONFLICTING, device LSA true, spent 1/2 → effective false.
+        let c1 = write_record(
+            0x11,
+            2,
+            1,
+            TxFlags::CONFLICTING | TxFlags::LAST_SPENT_ALL,
+            0,
+        );
+        // c2: CONFLICTING, device LSA false, spent 1/1 → effective true.
+        let c2 = write_record(0x12, 1, 1, TxFlags::CONFLICTING, 0);
+        // p1: PRESERVED, device LSA true, spent 1/2 → effective false.
+        let p1 = write_record(0x13, 2, 1, TxFlags::LAST_SPENT_ALL, 5000);
+        // p2: PRESERVED, device LSA false, spent 1/1 → effective true.
+        let p2 = write_record(0x14, 1, 1, TxFlags::empty(), 5000);
+        let cases: [(&(TxKey, TxMetadata), bool); 4] =
+            [(&c1, true), (&c2, false), (&p1, true), (&p2, false)];
+
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(64),
+            DahIndex::new(),
+        );
+
+        for (rec, expected_lsa) in cases {
+            let (key, meta) = rec;
+            let bid = key.txid[0] as u32;
+            let slot = seed_mined_index_for_test(&engine, key, meta, &[(bid, 1000, 0)]);
+            let e = engine.index.lookup(key).unwrap();
+            engine
+                .index
+                .register(
+                    *key,
+                    TxIndexEntry {
+                        device_id: 0,
+                        record_offset: e.record_offset,
+                        mined_slot: slot,
+                    },
+                )
+                .unwrap();
+            // Clobber to the OPPOSITE so reconcile must actively set it right.
+            engine
+                .mined_index()
+                .set_de_flag(key, slot, MINED_LAST_SPENT_ALL, !expected_lsa);
+        }
+
+        engine
+            .reconcile_secondaries_from_mined_index(2000, 288)
+            .expect("reconcile must reconstruct the cache LSA");
+
+        for (rec, expected_lsa) in cases {
+            let (key, meta) = rec;
+            let slot = engine.lookup(key).unwrap().mined_slot;
+            let got =
+                engine.mined_index().read_de_flags(key, slot).unwrap() & MINED_LAST_SPENT_ALL != 0;
+            let effective = { meta.spent_utxos } == { meta.utxo_count };
+            // Non-vacuous: the frozen device value and effective_all_spent must
+            // differ, else the test could pass by the wrong reconstruction.
+            assert_ne!(
+                expected_lsa, effective,
+                "test setup bug: case {:#x} needs device LSA != effective_all_spent",
+                key.txid[0],
+            );
+            assert_eq!(
+                got, expected_lsa,
+                "conflicting/preserved record txid byte {:#x} must reconstruct LSA={expected_lsa} \
+                 from the FROZEN device bit, not effective_all_spent={effective}",
+                key.txid[0],
             );
         }
     }
