@@ -18,13 +18,41 @@ pub struct MinedEntry {
     /// 0 == mined on the longest chain.
     pub unmined_since: u32,
     pub flags: u8,
+    /// ABA guard: the owning key's fingerprint (see [`key_fp`]), stamped
+    /// when this slot is allocated for a key ([`ShardedMinedIndex::alloc_created`]).
+    ///
+    /// A lock-free GET resolves `mined_slot` from the primary index, then
+    /// reads this slot WITHOUT holding a lock across the two steps — if the
+    /// key is deleted (freeing the slot) and a different key is created
+    /// reusing the same shard-local slot number in between, a bare
+    /// slot-number read would silently return the WRONG tx's mined-state.
+    /// [`ShardedMinedIndex::with_entry`] / [`ShardedMinedIndex::read_block_entries`]
+    /// verify the caller-supplied key's fingerprint against this field before
+    /// returning the slot's data, and report "absent" on a mismatch — mirrors
+    /// the device path's analogous `read_metadata_for_key` tx_id re-check.
+    /// Costs +4 bytes/entry (~400 MB at 100M entries).
+    pub key_fp: u32,
+}
+
+/// Derive a [`MinedEntry::key_fp`] fingerprint from a key: the first 4 bytes
+/// of its txid, little-endian. Cheap (no hashing) — only needs to
+/// distinguish the astronomically unlikely case of two DIFFERENT keys
+/// colliding on the very same freed-then-reallocated slot number within the
+/// same shard, not to be collision-resistant against an adversary.
+#[inline]
+fn key_fp(key: &TxKey) -> u32 {
+    u32::from_le_bytes(key.txid[0..4].try_into().unwrap_or([0u8; 4]))
 }
 
 /// A `u32::MAX` slot means "no mined slot assigned" (stored in the primary entry).
 pub const NO_MINED_SLOT: u32 = u32::MAX;
 
 /// Version byte for the [`ShardedMinedIndex::serialize`] snapshot format.
-const MINED_SNAPSHOT_VERSION: u8 = 1;
+///
+/// Bumped 1 -> 2 (defense-in-depth fix) to add each entry's `key_fp` — see
+/// [`MinedEntry::key_fp`] — so a restored slot's ABA guard round-trips
+/// identically to a freshly-allocated one.
+const MINED_SNAPSHOT_VERSION: u8 = 2;
 
 /// Version byte for the TXID-keyed checkpoint snapshot format written by
 /// [`ShardedMinedIndex::serialize_by_key`] / read by
@@ -259,6 +287,7 @@ impl MinedShard {
             out.extend_from_slice(&e.subtree_idx.to_le_bytes());
             out.extend_from_slice(&e.unmined_since.to_le_bytes());
             out.push(e.flags);
+            out.extend_from_slice(&e.key_fp.to_le_bytes());
         }
 
         out.extend_from_slice(&(self.free.len() as u32).to_le_bytes());
@@ -305,12 +334,14 @@ impl MinedShard {
             let subtree_idx = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
             let unmined_since = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
             let flags = cur.read_u8().ok_or(MinedIndexError::Corrupt)?;
+            let key_fp = cur.read_u32().ok_or(MinedIndexError::Corrupt)?;
             entries.push(MinedEntry {
                 block_id,
                 block_height,
                 subtree_idx,
                 unmined_since,
                 flags,
+                key_fp,
             });
             live.push(l != 0);
         }
@@ -457,6 +488,7 @@ impl ShardedMinedIndex {
         let mut sh = self.shards[self.shard_for(key)].lock();
         let slot = sh.alloc(MinedEntry {
             unmined_since: block_height,
+            key_fp: key_fp(key),
             ..Default::default()
         });
         sh.set_unmined(slot, 0, block_height, key);
@@ -495,8 +527,13 @@ impl ShardedMinedIndex {
 
     /// Apply a closure to the entry at the given shard-local slot.
     ///
-    /// Returns `Some(R)` if the slot is live, or `None` if the slot is absent
-    /// or has been freed.
+    /// Returns `Some(R)` if the slot is live AND its stamped `key_fp`
+    /// matches `key`, or `None` if the slot is absent, has been freed, or
+    /// (the ABA guard — see [`MinedEntry::key_fp`]) now belongs to a
+    /// DIFFERENT key that reused this slot number after a lock-free caller's
+    /// primary-index lookup and this call raced a delete+realloc of `key`'s
+    /// original slot. Either way the caller sees exactly the same "absent"
+    /// result, so a raced read can never observe another tx's data.
     pub fn with_entry<R>(
         &self,
         key: &TxKey,
@@ -504,7 +541,11 @@ impl ShardedMinedIndex {
         f: impl FnOnce(&MinedEntry) -> R,
     ) -> Option<R> {
         let sh = self.shards[self.shard_for(key)].lock();
-        sh.get(slot).map(f)
+        let entry = sh.get(slot)?;
+        if entry.key_fp != key_fp(key) {
+            return None;
+        }
+        Some(f(entry))
     }
 
     /// Read the complete block-entry set for a slot — the inline tuple
@@ -515,10 +556,16 @@ impl ShardedMinedIndex {
     /// acquisition so the two can't be torn against a concurrent
     /// `apply_set_mined`/`apply_unset` on the same slot.
     ///
-    /// Returns `None` if the slot is not live (mirrors [`Self::with_entry`]).
+    /// Returns `None` if the slot is not live, or if the slot's stamped
+    /// `key_fp` doesn't match `key` — the ABA guard (see
+    /// [`MinedEntry::key_fp`] and [`Self::with_entry`]'s doc) against a
+    /// lock-free caller racing a delete+realloc of this slot number.
     pub fn read_block_entries(&self, key: &TxKey, slot: u32) -> Option<(Vec<BlockEntry>, u32)> {
         let sh = self.shards[self.shard_for(key)].lock();
         let entry = sh.get(slot)?;
+        if entry.key_fp != key_fp(key) {
+            return None;
+        }
         let mut entries = Vec::new();
         if entry.block_id != 0 {
             entries.push(BlockEntry {
@@ -599,6 +646,15 @@ impl ShardedMinedIndex {
     ///
     /// Both the setMined hot path and crash-recovery redo replay call this so
     /// their mutation semantics stay identical.
+    ///
+    /// # Panics (debug builds only)
+    ///
+    /// Debug-asserts `block_id != 0` — `0` is the reserved "no block yet"
+    /// sentinel an empty inline tuple is checked against (see
+    /// [`Self::read_block_entries`]'s `entry.block_id != 0` check); a caller
+    /// ever passing `0` here would silently mis-tag a real block as "no
+    /// block", which this catches loudly in dev/test rather than corrupting
+    /// state quietly in production.
     pub fn apply_set_mined(
         &self,
         key: &TxKey,
@@ -608,6 +664,7 @@ impl ShardedMinedIndex {
         subtree_idx: u32,
         on_longest_chain: bool,
     ) -> MinedApplyResult {
+        debug_assert!(block_id != 0, "block_id 0 is the no-block sentinel");
         let mut sh = self.shards[self.shard_for(key)].lock();
 
         let Some(inline_block_id) = sh.get(slot).map(|e| e.block_id) else {
@@ -686,7 +743,14 @@ impl ShardedMinedIndex {
     /// blocks, the tx becomes unmined again as of `current_height`.
     ///
     /// No-op if the slot is absent or `block_id` isn't recorded for it.
+    ///
+    /// # Panics (debug builds only)
+    ///
+    /// Debug-asserts `block_id != 0` — see [`Self::apply_set_mined`]'s
+    /// matching assert doc; `0` can never have been a real recorded block
+    /// tuple, so unsetting it would be a caller bug, not a legitimate no-op.
     pub fn apply_unset(&self, key: &TxKey, slot: u32, block_id: u32, current_height: u32) {
+        debug_assert!(block_id != 0, "block_id 0 is the no-block sentinel");
         let mut sh = self.shards[self.shard_for(key)].lock();
         let Some(inline_block_id) = sh.get(slot).map(|e| e.block_id) else {
             return;
@@ -1161,6 +1225,7 @@ mod tests {
             subtree_idx: 0,
             unmined_since: 0,
             flags: 0,
+            key_fp: 0,
         }
     }
 
@@ -1860,5 +1925,183 @@ mod tests {
             "a slot freed between resolving pairs and reading mined-state must be omitted, \
              not produce a bogus zeroed entry"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // key_fp ABA guard (defense-in-depth: close the lock-free-read
+    // slot-realloc race)
+    // -------------------------------------------------------------------
+
+    /// Reproduces the exact race `key_fp` defends against: a lock-free GET
+    /// resolves `mined_slot` for key A from the primary index, then — before
+    /// it reads the MinedIndex slot — A is deleted (freeing the slot) and a
+    /// DIFFERENT key B is created, reusing the very same shard-local slot
+    /// number via the free-list. Without the `key_fp` check, `A`'s stale slot
+    /// number would still be "live" (now B's data) and both
+    /// `read_block_entries`/`with_entry` would silently hand back B's
+    /// mined-state under A's key. With the check, both must report A as
+    /// absent instead.
+    #[test]
+    fn read_block_entries_rejects_slot_reallocated_to_different_key() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+
+        // key_a and key_b share bytes [16..24] (what `shard_for` hashes) so
+        // they are GUARANTEED to land in the same shard — required for the
+        // free-list to actually hand key_b the exact slot number key_a just
+        // vacated. They differ in bytes [0..4] (what `key_fp` reads), so a
+        // buggy (no-check) implementation would conflate them.
+        let key_a = TxKey { txid: [0xAAu8; 32] };
+        let mut txid_b = [0xAAu8; 32];
+        txid_b[0..4].copy_from_slice(&[0xBB, 0xBB, 0xBB, 0xBB]);
+        let key_b = TxKey { txid: txid_b };
+        assert_eq!(
+            idx.shard_for(&key_a),
+            idx.shard_for(&key_b),
+            "test setup invariant: key_a/key_b must route to the same shard for this \
+             test to actually exercise slot reuse across different keys"
+        );
+
+        let slot_a = idx.alloc_created(&key_a, 10);
+        idx.free(&key_a, slot_a);
+
+        let slot_b = idx.alloc_created(&key_b, 20);
+        assert_eq!(
+            slot_b, slot_a,
+            "test setup invariant: the shard's LIFO free-list must reuse the slot \
+             number just vacated by key_a"
+        );
+        // Give B real, distinguishable mined-state so a broken (no key_fp
+        // check) implementation reading it back under key_a's identity would
+        // be caught red-handed rather than coincidentally matching.
+        idx.apply_set_mined(&key_b, slot_b, 900, 55, 2, true);
+
+        // The ABA read: key_a's OWN (now-stale) slot number, reused by B.
+        assert!(
+            idx.read_block_entries(&key_a, slot_a).is_none(),
+            "a slot reallocated to a different key must read as absent for the OLD key, \
+             not return the new occupant's block entries"
+        );
+        assert!(
+            idx.with_entry(&key_a, slot_a, |e| e.block_id).is_none(),
+            "with_entry must also reject the stale key for a reallocated slot"
+        );
+
+        // Sanity: B's own key at its own (same-numbered) slot still reads
+        // normally — proves the rejection above is specifically about the
+        // KEY mismatch, not the slot having become unreadable.
+        let (entries_b, _) = idx
+            .read_block_entries(&key_b, slot_b)
+            .expect("the new rightful occupant must still read normally at the same slot");
+        assert_eq!(entries_b.len(), 1);
+        assert_eq!({ entries_b[0].block_id }, 900);
+        idx.with_entry(&key_b, slot_b, |e| {
+            assert_eq!(
+                e.block_id, 900,
+                "with_entry must see B's real data under B's key"
+            );
+        });
+    }
+
+    /// `key_fp` must survive the checkpoint snapshot-by-key round-trip: the
+    /// by-key wire format doesn't persist `key_fp` on the wire (recovery
+    /// re-derives it from the real key it already has via `alloc_created`),
+    /// so this proves that replay path still leaves the ABA guard intact —
+    /// a read with the correct (freshly-derived) key succeeds, and a read
+    /// with an unrelated key sharing the same slot number/shard is rejected.
+    #[test]
+    fn key_fp_round_trips_through_snapshot() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+        let key = TxKey { txid: [77u8; 32] };
+        let slot = idx.alloc_created(&key, 12);
+        idx.apply_set_mined(&key, slot, 900, 44, 1, true);
+
+        let mut buf = Vec::new();
+        idx.serialize_by_key(1, &[(key, slot)], &mut buf);
+        let (_fence, entries) =
+            ShardedMinedIndex::deserialize_by_key(&buf).expect("well-formed snapshot must decode");
+        assert_eq!(entries.len(), 1);
+        let restored_entry = &entries[0];
+        assert_eq!(restored_entry.txid, key.txid);
+
+        // Replay into a FRESH index the way
+        // `Engine::restore_mined_index_from_snapshot_entries` does:
+        // `alloc_created` (re-derives `key_fp` from the real key) then
+        // `apply_set_mined` per recorded block tuple.
+        let restored = ShardedMinedIndex::new(16);
+        let new_key = TxKey {
+            txid: restored_entry.txid,
+        };
+        let new_slot = restored.alloc_created(&new_key, restored_entry.unmined_since);
+        for be in &restored_entry.block_entries {
+            restored.apply_set_mined(
+                &new_key,
+                new_slot,
+                be.block_id,
+                be.block_height,
+                be.subtree_idx,
+                true,
+            );
+        }
+
+        // The correct (real) key succeeds after replay.
+        let (read_entries, _) = restored
+            .read_block_entries(&new_key, new_slot)
+            .expect("key_fp must verify for the correct key after a snapshot replay");
+        assert_eq!(read_entries.len(), 1);
+        assert_eq!({ read_entries[0].block_id }, 900);
+
+        // A DIFFERENT key that happens to share bytes [16..24] with new_key
+        // (so it routes to the same shard) must be rejected at the same
+        // slot number — proves the replayed slot's key_fp is the REAL key's
+        // fingerprint, not a stale/zeroed one that would accept anything.
+        let mut wrong_txid = new_key.txid;
+        wrong_txid[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let wrong_key = TxKey { txid: wrong_txid };
+        assert_eq!(
+            restored.shard_for(&wrong_key),
+            restored.shard_for(&new_key),
+            "test setup invariant: wrong_key must route to the same shard as new_key"
+        );
+        assert!(
+            restored.read_block_entries(&wrong_key, new_slot).is_none(),
+            "a key that never owned this slot must be rejected even after a snapshot replay"
+        );
+    }
+
+    /// `apply_set_mined`'s `block_id == 0` debug_assert: `0` is the reserved
+    /// "no block yet" sentinel (see `read_block_entries`'s `entry.block_id !=
+    /// 0` check), so a caller ever passing it here is an external-invariant
+    /// violation this must fail loudly on in debug/test builds rather than
+    /// silently mis-tagging a real block as "no block".
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "block_id 0 is the no-block sentinel")]
+    fn apply_set_mined_debug_asserts_nonzero_block_id() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+        let key = TxKey { txid: [88u8; 32] };
+        let slot = idx.alloc_created(&key, 5);
+        idx.apply_set_mined(&key, slot, 0, 10, 0, true);
+    }
+
+    /// Mirrors [`apply_set_mined_debug_asserts_nonzero_block_id`] for
+    /// `apply_unset`: `block_id == 0` can never have been a genuinely
+    /// recorded block tuple, so unsetting it is a caller bug, not a
+    /// legitimate no-op.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "block_id 0 is the no-block sentinel")]
+    fn apply_unset_debug_asserts_nonzero_block_id() {
+        use crate::index::TxKey;
+
+        let idx = ShardedMinedIndex::new(16);
+        let key = TxKey { txid: [89u8; 32] };
+        let slot = idx.alloc_created(&key, 5);
+        idx.apply_unset(&key, slot, 0, 20);
     }
 }

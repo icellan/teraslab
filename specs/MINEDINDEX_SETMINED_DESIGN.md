@@ -209,12 +209,14 @@ the master↔replica convergence tests (§14).
 
 ## 13. Memory budget @ 100M
 
-- MinedIndex dense arenas: 100M × 20 B (incl. `all_spent`, padding) ≈ **~2.0 GB**
-  (+ rare overflow).
+- MinedIndex dense arenas: 100M × 24 B (incl. `all_spent`, `key_fp` ABA guard, padding)
+  ≈ **~2.4 GB** (+ rare overflow). The `key_fp` field (+4 B/entry, ~0.4 GB @ 100M) was
+  added as defense-in-depth against a lock-free GET racing a slot's free+realloc to a
+  different key between the primary-index lookup and the MinedIndex read.
 - Primary `mined_slot` pointers: 100M × 4 B ≈ **~0.4 GB**.
 - Height buckets: bounded by the *unmined* backlog (≈ mempool, single-digit millions),
   small.
-- Total ≈ **~2.4 GB**, vs ~3 GB+ for the key duplication a standalone txid-keyed map
+- Total ≈ **~2.8 GB**, vs ~3 GB+ for the key duplication a standalone txid-keyed map
   would incur (D4 avoids it).
 
 ## 14. Testing strategy

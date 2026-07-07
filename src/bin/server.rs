@@ -1104,7 +1104,7 @@ fn main() {
             // device `block_entry_count` / `unmined_since` / `delete_at_height`
             // fields are no longer kept current by `set_mined`, so reconciling
             // from them here would resurrect a stale DAH entry for a
-            // reorg-unmined (retained) record. The secondaries are instead
+            // reorg-unmined (retained) record. The DAH secondary is instead
             // rebuilt store-authoritatively from the recovered MinedIndex below,
             // AFTER `engine.recover_mined_index`.
             true,
@@ -1413,11 +1413,14 @@ fn main() {
     }
 
     // Task 16d recovery reorder: with the MinedIndex now recovered, rebuild the
-    // DAH + unmined secondary indexes store-authoritatively from it (the
-    // device-metadata reconcile in `recover_all_multi_store` was deferred
-    // above). Post-16d the device mined-state fields are stale, so this is the
-    // ONLY correct source: it EXCLUDES a reorg-unmined record's stale DAH (no
-    // premature delete of a retained record on crash recovery) and re-derives a
+    // DAH secondary index store-authoritatively from it (the device-metadata
+    // reconcile in `recover_all_multi_store` was deferred above; Task 16e
+    // removed the former sibling `unmined_index` secondary this step used to
+    // also rebuild — `unmined_since` membership now lives solely in the
+    // recovered MinedIndex, nothing left here to reconcile for it). Post-16d
+    // the device mined-state fields are stale, so this is the ONLY correct
+    // source: it EXCLUDES a reorg-unmined record's stale DAH (no premature
+    // delete of a retained record on crash recovery) and re-derives a
     // setMined-planted DAH the device never recorded. `recovery_height_floor` is
     // the highest block height the replayed redo proved this node has seen — the
     // conservative "current height" for re-deriving any device-stale DAH.
@@ -1427,14 +1430,14 @@ fn main() {
     ) {
         tracing::error!(
             err = %e,
-            "FATAL: failed to rebuild the DAH/unmined secondary indexes from the \
+            "FATAL: failed to rebuild the DAH secondary index from the \
              recovered mined index; aborting startup",
         );
         std::process::exit(1);
     }
     tracing::info!(
         dah_entries = engine.dah_index().len(),
-        "secondary indexes rebuilt store-authoritatively from the recovered mined index",
+        "DAH secondary index rebuilt store-authoritatively from the recovered mined index",
     );
 
     // Attach the per-store redo logs so the engine performs two-phase durability
