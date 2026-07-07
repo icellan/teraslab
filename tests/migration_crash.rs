@@ -31,18 +31,24 @@
 //! change), and the restore path (`load_inbound_state` → `restore_inbound`)
 //! are the exact production components; only the network transport is elided.
 //!
-//! ## No-journal baseline (redo-full fix)
+//! ## Lightweight-journal baseline (issue #1 — Option A)
 //!
-//! Production migration-baseline applies SKIP the per-op receiver redo write
-//! (`apply_op_journal(.., journal=false)`): the single 64 MiB redo log would
-//! otherwise fill during a large baseline stream. This is crash-safe because
-//! migrated baseline data is idempotently RE-DRIVABLE FROM THE SOURCE under
-//! the persisted inbound fence — the source never commits the handoff until
-//! `OP_MIGRATION_COMPLETE`, so a receiver that crashes mid-baseline
-//! re-acquires the fence and the source re-runs a fresh full baseline. The
-//! load-bearing safety check below is the committed-source boundary: the
-//! source never commits on a receiver crash, so no record is lost even though
-//! the receiver journalled nothing for the baseline.
+//! Migration-baseline applies (`apply_op_journal(.., journal=false,
+//! is_migration=true)`) SUPPRESS the HEAVY per-record engine redo (create's
+//! unmined-index insert, `restore_migrated_lifecycle`'s secondary intents) but
+//! now JOURNAL a bounded, lightweight index-only redo — a ~24-byte
+//! `ReplicaCreate` per create plus a `SetMinedBatch` for each standalone
+//! `ReplicaOp::SetMined`. This is required post-#1: mined-state no longer lives
+//! on the device and there is no device-scan MinedIndex rebuild, so an
+//! already-mined baseline handed off but not yet checkpointed would otherwise
+//! recover slot-less + unmined. LogFull avoidance moved from "write zero redo"
+//! to the SAME mechanism that already protects NORMAL replication (which also
+//! journals a `ReplicaCreate` per create): the issue-#29 `redo_backpressure_gate`
+//! stalls a burst, and the checkpoint task drains/compacts the redo — so a large
+//! migration stalls-and-drains instead of hitting `LogFull`. Crash-safety is now
+//! two-sided: the FLUSHED portion of a mid-crash baseline recovers via the redo
+//! tail; the UNFLUSHED tail is still covered by the inbound fence + source
+//! re-drive (the source never commits the handoff until `OP_MIGRATION_COMPLETE`).
 //!
 //! Requires the `fault-injection` feature flag (to match the migration test
 //! family; the test itself uses only stable APIs):
@@ -55,21 +61,28 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 
 use teraslab::allocator::SlotAllocator;
+use teraslab::checkpoint::{CheckpointConfig, perform_blocking_checkpoint_with_reset_guard};
 use teraslab::cluster::migration::{MigrationManager, load_inbound_state, persist_inbound_state};
 use teraslab::cluster::shards::ShardTable;
 use teraslab::device::{BlockDevice, MemoryDevice};
+use teraslab::index::mined_index::NO_MINED_SLOT;
 use teraslab::index::{DahBackend, PrimaryBackend, ShardedIndex, TxKey};
 use teraslab::locks::StripedLocks;
 use teraslab::ops::create::CreateRequest;
 use teraslab::ops::engine::Engine;
+use teraslab::protocol::frame::RequestFrame;
+use teraslab::protocol::opcodes::{
+    FLAG_MIGRATION_BATCH, OP_REPLICA_BATCH, STATUS_ERROR, STATUS_OK,
+};
 use teraslab::recovery::recover_all_with_allocator;
 use teraslab::redo::RedoLog;
-use teraslab::replication::protocol::ReplicaOp;
-use teraslab::replication::receiver::apply_op_journal;
+use teraslab::replication::protocol::{ReplicaAck, ReplicaBatch, ReplicaOp};
+use teraslab::replication::receiver::{apply_op_journal, handle_replica_batch};
 
 const DATA_SIZE: u64 = 32 * 1024 * 1024;
 const REDO_SIZE: u64 = 1024 * 1024;
@@ -146,23 +159,39 @@ impl Node {
         let dah_idx =
             PrimaryBackend::rebuild_secondary(&*self.data_dev as &dyn BlockDevice, &alloc).unwrap();
         let mut dah = DahBackend::from(dah_idx);
-        let redo = RedoLog::open(self.redo_dev.clone() as Arc<dyn BlockDevice>, 0, REDO_SIZE)
-            .expect("reopen redo after crash");
-        recover_all_with_allocator(
-            &*self.data_dev as &dyn BlockDevice,
-            &redo,
-            &index,
-            &mut dah,
-            Some(&mut alloc),
-        )
-        .expect("recovery must not fail");
-        Arc::new(Engine::new_with_sharded_index(
+        // Reopen the redo as a SHARED handle so both primary-index recovery and
+        // the mined-index redo-tail replay below read the same durable log.
+        let redo = Arc::new(Mutex::new(
+            RedoLog::open(self.redo_dev.clone() as Arc<dyn BlockDevice>, 0, REDO_SIZE)
+                .expect("reopen redo after crash"),
+        ));
+        {
+            let redo_guard = redo.lock();
+            recover_all_with_allocator(
+                &*self.data_dev as &dyn BlockDevice,
+                &redo_guard,
+                &index,
+                &mut dah,
+                Some(&mut alloc),
+            )
+            .expect("recovery must not fail");
+        }
+        let engine = Arc::new(Engine::new_with_sharded_index(
             self.data_dev.clone() as Arc<dyn BlockDevice>,
             index,
             alloc,
             StripedLocks::new(64),
             dah,
-        ))
+        ));
+        // Production startup also reconstructs the MinedIndex from the redo tail
+        // (`Engine::recover_mined_index`). A crash-mid-baseline node has no
+        // checkpoint snapshot, so this is the fresh-boot full redo-tail replay —
+        // exactly how a FLUSHED migration baseline's journaled `ReplicaCreate`
+        // (+ `SetMinedBatch`) reconstructs each record's mined-index slot post-#1.
+        engine
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo))
+            .expect("mined-index redo-tail replay");
+        engine
     }
 }
 
@@ -313,8 +342,11 @@ fn crash_mid_migration_no_loss_no_dup_no_dual_master() {
     let crash_after = NUM_RECORDS / 2;
     for (i, k) in keys.iter().enumerate() {
         let op = build_migration_create_op(&old.engine, k);
-        // Production migration-baseline path: journal = false. No receiver
-        // redo entry is written for migrated baseline records.
+        // Production migration-baseline path: journal = false. Post-#1 this
+        // BUFFERS a lightweight `ReplicaCreate` per record, but the crash below
+        // hits BEFORE the receiver's end-of-batch redo flush + device sync, so
+        // the buffered redo is lost to power loss — recovery of this unflushed
+        // batch relies entirely on the inbound fence + source re-drive.
         apply_op_journal(&new.engine, &op, false, true).expect("migration apply");
         if i + 1 == crash_after {
             break;
@@ -434,21 +466,38 @@ fn clean_migration_completes_with_single_master() {
     persist_inbound_state(&inbound_path, &new_mgr);
 
     // Stream ALL records, then complete. journal = false (production
-    // migration-baseline path: no receiver redo entries written).
+    // migration-baseline path).
     for k in &keys {
         let op = build_migration_create_op(&old.engine, k);
         apply_op_journal(&new.engine, &op, false, true).expect("migration apply");
     }
+    new.redo_log.lock().flush().unwrap();
 
-    // No-journal invariant: the receiver wrote ZERO redo entries for the
-    // entire baseline stream. This is what keeps the single redo log from
-    // filling during a large migration. (The data itself is still durable;
-    // only the redo journalling is skipped.)
-    assert_eq!(
-        new.redo_log.lock().earliest_sequence().unwrap(),
-        None,
-        "migration-baseline applies must not write receiver redo entries",
-    );
+    // Bounded-lightweight-journal invariant (issue #1 / Option A): the baseline
+    // journals ONLY the lightweight index-only redo — exactly one ~24-byte
+    // `ReplicaCreate` per create (these are unmined 70-byte creates, so no
+    // `SetMinedBatch` companion) and NO full-record `Create`. This is the same
+    // per-create redo NORMAL replication writes, so migration is no worse than
+    // the already-backpressure-protected normal path — the heavy per-record
+    // engine redo stays suppressed.
+    {
+        use teraslab::redo::RedoOp;
+        let entries = new.redo_log.lock().recover().unwrap();
+        let replica_creates = entries
+            .iter()
+            .filter(|e| matches!(e.op, RedoOp::ReplicaCreate { .. }))
+            .count();
+        assert_eq!(
+            replica_creates, NUM_RECORDS,
+            "baseline journals exactly one lightweight ReplicaCreate per create",
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e.op, RedoOp::Create { .. })),
+            "baseline must NOT journal the heavy full-record Create redo",
+        );
+    }
 
     new.make_durable();
     // Proven completion: mark inbound complete + persist, and the source
@@ -509,22 +558,55 @@ impl TinyRedoNode {
     }
 }
 
-/// HEADLINE REGRESSION (fail-before / pass-after): a migration whose
-/// baseline op-count would exceed redo capacity COMPLETES without
-/// `LogFull` once baseline applies skip the receiver redo journal.
+/// Build a `FLAG_MIGRATION_BATCH` request frame carrying baseline creates for
+/// `keys`, exactly as the coordinator's `stream_shard_baseline` sends them.
+fn migration_batch_frame(source: &Engine, keys: &[TxKey], shard: u16) -> RequestFrame {
+    let ops: Vec<ReplicaOp> = keys
+        .iter()
+        .map(|k| build_migration_create_op(source, k))
+        .collect();
+    let batch = ReplicaBatch {
+        first_sequence: 0,
+        ops,
+        trace_ctx: None,
+        source_node_id: None,
+        cluster_key: 0,
+    };
+    RequestFrame {
+        request_id: shard as u64,
+        op_code: OP_REPLICA_BATCH,
+        flags: FLAG_MIGRATION_BATCH,
+        payload: batch.serialize().into(),
+    }
+}
+
+/// HEADLINE REGRESSION, reworked for issue #1 / Option A. Pre-#1 a migration
+/// baseline wrote ZERO receiver redo, so it could never overflow the log. Post-#1
+/// it journals a bounded lightweight `ReplicaCreate` per create — the SAME redo a
+/// NORMAL replication stream writes — so LogFull avoidance no longer comes from
+/// "write nothing"; it comes from the checkpoint DRAIN (the issue-#29
+/// `redo_backpressure_gate` stalls a burst while `perform_checkpoint` reclaims the
+/// log), exactly as for a large normal-replication stream.
 ///
-/// The test first proves the regression is real — journalling the SAME
-/// stream into the SAME tiny redo log hits `RedoError::LogFull` before the
-/// stream completes (fail-before). It then streams with `journal = false`
-/// and asserts the full baseline applies with the redo log staying empty
-/// and every record present (pass-after).
+/// The test proves the drain is LOAD-BEARING, driving the REAL receiver path
+/// (`handle_replica_batch` with `FLAG_MIGRATION_BATCH`, which runs the
+/// backpressure gate + per-batch redo flush):
+///   * fail-before: one big migration batch into a tiny redo with NO drain hits
+///     `redo log full` (STATUS_ERROR) before completing — the pressure is real.
+///   * pass-after: the SAME baseline streamed in batches, DRAINING the redo
+///     (blocking checkpoint reclaim) between batches, COMPLETES with every record
+///     applied + recoverable and no batch ever overflowing.
 #[test]
 fn large_migration_baseline_completes_without_log_full() {
-    // Header block is one ALIGN-sized block; two blocks is the minimum
-    // region. With ~4 KiB usable, a Create redo entry (>100 bytes) lets
-    // only a few dozen entries fit — far fewer than NUM.
-    let redo_size = 2 * ALIGN as u64; // 8 KiB
-    const NUM: usize = 400;
+    let tmp = tempfile::tempdir().unwrap();
+    // 32 KiB redo (28672 usable). A lightweight migration `ReplicaCreate` redo
+    // entry is ~62 bytes, so this log holds ~462 entries — the full NUM stream
+    // overflows it, but one drained BATCH plus the checkpoint's own aligned
+    // compaction block fits with headroom.
+    let redo_size = 8 * ALIGN as u64;
+    const NUM: usize = 600;
+    const BATCH: usize = 40;
+    let shard = 0u16;
 
     let source = TinyRedoNode::new(8 * 1024 * 1024); // ample redo for source
     let keys: Vec<TxKey> = (0..NUM).map(key).collect();
@@ -534,61 +616,60 @@ fn large_migration_baseline_completes_without_log_full() {
     }
     source.data_dev.sync().unwrap();
 
-    // --- fail-before: journalling the baseline overflows the tiny redo. ---
+    // --- fail-before: one big migration batch, NO drain → LogFull. ---
     {
         let journalled = TinyRedoNode::new(redo_size);
-        let mut hit_log_full = false;
-        for k in &keys {
-            let op = build_migration_create_op(&source.engine, k);
-            // journal = true is the OLD (pre-fix) migration behaviour.
-            match apply_op_journal(&journalled.engine, &op, true, true) {
-                Ok(()) => {}
-                Err(e) => {
-                    assert!(
-                        e.contains("redo log full"),
-                        "the only expected failure is redo log full, got: {e}",
-                    );
-                    hit_log_full = true;
-                    break;
-                }
-            }
-        }
-        assert!(
-            hit_log_full,
-            "fail-before: journalling {NUM} baseline ops into an 8 KiB redo \
-             MUST hit LogFull — if it does not, the regression setup is wrong",
+        let last_applied = AtomicU64::new(0);
+        let frame = migration_batch_frame(&source.engine, &keys, shard);
+        let resp = handle_replica_batch(&frame, &journalled.engine, &last_applied);
+        assert_eq!(
+            resp.status, STATUS_ERROR,
+            "fail-before: {NUM} lightweight baseline creates into a 32 KiB redo \
+             with no drain MUST overflow — if it does not, the setup is wrong",
         );
+        match ReplicaAck::deserialize(&resp.payload).unwrap() {
+            ReplicaAck::Error { message, .. } => assert!(
+                message.contains("redo log full"),
+                "the only expected failure is redo log full, got: {message}",
+            ),
+            other => panic!("expected ReplicaAck::Error(redo log full), got {other:?}"),
+        }
     }
 
-    // --- pass-after: no-journal baseline completes, redo stays empty. ---
+    // --- pass-after: batched migration WITH a checkpoint drain between batches
+    //     completes without LogFull. ---
     let receiver = TinyRedoNode::new(redo_size);
-    for k in &keys {
-        let op = build_migration_create_op(&source.engine, k);
-        apply_op_journal(&receiver.engine, &op, false, true)
-            .expect("no-journal migration baseline must apply without LogFull");
+    let last_applied = AtomicU64::new(0);
+    let cfg = CheckpointConfig::new(tmp.path().join("ckpt.snap"));
+    for chunk in keys.chunks(BATCH) {
+        let frame = migration_batch_frame(&source.engine, chunk, shard);
+        let resp = handle_replica_batch(&frame, &receiver.engine, &last_applied);
+        assert_eq!(
+            resp.status,
+            STATUS_OK,
+            "pass-after: each drained migration batch must apply without LogFull \
+             (redo usage {:.2})",
+            receiver.redo_log.lock().usage_fraction(),
+        );
+        // DRAIN: a blocking checkpoint fences + reclaims the redo to ~0, exactly
+        // as the checkpoint task does under sustained write load in production.
+        // Without this reclaim the same stream overflows (see fail-before).
+        perform_blocking_checkpoint_with_reset_guard(
+            &cfg,
+            &receiver.engine,
+            &receiver.redo_log,
+            |_| true,
+        )
+        .expect("checkpoint drain must succeed");
     }
     receiver.data_dev.sync().unwrap();
 
-    // Receiver redo usage stayed bounded: ZERO entries written.
-    assert_eq!(
-        receiver.redo_log.lock().earliest_sequence().unwrap(),
-        None,
-        "no-journal baseline must leave the receiver redo log empty",
-    );
-    assert_eq!(
-        receiver.redo_log.lock().current_sequence(),
-        1,
-        "a fresh log starts at next_sequence == 1; a no-journal baseline must \
-         not consume any sequence numbers (it stays at 1)",
-    );
-
-    // Every record is durably applied on the receiver.
+    // Every record applied + structurally intact (recoverable) on the receiver.
     for k in &keys {
         assert!(
             receiver.engine.lookup(k).is_some(),
-            "every migrated record must be present after no-journal baseline",
+            "every migrated record must be present after the drained baseline",
         );
-        // Structurally intact (not torn).
         let meta = receiver.engine.read_metadata(k).unwrap();
         let utxo_count = { meta.utxo_count };
         for v in 0..utxo_count {
@@ -597,14 +678,16 @@ fn large_migration_baseline_completes_without_log_full() {
     }
 }
 
-/// Receiver crash mid no-journal baseline still recovers via the inbound
-/// fence + source re-drive. Because the baseline wrote NO receiver redo,
-/// recovery cannot (and must not need to) replay it; the fence keeps the
-/// receiver from serving the partial shard, and the source — which never
-/// committed the handoff — re-runs a fresh full baseline. We assert the
-/// re-driven baseline then completes cleanly with all records present.
+/// Receiver crash mid-baseline: two-sided recovery (issue #1 / Option A). The
+/// FLUSHED portion of the baseline recovers via the journaled redo tail —
+/// including each record's MinedIndex slot, reconstructed from the lightweight
+/// `ReplicaCreate` entries (the durability the pre-#1 zero-redo baseline could
+/// not provide); the UNFLUSHED tail is still covered by the inbound fence +
+/// source re-drive (the source never committed the handoff). We assert BOTH:
+/// the flushed half recovers slotted, and the source re-drive completes the
+/// shard with no loss.
 #[test]
-fn receiver_crash_mid_no_journal_baseline_recovers_via_fence_and_redrive() {
+fn receiver_crash_mid_baseline_recovers_flushed_via_redo_then_redrives() {
     let tmp = tempfile::tempdir().unwrap();
     let inbound_path = tmp.path().join("inbound.state");
 
@@ -625,39 +708,74 @@ fn receiver_crash_mid_no_journal_baseline_recovers_via_fence_and_redrive() {
     assert!(new_mgr.mark_inbound_active(shard));
     persist_inbound_state(&inbound_path, &new_mgr);
 
-    // Apply HALF the no-journal baseline, then power-loss before completion.
-    for (i, k) in keys.iter().enumerate() {
+    // Apply the FIRST HALF, then make it DURABLE (redo flush + device sync) —
+    // modeling the receiver's end-of-batch barrier for the first batch. Post-#1
+    // these journal a lightweight ReplicaCreate each, now flushed to the redo.
+    let half = NUM_RECORDS / 2;
+    for k in keys.iter().take(half) {
         let op = build_migration_create_op(&old.engine, k);
-        apply_op_journal(&new.engine, &op, false, true).expect("migration apply");
-        if i + 1 == NUM_RECORDS / 2 {
-            break;
-        }
+        apply_op_journal(&new.engine, &op, false, true).expect("first-half migration apply");
+    }
+    new.make_durable();
+
+    // Apply the SECOND HALF but do NOT flush/sync — the in-flight tail that
+    // power loss discards.
+    for k in keys.iter().skip(half) {
+        let op = build_migration_create_op(&old.engine, k);
+        apply_op_journal(&new.engine, &op, false, true).expect("second-half migration apply");
     }
     assert!(new.data_dev.simulate_power_loss());
     assert!(new.redo_dev.simulate_power_loss());
 
-    // Restart through real recovery. The no-journal baseline left no redo,
-    // so recovery replays nothing for it — and that is correct.
-    let _new_recovered = new.recover();
+    // Restart through real recovery (primary rebuild + redo replay + MinedIndex
+    // redo-tail replay). The FLUSHED half recovers with reconstructed slots.
+    let new_recovered = new.recover();
     let mut restored_mgr = MigrationManager::new();
     restored_mgr.restore_inbound(&load_inbound_state(&inbound_path));
 
-    // FENCE intact: the receiver still refuses to serve the shard, so the
-    // source remains the sole master (committed-source boundary held).
+    // FENCE intact: the receiver still refuses to serve the shard.
     assert!(
         restored_mgr.has_pending_inbound(shard),
-        "after crash mid no-journal baseline, the receiver must still be \
-         fenced (pending-inbound) so the source stays sole master",
+        "after crash mid baseline, the receiver must still be fenced \
+         (pending-inbound) so the source stays sole master",
     );
+
+    // REDO-TAIL RECOVERY: every FLUSHED (first-half) record survives AND has a
+    // reconstructed, non-sentinel MinedIndex slot — the journaled ReplicaCreate
+    // replayed through mined-index recovery. Pre-#1 (zero redo) these recovered
+    // slot-less.
+    let mut recovered_flushed = 0;
+    for k in keys.iter().take(half) {
+        let entry = new_recovered
+            .lookup(k)
+            .expect("flushed first-half record must survive via the durable redo/device");
+        assert_ne!(
+            entry.mined_slot, NO_MINED_SLOT,
+            "a flushed migration record must recover a MinedIndex slot from the redo tail",
+        );
+        // Structurally intact (not torn).
+        let meta = new_recovered.read_metadata(k).unwrap();
+        let utxo_count = { meta.utxo_count };
+        for v in 0..utxo_count {
+            new_recovered.read_slot(k, v).unwrap();
+        }
+        recovered_flushed += 1;
+    }
+    assert_eq!(
+        recovered_flushed, half,
+        "all flushed first-half records recovered via the redo tail",
+    );
+
+    // Source never committed the handoff: it still serves the full shard.
     let old_set = master_record_set(&old.engine, &keys, &new_mgr_source(), shard, true);
     assert_eq!(
         old_set, original,
         "source never committed the handoff: it still serves the full shard",
     );
 
-    // SOURCE RE-DRIVE: the source re-runs a FRESH full baseline into a clean
-    // receiver engine (modeling the post-crash retry). With the fence still
-    // pending, this re-applies every record idempotently and completes.
+    // SOURCE RE-DRIVE covers the UNFLUSHED tail: the source re-runs a FRESH full
+    // baseline into a clean receiver (modeling the post-crash retry). With the
+    // fence still pending, this re-applies every record idempotently and completes.
     let redriven = Node::new(false);
     let mut redrive_mgr = MigrationManager::new();
     assert!(redrive_mgr.mark_inbound_active(shard));

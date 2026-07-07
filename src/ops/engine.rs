@@ -48,18 +48,23 @@ fn migration_journal_suppressed() -> bool {
 /// RAII guard that suppresses ALL engine-internal redo journalling on the
 /// current thread for its lifetime.
 ///
-/// Used to wrap migration-baseline applies on the receiver. Migrated
-/// baseline data is idempotently RE-DRIVABLE FROM THE SOURCE under the
-/// persisted inbound fence: the source never commits the handoff until
-/// `OP_MIGRATION_COMPLETE`, so a receiver that crashes mid-baseline
-/// re-acquires the fence and the source re-runs a fresh full baseline.
-/// Baseline records therefore need NO receiver redo entries for
-/// crash-safety, and journalling them (create's unmined-index insert,
-/// `restore_migrated_lifecycle`'s secondary-index intents, the post-apply
-/// replica redo entry) would fill the single 64 MiB redo log during a large
-/// migration (`redo log full`). The guard suppresses only the redo writes —
-/// device, in-memory/redb secondary indexes, and the primary cache are all
-/// still updated, so the migrated data is fully durable and queryable.
+/// Used to wrap migration-baseline applies on the receiver. Journalling the
+/// HEAVY per-record redo (create's unmined-index insert,
+/// `restore_migrated_lifecycle`'s secondary-index intents) would fill the
+/// single 64 MiB redo log during a large migration (`redo log full`); that
+/// state is idempotently RE-DRIVABLE FROM THE SOURCE under the persisted
+/// inbound fence (the source never commits the handoff until
+/// `OP_MIGRATION_COMPLETE`), so it needs no receiver redo. The guard
+/// suppresses only the redo writes — device, in-memory/redb secondary
+/// indexes, and the primary cache are all still updated, so the migrated data
+/// is fully durable and queryable.
+///
+/// Issue #1: the receiver DOES still journal a lightweight, index-only
+/// `ReplicaCreate` + mined companion per baseline create — but only AFTER this
+/// guard is released (`apply_op_journal` drops it before its post-apply redo
+/// block). Post-#1 the mined-state has no on-device backing, so it must ride
+/// the redo tail through crash recovery; the ~24-byte entry does not
+/// meaningfully load the redo log the way the heavy per-record redo would.
 ///
 /// Out-of-band / compensation ops do NOT use this guard: they are normal
 /// replicated mutations and must keep journalling.

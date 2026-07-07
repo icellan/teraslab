@@ -934,16 +934,18 @@ pub fn handle_replica_batch_with_tracker(
         0
     };
 
-    // Migration-baseline applies SKIP the per-op redo journal. The
-    // single 64 MiB redo log would otherwise fill during a large
-    // baseline stream (`redo log full`), stalling scale-down convergence
-    // and aborting rejoin-after-quiesce. Migrated baseline data is
-    // idempotently re-drivable from the source under the persisted
-    // inbound fence (the source does not commit the handoff until
-    // `OP_MIGRATION_COMPLETE`), so it needs no receiver redo entry for
-    // crash-safety. Out-of-band / compensation batches carry no
-    // `FLAG_MIGRATION_BATCH` (`is_migration == false`) and therefore keep
-    // journalling — they are normal replicated mutations.
+    // Migration-baseline applies suppress the HEAVY per-op engine redo (the
+    // single 64 MiB redo log would otherwise fill during a large baseline
+    // stream — `redo log full` — stalling scale-down convergence and aborting
+    // rejoin-after-quiesce). Issue #1: they STILL journal the lightweight
+    // index-only `ReplicaCreate` + mined companion (see `apply_op_journal`), so
+    // an already-mined baseline handed off but not yet checkpointed survives a
+    // target crash instead of recovering slot-less + unmined (post-#1 the
+    // mined-state has no on-device backing). That per-baseline-create redo is
+    // flushed in this same batch, before the ACK, and before the later
+    // `OP_MIGRATION_COMPLETE` that gates the handoff commit. Out-of-band /
+    // compensation batches carry no `FLAG_MIGRATION_BATCH` (`is_migration ==
+    // false`) and journal the FULL redo — they are normal replicated mutations.
     let journal = !is_migration;
     let start_seq = batch.first_sequence + skip_count as u64;
 
@@ -1365,16 +1367,26 @@ pub fn apply_op(engine: &Engine, op: &ReplicaOp) -> std::result::Result<(), Stri
 /// resync of every surviving replica.
 ///
 /// `journal == false` is used ONLY for `FLAG_MIGRATION_BATCH` baseline
-/// applies. Migrated baseline data is idempotently re-drivable from the
-/// source under the persisted inbound fence: the source never commits
-/// the handoff until `OP_MIGRATION_COMPLETE`, so a receiver that crashes
-/// mid-baseline re-acquires the fence and the source re-runs a fresh
-/// full baseline. Baseline records therefore do NOT need a receiver redo
-/// entry for crash-safety, and journalling them would fill the single
-/// 64 MiB redo log during a large migration (`redo log full`), which is
-/// the bug this skip fixes. Out-of-band / compensation ops are NORMAL
-/// replicated mutations (not re-drivable from a source the same way) and
-/// MUST always journal — callers pass `journal = true` for those.
+/// applies. It suppresses the HEAVY per-record engine-internal redo (the
+/// create's unmined-index insert, `restore_migrated_lifecycle`'s
+/// secondary-index intents, the post-apply generation sync) via the
+/// `MigrationJournalGuard` below — journalling all of that would fill the
+/// single 64 MiB redo log during a large migration (`redo log full`).
+///
+/// Issue #1: `journal == false` no longer means "write NO receiver redo".
+/// Post-#1 there is no on-device block-entry backing and no device-scan
+/// MinedIndex rebuild, so an already-mined baseline record that was handed
+/// off but not yet checkpointed would recover slot-less + unmined after a
+/// target crash — its mining silently lost. The baseline therefore still
+/// journals the SAME lightweight, index-only redo a buffered replica writes
+/// (`RedoOp::ReplicaCreate`, ~24 bytes, no record bytes) plus the mined
+/// `create_companion_set_mined_ops` companion, emitted AFTER the guard is
+/// released so they are NOT suppressed. On recovery the existing redo-tail
+/// replay reconstructs the slot (device still holds the migrated record) and
+/// re-applies the mining, with no new recovery code. This is the only redo a
+/// baseline writes; the heavy per-record intents stay suppressed. Out-of-band
+/// / compensation ops are NORMAL replicated mutations and MUST always journal
+/// via the full (`journal = true`) path — callers pass `journal = true`.
 ///
 /// `is_migration` is `true` only for `FLAG_MIGRATION_BATCH` baseline applies.
 /// It makes two apply paths idempotent under CONCURRENT multi-source migration
@@ -1396,16 +1408,20 @@ pub fn apply_op_journal(
     journal: bool,
     is_migration: bool,
 ) -> std::result::Result<(), String> {
-    // When journalling is disabled (migration-baseline apply), suppress
-    // ALL engine-internal redo writes for the duration of this apply too —
-    // not just the post-apply replica redo entry below. A baseline Create
-    // also drives `engine.create` (unmined secondary insert) and
+    // When journalling is disabled (migration-baseline apply), suppress the
+    // HEAVY engine-internal redo writes for the duration of the apply below —
+    // a baseline Create drives `engine.create` (unmined secondary insert) and
     // `restore_migrated_lifecycle` (DAH/unmined secondary intents), each of
-    // which journals via the engine's redo log; without this guard those
-    // alone fill the single 64 MiB redo log during a large migration. The
-    // guard suppresses redo only — the data, secondary indexes, and primary
-    // cache are still updated. See `Engine::MigrationJournalGuard`.
-    let _journal_guard = if journal {
+    // which journals via the engine's redo log; without this guard those alone
+    // fill the single 64 MiB redo log during a large migration. The guard
+    // suppresses redo only — the data, secondary indexes, and primary cache are
+    // still updated. See `Engine::MigrationJournalGuard`.
+    //
+    // Issue #1: the guard is RELEASED (`drop`) just before the post-apply redo
+    // block so the LIGHTWEIGHT index-only `ReplicaCreate` + mined companion are
+    // still journaled for baselines — see that block. For the normal
+    // `journal == true` path this is `None` and the drop is a no-op.
+    let journal_guard = if journal {
         None
     } else {
         Some(crate::ops::engine::MigrationJournalGuard::enter())
@@ -2093,6 +2109,15 @@ pub fn apply_op_journal(
     // level: all batch ops are applied → device fsync → redo entries
     // written → ACK sent.
 
+    // Issue #1: release the migration journal guard (if any) so the
+    // lightweight index-only redo written below is NOT suppressed. The HEAVY
+    // per-record engine redo above (create's unmined insert,
+    // `restore_migrated_lifecycle`'s secondary intents, the generation sync)
+    // already ran under the guard and stays suppressed; only the ~24-byte
+    // `ReplicaCreate` + mined companion survive. For `journal == true` this is
+    // `None`, so the drop is a no-op and the path is unchanged.
+    drop(journal_guard);
+
     // R-034 (BC-34): write a local redo entry so the replica can replay
     // through its own crash recovery and a failover does not require a
     // full resync of every surviving replica. The entry captures the
@@ -2100,7 +2125,13 @@ pub fn apply_op_journal(
     // the master uses on its own write path. Failure to journal the entry
     // is a hard batch-level error: ACKing without the local log would
     // re-introduce the same divergence R-034 was opened to fix.
-    if journal {
+    //
+    // Issue #1: a `FLAG_MIGRATION_BATCH` baseline (`journal == false`,
+    // `is_migration == true`) journals here too — the SAME lightweight
+    // `ReplicaCreate` + mined companion as a buffered replica — so an
+    // already-mined baseline handed off but not yet checkpointed recovers
+    // slotted + mined after a target crash instead of slot-less + unmined.
+    if journal || is_migration {
         if let Some(redo_op) = build_post_apply_redo_op(engine, op)? {
             match pre_delete_device_id {
                 // Route the Delete redo to the record's own store log (see the
@@ -5184,6 +5215,268 @@ mod tests {
         assert_eq!(
             unmined, 0,
             "already-mined replicated create: unmined_since==0"
+        );
+    }
+
+    /// Build the 70-byte migration-baseline metadata prefix the coordinator's
+    /// `stream_shard_baseline` ships (core 46 + lifecycle 24, NO embedded
+    /// block-entry section — coordinator.rs:5977-6066). Mining for an
+    /// already-mined record rides SEPARATE `ReplicaOp::SetMined` ops in the same
+    /// baseline batch, NOT this buffer, so this is the faithful wire shape for a
+    /// migration create (unlike `build_full_metadata`'s >=75-byte embedded-block
+    /// form, which is the NORMAL-replication create path).
+    fn build_migration_meta_70(generation: u32, unmined_since: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(70);
+        // Core 46 bytes.
+        buf.extend_from_slice(&2u32.to_le_bytes()); // tx_version
+        buf.extend_from_slice(&0u32.to_le_bytes()); // locktime
+        buf.extend_from_slice(&0u64.to_le_bytes()); // fee
+        buf.extend_from_slice(&0u64.to_le_bytes()); // size_in_bytes
+        buf.extend_from_slice(&0u64.to_le_bytes()); // extended_size
+        buf.push(0); // is_coinbase
+        buf.extend_from_slice(&0u32.to_le_bytes()); // spending_height
+        buf.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        buf.push(0); // wire flags
+        // Lifecycle 24 bytes.
+        buf.extend_from_slice(&generation.to_le_bytes()); // generation
+        buf.extend_from_slice(&0u64.to_le_bytes()); // updated_at
+        buf.extend_from_slice(&unmined_since.to_le_bytes()); // unmined_since
+        buf.extend_from_slice(&0u32.to_le_bytes()); // delete_at_height
+        buf.extend_from_slice(&0u32.to_le_bytes()); // preserve_until
+        assert_eq!(buf.len(), 70, "migration baseline metadata is 70 bytes");
+        buf
+    }
+
+    /// Issue #1 (migration crash-safety), FAITHFUL wire shape: the real
+    /// `stream_shard_baseline` (coordinator.rs:5977-6066) ships a 70-byte create
+    /// (no embedded blocks) followed by SEPARATE `ReplicaOp::SetMined` ops for
+    /// the mining, ALL inside one `FLAG_MIGRATION_BATCH` batch — so every op
+    /// applies with `journal=false`, `is_migration=true`. Post-#1 the mined-state
+    /// has no on-device backing and there is no device-scan MinedIndex rebuild,
+    /// so a target handed the shard but crashed BEFORE the next checkpoint must
+    /// recover the record MINED with a non-sentinel slot from the JOURNALED redo
+    /// tail — otherwise its mining is silently lost. The create journals a
+    /// lightweight `ReplicaCreate`; the standalone `SetMined` journals a
+    /// `SetMinedBatch`. RED before the incremental-journal fix (the baseline
+    /// journals nothing → the redo tail has nothing to replay).
+    #[test]
+    fn already_mined_migration_baseline_recovers_mined_and_slotted() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        use crate::index::{ShardedIndex, TxIndexEntry};
+        use crate::redo::{RedoLog, RedoOp};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        const BID: u32 = 77;
+        const BHT: u32 = 2000;
+        const BSI: u32 = 3;
+        let k = key(114);
+
+        // A 70-byte migration-baseline create (unmined on the wire; mining rides
+        // the standalone SetMined below). journal=false, is_migration=true.
+        let create = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: build_migration_meta_70(9, 0),
+            utxo_hashes: vec![[0xAB; 32]; 3],
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op_journal(&engine, &create, false, true).expect("baseline create applies");
+        // The mining as a SEPARATE per-block SetMined op in the same baseline
+        // batch, exactly as stream_shard_baseline emits it. journal=false.
+        let set_mined = ReplicaOp::SetMined {
+            tx_key: k,
+            block_id: BID,
+            block_height: BHT,
+            subtree_idx: BSI,
+            on_longest_chain: true,
+            current_block_height: 0,
+            block_height_retention: 0,
+            master_generation: 9,
+        };
+        apply_op_journal(&engine, &set_mined, false, true).expect("baseline set_mined applies");
+        engine.flush_all_redo().expect("flush baseline redo");
+
+        let entry = engine.lookup(&k).expect("migration record registered");
+        engine.allocator().lock().persist().unwrap();
+
+        // The lightweight ReplicaCreate + the standalone SetMined's SetMinedBatch
+        // must BOTH be journaled (pre-fix: journal=false skipped the whole redo
+        // block for both), create-before-mining.
+        let entries = redo.lock().recover().expect("recover baseline redo");
+        let rc_seq = entries
+            .iter()
+            .find_map(|e| match &e.op {
+                RedoOp::ReplicaCreate { tx_key, .. } if *tx_key == k => Some(e.sequence),
+                _ => None,
+            })
+            .expect("ReplicaCreate journaled for migration baseline");
+        let sm = entries
+            .iter()
+            .find(|e| matches!(&e.op, RedoOp::SetMinedBatch { txids, .. } if txids.contains(&k)))
+            .expect("SetMinedBatch journaled for the standalone baseline SetMined");
+        assert!(
+            sm.sequence > rc_seq,
+            "the mining redo must sequence after its ReplicaCreate"
+        );
+
+        // Recover a FRESH MinedIndex from the baseline's redo tail alone and
+        // assert the record recovers MINED with the exact block + a valid slot.
+        let fresh = ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        fresh
+            .register(
+                k,
+                TxIndexEntry {
+                    device_id: entry.device_id,
+                    record_offset: entry.record_offset,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register key");
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            fresh,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        engine2
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo))
+            .expect("mined-index redo-tail replay");
+
+        let after = engine2.lookup(&k).expect("key registered after replay");
+        assert_ne!(
+            after.mined_slot, NO_MINED_SLOT,
+            "migration baseline must recover a non-sentinel mined slot"
+        );
+        let (blocks, unmined) = engine2
+            .mined_index()
+            .read_block_entries(&k, after.mined_slot)
+            .expect("mined-state present after recovery");
+        assert_eq!(blocks.len(), 1, "exactly one mined block; got {blocks:?}");
+        let (r_bid, r_bht, r_bsi) = ({ blocks[0].block_id }, { blocks[0].block_height }, {
+            blocks[0].subtree_idx
+        });
+        assert_eq!(r_bid, BID);
+        assert_eq!(r_bht, BHT);
+        assert_eq!(r_bsi, BSI);
+        assert_eq!(
+            unmined, 0,
+            "on_longest_chain baseline SetMined: unmined_since==0"
+        );
+    }
+
+    /// Issue #1 coverage, FAITHFUL wire shape: an UNMINED migration-baseline
+    /// create (a 70-byte create with NO standalone SetMined) still journals its
+    /// lightweight `ReplicaCreate`, so it recovers with a valid, non-sentinel
+    /// slot and zero block entries (needed for DAH tracking / unmined
+    /// enumeration). RED before the fix (journal=false skipped the ReplicaCreate
+    /// too → recovers slot-less).
+    #[test]
+    fn unmined_migration_baseline_recovers_slotted() {
+        use crate::index::mined_index::NO_MINED_SLOT;
+        use crate::index::{ShardedIndex, TxIndexEntry};
+        use crate::redo::{RedoLog, RedoOp};
+
+        let dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(64 * 1024 * 1024, 4096).unwrap());
+        let alloc = SlotAllocator::new(dev.clone()).unwrap();
+        let index = Index::new(10_000).unwrap();
+        let engine = Engine::new(
+            dev.clone(),
+            index,
+            alloc,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        let redo_dev: Arc<dyn BlockDevice> =
+            Arc::new(MemoryDevice::new(4 * 1024 * 1024, 4096).unwrap());
+        let redo = Arc::new(parking_lot::Mutex::new(
+            RedoLog::open(redo_dev, 0, 4 * 1024 * 1024).unwrap(),
+        ));
+        engine.set_redo_logs(vec![redo.clone()]);
+
+        let k = key(115);
+        // A 70-byte migration create, unmined (unmined_since != 0), no SetMined.
+        let op = ReplicaOp::Create {
+            tx_key: k,
+            metadata_bytes: build_migration_meta_70(4, 900_000),
+            utxo_hashes: vec![[0xCD; 32]; 2],
+            cold_data: None,
+            is_external: false,
+        };
+        apply_op_journal(&engine, &op, false, true).expect("unmined migration baseline applies");
+        engine.flush_all_redo().expect("flush baseline redo");
+
+        let entry = engine.lookup(&k).expect("migration record registered");
+        engine.allocator().lock().persist().unwrap();
+
+        let entries = redo.lock().recover().expect("recover baseline redo");
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(&e.op, RedoOp::ReplicaCreate { tx_key, .. } if *tx_key == k)),
+            "ReplicaCreate journaled for unmined migration baseline"
+        );
+        assert!(
+            !entries.iter().any(
+                |e| matches!(&e.op, RedoOp::SetMinedBatch { txids, .. } if txids.contains(&k))
+            ),
+            "no mining redo for an unmined baseline create (no standalone SetMined)"
+        );
+
+        let fresh = ShardedIndex::from_single(Index::new(10_000).unwrap().into());
+        fresh
+            .register(
+                k,
+                TxIndexEntry {
+                    device_id: entry.device_id,
+                    record_offset: entry.record_offset,
+                    mined_slot: NO_MINED_SLOT,
+                },
+            )
+            .expect("register key");
+        let alloc2 = SlotAllocator::recover(dev.clone()).expect("allocator recovers");
+        let engine2 = Engine::new_with_sharded_index(
+            dev.clone(),
+            fresh,
+            alloc2,
+            StripedLocks::new(1024),
+            DahIndex::new(),
+        );
+        engine2
+            .replay_mined_index_redo_tail(std::slice::from_ref(&redo))
+            .expect("mined-index redo-tail replay");
+
+        let after = engine2.lookup(&k).expect("key registered after replay");
+        assert_ne!(
+            after.mined_slot, NO_MINED_SLOT,
+            "unmined migration baseline must still recover a non-sentinel slot"
+        );
+        let (blocks, _unmined) = engine2
+            .mined_index()
+            .read_block_entries(&k, after.mined_slot)
+            .expect("mined-state readable after recovery");
+        assert!(
+            blocks.is_empty(),
+            "unmined baseline has no mined blocks; got {blocks:?}"
         );
     }
 
