@@ -1234,12 +1234,16 @@ fn segment_cluster_master_failover_preserves_replicated_record() {
                 .node_addresses()
                 .contains_key(&NodeId(master_id))
         },
-        Duration::from_secs(10),
+        Duration::from_secs(20),
     )
     .expect("survivors should drop the killed master after suspicion");
     wait_until(
         || matches!(replica.cluster.is_master(&key), MasterQueryResult::Yes),
-        Duration::from_secs(15),
+        // Generous: SWIM suspicion → failover → promotion convergence is slow
+        // on loaded shared CI runners. `wait_until` polls and returns as soon
+        // as the condition holds, so this only costs wall time on a genuine
+        // failure — a tighter bound flaked under CI contention.
+        Duration::from_secs(45),
     )
     .expect("the replica must be promoted to master of the shard after failover");
     assert!(

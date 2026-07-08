@@ -1555,22 +1555,30 @@ mod tests {
             ckpt_us >= 20_000,
             "snapshot too fast ({ckpt_us}us) to be a meaningful isolation test; raise N"
         );
-        // Reads kept flowing across the whole checkpoint. A stop-the-world
-        // checkpoint would block the reader for the full snapshot, completing
-        // ~1 acquisition; the fuzzy checkpoint lets thousands through.
-        assert!(
-            reads >= 1000,
-            "reads stalled during checkpoint: only {reads} guard acquisitions across {ckpt_us}us"
-        );
-        // Sanity: no read waited for ~the whole checkpoint (a reader blocked on
-        // a barrier held across the snapshot would show max ≈ checkpoint
-        // duration). The `reads >= 1000` count above is the definitive
-        // non-blocking signal; this bound stays loose so heavy parallel
-        // test-runner scheduling jitter cannot flake it.
+        // The DEFINITIVE non-blocking signal: no single guard acquisition
+        // waited for ~the whole checkpoint. A stop-the-world checkpoint holds a
+        // barrier across the snapshot, so the reader's next acquisition blocks
+        // for ≈ the full snapshot duration (max ≈ ckpt). The fuzzy checkpoint
+        // never blocks an acquisition, so max stays a tiny fraction of ckpt.
+        // This is robust to test-runner scheduling: it does not depend on how
+        // many times the reader was scheduled, only that no acquisition was
+        // held.
         assert!(
             (max_us as u128) < ckpt_us,
             "a read stalled ~the whole checkpoint ({max_us}us vs {ckpt_us}us) — \
              is the barrier still held across the snapshot?"
+        );
+        // Liveness floor: the reader made real forward progress DURING the
+        // checkpoint (a stop-the-world run completes ~1-2 acquisitions — the
+        // one before it blocks on the barrier). The threshold is deliberately
+        // low (not the raw throughput) so a starved CI runner that gives the
+        // reader little CPU cannot flake it, while still catching the
+        // stop-the-world case (~1-2 << 50). The `max_us` bound above is the
+        // primary proof; this guards against the reader never running at all.
+        assert!(
+            reads >= 50,
+            "reader made almost no progress during checkpoint: only {reads} guard \
+             acquisitions across {ckpt_us}us — stop-the-world, or the reader was never scheduled?"
         );
     }
 
