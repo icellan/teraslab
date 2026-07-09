@@ -1171,14 +1171,25 @@ fn segment_cluster_master_failover_preserves_replicated_record() {
         })
         .expect("some node must master the key");
     let master = node_by_id(master_id);
+    // The replica assignment can land in a LATER shard-table install than the
+    // one that made the master serve (rebalance fills replicas progressively as
+    // the cluster settles), so poll for it rather than one-shot asserting — the
+    // one-shot check flaked when the replica had not been installed yet.
+    // `wait_until` returns the instant it is assigned, so the deadline only
+    // tolerates a slow runner; it does not slow a healthy run.
+    let shard = ShardTable::shard_for_key(&key);
+    wait_until(
+        || {
+            let table = master.cluster.shard_table();
+            let a = table.read().assignment(shard).clone();
+            !a.replicas.is_empty()
+        },
+        Duration::from_secs(20),
+    )
+    .expect("RF=2 shard must get a replica assigned after the cluster settles");
     let replica_id = {
-        let shard = ShardTable::shard_for_key(&key);
         let table = master.cluster.shard_table();
         let a = table.read().assignment(shard).clone();
-        assert!(
-            !a.replicas.is_empty(),
-            "RF=2 shard must have a replica assigned"
-        );
         a.replicas[0].0
     };
     let replica = node_by_id(replica_id);
